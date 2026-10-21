@@ -2584,6 +2584,37 @@ fn eval_convert_scalar(
     })
 }
 
+/// What a name holds when an operand is evaluated outside a query: a value, or
+/// a stored node (by dense id), so `key(n)` and `labels(n)` read the node.
+pub enum Binding {
+    Value(Value),
+    Node(u32),
+}
+
+/// Evaluate one operand against named bindings, with the same evaluator a
+/// `RETURN` uses. A property of a node binding reads the store's value; a
+/// caller that needs another source for it substitutes the read first.
+pub fn eval_operand(
+    view: &GraphView,
+    operand: &Operand,
+    params: &Params,
+    bindings: &[(&str, Binding)],
+) -> Result<Option<Value>, String> {
+    let mut vars = VarTable { names: Vec::new() };
+    let mut row: Row = Vec::new();
+    for (name, binding) in bindings {
+        let slot = vars.intern(name);
+        if row.len() <= slot {
+            row.resize(slot + 1, None);
+        }
+        row[slot] = Some(match binding {
+            Binding::Value(v) => Cell::Scalar(v.clone()),
+            Binding::Node(id) => Cell::Node(*id),
+        });
+    }
+    resolve_operand(view, &vars, &row, operand, params)
+}
+
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -2846,7 +2877,12 @@ fn resolve_prop(
                 Ok(None)
             }
         }
-        // Scalar alias: has no properties.
+        // A scalar alias holding a map (`UNWIND $rows AS r` → `r.id`): the entry,
+        // null when the key is absent. Any other scalar has no properties.
+        Cell::Scalar(Value::Map(entries)) => Ok(entries
+            .get(field)
+            .cloned()
+            .and_then(crate::value_ops::element)),
         Cell::Scalar(_) => Ok(None),
     }
 }

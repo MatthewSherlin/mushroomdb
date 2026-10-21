@@ -38,6 +38,15 @@ In a query, a node's key is written as its `id` property: `CREATE (n:Person {id:
 makes the node whose key is `ada`, and `MATCH (p:Person {id: 'person-01'})` finds one by key.
 `key(n)` returns it.
 
+A node whose stored `id` property equals its key (what `CREATE` and the default ingest
+produce) keeps it that way. On such a node, setting `id` to another value or removing `id` is
+refused with `cannot change the key property `id` of node K; renaming a node is rename_node`,
+whatever API the write comes from: Cypher, the Rust, Python and HTTP property calls, batches,
+and upserts. Writing the key itself is accepted. A node whose `id` differs from its key, or
+that has none (a store ingested with another `key_field`, such as `sku`, and an unrelated `id`
+column), treats `id` as an ordinary property. `rename_node` changes a key and moves a matching
+`id` with it.
+
 Deleting a node **tombstones** it: it leaves the graph, and stays in the history.
 
 ## Edges

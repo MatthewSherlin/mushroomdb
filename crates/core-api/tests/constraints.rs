@@ -1022,4 +1022,112 @@ mod unlocked {
         assert_eq!(reopened.constraints().len(), 1);
         assert_violation(reopened.insert_node("User", "bob", email("a@x")));
     }
+    // ── Cypher REMOVE and SET maps (QL-05, QL-06) ────────────────────────────
+
+    fn cypher(db: &mut GraphDb, q: &str) -> Result<mushroomdb::ResultSet, GraphError> {
+        db.query_write(q, &BTreeMap::new())
+    }
+
+    #[test]
+    fn cypher_remove_of_a_unique_property_frees_the_value_for_another_node() {
+        let (dir, mut db) = constrained("cypher-remove");
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' REMOVE n.email",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'a@x'})").unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Alice can no longer take it back.
+        assert_violation(cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n.email = 'a@x'",
+        ));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.get_prop("alice", "email"), None);
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn cypher_set_maps_meet_the_unique_constraint_and_write_nothing_when_refused() {
+        let (dir, mut db) = constrained("cypher-set-map");
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'b@x', age: 3})").unwrap();
+        let before = wal_bytes(&dir);
+        for q in [
+            "MATCH (n:User) WHERE n.id = 'bob' SET n = {email: 'a@x'}",
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x', age: 4}",
+        ] {
+            assert_violation(cypher(&mut db, q));
+            assert_eq!(wal_bytes(&dir), before, "{q}: a refused write appended");
+            assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("b@x".into())));
+            assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(3)), "{q}");
+        }
+        // A replace that drops the property frees its value in the same store.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n = {name: 'A'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // `+= {email: null}` frees it again.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: null}",
+        )
+        .unwrap();
+        cypher(&mut db, "CREATE (n:User {id: 'carol', email: 'a@x'})").unwrap();
+    }
+
+    #[test]
+    fn unwind_create_meets_the_unique_constraint_and_writes_nothing_when_a_row_violates_it() {
+        let (dir, mut db) = constrained("cypher-unwind-create");
+        let before = wal_bytes(&dir);
+        let row = |id: &str, mail: &str| {
+            Value::Map(BTreeMap::from([
+                ("id".to_string(), Value::Str(id.into())),
+                ("email".to_string(), Value::Str(mail.into())),
+            ]))
+        };
+        // Row 3 repeats alice's email.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![
+                row("u1", "1@x"),
+                row("u2", "2@x"),
+                row("u3", "a@x"),
+                row("u4", "4@x"),
+            ]),
+        )]);
+        let q = "UNWIND $rows AS r CREATE (:User {id: r.id, email: r.email})";
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before, "a refused statement appended");
+        for key in ["u1", "u2", "u3", "u4"] {
+            assert!(!db.has_node(key), "{key} was written");
+        }
+        // Two rows of one statement that share a value are refused too.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("v1", "same@x"), row("v2", "same@x")]),
+        )]);
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before);
+        // Rows that are distinct commit as one frame.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("w1", "w1@x"), row("w2", "w2@x")]),
+        )]);
+        db.query_write(q, &params).unwrap();
+        assert!(db.has_node("w1") && db.has_node("w2"));
+    }
 }
