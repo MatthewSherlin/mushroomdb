@@ -89,6 +89,13 @@ describe.skipIf(NO_SERVER)("query", () => {
     expect(result.rows.length).toBe(1);
     expect(result.rows[0]![0]).toBe("person-01");
   });
+
+  it("returns a null list element as null, from a query without MATCH", async () => {
+    const result = await client.query("RETURN [1, null] AS l, null AS v");
+
+    expect(result.columns).toEqual(["l", "v"]);
+    expect(result.rows).toEqual([[[1, null], null]]);
+  });
 });
 
 // ---------------------------------------------------------------------------

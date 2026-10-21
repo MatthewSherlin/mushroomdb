@@ -624,10 +624,14 @@ fn run_serve(
                 .apply_schema(&mushroomdb::memory_schema::memory_defaults())
                 .map_err(|e| e.to_string())?;
         }
+        // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
+        // for the life of the server: dropping the sender stops the worker.
+        let backup = start_backup(&db, &db_dir)?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
+            let backup_tx = backup.as_ref().map(|(tx, _)| tx.clone());
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -642,7 +646,13 @@ fn run_serve(
                     let taken =
                         tokio::task::spawn_blocking(move || cli::snapshot_shared(&db_snap)).await;
                     match taken {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            // Upload it now rather than at the worker's next
+                            // tick.
+                            if let Some(tx) = &backup_tx {
+                                let _ = tx.send(backup::BackupTrigger::Snapshot);
+                            }
+                        }
                         Ok(Err(GraphError::Busy { .. })) => {
                             eprintln!(
                                 "snapshot-every skipped: another process holds the write lock"
@@ -854,6 +864,36 @@ fn run_serve(
             }
         }
     })
+}
+
+/// The backup worker and the sender that drives it, or `None` when
+/// `MUSHROOMDB_BACKUP_S3_URL` is unset.
+type RunningBackup = (
+    tokio::sync::watch::Sender<backup::BackupTrigger>,
+    backup::BackupHandle,
+);
+
+/// Start the backup worker when the environment configures one.
+///
+/// A configuration that is set but malformed refuses to start the server: a
+/// typo must not quietly leave a store without the backup its operator asked
+/// for. The worker itself never stops the server — its failures are retried
+/// and counted on the handle.
+fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<RunningBackup>, String> {
+    let Some(config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let store = backup::build_store(&config).map_err(|e| e.to_string())?;
+    let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
+    let handle = backup::BackupWorker::spawn(
+        config,
+        store,
+        std::sync::Arc::new(db.clone()),
+        db_dir.to_path_buf(),
+        rx,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some((tx, handle)))
 }
 
 async fn shutdown_signal() {

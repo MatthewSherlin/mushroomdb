@@ -7089,3 +7089,23 @@ async fn cors_preflight_needs_no_token_but_actual_request_does() {
         "https://app.example"
     );
 }
+
+/// QL-17: a null list element is JSON `null` inside the array, and a query
+/// may begin with RETURN.
+#[tokio::test]
+async fn query_json_renders_a_null_list_element_as_null() {
+    let (app, _db) = open("query-null-element");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "RETURN [1, null] AS l, {a: null} AS m, null AS v"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["l", "m", "v"]));
+    assert_eq!(v["rows"], json!([[[1, null], {"a": null}, null]]));
+}

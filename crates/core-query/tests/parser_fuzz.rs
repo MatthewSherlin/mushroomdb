@@ -51,7 +51,23 @@ const VALID: &[&str] = &[
      RETURN a, r.since AS since, b.name \
      ORDER BY since DESC, b.name ASC \
      SKIP 1 LIMIT 5",
+    // list + map literals: null element, backtick key with a space, nesting
+    "MATCH (n) RETURN [1, null, n.x] AS l, {`a b`: 1, k: [2, {c: null}]} AS m",
+    // query without MATCH: UNWIND first, null element
+    "UNWIND [1, null, 3] AS x RETURN x",
+    // query without MATCH: RETURN first; `null` as a backtick-quoted key
+    "RETURN {`null`: null, `x``y`: [true, false]} AS m, null AS v",
 ];
+
+/// An identifier as source text: bare when it lexes back to itself, otherwise
+/// backtick-quoted (a doubled backtick is one literal backtick).
+fn render_ident(s: &str) -> String {
+    if matches!(lex(s).as_deref(), Ok([Tok::Ident(back)]) if back == s) {
+        s.to_string()
+    } else {
+        format!("`{}`", s.replace('`', "``"))
+    }
+}
 
 fn render_tok(t: &Tok) -> String {
     match t {
@@ -68,7 +84,7 @@ fn render_tok(t: &Tok) -> String {
         Tok::Not => "NOT".into(),
         Tok::Asc => "ASC".into(),
         Tok::Desc => "DESC".into(),
-        Tok::Ident(s) => s.clone(),
+        Tok::Ident(s) => render_ident(s),
         Tok::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
         Tok::Int(n) => n.to_string(),
         Tok::Float(f) => f.to_string(),
@@ -256,6 +272,18 @@ fn valid_pool_has_at_least_ten_and_each_parses() {
     for src in VALID {
         let toks = lex(src).unwrap_or_else(|e| panic!("VALID query must lex: {src:?}: {e}"));
         parse(&toks).unwrap_or_else(|e| panic!("VALID query must parse: {src:?}: {e}"));
+    }
+}
+
+#[test]
+fn rendered_tokens_lex_back_to_the_same_tokens() {
+    // A backtick-quoted name (`a b`, `null`) must survive render + lex, or
+    // the mutation block would fuzz a different query than it names.
+    for src in VALID {
+        let toks = lex(src).expect("VALID query must lex");
+        let rendered: Vec<String> = toks.iter().map(render_tok).collect();
+        let back = lex(&rendered.join(" ")).expect("rendered query must lex");
+        assert_eq!(back, toks, "{src}");
     }
 }
 

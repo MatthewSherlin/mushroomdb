@@ -102,3 +102,12 @@ describe("narrowing helpers", () => {
     expect(binaryBytes({ $binary: "AA==" })).toEqual(Uint8Array.from([0]));
   });
 });
+
+describe("a null list element", () => {
+  it("is a CellValue and narrows to no tagged type", () => {
+    const row: CellValue = [1, null];
+    expect(row).toEqual([1, null]);
+    expect(asDate(null)).toBeUndefined();
+    expect(asBinary(null)).toBeUndefined();
+  });
+});

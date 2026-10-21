@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// A property or query value.
+///
+/// # Serde tags are a storage format
+///
+/// bincode encodes a variant by its declaration index, and the WAL, the
+/// mixed-column blob and snapshots all store `Value` that way. A variant is
+/// therefore only ever **added**, never reordered or removed, and a new storable
+/// variant goes **before `Null`**, which is always last. The index of every
+/// variant is pinned by `types::tests::value_serde_tags_are_pinned`; changing
+/// it means changing that test deliberately.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Int(i64),
@@ -39,6 +49,39 @@ pub enum Value {
     },
     /// Byte blob, no encoding assumed. JSON form `{"$binary": "<base64>"}`.
     Binary(Vec<u8>),
+    /// Null as an element of a list or a value of a map, produced only by
+    /// query evaluation (`[1, null]`, `{a: n.missing}`). A top-level query
+    /// null is still `Option<Value>::None`.
+    ///
+    /// Query-only: it is never stored. The write path refuses a property
+    /// value that holds one, and the WAL frame and column encoders refuse it
+    /// again as a backstop. It serialises like any unit variant (bincode tag =
+    /// its index; serde JSON `"Null"`), so a query result carrying it can be
+    /// sent anywhere a `Value` can.
+    ///
+    /// **Must stay the last variant.** Add new variants above it.
+    Null,
+}
+
+impl Value {
+    /// True if this value is [`Value::Null`] or holds one at any depth. A
+    /// write path refuses such a value: a stored property can never be null.
+    pub fn contains_null(&self) -> bool {
+        match self {
+            Value::Null => true,
+            Value::List(items) => items.iter().any(Value::contains_null),
+            Value::Map(map) => map.values().any(Value::contains_null),
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Bool(_)
+            | Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Duration { .. }
+            | Value::Binary(_) => false,
+        }
+    }
 }
 
 /// Largest accepted [`Value::Binary`] payload: 1 MiB.
@@ -76,6 +119,7 @@ impl ValueKey {
             // A duration is not totally ordered (a month against 30 days is
             // indeterminate), so it has no index key.
             Value::Duration { .. } => None,
+            Value::Null => None,
         }
     }
 }
@@ -96,6 +140,7 @@ pub fn v11_only_type(v: &Value) -> Option<&'static str> {
         Value::DateTime { .. } => Some("DateTime"),
         Value::Duration { .. } => Some("Duration"),
         Value::Binary(_) => Some("Binary"),
+        Value::Null => None,
     }
 }
 
@@ -620,7 +665,8 @@ pub fn tagged_text(v: &Value) -> std::result::Result<Option<(&'static str, Strin
         | Value::Str(_)
         | Value::Bool(_)
         | Value::List(_)
-        | Value::Map(_) => return Ok(None),
+        | Value::Map(_)
+        | Value::Null => return Ok(None),
         Value::Date(days) => (TAG_DATE, date_to_iso8601(*days)),
         Value::LocalDateTime(us) => (TAG_LOCAL_DATETIME, local_datetime_to_iso8601(*us)),
         Value::DateTime {
@@ -1090,6 +1136,64 @@ impl From<std::io::Error> for GraphError {
 
 pub type Result<T> = std::result::Result<T, GraphError>;
 
+/// One value of every variant, for tests that pin or round-trip the encoding.
+#[cfg(test)]
+pub(crate) mod pinned {
+    use super::Value;
+    use std::collections::BTreeMap;
+
+    /// The serde variant index of `v`. Exhaustive on purpose: a new variant
+    /// does not compile until it is given its index here.
+    pub(crate) fn index(v: &Value) -> u32 {
+        match v {
+            Value::Int(_) => 0,
+            Value::Float(_) => 1,
+            Value::Str(_) => 2,
+            Value::Bool(_) => 3,
+            Value::List(_) => 4,
+            Value::Map(_) => 5,
+            Value::Date(_) => 6,
+            Value::LocalDateTime(_) => 7,
+            Value::DateTime { .. } => 8,
+            Value::Duration { .. } => 9,
+            Value::Binary(_) => 10,
+            Value::Null => 11,
+        }
+    }
+
+    /// One value of every variant but `Null`, in index order: the types a
+    /// store can hold (the five format-V11 types once V11 lands).
+    pub(crate) fn storable_values() -> Vec<Value> {
+        vec![
+            Value::Int(-7),
+            Value::Float(1.5),
+            Value::Str("s".into()),
+            Value::Bool(true),
+            Value::List(vec![Value::Int(1), Value::Str("x".into())]),
+            Value::Map(BTreeMap::from([("k".to_string(), Value::Int(2))])),
+            Value::Date(19_737),
+            Value::LocalDateTime(1_705_322_096_789_012),
+            Value::DateTime {
+                micros_utc: 1_705_302_296_789_012,
+                offset_seconds: 19_800,
+            },
+            Value::Duration {
+                months: 14,
+                days: 3,
+                nanos: 14_706_789_000_000,
+            },
+            Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        ]
+    }
+
+    /// Every variant, in index order.
+    pub(crate) fn all_values() -> Vec<Value> {
+        let mut out = storable_values();
+        out.push(Value::Null);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1227,46 @@ mod tests {
             bincode::serialize(&Value::Int(7)).unwrap(),
             vec![0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn value_serde_tags_are_pinned() {
+        let all = pinned::all_values();
+        // Every index from 0 to the last is used exactly once, in order, and
+        // Null holds the last one.
+        let indices: Vec<u32> = all.iter().map(pinned::index).collect();
+        assert_eq!(indices, (0..all.len() as u32).collect::<Vec<_>>());
+        assert_eq!(pinned::index(&Value::Null), all.len() as u32 - 1);
+        for v in &all {
+            // bincode: a little-endian u32 variant index, then the payload.
+            let bytes = bincode::serialize(v).unwrap();
+            assert_eq!(bytes[..4], pinned::index(v).to_le_bytes(), "{v:?}");
+            let back: Value = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(&back, v);
+        }
+        // The serde JSON form (external tagging, as `/subscribe` rows carry
+        // it) is pinned in core-api, which depends on serde_json.
+        // The exact bytes of the stored scalars did not move.
+        assert_eq!(
+            bincode::serialize(&Value::Bool(true)).unwrap(),
+            vec![3, 0, 0, 0, 1]
+        );
+        assert_eq!(bincode::serialize(&Value::Null).unwrap(), vec![11, 0, 0, 0]);
+        assert_eq!(
+            bincode::serialize(&Value::Date(1)).unwrap(),
+            vec![6, 0, 0, 0, 1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn contains_null_looks_at_every_depth() {
+        assert!(Value::Null.contains_null());
+        assert!(Value::List(vec![Value::Int(1), Value::Null]).contains_null());
+        let inner: BTreeMap<String, Value> =
+            [("b".to_string(), Value::List(vec![Value::Null]))].into();
+        assert!(Value::List(vec![Value::Map(inner)]).contains_null());
+        assert!(!Value::List(vec![Value::Int(1), Value::List(vec![])]).contains_null());
+        assert!(!Value::Str("null".into()).contains_null());
     }
 
     #[test]

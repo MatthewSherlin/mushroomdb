@@ -1,4 +1,4 @@
-use crate::value_ops::values_equal;
+use crate::value_ops::equality;
 use core_storage::Value;
 use std::cmp::Ordering;
 
@@ -38,10 +38,14 @@ fn is_orderable_pair(lhs: &Value, rhs: &Value) -> bool {
     )
 }
 
+/// A comparison that is true. openCypher's null result (a `Value::Null`
+/// operand, or a list or map whose equality is unknown because of a null
+/// element) is `false`, as a WHERE reads it: the row is dropped for every
+/// operator, `<>` included.
 pub fn eval_cmp(op: &CmpOp, lhs: &Value, rhs: &Value) -> bool {
     match op {
-        CmpOp::Eq => values_equal(lhs, rhs),
-        CmpOp::Ne => !values_equal(lhs, rhs),
+        CmpOp::Eq => equality(lhs, rhs) == Some(true),
+        CmpOp::Ne => equality(lhs, rhs) == Some(false),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
             if !is_orderable_pair(lhs, rhs) {
                 return false;

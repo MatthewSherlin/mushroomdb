@@ -10,6 +10,7 @@
 pub mod hello;
 pub mod reset;
 pub mod route;
+pub mod run;
 
 use crate::error::BoltError;
 use crate::packstream::{self, PackStruct, PackValue};
@@ -26,6 +27,7 @@ pub const TAG_PULL: u8 = 0x3F;
 pub const TAG_ROUTE: u8 = 0x66;
 
 pub const TAG_SUCCESS: u8 = 0x70;
+pub const TAG_RECORD: u8 = 0x71;
 pub const TAG_IGNORED: u8 = 0x7E;
 pub const TAG_FAILURE: u8 = 0x7F;
 
@@ -121,6 +123,8 @@ impl ClientMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
     Success(Vec<(String, PackValue)>),
+    /// One row of a result: the values, in field order.
+    Record(Vec<PackValue>),
     Failure(BoltError),
     Ignored,
 }
@@ -150,6 +154,7 @@ impl ServerMessage {
                 TAG_SUCCESS,
                 vec![PackValue::Map(meta.clone())],
             )),
+            ServerMessage::Record(values) => run::record_struct(values.clone()),
             ServerMessage::Ignored => PackValue::Struct(PackStruct::new(TAG_IGNORED, vec![])),
             ServerMessage::Failure(err) => PackValue::Struct(PackStruct::new(
                 TAG_FAILURE,

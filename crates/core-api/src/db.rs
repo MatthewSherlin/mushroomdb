@@ -1,3 +1,4 @@
+use crate::durable_wal::{DurableWal, WalPosition};
 use crate::ingest::{IngestOptions, IngestReport};
 use crate::roles::{PropPredicate, RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
@@ -22,7 +23,7 @@ use core_storage::v8::encode::{
     archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
-use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::wal::{decode_all, encode_record, try_encode_record, WalRecord};
 use core_storage::EdgePropsView;
 use core_storage::{
     namespace_of_value, ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result,
@@ -950,10 +951,12 @@ fn eval_set_return_operand<F: Fs>(
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
     match op {
+        // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
+        Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
         Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
             detail: format!("missing parameter `{name}`"),
-        }).map(Some),
+        }).map(core_query::value_ops::element),
         Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
             detail: format!(
                 "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
@@ -1004,36 +1007,44 @@ fn eval_set_return_operand<F: Fs>(
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
             Ok(core_query::value_ops::index_list(base_val, idx_val))
         }
+        // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item, params)? {
-                    Some(v) => out.push(v),
-                    None => return Err(literal_null_error()),
-                }
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, item, params)?;
+                out.push(core_query::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
         }
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, value, params)? {
-                    Some(v) => {
-                        out.insert(key.clone(), v);
-                    }
-                    None => return Err(literal_null_error()),
-                }
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, value, params)?;
+                out.insert(key.clone(), core_query::value_ops::into_element(v));
             }
             Ok(Some(Value::Map(out)))
         }
     }
 }
 
-/// `Value` has no null variant, so a list or map literal cannot hold one.
-fn literal_null_error() -> GraphError {
-    GraphError::QueryError {
-        detail: "a list or map literal cannot contain null (an element evaluated to null)".into(),
+/// The start of the error a write gets when a property value holds a null.
+const NULL_PROPERTY_ERROR: &str = "a property value cannot contain null";
+
+/// A stored property is never null, at any depth: `[1, null]` and
+/// `{a: null}` exist only as query results. Checked on the dense-rewrite
+/// seam every node insert and property write passes through (contract C2),
+/// before anything reaches the WAL. Storing a list or map property that holds
+/// a null is not supported in 0.10.
+fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
+    if value.contains_null() {
+        return Err(GraphError::QueryError {
+            detail: format!(
+                "{NULL_PROPERTY_ERROR}: property `{field}` of node `{key}` holds a null \
+                 (a list or map property with a null element cannot be stored)"
+            ),
+        });
     }
+    Ok(())
 }
 
 fn eval_set_return_expr<F: Fs>(
@@ -1096,6 +1107,7 @@ fn eval_set_return_expr<F: Fs>(
                     | Value::DateTime { .. }
                     | Value::Duration { .. },
                 ) => true,
+                Some(Value::Null) => false,
             })
         }
         Expr::IsNull(op) => {
@@ -1912,10 +1924,21 @@ pub struct GraphDb<F: Fs> {
     /// the same appends advance both, one in frames and one in bytes — so the
     /// two are seeded and rewound at exactly the same places. Keep it that way.
     wal_frames_written: u64,
+    /// How much of the live WAL is known fsynced, for readers outside the
+    /// engine (the backup worker). Set right after each successful WAL fsync
+    /// and when a snapshot replaces `wal.bin`; never read by the engine
+    /// itself. Shared, so a [`SharedDb`](crate::SharedDb) reads it without
+    /// taking the handle's lock. See [`WalPosition`].
+    durable_wal: DurableWal,
     /// Identity of the snapshot this handle's base state came from, as
     /// `(len, mtime_nanos)`. A different value means another process replaced
     /// the snapshot and the WAL no longer continues our state: refresh reloads.
     snapshot_ident: Option<(u64, u64)>,
+    /// Identity of the `wal.bin` file this handle's cursor describes
+    /// ([`Fs::wal_ident`]). A different file under the name — another
+    /// process's snapshot replaced it — makes [`refresh`](GraphDb::refresh)
+    /// reload, even when the new file is longer than the cursor.
+    wal_ident: Option<u64>,
     /// The options this handle was opened with. Replayed verbatim when
     /// `refresh` has to rebuild from disk.
     open_opts: OpenOptions,
@@ -2573,7 +2596,9 @@ impl<F: Fs> GraphDb<F> {
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
             wal_frames_written: 0,
+            durable_wal: DurableWal::default(),
             snapshot_ident: None,
+            wal_ident: None,
             open_opts: opts,
             holds_lifetime_lock: false,
             lock_denied: false,
@@ -2647,6 +2672,7 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = 0;
         self.wal_frames_written = 0;
         self.snapshot_ident = None;
+        self.wal_ident = None;
         self.base_edge_count_from_rows = None;
     }
 
@@ -2773,6 +2799,9 @@ impl<F: Fs> GraphDb<F> {
         if let Some(&max_seq) = db.last_change.values().max() {
             db.commit_seq = db.commit_seq.max(max_seq);
         }
+        // Taken before the read: a file replaced between the two then reads
+        // as a different identity later, which reloads — the safe direction.
+        db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         // The valid prefix is replayed either way; `repair_wal` only decides
@@ -2780,6 +2809,7 @@ impl<F: Fs> GraphDb<F> {
         // appender must not persist a truncation the writer never asked for.
         if valid_len < bytes.len() && repair_wal {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+            db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
@@ -2912,6 +2942,15 @@ impl<F: Fs> GraphDb<F> {
         // every open, and costs nothing on a store that has never archived.
         db.wal_frames_written = db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
         db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
+        // What was just replayed is not this handle's fsync to vouch for: a
+        // reader of the durable position fsyncs it once before counting it.
+        db.durable_wal.loaded(
+            db.snapshot_ident,
+            db.wal_ident,
+            db.wal_frames_written - decoded_frames,
+            db.wal_consumed,
+            db.wal_frames_written,
+        );
         trace_open!("wal replay done", _t0);
         // Rebuild view values after WAL replay only when there is no V8 base.
         // With a V8 base, view values are correct in the snapshot and are updated
@@ -3136,16 +3175,45 @@ impl<F: Fs> GraphDb<F> {
     /// the handle must be reopened. Nothing on disk was damaged — the store
     /// itself is fine, and a fresh open recovers it.
     pub fn refresh(&mut self) -> Result<u64> {
+        self.refresh_checking(false)
+    }
+
+    /// [`refresh`](GraphDb::refresh), with `before_append` set when a write
+    /// scope is about to append at this handle's cursor.
+    ///
+    /// The case the WAL file's identity catches: the file was replaced while
+    /// the snapshot this handle already saw stayed — it reloaded while another
+    /// process was between writing its snapshot and replacing the WAL. Its
+    /// cursor describes the old file. A tail read at that offset in the new
+    /// one would apply frames that are not the next ones; an append there
+    /// would write frames encoded against the wrong state, and the store would
+    /// no longer open.
+    ///
+    /// A read follows a tail only when the WAL is longer than the cursor, so a
+    /// read-only refresh checks the identity only then. An append happens at
+    /// any length — a replacement of exactly the cursor's length included,
+    /// which no length check can see — so before an append it is always
+    /// checked: one stat per cross-process write scope.
+    fn refresh_checking(&mut self, before_append: bool) -> Result<u64> {
         if self.pinned {
             return Ok(0);
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
-        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed {
+        let wal_replaced = || -> Result<bool> {
+            Ok((before_append || wal_len > self.wal_consumed)
+                && self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident)
+        };
+        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
             // The WAL no longer continues our state: rebuild from disk. State
             // is cleared first, so a failed load leaves an empty handle — mark
             // it degraded rather than let a caller read an empty graph as if
             // it were the store's contents.
+            //
+            // The WAL this handle was reading is not the one on disk any more,
+            // so the durable position starts a new generation; what a peer
+            // fsynced is not this handle's to vouch for.
+            self.durable_wal.replaced();
             self.reset_for_reload();
             return match self.load_from_disk(LoadOrigin::Reload) {
                 Ok(frames) => Ok(frames as u64),
@@ -3179,6 +3247,10 @@ impl<F: Fs> GraphDb<F> {
         // incomplete trailing frame stays unconsumed for the next refresh.
         self.wal_consumed += valid_len as u64;
         self.wal_frames_written += decoded_frames;
+        // Another process wrote these frames; whether it fsynced them is not
+        // this handle's to say.
+        self.durable_wal
+            .absorbed(self.wal_consumed, self.wal_frames_written);
         // The peer that wrote those frames also stamped them. Absorbing the
         // frames without the stamps leaves this handle resolving dates from a
         // prefix of the store's history, and — while our own map is still
@@ -3207,6 +3279,34 @@ impl<F: Fs> GraphDb<F> {
     /// failed group off the tail, so the cursor still describes the file.
     pub(crate) fn set_wal_consumed(&mut self, len: u64) {
         self.wal_consumed = len;
+    }
+
+    /// The global frame index the next appended frame will occupy. The frame
+    /// twin of [`wal_consumed`](GraphDb::wal_consumed).
+    pub(crate) fn wal_frames_written(&self) -> u64 {
+        self.wal_frames_written
+    }
+
+    /// How much of the live WAL is known to be on stable storage — only bytes
+    /// an fsync has covered, ending on a frame boundary. See [`WalPosition`].
+    ///
+    /// Under [`FsyncPolicy::Relaxed`] nothing is fsynced between snapshots, so
+    /// the position advances only when a snapshot replaces the WAL; under
+    /// [`FsyncPolicy::Batched`] it advances at the next batch fsync.
+    pub fn durable_wal_position(&self) -> WalPosition {
+        self.durable_wal.get()
+    }
+
+    /// The shared cell behind [`durable_wal_position`](GraphDb::durable_wal_position),
+    /// for a [`SharedDb`](crate::SharedDb) to read without the handle's lock.
+    pub(crate) fn durable_wal(&self) -> DurableWal {
+        self.durable_wal.clone()
+    }
+
+    /// Record that everything this handle has appended is now fsynced.
+    fn note_wal_synced(&self) {
+        self.durable_wal
+            .synced(self.wal_consumed, self.wal_frames_written);
     }
 
     /// One non-blocking attempt at the cross-process write lock.
@@ -3265,7 +3365,7 @@ impl<F: Fs> GraphDb<F> {
         if !acquired || self.holds_lifetime_lock {
             return Ok(());
         }
-        if let Err(e) = self.refresh() {
+        if let Err(e) = self.refresh_checking(true) {
             // Do not hold a lock we cannot use: release it and let the caller
             // see the underlying failure.
             let _ = self.fs.unlock();
@@ -5470,6 +5570,9 @@ impl<F: Fs> GraphDb<F> {
             };
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
+                    for (field, value) in &props {
+                        refuse_null_property(&key, field, value)?;
+                    }
                     // Namespace validation and normalisation, on the one seam
                     // every user-visible node insert passes through: insert_node,
                     // a batch, ingest, Cypher CREATE and MERGE all arrive here
@@ -5501,6 +5604,7 @@ impl<F: Fs> GraphDb<F> {
                     });
                 }
                 WalRecord::SetProp { key, field, value } => {
+                    refuse_null_property(&key, &field, &value)?;
                     // A namespace is set at insert and fixed after: the write is
                     // refused when it would move the node, and dropped when it
                     // names the namespace the node is already in. Checked here
@@ -6251,14 +6355,24 @@ impl<F: Fs> GraphDb<F> {
             self.v11_unlocked || v11_refusal(&rec).is_none(),
             "a format-V11 value or record reached the WAL append without the dense rewrite"
         );
-        let frame = encode_record(&rec);
+        // Fallible only for a record that carries a null property value, which
+        // `rewrite_wal_dense` has already refused; nothing is appended then.
+        let frame = try_encode_record(&rec)?;
         self.fs.append(FileId::Wal, &frame)?;
+        // The first append to a store with no WAL creates the file: learn
+        // which one it is. One stat, once (where a file identity exists).
+        if cfg!(unix) && self.wal_ident.is_none() {
+            self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+            self.durable_wal
+                .snapshot_is(self.snapshot_ident, self.wal_ident);
+        }
         // The cursor advances by exactly the bytes appended: these frames are
         // ours and already applied, so a later refresh must not replay them.
         self.wal_consumed += frame.len() as u64;
         self.wal_frames_written += 1;
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
+            self.note_wal_synced();
         }
         // Marker writing always needs the engine deltas, but the engine only
         // accumulates them when emit_deltas is true (normally gated on subscribers
@@ -7703,10 +7817,15 @@ impl<F: Fs> GraphDb<F> {
         }
         let any_ok = results.iter().any(|r| r.is_ok());
         let sync_err = if self.fsync != FsyncPolicy::Relaxed && any_ok {
-            self.fs
+            let r = self
+                .fs
                 .sync(core_storage::fs::FileId::Wal)
                 .map_err(GraphError::Io)
-                .err()
+                .err();
+            if r.is_none() {
+                self.note_wal_synced();
+            }
+            r
         } else {
             None
         };
@@ -15189,6 +15308,11 @@ impl<F: Fs> GraphDb<F> {
         if self.lock_denied {
             return Err(GraphError::Busy { holder: None });
         }
+        // From here `snapshot.bin` and `wal.bin` may be between states on disk.
+        // A reader outside the engine pairing the two (the backup worker) waits
+        // until the mark drops, on every exit from this function.
+        let _snapshot_mark = self.durable_wal.begin_snapshot();
+        let generation_at_start = self.durable_wal.get().generation;
         // Capture whether snapshot.bin already existed BEFORE this snapshot write.
         // Used by the archive path's conservative genesis-chain check: if a prior
         // snapshot exists but wal.truncated does not, we cannot distinguish a
@@ -15638,6 +15762,7 @@ impl<F: Fs> GraphDb<F> {
             stopped(SnapshotStop::BeforeWalReplacement)?;
             if nothing_to_archive {
                 if live_wal_bytes_for_name != baseline_wal {
+                    self.durable_wal.replaced();
                     self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
                 }
             } else {
@@ -15652,6 +15777,7 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     });
                 }
+                self.durable_wal.replaced();
                 self.fs.archive_wal(archive_n)?;
 
                 // The replacement WAL goes in **immediately**, with no fallible call
@@ -15821,6 +15947,7 @@ impl<F: Fs> GraphDb<F> {
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
             stopped(SnapshotStop::BeforeWalReplacement)?;
+            self.durable_wal.replaced();
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
             // Every archive now ends at or below the floor. They are the
             // history this snapshot was asked to discard; removing them here is
@@ -15865,6 +15992,14 @@ impl<F: Fs> GraphDb<F> {
         // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+        self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+        self.durable_wal
+            .snapshot_is(self.snapshot_ident, self.wal_ident);
+        // A replacement WAL went in through `write_atomic`, which fsyncs it:
+        // all of it is durable.
+        if self.durable_wal.get().generation != generation_at_start {
+            self.note_wal_synced();
+        }
         Ok(())
     }
 }
