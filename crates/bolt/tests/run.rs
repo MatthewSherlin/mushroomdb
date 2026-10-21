@@ -586,6 +586,98 @@ fn a_role_token_with_no_role_definition_is_unauthorized_for_reads_and_writes() {
     assert_eq!(count_in(&db, "X"), Value::Int(0));
 }
 
+/// A `$rows` parameter: a list of `{id, name}` maps.
+fn rows_parameter(ids: &[&str]) -> PackValue {
+    PackValue::List(
+        ids.iter()
+            .map(|id| {
+                PackValue::Map(vec![
+                    ("id".into(), s(id)),
+                    ("name".into(), s(&format!("name-{id}"))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn unwind_create_with_a_list_parameter_writes_every_row_in_one_commit() {
+    let (db, _dir) = open_db("unwind-create");
+    let mut conn = connected(&db, FULL);
+    let message = ClientMessage::Other(
+        MessageKind::Run,
+        vec![
+            s("UNWIND $rows AS r CREATE (:Person {id: r.id, name: r.name})"),
+            PackValue::Map(vec![("rows".into(), rows_parameter(&["a", "b", "c"]))]),
+            PackValue::Map(vec![]),
+        ],
+    );
+    let out = conn.handle(message);
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{out:?}"
+    );
+    let out = conn.handle(pull(-1));
+    let (_, end) = rows_and_end(&out);
+    assert_eq!(get(meta(end), "type"), Some(&s("w")));
+    assert_eq!(
+        get(meta(end), "bookmark"),
+        Some(&s("mushroomdb:commit:1")),
+        "the three rows are one commit"
+    );
+    assert_eq!(count_rows(&mut conn, "MATCH (n:Person) RETURN COUNT(n)"), 3);
+    let seen = db
+        .reader()
+        .query(
+            "MATCH (n:Person {id: 'b'}) RETURN n.name AS name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(seen.get(0, "name"), Some(&Value::Str("name-b".into())));
+}
+
+#[test]
+fn unwind_create_that_fails_on_a_later_row_writes_nothing() {
+    let (db, _dir) = open_db("unwind-create-fails");
+    let mut conn = connected(&db, FULL);
+    let message = ClientMessage::Other(
+        MessageKind::Run,
+        vec![
+            s("UNWIND $rows AS r CREATE (:Person {id: r.id})"),
+            PackValue::Map(vec![("rows".into(), rows_parameter(&["a", "b", "a"]))]),
+            PackValue::Map(vec![]),
+        ],
+    );
+    let out = conn.handle(message);
+    let failed = matches!(out.last(), Some(ServerMessage::Failure(_)))
+        || matches!(
+            conn.handle(pull(-1)).last(),
+            Some(ServerMessage::Failure(_))
+        );
+    assert!(failed, "a duplicate key fails the statement");
+    conn.handle(ClientMessage::Reset);
+    assert_eq!(count_rows(&mut conn, "MATCH (n:Person) RETURN COUNT(n)"), 0);
+}
+
+#[test]
+fn unwind_create_inside_a_bolt_transaction_is_a_named_failure() {
+    let (db, _dir) = open_db("unwind-create-tx");
+    let mut conn = in_tx(&db, FULL);
+    let message = ClientMessage::Other(
+        MessageKind::Run,
+        vec![
+            s("UNWIND $rows AS r CREATE (:Person {id: r.id})"),
+            PackValue::Map(vec![("rows".into(), rows_parameter(&["a"]))]),
+            PackValue::Map(vec![]),
+        ],
+    );
+    let out = conn.handle(message);
+    assert!(
+        matches!(out.last(), Some(ServerMessage::Failure(_))),
+        "{out:?}"
+    );
+}
+
 // -------------------------------------------------------- in a transaction
 
 fn in_tx(db: &SharedDb, token: &str) -> Connection {

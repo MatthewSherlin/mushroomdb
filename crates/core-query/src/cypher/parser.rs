@@ -2,10 +2,15 @@
 
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
-    OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
-    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
+    MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
+    UnwindExpr, WithStage, WriteStatement,
 };
+/// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
+/// is the merge (`+=`) form, and the map's entries.
+type SetMapClause = (String, bool, Vec<(String, Operand)>, Option<String>);
+
 use super::Tok;
 use crate::filter::CmpOp;
 use core_storage::{Value, NS_PROP};
@@ -86,9 +91,37 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
 pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
-        Some(Tok::Match) => tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)),
+        Some(Tok::Match) => {
+            tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)) || has_remove_clause(tokens)
+        }
+        // `UNWIND … CREATE|MERGE|SET|DELETE|REMOVE …`: a write when any write
+        // clause follows; `UNWIND … RETURN` stays a read.
+        Some(Tok::Unwind) => {
+            tokens.iter().any(|t| {
+                matches!(
+                    t,
+                    Tok::Create | Tok::Merge | Tok::Set | Tok::Delete | Tok::Detach
+                )
+            }) || has_remove_clause(tokens)
+        }
         _ => false,
     }
+}
+
+/// True if the tokens hold a `REMOVE var.field` or `REMOVE var:Label` clause.
+/// `REMOVE` is an ordinary identifier, so it counts only in clause position:
+/// followed by `name` and then `.` or `:`, and not itself a property or label
+/// name (`n.remove`, `(x:Remove)`).
+fn has_remove_clause(tokens: &[Tok]) -> bool {
+    tokens.iter().enumerate().any(|(i, tok)| {
+        kw(Some(tok), "remove")
+            && !matches!(
+                i.checked_sub(1).and_then(|j| tokens.get(j)),
+                Some(Tok::Dot | Tok::Colon)
+            )
+            && matches!(tokens.get(i + 1), Some(Tok::Ident(_)))
+            && matches!(tokens.get(i + 2), Some(Tok::Dot | Tok::Colon))
+    })
 }
 
 /// `true` or `false` in any case, as the literal it spells; `None` for any
@@ -109,6 +142,20 @@ fn bool_literal(name: &str) -> Option<bool> {
 fn is_null_literal(name: &str) -> bool {
     name.eq_ignore_ascii_case("null")
 }
+
+/// Reads a `{key: value, …}` map whose values are of type `V`.
+type PropsParser<'a, V> = fn(&mut Parser<'a>) -> Result<Vec<(String, V)>, String>;
+
+/// A parsed MERGE node pattern.
+struct MergeNode<V = Value> {
+    var: Option<String>,
+    label: String,
+    key_field: String,
+    key_value: V,
+    ns: Option<V>,
+}
+
+mod unwind_write;
 
 struct Parser<'a> {
     toks: &'a [Tok],
@@ -233,10 +280,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // WITH pipeline stages (zero or more).
+        // WITH pipeline stages (zero or more). After an UNWIND the stages may
+        // also be plain MATCH / OPTIONAL MATCH / UNWIND clauses.
         let mut stages = Vec::new();
-        while self.peek() == Some(&Tok::With) {
-            stages.push(self.with_stage()?);
+        if unwinds.is_empty() {
+            while self.peek() == Some(&Tok::With) {
+                stages.push(self.with_stage()?);
+            }
+        } else {
+            let mut scope = unwind_write::Scope::default();
+            scope.bind_clauses(&matches, &optional_clauses, &unwinds);
+            self.stages_after_unwind(&mut scope, &mut stages)?;
         }
         let (distinct, returns) = self.return_clause()?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
@@ -362,6 +416,34 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let (matches, optional_clauses, stage_unwinds, post_where) = self.with_stage_tail()?;
+        Ok(WithStage {
+            items,
+            where_expr,
+            order_by,
+            skip,
+            limit,
+            matches,
+            optional_clauses,
+            unwinds: stage_unwinds,
+            post_where,
+        })
+    }
+
+    /// The clauses that may follow a WITH (or an UNWIND): `MATCH`es, then
+    /// `OPTIONAL MATCH`es, then `UNWIND`s, then one `WHERE` over all of them.
+    #[allow(clippy::type_complexity)]
+    fn with_stage_tail(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<Pattern>,
+            Vec<OptionalClause>,
+            Vec<UnwindClause>,
+            Option<Expr>,
+        ),
+        String,
+    > {
         // Optional MATCH clauses that follow this WITH.
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -386,17 +468,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(WithStage {
-            items,
-            where_expr,
-            order_by,
-            skip,
-            limit,
-            matches,
-            optional_clauses,
-            unwinds: stage_unwinds,
-            post_where,
-        })
+        Ok((matches, optional_clauses, stage_unwinds, post_where))
     }
 
     /// Parse `UNWIND <expr> AS <alias>`.
@@ -408,30 +480,22 @@ impl<'a> Parser<'a> {
         Ok(UnwindClause { list, alias })
     }
 
-    /// Parse the list expression in an UNWIND clause:
-    /// - `[e1, e2, …]` — list literal (any expressions as elements).
-    /// - `var.field`   — property reference.
-    /// - `var`         — bare variable (alias from a prior WITH).
+    /// Parse the list expression in an UNWIND clause: any expression that
+    /// evaluates to a list, such as `[e1, e2, …]`, `range(1, 5)`, `$items`,
+    /// `a + b`, `var.field` or a bare `var`. The plain forms keep their
+    /// dedicated variants; everything else becomes `UnwindExpr::Expr`.
     fn unwind_expr(&mut self) -> Result<UnwindExpr, String> {
-        match self.peek() {
-            Some(Tok::LBracket) => match self.arith_expr()? {
-                Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
-                other => Ok(UnwindExpr::Expr(other)),
-            },
-            Some(Tok::Ident(n)) if is_null_literal(n) => {
+        if let Some(Tok::Ident(n)) = self.peek() {
+            if is_null_literal(n) {
                 self.pos += 1;
-                Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)))
+                return Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)));
             }
-            Some(Tok::Ident(_)) => {
-                let name = self.ident("expected variable or property in UNWIND")?;
-                if self.eat(&Tok::Dot) {
-                    let field = self.ident("expected field name after '.' in UNWIND")?;
-                    Ok(UnwindExpr::Prop { var: name, field })
-                } else {
-                    Ok(UnwindExpr::Var(name))
-                }
-            }
-            _ => Err(self.err("expected list literal, property, or variable in UNWIND")),
+        }
+        match self.arith_expr()? {
+            Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
+            Operand::Prop { var, field } => Ok(UnwindExpr::Prop { var, field }),
+            Operand::Var(name) => Ok(UnwindExpr::Var(name)),
+            other => Ok(UnwindExpr::Expr(other)),
         }
     }
 
@@ -1412,8 +1476,11 @@ impl<'a> Parser<'a> {
             Some(Tok::Create) => self.create_stmt(),
             Some(Tok::Merge) => self.merge_stmt(),
             Some(Tok::Match) => self.match_write_stmt(),
-            _ => Err(self
-                .err("expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)")),
+            Some(Tok::Unwind) => self.unwind_write_stmt(),
+            _ => Err(self.err(
+                "expected CREATE, MERGE, MATCH … SET/DELETE, or UNWIND … CREATE/MERGE/SET \
+                 (write statement required)",
+            )),
         }
     }
 
@@ -1622,9 +1689,19 @@ impl<'a> Parser<'a> {
 
     // ── MERGE ─────────────────────────────────────────────────────────────────
 
-    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
-        self.expect(&Tok::Merge, "expected MERGE")?;
-        self.expect(&Tok::LParen, "expected '(' after MERGE")?;
+    /// One MERGE node pattern `(var:Label {key: 'x' [, ns: 'y']})`.
+    fn merge_node(&mut self, open_msg: &str) -> Result<MergeNode, String> {
+        self.merge_node_with(open_msg, Self::literal_props)
+    }
+
+    /// [`merge_node`](Self::merge_node) with the property values read by
+    /// `props`: literals for a plain MERGE, expressions for a per-row one.
+    fn merge_node_with<V>(
+        &mut self,
+        open_msg: &str,
+        props: PropsParser<'a, V>,
+    ) -> Result<MergeNode<V>, String> {
+        self.expect(&Tok::LParen, open_msg)?;
         // Optional var: `MERGE (n:Label {…})` — capture n for RETURN projection.
         let var = match self.peek() {
             Some(Tok::Ident(_)) => {
@@ -1647,7 +1724,7 @@ impl<'a> Parser<'a> {
                 "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
             ));
         }
-        let props = self.literal_props()?;
+        let props = props(self)?;
         let mut ns = None;
         let mut rest = Vec::new();
         for (k, v) in props {
@@ -1677,15 +1754,84 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+        let (key_field, key_value) = rest.remove(0);
+        Ok(MergeNode {
+            var,
+            label,
+            key_field,
+            key_value,
+            ns,
+        })
+    }
+
+    /// The `-[:T]->` / `<-[:T]-` of a MERGE pattern: one typed, directed,
+    /// single-hop relationship.
+    fn merge_rel(&mut self) -> Result<(Option<String>, String, RelDir), String> {
+        let rel = self.rel()?;
+        if rel.hops.is_some() {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with a variable-length relationship"
+                    .to_string(),
+            );
+        }
+        if rel.dir == RelDir::Undirected {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with an undirected relationship; \
+                 give it a direction (-[:T]-> or <-[:T]-)"
+                    .to_string(),
+            );
+        }
+        match rel.etypes.as_slice() {
+            [one] => Ok((rel.var, one.clone(), rel.dir)),
+            [] => Err("MERGE requires a relationship type (e.g., -[:KNOWS]->)".to_string()),
+            _ => Err(
+                "not supported in mushroomdb 0.10: MERGE with alternative relationship types"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
+        self.expect(&Tok::Merge, "expected MERGE")?;
+        let start = self.merge_node("expected '(' after MERGE")?;
+        let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+            let (rel_var, etype, dir) = self.merge_rel()?;
+            let end = self.merge_node("expected '(' to start the MERGE end node")?;
+            if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+                return Err(
+                    "not supported in mushroomdb 0.10: MERGE with more than one relationship"
+                        .to_string(),
+                );
+            }
+            Some(MergeEdgePat {
+                etype,
+                dir,
+                end_label: end.label,
+                end_key_field: end.key_field,
+                end_key_value: end.key_value,
+                end_ns: end.ns,
+                end_var: end.var,
+                rel_var,
+            })
+        } else {
+            None
+        };
+        let MergeNode {
+            var,
+            label,
+            key_field,
+            key_value,
+            ns,
+        } = start;
         let mut on_create = Vec::new();
         let mut on_match = Vec::new();
         while self.eat_ident_kw("on") {
             if self.eat(&Tok::Create) {
                 self.expect(&Tok::Set, "expected SET after ON CREATE")?;
-                on_create.extend(self.set_clauses()?);
+                on_create.extend(self.merge_set_clauses()?);
             } else if self.eat(&Tok::Match) {
                 self.expect(&Tok::Set, "expected SET after ON MATCH")?;
-                on_match.extend(self.set_clauses()?);
+                on_match.extend(self.merge_set_clauses()?);
             } else {
                 return Err(self.err("expected CREATE or MATCH after ON"));
             }
@@ -1699,7 +1845,6 @@ impl<'a> Parser<'a> {
         if self.pos < self.toks.len() {
             return Err(self.unsupported_or_unexpected("unexpected tokens after MERGE"));
         }
-        let (key_field, key_value) = rest.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
             label,
             key_field,
@@ -1709,6 +1854,7 @@ impl<'a> Parser<'a> {
             on_create,
             on_match,
             returns,
+            edge,
         }))
     }
 
@@ -1731,6 +1877,27 @@ impl<'a> Parser<'a> {
         };
         // Dispatch on SET, DETACH DELETE, or DELETE.
         match self.peek() {
+            Some(Tok::Set) if self.set_map_form_ahead() => {
+                self.pos += 1; // consume SET
+                let (var, merge, map, param) = self.set_map_clause(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.return_items()?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after SET"));
+                }
+                Ok(WriteStatement::MatchSetMap(MatchSetMapStmt {
+                    matches,
+                    where_expr,
+                    merge,
+                    var,
+                    map,
+                    param,
+                    returns,
+                }))
+            }
             Some(Tok::Set) => {
                 self.pos += 1; // consume SET
                 let sets = self.set_clauses()?;
@@ -1792,10 +1959,170 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            _ if self.peek_kw("remove") => {
+                self.pos += 1; // consume REMOVE
+                let removals = self.remove_items(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.return_items()?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after REMOVE"));
+                }
+                Ok(WriteStatement::MatchRemove(MatchRemoveStmt {
+                    matches,
+                    where_expr,
+                    removals,
+                    returns,
+                }))
+            }
             _ => Err(self.err(
-                "expected SET or DELETE after MATCH [WHERE]; \
+                "expected SET, REMOVE or DELETE after MATCH [WHERE]; \
                  combined MATCH…RETURN is a read query, not a write statement",
             )),
+        }
+    }
+
+    /// True when the SET at the cursor is a map form: `SET var = …` or
+    /// `SET var += …` (a name straight after SET, then `=` or `+ =`, no `.`).
+    fn set_map_form_ahead(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+            && matches!(
+                (self.toks.get(self.pos + 2), self.toks.get(self.pos + 3)),
+                (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+            )
+    }
+
+    /// `var = {…}` or `var += {…}` after SET: the variable, whether it is the
+    /// merge form, and the map's entries. The variable must be
+    /// a node bound by `matches`; the right side must be a map literal or a
+    /// `$parameter` (another variable is refused by name); a second SET item
+    /// after the map is refused, since the forms do not mix in one clause.
+    fn set_map_clause(&mut self, matches: &[Pattern]) -> Result<SetMapClause, String> {
+        let var = self.ident("expected variable after SET")?;
+        let merge = self.eat(&Tok::Plus);
+        self.expect(&Tok::Eq, "expected '=' in SET clause")?;
+        let param = match self.peek() {
+            Some(Tok::Param(name)) => Some(name.clone()),
+            Some(Tok::LBrace) => None,
+            _ => {
+                return Err(format!(
+                    "not supported in mushroomdb 0.10: SET {var} {}= with a right side that is \
+                     neither a map literal ({{key: value, …}}) nor a $parameter",
+                    if merge { "+" } else { "" }
+                ));
+            }
+        };
+        let is_rel = matches
+            .iter()
+            .flat_map(|p| p.chain.iter())
+            .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+        let is_node = matches.iter().any(|p| {
+            p.start.var.as_deref() == Some(var.as_str())
+                || p.chain
+                    .iter()
+                    .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+        });
+        if is_rel {
+            return Err(format!(
+                "SET {var} = map: '{var}' is a relationship; the map forms work on nodes"
+            ));
+        }
+        if !is_node {
+            return Err(format!(
+                "SET {var} = map: '{var}' is not a node variable bound by MATCH"
+            ));
+        }
+        if param.is_some() {
+            self.pos += 1;
+        }
+        let map = match if param.is_some() {
+            Operand::MapLit(vec![])
+        } else {
+            self.map_literal()?
+        } {
+            Operand::Lit(Value::Map(entries)) => entries
+                .into_iter()
+                .map(|(k, v)| (k, Operand::Lit(v)))
+                .collect(),
+            Operand::MapLit(entries) => entries,
+            _ => return Err(self.err("expected a map literal after SET")),
+        };
+        if self.peek() == Some(&Tok::Comma) {
+            return Err(
+                "not supported in mushroomdb 0.10: a SET map form followed by another SET item; \
+                 use one SET clause per statement"
+                    .to_string(),
+            );
+        }
+        Ok((var, merge, map, param))
+    }
+
+    /// `var.field [, var.field …]` after REMOVE. Each `var` must be a node bound
+    /// by `matches`. A label removal (`n:Label`) is refused by name: a node has
+    /// one label in 0.10.
+    fn remove_items(&mut self, matches: &[Pattern]) -> Result<Vec<(String, String)>, String> {
+        let mut items = Vec::new();
+        loop {
+            let var = self.ident("expected variable after REMOVE")?;
+            if self.peek() == Some(&Tok::Colon) {
+                return Err(
+                    "not supported in mushroomdb 0.10: REMOVE n:Label (label removal)".to_string(),
+                );
+            }
+            self.expect(&Tok::Dot, "expected '.' after variable in REMOVE")?;
+            let field = self.ident("expected property name after '.' in REMOVE")?;
+            let is_rel = matches
+                .iter()
+                .flat_map(|p| p.chain.iter())
+                .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+            if is_rel {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is a relationship; REMOVE works on node properties"
+                ));
+            }
+            let is_node = matches.iter().any(|p| {
+                p.start.var.as_deref() == Some(var.as_str())
+                    || p.chain
+                        .iter()
+                        .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+            });
+            if !is_node {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is not a node variable bound by MATCH"
+                ));
+            }
+            items.push((var, field));
+            if !self.eat(&Tok::Comma) {
+                return Ok(items);
+            }
+        }
+    }
+
+    /// `set_clauses` for `MERGE … ON CREATE/ON MATCH SET`: the map forms
+    /// (`n = {…}`, `n += {…}`) are refused by name; MERGE takes property items.
+    fn merge_set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
+        self.merge_set_clauses_with(false)
+    }
+
+    /// [`merge_set_clauses`](Self::merge_set_clauses); `row` allows a property
+    /// or variable on the right side (the per-row form after UNWIND).
+    fn merge_set_clauses_with(&mut self, row: bool) -> Result<Vec<SetClause>, String> {
+        let mut sets = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::Ident(_)))
+                && matches!(
+                    (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+                    (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+                )
+            {
+                return Err("not supported in mushroomdb 0.10: MERGE … SET with a map".to_string());
+            }
+            sets.push(self.set_clause_with(row)?);
+            if !self.eat(&Tok::Comma) {
+                return Ok(sets);
+            }
         }
     }
 
@@ -1808,6 +2135,12 @@ impl<'a> Parser<'a> {
     }
 
     fn set_clause(&mut self) -> Result<SetClause, String> {
+        self.set_clause_with(false)
+    }
+
+    /// One `var.field = expr`. `row` is the per-row form (after UNWIND), where a
+    /// bare property or variable is a value like any other.
+    fn set_clause_with(&mut self, row: bool) -> Result<SetClause, String> {
         let var = self.ident("expected variable in SET clause")?;
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
@@ -1839,6 +2172,7 @@ impl<'a> Parser<'a> {
                     | Operand::ListComprehension { .. }
                     | Operand::Reduce { .. }
                     | Operand::Case { .. } => op,
+                    Operand::Prop { .. } | Operand::Var(_) if row => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
                             "SET RHS: bare property/variable reference is not supported; \

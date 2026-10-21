@@ -417,9 +417,14 @@ pub struct OrderItem {
 pub enum WriteStatement {
     Create(CreateStmt),
     MatchSet(MatchSetStmt),
+    MatchSetMap(MatchSetMapStmt),
+    MatchRemove(MatchRemoveStmt),
     MatchDelete(MatchDeleteStmt),
     MatchDeleteNode(MatchDeleteNodeStmt),
     Merge(MergeStmt),
+    /// `UNWIND … [MATCH|WITH …]* <write clause>+ [RETURN …]`: the write clauses
+    /// run once per row the read part produces.
+    UnwindWrite(Box<UnwindWriteStmt>),
 }
 
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
@@ -461,6 +466,41 @@ pub struct MatchSetStmt {
     pub matches: Vec<Pattern>,
     pub where_expr: Option<Expr>,
     pub sets: Vec<SetClause>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] SET var = {…} | SET var += {…} [RETURN …]`
+///
+/// `merge` is `true` for `+=` (set the listed keys, leave every other property,
+/// a null value removes that property) and `false` for `=` (the node's user
+/// properties become exactly the map; the key `id`, the namespace `ns` and view
+/// owned properties are never removed, and a null value is an absent key).
+/// `var` is a node variable bound by `matches` (the parser checks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchSetMapStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    pub merge: bool,
+    pub var: String,
+    pub map: Vec<(String, Operand)>,
+    /// `SET n = $param` / `SET n += $param`: the parameter holding the map, with
+    /// `map` empty. The parameter must be a `Value::Map` at execution time.
+    pub param: Option<String>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] REMOVE var.field [, …] [RETURN …]`
+///
+/// Every `var` is a node variable bound by `matches` (the parser checks).
+/// Removing a property a node does not have is a no-op, not an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchRemoveStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    /// `(var, field)` in source order.
+    pub removals: Vec<(String, String)>,
     /// Optional RETURN clause: project matched bindings from post-write state.
     pub returns: Option<Vec<RetItem>>,
 }
@@ -540,4 +580,129 @@ pub struct MergeStmt {
     pub on_match: Vec<SetClause>,
     /// Optional RETURN clause: project the node after commit.
     pub returns: Option<Vec<RetItem>>,
+    /// `Some` for `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})`: the one
+    /// relationship and its end node. The fields above describe the start node.
+    pub edge: Option<MergeEdgePat>,
+}
+
+/// The relationship and end node of a `MERGE (a)-[:T]->(b)` pattern. Exactly
+/// one relationship is allowed in 0.10; the start node is the `MergeStmt`'s own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeEdgePat {
+    /// The single relationship type.
+    pub etype: String,
+    /// `Right`: start -> end. `Left`: end -> start. Undirected is refused at parse time.
+    pub dir: RelDir,
+    pub end_label: String,
+    /// The end node's single identifying property.
+    pub end_key_field: String,
+    pub end_key_value: core_storage::Value,
+    /// Optional `ns` named on the end node, as `MergeStmt::ns` is for the start.
+    pub end_ns: Option<core_storage::Value>,
+    /// Bound variable of the end node (`ON … SET b.x = …`, `RETURN b`).
+    pub end_var: Option<String>,
+    /// Bound variable of the relationship (`RETURN r`); it takes no SET.
+    pub rel_var: Option<String>,
+}
+
+// ─── UNWIND-led write statements (QL-09b) ─────────────────────────────────────
+
+/// `UNWIND <expr> AS x [MATCH … | WITH … | UNWIND …]* <write clause>+ [RETURN …]`
+///
+/// The `read` part (everything before the first write clause) produces one row
+/// per iteration; each write clause then runs for each row, in order, and all
+/// of it commits as one batch. A read clause after a write clause is refused at
+/// parse time, so every read sees the state before the statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindWriteStmt {
+    /// The read part. Its `returns` are empty: the executor projects what the
+    /// write clauses need.
+    pub read: Query,
+    /// Names in scope at the end of the read part that hold a node or a value
+    /// (not a relationship); a `RETURN` after the writes is evaluated with them.
+    pub scope: Vec<String>,
+    /// Every name that holds a node at the end of the statement: the nodes of
+    /// the read part and the ones the write clauses create or merge.
+    pub node_vars: Vec<String>,
+    /// Every name that holds a relationship at the end of the statement: the
+    /// read part's, and the ones a `MERGE` pattern binds.
+    pub rel_vars: Vec<String>,
+    /// The write clauses, in source order.
+    pub writes: Vec<RowWrite>,
+    /// Optional `RETURN [DISTINCT] … [ORDER BY …] [SKIP …] [LIMIT …]`.
+    pub returns: Option<RowReturn>,
+}
+
+/// The RETURN clause of an UNWIND-led write statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowReturn {
+    pub items: Vec<RetItem>,
+    pub distinct: bool,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
+}
+
+/// One write clause of an UNWIND-led statement. Every `Operand` is evaluated
+/// per row by the read part, so it may name the UNWIND alias, a matched node's
+/// property, a `$parameter` or any expression over them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowWrite {
+    /// `CREATE (a:L {…})[-[:T]->(b:L {…})]`
+    Create {
+        nodes: Vec<RowCreateNode>,
+        edges: Vec<CreateEdge>,
+    },
+    /// `MERGE (a:L {key: …}) [-[:T]->(b:L {key: …})] [ON CREATE SET …] [ON MATCH SET …]`
+    Merge(Box<RowMerge>),
+    /// `SET n.f = expr [, …]`
+    Set(Vec<SetClause>),
+    /// `SET n = <map>` / `SET n += <map>`; `value` evaluates to a map per row.
+    SetMap {
+        var: String,
+        merge: bool,
+        value: Operand,
+    },
+    /// `REMOVE n.f [, …]`
+    Remove(Vec<(String, String)>),
+    /// `[DETACH] DELETE n [, …]` (node variables only)
+    Delete { vars: Vec<String>, detach: bool },
+}
+
+/// One node of a per-row CREATE. `var` is always set (the parser names an
+/// anonymous node).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowCreateNode {
+    pub var: String,
+    pub label: String,
+    pub props: Vec<(String, Operand)>,
+}
+
+/// A per-row MERGE: one node, or two nodes and the relationship between them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMerge {
+    pub start: RowMergeNode,
+    pub edge: Option<RowMergeEdge>,
+    pub on_create: Vec<SetClause>,
+    pub on_match: Vec<SetClause>,
+}
+
+/// A MERGE node pattern: its single identifying property and optional `ns`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMergeNode {
+    /// Always set (the parser names an anonymous node).
+    pub var: String,
+    pub label: String,
+    pub key_field: String,
+    pub key: Operand,
+    pub ns: Option<Operand>,
+}
+
+/// The relationship and end node of a per-row `MERGE (a)-[:T]->(b)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMergeEdge {
+    pub etype: String,
+    pub dir: RelDir,
+    pub rel_var: Option<String>,
+    pub end: RowMergeNode,
 }
