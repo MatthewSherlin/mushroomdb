@@ -1052,6 +1052,7 @@ unexpected-token parse error or other unspecified result.
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
+| Declaring a unique constraint | Scans the label's existing nodes, so it blocks writers for a time proportional to the label's node count (about 1 to 3 seconds at a million nodes); readers are unaffected. Refused, listing the first 100 conflicting nodes and the total, when two already hold equal values |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |

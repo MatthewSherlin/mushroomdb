@@ -2809,6 +2809,9 @@ impl GraphDb<RealFs> {
     }
 }
 
+/// How many conflicting nodes `GraphError::ConstraintCreationConflict` lists.
+const CONSTRAINT_CONFLICTS_LISTED: usize = 100;
+
 /// Where two values the scan can find equal always share a bucket: numbers by
 /// the bit pattern of their `f64` (so `Int` 2, `Float` 2.0, and both zeros
 /// meet), every other indexable value by its index key. `None` for a value
@@ -9540,7 +9543,9 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// The existing data is checked first: every live node of `label` is read,
     /// and if two hold equal values for `field` nothing is logged and the error
-    /// lists every node involved.
+    /// lists the first 100 nodes involved, in node-id order, and counts them all.
+    /// Declaring blocks writers for a time proportional to the label's node
+    /// count (the scan, then the index build); readers are unaffected.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
@@ -9573,9 +9578,16 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
-        let violations = self.existing_unique_violations(label, field);
-        if !violations.is_empty() {
-            return Err(GraphError::ConstraintCreationConflict { violations });
+        // Ahead of the scan: a refused declaration does no O(label) work, and
+        // a pre-V11 caller gets the refusal whatever the data holds.
+        if !self.v11_unlocked {
+            return Err(GraphError::QueryError {
+                detail: core_storage::v11_record_refusal("unique constraints"),
+            });
+        }
+        let (violations, total) = self.existing_unique_violations(label, field);
+        if total > 0 {
+            return Err(GraphError::ConstraintCreationConflict { violations, total });
         }
         self.log_dense(vec![WalRecord::CreateConstraint {
             name: name.into(),
@@ -9584,8 +9596,9 @@ impl<F: Fs> GraphDb<F> {
         }])
     }
 
-    /// Every `(node_key, value)` of a live node of `label` whose `field` equals
-    /// another live node's, in node-id order.
+    /// The first [`CONSTRAINT_CONFLICTS_LISTED`] `(node_key, value)` of live
+    /// nodes of `label` whose `field` equals another live node's, in node-id
+    /// order, and the count of all of them.
     ///
     /// One pass over the label column and one props read per node of `label`;
     /// nodes are grouped by [`equality_bucket`] and compared with
@@ -9594,15 +9607,24 @@ impl<F: Fs> GraphDb<F> {
     /// values that round to one `f64` or share an index key, so the
     /// distinct values per bucket are few and the comparison does not go
     /// quadratic on a heavily duplicated value.
-    fn existing_unique_violations(&self, label: &str, field: &str) -> Vec<(String, Value)> {
+    fn existing_unique_violations(
+        &self,
+        label: &str,
+        field: &str,
+    ) -> (Vec<(String, Value)>, usize) {
         let Some(label_sym) = self.syms.get(label) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let props = self.props_view();
         // Per bucket: the distinct values seen (each with the ids holding a
         // value equal to it), kept as classes so a duplicate is one lookup
         // against a handful of representatives, not against every holder.
-        type Class = (Value, Vec<u32>);
+        // `forms` is every distinct stored form of the class's value (an `Int`
+        // and the `Float` it equals), for the cross-class check below.
+        struct Class {
+            forms: Vec<Value>,
+            holders: Vec<u32>,
+        }
         let mut buckets: HashMap<EqualityBucket, Vec<Class>> = HashMap::new();
         for (id, &sym) in self.labels.iter().enumerate() {
             if sym != label_sym {
@@ -9621,35 +9643,51 @@ impl<F: Fs> GraphDb<F> {
             let classes = buckets.entry(bucket).or_default();
             match classes
                 .iter_mut()
-                .find(|(rep, _)| values_equal(rep, &value))
+                .find(|class| values_equal(&class.forms[0], &value))
             {
-                Some((_, holders)) => holders.push(id),
-                None => classes.push((value, vec![id])),
+                Some(class) => {
+                    class.holders.push(id);
+                    if !class.forms.contains(&value) {
+                        class.forms.push(value);
+                    }
+                }
+                None => classes.push(Class {
+                    forms: vec![value],
+                    holders: vec![id],
+                }),
             }
         }
         let mut conflicting: Vec<u32> = Vec::new();
         for classes in buckets.values() {
-            for (i, (rep, holders)) in classes.iter().enumerate() {
-                // Equality past 2^53 is not transitive, so two classes whose
-                // representatives are equal conflict as well.
-                let crosses = classes
-                    .iter()
-                    .enumerate()
-                    .any(|(j, (other, _))| j != i && values_equal(rep, other));
-                if holders.len() > 1 || crosses {
-                    conflicting.extend(holders);
+            for (i, class) in classes.iter().enumerate() {
+                // Equality past 2^53 is not transitive: `Int` 2^53 and
+                // 2^53 + 1 are unequal, yet both equal `Float` 2^53. A class
+                // whose any form equals any form of another conflicts with it.
+                let crosses = classes.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && class
+                            .forms
+                            .iter()
+                            .any(|a| other.forms.iter().any(|b| values_equal(a, b)))
+                });
+                if class.holders.len() > 1 || crosses {
+                    conflicting.extend(&class.holders);
                 }
             }
         }
         conflicting.sort_unstable();
-        conflicting
+        let total = conflicting.len();
+        // Only the returned list is capped; the count above is of them all.
+        let listed = conflicting
             .into_iter()
+            .take(CONSTRAINT_CONFLICTS_LISTED)
             .filter_map(|id| {
                 let key = self.ids.key_of(id)?.to_string();
                 let value = props.get(id, field)?.into_value();
                 Some((key, value))
             })
-            .collect()
+            .collect();
+        (listed, total)
     }
 
     /// Withdraw the unique constraint `name`. Its backing equality index stays

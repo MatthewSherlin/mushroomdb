@@ -1146,7 +1146,10 @@ mod unlocked {
 
     fn conflict(result: Result<(), GraphError>) -> Vec<(String, Value)> {
         match result {
-            Err(GraphError::ConstraintCreationConflict { violations }) => violations,
+            Err(GraphError::ConstraintCreationConflict { violations, total }) => {
+                assert_eq!(total, violations.len(), "an uncapped conflict lists all");
+                violations
+            }
             other => panic!("expected ConstraintCreationConflict, got {other:?}"),
         }
     }
@@ -1278,6 +1281,96 @@ mod unlocked {
         match db.create_constraint("uniq_deg", "User", "deg") {
             Err(GraphError::QueryError { detail }) => assert!(detail.contains("owned by view")),
             other => panic!("expected the view refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_conflict_list_is_capped_in_node_id_order_and_counts_them_all() {
+        let (dir, mut db) = open_temp("scan-cap");
+        for i in 0..150 {
+            db.insert_node("User", &format!("u{i:03}"), email("dup@x"))
+                .unwrap();
+        }
+        // Id order is insertion order, which is not key order here.
+        db.insert_node("User", "a-last", email("dup@x")).unwrap();
+        let check = |db: &mut GraphDb| match db.create_constraint("uniq_email", "User", "email") {
+            Err(e @ GraphError::ConstraintCreationConflict { .. }) => {
+                let text = e.to_string();
+                let GraphError::ConstraintCreationConflict { violations, total } = e else {
+                    unreachable!()
+                };
+                assert_eq!(total, 151);
+                assert_eq!(violations.len(), 100);
+                let keys: Vec<String> = violations.iter().map(|(k, _)| k.clone()).collect();
+                let expected: Vec<String> = (0..100).map(|i| format!("u{i:03}")).collect();
+                assert_eq!(keys, expected, "node-id order, not sorted");
+                assert!(violations
+                    .iter()
+                    .all(|(_, v)| v == &Value::Str("dup@x".into())));
+                assert_eq!(
+                    text,
+                    "cannot create the constraint: 151 existing nodes hold duplicate values \
+                     (first 100 listed)"
+                );
+            }
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        };
+        check(&mut db);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        reopened.unlock_v11_format_for_test();
+        check(&mut reopened);
+    }
+
+    /// Past 2^53 an `Int` equals the `Float` it rounds to and two `Int`s are
+    /// equal only when they are the same integer, so equality is not
+    /// transitive: the scan must report a pair of unequal `Int`s that a `Float`
+    /// ties together, and not report the `Int`s alone.
+    #[test]
+    fn the_scan_follows_the_large_integer_equality() {
+        let big = 1_i64 << 53;
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        let (_dir, mut db) = open_temp("scan-large-ints-alone");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        let (_dir, mut db) = open_temp("scan-large-ints-tied");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "c", Value::Float(big as f64));
+        let keys: Vec<String> = conflict(db.create_constraint("uniq_v", "N", "v"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+
+        // The next float up equals none of them.
+        let (_dir, mut db) = open_temp("scan-large-ints-next-up");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "d", Value::Float((big as f64).next_up()));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        // i64::MAX rounds to 2^63 as a float.
+        let (_dir, mut db) = open_temp("scan-large-ints-max");
+        put(&mut db, "a", Value::Int(i64::MAX));
+        put(&mut db, "b", Value::Float(9_223_372_036_854_775_808.0));
+        assert_eq!(conflict(db.create_constraint("uniq_v", "N", "v")).len(), 2);
+    }
+
+    #[test]
+    fn a_refused_declaration_does_no_scan_before_the_v11_gate() {
+        // Locked handle, duplicates present: the refusal, not the conflict.
+        let dir = tmp("locked-dups");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        match db.create_constraint("uniq_email", "User", "email") {
+            Err(GraphError::QueryError { detail }) => assert_eq!(detail, CONSTRAINT_REFUSAL),
+            other => panic!("expected the V11 record refusal, got {other:?}"),
         }
     }
 }

@@ -233,6 +233,7 @@ mod tests {
             },
             GraphError::ConstraintCreationConflict {
                 violations: vec![("k".into(), Value::Int(1))],
+                total: 1,
             },
             GraphError::ValueTooLarge {
                 field: "f".into(),

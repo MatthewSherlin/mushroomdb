@@ -328,6 +328,7 @@ def test_constraint_creation_conflict_carries_the_conflicting_pairs(tmp_path):
     pairs = sorted(raised.value.violations, key=lambda pair: pair[0])
     assert pairs == [("a", 2), ("b", 2.0)]
     assert isinstance(pairs[0][1], int) and isinstance(pairs[1][1], float)
+    assert raised.value.total == 2
     assert raised.value.code == "constraint_creation_conflict"
     # Removing one of the pair lets the declaration through.
     db.delete_node("b")

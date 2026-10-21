@@ -1579,5 +1579,5 @@ attributes. Classes may be added; a `code` is never respelled.
 | `NoRecordedTime` | — | A date was given to a history call on a store that records no commit times. |
 | `TimeBeforeFloor` | `floor_ms: int`, `floor_commit: int` | The date predates the oldest commit time the store still records. |
 | `ConstraintViolation` | `constraint: str`, `field: str` | A write would give two live nodes the same value under a unique constraint. |
-| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]` | A unique constraint cannot be declared: live nodes already share a value. |
+| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]`, `total: int` | A unique constraint cannot be declared: live nodes already share a value. |
 | `ValueTooLarge` | `field: str`, `size: int`, `limit: int` | A value is larger than the store accepts; `size` and `limit` are bytes. |
