@@ -820,14 +820,16 @@ fn a_chained_rename_in_one_batch_moves_a_stored_id_as_two_commits_would() {
 /// renamed in the same batch.
 #[test]
 fn a_batch_deletes_an_edge_of_a_node_it_just_renamed() {
-    let mut db = GraphDb::open(&tmp("batch-rename-edge")).unwrap();
+    let mut db = GraphDb::open(&tmp("batch-rename-delete-edge")).unwrap();
     db.insert_node("Person", "a", vec![]).unwrap();
     db.insert_node("Person", "d", vec![]).unwrap();
     db.insert_edge("KNOWS", "a", "d").unwrap();
 
     let mut batch = db.batch();
     batch.rename_node("a", "b").delete_edge("KNOWS", "b", "d");
-    batch.commit().unwrap();
+    batch
+        .commit()
+        .expect("a batch that renames a node and deletes its edge commits");
 
     assert!(db
         .neighbors("b", "KNOWS", Direction::Out)
@@ -1140,4 +1142,26 @@ fn was_linked_is_not_confused_by_an_earlier_node_that_held_the_key() {
         })
         .collect();
     assert_eq!(answers, "fffff");
+}
+
+/// Guard for FLAKE-1: `tmp()` wipes the directory it names, so two tests that
+/// pass the same name delete each other's store while both run in parallel.
+#[test]
+fn every_test_in_this_file_names_its_own_tmp_dir() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/rename_upsert.rs"
+    ))
+    .unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for piece in source.split("tmp(\"").skip(1) {
+        let name = piece.split('"').next().unwrap();
+        if name.is_empty() || name == "name" {
+            continue;
+        }
+        assert!(
+            seen.insert(name.to_string()),
+            "tmp name {name:?} is used twice"
+        );
+    }
 }
