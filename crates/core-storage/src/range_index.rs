@@ -612,7 +612,9 @@ fn order_class(v: &Value) -> Option<OrderClass> {
         Value::LocalDateTime(_) => Some(OrderClass::LocalDateTime),
         Value::DateTime { .. } => Some(OrderClass::DateTime),
         Value::Binary(_) => Some(OrderClass::Binary),
-        Value::Bool(_) | Value::List(_) | Value::Map(_) | Value::Duration { .. } => None,
+        Value::Bool(_) | Value::List(_) | Value::Map(_) | Value::Duration { .. } | Value::Null => {
+            None
+        }
     }
 }
 
