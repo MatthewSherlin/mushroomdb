@@ -4980,6 +4980,7 @@ List source forms:
 - Literal list: `UNWIND [1, 2, 'a'] AS x`
 - Property containing a list value: `UNWIND p.tags AS tag`
 - A named alias from a prior `WITH`: `UNWIND items AS item`
+- Any expression that evaluates to a list: `UNWIND range(1, 5) AS i`, `UNWIND $items AS x`, `UNWIND tail(p.tags) AS t`
 
 Passing a non-list value (e.g., a plain integer property) is a named error.
 Intermediate rows produced by `UNWIND` count against the 1,000,000-row budget.
@@ -5460,6 +5461,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `WITH … MATCH` re-entry | `WITH city MATCH (p:Person) WHERE p.city = city RETURN p` |
 | `UNWIND list_literal AS x` | `UNWIND [1, 2, 3] AS x RETURN x` |
 | `UNWIND n.prop AS x` (list-valued property) | `UNWIND n.tags AS tag RETURN tag` |
+| `UNWIND expr AS x` (any list-valued expression) | `UNWIND range(1, 5) AS i RETURN i` |
 | `UNWIND alias AS x` (from prior WITH) | `WITH n.tags AS ts UNWIND ts AS t RETURN t` |
 | `UNWIND … WHERE` (filter after UNWIND) | `UNWIND [1,2,3] AS x WHERE x > 1 RETURN x` |
 | `OPTIONAL MATCH` (left-outer-join) | `MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, b` |
@@ -5556,7 +5558,7 @@ unexpected-token parse error or other unspecified result.
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
 | Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
-| UNWIND | Supported — list literals, list-valued properties, and scalar aliases from prior WITH; non-list → named error |
+| UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |

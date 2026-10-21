@@ -440,30 +440,22 @@ impl<'a> Parser<'a> {
         Ok(UnwindClause { list, alias })
     }
 
-    /// Parse the list expression in an UNWIND clause:
-    /// - `[e1, e2, …]` — list literal (any expressions as elements).
-    /// - `var.field`   — property reference.
-    /// - `var`         — bare variable (alias from a prior WITH).
+    /// Parse the list expression in an UNWIND clause: any expression that
+    /// evaluates to a list, such as `[e1, e2, …]`, `range(1, 5)`, `$items`,
+    /// `a + b`, `var.field` or a bare `var`. The plain forms keep their
+    /// dedicated variants; everything else becomes `UnwindExpr::Expr`.
     fn unwind_expr(&mut self) -> Result<UnwindExpr, String> {
-        match self.peek() {
-            Some(Tok::LBracket) => match self.arith_expr()? {
-                Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
-                other => Ok(UnwindExpr::Expr(other)),
-            },
-            Some(Tok::Ident(n)) if is_null_literal(n) => {
+        if let Some(Tok::Ident(n)) = self.peek() {
+            if is_null_literal(n) {
                 self.pos += 1;
-                Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)))
+                return Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)));
             }
-            Some(Tok::Ident(_)) => {
-                let name = self.ident("expected variable or property in UNWIND")?;
-                if self.eat(&Tok::Dot) {
-                    let field = self.ident("expected field name after '.' in UNWIND")?;
-                    Ok(UnwindExpr::Prop { var: name, field })
-                } else {
-                    Ok(UnwindExpr::Var(name))
-                }
-            }
-            _ => Err(self.err("expected list literal, property, or variable in UNWIND")),
+        }
+        match self.arith_expr()? {
+            Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
+            Operand::Prop { var, field } => Ok(UnwindExpr::Prop { var, field }),
+            Operand::Var(name) => Ok(UnwindExpr::Var(name)),
+            other => Ok(UnwindExpr::Expr(other)),
         }
     }
 
