@@ -9,7 +9,7 @@ use super::ast::{
 };
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
 /// is the merge (`+=`) form, and the map's entries.
-type SetMapClause = (String, bool, Vec<(String, Operand)>);
+type SetMapClause = (String, bool, Vec<(String, Operand)>, Option<String>);
 
 use super::Tok;
 use crate::filter::CmpOp;
@@ -1639,10 +1639,10 @@ impl<'a> Parser<'a> {
         while self.eat_ident_kw("on") {
             if self.eat(&Tok::Create) {
                 self.expect(&Tok::Set, "expected SET after ON CREATE")?;
-                on_create.extend(self.set_clauses()?);
+                on_create.extend(self.merge_set_clauses()?);
             } else if self.eat(&Tok::Match) {
                 self.expect(&Tok::Set, "expected SET after ON MATCH")?;
-                on_match.extend(self.set_clauses()?);
+                on_match.extend(self.merge_set_clauses()?);
             } else {
                 return Err(self.err("expected CREATE or MATCH after ON"));
             }
@@ -1690,7 +1690,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Tok::Set) if self.set_map_form_ahead() => {
                 self.pos += 1; // consume SET
-                let (var, merge, map) = self.set_map_clause(&matches)?;
+                let (var, merge, map, param) = self.set_map_clause(&matches)?;
                 let returns = if self.eat(&Tok::Return) {
                     Some(self.return_items()?)
                 } else {
@@ -1705,6 +1705,7 @@ impl<'a> Parser<'a> {
                     merge,
                     var,
                     map,
+                    param,
                     returns,
                 }))
             }
@@ -1806,20 +1807,24 @@ impl<'a> Parser<'a> {
 
     /// `var = {…}` or `var += {…}` after SET: the variable, whether it is the
     /// merge form, and the map's entries. The variable must be
-    /// a node bound by `matches`; the right side must be a map literal (a
-    /// `$parameter` or another variable is refused by name); a second SET item
+    /// a node bound by `matches`; the right side must be a map literal or a
+    /// `$parameter` (another variable is refused by name); a second SET item
     /// after the map is refused, since the forms do not mix in one clause.
     fn set_map_clause(&mut self, matches: &[Pattern]) -> Result<SetMapClause, String> {
         let var = self.ident("expected variable after SET")?;
         let merge = self.eat(&Tok::Plus);
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-        if self.peek() != Some(&Tok::LBrace) {
-            return Err(format!(
-                "not supported in mushroomdb 0.10: SET {var} {}= with a right side that is not a \
-                 map literal ({{key: value, …}})",
-                if merge { "+" } else { "" }
-            ));
-        }
+        let param = match self.peek() {
+            Some(Tok::Param(name)) => Some(name.clone()),
+            Some(Tok::LBrace) => None,
+            _ => {
+                return Err(format!(
+                    "not supported in mushroomdb 0.10: SET {var} {}= with a right side that is \
+                     neither a map literal ({{key: value, …}}) nor a $parameter",
+                    if merge { "+" } else { "" }
+                ));
+            }
+        };
         let is_rel = matches
             .iter()
             .flat_map(|p| p.chain.iter())
@@ -1840,7 +1845,14 @@ impl<'a> Parser<'a> {
                 "SET {var} = map: '{var}' is not a node variable bound by MATCH"
             ));
         }
-        let map = match self.map_literal()? {
+        if param.is_some() {
+            self.pos += 1;
+        }
+        let map = match if param.is_some() {
+            Operand::MapLit(vec![])
+        } else {
+            self.map_literal()?
+        } {
             Operand::Lit(Value::Map(entries)) => entries
                 .into_iter()
                 .map(|(k, v)| (k, Operand::Lit(v)))
@@ -1855,7 +1867,7 @@ impl<'a> Parser<'a> {
                     .to_string(),
             );
         }
-        Ok((var, merge, map))
+        Ok((var, merge, map, param))
     }
 
     /// `var.field [, var.field …]` after REMOVE. Each `var` must be a node bound
@@ -1895,6 +1907,26 @@ impl<'a> Parser<'a> {
             items.push((var, field));
             if !self.eat(&Tok::Comma) {
                 return Ok(items);
+            }
+        }
+    }
+
+    /// `set_clauses` for `MERGE … ON CREATE/ON MATCH SET`: the map forms
+    /// (`n = {…}`, `n += {…}`) are refused by name; MERGE takes property items.
+    fn merge_set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
+        let mut sets = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::Ident(_)))
+                && matches!(
+                    (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+                    (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+                )
+            {
+                return Err("not supported in mushroomdb 0.10: MERGE … SET with a map".to_string());
+            }
+            sets.push(self.set_clause()?);
+            if !self.eat(&Tok::Comma) {
+                return Ok(sets);
             }
         }
     }

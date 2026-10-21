@@ -449,6 +449,9 @@ pub struct MatchSetMapStmt {
     pub merge: bool,
     pub var: String,
     pub map: Vec<(String, Operand)>,
+    /// `SET n = $param` / `SET n += $param`: the parameter holding the map, with
+    /// `map` empty. The parameter must be a `Value::Map` at execution time.
+    pub param: Option<String>,
     /// Optional RETURN clause: project matched bindings from post-write state.
     pub returns: Option<Vec<RetItem>>,
 }

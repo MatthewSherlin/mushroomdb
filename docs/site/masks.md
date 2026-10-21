@@ -228,9 +228,10 @@ changed to tenant-b — delete and re-insert the node instead
 
 **Removing `ns` is changing it**, to `default` — the namespace an absent property
 names — so it is refused with the same error: `remove_prop`, a batched
-`RemoveProp`, `DELETE /node/{key}/prop/ns` and Cypher `MATCH … REMOVE n.ns`, `SET n += {ns: null}` and a `SET n = {…}` that
-names a different `ns` all return it. A `SET n = {…}` that leaves `ns` out keeps the
-namespace, as it keeps `id`.
+`RemoveProp`, `DELETE /node/{key}/prop/ns`, Cypher `MATCH … REMOVE n.ns`,
+`SET n += {ns: null}` and a `SET n = {…}` that names a different `ns` all
+return it. A `SET n = {…}` that leaves `ns` out keeps the namespace, as it
+keeps `id`.
 
 Writing the namespace a node is already in is a no-op, not an error, and so is
 removing `ns` from a node already in `default`: neither changes a namespace, and

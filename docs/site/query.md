@@ -472,9 +472,17 @@ SET n = {name: 'Alice', score: 1}
   WAL frame: unique constraints apply, rules re-evaluate every set and every
   removal, and one refusal applies nothing.
 - Map values are expressions evaluated per matched row (`SET n += {a: n.a + 1,
-  b: $p}`). The map must be a literal: `SET n = $props` and `SET n = m` are
-  refused (`not supported in mushroomdb 0.10`), as is mixing the map form with
-  `SET n.prop = …` in one clause. `n` must be a node.
+  b: $p}`). The map is a literal or a `$parameter` holding a map
+  (`SET n += $props`), with the same semantics: a null value in the parameter
+  removes the key under `+=`. A parameter that is not a map is an error naming
+  it, before anything is written. `SET n = m` (a variable) is refused
+  (`not supported in mushroomdb 0.10`), as is mixing the map form with
+  `SET n.prop = …` in one clause, and `MERGE … ON CREATE/ON MATCH SET n = {…}`
+  (`not supported in mushroomdb 0.10: MERGE … SET with a map`). `n` must be a
+  node.
+- `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms: `id`
+  mirrors the node's key, so restating the key is a no-op and anything else is
+  an error pointing at `rename_node`.
 - `RETURN` projects the post-write state. `properties_set` counts the
   properties set plus the properties removed.
 - Inside an interactive transaction the map forms are refused:

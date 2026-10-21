@@ -52,19 +52,44 @@ fn the_property_form_still_parses_as_match_set() {
 }
 
 #[test]
-fn a_right_side_that_is_not_a_map_literal_is_refused_by_name() {
+fn a_parameter_right_side_parses_and_other_right_sides_are_refused_by_name() {
+    let s = map_stmt("MATCH (n) SET n = $props RETURN n.a");
+    assert_eq!(s.param.as_deref(), Some("props"));
+    assert!(s.map.is_empty() && !s.merge && s.returns.is_some());
+    let s = map_stmt("MATCH (n) SET n += $props");
+    assert_eq!(s.param.as_deref(), Some("props"));
+    assert!(s.merge);
+    assert_eq!(map_stmt("MATCH (n) SET n = {a: 1}").param, None);
     for (q, expected) in [
         (
-            "MATCH (n) SET n = $props",
-            "not supported in mushroomdb 0.10: SET n = with a right side that is not a map literal ({key: value, …})",
+            "MATCH (n) SET n = m",
+            "not supported in mushroomdb 0.10: SET n = with a right side that is neither a map literal ({key: value, …}) nor a $parameter",
         ),
         (
-            "MATCH (n) SET n += m",
-            "not supported in mushroomdb 0.10: SET n += with a right side that is not a map literal ({key: value, …})",
+            "MATCH (n) SET n += 5",
+            "not supported in mushroomdb 0.10: SET n += with a right side that is neither a map literal ({key: value, …}) nor a $parameter",
         ),
     ] {
         assert_eq!(parse(q).unwrap_err(), expected, "{q}");
     }
+    assert!(parse("MATCH (n) SET n = $props junk").is_err());
+    assert!(parse("MATCH (n) SET n = $props, n.a = 1").is_err());
+}
+
+#[test]
+fn merge_set_with_a_map_is_refused_by_name() {
+    for q in [
+        "MERGE (n:L {id: 'x'}) ON CREATE SET n = {a: 1}",
+        "MERGE (n:L {id: 'x'}) ON MATCH SET n += $p",
+        "MERGE (n:L {id: 'x'}) ON CREATE SET n.a = 1, n = {b: 2}",
+    ] {
+        assert_eq!(
+            parse(q).unwrap_err(),
+            "not supported in mushroomdb 0.10: MERGE … SET with a map",
+            "{q}"
+        );
+    }
+    assert!(parse("MERGE (n:L {id: 'x'}) ON CREATE SET n.a = 1").is_ok());
 }
 
 #[test]

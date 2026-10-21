@@ -799,6 +799,37 @@ pub struct EdgeTypeCensus {
     pub sample: Option<(String, String)>,
 }
 
+/// The refusal every Cypher write of a node's `id` property makes unless it
+/// restates the node's own key: `id` mirrors the key, and only `rename_node`
+/// moves both together.
+pub(crate) fn key_property_error(key: &str) -> GraphError {
+    GraphError::QueryError {
+        detail: format!(
+            "cannot change the key property `id` of node {key}; \
+             renaming a node is rename_node"
+        ),
+    }
+}
+
+/// `Ok(true)` when `SET n.id = value` (or an `id` map entry) is a real write,
+/// `Ok(false)` when it restates the key and is a no-op, `Err` otherwise.
+pub(crate) fn check_key_property_write(key: &str, value: Option<&Value>) -> Result<bool> {
+    match value {
+        Some(Value::Str(s)) if s == key => Ok(false),
+        _ => Err(key_property_error(key)),
+    }
+}
+
+/// `REMOVE n.id` is always refused: the key property is not removable.
+pub(crate) fn refuse_key_property_removal(removals: &[(String, String)]) -> Result<()> {
+    if removals.iter().any(|(_, field)| field == "id") {
+        return Err(GraphError::QueryError {
+            detail: "cannot REMOVE the key property `id`; renaming a node is rename_node".into(),
+        });
+    }
+    Ok(())
+}
+
 /// A SET map's keys with each value evaluated for one matched row; `None` is null.
 type MapEntries = Vec<(String, Option<Value>)>;
 
@@ -839,15 +870,8 @@ fn plan_map_write(
     let mut removes = Vec::new();
     for (field, value) in entries {
         if field == "id" {
-            if matches!(value, Some(Value::Str(s)) if s == key) {
-                continue;
-            }
-            return Err(GraphError::QueryError {
-                detail: format!(
-                    "cannot change the key property `id` of node {key} with a SET map; \
-                     renaming a node is rename_node"
-                ),
-            });
+            check_key_property_write(key, value.as_ref())?;
+            continue;
         }
         match value {
             Some(v) => sets.push(MapWrite::Set {
@@ -12564,6 +12588,12 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
+                if sc.field == "id"
+                    && !rel_vars.iter().any(|r| r == &sc.var)
+                    && !check_key_property_write(&key, Some(&value))?
+                {
+                    continue;
+                }
                 set_ops.push((key, sc.field.clone(), value));
             }
         }
@@ -12631,6 +12661,12 @@ impl<F: Fs> GraphDb<F> {
                 alias: Some(col.clone()),
             });
         }
+        if let Some(name) = &stmt.param {
+            match_returns.push(RetItem {
+                value: RetVal::ScalarExpr(Operand::Param(name.clone())),
+                alias: Some("__sv_param".into()),
+            });
+        }
         for r in &rel_vars {
             match_returns.push(RetItem {
                 value: RetVal::FuncCall {
@@ -12684,6 +12720,39 @@ impl<F: Fs> GraphDb<F> {
                     })
                 }
             };
+            if let Some(name) = &stmt.param {
+                // The parameter is a map: its keys are the map's, a null value
+                // is a null entry. Anything else is a named error, before any
+                // write.
+                let entries = match match_rs.get(row_i, "__sv_param") {
+                    Some(Value::Map(m)) => m
+                        .iter()
+                        .map(|(k, v)| {
+                            let v = if matches!(v, Value::Null) {
+                                None
+                            } else {
+                                Some(v.clone())
+                            };
+                            (k.clone(), v)
+                        })
+                        .collect::<MapEntries>(),
+                    other => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "SET {} {}= ${name}: the parameter must be a map, got {}",
+                                stmt.var,
+                                if stmt.merge { "+" } else { "" },
+                                other.map_or("null".to_string(), |v| format!("{v:?}")),
+                            ),
+                        })
+                    }
+                };
+                if !stmt.merge {
+                    per_node.retain(|(k, _)| k != &key);
+                }
+                per_node.push((key, entries));
+                continue;
+            }
             let entries: MapEntries = stmt
                 .map
                 .iter()
@@ -12760,6 +12829,7 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchRemoveStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        refuse_key_property_removal(&stmt.removals)?;
         let project_returns = stmt.returns.clone();
         let rel_vars = pattern_rel_vars(&stmt.matches);
         let mut lookup_vars: Vec<String> = Vec::new();
@@ -13234,12 +13304,18 @@ impl<F: Fs> GraphDb<F> {
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;
+                    if sc.field == "id" && !check_key_property_write(&key, Some(&value))? {
+                        continue;
+                    }
                     batch.set_prop(&key, &sc.field, value);
                 }
                 created = 1;
             } else {
                 for sc in &stmt.on_match {
                     let value = resolve_merge_set_value(&sc.value, params)?;
+                    if sc.field == "id" && !check_key_property_write(&key, Some(&value))? {
+                        continue;
+                    }
                     batch.set_prop(&key, &sc.field, value);
                 }
             }

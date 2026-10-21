@@ -606,6 +606,12 @@ impl Transaction {
                                 sc.var, sc.field
                             ),
                         })?;
+                if sc.field == "id"
+                    && !rel_vars.iter().any(|r| r == &sc.var)
+                    && !crate::db::check_key_property_write(&key, Some(&value))?
+                {
+                    continue;
+                }
                 staged.set_prop(&key, &sc.field, value);
                 props_set += 1;
             }
@@ -622,6 +628,7 @@ impl Transaction {
         if stmt.returns.is_some() {
             return Err(not_supported("MATCH … REMOVE … RETURN"));
         }
+        crate::db::refuse_key_property_removal(&stmt.removals)?;
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
         bind_node_vars(&mut matches, &mut 0, &mut node_vars);
@@ -775,6 +782,9 @@ impl Transaction {
         if existed {
             for sc in &stmt.on_match {
                 let value = resolve_merge_set_value(&sc.value, params)?;
+                if sc.field == "id" && !crate::db::check_key_property_write(&key, Some(&value))? {
+                    continue;
+                }
                 staged.set_prop(&key, &sc.field, value);
             }
         } else {
@@ -785,6 +795,9 @@ impl Transaction {
             staged.insert_node(&stmt.label, &key, props);
             for sc in &stmt.on_create {
                 let value = resolve_merge_set_value(&sc.value, params)?;
+                if sc.field == "id" && !crate::db::check_key_property_write(&key, Some(&value))? {
+                    continue;
+                }
                 staged.set_prop(&key, &sc.field, value);
             }
             created = 1;

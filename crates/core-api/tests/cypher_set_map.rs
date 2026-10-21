@@ -498,9 +498,9 @@ fn malformed_and_unsupported_forms_are_refused_by_name() {
     seed(&mut db);
     db.insert_edge("KNOWS", "alice", "bob").unwrap();
     for (q, needle) in [
-        ("MATCH (n:P) SET n = $props", "not a map literal"),
-        ("MATCH (n:P) SET n += $props", "not a map literal"),
-        ("MATCH (n:P) SET n = 5", "not a map literal"),
+        ("MATCH (n:P) SET n = m", "neither a map literal"),
+        ("MATCH (n:P) SET n += 5", "neither a map literal"),
+        ("MATCH (n:P) SET n = 5", "neither a map literal"),
         ("MATCH (n:P) SET n = {a: 1}, n.b = 2", "another SET item"),
         ("MATCH (n:P) SET m = {a: 1}", "not a node variable"),
         (
@@ -690,4 +690,207 @@ fn scoped_map_forms_reach_visible_nodes_and_never_hidden_ones() {
     assert_eq!(db.get_prop("m", "c"), Some(Value::Int(2)));
     assert_eq!(db.get_prop("s", "c"), None);
     assert_eq!(db.get_prop("s", "b"), Some(Value::Int(1)));
+}
+
+// ── Parameter maps ──────────────────────────────────────────────────────────
+
+fn map_param(entries: Vec<(&str, Value)>) -> BTreeMap<String, Value> {
+    let map: BTreeMap<String, Value> = entries
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let mut params = p();
+    params.insert("props".into(), Value::Map(map));
+    params
+}
+
+#[test]
+fn a_parameter_map_merges_like_the_literal_including_null_removal() {
+    let mut db = GraphDb::open(&tmp("param-merge")).unwrap();
+    seed(&mut db);
+    let params = map_param(vec![
+        ("a", Value::Float(2.5)),
+        ("b", Value::Null),
+        ("d", Value::Str("new".into())),
+    ]);
+    let rs = db
+        .query_write(
+            "MATCH (n:P) WHERE n.id = 'alice' SET n += $props RETURN n.a AS a, n.b AS b",
+            &params,
+        )
+        .unwrap();
+    assert_eq!(rs.get(0, "a"), Some(&Value::Float(2.5)));
+    assert_eq!(rs.get(0, "b"), None);
+    assert_eq!(db.get_prop("alice", "b"), None, "null removed it");
+    assert_eq!(db.get_prop("alice", "c"), Some(Value::Int(1)), "rest kept");
+    assert_eq!(db.get_prop("alice", "d"), Some(Value::Str("new".into())));
+    assert_eq!(db.get_prop("bob", "b"), Some(Value::Int(20)), "other node");
+}
+
+#[test]
+fn a_parameter_map_replaces_like_the_literal() {
+    let mut db = GraphDb::open(&tmp("param-replace")).unwrap();
+    seed(&mut db);
+    let params = map_param(vec![("a", Value::Int(9)), ("b", Value::Null)]);
+    db.query_write("MATCH (n:P) WHERE n.id = 'alice' SET n = $props", &params)
+        .unwrap();
+    let alice = props(&db, "alice");
+    assert_eq!(alice.get("a"), Some(&Value::Int(9)));
+    assert_eq!(alice.get("b"), None);
+    assert_eq!(alice.get("c"), None);
+    assert_eq!(alice.get("id"), Some(&Value::Str("alice".into())));
+    // Empty parameter map: replace clears, merge is a no-op.
+    let empty = map_param(vec![]);
+    let before = db.commit_seq();
+    db.query_write("MATCH (n:P) WHERE n.id = 'bob' SET n += $props", &empty)
+        .unwrap();
+    assert_eq!(db.commit_seq(), before);
+    db.query_write("MATCH (n:P) WHERE n.id = 'bob' SET n = $props", &empty)
+        .unwrap();
+    assert_eq!(props(&db, "bob").len(), 1, "only id remains");
+}
+
+#[test]
+fn a_parameter_map_meets_the_same_protections_as_a_literal() {
+    let mut db = degree_view_store("param-protect");
+    for (name, entries) in [
+        ("view", vec![("pop", Value::Int(5))]),
+        ("view-null", vec![("pop", Value::Null)]),
+        ("id", vec![("id", Value::Str("other".into()))]),
+    ] {
+        let params = map_param(entries);
+        let before = db.commit_seq();
+        let err = db
+            .query_write("MATCH (n:City) SET n += $props", &params)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GraphError::ViewPropReadOnly { .. } | GraphError::QueryError { .. }
+            ),
+            "{name}: {err:?}"
+        );
+        assert_eq!(db.commit_seq(), before, "{name}");
+    }
+    let mut ns_db = namespaced("param-ns");
+    let err = ns_db
+        .query_write(
+            "MATCH (n:P) WHERE n.id = 'n1' SET n = $props",
+            &map_param(vec![("ns", Value::Str("other".into()))]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GraphError::NamespaceImmutable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(ns_db.get_prop("n1", "a"), Some(Value::Int(1)));
+}
+
+#[test]
+fn a_parameter_that_is_not_a_map_is_a_named_error_and_writes_nothing() {
+    let mut db = GraphDb::open(&tmp("param-bad")).unwrap();
+    seed(&mut db);
+    let before = db.commit_seq();
+    for (what, value) in [
+        ("string", Some(Value::Str("x".into()))),
+        ("list", Some(Value::List(vec![Value::Int(1)]))),
+        ("null", Some(Value::Null)),
+        ("missing", None),
+    ] {
+        let mut params = p();
+        if let Some(v) = value {
+            params.insert("props".into(), v);
+        }
+        for q in ["MATCH (n:P) SET n = $props", "MATCH (n:P) SET n += $props"] {
+            let err = db.query_write(q, &params).unwrap_err();
+            let GraphError::QueryError { detail } = err else {
+                panic!("{what} {q}: expected QueryError");
+            };
+            if what != "missing" {
+                assert!(detail.contains("must be a map"), "{what} {q}: {detail}");
+            }
+        }
+    }
+    assert_eq!(db.commit_seq(), before);
+    assert_eq!(db.get_prop("alice", "a"), Some(Value::Int(1)));
+}
+
+// ── The key property in the single-property forms ───────────────────────────
+
+#[test]
+fn set_and_remove_of_the_key_property_are_refused_like_the_map_form() {
+    let mut db = GraphDb::open(&tmp("id-single")).unwrap();
+    seed(&mut db);
+    let before = db.commit_seq();
+    for q in [
+        "MATCH (n:P) WHERE n.id = 'alice' SET n.id = 'mallory'",
+        "MATCH (n:P) WHERE n.id = 'alice' SET n.a = 5, n.id = 7",
+        "MATCH (n:P) WHERE n.id = 'alice' REMOVE n.id",
+        "MATCH (n:P) WHERE n.id = 'alice' REMOVE n.a, n.id",
+        "MERGE (n:P {id: 'alice'}) ON MATCH SET n.id = 'mallory'",
+        "MERGE (n:P {id: 'zed'}) ON CREATE SET n.id = 'mallory'",
+    ] {
+        match query_err(&mut db, q) {
+            GraphError::QueryError { detail } => assert!(
+                detail.contains("`id`") && detail.contains("rename_node"),
+                "{q}: {detail}"
+            ),
+            other => panic!("{q}: expected QueryError, got {other:?}"),
+        }
+        assert_eq!(db.commit_seq(), before, "{q}: nothing written");
+    }
+    assert_eq!(db.get_prop("alice", "a"), Some(Value::Int(1)));
+    assert!(db.node_info("zed").is_none());
+    // Restating the key is a no-op, not an error.
+    run(
+        &mut db,
+        "MATCH (n:P) WHERE n.id = 'alice' SET n.id = 'alice', n.a = 6",
+    );
+    assert_eq!(db.get_prop("alice", "a"), Some(Value::Int(6)));
+    // Reading `n.id` is unchanged.
+    let rs = db
+        .query("MATCH (n:P) WHERE n.id = 'alice' RETURN n.id AS k", &p())
+        .unwrap();
+    assert_eq!(rs.get(0, "k"), Some(&Value::Str("alice".into())));
+}
+
+#[test]
+fn key_property_refusals_hold_inside_a_transaction_too() {
+    let dir = tmp("id-tx");
+    let db: SharedDb = SharedDb::open(&dir).unwrap();
+    db.submit_batch(vec![node("x")]).unwrap();
+    let mut tx = db.begin_transaction();
+    for q in [
+        "MATCH (n:P) WHERE n.id = 'x' SET n.id = 'y'",
+        "MATCH (n:P) WHERE n.id = 'x' REMOVE n.id",
+        "MERGE (n:P {id: 'x'}) ON MATCH SET n.id = 'y'",
+    ] {
+        assert!(
+            matches!(tx.execute(q, &p()), Err(GraphError::QueryError { .. })),
+            "{q}"
+        );
+    }
+    tx.commit().unwrap();
+    assert!(db.reader().node_info("x").is_some());
+}
+
+// ── MERGE with a map ────────────────────────────────────────────────────────
+
+#[test]
+fn merge_set_with_a_map_is_refused_by_name() {
+    let mut db = GraphDb::open(&tmp("merge-map")).unwrap();
+    for q in [
+        "MERGE (n:P {id: 'm'}) ON CREATE SET n = {a: 1}",
+        "MERGE (n:P {id: 'm'}) ON MATCH SET n += {a: 1}",
+        "MERGE (n:P {id: 'm'}) ON CREATE SET n.b = 1, n = {a: 1}",
+    ] {
+        match query_err(&mut db, q) {
+            GraphError::QueryError { detail } => assert!(
+                detail.contains("not supported in mushroomdb 0.10: MERGE … SET with a map"),
+                "{q}: {detail}"
+            ),
+            other => panic!("{q}: expected QueryError, got {other:?}"),
+        }
+    }
+    assert!(db.node_info("m").is_none());
 }
