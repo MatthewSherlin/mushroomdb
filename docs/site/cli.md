@@ -181,6 +181,8 @@ Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHAN
 ### `schema`
 
 ```text
+mushroomdb schema indexes <db-dir>
+mushroomdb schema constraints <db-dir>
 mushroomdb schema apply <db-dir> <schema.json>
 mushroomdb schema apply <db-dir> --memory-defaults
                                  applies the built-in memory schema to an existing store;
@@ -191,6 +193,8 @@ mushroomdb schema apply <db-dir> --memory-identity
 ```
 
 Idempotently apply a schema file (rules, views, fulltext indexes), the built-in memory schema, or the identity preset; prints a diff
+
+`schema indexes` and `schema constraints` print what `SHOW INDEXES` and `SHOW CONSTRAINTS` list, as a table with one row per index (`name | type | label | property | state`) or unique constraint (`name | type | label | property`) and the header alone when there are none. They open the store read-only: they write nothing and run while `mushroomdb serve` holds the store. Create and drop with the Cypher statements (`mushroomdb query`) or the [HTTP routes](http.md#schema-indexes-and-constraints).
 
 ### `build-index`
 

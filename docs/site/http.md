@@ -80,6 +80,8 @@ Role-token behavior per endpoint:
 | `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
+| `GET /schema/indexes`, `GET /schema/constraints` | 200 — only the rows whose label the role can see a node of, as `SHOW` lists them |
+| `POST`/`DELETE /schema/indexes`, `/schema/constraints` | 403 (schema changes are not permitted to a role token) |
 | `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
@@ -137,7 +139,7 @@ convert it.
 | Tier | What it is |
 |---|---|
 | `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
-| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/schema/*`, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
 | `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
 
 Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
@@ -1255,6 +1257,58 @@ only leave edges out; the score is a count.
 ```
 
 Highest first.
+
+## Schema indexes and constraints
+
+`/schema/indexes` and `/schema/constraints` list, create and drop the same things the Cypher statements `SHOW INDEXES`, `CREATE INDEX`, `DROP INDEX`, `SHOW CONSTRAINTS`, `CREATE CONSTRAINT` and `DROP CONSTRAINT` do, through the same code: a row has the fields and values `SHOW` gives it, and a request fails as the statement does. See [Cypher query language](query.md) for the statements.
+
+A `GET` needs read access, and a role-bound token or a `read` key sees only the rows `SHOW` shows it (those whose label it can see a node of). A `POST` or `DELETE` is a write: a full token, an `admin` key or a `write` key may; a role-bound token or a `read` key gets 403.
+
+Errors: a missing or empty field, an unknown `kind` or `type`, a `name` that is not letters, digits and underscores, or a range-index name beginning `eq_` or `ft_` (reserved for the names `SHOW INDEXES` lists equality and full-text indexes under) is `400`. A name that already exists, a pair that already has a range index, an index a unique constraint is checked against, and a constraint over properties that already hold duplicates are `409`. A name nothing answers to on `DELETE` is `404`. Each carries `{"error": "..."}`.
+
+### `GET /schema/indexes`
+
+Every index, range, equality and full-text, sorted by name.
+
+```json
+[{"name": "idx_Person_age", "type": "range", "label": "Person", "property": "age", "state": "online"}]
+```
+
+### `POST /schema/indexes`
+
+Declare an index.
+
+```json
+{"name": "by_age", "label": "Person", "property": "age", "kind": "range"}
+```
+
+`label` and `property` are required. `kind` is `"range"` (the default) or `"equality"`; full-text indexes are declared in a schema file, not here. `name` is optional for a range index and is `idx_<label>_<property>` without it. An equality index has no name of its own and is listed as `eq_<label>_<property>`: omit `name` or give exactly that. Answers `201` with the row `GET` lists.
+
+### `DELETE /schema/indexes/{name}`
+
+Drop the index listed under `name`, of any kind. `204` with no body. An equality index that a unique constraint is checked against is `409` naming the constraint: drop the constraint first.
+
+### `GET /schema/constraints`
+
+Every unique constraint, sorted by name.
+
+```json
+[{"name": "uc_email", "type": "unique", "label": "User", "property": "email"}]
+```
+
+### `POST /schema/constraints`
+
+Declare a unique constraint.
+
+```json
+{"name": "uc_email", "label": "User", "property": "email", "type": "unique"}
+```
+
+`name`, `label` and `property` are required; `type` is `"unique"`, the only one, and may be left out. Answers `201` with the row `GET` lists. Its equality index is created with it.
+
+### `DELETE /schema/constraints/{name}`
+
+Withdraw the constraint. `204` with no body. Its equality index stays.
 
 ## Live streams
 

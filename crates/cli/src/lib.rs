@@ -20,8 +20,8 @@ pub use mushroomdb::restore::RestoreOutcome;
 use mushroomdb::schema::Schema;
 use mushroomdb::{
     default_max_edges, is_write_query, valid_namespace, AlgoDir, BackupReport, DegreeConfig,
-    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs,
-    ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    Explanation, GraphDb, IngestOptions, LouvainConfig, OpenOptions, PageRankConfig, Predicate,
+    RealFs, ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
     WriteGuard, NS_MAX_LEN,
 };
 use std::collections::BTreeMap;
@@ -369,6 +369,12 @@ pub enum Command {
         memory_defaults: bool,
         memory_identity: bool,
     },
+    /// List the declared indexes (`schema indexes <db-dir>`) or unique
+    /// constraints (`schema constraints <db-dir>`) as a table.
+    SchemaList {
+        db_dir: PathBuf,
+        what: SchemaListing,
+    },
     /// Migrate an old-format snapshot to the current version and keep `.bak`.
     Migrate {
         db_dir: PathBuf,
@@ -522,6 +528,8 @@ Usage:
                      operator who wants the build finished before traffic arrives; a rule
                      created over a large corpus derives no edges until its index is whole
   mushroomdb migrate <db-dir>
+  mushroomdb schema indexes <db-dir>
+  mushroomdb schema constraints <db-dir>
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb schema apply <db-dir> --memory-defaults
                                    applies the built-in memory schema to an existing store;
@@ -1777,13 +1785,92 @@ pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<St
 
 fn parse_schema(args: &[&str]) -> Result<Command, String> {
     if args.is_empty() {
-        return Err("schema requires a subcommand: apply".to_string());
+        return Err("schema requires a subcommand: apply | indexes | constraints".to_string());
     }
     match args[0] {
         "apply" => parse_schema_apply(&args[1..]),
+        "indexes" => {
+            parse_one_dir("schema indexes", &args[1..]).map(|db_dir| Command::SchemaList {
+                db_dir,
+                what: SchemaListing::Indexes,
+            })
+        }
+        "constraints" => {
+            parse_one_dir("schema constraints", &args[1..]).map(|db_dir| Command::SchemaList {
+                db_dir,
+                what: SchemaListing::Constraints,
+            })
+        }
         other => Err(format!(
-            "unknown schema subcommand: {other}; expected apply"
+            "unknown schema subcommand: {other}; expected apply | indexes | constraints"
         )),
+    }
+}
+
+/// What `mushroomdb schema indexes|constraints` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaListing {
+    Indexes,
+    Constraints,
+}
+
+/// `mushroomdb schema indexes|constraints`: the rows `SHOW INDEXES` /
+/// `SHOW CONSTRAINTS` give, as a table. The store opens read-only, so this
+/// writes nothing and never waits on a writer, a server included.
+pub fn run_schema_list(db_dir: &Path, what: SchemaListing) -> Result<String, CliError> {
+    let db = GraphDb::open_with_options(
+        db_dir,
+        OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )?;
+    let statement = match what {
+        SchemaListing::Indexes => "SHOW INDEXES",
+        SchemaListing::Constraints => "SHOW CONSTRAINTS",
+    };
+    let rs = db.query(statement, &BTreeMap::new())?;
+    let columns = rs.columns();
+    let rows: Vec<Vec<String>> = (0..rs.len())
+        .map(|i| {
+            columns
+                .iter()
+                .map(|c| fmt_cell_plain(rs.get(i, c)))
+                .collect()
+        })
+        .collect();
+    let widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(n, c)| {
+            rows.iter()
+                .map(|r| r[n].chars().count())
+                .chain([c.chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: &[String]| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
+        format!("{}\n", padded.join(" | ").trim_end())
+    };
+    let mut out = line(columns);
+    for row in &rows {
+        out.push_str(&line(row));
+    }
+    Ok(out)
+}
+
+/// A cell as text, without the quoting [`fmt_cell`] puts around a string.
+fn fmt_cell_plain(cell: Option<&Value>) -> String {
+    match cell {
+        Some(Value::Str(s)) => s.clone(),
+        other => fmt_cell(other),
     }
 }
 

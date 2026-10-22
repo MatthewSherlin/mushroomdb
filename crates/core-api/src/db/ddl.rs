@@ -260,6 +260,64 @@ impl<F: Fs> GraphDb<F> {
         SchemaListing::of(&self.prop_index, &self.fulltext, &self.constraints)
     }
 
+    /// `CREATE INDEX [name] FOR (n:label) ON (n.field)` for the HTTP routes:
+    /// the same statement, run by the same code, without going through text.
+    /// Returns the name the index is listed under.
+    pub fn schema_create_range_index(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        field: &str,
+    ) -> Result<String> {
+        let listed = name
+            .map(str::to_string)
+            .unwrap_or_else(|| auto_index_name(label, field));
+        self.exec_ddl(DdlStatement::CreateIndex {
+            name: name.map(str::to_string),
+            label: label.to_string(),
+            field: field.to_string(),
+            if_not_exists: false,
+        })?;
+        Ok(listed)
+    }
+
+    /// Declare the equality index on `(label, field)`, which `SHOW INDEXES`
+    /// lists as `eq_<label>_<field>` (Cypher DDL creates range indexes only).
+    /// Returns that name.
+    pub fn schema_create_equality_index(&mut self, label: &str, field: &str) -> Result<String> {
+        self.enable_index(label, field)?;
+        Ok(equality_index_name(label, field))
+    }
+
+    /// `DROP INDEX name`, for any listed kind.
+    pub fn schema_drop_index(&mut self, name: &str) -> Result<()> {
+        self.exec_ddl(DdlStatement::DropIndex {
+            name: name.to_string(),
+            if_exists: false,
+        })
+        .map(|_| ())
+    }
+
+    /// `CREATE CONSTRAINT name FOR (n:label) REQUIRE n.field IS UNIQUE`.
+    pub fn schema_create_constraint(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
+        self.exec_ddl(DdlStatement::CreateConstraint {
+            name: name.to_string(),
+            label: label.to_string(),
+            field: field.to_string(),
+            if_not_exists: false,
+        })
+        .map(|_| ())
+    }
+
+    /// `DROP CONSTRAINT name`.
+    pub fn schema_drop_constraint(&mut self, name: &str) -> Result<()> {
+        self.exec_ddl(DdlStatement::DropConstraint {
+            name: name.to_string(),
+            if_exists: false,
+        })
+        .map(|_| ())
+    }
+
     /// Run a parsed DDL statement. `SHOW …` answers from the live state; the
     /// rest change the schema and are refused on a read-only handle before
     /// anything else, `IF [NOT] EXISTS` included.
