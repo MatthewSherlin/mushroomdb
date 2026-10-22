@@ -6655,13 +6655,19 @@ fixed.
 | `mushroomdb_process_start_time_seconds` | gauge | Server start, Unix seconds (uptime is `time() - this`) |
 | `mushroomdb_slow_queries_total` | counter | Reads that met the slow-query threshold since start |
 | `mushroomdb_http_transactions_open` | gauge | Open `/tx` transactions |
+| `mushroomdb_bolt_connections_open` | gauge | Bolt connections being served now |
+| `mushroomdb_bolt_connections_accepted_total` | counter | Bolt connections admitted since the listener started |
 | `mushroomdb_backup_upload_errors_total` | counter | Failed backup steps since start |
 | `mushroomdb_backup_last_success_timestamp_seconds` | gauge | Unix time all durable data was last shipped; 0 before the first |
 | `mushroomdb_backup_lag_seconds` | gauge | Seconds the oldest unshipped durable WAL byte has waited; 0 when all is shipped |
 | `mushroomdb_backup_healthy` | gauge | 1 while the backup worker reports healthy, else 0 |
+| `mushroomdb_backup_lease_held` | gauge | 1 while this instance holds the bucket lease, 0 while another does or the lease was lost |
 
-The four `mushroomdb_backup_*` series exist only on a server running continuous
-backup (`MUSHROOMDB_BACKUP_S3_URL`); without it they are absent, not zero.
+The five `mushroomdb_backup_*` series exist only on a server running continuous
+backup (`MUSHROOMDB_BACKUP_S3_URL`); without it they are absent, not zero. The
+two `mushroomdb_bolt_*` series exist only when the Bolt listener is on
+(`--bolt-port`). One process reports one store's metrics. The response carries
+`Vary: Accept`, and `Accept` quality values are not weighed.
 
 A scrape config, with the token as a bearer credential (a full-access token or an
 `admin`-tier key; role tokens and `write`/`read` keys get 403):
@@ -6670,6 +6676,7 @@ A scrape config, with the token as a bearer credential (a full-access token or a
 scrape_configs:
   - job_name: mushroomdb
     metrics_path: /metrics
+    scheme: https   # when the server terminates TLS (--tls-cert/--tls-key) or a proxy does
     authorization:
       credentials: "<full-access token>"
     static_configs:

@@ -14,8 +14,8 @@ mod ws;
 use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
 
 pub use http::{
-    register_backup_metrics, BackupMetrics, TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV,
-    TX_TIMEOUT_ENV,
+    register_backup_metrics, register_bolt_metrics, BackupMetrics, BoltMetrics, TxLimits,
+    TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV,
 };
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 

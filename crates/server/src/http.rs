@@ -2297,11 +2297,50 @@ pub struct BackupMetrics {
     pub lag_s: Arc<AtomicU64>,
     /// Whether the worker reports itself healthy.
     pub healthy: Arc<AtomicBool>,
+    /// Whether the worker holds the bucket lease right now.
+    pub lease_held: Arc<AtomicBool>,
+}
+
+/// The Bolt listener's counters `GET /metrics` reports as
+/// `mushroomdb_bolt_connections_*`; absent when Bolt is off.
+#[derive(Debug, Clone)]
+pub struct BoltMetrics {
+    /// Connections being served now.
+    pub open: Arc<AtomicU64>,
+    /// Connections admitted since the listener started.
+    pub accepted: Arc<AtomicU64>,
+}
+
+static BOLT_METRICS: std::sync::Mutex<Option<BoltMetrics>> = std::sync::Mutex::new(None);
+
+/// Report `metrics` on `GET /metrics` from now on. Like
+/// [`register_backup_metrics`] this is per process: one process serves one
+/// store's metrics.
+pub fn register_bolt_metrics(metrics: BoltMetrics) {
+    *BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+}
+
+fn registered_bolt_metrics() -> Option<BoltSample> {
+    let guard = BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().map(|m| BoltSample {
+        open: m.open.load(Ordering::Acquire),
+        accepted_total: m.accepted.load(Ordering::Acquire),
+    })
+}
+
+/// One reading of the Bolt counters.
+struct BoltSample {
+    open: u64,
+    accepted_total: u64,
 }
 
 static BACKUP_METRICS: std::sync::Mutex<Option<BackupMetrics>> = std::sync::Mutex::new(None);
 
 /// Report `metrics` on `GET /metrics` from now on. Replaces an earlier call.
+///
+/// The registration is process-wide: one process serves one store's metrics,
+/// as `mushroomdb serve` does. Serving several stores from one process would
+/// need these threaded through `AppState` instead.
 pub fn register_backup_metrics(metrics: BackupMetrics) {
     *BACKUP_METRICS
         .lock()
@@ -2317,6 +2356,7 @@ fn registered_backup_metrics() -> Option<BackupSample> {
         last_success_ts: m.last_success_ts.load(Ordering::Acquire),
         lag_s: m.lag_s.load(Ordering::Acquire),
         healthy: m.healthy.load(Ordering::Acquire),
+        lease_held: m.lease_held.load(Ordering::Acquire),
     })
 }
 
@@ -2332,6 +2372,7 @@ struct BackupSample {
     last_success_ts: u64,
     lag_s: u64,
     healthy: bool,
+    lease_held: bool,
 }
 
 /// Everything the text exposition reports, read once.
@@ -2345,6 +2386,7 @@ struct PrometheusSample {
     process_start_time_seconds: u64,
     slow_queries_total: u64,
     transactions_open: u64,
+    bolt: Option<BoltSample>,
     backup: Option<BackupSample>,
 }
 
@@ -2354,7 +2396,7 @@ struct PrometheusSample {
 /// `text/html,...` or a client that lists `application/json` among others
 /// (`application/json, text/plain, */*`) gets JSON. Only a caller that names
 /// `text/plain` or `application/openmetrics-text` and not JSON gets text, which
-/// is what a Prometheus scraper sends.
+/// is what a Prometheus scraper sends. Quality values are not weighed.
 fn wants_prometheus_text(headers: &HeaderMap) -> bool {
     let mut text = false;
     for value in headers.get_all(header::ACCEPT) {
@@ -2457,6 +2499,22 @@ fn format_prometheus(s: &PrometheusSample) -> String {
         "Open interactive HTTP transactions.",
         s.transactions_open,
     );
+    if let Some(b) = &s.bolt {
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_open",
+            "gauge",
+            "Bolt connections being served now.",
+            b.open,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_accepted_total",
+            "counter",
+            "Bolt connections admitted since the listener started.",
+            b.accepted_total,
+        );
+    }
     if let Some(b) = &s.backup {
         write_family(
             &mut out,
@@ -2485,6 +2543,13 @@ fn format_prometheus(s: &PrometheusSample) -> String {
             "gauge",
             "1 while the backup worker reports itself healthy, else 0.",
             u8::from(b.healthy),
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_lease_held",
+            "gauge",
+            "1 while this instance holds the backup bucket lease, else 0.",
+            u8::from(b.lease_held),
         );
     }
     out
@@ -2518,11 +2583,15 @@ async fn metrics(
             process_start_time_seconds: state.started_unix_s,
             slow_queries_total: slow_snap.count,
             transactions_open: state.txs.open_count() as u64,
+            bolt: registered_bolt_metrics(),
             backup: registered_backup_metrics(),
         });
         return (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+            [
+                (header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE),
+                (header::VARY, "Accept"),
+            ],
             text,
         )
             .into_response();
@@ -2539,7 +2608,7 @@ async fn metrics(
             })
         })
         .collect();
-    json_ok(json!({
+    let mut response = json_ok(json!({
         "nodes_live": nodes_live,
         "nodes_tombstoned": nodes_tombstoned,
         "edges": edges,
@@ -2552,7 +2621,11 @@ async fn metrics(
             "count": slow_snap.count,
             "last": slow_entries,
         },
-    }))
+    }));
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    response
 }
 
 /// `Content-Type` of the Prometheus text exposition.
@@ -3946,7 +4019,11 @@ impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
 
 #[cfg(test)]
 mod tests {
-    fn prom_sample(backup: Option<BackupSample>, rss: Option<u64>) -> PrometheusSample {
+    fn prom_sample(
+        backup: Option<BackupSample>,
+        bolt: Option<BoltSample>,
+        rss: Option<u64>,
+    ) -> PrometheusSample {
         PrometheusSample {
             nodes_live: 3,
             nodes_tombstoned: 1,
@@ -3957,13 +4034,14 @@ mod tests {
             process_start_time_seconds: 1_700_000_000,
             slow_queries_total: 4,
             transactions_open: 2,
+            bolt,
             backup,
         }
     }
 
     #[test]
     fn prometheus_text_has_help_and_type_for_every_sample() {
-        let text = format_prometheus(&prom_sample(None, Some(1024)));
+        let text = format_prometheus(&prom_sample(None, None, Some(1024)));
         let samples: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         assert!(samples.contains(&"mushroomdb_nodes_live 3"));
         assert!(samples.contains(&"mushroomdb_commits_total 9"));
@@ -3974,6 +4052,23 @@ mod tests {
             assert!(text.contains(&format!("# TYPE {name} ")), "{name} TYPE");
         }
         assert!(!text.contains("backup"));
+        assert!(!text.contains("bolt"), "no Bolt series with Bolt off");
+    }
+
+    #[test]
+    fn prometheus_text_reports_bolt_connections_when_bolt_is_on() {
+        let text = format_prometheus(&prom_sample(
+            None,
+            Some(BoltSample {
+                open: 3,
+                accepted_total: 41,
+            }),
+            None,
+        ));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_open gauge\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_open 3\n"));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_accepted_total counter\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_accepted_total 41\n"));
     }
 
     #[test]
@@ -3984,7 +4079,9 @@ mod tests {
                 last_success_ts: 1_700_000_123,
                 lag_s: 7,
                 healthy: false,
+                lease_held: true,
             }),
+            None,
             None,
         ));
         assert!(!text.contains("mushroomdb_rss_bytes"));
@@ -3993,6 +4090,8 @@ mod tests {
         assert!(text.contains("\nmushroomdb_backup_last_success_timestamp_seconds 1700000123\n"));
         assert!(text.contains("\nmushroomdb_backup_lag_seconds 7\n"));
         assert!(text.contains("\nmushroomdb_backup_healthy 0\n"));
+        assert!(text.contains("# TYPE mushroomdb_backup_lease_held gauge\n"));
+        assert!(text.contains("\nmushroomdb_backup_lease_held 1\n"));
     }
 
     #[test]
