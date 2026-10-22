@@ -1071,3 +1071,35 @@ fn a_non_v11_store_keeps_wal_genesis() {
     db.snapshot().unwrap();
     assert!(!dir.join("wal.genesis.v11").exists());
 }
+
+/// `commit_group_nosync` — the drain's own entry point, public — upgrades
+/// ahead of its first append like `commit_group`, rather than refusing the
+/// store's first V11 value at the in-group backstop on every retry.
+#[test]
+fn commit_group_nosync_upgrades_ahead_of_its_first_append() {
+    use mushroomdb::BatchOp;
+    let dir = tmp("group-nosync");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap();
+    let set = |k: &str, d: i32| BatchOp::SetProp {
+        key: k.into(),
+        field: "on".into(),
+        value: date(d),
+    };
+    let plain = BatchOp::InsertNode {
+        label: "N".into(),
+        key: "b".into(),
+        props: vec![],
+    };
+    let results = db.commit_group_nosync(vec![vec![plain], vec![set("a", 1)]]);
+    assert!(results.iter().all(Result::is_ok), "{:?}", results.len());
+    assert!(db.is_v11());
+    assert_eq!(peek_snapshot_version(&dir), Some(11));
+    // A second V11 value through the same path needs no second upgrade.
+    let again = db.commit_group_nosync(vec![vec![set("b", 2)]]);
+    assert!(again[0].is_ok());
+    drop(db);
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(reopened.get_prop("a", "on"), Some(date(1)));
+    assert_eq!(reopened.get_prop("b", "on"), Some(date(2)));
+}

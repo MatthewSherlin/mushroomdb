@@ -3116,7 +3116,8 @@ impl<F: Fs> GraphDb<F> {
             db.v11_features = true;
         }
         // The declarations a V11 snapshot carries itself (section 18), applied
-        // just before the WAL replays. `None` for every earlier snapshot.
+        // at the `held` boundary of the replay below — the point of the WAL
+        // the snapshot was taken at. `None` for every earlier snapshot.
         let mut snapshot_declarations = None;
         // No snapshot means no snapshot has ever truncated the WAL, so this
         // handle can prove the history is whole. Once a snapshot exists that
@@ -8546,6 +8547,12 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> Vec<Result<(usize, usize)>> {
+        // Ahead of the first append, as `commit_group` and the drain do: the
+        // upgrade fsyncs the WAL before its snapshot, so the snapshot holds
+        // only durable state, never a submission of this group.
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return group_refusal(e, groups.len());
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
