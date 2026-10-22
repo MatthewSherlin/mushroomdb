@@ -1354,9 +1354,11 @@ which is what the MCP tool's JSON reply calls it), `created`,
 `matched`, `derived`, `provisional`, `provisional_capped` (keys past
 the per-call cap of 20, **not** created), `fulltext_declared`,
 `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-the identity links this call made, and the ones it retracted). A
-`score` is the raw float (`0.6666666666666666`); the MCP tool prints
-the same score to two decimals.
+the identity links this call made, and the ones it retracted), and
+`same_as_unread` (`None`, or the error text when the write committed
+but its links could not be read back, so both lists are empty because
+nothing was read). A `score` is the raw float (`0.6666666666666666`);
+the MCP tool prints the same score to two decimals.
 
 Raises `IngestError` when the text is empty or over 4,000 characters,
 the `kind` is unknown, an entity's `props` carry `aliases` or
@@ -1445,10 +1447,13 @@ node its own namespace is a no-op and another raises
 is a `ValueError`.
 
 Returns `{"key", "label", "created", "updated_fields",
-"same_as_lost"}`. `same_as_lost` lists the identity links this update
-retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-full-name link below the floor. A `score` is the raw float
-(`0.6666666666666666`); the MCP tool prints it to two decimals.
+"same_as_lost", "same_as_unread"}`. `same_as_lost` lists the identity
+links this update retracted, as `{"a", "b", "score"}`: a changed `name`
+can take a full-name link below the floor. `same_as_unread` is `None`,
+or the error text when the update committed but the links could not be
+read back afterwards, so `same_as_lost` is empty because nothing was
+read. A `score` is the raw float (`0.6666666666666666`); the MCP tool
+prints it to two decimals.
 
 `aliases` or `alias_keys` inside `props` raise `IngestError`: the
 store maintains both. So does a `key` that is empty or only
