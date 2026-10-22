@@ -125,7 +125,7 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
 
 /// The k8s manifest as JSON documents. Parsing is done by python3's PyYAML (no
 /// YAML crate may be added); the test is skipped with a message where that is
-/// unavailable.
+/// unavailable, and fails when `CI` is set.
 fn k8s_documents() -> Option<Vec<serde_json::Value>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s/statefulset.yaml");
     let script =
@@ -137,6 +137,11 @@ fn k8s_documents() -> Option<Vec<serde_json::Value>> {
     match out {
         Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).expect("json")),
         other => {
+            // A skip in CI would leave the manifest unchecked without anyone seeing it.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "python3 with PyYAML is required in CI: {other:?}"
+            );
             eprintln!("skipping: python3 with PyYAML unavailable: {other:?}");
             None
         }
