@@ -617,7 +617,7 @@ Usage:
   mushroomdb --version
   mushroomdb --help
 
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).

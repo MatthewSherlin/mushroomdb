@@ -428,3 +428,21 @@ fn nothing_configured_still_refuses_a_non_loopback_address() {
     assert!(!listening);
     assert!(stderr.contains(NON_LOOPBACK_MESSAGE), "{stderr}");
 }
+
+/// `--help` states the non-loopback rule the refusal applies, admin key
+/// included (the generated CLI reference page is built from this text).
+#[test]
+fn help_names_an_admin_key_as_satisfying_the_non_loopback_rule() {
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("--help")
+        .output()
+        .expect("run --help");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains(
+            "Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in \
+             `<db-dir>/keys.json` (read and write keys alone do not count)."
+        ),
+        "{help}"
+    );
+}

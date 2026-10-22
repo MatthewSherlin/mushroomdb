@@ -45,7 +45,7 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 
 {{usage serve}}
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
 
 ### `mcp`
 
@@ -125,6 +125,12 @@ Drive a rule's vector index to completion a slice at a time, for an operator who
 
 Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole
 
+### `keys`
+
+{{usage keys}}
+
+`keys add` works on every platform (the token comes from the operating system's random source). It writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. The mode and owner check on `keys.json` applies on Unix only; Windows has none. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+
 ### `verify`
 
 {{usage verify}}
@@ -153,7 +159,7 @@ Restore a continuous S3 backup, the newest restore point or a point in time, int
 
 {{usage export}}
 
-Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools. `--format jsonl --single-file` writes one `graph.jsonl` of typed `node`, `edge` and `rule` lines. JSONL, CSV and Cypher stream, so memory does not grow with the properties of the store. CSV (`nodes.csv`, `relationships.csv`) and JSONL load back with `import` and give the same store, rules included; Cypher (`graph.cypher`, one `MERGE` per line) is read by this engine's own `query`, and says in its output what it could not write. The formats are described in [Durability](durability.md#export-cli)
+Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools. `--format jsonl --single-file` writes one `graph.jsonl` of typed `node`, `edge` and `rule` lines. JSONL, CSV and Cypher stream, so memory does not grow with the properties of the store. CSV (`nodes.csv`, `relationships.csv`) and JSONL load back with `import` and give the same store, rules included; Cypher (`graph.cypher`, one `MERGE` per line) is read by this engine's own `query`, and says in its output what it could not write, such as a NaN or infinite float, or a property whose name or map key holds a line break (one line cannot carry it; the JSONL export does). The formats are described in [Durability](durability.md#export-cli)
 
 ### `import`
 
