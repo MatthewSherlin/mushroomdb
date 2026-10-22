@@ -5599,6 +5599,8 @@ fn pull_scan_label(
     if let Some((field, cmp_op_ref, lit)) = fused_filter {
         // Fused scan+filter: column resolved once, comparison done
         // inline — no recursive call into pull_rows for the Filter arm.
+        // The column reads layer, overlay and snapshot base, as
+        // `resolve_prop` does (ledger row 139).
         #[cfg(test)]
         FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
         let col = ctx.view.props.column(field);
@@ -5625,11 +5627,9 @@ fn pull_scan_label(
                     if !ctx.view.visible(id) {
                         continue;
                     }
-                    if let Some(v) = col.get(id) {
-                        if eval_cmp(cmp_op_ref, v, lit) {
-                            row[slot] = Some(Cell::Node(id));
-                            pull_rows(ctx, rest_after_filter, row, result)?;
-                        }
+                    if col.test(id, |v| eval_cmp(cmp_op_ref, v, lit)) {
+                        row[slot] = Some(Cell::Node(id));
+                        pull_rows(ctx, rest_after_filter, row, result)?;
                     }
                 }
             };

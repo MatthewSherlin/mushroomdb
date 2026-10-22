@@ -810,27 +810,6 @@ fn random_graph(rng: &mut Rng, db: &mut GraphDb, index: bool) {
     }
 }
 
-/// REMOVE WHEN QL-FS (branch `v0.10/ql-fs-fused-scan`) lands: ledger row 139.
-///
-/// The released pull path fuses a lone `WHERE n.f <op> <literal>` into its
-/// label walk when a `LIMIT` follows with no `ORDER BY`; the fused walk reads
-/// only the column overlay and misses values in a snapshot's base. Without an
-/// index TY-10's plan falls back to that walk, so for exactly that shape the
-/// no-index store is not an oracle until QL-FS fixes it. (The index plan does
-/// not share the defect: it is compared against the unfused scan for every
-/// shape.) Every other shape is compared without an index too.
-fn row_139_shape(cypher: &str) -> bool {
-    let (Some(at), Some(ret)) = (cypher.find(" WHERE "), cypher.find(" RETURN ")) else {
-        return false;
-    };
-    let pred = &cypher[at + " WHERE ".len()..ret];
-    let lone_literal_cmp = pred.starts_with("n.val ")
-        && !pred.contains(" AND ")
-        && !pred.contains('$')
-        && !pred.contains("STARTS WITH");
-    lone_literal_cmp && cypher.contains(" LIMIT ") && !cypher.contains(" ORDER BY ")
-}
-
 fn run(db: &GraphDb, cypher: &str, params: &[(String, Value)]) -> String {
     let map: BTreeMap<String, Value> = params.iter().cloned().collect();
     // Debug text compares NaN with NaN, which `==` on values does not.
@@ -864,14 +843,11 @@ fn index_plans_return_exactly_what_the_scan_returns() {
                 "seed {seed}: {index_q} {params:?}\n  vs {scan_q}"
             );
             // Without the index the plan falls back to the label scan.
-            let fused_shape = row_139_shape(&index_q);
-            if !fused_shape {
-                let unindexed = run(&plain, &index_q, &params);
-                assert_eq!(
-                    got, unindexed,
-                    "seed {seed}, no index: {index_q} {params:?}"
-                );
-            }
+            let unindexed = run(&plain, &index_q, &params);
+            assert_eq!(
+                got, unindexed,
+                "seed {seed}, no index: {index_q} {params:?}"
+            );
             // Under a mask (what a role or a namespace resolves to).
             let visible: Vec<String> = (0..60)
                 .filter(|_| rng.below(2) == 0)
