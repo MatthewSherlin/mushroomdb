@@ -45,6 +45,8 @@ include_dir = { version = "0.7", optional = true }
 # RSS memory metric — already in the transitive tree at 0.2.189; direct dep
 # so the cfg(target_os) blocks compile without an indirect version pin.
 libc = { version = "0.2", default-features = false }
+# Transaction ids: 128 random bits from the thread's CSPRNG.
+rand = "0.9"
 
 [dev-dependencies]
 # `test-hooks` exposes `GraphDb::push_unapplyable_delta_for_test`, which
