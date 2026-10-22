@@ -303,8 +303,14 @@ fn percentile_cont_is_continuous_across_a_boundary() {
 fn stdev_is_stable_with_a_large_offset() {
     let xs: Vec<f64> = WIKI.iter().map(|x| 1e9 + x).collect();
     let fx = floats(&xs);
-    assert_close(one(&fx, "MATCH (n:N) RETURN stDevP(n.score)"), 2.0);
-    assert_close(
+    // A sum-of-squares formula loses everything here; the running mean keeps
+    // the error near one ulp of 1e9 (about 1e-7).
+    let near = |got: Option<Value>, want: f64| match got {
+        Some(Value::Float(g)) => assert!((g - want).abs() < 1e-6, "got {g}, want {want}"),
+        other => panic!("want Float({want}), got {other:?}"),
+    };
+    near(one(&fx, "MATCH (n:N) RETURN stDevP(n.score)"), 2.0);
+    near(
         one(&fx, "MATCH (n:N) RETURN stDev(n.score)"),
         (32.0f64 / 7.0).sqrt(),
     );
