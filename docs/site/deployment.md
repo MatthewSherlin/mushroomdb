@@ -265,44 +265,53 @@ a release blocker that closes when every restore gets a new lineage.
 
 ## Stopping cleanly, and the grace period
 
-On SIGTERM or SIGINT `serve` stops in this order, so that no acknowledged write
-is lost:
+On SIGTERM or SIGINT `serve` stops in three phases, all inside one deadline,
+`--shutdown-timeout-secs` (default 55):
 
-1. It stops accepting connections and lets every request already in flight
-   finish.
-2. It takes the shutdown snapshot.
-3. If continuous backup is on, it tells the backup worker to stop and waits for
-   it. The worker uploads the last WAL segment and the new snapshot, writes a
-   final restore point, and deletes the bucket lease. The lease is deleted only
-   if it still names this instance.
-
-Step 3 is bounded. The worker abandons an upload still running after
-`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS`, then spends at most one request deadline
-(`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`) on releasing the lease. `serve` waits for
-that, plus 2 s, and no longer. If the bucket is unreachable it logs a warning
-and exits; the local store is already safe, and the lease expires by itself
-after its TTL.
-
-| Variable | Default | Meaning |
+| Phase | What happens | Bound at the defaults |
 | --- | --- | --- |
+| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. Whatever is still open at the bound is cut off. | 25 s |
+| 2. Snapshot | Write the shutdown snapshot. If it has not finished by its bound it is skipped: the WAL holds every commit and the next open replays it. | 8 s (what is left) |
+| 3. Backup | Tell the backup worker to stop. It uploads the last WAL segment and the new snapshot, writes a final restore point, and deletes the bucket lease (only if it still names this instance). | 22 s |
+
+The arithmetic: the backup phase is reserved first. It is
+`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` (10 s) plus one request deadline,
+`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` (10 s), plus 2 s, which is 22 s. The drain
+takes at most 25 s, or less if the deadline leaves less after that reserve. The
+snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
+time to the next one. Every phase runs even when an earlier one ran out, so the
+lease is released whenever the bucket is reachable. If the bucket is
+unreachable the log says so, the process exits, and the lease expires by itself
+after its TTL. No acknowledged write is lost in any of these cases, because the
+WAL holds every commit.
+
+| Variable or flag | Default | Meaning |
+| --- | --- | --- |
+| `--shutdown-timeout-secs` | `55` | The whole shutdown must finish within this many seconds |
 | `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take before the upload in flight is abandoned |
 | `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request, including the lease release |
 
-**Set the platform's stop timeout above the whole sequence.** The backup's part
-is at most `SHUTDOWN_GRACE_MS + OP_TIMEOUT_MS + 2 s`, 22 s at the defaults. The
-drain (step 1) and the snapshot (step 2) come first, and both grow with the
-store and with the slowest request in flight. A platform that kills the process
-earlier cuts the sequence short. Nothing is lost, because the WAL holds every
-commit, but the lease is then left behind and the next start waits for it. Aim
-for at least 60 s at the defaults, and raise it by the same amount if you raise
-either variable.
+**A second SIGTERM or SIGINT exits at once.** An operator who presses Ctrl-C
+twice on a slow shutdown gets an immediate exit. The log says that the backup
+lease, if held, expires on its own after its TTL (at most 40 s until a
+successor holds it).
 
-| Platform | Setting | Template value |
-| --- | --- | --- |
-| Fly.io | `kill_timeout` | `"60s"` |
-| Docker Compose | `stop_grace_period` | `60s` |
-| Kubernetes | `terminationGracePeriodSeconds` | at least `60` (the default, 30, is shorter than the sequence) |
-| Render, Railway | set by the platform | check that it allows the sequence above; Railway's is `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` |
+**Set the platform's stop timeout above `--shutdown-timeout-secs`.** A platform
+that sends SIGKILL earlier cuts the sequence short. Nothing is lost, but the
+lease is left behind and the next start waits for it. The templates use 60 s.
+If you raise `--shutdown-timeout-secs`, raise the platform's value by the same
+amount.
+
+| Platform | Setting | Default | Template value |
+| --- | --- | --- | --- |
+| Fly.io | `kill_timeout` | not checked | `"60s"` |
+| Docker Compose | `stop_grace_period` | 10 s | `60s` |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Render | `maxShutdownDelaySeconds` (1-300) | 30 | `60` |
+| Railway | `drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified | `60` (the maximum is unverified) |
+
+Render's and Railway's settings were read from their current documentation; the
+Fly.io value and the Railway default and maximum were not confirmed.
 
 **Backup health never gates `/ready`.** `/ready` answers 503 only until the
 store is open. A rolling deploy starts the new instance while the old one still

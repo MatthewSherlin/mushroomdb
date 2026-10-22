@@ -158,6 +158,7 @@ fn main() -> ExitCode {
             token,
             role_tokens,
             snapshot_every,
+            shutdown_timeout,
             restore_from,
             tls_cert,
             tls_key,
@@ -247,6 +248,7 @@ fn main() -> ExitCode {
                 token,
                 all_role_tokens,
                 snapshot_every,
+                shutdown_timeout,
                 tls_cert,
                 tls_key,
             ))
@@ -600,11 +602,12 @@ fn run_serve(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     snapshot_every: Option<Duration>,
+    shutdown_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         // Same guard as `run_mcp`: checked before `open` creates the
         // directory's files, so it tells a brand-new store from one this
         // invocation is merely reopening (or one `--demo-if-empty` /
@@ -648,10 +651,11 @@ fn run_serve(
         let backup = start_backup(&db, &db_dir)?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut snapshot_task = None;
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
             let backup_tx = backup.as_ref().map(|(tx, _, _)| tx.clone());
-            tokio::spawn(async move {
+            snapshot_task = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await; // skip immediate fire
@@ -681,7 +685,7 @@ fn run_serve(
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
                 }
-            });
+            }));
         }
         // A quiescent server still finishes a vector-index build it was handed:
         // one slice a second, and the rule's edges appear when it completes.
@@ -851,6 +855,7 @@ fn run_serve(
                 };
             }
         }
+        let mut backup = backup;
         let outcome = tokio::select! {
             result = &mut serve => match result {
                 Ok(Ok(())) => Ok(()),
@@ -858,55 +863,135 @@ fn run_serve(
                 Err(e) => Err(e.to_string()),
             },
             _ = shutdown_signal() => {
-                // Ask the server to stop, then wait for it. In-flight requests
-                // and live subscribers finish; `serve.abort()` cut them off.
-                // Only then is the store quiet: every acknowledged write is in
-                // the WAL, and the backup flush below ships all of it.
-                tracing::info!("shutdown signal received; draining in-flight requests");
-                let _ = stop_tx.send(());
-                match (&mut serve).await {
-                    Ok(Ok(())) => tracing::info!("drained; stopped"),
-                    Ok(Err(e)) => tracing::error!(error = %e, "server exited with an error"),
-                    Err(e) => tracing::error!(error = %e, "server task failed"),
+                let deadline = std::time::Instant::now() + shutdown_timeout;
+                // The periodic snapshot must not run beside the shutdown one.
+                if let Some(task) = &snapshot_task {
+                    task.abort();
                 }
-                // Same rule as the periodic snapshot: it needs the store's
-                // write lock. Shutting down without one is fine — the WAL holds
-                // every commit, and the next open replays it.
-                match cli::snapshot_shared(&db) {
-                    Ok(()) => Ok(()),
-                    Err(GraphError::Busy { .. }) => {
-                        eprintln!(
-                            "shutdown snapshot skipped: another process holds the write lock"
+                // Listen for a second signal before the sequence starts, so
+                // none is swallowed by the handler tokio keeps installed.
+                let second = shutdown_signal();
+                let sequence = graceful_stop(&mut serve, stop_tx, &db, backup.take(), deadline);
+                tokio::select! {
+                    result = sequence => result,
+                    _ = second => {
+                        tracing::warn!(
+                            "second shutdown signal: exiting now; the backup lease, if held, \
+                             expires on its own after its TTL"
                         );
-                        Ok(())
+                        Err("shutdown forced by a second signal".to_string())
                     }
-                    Err(e) => Err(e.to_string()),
                 }
             }
         };
-        // However serving ended, the backup worker gets its last flush and
-        // gives the bucket lease back, so a successor starts at once instead
-        // of waiting out the TTL.
-        if let Some(running) = backup {
-            stop_backup(running).await;
+        // The server ended by itself: the backup still gets its last flush.
+        if let Some((tx, handle, budget)) = backup.take() {
+            stop_backup(tx, handle, budget).await;
         }
         outcome
-    })
+    });
+    // A snapshot abandoned past the deadline runs on a blocking thread; do not
+    // wait for it (the WAL already holds every commit).
+    rt.shutdown_background();
+    result
 }
 
-/// Send the backup worker `Shutdown` and wait for it, no longer than the
-/// worker's own bound (`BackupConfig::shutdown_budget`). The worker flushes
-/// the last WAL segment and any new snapshot, writes a final manifest, and
-/// deletes its lease. A timeout is logged and ignored: the local store is
-/// already safe, and the lease then expires by itself.
-async fn stop_backup((tx, handle, budget): RunningBackup) {
+/// Test hook: delay the shutdown snapshot by this many milliseconds, to
+/// exercise the overrun path. Never set in production.
+const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS";
+
+/// The graceful shutdown, in three bounded phases inside one `deadline`:
+///
+/// 1. **Drain**: stop accepting and let in-flight requests finish, for at most
+///    [`cli::SHUTDOWN_DRAIN_SECS`] (less if the deadline leaves less, after the
+///    backup's reserve). What is still open then is cut off.
+/// 2. **Snapshot**, on a blocking thread, in what remains once the backup's
+///    reserve is set aside. If it overruns it is skipped: the WAL holds every
+///    commit and the next open replays it.
+/// 3. **Backup**: flush, final manifest, lease release, for at most the
+///    backup's own bound (or what the deadline leaves).
+///
+/// Every phase runs even if an earlier one failed or ran out, so the lease is
+/// always released when the bucket is reachable.
+async fn graceful_stop(
+    serve: &mut tokio::task::JoinHandle<io::Result<()>>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    db: &SharedDb,
+    backup: Option<RunningBackup>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let reserve = backup.as_ref().map_or(Duration::ZERO, |(_, _, b)| *b);
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
+    let _ = stop_tx.send(());
+    let drain = Duration::from_secs(cli::SHUTDOWN_DRAIN_SECS).min(left().saturating_sub(reserve));
+    match tokio::time::timeout(drain, &mut *serve).await {
+        Ok(Ok(Ok(()))) => tracing::info!("drained; stopped"),
+        Ok(Ok(Err(e))) => tracing::error!(error = %e, "server exited with an error"),
+        Ok(Err(e)) => tracing::error!(error = %e, "server task failed"),
+        Err(_) => {
+            tracing::warn!(
+                drain_s = drain.as_secs(),
+                "requests still open after the drain period; closing them"
+            );
+            serve.abort();
+        }
+    }
+
+    // Same rule as the periodic snapshot: it needs the store's write lock.
+    // Shutting down without one is fine: the WAL holds every commit.
+    let mut outcome = Ok(());
+    let snapshot_budget = left().saturating_sub(reserve);
+    if snapshot_budget.is_zero() {
+        tracing::warn!("no time left for the shutdown snapshot; skipped (the WAL is durable)");
+    } else {
+        let db_snap = db.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            if let Some(ms) = std::env::var(TEST_SNAPSHOT_DELAY_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            cli::snapshot_shared(&db_snap)
+        });
+        match tokio::time::timeout(snapshot_budget, snapshot).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(GraphError::Busy { .. }))) => {
+                eprintln!("shutdown snapshot skipped: another process holds the write lock");
+            }
+            Ok(Ok(Err(e))) => outcome = Err(e.to_string()),
+            Ok(Err(e)) => outcome = Err(format!("shutdown snapshot task failed: {e}")),
+            Err(_) => tracing::warn!(
+                budget_s = snapshot_budget.as_secs(),
+                "the shutdown snapshot overran its budget; skipped (the WAL is durable)"
+            ),
+        }
+    }
+
+    if let Some((tx, handle, budget)) = backup {
+        stop_backup(tx, handle, budget.min(left())).await;
+    }
+    outcome
+}
+
+/// Send the backup worker `Shutdown` and wait for it, no longer than `wait`.
+/// The worker flushes the last WAL segment and any new snapshot, writes a
+/// final manifest, and deletes its lease. A timeout is logged and ignored: the
+/// local store is already safe, and the lease then expires by itself.
+async fn stop_backup(
+    tx: tokio::sync::watch::Sender<backup::BackupTrigger>,
+    handle: backup::BackupHandle,
+    wait: Duration,
+) {
     tracing::info!("shutdown: flushing the S3 backup");
     let _ = tx.send(backup::BackupTrigger::Shutdown);
-    match tokio::time::timeout(budget, handle.join).await {
+    match tokio::time::timeout(wait, handle.join).await {
         Ok(Ok(())) => tracing::info!("shutdown: backup flushed"),
         Ok(Err(e)) => tracing::warn!(error = %e, "shutdown: the backup worker failed"),
         Err(_) => tracing::warn!(
-            budget_s = budget.as_secs(),
+            wait_s = wait.as_secs(),
             "shutdown: the S3 flush did not finish in time; the local store is safe"
         ),
     }

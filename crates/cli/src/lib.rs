@@ -264,6 +264,10 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// `--shutdown-timeout-secs`: the whole graceful shutdown (drain,
+        /// snapshot, backup flush, lease release) must finish within this.
+        /// Default [`DEFAULT_SHUTDOWN_TIMEOUT_SECS`].
+        shutdown_timeout: Duration,
         /// Seed an empty `db_dir` from the newest backup under this directory
         /// before opening it. See [`restore_if_empty`]. `None` = off (default).
         restore_from: Option<PathBuf>,
@@ -521,7 +525,7 @@ Usage:
                                       graphml writes one file: <dest>/graph.graphml if <dest> is an
                                       existing directory, otherwise <dest> is the file path itself
                                       (nodes + edges only; rules have no GraphML analogue)
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
@@ -931,6 +935,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
@@ -998,6 +1003,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--shutdown-timeout-secs" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --shutdown-timeout-secs".to_string())?;
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--shutdown-timeout-secs=") {
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 1;
         } else if a == "--restore-from" {
             let val = args
                 .get(i + 1)
@@ -1054,6 +1069,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        shutdown_timeout,
         restore_from,
         tls_cert,
         tls_key,
@@ -1071,6 +1087,23 @@ fn parse_role_token(val: &str) -> Result<(String, String), String> {
         return Err("--role-token: ROLE must not be empty".to_string());
     }
     Ok((tok.to_string(), role.to_string()))
+}
+
+/// Default for `serve --shutdown-timeout-secs`: drain up to 25 s, snapshot in
+/// what is left of the budget (8 s with the default backup bounds), then flush
+/// the backup and release the lease within 22 s.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 55;
+/// The longest the drain phase of a shutdown may take.
+pub const SHUTDOWN_DRAIN_SECS: u64 = 25;
+
+fn parse_shutdown_timeout(val: &str) -> Result<Duration, String> {
+    let secs: u64 = val
+        .parse()
+        .map_err(|_| format!("invalid --shutdown-timeout-secs: {val}"))?;
+    if secs == 0 {
+        return Err("--shutdown-timeout-secs must be a positive number of seconds".into());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
@@ -3331,6 +3364,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3360,6 +3394,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3392,6 +3427,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3784,6 +3820,34 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_shutdown_timeout_parses_seconds_and_defaults_to_55() {
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(55)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", "90"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(90)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs=7"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(7)),
+            other => panic!("{other:?}"),
+        }
+        for bad in ["0", "nope"] {
+            let err =
+                parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", bad]).unwrap_err();
+            assert!(err.contains("shutdown-timeout-secs"), "{err}");
+        }
+        assert!(parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs"]).is_err());
     }
 
     #[test]

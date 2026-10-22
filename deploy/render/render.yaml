@@ -31,6 +31,10 @@ services:
       sizeGB: 10
     # Render probes the port named by PORT; the server binds 8080 (--addr above).
     healthCheckPath: /ready
+    # Time between SIGTERM and SIGKILL (default 30, range 1-300). serve drains,
+    # snapshots, flushes the backup and deletes its bucket lease within 55 s by
+    # default; see docs/site/deployment.md, "Stopping cleanly".
+    maxShutdownDelaySeconds: 60
     envVars:
       - key: PORT
         value: "8080"

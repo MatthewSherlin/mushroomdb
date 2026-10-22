@@ -129,7 +129,7 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
 #[test]
 fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
     for (name, needle) in [
-        ("fly/fly.toml", "kill_timeout = \"60s\""),
+        ("fly/fly.toml", "\nkill_timeout = \"60s\"\n"),
         (
             "docker-compose/docker-compose.yml",
             "stop_grace_period: 60s",

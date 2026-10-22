@@ -177,20 +177,32 @@ impl S3Env {
 
     /// `serve` against `dir`, backing up to `prefix`, stdout piped.
     fn serve(&self, dir: &PathBuf, prefix: &str) -> std::process::Child {
-        serve(
-            dir,
-            &[
-                ("MUSHROOMDB_BACKUP_S3_URL", self.url(prefix).as_str()),
-                ("MUSHROOMDB_BACKUP_WAL_INTERVAL_MS", "100"),
-                ("AWS_ENDPOINT_URL", self.endpoint.as_str()),
-                ("AWS_ACCESS_KEY_ID", self.key.as_str()),
-                ("AWS_SECRET_ACCESS_KEY", self.secret.as_str()),
-            ],
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mushroomdb serve")
+        self.serve_with(dir, prefix, &[], &[])
+    }
+
+    /// As [`serve`](Self::serve), with extra arguments and environment.
+    fn serve_with(
+        &self,
+        dir: &PathBuf,
+        prefix: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::process::Child {
+        let url = self.url(prefix);
+        let mut all: Vec<(&str, &str)> = vec![
+            ("MUSHROOMDB_BACKUP_S3_URL", url.as_str()),
+            ("MUSHROOMDB_BACKUP_WAL_INTERVAL_MS", "100"),
+            ("AWS_ENDPOINT_URL", self.endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", self.key.as_str()),
+            ("AWS_SECRET_ACCESS_KEY", self.secret.as_str()),
+        ];
+        all.extend_from_slice(env);
+        serve(dir, &all)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mushroomdb serve")
     }
 }
 
@@ -457,4 +469,199 @@ fn a_black_holed_bucket_does_not_hold_up_a_shutdown() {
     // Budget 3 s, plus the drain and the snapshot of an empty store.
     assert!(took < Duration::from_secs(8), "shutdown took {took:?}");
     drop(held);
+}
+
+/// Open a request that never finishes: the headers promise a body, one byte
+/// arrives, and the socket stays open. The server cannot drain it.
+fn stuck_request(addr: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).expect("connect to serve");
+    stream
+        .write_all(
+            b"POST /nodes HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+              Content-Length: 1000\r\n\r\n{",
+        )
+        .unwrap();
+    stream.flush().unwrap();
+    stream
+}
+
+fn send_term(child: &std::process::Child) {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+}
+
+/// Wait for exit and return how long it took; any exit status.
+fn wait_exit(child: &mut std::process::Child, started: std::time::Instant, within: Duration) {
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        assert!(
+            started.elapsed() < within,
+            "serve was still running {:?} after the signal",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const SMALL_BACKUP_BOUNDS: [(&str, &str); 2] = [
+    ("MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS", "500"),
+    ("MUSHROOMDB_BACKUP_OP_TIMEOUT_MS", "500"),
+];
+
+#[test]
+fn a_stuck_request_does_not_stop_shutdown_finishing_within_the_deadline() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let dir = tmp("stuck");
+    let prefix = dir.file_name().unwrap().to_string_lossy().to_string();
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Backup bounds 3 s, deadline 10 s: the drain gets 7 s.
+    let mut child = s3.serve_with(
+        &dir,
+        &prefix,
+        &["--shutdown-timeout-secs", "10"],
+        &SMALL_BACKUP_BOUNDS,
+    );
+    let addr = listening_addr(&mut child);
+    create_node(&addr, "acked");
+    rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LEASE"),
+        Duration::from_secs(20),
+    ));
+    let _stuck = stuck_request(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    send_term(&child);
+    wait_exit(&mut child, started, Duration::from_secs(13));
+    let gone = rt.block_on(store.get(&ObjectPath::from(format!("{prefix}/LEASE"))));
+    assert!(
+        matches!(gone, Err(backup::object_store::Error::NotFound { .. })),
+        "the lease is released even though the drain timed out: {gone:?}"
+    );
+    assert!(mushroomdb::GraphDb::open(&dir).unwrap().has_node("acked"));
+}
+
+#[test]
+fn a_second_signal_exits_immediately() {
+    let dir = tmp("second-signal");
+    let mut child = serve(&dir, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mushroomdb serve");
+    let addr = listening_addr(&mut child);
+    let _stuck = stuck_request(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+    send_term(&child);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the stuck request holds the drain open"
+    );
+    let started = std::time::Instant::now();
+    send_term(&child);
+    wait_exit(&mut child, started, Duration::from_secs(3));
+}
+
+#[test]
+fn a_snapshot_that_overruns_is_skipped_and_the_lease_is_still_released() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let dir = tmp("slow-snapshot");
+    let prefix = dir.file_name().unwrap().to_string_lossy().to_string();
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut env = SMALL_BACKUP_BOUNDS.to_vec();
+    env.push(("MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS", "60000"));
+    // Deadline 10 s, backup reserve 3 s: the snapshot gets 7 s of a 60 s job.
+    let mut child = s3.serve_with(&dir, &prefix, &["--shutdown-timeout-secs", "10"], &env);
+    let addr = listening_addr(&mut child);
+    create_node(&addr, "acked");
+    rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LEASE"),
+        Duration::from_secs(20),
+    ));
+    let started = std::time::Instant::now();
+    send_term(&child);
+    wait_exit(&mut child, started, Duration::from_secs(13));
+    let gone = rt.block_on(store.get(&ObjectPath::from(format!("{prefix}/LEASE"))));
+    assert!(
+        matches!(gone, Err(backup::object_store::Error::NotFound { .. })),
+        "the lease is released after a skipped snapshot: {gone:?}"
+    );
+    // No snapshot was written, and the commit is still in the WAL.
+    assert!(
+        !dir.join("snapshot.bin").exists(),
+        "the snapshot was skipped"
+    );
+    assert!(mushroomdb::GraphDb::open(&dir).unwrap().has_node("acked"));
+}
+
+#[test]
+fn writes_acknowledged_before_sigterm_are_present_after_restart() {
+    let dir = tmp("acked");
+    let mut child = serve(&dir, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mushroomdb serve");
+    let addr = listening_addr(&mut child);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let addr = addr.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut acked = Vec::new();
+                for n in 0u32.. {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let key = format!("w{w}-{n}");
+                    let Ok(mut stream) = TcpStream::connect(&addr) else {
+                        break;
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let body = format!(r#"{{"label":"Thing","key":"{key}"}}"#);
+                    let req = format!(
+                        "POST /nodes HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(req.as_bytes()).is_err() {
+                        break;
+                    }
+                    let mut raw = String::new();
+                    let _ = stream.read_to_string(&mut raw);
+                    if raw.starts_with("HTTP/1.1 200") {
+                        acked.push(key);
+                    }
+                }
+                acked
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(800));
+    let started = std::time::Instant::now();
+    send_term(&child);
+    wait_exit(&mut child, started, Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let acked: Vec<String> = writers
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    assert!(!acked.is_empty(), "the writers acknowledged nothing");
+    let reopened = mushroomdb::GraphDb::open(&dir).unwrap();
+    for key in &acked {
+        assert!(reopened.has_node(key), "{key} was acknowledged but is gone");
+    }
 }
