@@ -21,6 +21,26 @@ pub struct PathHop {
     pub trail_var: Option<String>,
 }
 
+/// One end of an [`PlanOp::IndexRangeScan`] range: `field > value` (or `>=`
+/// when `inclusive`) for a lower bound, `field < value` (or `<=`) for an
+/// upper one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeBound {
+    pub value: Operand,
+    pub inclusive: bool,
+}
+
+/// The `ORDER BY n.field [DESC] [SKIP s] LIMIT k` that follows an
+/// [`PlanOp::IndexRangeScan`] over `field`: the scan need only produce the
+/// candidates for the first `s + k` sorted rows. The `OrderBy`, `Skip` and
+/// `Limit` ops stay in the plan and do the sorting and slicing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeOrder {
+    pub descending: bool,
+    pub skip: Option<LimitSkip>,
+    pub limit: LimitSkip,
+}
+
 /// One operator in the logical plan. Patterns compile left-to-right into
 /// scan / join / expand ops; WHERE is a single `Filter`; then `Project`,
 /// rewritten `OrderBy`, `Skip`, `Limit` in that order.
@@ -63,6 +83,32 @@ pub enum PlanOp {
         var: String,
         label: Option<String>,
         equalities: Vec<(String, Operand)>,
+    },
+    /// Range-index lookup: seed rows from the nodes of `label` whose `field`
+    /// lies within `lo`/`hi`, or starts with `prefix`; with `order`, only
+    /// the ones an `ORDER BY` over `field` followed by `LIMIT` can keep.
+    ///
+    /// Emitted by [`fold_range_predicates`] for a `WHERE` conjunct
+    /// `n.field < | <= | > | >= <literal or $param>` (either side) or
+    /// `n.field STARTS WITH <literal or $param>`, and by
+    /// [`fold_index_order`] for `ORDER BY n.field … LIMIT`. The `Filter` the
+    /// bounds came from stays in the plan, whole, so the op only narrows the
+    /// candidates: the rows are those of `ScanLabel` + that `Filter`.
+    ///
+    /// The executor answers from the range index when one is declared on
+    /// `(label, field)` and the view carries it, and the bounds are of a
+    /// class the index orders (numbers, strings, the temporal types except
+    /// `Duration`, binary); otherwise it scans the label. Either way the
+    /// candidates come out in node-id order, the order a label scan gives, so
+    /// the rows and their order do not depend on whether an index exists.
+    IndexRangeScan {
+        var: String,
+        label: String,
+        field: String,
+        lo: Option<RangeBound>,
+        hi: Option<RangeBound>,
+        prefix: Option<Operand>,
+        order: Option<RangeOrder>,
     },
     /// Retain rows whose `var` node matches the pattern-map props.
     LookupProps {
@@ -385,6 +431,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
                 | PlanOp::ScanKey { .. }
                 | PlanOp::IndexScan { .. }
                 | PlanOp::IndexIntersect { .. }
+                | PlanOp::IndexRangeScan { order: None, .. }
                 | PlanOp::LookupProps { .. }
                 | PlanOp::Expand { .. }
                 | PlanOp::Filter { .. }
@@ -400,6 +447,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
                 | PlanOp::ScanKey { .. }
                 | PlanOp::IndexScan { .. }
                 | PlanOp::IndexIntersect { .. }
+                | PlanOp::IndexRangeScan { .. }
         )
     })
     // Exactly one Project (ensures it is a RETURN query).
@@ -459,6 +507,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     // aggregate or project ops are appended.
     ops = fold_where_equalities(ops);
     ops = fold_key_anchor_after_expand(ops);
+    ops = fold_range_predicates(ops);
 
     // Post-UNWIND WHERE: filter expanded rows using UNWIND alias bindings.
     if let Some(expr) = &q.post_unwind_where {
@@ -612,7 +661,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::Limit(ls.clone()));
     }
 
-    Ok(ops)
+    Ok(fold_index_order(ops, q))
 }
 
 /// Compile one WITH pipeline stage.
@@ -1093,6 +1142,324 @@ pub(super) fn fold_key_anchor_after_expand(mut ops: Vec<PlanOp>) -> Vec<PlanOp> 
         None => {
             ops.remove(filter_pos);
         }
+    }
+    ops
+}
+
+/// One `WHERE` conjunct a range index can answer, on `field` of the scan
+/// variable.
+#[derive(Debug, Clone)]
+enum RangeTerm {
+    Lower(String, RangeBound),
+    Upper(String, RangeBound),
+    Prefix(String, Operand),
+}
+
+impl RangeTerm {
+    fn field(&self) -> &str {
+        match self {
+            RangeTerm::Lower(f, _) | RangeTerm::Upper(f, _) | RangeTerm::Prefix(f, _) => f,
+        }
+    }
+}
+
+/// A bound operand an index lookup can take: a `$param` (checked when it is
+/// resolved), or a literal of a class the index orders. A `Bool`, list, map,
+/// `Duration` or `null` literal never ranges over the index; its conjunct is
+/// left to the scan, which answers it.
+fn range_operand(op: &Operand) -> bool {
+    match op {
+        Operand::Param(_) => true,
+        Operand::Lit(v) => matches!(
+            v,
+            core_storage::Value::Int(_)
+                | core_storage::Value::Float(_)
+                | core_storage::Value::Str(_)
+                | core_storage::Value::Date(_)
+                | core_storage::Value::LocalDateTime(_)
+                | core_storage::Value::DateTime { .. }
+                | core_storage::Value::Binary(_)
+        ),
+        _ => false,
+    }
+}
+
+/// A stored property a range index can hold: not the node identity that
+/// `n.key`, `n.id` and `n.label` fall back to when nothing is stored.
+fn range_field(field: &str) -> bool {
+    !matches!(field, "key" | "id" | "label")
+}
+
+/// `term` as a [`RangeTerm`] on `scan_var`, if it is one.
+fn range_term(term: &Expr, scan_var: &str) -> Option<RangeTerm> {
+    match term {
+        Expr::Cmp { lhs, op, rhs } => {
+            // `n.f > x` as written, or `x < n.f` turned around.
+            let (field, op, value) = match (lhs, rhs) {
+                (Operand::Prop { var, field }, value) if var == scan_var => {
+                    (field, op.clone(), value)
+                }
+                (value, Operand::Prop { var, field }) if var == scan_var => (
+                    field,
+                    match op {
+                        CmpOp::Lt => CmpOp::Gt,
+                        CmpOp::Le => CmpOp::Ge,
+                        CmpOp::Gt => CmpOp::Lt,
+                        CmpOp::Ge => CmpOp::Le,
+                        other => other.clone(),
+                    },
+                    value,
+                ),
+                _ => return None,
+            };
+            if !range_field(field) || !range_operand(value) {
+                return None;
+            }
+            let bound = |inclusive| RangeBound {
+                value: value.clone(),
+                inclusive,
+            };
+            let field = field.clone();
+            match op {
+                CmpOp::Gt => Some(RangeTerm::Lower(field, bound(false))),
+                CmpOp::Ge => Some(RangeTerm::Lower(field, bound(true))),
+                CmpOp::Lt => Some(RangeTerm::Upper(field, bound(false))),
+                CmpOp::Le => Some(RangeTerm::Upper(field, bound(true))),
+                CmpOp::Eq | CmpOp::Ne => None,
+            }
+        }
+        Expr::Truthy(Operand::FuncCall { name, args })
+            if name.eq_ignore_ascii_case("startsWith") && args.len() == 2 =>
+        {
+            match (&args[0], &args[1]) {
+                (Operand::Prop { var, field }, prefix)
+                    if var == scan_var
+                        && range_field(field)
+                        && matches!(
+                            prefix,
+                            Operand::Param(_) | Operand::Lit(core_storage::Value::Str(_))
+                        ) =>
+                {
+                    Some(RangeTerm::Prefix(field.clone(), prefix.clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The bounds a range scan over one field takes from a `WHERE`'s conjuncts:
+/// the field of the first range conjunct, its first lower and first upper
+/// bound — or, when that first conjunct is a `STARTS WITH`, that prefix
+/// alone. `consumed` counts the conjuncts the bounds stand for.
+struct RangeSpec {
+    field: String,
+    lo: Option<RangeBound>,
+    hi: Option<RangeBound>,
+    prefix: Option<Operand>,
+    consumed: usize,
+}
+
+fn range_spec(terms: &[Expr], scan_var: &str) -> Option<RangeSpec> {
+    let found: Vec<RangeTerm> = terms
+        .iter()
+        .filter_map(|t| range_term(t, scan_var))
+        .collect();
+    let first = found.first()?;
+    let mut spec = RangeSpec {
+        field: first.field().to_string(),
+        lo: None,
+        hi: None,
+        prefix: None,
+        consumed: 0,
+    };
+    if let RangeTerm::Prefix(_, prefix) = first {
+        spec.prefix = Some(prefix.clone());
+        spec.consumed = 1;
+        return Some(spec);
+    }
+    for term in found.iter().filter(|t| t.field() == spec.field) {
+        match term {
+            RangeTerm::Lower(_, b) if spec.lo.is_none() => spec.lo = Some(b.clone()),
+            RangeTerm::Upper(_, b) if spec.hi.is_none() => spec.hi = Some(b.clone()),
+            _ => continue,
+        }
+        spec.consumed += 1;
+    }
+    Some(spec)
+}
+
+/// Post-pass: seed a label scan from a range index when its `WHERE` holds a
+/// range or `STARTS WITH` conjunct on the scanned node (see
+/// [`PlanOp::IndexRangeScan`]).
+///
+/// Eligibility mirrors [`fold_where_equalities`]: the plan's first scan op is
+/// a labelled `ScanLabel` (an equality fold, which is more selective, already
+/// took it otherwise), and no op that walks relationships or runs a pipeline
+/// stands between it and the first `Filter`. The `Filter` is kept whole: the
+/// op narrows the candidates and the filter still decides every row, so the
+/// rows are the scan's. Candidates come in node-id order, as the scan's do.
+///
+/// As with the equality fold, a residual conjunct that would raise an error
+/// on a node outside the range is not evaluated on that node.
+pub(super) fn fold_range_predicates(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
+    let Some(scan_pos) = ops.iter().position(|op| {
+        matches!(
+            op,
+            PlanOp::ScanLabel { .. }
+                | PlanOp::ScanKey { .. }
+                | PlanOp::IndexScan { .. }
+                | PlanOp::IndexIntersect { .. }
+        )
+    }) else {
+        return ops;
+    };
+    let PlanOp::ScanLabel {
+        var,
+        label: Some(label),
+    } = &ops[scan_pos]
+    else {
+        return ops;
+    };
+    let mut filter = None;
+    for op in &ops[scan_pos + 1..] {
+        match op {
+            PlanOp::Filter { expr } => {
+                filter = Some(expr);
+                break;
+            }
+            PlanOp::ScanLabel { .. }
+            | PlanOp::ScanKey { .. }
+            | PlanOp::IndexScan { .. }
+            | PlanOp::IndexIntersect { .. }
+            | PlanOp::LookupProps { .. }
+            | PlanOp::JoinBound { .. } => {}
+            _ => return ops,
+        }
+    }
+    let Some(expr) = filter else {
+        return ops;
+    };
+    let Some(spec) = range_spec(&split_and(expr.clone()), var) else {
+        return ops;
+    };
+    ops[scan_pos] = PlanOp::IndexRangeScan {
+        var: var.clone(),
+        label: label.clone(),
+        field: spec.field,
+        lo: spec.lo,
+        hi: spec.hi,
+        prefix: spec.prefix,
+        order: None,
+    };
+    ops
+}
+
+/// The `(var, field)` an `ORDER BY` item sorts by, when it is a node property
+/// read directly or through a `RETURN` alias.
+fn order_prop<'a>(item: &'a OrderItem, returns: &'a [RetItem]) -> Option<(&'a str, &'a str)> {
+    match &item.target {
+        OrderTarget::Prop { var, field } | OrderTarget::Expr(Operand::Prop { var, field }) => {
+            Some((var, field))
+        }
+        OrderTarget::Alias(name) => {
+            let ret = returns
+                .iter()
+                .find(|r| r.alias.as_deref() == Some(name.as_str()))?;
+            match &ret.value {
+                RetVal::Prop { var, field } | RetVal::ScalarExpr(Operand::Prop { var, field }) => {
+                    Some((var, field))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Post-pass: let a range index produce only the candidates of an
+/// `ORDER BY n.field [DESC] … LIMIT` top-k (see [`RangeOrder`]).
+///
+/// Only the plain shape qualifies — one labelled scan of `n`, then at most a
+/// `Filter`, `Project`, `OrderBy`, an optional `Skip`, and `Limit` — with a
+/// single sort key that is `n.field`, and no `DISTINCT`. A `Filter` is
+/// allowed only when every one of its conjuncts is a bound the scan already
+/// takes on that same field: any other conjunct could drop rows of the top
+/// k, so the k sorted first would not be the k returned.
+pub(super) fn fold_index_order(mut ops: Vec<PlanOp>, q: &Query) -> Vec<PlanOp> {
+    if q.distinct || q.order_by.len() != 1 {
+        return ops;
+    }
+    let Some(limit) = q.limit.clone() else {
+        return ops;
+    };
+    let Some((order_var, order_field)) = order_prop(&q.order_by[0], &q.returns) else {
+        return ops;
+    };
+    if !range_field(order_field) {
+        return ops;
+    }
+    let has_filter = matches!(ops.get(1), Some(PlanOp::Filter { .. }));
+    let tail = &ops[1 + usize::from(has_filter)..];
+    let shape_ok = matches!(
+        tail,
+        [
+            PlanOp::Project { .. },
+            PlanOp::OrderBy { .. },
+            PlanOp::Limit(_)
+        ] | [
+            PlanOp::Project { .. },
+            PlanOp::OrderBy { .. },
+            PlanOp::Skip(_),
+            PlanOp::Limit(_)
+        ]
+    );
+    if !shape_ok {
+        return ops;
+    }
+    let order = RangeOrder {
+        descending: q.order_by[0].descending,
+        skip: q.skip.clone(),
+        limit,
+    };
+    match &ops[0] {
+        PlanOp::ScanLabel {
+            var,
+            label: Some(label),
+        } if var == order_var && !has_filter => {
+            ops[0] = PlanOp::IndexRangeScan {
+                var: var.clone(),
+                label: label.clone(),
+                field: order_field.to_string(),
+                lo: None,
+                hi: None,
+                prefix: None,
+                order: Some(order),
+            };
+        }
+        PlanOp::IndexRangeScan {
+            var,
+            field,
+            lo,
+            hi,
+            prefix,
+            ..
+        } if var == order_var && field == order_field => {
+            let bounds = usize::from(lo.is_some())
+                + usize::from(hi.is_some())
+                + usize::from(prefix.is_some());
+            let conjuncts = match ops.get(1) {
+                Some(PlanOp::Filter { expr }) => split_and(expr.clone()).len(),
+                _ => 0,
+            };
+            if conjuncts == bounds {
+                if let PlanOp::IndexRangeScan { order: slot, .. } = &mut ops[0] {
+                    *slot = Some(order);
+                }
+            }
+        }
+        _ => {}
     }
     ops
 }
@@ -2119,7 +2486,7 @@ fn resolve_order_items(
 
 #[cfg(test)]
 mod tests {
-    use super::{plan, PlanOp};
+    use super::{plan, split_and, PlanOp, RangeBound};
     use crate::cypher::ast::{Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
     use crate::cypher::{lex, parse, RelDir};
     use crate::filter::CmpOp;
@@ -3138,5 +3505,135 @@ LIMIT 10";
             !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
             "all three equalities fully consumed; no residual Filter expected"
         );
+    }
+
+    // ── TY-10: range predicates, STARTS WITH, ORDER BY over a range index ──
+
+    fn first(src: &str) -> PlanOp {
+        plan_src(src).unwrap().remove(0)
+    }
+
+    fn range_parts(op: &PlanOp) -> (String, Option<RangeBound>, Option<RangeBound>, bool, bool) {
+        match op {
+            PlanOp::IndexRangeScan {
+                field,
+                lo,
+                hi,
+                prefix,
+                order,
+                ..
+            } => (
+                field.clone(),
+                lo.clone(),
+                hi.clone(),
+                prefix.is_some(),
+                order.is_some(),
+            ),
+            other => panic!("expected IndexRangeScan, got {other:?}"),
+        }
+    }
+
+    fn bound(value: Operand, inclusive: bool) -> Option<RangeBound> {
+        Some(RangeBound { value, inclusive })
+    }
+
+    #[test]
+    fn range_conjuncts_become_bounds_and_the_filter_stays_whole() {
+        let ops =
+            plan_src("MATCH (n:S) WHERE n.v >= 1 AND n.v < $hi AND n.w <> 2 RETURN n").unwrap();
+        let (field, lo, hi, prefix, order) = range_parts(&ops[0]);
+        assert_eq!(field, "v");
+        assert_eq!(lo, bound(Operand::Lit(core_storage::Value::Int(1)), true));
+        assert_eq!(hi, bound(Operand::Param("hi".into()), false));
+        assert!(!prefix && !order);
+        // The bounds' conjuncts stay in the filter with the rest.
+        assert!(matches!(&ops[1], PlanOp::Filter { expr } if split_and(expr.clone()).len() == 3));
+    }
+
+    #[test]
+    fn a_reversed_comparison_is_turned_around() {
+        let (_, lo, hi, _, _) = range_parts(&first("MATCH (n:S) WHERE 5 > n.v RETURN n"));
+        assert_eq!(lo, None);
+        assert_eq!(hi, bound(Operand::Lit(core_storage::Value::Int(5)), false));
+    }
+
+    #[test]
+    fn starts_with_becomes_a_prefix() {
+        let (field, lo, hi, prefix, _) =
+            range_parts(&first("MATCH (n:S) WHERE n.name STARTS WITH 'al' RETURN n"));
+        assert_eq!(field, "name");
+        assert!(prefix && lo.is_none() && hi.is_none());
+    }
+
+    #[test]
+    fn what_a_range_index_cannot_answer_stays_a_scan() {
+        for src in [
+            // An equality anchor wins.
+            "MATCH (n:S) WHERE n.v = 1 AND n.v > 0 RETURN n",
+            // Node identity is not a stored property.
+            "MATCH (n:S) WHERE n.key > 'a' RETURN n",
+            "MATCH (n:S) WHERE n.id >= 'a' RETURN n",
+            // No label, no index.
+            "MATCH (n) WHERE n.v > 1 RETURN n",
+            // Literals of classes the index does not order.
+            "MATCH (n:S) WHERE n.v > true RETURN n",
+            "MATCH (n:S) WHERE n.v > null RETURN n",
+            // A disjunction, a negation, a property of another node.
+            "MATCH (n:S) WHERE n.v > 1 OR n.v < 0 RETURN n",
+            "MATCH (n:S) WHERE NOT n.v > 1 RETURN n",
+            "MATCH (n:S) WHERE n.v > n.w RETURN n",
+            // Across a relationship.
+            "MATCH (n:S)-[:R]->(m) WHERE n.v > 1 RETURN m",
+        ] {
+            let ops = plan_src(src).unwrap();
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(op, PlanOp::IndexRangeScan { .. })),
+                "{src}: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_by_limit_over_the_field_is_a_top_k() {
+        for src in [
+            "MATCH (n:S) RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) RETURN n.v AS v ORDER BY v DESC SKIP 1 LIMIT 3",
+            "MATCH (n:S) WHERE n.v > 1 AND n.v <= 9 RETURN n ORDER BY n.v LIMIT $k",
+            "MATCH (n:S) WHERE n.v STARTS WITH 'a' RETURN n ORDER BY n.v LIMIT 3",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let (_, _, _, _, order) = range_parts(&ops[0]);
+            assert!(order, "{src}: {ops:?}");
+            assert!(
+                ops.iter().any(|op| matches!(op, PlanOp::OrderBy { .. })),
+                "the sort stays: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_by_that_another_op_could_reorder_or_thin_is_not_a_top_k() {
+        for src in [
+            // No LIMIT: every row is sorted anyway.
+            "MATCH (n:S) RETURN n ORDER BY n.v",
+            // A second key, DISTINCT, a sort key that is not a property.
+            "MATCH (n:S) RETURN n ORDER BY n.v, n.w LIMIT 3",
+            "MATCH (n:S) RETURN n ORDER BY n.v + 1 LIMIT 3",
+            "MATCH (n:S) RETURN DISTINCT n.v AS v ORDER BY v LIMIT 3",
+            // A conjunct that is not a bound on the sorted field.
+            "MATCH (n:S) WHERE n.v > 1 AND n.w = 2 RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WHERE n.v > 1 AND n.v > 2 RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WHERE n.u > 1 RETURN n ORDER BY n.v LIMIT 3",
+            // More than the scan between it and the sort.
+            "MATCH (n:S)-[:R]->(m) RETURN m ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WITH n RETURN n ORDER BY n.v LIMIT 3",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let top_k = ops
+                .iter()
+                .any(|op| matches!(op, PlanOp::IndexRangeScan { order: Some(_), .. }));
+            assert!(!top_k, "{src}: {ops:?}");
+        }
     }
 }

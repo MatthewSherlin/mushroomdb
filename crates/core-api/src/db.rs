@@ -2467,7 +2467,8 @@ pub struct SnapshotOptions {
 /// Derive the scan-label sym for the commit-skip fast-path.
 ///
 /// Walks `ops` to find the plan's leading scan op (`ScanLabel`, `IndexScan`,
-/// or `IndexIntersect`) with a concrete label string, then interns it.
+/// `IndexIntersect` or `IndexRangeScan`) with a concrete label string, then
+/// interns it.
 ///
 /// Returns `None` in all cases where skipping is unsafe:
 /// - Any `Expand` op is present (edge traversal; edges change results regardless
@@ -2493,6 +2494,7 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
             PlanOp::IndexIntersect {
                 label: Some(label), ..
             } => return Some(syms.intern(label)),
+            PlanOp::IndexRangeScan { label, .. } => return Some(syms.intern(label)),
             _ => {}
         }
     }
