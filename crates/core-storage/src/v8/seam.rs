@@ -340,6 +340,76 @@ mod tests {
         assert_eq!(store.get(2, "tag"), Some(&Value::Str("beta".into())));
     }
 
+    /// The column handle answers what `get()` answers for every node and
+    /// field: base values, overlay overwrites, overlay tombstones, typed and
+    /// `Mixed` base columns, cached or not (ledger row 139: the handle the
+    /// fused scan used read the overlay alone).
+    #[test]
+    fn the_column_handle_reads_what_get_reads() {
+        use crate::v8::layout::{ColumnData, ColumnsData, FieldEntry};
+        use std::collections::HashMap;
+
+        let mixed: HashMap<u32, Value> = HashMap::from([
+            (0, Value::List(vec![Value::Int(1)])),
+            (2, Value::Str("m".into())),
+            (3, Value::Int(7)),
+        ]);
+        let base = ColumnsData {
+            fields: vec![
+                FieldEntry {
+                    name: "n".to_string(),
+                    // Nodes 0, 1, 2, 3 present; 4 absent.
+                    col: ColumnData::Int {
+                        data: vec![10, 11, 12, 13, 0],
+                        present: vec![0b01111],
+                    },
+                },
+                FieldEntry {
+                    name: "x".to_string(),
+                    col: ColumnData::Mixed(bincode::serialize(&mixed).unwrap()),
+                },
+            ],
+        };
+        let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&base).expect("rkyv encode");
+        let archived =
+            rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv access");
+
+        let mut overlay = ColumnStore::new();
+        overlay.set(1, "n", Value::Int(21));
+        overlay.record_prop_tombstone(2, "n");
+        overlay.record_prop_tombstone(3, "x");
+        overlay.set(4, "x", Value::Bool(true));
+        let cache = MixedCache::default();
+
+        let views = [
+            ColumnsView::with_base(&overlay, archived),
+            ColumnsView::with_base_cached(&overlay, archived, &cache),
+            ColumnsView::owned(&overlay),
+        ];
+        for (v, view) in views.iter().enumerate() {
+            for field in ["n", "x", "absent"] {
+                let col = view.view_column(field);
+                for id in 0..6u32 {
+                    let want = view.get(id, field).map(ValueRef::into_value);
+                    let got = col.get(id).map(ValueRef::into_value);
+                    assert_eq!(got, want, "view {v}, `{field}` of node {id}");
+                    let tested = col.test(id, |x| Some(x) == want.as_ref());
+                    assert_eq!(tested, want.is_some(), "view {v}, test `{field}` of {id}");
+                }
+            }
+        }
+        // The base is read, not only the overlay.
+        assert_eq!(
+            views[0].view_column("n").get(0).map(ValueRef::into_value),
+            Some(Value::Int(10))
+        );
+        assert_eq!(
+            views[0].view_column("n").get(2).map(ValueRef::into_value),
+            None
+        );
+    }
+
     fn tiny_meta() -> V8Meta {
         use std::collections::HashMap;
         V8Meta {
@@ -692,13 +762,11 @@ pub struct BaseColumns<'a> {
 /// absent in the overlay, the archived base section is checked.  Writes always
 /// go through the WAL into the owned overlay (never through this view).
 ///
-/// **Column handle**: `ColumnsView::column()` returns an overlay-backed
-/// `ColumnHandle`.  Base values are NOT visible through the column handle —
-/// only through the `get()` path.  This is acceptable because:
-///   (a) base is `None` for V5–V7 stores, which have no mmap'd section at all
-///       (their whole snapshot is materialised into the overlay at open);
-///   (b) callers that need a fused-scan path with base values should use
-///       `get()` directly.
+/// **Column handle**: `ColumnsView::view_column()` returns a [`ViewColumn`]
+/// that reads exactly what `get()` reads — overlay, tombstone, base — with the
+/// field resolved once. `ColumnsView::column()` is the older, overlay-only
+/// handle, kept so a 0.9.x caller still compiles; the fused scan-and-filter
+/// used it and missed every value a snapshot base held (ledger row 139).
 ///
 /// **String columns come in two shapes.** In a V5–V8 base every
 /// `ArchivedColumnData::Str` carries its own full copy of the string table and
@@ -794,7 +862,15 @@ impl<'a> ColumnsView<'a> {
         // Base fallback.
         let base = self.base?;
         let field_entry = base.fields.iter().find(|e| e.name.as_str() == field)?;
-        match &field_entry.col {
+        self.base_value(field, &field_entry.col, id)
+            .map(ValueRef::Owned)
+    }
+
+    /// The archived base's value of `field` for `id`, read from that field's
+    /// column `col`. The precedence above the base (overlay, tombstone) is the
+    /// caller's.
+    fn base_value(&self, field: &str, col: &ArchivedColumnData, id: u32) -> Option<Value> {
+        match col {
             ArchivedColumnData::Int { data, present } => {
                 if !archived_bitmap_test(present.as_slice(), id) {
                     return None;
@@ -803,7 +879,7 @@ impl<'a> ColumnsView<'a> {
                 if idx >= data.len() {
                     return None;
                 }
-                Some(ValueRef::Owned(Value::Int(i64::from(data[idx]))))
+                Some(Value::Int(i64::from(data[idx])))
             }
             ArchivedColumnData::Float { data, present } => {
                 if !archived_bitmap_test(present.as_slice(), id) {
@@ -813,7 +889,7 @@ impl<'a> ColumnsView<'a> {
                 if idx >= data.len() {
                     return None;
                 }
-                Some(ValueRef::Owned(Value::Float(f64::from(data[idx]))))
+                Some(Value::Float(f64::from(data[idx])))
             }
             ArchivedColumnData::Bool { data, present } => {
                 if !archived_bitmap_test(present.as_slice(), id) {
@@ -823,7 +899,7 @@ impl<'a> ColumnsView<'a> {
                 if idx >= data.len() {
                     return None;
                 }
-                Some(ValueRef::Owned(Value::Bool(data[idx] != 0)))
+                Some(Value::Bool(data[idx] != 0))
             }
             ArchivedColumnData::Str {
                 ids,
@@ -847,7 +923,7 @@ impl<'a> ColumnsView<'a> {
                 if sid >= table.len() {
                     return None;
                 }
-                Some(ValueRef::Owned(Value::Str(table[sid].as_str().to_string())))
+                Some(Value::Str(table[sid].as_str().to_string()))
             }
             ArchivedColumnData::Mixed(blob) => match self.mixed {
                 // One decode per field for the life of the mapping. The value
@@ -855,11 +931,10 @@ impl<'a> ColumnsView<'a> {
                 Some(cache) => cache
                     .get_or_decode(field, blob.as_slice())
                     .get(&id)
-                    .cloned()
-                    .map(ValueRef::Owned),
+                    .cloned(),
                 None => {
                     let map: HashMap<u32, Value> = bincode::deserialize(blob.as_slice()).ok()?;
-                    map.get(&id).cloned().map(ValueRef::Owned)
+                    map.get(&id).cloned()
                 }
             },
             ArchivedColumnData::Vector { dim, data, present } => {
@@ -876,7 +951,7 @@ impl<'a> ColumnsView<'a> {
                     .iter()
                     .map(|f| Value::Float(f64::from(*f)))
                     .collect();
-                Some(ValueRef::Owned(Value::List(floats)))
+                Some(Value::List(floats))
             }
         }
     }
@@ -972,14 +1047,101 @@ impl<'a> ColumnsView<'a> {
         seen.into_iter().collect()
     }
 
-    /// Return a pre-resolved column handle for `field`.
+    /// Return a pre-resolved, **overlay-only** column handle for `field`.
     ///
-    /// The handle is backed by the overlay only.  Base values are NOT visible
-    /// through the returned handle — use `get()` for overlay-then-base reads.
-    /// This matches the fused-scan hot path in exec.rs which handles V5–V7 and
-    /// V8 post-snapshot overlay data; base reads happen via `get()`.
+    /// Base values are NOT visible through it: after a snapshot it misses
+    /// every value the snapshot holds. Use [`Self::view_column`], which reads
+    /// what [`Self::get`] reads.
+    #[deprecated(
+        since = "0.9.3",
+        note = "reads the overlay only and misses every value a snapshot base holds (ledger row 139); use `view_column`"
+    )]
     pub fn column(&self, field: &str) -> ColumnHandle<'_> {
         self.overlay.column(field)
+    }
+
+    /// Return a pre-resolved column handle for `field` that reads what
+    /// [`Self::get`] reads, with the same precedence: the overlay, then —
+    /// unless the overlay tombstoned the value — the archived base. The field
+    /// is looked up once, here, in each of them, so a scan pays only the
+    /// per-node lookup.
+    ///
+    /// A `Mixed` base column is decoded once for the handle (served from the
+    /// [`MixedCache`] when the view has one), never once per node.
+    pub fn view_column<'f>(&'f self, field: &'f str) -> ViewColumn<'f> {
+        let base = self
+            .base
+            .and_then(|b| b.fields.iter().find(|e| e.name.as_str() == field))
+            .map(|entry| match &entry.col {
+                ArchivedColumnData::Mixed(blob) => BaseColumn::Mixed(match self.mixed {
+                    Some(cache) => cache.get_or_decode(field, blob.as_slice()),
+                    None => std::sync::Arc::new(
+                        bincode::deserialize(blob.as_slice()).unwrap_or_default(),
+                    ),
+                }),
+                col => BaseColumn::Typed(col),
+            });
+        ViewColumn {
+            view: self,
+            field,
+            overlay: self.overlay.column(field),
+            base,
+        }
+    }
+}
+
+/// The archived base's column of one field, as a [`ViewColumn`] reads it.
+enum BaseColumn<'a> {
+    /// Indexed by node id: one node's value is O(1) against the mapping.
+    Typed(&'a ArchivedColumnData),
+    /// A `Mixed` column, decoded once for the handle.
+    Mixed(std::sync::Arc<HashMap<u32, Value>>),
+}
+
+/// A pre-resolved column of a [`ColumnsView`]: the overlay's column over the
+/// archived base's. See [`ColumnsView::view_column`].
+pub struct ViewColumn<'a> {
+    view: &'a ColumnsView<'a>,
+    field: &'a str,
+    overlay: ColumnHandle<'a>,
+    base: Option<BaseColumn<'a>>,
+}
+
+impl<'a> ViewColumn<'a> {
+    /// The value for `node`: the overlay's when it holds one, otherwise the
+    /// base's unless the overlay tombstoned it — exactly
+    /// [`ColumnsView::get`]'s answer.
+    #[inline]
+    pub fn get(&self, node: u32) -> Option<ValueRef<'a>> {
+        if let Some(v) = self.overlay.get(node) {
+            return Some(ValueRef::Borrowed(v));
+        }
+        self.base_get(node).map(ValueRef::Owned)
+    }
+
+    /// Whether `node` has a value for this column and `pred` holds of it —
+    /// `get(node).is_some_and(|v| pred(v.as_value()))`, without wrapping the
+    /// overlay's value: the fused scan-and-filter's hot loop.
+    #[inline]
+    pub fn test(&self, node: u32, pred: impl FnOnce(&Value) -> bool) -> bool {
+        if let Some(v) = self.overlay.get(node) {
+            return pred(v);
+        }
+        self.base_get(node).is_some_and(|v| pred(&v))
+    }
+
+    /// The base's value for `node` unless the overlay tombstoned it; the
+    /// overlay is the caller's to consult first.
+    #[inline]
+    fn base_get(&self, node: u32) -> Option<Value> {
+        let base = self.base.as_ref()?;
+        if self.view.overlay.is_tombstoned(node, self.field) {
+            return None;
+        }
+        match base {
+            BaseColumn::Typed(col) => self.view.base_value(self.field, col, node),
+            BaseColumn::Mixed(map) => map.get(&node).cloned(),
+        }
     }
 }
 
