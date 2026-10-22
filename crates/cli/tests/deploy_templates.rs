@@ -155,4 +155,23 @@ fn the_render_template_fits_its_fixed_shutdown_window() {
             .any(|l| l.trim_start().starts_with("maxShutdownDelaySeconds")),
         "maxShutdownDelaySeconds is not allowed with a disk"
     );
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("dockerCommand:")
+                && l.contains("--shutdown-timeout-secs 25")),
+        "serve must be told to finish inside Render's 30 s"
+    );
+}
+
+/// Railway drains the old deployment for `drainingSeconds` before SIGKILL;
+/// it must cover `serve`'s default 55 s shutdown budget.
+#[test]
+fn the_railway_template_drains_long_enough_for_the_shutdown_sequence() {
+    let text = template("railway/railway.json");
+    let seconds: u64 = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"drainingSeconds\":"))
+        .and_then(|v| v.trim().trim_end_matches(',').parse().ok())
+        .expect("railway.json sets deploy.drainingSeconds");
+    assert!(seconds >= 55, "drainingSeconds {seconds} < 55");
 }
