@@ -448,6 +448,49 @@ pub enum WriteStatement {
     UnwindWrite(Box<UnwindWriteStmt>),
 }
 
+// ─── Schema (DDL) statement AST ──────────────────────────────────────────────
+
+/// A schema statement: an index or a unique constraint declared, withdrawn or
+/// listed. Produced by `parse_ddl`; executed by `GraphDb::query_write` (and,
+/// for the two `Show…` forms, by every read entry point). A DDL statement is
+/// the whole statement — no clause may precede or follow it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DdlStatement {
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.field)` — a
+    /// range index. With no name it is `idx_<Label>_<field>`.
+    CreateIndex {
+        name: Option<String>,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX name [IF EXISTS]`.
+    DropIndex { name: String, if_exists: bool },
+    /// `SHOW INDEXES` (or `SHOW INDEX`).
+    ShowIndexes,
+    /// `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:Label) REQUIRE n.field IS UNIQUE`.
+    CreateConstraint {
+        name: String,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP CONSTRAINT name [IF EXISTS]`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SHOW CONSTRAINTS` (or `SHOW CONSTRAINT`).
+    ShowConstraints,
+}
+
+impl DdlStatement {
+    /// Whether the statement only lists the schema (`SHOW …`) and so is a read.
+    pub fn is_show(&self) -> bool {
+        matches!(
+            self,
+            DdlStatement::ShowIndexes | DdlStatement::ShowConstraints
+        )
+    }
+}
+
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
 ///
 /// `nodes` is in encounter order. `edges` reference node vars that appear in

@@ -2,7 +2,7 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, DurationMicrosecondArray, Float64Array, Int64Array,
-    LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    LargeBinaryArray, RecordBatch, RecordBatchOptions, StringArray, TimestampMicrosecondArray,
 };
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -271,7 +271,10 @@ pub fn to_record_batch(rs: &ResultSet) -> Result<RecordBatch, String> {
         .enumerate()
         .map(|(c, kind)| build_column(rs, c, kind))
         .collect();
-    RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+    // The row count is given, not inferred from the columns, so a result with
+    // none (a schema statement's) is a batch too.
+    let options = RecordBatchOptions::new().with_row_count(Some(rs.len()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(|e| e.to_string())
 }
 
 /// Encode `rs` as a single-batch Arrow IPC stream.
@@ -298,6 +301,15 @@ mod tests {
             rs.push_row(vec![v]);
         }
         to_record_batch(&rs).unwrap()
+    }
+
+    #[test]
+    fn a_result_with_no_columns_encodes() {
+        // What a schema statement (`CREATE INDEX …`) answers with.
+        let rs = ResultSet::new(Vec::new());
+        let batch = to_record_batch(&rs).unwrap();
+        assert_eq!((batch.num_columns(), batch.num_rows()), (0, 0));
+        assert!(!to_ipc_bytes(&rs).unwrap().is_empty());
     }
 
     #[test]
