@@ -118,12 +118,20 @@ const CONFLICT_MESSAGE: &str =
 /// The mapping is exhaustive on purpose: a new `GraphError` variant must fail
 /// to compile here until someone decides its class.
 ///
+/// Every arm that replaces the engine's message with fixed text logs the
+/// engine's message here, where it is dropped, so the detail the client is not
+/// shown reaches the server's log.
 impl From<GraphError> for BoltError {
     fn from(err: GraphError) -> Self {
         match err {
             // Transient: the driver retries.
             GraphError::CasConflict { .. } => BoltError::Conflict(CONFLICT_MESSAGE.into()),
-            GraphError::Io(_) | GraphError::Busy { .. } => {
+            GraphError::Io(_) => {
+                tracing::error!(error = %err, "bolt: storage I/O failed; the client is told to retry");
+                BoltError::Unavailable(UNAVAILABLE_MESSAGE.into())
+            }
+            GraphError::Busy { .. } => {
+                tracing::warn!(error = %err, "bolt: the store is busy; the client is told to retry");
                 BoltError::Unavailable(UNAVAILABLE_MESSAGE.into())
             }
             // Database errors: a fault in the store, not in the request. The
@@ -131,8 +139,12 @@ impl From<GraphError> for BoltError {
             // An unwritable data directory is a deployment fault on the server,
             // not something the client can fix or retry away; the message names
             // paths and uids, so it stays in the server's own logs.
-            GraphError::Corrupt { .. } => BoltError::Internal(INTERNAL_MESSAGE.into()),
+            GraphError::Corrupt { .. } => {
+                tracing::error!(error = %err, "bolt: the store reported corruption");
+                BoltError::Internal(INTERNAL_MESSAGE.into())
+            }
             GraphError::Unwritable { .. } => {
+                tracing::error!(error = %err, "bolt: the data directory is not writable");
                 BoltError::Internal(GraphError::UNWRITABLE_CLIENT_MESSAGE.into())
             }
             // Client errors whose text is about the request, not the host.
@@ -334,6 +346,57 @@ mod tests {
             actual: 2,
         });
         assert!(!conflict.message().contains("hidden-node"));
+    }
+
+    /// A writer that keeps what the subscriber writes, for the logging test.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The detail a client never sees is written to the server's log instead.
+    #[test]
+    fn withheld_detail_is_logged_where_it_is_dropped() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = BoltError::from(GraphError::Io(std::io::Error::other("disk-detail-io")));
+            let _ = BoltError::from(GraphError::Busy { holder: Some(4242) });
+            let _ = BoltError::from(GraphError::Corrupt {
+                detail: "corrupt-detail-crc".into(),
+            });
+            let _ = BoltError::from(GraphError::Unwritable {
+                path: "/data/unwritable-path".into(),
+                detail: "unwritable-detail".into(),
+                read_only_filesystem: false,
+            });
+            // A request-shaped error is the client's to read; nothing is logged.
+            let _ = BoltError::from(GraphError::QueryError {
+                detail: "query-detail".into(),
+            });
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for detail in [
+            "disk-detail-io",
+            "4242",
+            "corrupt-detail-crc",
+            "unwritable-detail",
+        ] {
+            assert!(log.contains(detail), "{detail} is not in the log:\n{log}");
+        }
+        assert!(!log.contains("query-detail"), "{log}");
     }
 
     #[test]

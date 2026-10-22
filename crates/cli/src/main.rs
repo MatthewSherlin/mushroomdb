@@ -25,7 +25,7 @@ use std::time::Duration;
 /// that matches nothing is indistinguishable from a server with nothing to say;
 /// `default_filter_enables_the_crates_that_log` exists because that is exactly
 /// the mistake this line shipped with for an afternoon.
-const DEFAULT_LOG_FILTER: &str = "mushroomdb=info,server=info,cli=info,warn";
+const DEFAULT_LOG_FILTER: &str = "mushroomdb=info,server=info,bolt=info,cli=info,warn";
 
 /// Install the log subscriber for a long-running `serve`.
 ///
@@ -162,6 +162,7 @@ fn main() -> ExitCode {
             restore_from,
             tls_cert,
             tls_key,
+            bolt,
         }) => {
             // Before anything touches the store (restore, demo, open).
             if let Err(message) =
@@ -220,6 +221,18 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            // The Bolt listener binds --addr's IP, so the non-loopback rule
+            // above already covers it. Its own settings are checked here, for
+            // the same reason as the origin list.
+            let bolt = match cli::serve_bolt::resolve_bolt_settings(
+                &bolt,
+                &|name| std::env::var(name).ok(),
+                addr,
+                tls_cert.is_some(),
+            ) {
+                Ok(bolt) => bolt,
+                Err(e) => return fail(&e),
+            };
             // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
             // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
             // collision (flags are inserted last; HashMap retains last writer).
@@ -286,6 +299,7 @@ fn main() -> ExitCode {
                 tls_cert,
                 tls_key,
                 restore_from_s3,
+                bolt,
             ))
         }
         Ok(Command::Mcp {
@@ -715,6 +729,7 @@ fn run_serve(
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     restore_from_s3: Option<String>,
+    bolt: Option<cli::serve_bolt::BoltSettings>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = rt.block_on(async {
@@ -857,6 +872,22 @@ fn run_serve(
             });
         }
         init_logging();
+        // Bound before HTTP starts, so a taken port stops the start with
+        // nothing served yet.
+        let bolt = match bolt {
+            Some(settings) => Some(
+                bind_bolt(
+                    settings,
+                    tls_cert.as_deref().zip(tls_key.as_deref()),
+                    token.clone(),
+                    role_tokens.clone(),
+                    access_keys.clone(),
+                    plan.drain,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let db_serve = db.clone();
         // The graceful-stop channel. Firing it — or dropping the sender — makes
         // the server stop accepting and let in-flight requests and subscribers
@@ -979,6 +1010,8 @@ fn run_serve(
                 };
             }
         }
+        // After the HTTP line: the docs and tests read that one first.
+        let mut bolt = bolt.map(|bound| bound.start(&db));
         let mut backup = backup;
         let outcome = tokio::select! {
             result = &mut serve => match result {
@@ -995,7 +1028,15 @@ fn run_serve(
                 // Listen for a second signal before the sequence starts, so
                 // none is swallowed by the handler tokio keeps installed.
                 let second = shutdown_signal();
-                let sequence = graceful_stop(&mut serve, stop_tx, &db, backup.take(), plan, deadline);
+                let sequence = graceful_stop(
+                    &mut serve,
+                    stop_tx,
+                    bolt.take(),
+                    &db,
+                    backup.take(),
+                    plan,
+                    deadline,
+                );
                 tokio::select! {
                     result = sequence => result,
                     _ = second => {
@@ -1008,7 +1049,11 @@ fn run_serve(
                 }
             }
         };
-        // The server ended by itself: the backup still gets its last flush.
+        // The server ended by itself: the Bolt listener stops with it, and
+        // the backup still gets its last flush.
+        if let Some(running) = bolt.take() {
+            running.stop(plan.drain).await;
+        }
         if let Some((tx, handle, budget)) = backup.take() {
             stop_backup(tx, handle, budget).await;
         }
@@ -1094,6 +1139,9 @@ const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_M
 ///
 /// 1. **Drain**: stop accepting and let in-flight requests finish, for at most
 ///    `plan.drain` (25 s at the default timeout, scaled down for a shorter one). What is still open then is cut off.
+///    The Bolt listener, when there is one, stops accepting at the same moment
+///    and closes each connection at its next idle point, which rolls back an
+///    open transaction; it shares the same drain bound.
 /// 2. **Snapshot**, on a blocking thread, in what remains once the backup's
 ///    reserve is set aside. If it overruns it is skipped: the WAL holds every
 ///    commit and the next open replays it.
@@ -1105,6 +1153,7 @@ const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_M
 async fn graceful_stop(
     serve: &mut tokio::task::JoinHandle<io::Result<()>>,
     stop_tx: tokio::sync::oneshot::Sender<()>,
+    bolt: Option<RunningBolt>,
     db: &SharedDb,
     backup: Option<RunningBackup>,
     plan: cli::ShutdownPlan,
@@ -1116,6 +1165,11 @@ async fn graceful_stop(
     tracing::info!("shutdown signal received; draining in-flight requests");
     let _ = stop_tx.send(());
     let drain = plan.drain.min(left().saturating_sub(reserve));
+    let drain_ends = std::time::Instant::now() + drain;
+    let bolt_stopping = bolt.map(|running| {
+        let _ = running.stop.send(true);
+        running.task
+    });
     match tokio::time::timeout(drain, &mut *serve).await {
         Ok(Ok(Ok(()))) => tracing::info!("drained; stopped"),
         Ok(Ok(Err(e))) => tracing::error!(error = %e, "server exited with an error"),
@@ -1126,6 +1180,19 @@ async fn graceful_stop(
                 "requests still open after the drain period; closing them"
             );
             serve.abort();
+        }
+    }
+    if let Some(mut task) = bolt_stopping {
+        // The listener holds itself to the same bound; this is the backstop.
+        let left_of_drain = drain_ends.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left_of_drain + BOLT_DRAIN_SLACK, &mut task).await {
+            Ok(Ok(Ok(()))) => tracing::info!("bolt: drained; stopped"),
+            Ok(Ok(Err(e))) => tracing::error!(error = %e, "bolt: listener exited with an error"),
+            Ok(Err(e)) => tracing::error!(error = %e, "bolt: listener task failed"),
+            Err(_) => {
+                tracing::warn!("bolt: connections still open after the drain period; closing them");
+                task.abort();
+            }
         }
     }
 
@@ -1165,6 +1232,128 @@ async fn graceful_stop(
         stop_backup(tx, handle, budget.min(left())).await;
     }
     outcome
+}
+
+/// How long past the drain bound the Bolt listener's task is waited for. The
+/// listener aborts its own connections at the bound; this covers the abort.
+const BOLT_DRAIN_SLACK: Duration = Duration::from_millis(500);
+
+/// A Bolt listener that is bound and not yet serving.
+struct BoundBolt {
+    listener: bolt::server::BoltListener,
+    authenticator: Arc<bolt::messages::hello::TokenAuthenticator>,
+    config: bolt::server::BoltConfig,
+    scheme: &'static str,
+    bound: SocketAddr,
+}
+
+/// A serving Bolt listener: its task and its stop signal.
+struct RunningBolt {
+    task: tokio::task::JoinHandle<io::Result<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl BoundBolt {
+    /// Starts serving and prints the line that says where.
+    fn start(self, db: &SharedDb) -> RunningBolt {
+        println!("listening on {}://{}", self.scheme, self.bound);
+        let advertised = self
+            .config
+            .connection
+            .routing
+            .as_ref()
+            .map(|r| r.advertised_address().to_string())
+            .unwrap_or_default();
+        tracing::info!(addr = %self.bound, %advertised, scheme = self.scheme, "bolt: listening");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let watched = stop_rx.clone();
+        let serving = self
+            .listener
+            .serve(db.clone(), self.authenticator, self.config, stop_rx);
+        let task = tokio::spawn(async move {
+            let ended = serving.await;
+            // The listener returns only when told to stop. Ending any other
+            // way leaves HTTP up with Bolt gone, which must not be silent.
+            if !*watched.borrow() {
+                match &ended {
+                    Ok(()) => tracing::error!("bolt: the listener stopped on its own"),
+                    Err(e) => tracing::error!(error = %e, "bolt: the listener failed"),
+                }
+            }
+            ended
+        });
+        RunningBolt { task, stop }
+    }
+}
+
+impl RunningBolt {
+    /// Stops the listener and waits for it, no longer than `drain` and the
+    /// slack.
+    async fn stop(mut self, drain: Duration) {
+        let _ = self.stop.send(true);
+        if tokio::time::timeout(drain + BOLT_DRAIN_SLACK, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
+    }
+}
+
+/// Binds the Bolt listener `settings` describes. Its credentials are exactly
+/// the HTTP server's: the token, the role tokens and the `keys.json` set (the
+/// same set, so a SIGHUP reload reaches both). With TLS it serves the HTTP
+/// certificate.
+async fn bind_bolt(
+    settings: cli::serve_bolt::BoltSettings,
+    tls: Option<(&std::path::Path, &std::path::Path)>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    access_keys: mushroomdb::AccessKeys,
+    drain: Duration,
+) -> Result<BoundBolt, String> {
+    let mut config = bolt::server::BoltConfig {
+        max_connections: settings.max_connections,
+        drain_timeout: drain,
+        ..bolt::server::BoltConfig::default()
+    };
+    config.connection.tx_timeout = settings.tx_timeout;
+    config.connection.bookmark_timeout = settings.bookmark_timeout;
+    if settings.tls {
+        let Some((cert, key)) = tls else {
+            return Err("--bolt-tls needs --tls-cert and --tls-key".into());
+        };
+        #[cfg(feature = "tls")]
+        {
+            config.tls = Some(server::load_server_config(cert, key)?);
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = (cert, key);
+            return Err(
+                "this binary was built without TLS support; rebuild with --features tls, \
+                 or give --bolt-plaintext and terminate TLS at a proxy \
+                 (see docs/site/bolt.md)"
+                    .into(),
+            );
+        }
+    }
+    let listener = bolt::server::BoltListener::bind(settings.bind)
+        .await
+        .map_err(|e| format!("--bolt-port: cannot listen on {}: {e}", settings.bind))?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    config.connection.routing = Some(settings.routing(bound)?);
+    let authenticator = Arc::new(
+        bolt::messages::hello::TokenAuthenticator::new(token, role_tokens)
+            .with_access_keys(access_keys),
+    );
+    Ok(BoundBolt {
+        listener,
+        authenticator,
+        config,
+        scheme: settings.scheme(),
+        bound,
+    })
 }
 
 /// Send the backup worker `Shutdown` and wait for it, no longer than `wait`.

@@ -7,6 +7,8 @@ mod json;
 mod mcp;
 mod mcp_tasks;
 mod subscribe;
+#[cfg(feature = "tls")]
+pub mod tls;
 mod ws;
 
 use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
@@ -100,3 +102,5 @@ pub use http::{
 };
 #[cfg(feature = "tls")]
 pub use http::{serve_tls, serve_tls_with_shutdown, serve_tls_with_shutdown_with_ready_flag};
+#[cfg(feature = "tls")]
+pub use tls::load_server_config;

@@ -83,8 +83,9 @@ done
 
 # 2. Inter-crate pins: `path = "../x", version = "Y"`. A sibling is always
 #    published at the workspace version, so Y is always the workspace version.
-#    The glob covers every crate, including mushroomdb-backup (whose own
-#    version is inherited from the workspace) and the cli's pin on it.
+#    The glob covers every crate, including mushroomdb-backup and
+#    mushroomdb-bolt (whose own versions are inherited from the workspace) and
+#    the cli's pins on them.
 while IFS= read -r f; do
   while IFS= read -r cur; do
     [[ "$cur" == "$NEW" ]] && continue
