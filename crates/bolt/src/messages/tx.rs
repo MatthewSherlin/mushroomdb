@@ -19,9 +19,11 @@
 
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
-use crate::messages::run::{map_get, parse_bookmark};
+use crate::messages::run::{
+    map_get, parse_bookmark, read_key_refusal, role_mask_error, tx_role_write_refusal, RowCursor,
+};
 use crate::packstream::PackValue;
-use mushroomdb::Value;
+use mushroomdb::{NodeMask, ReaderSnapshot, Value};
 use std::collections::BTreeMap;
 
 /// A decoded `BEGIN`.
@@ -134,6 +136,61 @@ impl OpenTransaction for ReadOnlyTransaction {
             ));
         }
         self.inner.execute(cypher, params)
+    }
+}
+
+/// The transaction a role token or a `read` key gets, the twin of the HTTP
+/// `/tx` scoped body: every statement reads through the role's mask on the
+/// snapshot frozen at `BEGIN`, and every write is refused with the text
+/// HTTP gives. The transaction engine has no role-scoped write path, so such
+/// a transaction never writes, whatever write scope the role carries (ledger
+/// row 140). Its commit writes nothing and returns the snapshot's commit.
+pub struct ScopedTransaction {
+    snapshot: ReaderSnapshot,
+    mask: NodeMask,
+    read_tier_key: bool,
+}
+
+impl ScopedTransaction {
+    /// `mask` is the role's, resolved on `snapshot`. `read_tier_key` picks the
+    /// refusal text a write gets, as it does over HTTP.
+    pub fn new(snapshot: ReaderSnapshot, mask: NodeMask, read_tier_key: bool) -> Self {
+        Self {
+            snapshot,
+            mask,
+            read_tier_key,
+        }
+    }
+}
+
+impl OpenTransaction for ScopedTransaction {
+    fn rollback(self: Box<Self>) {}
+
+    fn commit(self: Box<Self>) -> Result<u64, BoltError> {
+        Ok(self.snapshot.commit_seq())
+    }
+
+    fn execute(
+        &mut self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Box<dyn ResultCursor>, BoltError> {
+        if mushroomdb::is_write_query(cypher).map_err(BoltError::SyntaxError)? {
+            return Err(if self.read_tier_key {
+                read_key_refusal()
+            } else {
+                tx_role_write_refusal()
+            });
+        }
+        let result = self
+            .snapshot
+            .query_masked(cypher, params, &self.mask)
+            .map_err(role_mask_error)?;
+        Ok(Box::new(RowCursor::new(result, false, None)))
+    }
+
+    fn is_scoped(&self) -> bool {
+        true
     }
 }
 
