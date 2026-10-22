@@ -64,16 +64,30 @@ pub struct SameAsPair {
 
 /// Every `SAME_AS` claim touching any of `keys`, as unordered pairs, scored.
 ///
-/// Read through [`GraphDb::node_edges`], so a key that does not exist is
-/// skipped rather than an error. An edge with no stored score — a caller's own
-/// `SAME_AS` written through `query` — counts as 1.0. Of a pair's two
-/// directions, the higher score is kept. Sorted by `(a, b)`.
-pub fn same_as_pairs<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Vec<SameAsPair> {
+/// Read through [`GraphDb::node_edges`], so a key that does not exist
+/// ([`GraphError::KeyNotFound`]) is skipped: it has no claims. Any other read
+/// error is returned, so a failed read is never taken for "not linked". An
+/// edge with no stored score — a caller's own `SAME_AS` written through
+/// `query` — counts as 1.0. Of a pair's two directions, the higher score is
+/// kept. Sorted by `(a, b)`.
+pub fn same_as_pairs<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Result<Vec<SameAsPair>> {
+    same_as_pairs_reading(db, keys, |key| db.node_edges(key))
+}
+
+/// [`same_as_pairs`] with the edge read of one key passed in, so a test can
+/// make that read fail.
+fn same_as_pairs_reading<F: Fs>(
+    db: &GraphDb<F>,
+    keys: &[String],
+    node_edges: impl Fn(&str) -> Result<Vec<crate::EdgeInfo>>,
+) -> Result<Vec<SameAsPair>> {
     let mut best: std::collections::BTreeMap<(String, String), f64> =
         std::collections::BTreeMap::new();
     for key in keys {
-        let Ok(edges) = db.node_edges(key) else {
-            continue;
+        let edges = match node_edges(key) {
+            Ok(edges) => edges,
+            Err(GraphError::KeyNotFound { .. }) => continue,
+            Err(e) => return Err(e),
         };
         for e in edges.into_iter().filter(|e| e.edge_type == SAME_AS_EDGE) {
             let score = match db.get_edge_prop(SAME_AS_EDGE, &e.src_key, &e.dst_key, SAME_AS_WEIGHT)
@@ -93,9 +107,10 @@ pub fn same_as_pairs<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Vec<SameAsPair>
             }
         }
     }
-    best.into_iter()
+    Ok(best
+        .into_iter()
         .map(|((a, b), score)| SameAsPair { a, b, score })
-        .collect()
+        .collect())
 }
 
 /// The claims in `before` that `after` no longer holds, each with the score it
@@ -672,6 +687,42 @@ pub fn identity_clusters<F: Fs>(db: &GraphDb<F>, floor: f64) -> IdentityReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_store() -> GraphDb<core_storage::fs::RealFs> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("mdb-sameas-err-{}-{nanos}", std::process::id()));
+        GraphDb::open(&dir).unwrap()
+    }
+
+    #[test]
+    fn same_as_pairs_returns_a_read_error_instead_of_no_links() {
+        let db = empty_store();
+        let keys = vec!["a".to_string()];
+        let corrupt = same_as_pairs_reading(&db, &keys, |_| {
+            Err(GraphError::Corrupt {
+                detail: "injected".into(),
+            })
+        });
+        assert!(
+            matches!(corrupt, Err(GraphError::Corrupt { .. })),
+            "{corrupt:?}"
+        );
+    }
+
+    #[test]
+    fn same_as_pairs_skips_a_key_that_does_not_exist() {
+        let db = empty_store();
+        let keys = vec!["ghost".to_string()];
+        assert_eq!(same_as_pairs(&db, &keys).unwrap(), vec![]);
+        let missing = same_as_pairs_reading(&db, &keys, |k| {
+            Err(GraphError::KeyNotFound { key: k.into() })
+        });
+        assert_eq!(missing.unwrap(), vec![]);
+    }
 
     #[test]
     fn canonical_is_idempotent() {

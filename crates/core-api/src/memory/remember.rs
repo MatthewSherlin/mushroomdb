@@ -396,9 +396,17 @@ pub fn upsert_entity<F: Fs>(
         // outcome can name the links this update retracted: a changed name
         // takes a full-name link below the floor.
         let keys = [key.to_string()];
-        let same_as_before = same_as_pairs(db, &keys);
+        let same_as_before = same_as_pairs(db, &keys)?;
         describe_entity_with_aliases(db, key, None, &to_set, aliases)?;
-        let same_as_lost = same_as_lost(&same_as_before, &same_as_pairs(db, &keys));
+        // The write has committed: a failed read here cannot undo it, so the
+        // outcome names no retracted link and the failure is logged.
+        let same_as_lost = match same_as_pairs(db, &keys) {
+            Ok(after) => same_as_lost(&same_as_before, &after),
+            Err(e) => {
+                eprintln!("[mushroomdb] same_as_pairs error after commit: {e}");
+                Vec::new()
+            }
+        };
         Ok(UpsertOutcome {
             label: stored_label,
             created: false,
@@ -628,7 +636,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // names only the ones this commit made — and the ones it retracted. Stubs
     // are new by definition, so only the entities can have any yet.
     let entity_key_list: Vec<String> = input.entities.iter().map(|e| e.key.clone()).collect();
-    let same_as_before = same_as_pairs(db, &entity_key_list);
+    let same_as_before = same_as_pairs(db, &entity_key_list)?;
 
     let mut report = RememberReport {
         note: key.clone(),
@@ -782,12 +790,18 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     let mut touched = entity_key_list;
     touched.extend(report.provisional.iter().cloned());
-    let same_as_after = same_as_pairs(db, &touched);
-    report.same_as_lost = same_as_lost(&same_as_before, &same_as_after);
-    report.same_as = same_as_after
-        .into_iter()
-        .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
-        .collect();
+    // The commit is done: a failed read cannot undo it, so the report names
+    // no links and the failure is logged.
+    match same_as_pairs(db, &touched) {
+        Ok(same_as_after) => {
+            report.same_as_lost = same_as_lost(&same_as_before, &same_as_after);
+            report.same_as = same_as_after
+                .into_iter()
+                .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
+                .collect();
+        }
+        Err(e) => eprintln!("[mushroomdb] same_as_pairs error after commit: {e}"),
+    }
 
     Ok(report)
 }
