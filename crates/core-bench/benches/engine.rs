@@ -6,7 +6,7 @@
 //! `rule_incremental_fire`, `rule_backfill_10k`, `explain_pair`,
 //! `explain_pair_dense`, `vector_rule_update`, `read_contention_1r0w`,
 //! `read_contention_4r1w`, `read_contention_16r1w`,
-//! `backfill_field_equal_5k`.
+//! `backfill_field_equal_5k`, `readers_p50_p99_under_sustained_writes`.
 
 use core_storage::RealFs;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
+
+#[path = "shared/concurrency.rs"]
+mod concurrency;
 
 const N: usize = 10_000;
 const SEED: u64 = 0xA5A5_5A5A_C0DE_4B1D;
@@ -361,6 +364,7 @@ fn engine_benches(c: &mut Criterion) {
     field_equal_scale_backfill(c);
     open_store(c);
     contention(c);
+    readers_p50_p99_under_sustained_writes(c);
 }
 
 // ── Store open ───────────────────────────────────────────────────────────────
@@ -885,6 +889,31 @@ fn contention(c: &mut Criterion) {
     c.bench_function("read_contention_16r1w", |b| {
         b.iter(|| run_contention(&db, 16, 16, 16));
     });
+}
+
+/// TX-7: an iteration is 16 concurrent `ReaderSnapshot::neighborhood(key, 1)`
+/// calls on a 10k-node store while a writer commits 50 times a second. The
+/// per-call latencies of every iteration Criterion ran are printed as p50 /
+/// p99 against the gate (p50 <= 0.5 ms, p99 <= 2 ms), which the
+/// `concurrency_gate` test asserts (`tests/concurrency_gate.rs`).
+fn readers_p50_p99_under_sustained_writes(c: &mut Criterion) {
+    let store = concurrency::build_store("bench");
+    let writer = concurrency::start_writer(&store.db, concurrency::WRITES_PER_SEC);
+    let pool = concurrency::ReaderPool::new(&store.db);
+    c.bench_function("readers_p50_p99_under_sustained_writes", |b| {
+        b.iter(|| pool.iteration());
+    });
+    drop(writer);
+    let mut calls = pool.finish();
+    let p50 = concurrency::quantile(&mut calls, 0.50);
+    let p99 = concurrency::quantile(&mut calls, 0.99);
+    println!(
+        "readers_p50_p99_under_sustained_writes: {} calls on {} threads: p50 {p50:.3} ms, p99 {p99:.3} ms (gate p50 <= {} ms, p99 <= {} ms)",
+        calls.len(),
+        concurrency::reader_threads(),
+        concurrency::P50_MAX_MS,
+        concurrency::P99_MAX_MS,
+    );
 }
 
 fn bench_config() -> Criterion {

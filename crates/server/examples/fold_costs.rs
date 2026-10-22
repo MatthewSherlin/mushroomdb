@@ -17,6 +17,13 @@
 //!
 //! Builds against v0.9.2 as well as 0.10, so the same source is the baseline.
 //!
+//! `EDGES=<k>` adds `k` out-edges per node to the load.
+//!
+//! `CLOCK=cpu` times each commit by the writer thread's CPU time instead of
+//! wall time, which a loaded machine disturbs far less (fsync waits are then
+//! not counted, so read the fsync-off rows). `PASSES=<n>` repeats each pass
+//! `n` times, for more fold samples.
+//!
 //! ```text
 //! cargo run --release -p mushroomdb-server --example fold_costs -- <nodes> [label]
 //! ```
@@ -35,6 +42,23 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
     v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
 }
 
+/// Milliseconds on the clock `CLOCK` names: the calling thread's CPU time
+/// for `cpu`, else wall time since the first call.
+fn now_ms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    #[cfg(unix)]
+    if std::env::var("CLOCK").is_ok_and(|v| v == "cpu") {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        return ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6;
+    }
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1e3
+}
+
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
@@ -49,6 +73,7 @@ fn main() {
         .apply_schema(&mushroomdb::memory_schema::memory_defaults())
         .unwrap();
     db.write().set_fsync_policy(FsyncPolicy::Relaxed);
+    let load_start = Instant::now();
     for chunk in (0..n).step_by(10_000) {
         let ops = (chunk..(chunk + 10_000).min(n))
             .map(|i| BatchOp::InsertNode {
@@ -59,6 +84,28 @@ fn main() {
             .collect();
         db.submit_batch(ops).unwrap();
     }
+    // `EDGES=<k>`: give every node `k` `LINK` out-edges as well, so a store
+    // with no snapshot holds a topology overlay the size of the graph.
+    let edges: usize = std::env::var("EDGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for chunk in (0..n).step_by(10_000) {
+        if edges == 0 {
+            break;
+        }
+        let ops = (chunk..(chunk + 10_000).min(n))
+            .flat_map(|i| {
+                (1..=edges).map(move |d| BatchOp::InsertEdge {
+                    edge_type: "LINK".into(),
+                    src_key: format!("p{i}"),
+                    dst_key: format!("p{}", (i + d) % n),
+                })
+            })
+            .collect();
+        db.submit_batch(ops).unwrap();
+    }
+    let load_ms = load_start.elapsed().as_secs_f64() * 1e3;
 
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicU64::new(0));
@@ -82,18 +129,37 @@ fn main() {
         })
         .collect();
 
-    // One more bulk commit, timed: what a 10k ingest batch costs the writer.
-    let t = Instant::now();
-    let ops = (n..n + 10_000)
-        .map(|i| BatchOp::InsertNode {
-            label: "Person".into(),
-            key: format!("p{i}"),
-            props: vec![("name".into(), Value::Str(format!("person {i}")))],
-        })
-        .collect();
-    db.submit_batch(ops).unwrap();
-    let bulk = t.elapsed().as_secs_f64() * 1e3;
-    println!("{label}\tn={n}\treaders={readers}\tbulk10k={bulk:.3}");
+    // More bulk commits, timed (wall clock: the drain thread commits them):
+    // what a 10k ingest batch costs the writer. `BULKS=<n>` times `n` of
+    // them, which crosses a fold, and prints their median and mean.
+    let bulks: usize = std::env::var("BULKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let mut bulk_ms = Vec::with_capacity(bulks);
+    for b in 0..bulks {
+        let from = n + b * 10_000;
+        let ops = (from..from + 10_000)
+            .map(|i| BatchOp::InsertNode {
+                label: "Person".into(),
+                key: format!("p{i}"),
+                props: vec![("name".into(), Value::Str(format!("person {i}")))],
+            })
+            .collect();
+        let t = Instant::now();
+        db.submit_batch(ops).unwrap();
+        bulk_ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let bulk = bulk_ms[0];
+    if bulks > 1 {
+        let mean = bulk_ms.iter().sum::<f64>() / bulks as f64;
+        println!(
+            "{label}\tn={n}\tbulks={bulks}\tbulk_p50={:.3}\tbulk_mean={mean:.3}\tbulk_max={:.3}",
+            pct(&mut bulk_ms.clone(), 0.5),
+            pct(&mut bulk_ms, 1.0)
+        );
+    }
+    println!("{label}\tn={n}\treaders={readers}\tbulk10k={bulk:.3}\tload_ms={load_ms:.1}");
 
     // `NAME_LOOP=<secs>` / `PLAIN_LOOP=<secs>`: only commit `name` (or plain
     // `score`) writes for that long, fsync off — a steady target for a
@@ -134,15 +200,19 @@ fn main() {
         let (mut fold, mut first, mut steady) = (Vec::new(), Vec::new(), Vec::new());
         let mut after_fold = false;
         let (reads_before, pass_start) = (reads.load(Ordering::Relaxed), Instant::now());
-        for i in 0..(4 * mushroomdb::FOLD_EVERY_K) {
+        let passes: usize = std::env::var("PASSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for i in 0..(4 * passes * mushroomdb::FOLD_EVERY_K) {
             let key = format!("p{}", (i * 7919) % n);
             let value = match field {
                 "name" => Value::Str(format!("renamed {i}")),
                 _ => Value::Int(i as i64),
             };
-            let t = Instant::now();
+            let t = now_ms();
             db.write().set_prop(&key, field, value).unwrap();
-            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let ms = now_ms() - t;
             let folded = db.read().reader().deltas.is_empty();
             if folded {
                 fold.push(ms);

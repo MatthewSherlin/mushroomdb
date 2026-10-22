@@ -1,0 +1,12 @@
+### Changed
+- **The first write after a reader fold no longer copies the store under the write lock.** The column store, the equality and range index, the key map, and — when a rule runs but derives nothing — the topology, edge properties and interner are now copied only in the pieces a commit writes. First commit after a fold, fsync off, median: about 151 → 0.46 ms (indexed `name`) and 41 → 0.27 ms (plain field) at 500k nodes; 465 → 0.42 ms and 140 → 0.31 ms at 1.4M nodes; 237 → 0.39 ms for a plain field on a 1M-node store holding 2M edges and no snapshot. The worst 10k-row bulk commit at 1M nodes falls from 738 to 104 ms; its median rises from 51 to 77 ms, still 0.42× v0.9.2. Numbers are provisional (loaded machine). Ledger row 126. (TX-7)
+- **A batch that creates edges and deletes or renames nodes commits in linear time.** It used to filter every pending edge once per deleted or renamed node: 20k rows took 586–666 ms, and now take 179–201 ms. Ledger row 130. (TX-7)
+
+#### BREAKING
+
+- **`UnifiedIndex::postings` (`mushroomdb-storage`) now returns `Option<&CowMap<ValueKey, IdSet>>`, and `UnifiedIndex::lookup_eq` returns `Option<&IdSet>`,** where they returned `BTreeMap<ValueKey, BTreeSet<u32>>` and `BTreeSet<u32>`. Iterate with `.iter()`; an `IdSet`'s `iter()` yields `u32` by value (TX-7).
+- **New public module `mushroomdb_storage::cow`:** `CowVec`, `CowMap` (with its `Range` iterator), `IdSet` and `HashIndex`, the copy-on-write containers the store is now built from (TX-7).
+- **`GraphMut` (`mushroomdb-rules`): `syms`, `topo` and `edge_props` are now `CowMut<'a, T>`, not `&'a mut T`.** Build them with `.into()` from `&mut T` or from `&mut Arc<T>`; they read through `Deref` and copy a shared `Arc` on the first write through `DerefMut`. `CowMut` is exported from `mushroomdb-rules` (TX-7).
+
+### Added
+- **Concurrency gate.** CI's new `concurrency-gate` job checks that, on a 10k-node store with a writer committing 50 times a second, 16 concurrent neighbourhood reads keep p50 ≤ 0.5 ms and p99 ≤ 2 ms. It also builds v0.9.2 with the same scenario and, on the same runner, holds a plain commit within 1.15× v0.9.2's with no readers (the best of 3 measurements counts, until TX-5c removes TX-5's per-commit builder cost) and within 1.25× with readers running; within 1.5× its own cost with no readers; and the readers to at least 10k reads/s. The job also runs the row-130 scaling check. The same scenario is the Criterion bench `readers_p50_p99_under_sustained_writes`. (TX-7)

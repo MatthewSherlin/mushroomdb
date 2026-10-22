@@ -24,6 +24,7 @@
 //! Nothing here is persisted: declarations replay from the WAL and the
 //! postings rebuild at open ([`UnifiedIndex::rebuild_all`]).
 
+use crate::cow::{CowMap, IdSet};
 use crate::idmap::IdMap;
 use crate::interner::Interner;
 use crate::types::{Value, ValueKey};
@@ -42,7 +43,11 @@ pub enum IndexKind {
 }
 
 type Pair = (String, String);
-type Postings = BTreeMap<ValueKey, BTreeSet<u32>>;
+/// Value → the nodes holding it. Copy-on-write in leaves, as are the reverse
+/// and offset maps: the write path shares the index with the reader's fold,
+/// and the first indexed write after a fold copies the leaves it writes, not
+/// the index (ledger row 126).
+type Postings = CowMap<ValueKey, IdSet>;
 
 /// What a layered index answers beneath its own entries: a frozen index, with
 /// the nodes whose entries there may be stale left out.
@@ -63,12 +68,12 @@ pub struct UnifiedIndex {
     /// `(label, field)` → id → the node's current indexed key, so an update or
     /// delete can drop the stale forward entry without the old value. Built
     /// with the postings, at open too, so no write pays for it.
-    reverse: BTreeMap<Pair, BTreeMap<u32, ValueKey>>,
+    reverse: BTreeMap<Pair, CowMap<u32, ValueKey>>,
     /// `(label, field)` → id → UTC offset, for the nodes whose value is a
     /// `DateTime` with a non-zero offset. The key holds the instant only — two
     /// `DateTime`s at one instant are equal — but `<` orders such a tie by
     /// offset, so a range needs it to answer as a scan does.
-    offsets: BTreeMap<Pair, BTreeMap<u32, i32>>,
+    offsets: BTreeMap<Pair, CowMap<u32, i32>>,
     /// The kind of every maintained pair: `Range` while a range index is
     /// declared on it, else `Equality`.
     kind: BTreeMap<Pair, IndexKind>,
@@ -303,12 +308,15 @@ impl UnifiedIndex {
                     .or_default()
                     .insert(id, offset);
             }
-            self.forward
-                .entry(p.clone())
-                .or_default()
-                .entry(vk.clone())
-                .or_default()
-                .insert(id);
+            let postings = self.forward.entry(p.clone()).or_default();
+            match postings.get_mut(&vk) {
+                Some(ids) => {
+                    ids.insert(id);
+                }
+                None => {
+                    postings.insert(vk.clone(), single(id));
+                }
+            }
             self.reverse.entry(p).or_default().insert(id, vk);
         }
         current
@@ -345,7 +353,7 @@ impl UnifiedIndex {
     /// Every indexed value of `(label, field)` and the node ids holding it, or
     /// `None` when nothing is indexed under the pair. Lets a caller probing
     /// many values look the pair up once instead of once per value.
-    pub fn postings(&self, label: &str, field: &str) -> Option<&BTreeMap<ValueKey, BTreeSet<u32>>> {
+    pub fn postings(&self, label: &str, field: &str) -> Option<&CowMap<ValueKey, IdSet>> {
         self.forward.get(&pair(label, field))
     }
 
@@ -387,7 +395,7 @@ impl UnifiedIndex {
         let mut out: Vec<u32> = Vec::new();
         let mut take = |key: &ValueKey| {
             if let Some(ids) = postings.get(key) {
-                out.extend(ids.iter().copied());
+                out.extend(ids.iter());
             }
         };
         match value {
@@ -408,7 +416,7 @@ impl UnifiedIndex {
                     let (lo, hi) = (f.next_down() as i64, f.next_up() as i64);
                     for (key, ids) in postings.range(ValueKey::Int(lo)..=ValueKey::Int(hi)) {
                         if matches!(key, ValueKey::Int(j) if *j as f64 == *f) {
-                            out.extend(ids.iter().copied());
+                            out.extend(ids.iter());
                         }
                     }
                 }
@@ -427,7 +435,7 @@ impl UnifiedIndex {
     /// The nodes of `label` whose `field` has exactly index key `key`, `None`
     /// when none does. A raw key lookup: [`lookup`](Self::lookup) is the one
     /// that answers as a scan does.
-    pub fn lookup_eq(&self, label: &str, field: &str, key: &ValueKey) -> Option<&BTreeSet<u32>> {
+    pub fn lookup_eq(&self, label: &str, field: &str, key: &ValueKey) -> Option<&IdSet> {
         self.postings(label, field)?.get(key)
     }
 
@@ -522,7 +530,7 @@ impl UnifiedIndex {
             // of the build, and its cost is moving the elements.
             let mut fixed: Vec<(u8, u64, u32)> = Vec::new();
             let mut variable: Vec<(ValueKey, u32)> = Vec::new();
-            let mut offsets: BTreeMap<u32, i32> = BTreeMap::new();
+            let mut offsets: Vec<(u32, i32)> = Vec::new();
             // A label no node carries has no symbol, and no entries.
             if let Some(sym) = syms.get(&p.0) {
                 for (id, &node_sym) in labels.iter().enumerate().take(n) {
@@ -536,7 +544,7 @@ impl UnifiedIndex {
                     let value = vr.as_value();
                     if let Value::DateTime { offset_seconds, .. } = value {
                         if *offset_seconds != 0 {
-                            offsets.insert(id, *offset_seconds);
+                            offsets.push((id, *offset_seconds));
                         }
                     }
                     let key = ValueKey::from_value(value);
@@ -548,16 +556,19 @@ impl UnifiedIndex {
             }
             // Both lists are in id order here: two sorted runs, which
             // `collect` merges and builds in bulk.
-            let by_id: BTreeMap<u32, ValueKey> = fixed
+            let mut by_id: Vec<(u32, ValueKey)> = fixed
                 .iter()
                 .map(|&(variant, ordinal, id)| (id, from_fixed_width(variant, ordinal)))
                 .chain(variable.iter().map(|(key, id)| (*id, key.clone())))
                 .collect();
+            // Two runs, each in id order: the stable sort merges them.
+            by_id.sort_by_key(|(id, _)| *id);
+            let by_id = CowMap::from_sorted(by_id);
             // By key; the ids of one key are gathered into a set, so their
             // order here does not matter.
             fixed.sort_unstable();
             variable.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            let mut runs: Vec<(ValueKey, BTreeSet<u32>)> = Vec::new();
+            let mut runs: Vec<(ValueKey, IdSet)> = Vec::new();
             let mut last: Option<(u8, u64)> = None;
             for (variant, ordinal, id) in fixed {
                 match runs.last_mut() {
@@ -570,7 +581,7 @@ impl UnifiedIndex {
                     }
                 }
             }
-            let mut variable_runs: Vec<(ValueKey, BTreeSet<u32>)> = Vec::new();
+            let mut variable_runs: Vec<(ValueKey, IdSet)> = Vec::new();
             for (key, id) in variable {
                 match variable_runs.last_mut() {
                     Some((prev, ids)) if *prev == key => {
@@ -579,7 +590,11 @@ impl UnifiedIndex {
                     _ => variable_runs.push((key, single(id))),
                 }
             }
-            let by_value: Postings = runs.into_iter().chain(variable_runs).collect();
+            // Each list is in key order, but `Str` keys sort between the
+            // fixed-width variants: the stable sort merges the two runs.
+            runs.extend(variable_runs);
+            runs.sort_by(|a, b| a.0.cmp(&b.0));
+            let by_value: Postings = CowMap::from_sorted(runs);
             if by_value.is_empty() {
                 self.forward.remove(&p);
                 self.reverse.remove(&p);
@@ -590,7 +605,7 @@ impl UnifiedIndex {
             if offsets.is_empty() {
                 self.offsets.remove(&p);
             } else {
-                self.offsets.insert(p, offsets);
+                self.offsets.insert(p, CowMap::from_sorted(offsets));
             }
         }
     }
@@ -630,8 +645,8 @@ fn from_fixed_width(variant: u8, ordinal: u64) -> ValueKey {
 }
 
 /// A set holding `id` alone.
-fn single(id: u32) -> BTreeSet<u32> {
-    let mut ids = BTreeSet::new();
+fn single(id: u32) -> IdSet {
+    let mut ids = IdSet::new();
     ids.insert(id);
     ids
 }
@@ -641,7 +656,7 @@ fn single(id: u32) -> BTreeSet<u32> {
 fn remove_posting(by_value: Option<&mut Postings>, old: &ValueKey, id: u32) {
     if let Some(by_value) = by_value {
         if let Some(ids) = by_value.get_mut(old) {
-            ids.remove(&id);
+            ids.remove(id);
             if ids.is_empty() {
                 by_value.remove(old);
             }
@@ -689,8 +704,8 @@ fn empty<'a>() -> IdIter<'a> {
     Box::new(std::iter::empty())
 }
 
-fn ids_of<'a>(entries: impl Iterator<Item = (&'a ValueKey, &'a BTreeSet<u32>)> + 'a) -> IdIter<'a> {
-    Box::new(entries.flat_map(|(_, ids)| ids.iter().copied()))
+fn ids_of<'a>(entries: impl Iterator<Item = (&'a ValueKey, &'a IdSet)> + 'a) -> IdIter<'a> {
+    Box::new(entries.flat_map(|(_, ids)| ids.iter()))
 }
 
 fn same_variant(a: &ValueKey, b: &ValueKey) -> bool {
@@ -818,7 +833,7 @@ fn numeric_range<'a>(
                 if let ValueKey::Int(j) = key {
                     let x = *j as f64;
                     if within(x) {
-                        hits.extend(ids.iter().map(|&id| (x, id)));
+                        hits.extend(ids.iter().map(|id| (x, id)));
                     }
                 }
             }
@@ -843,7 +858,7 @@ fn numeric_range<'a>(
                 if let ValueKey::FloatBits(bits) = key {
                     let x = f64::from_bits(*bits);
                     if within(x) {
-                        hits.extend(ids.iter().map(|&id| (x, id)));
+                        hits.extend(ids.iter().map(|id| (x, id)));
                     }
                 }
             }
@@ -858,7 +873,7 @@ fn numeric_range<'a>(
 /// bounds' are a key run, filtered by the exact pair comparison.
 fn datetime_range<'a>(
     postings: &'a Postings,
-    offsets: Option<&'a BTreeMap<u32, i32>>,
+    offsets: Option<&'a CowMap<u32, i32>>,
     lo: Option<(&Value, bool)>,
     hi: Option<(&Value, bool)>,
 ) -> IdIter<'a> {
@@ -882,7 +897,7 @@ fn datetime_range<'a>(
         let ValueKey::DateTimeMicrosUtc(us) = *key else {
             unreachable!("a DateTime key run")
         };
-        ids.iter().copied().filter(move |id| {
+        ids.iter().filter(move |id| {
             let offset = offsets.and_then(|o| o.get(id)).copied().unwrap_or(0);
             let stored = (us, offset);
             lo.is_none_or(|(b, incl)| admits(stored.cmp(&b), true, incl))
@@ -921,6 +936,50 @@ mod tests {
             Vec::<u32>::new()
         );
         assert_eq!(layer.lookup("P", "city", &Value::Str("c".into())), [2]);
+    }
+
+    /// Ledger row 126: the reader's fold holds a clone of the index while the
+    /// writer goes on maintaining its own. The clone answers every lookup,
+    /// range and prefix as it did when it was taken, and the writer's copy
+    /// answers as an index built from its final values.
+    #[test]
+    fn a_clone_answers_as_it_did_while_the_original_is_written() {
+        let mut live = UnifiedIndex::new();
+        live.enable("P", "v");
+        live.enable_range("by_v", "P", "w");
+        for id in 0..5_000u32 {
+            live.set("P", "v", id, &Value::Str(format!("s{}", id % 700)));
+            live.set("P", "w", id, &iv(i64::from(id % 300)));
+        }
+        let frozen = live.clone();
+        let answers = |ix: &UnifiedIndex| {
+            (
+                ix.lookup("P", "v", &Value::Str("s7".into())),
+                ix.lookup_range("P", "w", Some((&iv(10), true)), Some((&iv(20), false)))
+                    .collect::<Vec<_>>(),
+                ix.lookup_prefix("P", "v", "s6").collect::<Vec<_>>(),
+            )
+        };
+        let before = answers(&frozen);
+        let mut want = UnifiedIndex::new();
+        want.enable("P", "v");
+        want.enable_range("by_v", "P", "w");
+        for id in 0..6_000u32 {
+            if id % 11 == 0 {
+                live.remove_node_all(id);
+                continue;
+            }
+            let v = Value::Str(format!("s{}", (id * 7) % 900));
+            let w = iv(i64::from((id * 3) % 300));
+            live.set("P", "v", id, &v);
+            live.set("P", "w", id, &w);
+            want.set("P", "v", id, &v);
+            want.set("P", "w", id, &w);
+        }
+        assert_eq!(answers(&frozen), before);
+        assert_eq!(answers(&live), answers(&want));
+        assert_eq!(live.postings("P", "v"), want.postings("P", "v"));
+        assert_eq!(live.postings("P", "w"), want.postings("P", "w"));
     }
 
     fn int(i: i64) -> ValueKey {
@@ -1295,7 +1354,7 @@ mod tests {
         ix.update("N", "v", 2, None, Some(int(4)));
         assert_eq!(
             ix.lookup_eq("N", "v", &int(4))
-                .map(|s| s.iter().copied().collect::<Vec<_>>()),
+                .map(|s| s.iter().collect::<Vec<_>>()),
             Some(vec![1, 2])
         );
         ix.update("N", "v", 1, Some(int(4)), Some(int(6)));

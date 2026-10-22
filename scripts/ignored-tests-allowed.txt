@@ -73,3 +73,5 @@ cli/tests/csv_import.rs::csv_import_throughput_above_50k_per_second — builds a
 
 # cypher_bool_exprs.rs — QL-BX WHERE timing; machine-dependent
 core-api/tests/cypher_bool_exprs.rs::bench_where_predicates_at_100k — measurement by hand: prints WHERE timings at 100k nodes for comparing builds (release, --ignored), nothing asserted
+# concurrency_gate.rs — the gate's v0.9.2 baseline probe; run by concurrency_gate, not by name
+core-bench/tests/concurrency_gate.rs::writer_probe — baseline probe: the concurrency-gate CI job builds it against the v0.9.2 tag and concurrency_gate spawns it (MUSHROOMDB_GATE_V092)

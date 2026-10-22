@@ -1,5 +1,6 @@
 pub mod columns;
 pub mod commit_times;
+pub mod cow;
 pub mod edge_props;
 pub mod fs;
 pub mod fulltext;

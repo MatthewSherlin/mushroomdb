@@ -493,3 +493,116 @@ fn insert_set_delete_insert_of_one_key_agrees() {
     );
     assert_eq!(accepted, 3);
 }
+
+/// An op from an edge-heavy mix: edges added and deleted between the keys the
+/// batch has standing, beside the node deletes, renames and re-inserts that
+/// have to find those edges by endpoint.
+fn random_edge_op(r: &mut Rng, present: &mut Vec<&'static str>) -> Op {
+    let absent: Vec<&'static str> = KEYS
+        .iter()
+        .copied()
+        .filter(|k| !present.contains(k))
+        .collect();
+    for _ in 0..8 {
+        match r.next() % 8 {
+            0..=2 if !present.is_empty() => {
+                return Op::InsEdge("KNOWS", r.pick(present), r.pick(present));
+            }
+            3 if !present.is_empty() => {
+                return Op::DelEdge("KNOWS", r.pick(present), r.pick(present));
+            }
+            4 if !present.is_empty() => {
+                let k = r.pick(present);
+                present.retain(|p| *p != k);
+                return Op::DelNode(k);
+            }
+            5 if !present.is_empty() && !absent.is_empty() => {
+                let (old, new) = (r.pick(present), r.pick(&absent));
+                present.retain(|p| *p != old);
+                present.push(new);
+                return Op::Rename(old, new);
+            }
+            6 if !absent.is_empty() => {
+                let k = r.pick(&absent);
+                present.push(k);
+                return Op::Insert("P", k, vec![]);
+            }
+            7 => return Op::EdgeUpsert("KNOWS", r.pick(&KEYS), r.pick(&KEYS)),
+            _ => {}
+        }
+    }
+    Op::EdgeUpsert("KNOWS", r.pick(&KEYS), r.pick(&KEYS))
+}
+
+/// Binding (ledger row 130): the edges a batch added or deleted are found by
+/// endpoint when the batch deletes or renames a node. Random edge-heavy
+/// batches, in which edges are added and deleted at a node that is then
+/// deleted, renamed or re-inserted, leave the store separate commits leave:
+/// live, after a reopen, and through `open_at`.
+#[test]
+fn random_edge_batches_with_deletes_and_renames_agree_with_separate_commits() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let cases: Vec<Vec<Op>> = (0..300)
+        .map(|_| {
+            let len = 3 + (rng.next() % 10) as usize;
+            let mut present = vec!["a", "c", "d"];
+            (0..len)
+                .map(|_| random_edge_op(&mut rng, &mut present))
+                .collect()
+        })
+        .collect();
+    let accepted = assert_all_agree("edges", cases);
+    assert!(
+        accepted >= 100,
+        "only {accepted} of 300 edge batches were accepted; the generator no longer reaches the overlay"
+    );
+}
+
+/// Ledger row 130's shape, timed: one batch that inserts `rows` node pairs
+/// with an edge between each pair and deletes `rows` nodes stored before it.
+/// Returns the commit's wall time in ms.
+fn create_edges_and_delete_batch_ms(rows: usize) -> f64 {
+    let dir = std::env::temp_dir().join(format!("mdb-row130-{rows}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+    let mut b = db.batch();
+    for i in 0..rows {
+        b.insert_node("Old", &format!("old{i}"), vec![]);
+    }
+    b.commit().unwrap();
+    let mut b = db.batch();
+    for i in 0..rows {
+        b.insert_node("P", &format!("s{i}"), vec![])
+            .insert_node("P", &format!("d{i}"), vec![])
+            .insert_edge("KNOWS", &format!("s{i}"), &format!("d{i}"))
+            .delete_node(&format!("old{i}"));
+    }
+    let t = std::time::Instant::now();
+    b.commit().unwrap();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(db.edge_count(), rows as u64, "every batch edge survives");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    ms
+}
+
+/// Ledger row 130, timed: a create-edges-and-delete batch of 20k rows costs
+/// about 4× one of 5k, not 16×. Release only (`--ignored`): a timing.
+#[test]
+#[ignore = "timing: run in release with --ignored"]
+fn bench_create_edges_and_delete_batch_is_linear() {
+    let median = |rows: usize| {
+        let mut runs: Vec<f64> = (0..5)
+            .map(|_| create_edges_and_delete_batch_ms(rows))
+            .collect();
+        runs.sort_by(f64::total_cmp);
+        runs[2]
+    };
+    let (small, large) = (median(5_000), median(20_000));
+    let ratio = large / small;
+    println!("row 130: 5k rows {small:.1} ms, 20k rows {large:.1} ms, ratio {ratio:.2}");
+    assert!(
+        ratio < 8.0,
+        "20k rows cost {ratio:.2}x 5k rows; linear is about 4x, quadratic 16x"
+    );
+}
