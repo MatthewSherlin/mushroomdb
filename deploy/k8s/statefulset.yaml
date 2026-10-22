@@ -1,4 +1,4 @@
-# mushroomdb on Kubernetes: ConfigMap, Secret placeholder, Service, StatefulSet.
+# mushroomdb on Kubernetes: ConfigMap, Services, StatefulSet.
 #
 # SINGLE WRITER - replicas must be 1. mushroomdb is single-writer: a second pod
 # on the same store contends for the write lock, and a ReadWriteOnce volume
@@ -7,9 +7,15 @@
 # No HorizontalPodAutoscaler is shipped on purpose: autoscaling would add
 # writers. Do not add one.
 #
-# Replace the Secret value below before applying, or create the Secret yourself
-# and delete that document:
-#   kubectl create secret generic mushroomdb --from-literal=MUSHROOMDB_TOKEN=...
+# The token lives in a Secret that is NOT part of this file, so no secret value
+# is ever committed and the pod fails closed: it stays in
+# CreateContainerConfigError until the Secret exists. Create it first:
+#   kubectl create secret generic mushroomdb-token \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# PIN THE IMAGE: :latest is only the default. A store has one-way format
+# opt-ins, so set a version tag (for example ghcr.io/matthewsherlin/mushroomdb:0.10.0)
+# before you rely on this, or a restart can pull a different version.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,17 +27,23 @@ data:
   # backup worker (HO-07) ships. Nothing in this file configures backup yet.
 ---
 apiVersion: v1
-kind: Secret
+kind: Service
 metadata:
-  name: mushroomdb
-type: Opaque
-stringData:
-  # Placeholder. Never commit a real value to this file.
-  MUSHROOMDB_TOKEN: "<set-me>"
+  # Governing Service for the StatefulSet (stable pod DNS); no virtual IP.
+  name: mushroomdb-headless
+spec:
+  clusterIP: None
+  selector:
+    app: mushroomdb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
 ---
 apiVersion: v1
 kind: Service
 metadata:
+  # What clients connect to.
   name: mushroomdb
 spec:
   type: ClusterIP
@@ -48,7 +60,7 @@ kind: StatefulSet
 metadata:
   name: mushroomdb
 spec:
-  serviceName: mushroomdb
+  serviceName: mushroomdb-headless
   # SINGLE WRITER - replicas must be 1. Do NOT scale to more than one.
   replicas: 1
   selector:
@@ -70,7 +82,10 @@ spec:
         # Only re-own the volume when the root directory's owner is wrong, so a
         # large store does not pay a recursive chown on every pod start.
         fsGroupChangePolicy: OnRootMismatch
-      terminationGracePeriodSeconds: 60
+      # The server drains on SIGTERM and writes a shutdown snapshot, which grows
+      # with the store. HO-11 adds a final backup flush and HO-07 a lease
+      # delete to the same shutdown: re-check this value when they land.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: mushroomdb
           image: ghcr.io/matthewsherlin/mushroomdb:latest
@@ -88,8 +103,33 @@ spec:
             - name: MUSHROOMDB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: mushroomdb
-                  key: MUSHROOMDB_TOKEN
+                  # Created by you, see the header. Not optional on purpose.
+                  name: mushroomdb-token
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # Requests keep the pod out of BestEffort; the memory limit bounds a
+          # runaway query. Defaults suit a small store: size memory to your data
+          # (the graph is held in memory) and drop the limit only knowingly.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          # Slow opens of a large store: no liveness or readiness check runs
+          # until this passes, up to 30 x 10s = 5 minutes.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /ready
@@ -105,6 +145,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # The server writes only under /data; /tmp is scratch for the
+            # read-only root filesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data
