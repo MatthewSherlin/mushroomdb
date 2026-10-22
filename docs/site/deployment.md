@@ -279,11 +279,22 @@ The arithmetic: the backup phase is reserved first. It is
 `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` (10 s), plus 2 s, which is 22 s. The drain
 takes at most 25 s, or less if the deadline leaves less after that reserve. The
 snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
-time to the next one. Every phase runs even when an earlier one ran out, so the
-lease is released whenever the bucket is reachable. If the bucket is
-unreachable the log says so, the process exits, and the lease expires by itself
-after its TTL. No acknowledged write is lost in any of these cases, because the
-WAL holds every commit.
+time to the next one.
+
+**The phases scale with `--shutdown-timeout-secs`.** With at least 55 s (more
+goes to the snapshot) the split above holds. With less, all three phases shrink
+in proportion, but the backup keeps a floor of 2 s and the drain gives way
+first, because a stuck client is what stretches it. The backup's own flush grace
+and request deadline are shrunk to fit its share, so the lease release still
+has a request deadline of its own. At `--shutdown-timeout-secs 25`, for
+example, the drain gets about 11 s, the snapshot about 3 s and the backup about
+10 s. The whole sequence never exceeds the timeout.
+
+Every phase runs even when an earlier one ran out, so the lease is released
+whenever the bucket is reachable. If the bucket is unreachable the log says so,
+the process exits, and the lease expires by itself after its TTL. No
+acknowledged write is lost in any of these cases, because the WAL holds every
+commit.
 
 | Variable or flag | Default | Meaning |
 | --- | --- | --- |
@@ -298,20 +309,31 @@ successor holds it).
 
 **Set the platform's stop timeout above `--shutdown-timeout-secs`.** A platform
 that sends SIGKILL earlier cuts the sequence short. Nothing is lost, but the
-lease is left behind and the next start waits for it. The templates use 60 s.
+lease is left behind and the next start waits for it. The Fly, Compose and Railway templates use 60 s.
 If you raise `--shutdown-timeout-secs`, raise the platform's value by the same
 amount.
 
-| Platform | Setting | Default | Template value |
+| Platform | Setting | Default | Template |
 | --- | --- | --- | --- |
-| Fly.io | `kill_timeout` | not checked | `"60s"` |
+| Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
 | Docker Compose | `stop_grace_period` | 10 s | `60s` |
 | Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
-| Render | `maxShutdownDelaySeconds` (1-300) | 30 | `60` |
-| Railway | `drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified | `60` (the maximum is unverified) |
+| Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
+| Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
+| Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |
 
-Render's and Railway's settings were read from their current documentation; the
-Fly.io value and the Railway default and maximum were not confirmed.
+Sources, read 2026-10-22:
+[Fly.io configuration](https://docs.fly.io/reference/configuration),
+[Render deploys](https://render.com/docs/deploys) and
+[blueprint spec](https://render.com/docs/blueprint-spec),
+[Railway config as code](https://docs.railway.com/config-as-code/reference).
+Railway's default and maximum are not documented there, so they are
+unverified. Compose and Kubernetes defaults are the tools' standard ones.
+
+**On Render with a disk the window is a fixed 30 s**, shorter than the 55 s
+default, so the Render template sets `--shutdown-timeout-secs 25`. Raising the
+platform value is not possible there; if you drop the disk, you may set
+`maxShutdownDelaySeconds` and a longer `--shutdown-timeout-secs`.
 
 **Backup health never gates `/ready`.** `/ready` answers 503 only until the
 store is open. A rolling deploy starts the new instance while the old one still

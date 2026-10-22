@@ -648,7 +648,7 @@ fn run_serve(
         }
         // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
         // for the life of the server: dropping the sender stops the worker.
-        let backup = start_backup(&db, &db_dir)?;
+        let (backup, plan) = start_backup(&db, &db_dir, shutdown_timeout)?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut snapshot_task = None;
@@ -871,7 +871,7 @@ fn run_serve(
                 // Listen for a second signal before the sequence starts, so
                 // none is swallowed by the handler tokio keeps installed.
                 let second = shutdown_signal();
-                let sequence = graceful_stop(&mut serve, stop_tx, &db, backup.take(), deadline);
+                let sequence = graceful_stop(&mut serve, stop_tx, &db, backup.take(), plan, deadline);
                 tokio::select! {
                     result = sequence => result,
                     _ = second => {
@@ -896,15 +896,16 @@ fn run_serve(
     result
 }
 
-/// Test hook: delay the shutdown snapshot by this many milliseconds, to
-/// exercise the overrun path. Never set in production.
+/// Test hook, compiled only with the `test-hooks` feature (enabled for this
+/// package's own tests, never in a release build): delay the shutdown
+/// snapshot by this many milliseconds, to exercise the overrun path.
+#[cfg(feature = "test-hooks")]
 const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS";
 
 /// The graceful shutdown, in three bounded phases inside one `deadline`:
 ///
 /// 1. **Drain**: stop accepting and let in-flight requests finish, for at most
-///    [`cli::SHUTDOWN_DRAIN_SECS`] (less if the deadline leaves less, after the
-///    backup's reserve). What is still open then is cut off.
+///    `plan.drain` (25 s at the default timeout, scaled down for a shorter one). What is still open then is cut off.
 /// 2. **Snapshot**, on a blocking thread, in what remains once the backup's
 ///    reserve is set aside. If it overruns it is skipped: the WAL holds every
 ///    commit and the next open replays it.
@@ -918,6 +919,7 @@ async fn graceful_stop(
     stop_tx: tokio::sync::oneshot::Sender<()>,
     db: &SharedDb,
     backup: Option<RunningBackup>,
+    plan: cli::ShutdownPlan,
     deadline: std::time::Instant,
 ) -> Result<(), String> {
     let left = || deadline.saturating_duration_since(std::time::Instant::now());
@@ -925,7 +927,7 @@ async fn graceful_stop(
 
     tracing::info!("shutdown signal received; draining in-flight requests");
     let _ = stop_tx.send(());
-    let drain = Duration::from_secs(cli::SHUTDOWN_DRAIN_SECS).min(left().saturating_sub(reserve));
+    let drain = plan.drain.min(left().saturating_sub(reserve));
     match tokio::time::timeout(drain, &mut *serve).await {
         Ok(Ok(Ok(()))) => tracing::info!("drained; stopped"),
         Ok(Ok(Err(e))) => tracing::error!(error = %e, "server exited with an error"),
@@ -948,6 +950,7 @@ async fn graceful_stop(
     } else {
         let db_snap = db.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-hooks")]
             if let Some(ms) = std::env::var(TEST_SNAPSHOT_DELAY_ENV)
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -1011,12 +1014,22 @@ type RunningBackup = (
 /// typo must not quietly leave a store without the backup its operator asked
 /// for. The worker itself never stops the server — its failures are retried
 /// and counted on the handle.
-fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<RunningBackup>, String> {
-    let Some(config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
-        return Ok(None);
+///
+/// Also divides `shutdown_timeout` between the shutdown phases. The backup's
+/// flush grace and request deadline are shrunk when its share of a short
+/// timeout is smaller than they are, so the lease release still fits.
+fn start_backup(
+    db: &SharedDb,
+    db_dir: &std::path::Path,
+    shutdown_timeout: Duration,
+) -> Result<(Option<RunningBackup>, cli::ShutdownPlan), String> {
+    let Some(mut config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
+        return Ok((None, cli::shutdown_plan(shutdown_timeout, Duration::ZERO)));
     };
+    let plan = cli::shutdown_plan(shutdown_timeout, config.shutdown_budget());
+    config.fit_shutdown_within(plan.backup);
     let store = backup::build_store(&config).map_err(|e| e.to_string())?;
-    let budget = config.shutdown_budget();
+    let budget = plan.backup;
     let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
     let handle = backup::BackupWorker::spawn(
         config,
@@ -1026,7 +1039,7 @@ fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<Runnin
         rx,
     )
     .map_err(|e| e.to_string())?;
-    Ok(Some((tx, handle, budget)))
+    Ok((Some((tx, handle, budget)), plan))
 }
 
 async fn shutdown_signal() {

@@ -169,6 +169,26 @@ impl BackupConfig {
             + SHUTDOWN_MARGIN
     }
 
+    /// Shrink the flush grace and the request deadline until they, plus a
+    /// margin of at most [`SHUTDOWN_MARGIN`], fit in `within`, keeping their
+    /// ratio. Does nothing when [`shutdown_budget`](Self::shutdown_budget)
+    /// already fits. For a serve whose whole shutdown window is shorter than
+    /// the configured bounds: the lease release still gets a request deadline
+    /// of its own.
+    pub fn fit_shutdown_within(&mut self, within: Duration) {
+        let budget = self.shutdown_budget();
+        if budget <= within {
+            return;
+        }
+        let margin = SHUTDOWN_MARGIN.min(within / 5);
+        let room = within.saturating_sub(margin).as_secs_f64();
+        let used = (self.shutdown_grace_ms.saturating_add(self.op_timeout_ms)) as f64 / 1000.0;
+        let ratio = (room / used).min(1.0);
+        let scale = |ms: u64| ((ms as f64 * ratio) as u64).max(100);
+        self.shutdown_grace_ms = scale(self.shutdown_grace_ms);
+        self.op_timeout_ms = scale(self.op_timeout_ms);
+    }
+
     /// The bucket and prefix `s3_url` names.
     pub fn location(&self) -> Result<S3Location, BackupError> {
         parse_location(&self.s3_url)
@@ -378,6 +398,28 @@ mod tests {
         c.shutdown_grace_ms = 3_000;
         c.op_timeout_ms = 1_000;
         assert_eq!(c.shutdown_budget(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_tight_shutdown_window_shrinks_the_bounds_to_fit() {
+        let mut c = BackupConfig::new("s3://b/p");
+        c.fit_shutdown_within(Duration::from_secs(30));
+        assert_eq!(c.shutdown_budget(), Duration::from_secs(22), "already fits");
+        c.fit_shutdown_within(Duration::from_secs(10));
+        let worst = |c: &BackupConfig, within: Duration| {
+            Duration::from_millis(c.shutdown_grace_ms + c.op_timeout_ms)
+                + SHUTDOWN_MARGIN.min(within / 5)
+        };
+        assert!(
+            worst(&c, Duration::from_secs(10)) <= Duration::from_secs(10),
+            "{c:?}"
+        );
+        assert!(c.op_timeout_ms >= 100 && c.shutdown_grace_ms >= 100);
+        c.fit_shutdown_within(Duration::from_millis(300));
+        assert!(
+            worst(&c, Duration::from_millis(300)) <= Duration::from_millis(300),
+            "{c:?}"
+        );
     }
 
     #[test]

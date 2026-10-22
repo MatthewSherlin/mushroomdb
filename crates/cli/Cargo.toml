@@ -25,6 +25,9 @@ doc = false
 default = []
 embed-ui = ["server/embed-ui"]
 tls = ["server/tls"]
+# Test-only hooks in the binary (a slow shutdown snapshot). Enabled for this
+# package's own tests through the self dev-dependency below; never default.
+test-hooks = []
 
 [dependencies]
 # The subscriber lives in the binary. `env-filter` gives MUSHROOMDB_LOG, and
@@ -49,3 +52,7 @@ arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
 # `mushroomdb import`: RFC 4180 parsing of the bulk-import CSV files.
 csv = "1"
+
+[dev-dependencies]
+# Self dev-dependency: turns on `test-hooks` for this package's tests only.
+mushroomdb-cli = { path = ".", features = ["test-hooks"] }

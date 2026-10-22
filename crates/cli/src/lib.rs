@@ -1093,8 +1093,60 @@ fn parse_role_token(val: &str) -> Result<(String, String), String> {
 /// what is left of the budget (8 s with the default backup bounds), then flush
 /// the backup and release the lease within 22 s.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 55;
-/// The longest the drain phase of a shutdown may take.
+/// The drain phase's share at the default timeout, and its cap at any timeout.
 pub const SHUTDOWN_DRAIN_SECS: u64 = 25;
+/// The snapshot phase's nominal share, used to scale the phases down when the
+/// timeout is shorter than drain + snapshot + backup.
+const SHUTDOWN_SNAPSHOT_NOMINAL: Duration = Duration::from_secs(8);
+/// A backup flush keeps at least this much of any timeout, so the lease
+/// release is still attempted under a tight one.
+const SHUTDOWN_BACKUP_FLOOR: Duration = Duration::from_secs(2);
+
+/// How a shutdown's time is divided: the three phases, in order, and the
+/// most each may take. They sum to at most the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// Longest the drain of in-flight requests may take.
+    pub drain: Duration,
+    /// Snapshot's share; unused drain time also goes to it at run time.
+    pub snapshot: Duration,
+    /// Backup flush and lease release. Zero without backup.
+    pub backup: Duration,
+}
+
+/// Divide `total` between the phases. `backup_bound` is the backup's own
+/// shutdown bound (`BackupConfig::shutdown_budget`), zero without backup.
+///
+/// With room (`total` at least drain cap + 8 s + `backup_bound`) the drain gets
+/// its cap, the backup its bound, and the snapshot the rest. With less, all
+/// three scale down in proportion, except that the backup keeps a floor
+/// ([`SHUTDOWN_BACKUP_FLOOR`], never more than its bound) and the drain gives
+/// way first: it is the phase a stuck client can stretch.
+pub fn shutdown_plan(total: Duration, backup_bound: Duration) -> ShutdownPlan {
+    let cap = Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    let nominal = cap + SHUTDOWN_SNAPSHOT_NOMINAL + backup_bound;
+    if total >= nominal {
+        return ShutdownPlan {
+            drain: cap,
+            snapshot: total - cap - backup_bound,
+            backup: backup_bound,
+        };
+    }
+    let scaled = |d: Duration| d.mul_f64(total.as_secs_f64() / nominal.as_secs_f64());
+    let backup = if backup_bound.is_zero() {
+        Duration::ZERO
+    } else {
+        scaled(backup_bound)
+            .max(SHUTDOWN_BACKUP_FLOOR.min(backup_bound))
+            .min(total)
+    };
+    let drain = scaled(cap).min(total - backup);
+    ShutdownPlan {
+        drain,
+        snapshot: total - backup - drain,
+        backup,
+    }
+}
 
 fn parse_shutdown_timeout(val: &str) -> Result<Duration, String> {
     let secs: u64 = val
@@ -3820,6 +3872,37 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_shutdown_plan_uses_the_nominal_split_with_room_and_scales_without() {
+        let s = Duration::from_secs;
+        // Default timeout, default backup bound: 25 + 8 + 22.
+        let p = shutdown_plan(s(55), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(8), s(22)));
+        // More room goes to the snapshot.
+        let p = shutdown_plan(s(100), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(53), s(22)));
+        // Less room: every phase shrinks, and the sum never exceeds the timeout.
+        for total in [1, 2, 5, 10, 25, 40, 54] {
+            for bound in [0, 1, 3, 22, 60] {
+                let p = shutdown_plan(s(total), s(bound));
+                assert!(
+                    p.drain + p.snapshot + p.backup <= s(total),
+                    "{total}/{bound}: {p:?}"
+                );
+                assert!(p.drain <= s(SHUTDOWN_DRAIN_SECS));
+                if bound == 0 {
+                    assert_eq!(p.backup, Duration::ZERO);
+                } else {
+                    assert!(p.backup <= s(bound).min(s(total)));
+                    assert!(p.backup >= s(2).min(s(bound)).min(s(total)), "{p:?}");
+                }
+            }
+        }
+        // 25 s with backup: the backup keeps a real share.
+        let p = shutdown_plan(s(25), s(22));
+        assert!(p.backup >= s(9) && p.drain >= s(10), "{p:?}");
     }
 
     #[test]

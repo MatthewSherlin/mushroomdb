@@ -24,17 +24,18 @@ services:
       url: ghcr.io/matthewsherlin/mushroomdb:latest
     numInstances: 1
     # Explicit command: no --demo-if-empty, so a production disk is never seeded.
-    dockerCommand: serve /data --addr 0.0.0.0:8080 --snapshot-every 300
+    dockerCommand: serve /data --addr 0.0.0.0:8080 --snapshot-every 300 --shutdown-timeout-secs 25
     disk:
       name: mushroomdb-data
       mountPath: /data
       sizeGB: 10
     # Render probes the port named by PORT; the server binds 8080 (--addr above).
     healthCheckPath: /ready
-    # Time between SIGTERM and SIGKILL (default 30, range 1-300). serve drains,
-    # snapshots, flushes the backup and deletes its bucket lease within 55 s by
-    # default; see docs/site/deployment.md, "Stopping cleanly".
-    maxShutdownDelaySeconds: 60
+    # Render sends SIGKILL 30 s after SIGTERM, and that delay cannot be changed
+    # for a service with a persistent disk (maxShutdownDelaySeconds is refused
+    # with one). So serve is told to finish its whole shutdown (drain, snapshot,
+    # backup flush, lease release) within 25 s; see docs/site/deployment.md,
+    # "Stopping cleanly".
     envVars:
       - key: PORT
         value: "8080"

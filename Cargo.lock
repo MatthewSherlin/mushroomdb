@@ -1477,6 +1477,7 @@ dependencies = [
  "csv",
  "mushroomdb",
  "mushroomdb-backup",
+ "mushroomdb-cli",
  "mushroomdb-extract",
  "mushroomdb-server",
  "parquet",

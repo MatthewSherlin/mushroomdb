@@ -665,3 +665,92 @@ fn writes_acknowledged_before_sigterm_are_present_after_restart() {
         assert!(reopened.has_node(key), "{key} was acknowledged but is gone");
     }
 }
+
+/// A TCP endpoint that accepts connections and never answers.
+fn black_hole() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut open = Vec::new();
+        for stream in listener.incoming().take(256).flatten() {
+            open.push(stream);
+        }
+    });
+    endpoint
+}
+
+/// Every phase slow at once, under a short `--shutdown-timeout-secs`: a stuck
+/// request holds the drain, the snapshot is slow, and the bucket never
+/// answers. The default backup bounds (22 s) are larger than the whole
+/// window; the sequence must still end inside it.
+#[test]
+fn a_short_timeout_with_every_phase_slow_still_finishes_inside_it() {
+    let endpoint = black_hole();
+    let dir = tmp("all-slow");
+    let mut child = serve(
+        &dir,
+        &[
+            ("MUSHROOMDB_BACKUP_S3_URL", "minio://bucket/prefix"),
+            ("MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS", "60000"),
+            ("AWS_ENDPOINT_URL", endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", "k"),
+            ("AWS_SECRET_ACCESS_KEY", "s"),
+        ],
+    )
+    .args(["--shutdown-timeout-secs", "8"])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn mushroomdb serve");
+    let addr = listening_addr(&mut child);
+    create_node(&addr, "acked");
+    let _stuck = stuck_request(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    send_term(&child);
+    wait_exit(&mut child, started, Duration::from_secs(11));
+    assert!(mushroomdb::GraphDb::open(&dir).unwrap().has_node("acked"));
+}
+
+/// A forced exit during a stuck drain and, separately, during a slow
+/// snapshot loses nothing that was acknowledged: the WAL is fsynced first.
+#[test]
+fn an_acknowledged_write_survives_a_forced_second_signal_exit() {
+    for (name, stuck, delay) in [
+        ("forced-drain", true, None),
+        ("forced-snap", false, Some("60000")),
+    ] {
+        let dir = tmp(name);
+        let mut cmd = serve(&dir, &[]);
+        if let Some(ms) = delay {
+            cmd.env("MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS", ms);
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mushroomdb serve");
+        let addr = listening_addr(&mut child);
+        for key in ["a", "b", "c"] {
+            create_node(&addr, key);
+        }
+        let _stuck = stuck.then(|| stuck_request(&addr));
+        std::thread::sleep(Duration::from_millis(300));
+        send_term(&child);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{name}: still stopping"
+        );
+        let started = std::time::Instant::now();
+        send_term(&child);
+        wait_exit(&mut child, started, Duration::from_secs(3));
+        let reopened = mushroomdb::GraphDb::open(&dir).unwrap();
+        for key in ["a", "b", "c"] {
+            assert!(
+                reopened.has_node(key),
+                "{name}: {key} was acknowledged but is gone"
+            );
+        }
+    }
+}

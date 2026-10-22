@@ -129,7 +129,7 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
 #[test]
 fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
     for (name, needle) in [
-        ("fly/fly.toml", "\nkill_timeout = \"60s\"\n"),
+        ("fly/fly.toml", "\nkill_timeout = 60\n"),
         (
             "docker-compose/docker-compose.yml",
             "stop_grace_period: 60s",
@@ -140,4 +140,19 @@ fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
             "{name} must contain {needle}"
         );
     }
+}
+
+/// A Render service with a persistent disk gets a fixed 30 s shutdown delay;
+/// `maxShutdownDelaySeconds` is refused with a disk, so it must not be set,
+/// and `serve` is told to finish inside the window instead.
+#[test]
+fn the_render_template_fits_its_fixed_shutdown_window() {
+    let text = template("render/render.yaml");
+    assert!(text.contains("disk:"), "the template has a persistent disk");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("maxShutdownDelaySeconds")),
+        "maxShutdownDelaySeconds is not allowed with a disk"
+    );
 }
