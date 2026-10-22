@@ -7,12 +7,13 @@
 //! `AWS_SECRET_ACCESS_KEY`, defaulting to MinIO's `minioadmin`. Each run writes
 //! under a fresh prefix.
 
+use backup::lease::{lease_key, LeaseRecord};
 use backup::manifest::{crc32_hex, latest_key, parse_segment_key};
 use backup::store::build_store_with;
-use backup::{BackupConfig, BackupWorker, Manifest};
+use backup::{BackupConfig, BackupWorker, BucketLease, Exclusion, LeaseError, Manifest};
 use mushroomdb::{BatchOp, GraphDb, SharedDb, SnapshotOptions, Value};
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, PutPayload};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,6 +24,11 @@ struct Bucket {
 }
 
 fn bucket() -> Option<Bucket> {
+    bucket_with(true)
+}
+
+/// A bucket handle; `lease_conditional` as `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL`.
+fn bucket_with(lease_conditional: bool) -> Option<Bucket> {
     let Ok(endpoint) = std::env::var("MUSHROOMDB_TEST_S3_ENDPOINT") else {
         eprintln!("MUSHROOMDB_TEST_S3_ENDPOINT is not set: skipping the S3 test");
         return None;
@@ -37,7 +43,10 @@ fn bucket() -> Option<Bucket> {
             .unwrap()
             .as_nanos()
     );
-    let config = BackupConfig::new(format!("minio://{name}/{prefix}"));
+    let config = BackupConfig {
+        lease_conditional,
+        ..BackupConfig::new(format!("minio://{name}/{prefix}"))
+    };
     let env = |k: &str| -> Option<String> {
         match k {
             "AWS_ENDPOINT_URL" => Some(endpoint.clone()),
@@ -188,4 +197,129 @@ async fn s3_refusals_are_logged_without_the_access_key_id() {
         .expect_err("the bucket refuses unknown keys");
     let shown = err.to_string();
     assert!(!shown.contains(key_id), "{shown}");
+}
+
+/// On a real S3 service the lease is a compare-and-swap: contenders that
+/// start together get exactly one lease, the probe confirms the service
+/// honors preconditions, and a holder whose lease was replaced learns so at
+/// its next renewal and leaves the new lease alone on release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_lease_gives_real_exclusion() {
+    let Some(b) = bucket() else { return };
+    let tries: Vec<_> = (0..8)
+        .map(|_| {
+            let (s, p) = (Arc::clone(&b.store), b.prefix.clone());
+            tokio::spawn(async move { BucketLease::acquire(s, &p, 30).await })
+        })
+        .collect();
+    let mut winners = Vec::new();
+    for t in tries {
+        match t.await.unwrap() {
+            Ok(l) => winners.push(l),
+            Err(LeaseError::ForeignActive { .. }) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one lease");
+    let lease = winners.pop().unwrap();
+    assert_eq!(lease.exclusion(), Exclusion::Conditional);
+    lease.renew().await.unwrap();
+    assert_eq!(lease.exclusion(), Exclusion::Conditional, "If-Match works");
+
+    let key = ObjectPath::from(lease_key(&b.prefix));
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let foreign = LeaseRecord {
+        instance_id: "successor".into(),
+        acquired_at: now.clone(),
+        renewed_at: now,
+        ttl_s: 30,
+    };
+    b.store
+        .put(
+            &key,
+            PutPayload::from(serde_json::to_vec(&foreign).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        lease.renew().await,
+        Err(LeaseError::Lost { instance_id: Some(ref id) }) if id == "successor"
+    ));
+    lease.release().await.unwrap();
+    let left: LeaseRecord = serde_json::from_slice(&get(&b.store, key.as_ref()).await).unwrap();
+    assert_eq!(left.instance_id, "successor");
+    b.store.delete(&key).await.unwrap();
+}
+
+/// With `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off` the client sends no
+/// preconditions, and the lease says it is best-effort.
+#[tokio::test]
+async fn s3_lease_without_conditional_put_is_best_effort() {
+    let Some(b) = bucket_with(false) else { return };
+    let lease = BucketLease::acquire(Arc::clone(&b.store), &b.prefix, 30)
+        .await
+        .unwrap();
+    assert_eq!(lease.exclusion(), Exclusion::BestEffort);
+    lease.renew().await.unwrap();
+    lease.release().await.unwrap();
+}
+
+/// A spawned worker on a real S3 service takes the lease, keeps it across
+/// renewals, uploads under it, and deletes it on shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_worker_holds_renews_and_releases_the_lease() {
+    let Some(b) = bucket() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
+    let h = BackupWorker::spawn(
+        BackupConfig {
+            wal_interval_ms: 100,
+            manifest_interval_s: 0,
+            // Generous: a loaded CI runner must not time a request out.
+            lease_ttl_s: 6,
+            op_timeout_ms: 5_000,
+            ..b.config.clone()
+        },
+        Arc::clone(&b.store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+        rx,
+    )
+    .unwrap();
+    let key = ObjectPath::from(lease_key(&b.prefix));
+    // Across renewals (every two seconds), writes keep shipping.
+    for i in 0..4 {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        db.write()
+            .insert_node("A", &format!("n{i}"), vec![])
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let held: LeaseRecord = serde_json::from_slice(&get(&b.store, key.as_ref()).await).unwrap();
+    let at = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    };
+    assert!(
+        at(&held.renewed_at) > at(&held.acquired_at),
+        "renewed: {held:?}"
+    );
+    assert!(
+        h.healthy.load(std::sync::atomic::Ordering::Acquire),
+        "{:?}",
+        h.reason.lock().unwrap()
+    );
+    assert_eq!(h.error_count.load(std::sync::atomic::Ordering::Acquire), 0);
+    tx.send(backup::BackupTrigger::Shutdown).unwrap();
+    h.join.await.unwrap();
+    assert!(matches!(
+        b.store.head(&key).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    let restored = tempfile::tempdir().unwrap();
+    restore_latest(&b, restored.path()).await;
+    assert_eq!(GraphDb::open(restored.path()).unwrap().node_count(), 5);
 }

@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+mod support;
+
 const PREFIX: &str = "pfx";
 
 fn config(wal_interval_ms: u64) -> BackupConfig {
@@ -1164,16 +1166,15 @@ async fn a_refused_snapshot_put_is_counted_and_retried() {
 /// times out and is counted; the worker keeps going and shuts down on time.
 #[tokio::test(start_paused = true)]
 async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
-    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     let dir = tempfile::tempdir().unwrap();
     let db = store_with_a_snapshot(dir.path());
-    let hung: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
-        InMemory::new(),
-        ThrottleConfig {
-            wait_put_per_call: Duration::from_secs(365 * 24 * 3600),
-            ..ThrottleConfig::default()
-        },
-    ));
+    // Every upload but the lease hangs: the worker holds its lease and the
+    // snapshot PUT is what times out.
+    let faulty = support::Faulty::new(mem());
+    faulty
+        .hang_data_puts
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let hung: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
     let (tx, rx) = watch::channel(BackupTrigger::Idle);
     let handle = BackupWorker::spawn(
         BackupConfig {
@@ -1202,6 +1203,10 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
     );
     let reason = handle.reason.lock().unwrap().clone().unwrap();
     assert!(reason.contains("consecutive failed"), "{reason}");
+    assert!(
+        faulty.data_writes() >= 3,
+        "the snapshot PUT was attempted and timed out each time"
+    );
     tx.send(BackupTrigger::Shutdown).unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.join)
         .await

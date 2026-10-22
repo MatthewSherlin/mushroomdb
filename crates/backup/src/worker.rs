@@ -41,13 +41,33 @@
 //! names. So at any point — a crash between any two requests included — every
 //! manifest in the bucket verifies, and `LATEST` names one of them.
 //!
+//! # The bucket lease
+//!
+//! A spawned worker uploads nothing until it holds the prefix's
+//! [`BucketLease`]. While another instance holds a fresh one the worker
+//! uploads nothing, reports itself unhealthy naming the holder, and tries
+//! again every third of a TTL — so a successor waiting on a holder that died,
+//! or on one shutting down in a rolling deploy, takes over within a TTL. A
+//! separate task renews the lease every third of a TTL; every request that
+//! changes the bucket runs only while [`BucketLease::may_write`] holds and is
+//! cancelled when it stops holding. A lease found lost (taken over) is
+//! dropped, and a lease taken again later starts from the bucket's state
+//! afresh: its previous run's view of the bucket is stale. On shutdown, after
+//! the flush, the lease is deleted. The lease is advisory; see
+//! [`crate::lease`] for what it does and does not guarantee.
+//!
+//! [`BackupWorker::run_once`] and [`BackupWorker::step`] take no lease: they
+//! are for tests and callers that hold one themselves.
+//!
 //! # Health
 //!
 //! A supervisor beside the worker re-evaluates health every `wal_interval_ms`,
 //! whatever the worker is doing, and reports a worker that exits or panics as
-//! unhealthy with the reason. A dead backup never looks healthy.
+//! unhealthy with the reason. A dead backup never looks healthy, and neither
+//! does one kept out of the bucket by its lease.
 
 use crate::disk::{self, DiskState, Ident};
+use crate::lease::{BucketLease, Exclusion, LeaseError};
 use crate::manifest::{
     archive_key, crc32_hex, format_crc32, latest_key, manifest_key, object_key, parse_archive_name,
     parse_segment_key, parse_versioned_generation, segment_key, side_key, snapshot_key, FileEntry,
@@ -97,6 +117,8 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The shortest lag that makes the worker unhealthy: durable data unshipped
 /// for longer than `max(MIN_UNHEALTHY_LAG, 10 × wal_interval)`.
 pub const MIN_UNHEALTHY_LAG: Duration = Duration::from_secs(30);
+/// Retry delay after a failed lease renewal (capped at the renewal interval).
+pub const RENEW_RETRY: Duration = Duration::from_secs(1);
 /// Read size when streaming a snapshot or archive.
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 
@@ -225,6 +247,8 @@ struct HealthState {
     seen_key: Option<WalKey>,
     /// Since when a new restore point has been due and not made.
     base_due_since: Option<Instant>,
+    /// Why the bucket lease keeps this worker from uploading, while it does.
+    lease: Option<String>,
     stopped: Option<String>,
 }
 
@@ -281,6 +305,8 @@ impl Health {
         }
         self.lag_s.store(lag.as_secs(), Ordering::Release);
         let reason = if let Some(r) = &s.stopped {
+            Some(r.clone())
+        } else if let Some(r) = &s.lease {
             Some(r.clone())
         } else if s.consecutive_failures >= UNHEALTHY_AFTER_FAILURES {
             Some(format!(
@@ -344,6 +370,14 @@ pub struct BackupWorker {
     panic_next: bool,
     /// LIST requests made, for the retention-cost test.
     lists: u64,
+    /// The bucket lease, while this worker holds it (spawned workers only).
+    lease: Option<Arc<BucketLease>>,
+    /// The task renewing `lease`.
+    renewer: Option<JoinHandle<()>>,
+    /// Leases taken so far; a second one starts from the bucket afresh.
+    tenures: u64,
+    /// The foreign holder last logged, so a wait is logged once.
+    foreign: Option<String>,
 }
 
 impl BackupWorker {
@@ -386,12 +420,18 @@ impl BackupWorker {
             write_budget: None,
             panic_next: false,
             lists: 0,
+            lease: None,
+            renewer: None,
+            tenures: 0,
+            foreign: None,
         })
     }
 
-    /// Start the worker as a Tokio task. It runs one step at once — reading
-    /// the bucket's previous state and uploading a base restore point — then
-    /// one every `wal_interval_ms`, and one immediately on each trigger.
+    /// Start the worker as a Tokio task. It takes the bucket lease, then runs
+    /// one step at once — reading the bucket's previous state and uploading a
+    /// base restore point — then one every `wal_interval_ms`, and one
+    /// immediately on each trigger. While another instance holds the lease it
+    /// uploads nothing and is unhealthy (see [the module docs](self)).
     ///
     /// # Errors
     ///
@@ -503,35 +543,150 @@ impl BackupWorker {
             if shutdown {
                 break;
             }
+            // Nothing is uploaded without the bucket lease.
+            if !self.holds_lease() {
+                match until_shutdown(&mut rx, self.take_lease()).await {
+                    None => break,
+                    Some(Some(wait)) => {
+                        delay = wait;
+                        continue;
+                    }
+                    Some(None) => {}
+                }
+            }
             // A step blocked on an unresponsive bucket must not hold up a
             // shutdown: the step is dropped — its in-flight request abandoned
             // — the moment one arrives.
-            let stepped = {
-                let step = self.step();
-                tokio::pin!(step);
-                loop {
-                    tokio::select! {
-                        d = &mut step => break Some(d),
-                        changed = rx.changed() => {
-                            if is_shutdown(changed, &mut rx) {
-                                break None;
-                            }
-                        }
-                    }
-                }
-            };
-            match stepped {
+            match until_shutdown(&mut rx, self.step()).await {
                 Some(d) => delay = d,
                 None => break,
             }
         }
-        let grace = Duration::from_millis(self.config.shutdown_grace_ms);
-        if tokio::time::timeout(grace, self.flush()).await.is_err() {
-            self.error_count.fetch_add(1, Ordering::AcqRel);
-            tracing::warn!(
-                grace_ms = self.config.shutdown_grace_ms,
-                "backup flush did not finish within the shutdown grace; abandoned"
-            );
+        if self.holds_lease() {
+            let grace = Duration::from_millis(self.config.shutdown_grace_ms);
+            if tokio::time::timeout(grace, self.flush()).await.is_err() {
+                self.error_count.fetch_add(1, Ordering::AcqRel);
+                tracing::warn!(
+                    grace_ms = self.config.shutdown_grace_ms,
+                    "backup flush did not finish within the shutdown grace; abandoned"
+                );
+            }
+        }
+        self.release_lease().await;
+    }
+
+    // ── The bucket lease ────────────────────────────────────────────────────
+
+    fn holds_lease(&self) -> bool {
+        self.lease.as_ref().is_some_and(|l| !l.is_lost())
+    }
+
+    /// Try to take the bucket lease. `None` once it is held; otherwise how
+    /// long to wait before trying again.
+    async fn take_lease(&mut self) -> Option<Duration> {
+        if self.lease.as_ref().is_some_and(|l| l.is_lost()) {
+            if let Some(r) = self.renewer.take() {
+                r.abort();
+            }
+            self.lease = None;
+        }
+        let ttl_s = self.config.lease_ttl_s;
+        let acquire = BucketLease::acquire(Arc::clone(&self.store), &self.prefix, ttl_s);
+        // A few requests: a read, a conditional write, the probe.
+        let wait = match tokio::time::timeout(self.op_timeout() * 3, acquire).await {
+            Ok(Ok(lease)) => {
+                self.hold(lease);
+                None
+            }
+            Ok(Err(LeaseError::ForeignActive { instance_id })) => {
+                if self.foreign.as_deref() != Some(instance_id.as_str()) {
+                    tracing::warn!(
+                        holder = %instance_id,
+                        "the backup bucket's lease is held by another instance; \
+                         this one uploads nothing while that lease is fresh"
+                    );
+                    self.foreign = Some(instance_id.clone());
+                }
+                self.health.lock().lease = Some(format!(
+                    "the backup bucket's lease is held by another instance ({instance_id}); \
+                     this instance uploads nothing while it is"
+                ));
+                Some(poll_interval(ttl_s))
+            }
+            Ok(Err(e)) => Some(self.failed(&BackupError::Lease(e.to_string()))),
+            Err(_) => Some(self.failed(&BackupError::Timeout("taking the bucket lease".into()))),
+        };
+        let pos = self.position().await;
+        self.health.observe(&pos, Instant::now());
+        wait
+    }
+
+    /// Hold `lease`: start renewing it, and forget a previous tenure's view
+    /// of the bucket.
+    fn hold(&mut self, lease: BucketLease) {
+        if self.tenures > 0 {
+            self.reset_tenure();
+        }
+        self.tenures += 1;
+        self.foreign = None;
+        self.health.lock().lease = None;
+        match lease.exclusion() {
+            Exclusion::Conditional => tracing::info!(
+                instance_id = lease.instance_id(),
+                "took the backup bucket lease (conditional writes: one writer at a time)"
+            ),
+            Exclusion::BestEffort => tracing::warn!(
+                instance_id = lease.instance_id(),
+                "took the backup bucket lease best-effort: this service does not honor \
+                 conditional writes, so two instances started together may both upload"
+            ),
+        }
+        let lease = Arc::new(lease);
+        self.renewer = Some(tokio::spawn(renew_loop(
+            Arc::clone(&lease),
+            self.op_timeout(),
+            self.health.clone(),
+            Arc::clone(&self.error_count),
+        )));
+        self.lease = Some(lease);
+    }
+
+    /// Forget everything known about the bucket: another writer may have
+    /// changed it since this worker last held the lease.
+    fn reset_tenure(&mut self) {
+        self.resumed = false;
+        self.next_generation = 0;
+        self.generations.clear();
+        self.current = None;
+        self.snapshot = None;
+        self.archives.clear();
+        self.base_archives.clear();
+        self.side.clear();
+        self.manifest_dirty = false;
+        self.last_manifest_at = None;
+        self.health.lock().shipped = None;
+    }
+
+    /// Stop renewing and delete the lease, if this worker still holds it.
+    async fn release_lease(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        if let Some(r) = self.renewer.take() {
+            r.abort();
+            let _ = r.await;
+        }
+        let Ok(lease) = Arc::try_unwrap(lease) else {
+            return;
+        };
+        match tokio::time::timeout(self.op_timeout(), lease.release()).await {
+            Ok(Ok(())) => tracing::info!("released the backup bucket lease"),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not release the backup bucket lease; it expires by itself")
+            }
+            Err(_) => {
+                tracing::warn!("releasing the backup bucket lease timed out; it expires by itself")
+            }
         }
     }
 
@@ -546,26 +701,29 @@ impl BackupWorker {
                 self.backoff = FIRST_BACKOFF;
                 Duration::from_millis(self.config.wal_interval_ms)
             }
-            Err(e) => {
-                self.error_count.fetch_add(1, Ordering::AcqRel);
-                let failures = {
-                    let mut s = self.health.lock();
-                    s.consecutive_failures += 1;
-                    s.consecutive_failures
-                };
-                let delay = self.backoff;
-                self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-                tracing::warn!(
-                    error = %e,
-                    consecutive_failures = failures,
-                    retry_in_s = delay.as_secs(),
-                    "backup step failed"
-                );
-                delay
-            }
+            Err(e) => self.failed(&e),
         };
         let pos = self.position().await;
         self.health.observe(&pos, Instant::now());
+        delay
+    }
+
+    /// Count a failed step or lease attempt; return the back-off to wait.
+    fn failed(&mut self, e: &BackupError) -> Duration {
+        self.error_count.fetch_add(1, Ordering::AcqRel);
+        let failures = {
+            let mut s = self.health.lock();
+            s.consecutive_failures += 1;
+            s.consecutive_failures
+        };
+        let delay = self.backoff;
+        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        tracing::warn!(
+            error = %e,
+            consecutive_failures = failures,
+            retry_in_s = delay.as_secs(),
+            "backup step failed"
+        );
         delay
     }
 
@@ -1085,11 +1243,21 @@ impl BackupWorker {
         }
     }
 
+    /// A request that changes the bucket: under the operation deadline and,
+    /// when the worker holds a lease, the lease's fence.
+    async fn fenced<T>(
+        &self,
+        what: impl FnOnce() -> String,
+        fut: impl Future<Output = Result<T, BackupError>>,
+    ) -> Result<T, BackupError> {
+        fence(self.lease.as_deref(), self.deadline(what, fut)).await
+    }
+
     async fn put(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
         self.spend_write()?;
         let path = ObjectPath::from(key);
         let store = Arc::clone(&self.store);
-        self.deadline(|| format!("PUT {key}"), async move {
+        self.fenced(|| format!("PUT {key}"), async move {
             store.put(&path, PutPayload::from(bytes)).await?;
             Ok(())
         })
@@ -1098,7 +1266,7 @@ impl BackupWorker {
 
     /// Stream `file` to `key`, multipart when large; return its entry, with
     /// its frame count when `count_frames`. Each chunk, and the final commit,
-    /// is under the operation deadline.
+    /// is under the operation deadline and the lease's fence.
     ///
     /// A failure while chunks are being written aborts the upload once. A
     /// failure of the final commit drops it instead: the writer has already
@@ -1119,6 +1287,7 @@ impl BackupWorker {
         let mut size = 0u64;
         let mut buf = vec![0u8; UPLOAD_CHUNK];
         let timeout = self.op_timeout();
+        let lease = self.lease.clone();
         let written: Result<(), BackupError> = async {
             loop {
                 let n = file.read(&mut buf).await?;
@@ -1130,9 +1299,13 @@ impl BackupWorker {
                     counter.feed(&buf[..n]);
                 }
                 size += n as u64;
-                tokio::time::timeout(timeout, writer.write_all(&buf[..n]))
-                    .await
-                    .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+                fence(lease.as_deref(), async {
+                    tokio::time::timeout(timeout, writer.write_all(&buf[..n]))
+                        .await
+                        .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+                    Ok(())
+                })
+                .await?;
             }
         }
         .await;
@@ -1140,9 +1313,13 @@ impl BackupWorker {
             let _ = tokio::time::timeout(timeout, writer.abort()).await;
             return Err(e);
         }
-        tokio::time::timeout(timeout, writer.shutdown())
-            .await
-            .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+        fence(lease.as_deref(), async {
+            tokio::time::timeout(timeout, writer.shutdown())
+                .await
+                .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+            Ok(())
+        })
+        .await?;
         Ok(FileEntry {
             name: name.to_string(),
             key: key.to_string(),
@@ -1169,7 +1346,7 @@ impl BackupWorker {
         self.spend_write()?;
         let path = ObjectPath::from(key);
         let store = Arc::clone(&self.store);
-        self.deadline(|| format!("DELETE {key}"), async move {
+        self.fenced(|| format!("DELETE {key}"), async move {
             match store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                 Err(e) => Err(e.into()),
@@ -1198,6 +1375,95 @@ async fn position_of(source: &Arc<dyn WalSource>) -> WalPosition {
         // The read itself cannot fail; a panicked blocking task falls back to
         // reading here.
         Err(_) => source.durable_wal_position(),
+    }
+}
+
+/// Run `fut` unless a shutdown arrives first; `None` if it did.
+async fn until_shutdown<F: Future>(
+    rx: &mut watch::Receiver<BackupTrigger>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            changed = rx.changed() => {
+                if is_shutdown(changed, rx) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// How often a worker kept out by a foreign lease looks again.
+fn poll_interval(ttl_s: u64) -> Duration {
+    Duration::from_millis(ttl_s.max(1) * 1000 / 3)
+}
+
+/// Run a write while `lease` allows writes, and cancel it the moment it
+/// stops: lost, or not renewed in time. No lease: run it as it is.
+async fn fence<T>(
+    lease: Option<&BucketLease>,
+    fut: impl Future<Output = Result<T, BackupError>>,
+) -> Result<T, BackupError> {
+    let Some(lease) = lease else {
+        return fut.await;
+    };
+    tokio::pin!(fut);
+    loop {
+        let Some(deadline) = lease.write_deadline() else {
+            return Err(BackupError::Lease(if lease.is_lost() {
+                "lost to another instance; this one no longer writes to the bucket".into()
+            } else {
+                "not renewed in time; writes are stopped until it is".into()
+            }));
+        };
+        // Look again at least every second: the wall clock can jump.
+        let wake = deadline.min(Instant::now() + Duration::from_secs(1));
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+    }
+}
+
+/// Renew `lease` every third of its TTL, and a second after a failure. Stops
+/// when the lease is found lost; health says why the worker is kept out.
+async fn renew_loop(
+    lease: Arc<BucketLease>,
+    op_timeout: Duration,
+    health: Health,
+    errors: Arc<AtomicU64>,
+) {
+    let every = lease.renew_interval().max(Duration::from_millis(1));
+    let mut wait = every;
+    loop {
+        tokio::time::sleep(wait).await;
+        let why = match tokio::time::timeout(op_timeout, lease.renew()).await {
+            Ok(Ok(())) => {
+                health.lock().lease = None;
+                wait = every;
+                continue;
+            }
+            Ok(Err(e @ LeaseError::Lost { .. })) => {
+                tracing::warn!(error = %e, "lost the backup bucket lease; uploads stop");
+                health.lock().lease = Some(format!(
+                    "{e}; this instance uploads nothing while another holds it"
+                ));
+                return;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "the renewal timed out".to_string(),
+        };
+        errors.fetch_add(1, Ordering::AcqRel);
+        tracing::warn!(error = %why, "backup bucket lease renewal failed; retrying");
+        if !lease.may_write() {
+            health.lock().lease = Some(format!(
+                "the bucket lease could not be renewed ({why}); uploads are stopped until it is"
+            ));
+        }
+        wait = RENEW_RETRY.min(every);
     }
 }
 

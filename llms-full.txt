@@ -12824,6 +12824,51 @@ recipes are the most reliable routes known, written without a live account.
 They are confirmed or corrected at the release gate by a real deploy on each
 platform, and this page changes with what that shows.
 
+## One writer per backup bucket (the lease)
+
+When `MUSHROOMDB_BACKUP_S3_URL` turns on continuous backup, `serve` takes a lease
+on the backup prefix before it uploads anything. The lease is one object,
+`<prefix>/LEASE`, naming the instance that holds it:
+
+```json
+{ "instance_id": "…", "acquired_at": "…", "renewed_at": "…", "ttl_s": 30 }
+```
+
+The holder renews it every third of a TTL and deletes it on shutdown. A second
+instance pointed at the same prefix finds a lease renewed less than `ttl_s` ago
+and uploads nothing. Its backup health turns false, naming the holder, while it
+keeps serving from its local disk. It checks again every third of a TTL. When the
+holder stops renewing, the second instance takes over within one TTL: the holder
+may have died, or it may be shutting down in a rolling deploy.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MUSHROOMDB_BACKUP_LEASE_TTL` | `30` | Seconds a lease stays its holder's after a renewal; at least 1 |
+| `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL` | `on` | `off` for a service that rejects conditional PUT headers |
+
+**The lease is advisory, not a distributed lock.** It catches the common mistake
+of giving two machines the same bucket. It does not make two writers safe:
+
+- **Real exclusion needs conditional PUT.** On AWS S3, Cloudflare R2 and MinIO the
+  lease is taken and renewed with `If-None-Match` / `If-Match`. Two instances
+  that start together get exactly one lease, and a holder whose lease was taken
+  over learns so at its next renewal. When a service ignores those headers, a
+  probe detects it as the lease is taken. Under `..._LEASE_CONDITIONAL=off` the
+  lease is best-effort, and the log says so. In that case two instances that
+  start together can both upload until the next renewal.
+- **A holder stops itself in time.** A holder that cannot renew stops writing two
+  thirds of a TTL after its last renewal. Its in-flight uploads are cancelled at
+  that point. Nobody may take the lease over until a full TTL has passed, so a
+  holder cut off from the bucket writes nothing after a takeover, even after
+  the network comes back. This tolerates clock skew between machines of up to a
+  third of a TTL (10 s at the default).
+- **What it cannot stop.** If the service has already received an upload, the
+  upload completes there even after the client gives up on it. A process
+  frozen in the middle of a request still sends it when it resumes. Every
+  backup object is immutable, so the worst outcome is an orphaned object or a
+  `LATEST` that points at an older restore point. A restore point that does
+  not verify is never one of the outcomes.
+
 ## Loopback-first posture
 
 mushroomdb defaults to `127.0.0.1:8080` and refuses to bind a non-loopback

@@ -10,6 +10,10 @@
 //! The recovery point is the segment cadence, not the snapshot interval: a
 //! commit is off-box durable once the segment holding it is uploaded.
 //!
+//! Before it uploads anything the worker takes the prefix's [`BucketLease`],
+//! an advisory single-writer lock, and while another instance holds a fresh
+//! one it uploads nothing and reports itself unhealthy (see [`lease`]).
+//!
 //! The worker never takes an engine lock and never writes to the store; a
 //! failed upload is retried with back-off and reported through
 //! [`BackupHandle`], never to the write path.
@@ -18,11 +22,13 @@
 pub use object_store;
 
 pub mod disk;
+pub mod lease;
 pub mod manifest;
 pub mod segment;
 pub mod store;
 pub mod worker;
 
+pub use lease::{BucketLease, Exclusion, LeaseError};
 pub use manifest::{FileEntry, Manifest, SegmentEntry, MANIFEST_VERSION};
 pub use store::{build_store, BackupConfig, S3Location};
 pub use worker::{
@@ -44,6 +50,9 @@ pub enum BackupError {
     Inconsistent(String),
     /// An object-store request took longer than `op_timeout_ms`.
     Timeout(String),
+    /// The bucket lease does not allow this write: it is lost, or it could
+    /// not be renewed in time and the holder has fenced itself.
+    Lease(String),
 }
 
 impl std::fmt::Display for BackupError {
@@ -57,6 +66,7 @@ impl std::fmt::Display for BackupError {
             BackupError::Io(e) => write!(f, "reading the store: {e}"),
             BackupError::Manifest(m) => write!(f, "manifest: {m}"),
             BackupError::Inconsistent(m) => write!(f, "{m}"),
+            BackupError::Lease(m) => write!(f, "bucket lease: {m}"),
         }
     }
 }
