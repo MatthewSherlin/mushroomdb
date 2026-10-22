@@ -8061,20 +8061,27 @@ Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a 
 ### `export`
 
 ```text
-mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                    --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                    csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                    cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
                                     graphml writes one file: <dest>/graph.graphml if <dest> is an
                                     existing directory, otherwise <dest> is the file path itself
                                     (nodes + edges only; rules have no GraphML analogue)
 ```
 
-Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools
+Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools. `--format jsonl --single-file` writes one `graph.jsonl` of typed `node`, `edge` and `rule` lines. JSONL, CSV and Cypher stream, so memory does not grow with the properties of the store. CSV (`nodes.csv`, `relationships.csv`) and JSONL load back with `import` and give the same store, rules included; Cypher (`graph.cypher`, one `MERGE` per line) is read by this engine's own `query`, and says in its output what it could not write. The formats are described in [Durability](durability.md#export-cli)
 
 ### `import`
 
 ```text
 mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                  [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                   [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
-                                 bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                 `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                 `-` reads one of them from standard input
                                  nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
                                  other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
                                  one label per node: Person;Employee is refused; relationship properties are not supported
@@ -8082,7 +8089,7 @@ mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--deli
                                  an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
 ```
 
-Bulk-load a nodes CSV and a relationships CSV. A node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
+Bulk-load CSV or JSONL files. `--jsonl` reads the single file `export --format jsonl --single-file` writes (an edge must come after its nodes, or it is an error at its line). `--nodes-jsonl`, `--edges-jsonl` and `--rules-jsonl` read the files `export --format jsonl` writes (and `--rules-jsonl` the one the CSV export writes), from a path or `-` for standard input, line by line in the same batches; a node line is `{"key": …, "label": …, <properties>}`, its key is not also stored as a property, derived edges are left to their rules, and the rules are created last so each backfills once. A CSV key column named `:KEY` is a key that is not also stored as the property `id`; `date`, `localdatetime`, `datetime`, `duration` and `binary` column types and `json` carry the newer types and nested values (the engine refuses to store the newer types until the V11 format ships). A CSV node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
 
 ## Hook bodies
 
@@ -11104,7 +11111,7 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
+mushroomdb export <db-dir> <dest> [--format jsonl|csv|cypher|parquet|graphml] [--single-file]
 ```
 
 Default format: `jsonl`.
@@ -11112,6 +11119,76 @@ Default format: `jsonl`.
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
 to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
 deterministic, and byte-identical between two runs on the same store.
+
+A node line is `{"key": …, "label": …, <properties>}`; a property whose name is
+`key`, `label` or `$props` is written inside a `"$props"` object instead, so no
+property is ever overwritten. The five newer value types are written in their
+tagged JSON forms (`{"$date": "2024-01-15"}`, see the [HTTP API](http.md)), and a
+float is always written with a fraction or exponent, so it reads back as a float.
+An edge line is `{"edge_type", "src", "dst", "derived", "rule"}`.
+
+`--format jsonl --single-file` writes the same records as one file,
+`<dest>/graph.jsonl`, each line an object whose `"type"` (written first) is
+`node`, `edge` or `rule`: every node, then every edge, then every rule
+(`{"type":"rule","rule":{…}}`). A property named `type` goes in the node's
+`$props` object.
+
+JSONL, CSV and Cypher exports stream: the store is read one node (and one
+source node's edges) at a time and written as it goes, so an export holds the
+sorted list of node ids (four bytes a node) and no property maps. Exporting a
+1,000,000-node, 1,000,000-edge store peaks at the memory of opening it; Parquet
+and GraphML build their whole file in memory.
+
+**CSV format** (`--format csv`): writes `nodes.csv` and `relationships.csv`, the
+files `mushroomdb import --nodes --relationships` reads, plus `rules.jsonl` when
+the store has rules. `nodes.csv` has `:ID` (the key), `:LABEL`, then one column
+per property, sorted by name, each named with its type: `age:int`,
+`score:float`, `active:boolean`, `name:string`, `born:date`,
+`seen:datetime`, `ttl:duration`, `blob:binary`. A property that is a list or a
+map, an empty string, or of different types on different nodes is a
+`name:json` column, whose cells are the JSON text of the value. The key column
+is `:KEY` instead of `:ID` when some node has no `id` property equal to its key:
+`:ID` stores the key as the property `id` as well, and `:KEY` does not, so an
+import gives back exactly the properties the store had.
+`relationships.csv` has `:START_ID`, `:END_ID`, `:TYPE` and holds manual edges
+only (edges carry no properties). A label containing `;` is refused, because the
+importer reads it as a multi-label.
+
+**Cypher format** (`--format cypher`): writes `graph.cypher`, one statement per
+line with no terminator, nodes first and then manual edges:
+
+```text
+MERGE (n:`Person` {id: 'alice'}) ON CREATE SET n.`age` = 30, n.`tags` = ['a', 'b']
+MERGE (a:`Person` {id: 'alice'})-[:`KNOWS`]->(b:`Person` {id: 'bob'})
+```
+
+Run each line with `mushroomdb query` (or `query_write`); running the file twice
+changes nothing, because every statement is a `MERGE`. Cypher stores a node's
+key as its `id` property, so a node that had no `id` gains one, and the export
+prints how many; the file reproduces the store exactly when every node's `id`
+equals its key (what `import` and `ingest` write). Things with no Cypher form
+are counted in the export's output rather than silently dropped: properties of the date, time,
+duration and binary types (no statement can store one until the V11 format
+ships), NaN, infinities and `-9223372036854775808` (the lexer has no literal),
+a property name or map key with a line break (a statement is one line), a node
+whose `id` differs from its key, and rules.
+
+**Loading an export back.** `mushroomdb import --jsonl graph.jsonl` reads the
+single-file form (a file or `-`); an edge must come after the nodes it joins,
+and one that does not is an error at its line (a node still waiting in the open
+batch counts, and is committed first). Rules are created last. The three-file
+form: `mushroomdb import --nodes-jsonl nodes.jsonl
+--edges-jsonl edges.jsonl --rules-jsonl rules.jsonl --db <dir>` (or `--nodes
+nodes.csv --relationships relationships.csv --rules-jsonl rules.jsonl`) rebuilds
+the store: the same nodes with the same properties, the same manual edges and the
+same rules, whose derived edges are made when the rules are created at the end
+(`derived: true` lines are skipped, and counted). A JSONL path of `-` reads
+standard input, and the file streams line by line in batches of 50,000
+(`--batch-size`), one WAL frame each, the same path the CSV import uses. The
+store you export must be the whole of what you want back: indexes, constraints
+and views are not part of an export. Until the V11 format ships a store cannot
+hold the newer value types, and an import carrying one is refused by the engine
+with nothing written.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
 and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
@@ -11136,8 +11213,9 @@ under `score`, another a string), the key declares `attr.type="string"` for
 every node rather than risk a value that doesn't fit a narrower type.
 
 **Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
-JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
-finite floats round-trip correctly.
+JSON `null` (JSONL/Parquet), an empty cell (CSV) or an empty `<data>` element
+(GraphML), and the export prints how many it left out. Normal finite floats
+round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
 the rule name (present for derived edges, null/omitted for manual edges).

@@ -463,7 +463,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
     ("run_export", "reads an existing store out to a file"),
     (
-        "run_import_with_progress",
+        "run_import_inputs",
         "general-purpose bulk loader of the user's own labels and properties; \
          declaring the memory schema would add full-text indexes the data did \
          not ask for and slow the load — schema is opt-in via `schema apply`",

@@ -40,7 +40,7 @@ use mushroomdb::{AutoFk, GraphDb, IngestOptions, RealFs, Value};
 
 type Db = GraphDb<RealFs>;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default rows per committed batch.
 pub const DEFAULT_BATCH_SIZE: usize = 50_000;
@@ -86,6 +86,12 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
     /// WAL batches committed.
     pub batches: usize,
+    /// Rules created from a rules file.
+    pub rules_created: usize,
+    /// `edges.jsonl` lines marked `"derived": true`. A derived edge belongs to
+    /// the rule that makes it and is made again when the rule is created, so it
+    /// is not inserted.
+    pub derived_edges_skipped: usize,
 }
 
 /// One committed batch, reported to the callback of [`run_import_with_progress`].
@@ -104,6 +110,31 @@ pub enum ScalarType {
     Int,
     Float,
     Bool,
+    /// A JSON document in the cell: a list, a map, or a value of any type, in
+    /// the wire forms of `docs/site/http.md` (a date is `{"$date": "…"}`).
+    Json,
+    /// The four temporal types and binary, in the text their tagged form
+    /// carries: `2024-01-15`, `2024-01-15T10:30:00`, `2024-01-15T10:30:00+05:30`,
+    /// `P1DT2H`, and base64.
+    Date,
+    LocalDateTime,
+    DateTime,
+    Duration,
+    Binary,
+}
+
+impl ScalarType {
+    /// The tag of the wire form this type's cell text is the payload of.
+    fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Date => Some("$date"),
+            Self::LocalDateTime => Some("$ldt"),
+            Self::DateTime => Some("$dt"),
+            Self::Duration => Some("$dur"),
+            Self::Binary => Some("$binary"),
+            _ => None,
+        }
+    }
 }
 
 /// A property column's declared type: a scalar, or an array of it.
@@ -127,6 +158,10 @@ pub struct NodeSchema {
     /// The property the node key is also stored under: the `:ID` column's name
     /// (`personId:ID`), or `id` when the column has none.
     pub key_field: String,
+    /// False for a `:KEY` column: the cell is the node key and is not also
+    /// stored as a property (an exported store whose nodes do not all carry
+    /// their key as `id` is written this way so that it re-imports exactly).
+    pub key_stored: bool,
     pub id_index: usize,
     pub label_index: usize,
     pub props: Vec<PropColumn>,
@@ -149,6 +184,7 @@ pub struct RelSchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Column {
     Id(String),
+    Key,
     Label,
     StartId,
     EndId,
@@ -194,6 +230,7 @@ fn parse_column(cell: &str, index: usize, warnings: &mut Vec<String>) -> Result<
     }
     match special {
         "ID" => return Ok(Column::Id(name.to_string())),
+        "KEY" if name.is_empty() => return Ok(Column::Key),
         "LABEL" if name.is_empty() => return Ok(Column::Label),
         "START_ID" => return Ok(Column::StartId),
         "END_ID" => return Ok(Column::EndId),
@@ -216,6 +253,12 @@ fn parse_column(cell: &str, index: usize, warnings: &mut Vec<String>) -> Result<
         "INT" | "INTEGER" | "LONG" | "SHORT" | "BYTE" => ScalarType::Int,
         "FLOAT" | "DOUBLE" => ScalarType::Float,
         "BOOLEAN" | "BOOL" => ScalarType::Bool,
+        "JSON" => ScalarType::Json,
+        "DATE" => ScalarType::Date,
+        "LOCALDATETIME" => ScalarType::LocalDateTime,
+        "DATETIME" => ScalarType::DateTime,
+        "DURATION" => ScalarType::Duration,
+        "BINARY" => ScalarType::Binary,
         _ => {
             warnings.push(format!(
                 "column {} `{cell}`: unknown type `{suffix}`, stored as a string",
@@ -233,6 +276,7 @@ fn parse_column(cell: &str, index: usize, warnings: &mut Vec<String>) -> Result<
 
 struct Columns {
     id: Vec<(usize, String)>,
+    key: Vec<usize>,
     label: Vec<usize>,
     start: Vec<usize>,
     end: Vec<usize>,
@@ -244,6 +288,7 @@ struct Columns {
 fn classify_header(record: &csv::StringRecord) -> Result<Columns, String> {
     let mut cols = Columns {
         id: Vec::new(),
+        key: Vec::new(),
         label: Vec::new(),
         start: Vec::new(),
         end: Vec::new(),
@@ -254,12 +299,21 @@ fn classify_header(record: &csv::StringRecord) -> Result<Columns, String> {
     for (index, cell) in record.iter().enumerate() {
         match parse_column(cell, index, &mut cols.warnings)? {
             Column::Id(name) => cols.id.push((index, name)),
+            Column::Key => cols.key.push(index),
             Column::Label => cols.label.push(index),
             Column::StartId => cols.start.push(index),
             Column::EndId => cols.end.push(index),
             Column::RelType => cols.rel_type.push(index),
             Column::Ignore => {}
             Column::Prop(p) => cols.props.push(p),
+        }
+    }
+    for p in &cols.props {
+        if p.ty.array && p.ty.scalar == ScalarType::Json {
+            return Err(format!(
+                "property column `{}`: json cannot be an array column; a json cell holds the whole list",
+                p.name
+            ));
         }
     }
     let mut seen = HashSet::new();
@@ -287,20 +341,27 @@ pub fn parse_node_header(record: &csv::StringRecord) -> Result<NodeSchema, Strin
             "a nodes file has a relationship column (:START_ID, :END_ID or :TYPE)".to_string(),
         );
     }
-    let id_indexes: Vec<usize> = cols.id.iter().map(|(i, _)| *i).collect();
+    let id_indexes: Vec<usize> = cols
+        .id
+        .iter()
+        .map(|(i, _)| *i)
+        .chain(cols.key.iter().copied())
+        .collect();
     let id_index = exactly_one(&id_indexes, ":ID")?;
     let label_index = exactly_one(&cols.label, ":LABEL")?;
-    let key_field = match cols.id[0].1.as_str() {
-        "" => "id".to_string(),
-        name => name.to_string(),
+    let key_stored = cols.key.is_empty();
+    let key_field = match cols.id.first().map(|(_, n)| n.as_str()) {
+        Some("") | None => "id".to_string(),
+        Some(name) => name.to_string(),
     };
-    if cols.props.iter().any(|p| p.name == key_field) {
+    if key_stored && cols.props.iter().any(|p| p.name == key_field) {
         return Err(format!(
             "property column `{key_field}` has the same name as the :ID column"
         ));
     }
     Ok(NodeSchema {
         key_field,
+        key_stored,
         id_index,
         label_index,
         props: cols.props,
@@ -313,7 +374,7 @@ pub fn parse_node_header(record: &csv::StringRecord) -> Result<NodeSchema, Strin
 /// `:END_ID` and `:TYPE`.
 pub fn parse_rel_header(record: &csv::StringRecord) -> Result<RelSchema, String> {
     let cols = classify_header(record)?;
-    if !cols.id.is_empty() || !cols.label.is_empty() {
+    if !cols.id.is_empty() || !cols.key.is_empty() || !cols.label.is_empty() {
         return Err("a relationships file has a node column (:ID or :LABEL)".to_string());
     }
     Ok(RelSchema {
@@ -343,6 +404,19 @@ fn parse_scalar(scalar: ScalarType, text: &str) -> Result<Value, String> {
             "false" => Ok(Value::Bool(false)),
             _ => Err(format!("`{text}` is not a boolean (true or false)")),
         },
+        ScalarType::Json => {
+            let json: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| format!("`{text}` is not JSON: {e}"))?;
+            json_to_exact_value(json)
+                .and_then(|v| v.ok_or_else(|| "a JSON null is not a value".to_string()))
+        }
+        typed => {
+            let tag = typed.tag().unwrap_or("$date");
+            let mut tagged = serde_json::Map::with_capacity(1);
+            tagged.insert(tag.to_string(), serde_json::Value::String(text.to_string()));
+            mushroomdb::json_to_value(serde_json::Value::Object(tagged))?
+                .ok_or_else(|| format!("`{text}` is not a value"))
+        }
     }
 }
 
@@ -386,7 +460,9 @@ pub fn parse_node_row(
         ));
     }
     let mut row = BTreeMap::new();
-    row.insert(schema.key_field.clone(), Value::Str(id.to_string()));
+    if schema.key_stored {
+        row.insert(schema.key_field.clone(), Value::Str(id.to_string()));
+    }
     for col in &schema.props {
         let text = &record[col.index];
         if text.is_empty() {
@@ -588,6 +664,7 @@ fn import_nodes(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliEr
     // TODO(W2 unique constraints): the batch is where a declared unique
     // constraint on (label, property) would be checked, before `ingest`.
     let mut batch: HashMap<String, Vec<BTreeMap<String, Value>>> = HashMap::new();
+    let mut records: Vec<NodeRecord> = Vec::new();
     let mut batch_keys: HashSet<String> = HashSet::new();
     let mut buffered = 0usize;
     let mut record = csv::StringRecord::new();
@@ -611,23 +688,107 @@ fn import_nodes(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliEr
                 continue;
             }
         };
-        let Some(Value::Str(key)) = row.get(&schema.key_field) else {
-            unreachable!("parse_node_row stores the key as a string");
-        };
-        if db.has_node(key) || !batch_keys.insert(key.clone()) {
+        let key = record[schema.id_index].to_string();
+        if db.has_node(&key) || !batch_keys.insert(key.clone()) {
             let reason = format!("duplicate :ID `{key}`");
             run.bad_row(&file, line, &reason)?;
             continue;
         }
-        batch.entry(label).or_default().push(row);
+        if schema.key_stored {
+            batch.entry(label).or_default().push(row);
+        } else {
+            records.push(NodeRecord {
+                label,
+                key,
+                props: row.into_iter().collect(),
+                line,
+            });
+        }
         buffered += 1;
         if buffered >= run.opts.batch_size {
             flush_nodes(db, &mut batch, &ingest_opts, run)?;
+            flush_node_records(db, &mut records, &file, run)?;
             batch_keys.clear();
             buffered = 0;
         }
     }
     flush_nodes(db, &mut batch, &ingest_opts, run)?;
+    flush_node_records(db, &mut records, &file, run)?;
+    Ok(())
+}
+
+/// One node to insert exactly as given: its key is not also a property.
+#[derive(Clone)]
+struct NodeRecord {
+    label: String,
+    key: String,
+    props: Vec<(String, Value)>,
+    /// Line in the file, for messages.
+    line: u64,
+}
+
+fn commit_node_records(db: &mut Db, records: Vec<NodeRecord>) -> mushroomdb::Result<usize> {
+    let (inserted, _) = db.write_batch(|b| {
+        for r in records {
+            b.insert_node(&r.label, &r.key, r.props);
+        }
+    })?;
+    Ok(inserted)
+}
+
+/// Commit `records` as one WAL batch through the engine's ordinary batch path,
+/// the one the CSV edges use. A rejected batch is handled like a rejected edge
+/// batch: strict mode stops with the lines named and nothing of the batch
+/// written; `--ignore-errors` retries the rows one by one and skips the ones
+/// that fail alone.
+fn flush_node_records(
+    db: &mut Db,
+    records: &mut Vec<NodeRecord>,
+    file: &str,
+    run: &mut Run<'_>,
+) -> Result<(), CliError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(records);
+    let first = batch.first().map_or(0, |r| r.line);
+    let last = batch.last().map_or(0, |r| r.line);
+    let count = batch.len();
+    // The rows are only needed again if the batch is rejected and the rows are
+    // to be tried one by one.
+    let retry: Option<Vec<NodeRecord>> = run.opts.ignore_errors.then(|| batch.clone());
+    match commit_node_records(db, batch) {
+        Ok(inserted) => {
+            run.report.nodes_inserted += inserted;
+            run.committed();
+        }
+        Err(batch_err) => {
+            let Some(rows) = retry else {
+                run.bad_row(
+                    file,
+                    first,
+                    &format!(
+                        "the batch of {count} nodes (lines {first}-{last}) was rejected: {batch_err}"
+                    ),
+                )?;
+                return Ok(());
+            };
+            let mut any = false;
+            for one in rows {
+                let line = one.line;
+                match commit_node_records(db, vec![one]) {
+                    Ok(inserted) => {
+                        run.report.nodes_inserted += inserted;
+                        any = true;
+                    }
+                    Err(e) => run.bad_row(file, line, &e.to_string())?,
+                }
+            }
+            if any {
+                run.committed();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -767,6 +928,365 @@ fn flush_edges(
     Ok(())
 }
 
+/// The files one import reads. Any of them may be absent; at least one is
+/// needed. They load in this order: nodes (CSV, then JSONL), edges (CSV, then
+/// JSONL), rules. A JSONL path of `-` reads standard input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportInputs {
+    pub nodes_csv: Option<PathBuf>,
+    pub rels_csv: Option<PathBuf>,
+    pub nodes_jsonl: Option<PathBuf>,
+    pub edges_jsonl: Option<PathBuf>,
+    pub rules_jsonl: Option<PathBuf>,
+    /// One stream of `{"type": "node" | "edge" | "rule", …}` lines, which
+    /// `export --format jsonl --single-file` writes.
+    pub stream_jsonl: Option<PathBuf>,
+}
+
+impl ImportInputs {
+    fn is_empty(&self) -> bool {
+        self.nodes_csv.is_none()
+            && self.rels_csv.is_none()
+            && self.nodes_jsonl.is_none()
+            && self.edges_jsonl.is_none()
+            && self.rules_jsonl.is_none()
+            && self.stream_jsonl.is_none()
+    }
+
+    fn csv_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.nodes_csv.iter().chain(self.rels_csv.iter())
+    }
+
+    fn jsonl_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.nodes_jsonl
+            .iter()
+            .chain(self.edges_jsonl.iter())
+            .chain(self.rules_jsonl.iter())
+            .chain(self.stream_jsonl.iter())
+    }
+}
+
+fn is_stdin(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+// ── JSON lines ───────────────────────────────────────────────────────────
+
+/// The five type tags of the typed JSON forms (`docs/site/http.md`).
+const TYPE_TAGS: [&str; 5] = ["$date", "$ldt", "$dt", "$dur", "$binary"];
+
+/// A JSON value as a stored [`Value`], keeping a float a float.
+///
+/// [`mushroomdb::json_to_value`] reads an integral number such as `3.0` as an
+/// integer, which is right for hand-written JSON and wrong for the file an
+/// export wrote: `Float(3.0)` must come back as a float. A JSON number with a
+/// fraction or exponent is a float here, one without is an integer. A one-key
+/// object whose key is a type tag is the typed value, read by the engine's own
+/// reader; `null` is an absent value, and inside a list it drops the whole list,
+/// as in `json_to_value`.
+pub fn json_to_exact_value(v: serde_json::Value) -> Result<Option<Value>, String> {
+    use serde_json::Value as Json;
+    Ok(match v {
+        Json::Null => None,
+        Json::Bool(b) => Some(Value::Bool(b)),
+        Json::Number(n) => Some(match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().ok_or("the number is out of range")?),
+        }),
+        Json::String(s) => Some(Value::Str(s)),
+        Json::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.into_iter().enumerate() {
+                match json_to_exact_value(item).map_err(|e| format!("item {i}: {e}"))? {
+                    Some(v) => out.push(v),
+                    None => return Ok(None),
+                }
+            }
+            Some(Value::List(out))
+        }
+        Json::Object(obj) => {
+            if obj.len() == 1 && obj.keys().all(|k| TYPE_TAGS.contains(&k.as_str())) {
+                return mushroomdb::json_to_value(Json::Object(obj));
+            }
+            let mut map = BTreeMap::new();
+            for (k, v) in obj {
+                if let Some(val) = json_to_exact_value(v).map_err(|e| format!("key {k:?}: {e}"))? {
+                    map.insert(k, val);
+                }
+            }
+            Some(Value::Map(map))
+        }
+    })
+}
+
+/// The property of a `nodes.jsonl` line that holds the properties whose names
+/// the line itself uses (`key`, `label`, and this one).
+pub const JSONL_PROPS_FIELD: &str = "$props";
+
+/// Parse one `nodes.jsonl` line: `{"key": …, "label": …, <properties>}`.
+/// Properties whose name is `key`, `label` or `$props` are in a `$props`
+/// object, which is how the export writes them.
+fn parse_node_line(text: &str) -> Result<NodeRecord, String> {
+    let json: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    parse_node_value(json, false)
+}
+
+/// [`parse_node_line`] for a line already parsed. In a stream (`typed`) the
+/// `"type"` field is the line's discriminator, not a property (a property of
+/// that name is in `$props`).
+fn parse_node_value(json: serde_json::Value, typed: bool) -> Result<NodeRecord, String> {
+    let serde_json::Value::Object(mut obj) = json else {
+        return Err("a node line must be a JSON object".to_string());
+    };
+    if typed {
+        obj.remove("type");
+    }
+    let mut text_field = |name: &str| match obj.remove(name) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s),
+        Some(_) => Err(format!("`{name}` must be a non-empty string")),
+        None => Err(format!("the line has no `{name}`")),
+    };
+    let key = text_field("key")?;
+    let label = text_field("label")?;
+    let mut props: BTreeMap<String, Value> = BTreeMap::new();
+    let reserved = match obj.remove(JSONL_PROPS_FIELD) {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(m)) => m,
+        Some(_) => return Err(format!("`{JSONL_PROPS_FIELD}` must be an object")),
+    };
+    for (name, value) in obj.into_iter().chain(reserved) {
+        if let Some(v) =
+            json_to_exact_value(value).map_err(|e| format!("property {name:?}: {e}"))?
+        {
+            props.insert(name, v);
+        }
+    }
+    Ok(NodeRecord {
+        label,
+        key,
+        props: props.into_iter().collect(),
+        line: 0,
+    })
+}
+
+/// One `edges.jsonl` line: `(edge_type, src, dst, derived)`.
+fn parse_edge_line(text: &str) -> Result<(String, String, String, bool), String> {
+    let json: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    parse_edge_value(&json)
+}
+
+fn parse_edge_value(json: &serde_json::Value) -> Result<(String, String, String, bool), String> {
+    let serde_json::Value::Object(obj) = json else {
+        return Err("an edge line must be a JSON object".to_string());
+    };
+    let field = |name: &str| match obj.get(name) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+        Some(_) => Err(format!("`{name}` must be a non-empty string")),
+        None => Err(format!("the line has no `{name}`")),
+    };
+    let derived = matches!(obj.get("derived"), Some(serde_json::Value::Bool(true)));
+    Ok((field("edge_type")?, field("src")?, field("dst")?, derived))
+}
+
+/// A line source over a file, or standard input for `-`. Reports each non-blank
+/// line with its 1-based number to `each`.
+fn for_each_line(
+    path: &Path,
+    mut each: impl FnMut(u64, &str) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    use std::io::BufRead;
+    let name = path.display().to_string();
+    let mut reader: Box<dyn BufRead> = if is_stdin(path) {
+        Box::new(std::io::BufReader::new(std::io::stdin().lock()))
+    } else {
+        let file = std::fs::File::open(path).map_err(|e| CliError(format!("{name}: {e}")))?;
+        Box::new(std::io::BufReader::with_capacity(1 << 20, file))
+    };
+    let mut buf = String::new();
+    let mut line = 0u64;
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(CliError(format!("{name}:{}: {e}", line + 1))),
+        }
+        line += 1;
+        let text = buf.trim_end_matches(['\n', '\r']);
+        if text.trim().is_empty() {
+            continue;
+        }
+        each(line, text)?;
+    }
+}
+
+fn import_nodes_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
+    let file = path.display().to_string();
+    let mut records: Vec<NodeRecord> = Vec::new();
+    let mut batch_keys: HashSet<String> = HashSet::new();
+    for_each_line(path, |line, text| {
+        let mut record = match parse_node_line(text) {
+            Ok(r) => r,
+            Err(reason) => return run.bad_row(&file, line, &reason),
+        };
+        record.line = line;
+        if db.has_node(&record.key) || !batch_keys.insert(record.key.clone()) {
+            let reason = format!("duplicate key `{}`", record.key);
+            return run.bad_row(&file, line, &reason);
+        }
+        records.push(record);
+        if records.len() >= run.opts.batch_size {
+            flush_node_records(db, &mut records, &file, run)?;
+            batch_keys.clear();
+        }
+        Ok(())
+    })?;
+    flush_node_records(db, &mut records, &file, run)
+}
+
+fn import_edges_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
+    let file = path.display().to_string();
+    let mut batch: Vec<(String, String, String, u64)> = Vec::new();
+    for_each_line(path, |line, text| {
+        let (edge_type, src, dst, derived) = match parse_edge_line(text) {
+            Ok(parsed) => parsed,
+            Err(reason) => return run.bad_row(&file, line, &reason),
+        };
+        if derived {
+            run.report.derived_edges_skipped += 1;
+            return Ok(());
+        }
+        let missing = [("src", &src), ("dst", &dst)]
+            .into_iter()
+            .find(|(_, key)| !db.has_node(key));
+        if let Some((field, key)) = missing {
+            let reason = format!("{field} `{key}` is not a node in the nodes file or the store");
+            return run.bad_row(&file, line, &reason);
+        }
+        batch.push((edge_type, src, dst, line));
+        if batch.len() >= run.opts.batch_size {
+            flush_edges(db, &mut batch, &file, run)?;
+        }
+        Ok(())
+    })?;
+    flush_edges(db, &mut batch, &file, run)
+}
+
+/// Create the rules of a `rules.jsonl`, each in its own commit, after the
+/// nodes and edges are in: the rule backfills once over all of them.
+fn import_rules_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
+    let file = path.display().to_string();
+    for_each_line(path, |line, text| {
+        let def: mushroomdb::RuleDef = match serde_json::from_str(text) {
+            Ok(def) => def,
+            Err(e) => return run.bad_row(&file, line, &format!("not a rule: {e}")),
+        };
+        match db.create_rule(def) {
+            Ok(()) => {
+                run.report.rules_created += 1;
+                run.committed();
+                Ok(())
+            }
+            Err(e) => run.bad_row(&file, line, &e.to_string()),
+        }
+    })
+}
+
+/// Import a single stream of typed lines (`export --format jsonl
+/// --single-file`): `{"type":"node",…}`, `{"type":"edge",…}` and
+/// `{"type":"rule","rule":{…}}`.
+///
+/// Lines are taken in order and nodes and edges are committed in batches as
+/// they arrive. An edge must come after both its nodes: one whose node is not
+/// in the store or earlier in the stream is an error at its line (a node still
+/// waiting in the open batch counts, and is committed first). Rules are created
+/// last, so each backfills once over everything.
+fn import_stream_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
+    let file = path.display().to_string();
+    let mut records: Vec<NodeRecord> = Vec::new();
+    let mut batch_keys: HashSet<String> = HashSet::new();
+    let mut edges: Vec<(String, String, String, u64)> = Vec::new();
+    let mut rules: Vec<(u64, mushroomdb::RuleDef)> = Vec::new();
+    for_each_line(path, |line, text| {
+        let json: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => return run.bad_row(&file, line, &format!("not JSON: {e}")),
+        };
+        let kind = json.get("type").and_then(serde_json::Value::as_str);
+        match kind {
+            Some("node") => {
+                let mut record = match parse_node_value(json, true) {
+                    Ok(r) => r,
+                    Err(reason) => return run.bad_row(&file, line, &reason),
+                };
+                record.line = line;
+                if db.has_node(&record.key) || !batch_keys.insert(record.key.clone()) {
+                    let reason = format!("duplicate key `{}`", record.key);
+                    return run.bad_row(&file, line, &reason);
+                }
+                records.push(record);
+                if records.len() >= run.opts.batch_size {
+                    flush_node_records(db, &mut records, &file, run)?;
+                    batch_keys.clear();
+                }
+            }
+            Some("edge") => {
+                let (edge_type, src, dst, derived) = match parse_edge_value(&json) {
+                    Ok(parsed) => parsed,
+                    Err(reason) => return run.bad_row(&file, line, &reason),
+                };
+                if derived {
+                    run.report.derived_edges_skipped += 1;
+                    return Ok(());
+                }
+                if [&src, &dst].iter().any(|k| batch_keys.contains(*k)) {
+                    flush_node_records(db, &mut records, &file, run)?;
+                    batch_keys.clear();
+                }
+                let missing = [("src", &src), ("dst", &dst)]
+                    .into_iter()
+                    .find(|(_, key)| !db.has_node(key));
+                if let Some((field, key)) = missing {
+                    let reason = format!(
+                        "{field} `{key}` is not a node earlier in the stream or in the store \
+                         (an edge must come after its nodes)"
+                    );
+                    return run.bad_row(&file, line, &reason);
+                }
+                edges.push((edge_type, src, dst, line));
+                if edges.len() >= run.opts.batch_size {
+                    flush_edges(db, &mut edges, &file, run)?;
+                }
+            }
+            Some("rule") => match json.get("rule").cloned().map(serde_json::from_value) {
+                Some(Ok(def)) => rules.push((line, def)),
+                Some(Err(e)) => return run.bad_row(&file, line, &format!("not a rule: {e}")),
+                None => return run.bad_row(&file, line, "the line has no `rule`"),
+            },
+            Some(other) => {
+                let reason = format!("unknown line type `{other}` (node, edge or rule)");
+                return run.bad_row(&file, line, &reason);
+            }
+            None => return run.bad_row(&file, line, "the line has no string `type`"),
+        }
+        Ok(())
+    })?;
+    flush_node_records(db, &mut records, &file, run)?;
+    flush_edges(db, &mut edges, &file, run)?;
+    for (line, def) in rules {
+        match db.create_rule(def) {
+            Ok(()) => {
+                run.report.rules_created += 1;
+                run.committed();
+            }
+            Err(e) => run.bad_row(&file, line, &e.to_string())?,
+        }
+    }
+    Ok(())
+}
+
 /// Import `nodes_csv` and then `rels_csv` into the store at `db_dir`
 /// (created if absent). At least one file is required.
 pub fn run_import(
@@ -778,6 +1298,14 @@ pub fn run_import(
     run_import_with_progress(db_dir, nodes_csv, rels_csv, opts, &mut |_| {})
 }
 
+fn csv_inputs(nodes_csv: Option<&Path>, rels_csv: Option<&Path>) -> ImportInputs {
+    ImportInputs {
+        nodes_csv: nodes_csv.map(Path::to_path_buf),
+        rels_csv: rels_csv.map(Path::to_path_buf),
+        ..ImportInputs::default()
+    }
+}
+
 /// [`run_import`], calling `on_batch` after every batch that committed.
 pub fn run_import_with_progress(
     db_dir: &Path,
@@ -786,9 +1314,20 @@ pub fn run_import_with_progress(
     opts: &ImportOptions,
     on_batch: &mut dyn FnMut(&BatchProgress),
 ) -> Result<ImportReport, CliError> {
-    check_inputs(nodes_csv, rels_csv, opts)?;
+    run_import_inputs(db_dir, &csv_inputs(nodes_csv, rels_csv), opts, on_batch)
+}
+
+/// Import every file of `inputs` into the store at `db_dir` (created if
+/// absent), then take one snapshot.
+pub fn run_import_inputs(
+    db_dir: &Path,
+    inputs: &ImportInputs,
+    opts: &ImportOptions,
+    on_batch: &mut dyn FnMut(&BatchProgress),
+) -> Result<ImportReport, CliError> {
+    check_inputs(inputs, opts)?;
     let mut db = GraphDb::open(db_dir)?;
-    let report = import_into(&mut db, nodes_csv, rels_csv, opts, on_batch)?;
+    let report = import_inputs_into(&mut db, inputs, opts, on_batch)?;
     // One snapshot, last. History-preserving, like every snapshot the engine
     // takes on its own: a bulk load must not erase how the store got here.
     // Nothing committed (a header-only file) means nothing to fold in.
@@ -798,25 +1337,30 @@ pub fn run_import_with_progress(
     Ok(report)
 }
 
-fn check_inputs(
-    nodes_csv: Option<&Path>,
-    rels_csv: Option<&Path>,
-    opts: &ImportOptions,
-) -> Result<(), CliError> {
-    if nodes_csv.is_none() && rels_csv.is_none() {
+fn check_inputs(inputs: &ImportInputs, opts: &ImportOptions) -> Result<(), CliError> {
+    if inputs.is_empty() {
         return Err(CliError(
-            "import needs --nodes <file>, --relationships <file>, or both".into(),
+            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl, --rules-jsonl or --jsonl"
+                .into(),
         ));
     }
     if opts.batch_size == 0 {
         return Err(CliError("--batch-size must be at least 1".into()));
     }
-    for path in nodes_csv.iter().chain(rels_csv.iter()) {
+    let files = inputs
+        .csv_paths()
+        .chain(inputs.jsonl_paths().filter(|p| !is_stdin(p)));
+    for path in files {
         if !path.is_file() {
             return Err(CliError(format!("{}: no such file", path.display())));
         }
     }
-    for path in nodes_csv.iter().chain(rels_csv.iter()) {
+    if inputs.jsonl_paths().filter(|p| is_stdin(p)).count() > 1 {
+        return Err(CliError(
+            "only one of the JSONL inputs can be - (standard input)".into(),
+        ));
+    }
+    for path in inputs.csv_paths() {
         check_file_quoting(path, opts)?;
     }
     Ok(())
@@ -832,17 +1376,39 @@ pub fn import_into(
     opts: &ImportOptions,
     on_batch: &mut dyn FnMut(&BatchProgress),
 ) -> Result<ImportReport, CliError> {
-    check_inputs(nodes_csv, rels_csv, opts)?;
+    import_inputs_into(db, &csv_inputs(nodes_csv, rels_csv), opts, on_batch)
+}
+
+/// [`import_into`] for every kind of input file.
+pub fn import_inputs_into(
+    db: &mut GraphDb<RealFs>,
+    inputs: &ImportInputs,
+    opts: &ImportOptions,
+    on_batch: &mut dyn FnMut(&BatchProgress),
+) -> Result<ImportReport, CliError> {
+    check_inputs(inputs, opts)?;
     let mut run = Run {
         opts,
         report: ImportReport::default(),
         on_batch,
     };
-    if let Some(path) = nodes_csv {
+    if let Some(path) = &inputs.nodes_csv {
         import_nodes(db, path, &mut run)?;
     }
-    if let Some(path) = rels_csv {
+    if let Some(path) = &inputs.nodes_jsonl {
+        import_nodes_jsonl(db, path, &mut run)?;
+    }
+    if let Some(path) = &inputs.rels_csv {
         import_rels(db, path, &mut run)?;
+    }
+    if let Some(path) = &inputs.edges_jsonl {
+        import_edges_jsonl(db, path, &mut run)?;
+    }
+    if let Some(path) = &inputs.stream_jsonl {
+        import_stream_jsonl(db, path, &mut run)?;
+    }
+    if let Some(path) = &inputs.rules_jsonl {
+        import_rules_jsonl(db, path, &mut run)?;
     }
     Ok(run.report)
 }
@@ -853,6 +1419,15 @@ pub fn format_import(report: &ImportReport) -> String {
         "imported {} nodes and {} edges in {} batches",
         report.nodes_inserted, report.edges_inserted, report.batches
     );
+    if report.rules_created > 0 {
+        out.push_str(&format!(", created {} rules", report.rules_created));
+    }
+    if report.derived_edges_skipped > 0 {
+        out.push_str(&format!(
+            ", left {} derived edges to their rules",
+            report.derived_edges_skipped
+        ));
+    }
     if report.rows_skipped > 0 {
         out.push_str(&format!(", skipped {} bad rows", report.rows_skipped));
     }
@@ -937,10 +1512,10 @@ mod tests {
 
     #[test]
     fn csv_import_unknown_type_suffix_warns_and_is_a_string() {
-        let s = parse_node_header(&rec(&[":ID", ":LABEL", "born:date"])).unwrap();
+        let s = parse_node_header(&rec(&[":ID", ":LABEL", "born:uuid"])).unwrap();
         assert_eq!(s.props[0].ty.scalar, ScalarType::Str);
         assert_eq!(s.warnings.len(), 1);
-        assert!(s.warnings[0].contains("born:date"), "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("born:uuid"), "{:?}", s.warnings);
     }
 
     #[test]
@@ -1055,5 +1630,90 @@ mod tests {
         assert!(e.contains("age") && e.contains("old"), "{e}");
         let e = rows[1].clone().unwrap_err();
         assert!(e.contains("ok") && e.contains("maybe"), "{e}");
+    }
+
+    #[test]
+    fn jsonl_import_node_line_reads_tagged_forms_and_reserved_names() {
+        let line = r#"{"key":"k","label":"L","born":{"$date":"2024-01-15"},"blob":{"$binary":"3q2+7w=="},"f":2.0,"$props":{"key":"x","label":1,"$props":true}}"#;
+        let r = parse_node_line(line).unwrap();
+        let props: BTreeMap<_, _> = r.props.into_iter().collect();
+        assert_eq!((r.key.as_str(), r.label.as_str()), ("k", "L"));
+        assert_eq!(props["born"], Value::Date(19_737));
+        assert_eq!(props["blob"], Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(props["f"], Value::Float(2.0));
+        assert_eq!(props["key"], Value::Str("x".into()));
+        assert_eq!(props["label"], Value::Int(1));
+        assert_eq!(props["$props"], Value::Bool(true));
+    }
+
+    #[test]
+    fn jsonl_import_node_line_refuses_bad_shapes() {
+        for (line, why) in [
+            ("[]", "must be a JSON object"),
+            (r#"{"label":"L"}"#, "no `key`"),
+            (r#"{"key":"","label":"L"}"#, "non-empty"),
+            (r#"{"key":"k","label":"L","$props":3}"#, "must be an object"),
+            (
+                r#"{"key":"k","label":"L","d":{"$date":"nope"}}"#,
+                "property \"d\"",
+            ),
+        ] {
+            let e = parse_node_line(line).err().unwrap_or_default();
+            assert!(e.contains(why), "{line}: {e}");
+        }
+    }
+
+    #[test]
+    fn csv_import_typed_columns_and_key_column() {
+        let schema = parse_node_header(&rec(&[
+            ":KEY",
+            ":LABEL",
+            "d:date",
+            "t:datetime",
+            "u:duration",
+            "b:binary",
+            "j:json",
+            "a:b:string",
+        ]))
+        .unwrap();
+        assert!(!schema.key_stored);
+        let row = rec(&[
+            "k",
+            "L",
+            "2024-01-15",
+            "2024-01-15T12:34:56.789012+05:30",
+            "P1Y2M3DT4H5M6.789S",
+            "3q2+7w==",
+            r#"[1.0,{"$date":"2024-01-15"}]"#,
+            "x",
+        ]);
+        let (_, props) = parse_node_row(&schema, &row, ';').unwrap();
+        assert!(!props.contains_key("id"));
+        assert_eq!(props["d"], Value::Date(19_737));
+        assert!(matches!(
+            props["t"],
+            Value::DateTime {
+                offset_seconds: 19_800,
+                ..
+            }
+        ));
+        assert!(matches!(
+            props["u"],
+            Value::Duration {
+                months: 14,
+                days: 3,
+                ..
+            }
+        ));
+        assert_eq!(props["b"], Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            props["j"],
+            Value::List(vec![Value::Float(1.0), Value::Date(19_737)])
+        );
+        assert_eq!(props["a:b"], Value::Str("x".into()));
+        let bad = rec(&["k", "L", "not a date", "", "", "", "", ""]);
+        let e = parse_node_row(&schema, &bad, ';').unwrap_err();
+        assert!(e.contains("column `d`"), "{e}");
+        assert!(parse_node_header(&rec(&[":ID", ":KEY", ":LABEL"])).is_err());
     }
 }

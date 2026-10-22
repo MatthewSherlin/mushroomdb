@@ -388,11 +388,10 @@ pub enum Command {
         dest: PathBuf,
         format: ExportFormat,
     },
-    /// Bulk-load a nodes CSV and a relationships CSV.
+    /// Bulk-load CSV and JSONL files.
     Import {
         db_dir: PathBuf,
-        nodes: Option<PathBuf>,
-        relationships: Option<PathBuf>,
+        inputs: import::ImportInputs,
         opts: import::ImportOptions,
     },
     /// Build (or incrementally sync) a graph of a git repository.
@@ -517,7 +516,10 @@ Usage:
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+  mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                      --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                      csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                      cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
                                       graphml writes one file: <dest>/graph.graphml if <dest> is an
                                       existing directory, otherwise <dest> is the file path itself
                                       (nodes + edges only; rules have no GraphML analogue)
@@ -526,8 +528,12 @@ Usage:
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
   mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                    [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                     [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
-                                   bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                   `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                   `-` reads one of them from standard input
                                    nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
                                    other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
                                    one label per node: Person;Employee is refused; relationship properties are not supported
@@ -2033,8 +2039,7 @@ fn single_char(flag: &str, val: &str) -> Result<char, String> {
 
 fn parse_import(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = PathBuf::from("mushroomdb-data");
-    let mut nodes = None;
-    let mut relationships = None;
+    let mut inputs = import::ImportInputs::default();
     let mut opts = import::ImportOptions::default();
     let mut i = 0;
     while i < args.len() {
@@ -2043,9 +2048,17 @@ fn parse_import(args: &[&str]) -> Result<Command, String> {
             opts.ignore_errors = true;
             i += 1;
         } else if let Some(v) = flag_value(args, &mut i, "--nodes")? {
-            nodes = Some(PathBuf::from(v));
+            inputs.nodes_csv = Some(PathBuf::from(v));
         } else if let Some(v) = flag_value(args, &mut i, "--relationships")? {
-            relationships = Some(PathBuf::from(v));
+            inputs.rels_csv = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--nodes-jsonl")? {
+            inputs.nodes_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--edges-jsonl")? {
+            inputs.edges_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--jsonl")? {
+            inputs.stream_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--rules-jsonl")? {
+            inputs.rules_jsonl = Some(PathBuf::from(v));
         } else if let Some(v) = flag_value(args, &mut i, "--db")? {
             db_dir = PathBuf::from(v);
         } else if let Some(v) = flag_value(args, &mut i, "--delimiter")? {
@@ -2068,13 +2081,15 @@ fn parse_import(args: &[&str]) -> Result<Command, String> {
             return Err(format!("unexpected argument: {a}"));
         }
     }
-    if nodes.is_none() && relationships.is_none() {
-        return Err("import needs --nodes <file>, --relationships <file>, or both".to_string());
+    if inputs == import::ImportInputs::default() {
+        return Err(
+            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl, --rules-jsonl or --jsonl"
+                .to_string(),
+        );
     }
     Ok(Command::Import {
         db_dir,
-        nodes,
-        relationships,
+        inputs,
         opts,
     })
 }
@@ -2083,21 +2098,25 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut dest = None;
     let mut format = ExportFormat::Jsonl;
+    let mut single_file = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--format" {
+        if a == "--single-file" {
+            single_file = true;
+            i += 1;
+        } else if a == "--format" {
             let val = args
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --format".to_string())?;
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--format=") {
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 1;
         } else if a.starts_with('-') {
@@ -2114,6 +2133,12 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
     }
     let db_dir = db_dir.ok_or_else(|| "export requires <db-dir>".to_string())?;
     let dest = dest.ok_or_else(|| "export requires <dest>".to_string())?;
+    if single_file {
+        if format != ExportFormat::Jsonl {
+            return Err("--single-file goes with --format jsonl".to_string());
+        }
+        format = ExportFormat::JsonlSingle;
+    }
     Ok(Command::Export {
         db_dir,
         dest,
@@ -2151,58 +2176,141 @@ pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
     out
 }
 
-/// Bulk-load CSV files into `db_dir`; the text `mushroomdb import` prints.
+/// Bulk-load CSV and JSONL files into `db_dir`; `mushroomdb import`.
 pub fn run_import(
     db_dir: &Path,
-    nodes: Option<&Path>,
-    relationships: Option<&Path>,
+    inputs: &import::ImportInputs,
     opts: &import::ImportOptions,
 ) -> Result<import::ImportReport, CliError> {
-    import::run_import(db_dir, nodes, relationships, opts)
+    import::run_import_inputs(db_dir, inputs, opts, &mut |_| {})
+}
+
+/// The warning line for NaN and infinite floats, which JSON and CSV cannot
+/// carry; empty when there are none.
+fn non_finite_note(stats: &export::ExportStats) -> String {
+    match stats.non_finite_floats {
+        0 => String::new(),
+        n => format!(
+            "warning: {n} NaN or infinite float values cannot be written in this format and were left out\n"
+        ),
+    }
+}
+
+fn export_summary(
+    dest: &Path,
+    format: &ExportFormat,
+    stats: &export::ExportStats,
+    rule_count: usize,
+    extra: &str,
+) -> String {
+    let manual = stats.edges - stats.derived_edges;
+    let mut out = format!(
+        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+        dest.display(),
+        format.name(),
+        stats.nodes,
+        manual,
+        rule_count
+    );
+    if stats.derived_edges > 0 {
+        let _ = writeln!(
+            out,
+            "{} derived edges are not written; they belong to their rules",
+            stats.derived_edges
+        );
+    }
+    out.push_str(extra);
+    out
 }
 
 /// Export all data from `db_dir` to `dest` in `format`.
+///
+/// JSONL, CSV and Cypher stream: the store is read node by node and the files
+/// are written as it goes. Parquet and GraphML build their whole file in
+/// memory, so they read the store whole.
 pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
-    let nodes = db.all_nodes_for_export();
-    let edges = db.all_edges_for_export();
     let mut rules = db.rules();
     rules.sort_by(|a, b| a.name.cmp(&b.name));
-    let node_count = nodes.len();
-    let edge_count = edges.len();
     let rule_count = rules.len();
     match format {
         ExportFormat::Jsonl => {
-            export::write_jsonl(&nodes, &edges, &rules, dest)?;
+            let stats = export::write_jsonl(&db, &rules, dest)?;
+            // JSONL has always counted every edge, derived included.
             Ok(format!(
-                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n{}",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
-                rule_count
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
             ))
         }
+        ExportFormat::JsonlSingle => {
+            let stats = export::write_jsonl_single(&db, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}, single file): {} nodes, {} edges, {} rules\n{}",
+                dest.display(),
+                format.name(),
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
+            ))
+        }
+        ExportFormat::Csv => {
+            let stats = export::write_csv(&db, &rules, dest)?;
+            let note = non_finite_note(&stats);
+            Ok(export_summary(dest, format, &stats, rule_count, &note))
+        }
+        ExportFormat::Cypher => {
+            let (stats, loss) = export::write_cypher(&db, dest)?;
+            let mut extra = String::new();
+            if rule_count > 0 {
+                extra.push_str(&format!(
+                    "{rule_count} rules are not written: Cypher has no statement for one\n"
+                ));
+            }
+            if loss.ids_added > 0 {
+                extra.push_str(&format!(
+                    "warning: {} nodes had no id property and gain one, equal to their key, when the file is run\n",
+                    loss.ids_added
+                ));
+            }
+            if loss.typed_properties + loss.unwritable_numbers + loss.differing_ids > 0 {
+                extra.push_str(&format!(
+                    "warning: not written to the Cypher file: {} properties of the date, time, duration or binary types, \
+                     {} NaN, infinite or -2^63 numbers or names with a line break, {} nodes whose id property is not their key\n",
+                    loss.typed_properties, loss.unwritable_numbers, loss.differing_ids
+                ));
+            }
+            Ok(export_summary(dest, format, &stats, 0, &extra))
+        }
         ExportFormat::Parquet => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             export::write_parquet(&nodes, &edges, &rules, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
                 rule_count
             ))
         }
         // GraphML has no rule analogue: only nodes and edges are written.
         ExportFormat::Graphml => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             let file_path = export::write_graphml(&nodes, &edges, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges\n",
                 file_path.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
             ))
         }
     }

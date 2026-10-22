@@ -12407,6 +12407,130 @@ impl<F: Fs> GraphDb<F> {
         edges
     }
 
+    /// [`all_nodes_for_export`](Self::all_nodes_for_export), one node at a time.
+    ///
+    /// Calls `each` with every live node in key order, and stops at its first
+    /// `Err`. Only the sorted list of node ids (four bytes a node) is held; a
+    /// node's property map is built when it is handed over and dropped when
+    /// `each` returns, so an export's memory does not grow with the properties
+    /// of the store.
+    pub fn for_each_node_for_export<E>(
+        &self,
+        mut each: impl FnMut(NodeInfo) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let pv = self.props_view();
+        let fields = pv.field_names();
+        let mut ids: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX && self.syms.resolve(sym).is_some())
+            })
+            .collect();
+        ids.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+        for id in ids {
+            let (Some(key), Some(&sym)) = (self.ids.key_of(id), self.labels.get(id as usize))
+            else {
+                continue;
+            };
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            let mut props = BTreeMap::new();
+            for field in &fields {
+                if let Some(vr) = pv.get(id, field) {
+                    props.insert(field.clone(), vr.into_value());
+                }
+            }
+            each(NodeInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                props,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// [`all_edges_for_export`](Self::all_edges_for_export), one edge at a
+    /// time, in the same `(edge_type, src, dst)` order.
+    ///
+    /// Held at once: the sorted node ids, the edge types, and the derived-edge
+    /// provenance as borrowed rule names (twelve bytes and a pointer per derived
+    /// edge, none for a store with no rules). One source node's out-edges at a
+    /// time are materialised.
+    pub fn for_each_edge_for_export<E>(
+        &self,
+        mut each: impl FnMut(ExportEdge) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let mut prov: HashMap<(u32, u32, u32), &str> = HashMap::new();
+        for (rule_name, triples) in self.engine.provenance() {
+            for &triple in triples {
+                prov.insert(triple, rule_name.as_str());
+            }
+        }
+        let weight_props: HashMap<&str, Option<&str>> = self
+            .engine
+            .rules()
+            .map(|r| (r.name.as_str(), r.weight_prop.as_deref()))
+            .collect();
+        let tv = self.topo_view();
+        let ep = self.edge_props_view();
+
+        let mut etypes: Vec<(&str, u32)> = tv
+            .etypes()
+            .filter_map(|sym| self.syms.resolve(sym).map(|name| (name, sym)))
+            .collect();
+        etypes.sort();
+        let mut srcs: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX)
+            })
+            .collect();
+        srcs.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+
+        for (edge_type, etype_sym) in etypes {
+            for &id in &srcs {
+                let Some(src) = self.ids.key_of(id) else {
+                    continue;
+                };
+                let mut out: Vec<(&str, u32)> = tv
+                    .neighbors(etype_sym, Direction::Out, id)
+                    .as_ref()
+                    .iter()
+                    .filter_map(|&nbr| self.ids.key_of(nbr).map(|k| (k, nbr)))
+                    .collect();
+                out.sort();
+                for (dst, nbr) in out {
+                    let rule = prov.get(&(etype_sym, id, nbr)).copied();
+                    let weight = rule
+                        .and_then(|rn| weight_props.get(rn).copied().flatten())
+                        .and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                            Some(Value::Float(f)) => Some(f),
+                            Some(Value::Int(i)) => Some(i as f64),
+                            _ => None,
+                        });
+                    each(ExportEdge {
+                        edge_type: edge_type.to_string(),
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                        derived: rule.is_some(),
+                        rule: rule.map(str::to_string),
+                        weight,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// What each edge type *is*, without building one record per edge.
     ///
     /// [`all_edges_for_export`](Self::all_edges_for_export) answers the same

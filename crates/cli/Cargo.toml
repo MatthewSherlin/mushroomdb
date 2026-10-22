@@ -42,7 +42,7 @@ code-extract = { package = "mushroomdb-extract", path = "../code-extract", versi
 server = { package = "mushroomdb-server", path = "../server", version = "0.9.2" }
 backup = { package = "mushroomdb-backup", path = "../backup", version = "0.9.2" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 parquet = { version = "59", default-features = false, features = ["arrow"] }
 arrow-array = { version = "59", default-features = false }
