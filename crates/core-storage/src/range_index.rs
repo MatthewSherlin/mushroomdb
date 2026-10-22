@@ -189,6 +189,22 @@ impl UnifiedIndex {
             .map(|(name, _)| name.as_str())
     }
 
+    /// Whether this is a read-only layered index ([`Self::layered_over`]),
+    /// whose range and prefix lookups see only the layer's own entries.
+    pub fn is_layered(&self) -> bool {
+        self.under.is_some()
+    }
+
+    /// The nodes with an entry under `(label, field)` — those whose value
+    /// there has an index key — in ascending id order. On a layered index, the
+    /// layer's own entries only.
+    pub fn indexed_ids(&self, label: &str, field: &str) -> impl Iterator<Item = u32> + '_ {
+        self.reverse
+            .get(&pair(label, field))
+            .into_iter()
+            .flat_map(|by_id| by_id.keys().copied())
+    }
+
     /// Whether any range index is declared.
     pub fn has_range_indexes(&self) -> bool {
         !self.range_names.is_empty()
@@ -909,6 +925,23 @@ fn datetime_range<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_ids_are_the_nodes_whose_value_has_an_index_key() {
+        let mut ix = UnifiedIndex::new();
+        ix.enable_range("r", "P", "v");
+        ix.set("P", "v", 4, &Value::Int(1));
+        ix.set("P", "v", 1, &Value::Int(1));
+        ix.set("P", "v", 2, &Value::List(vec![Value::Int(1)]));
+        ix.set("P", "v", 3, &Value::Str("a".into()));
+        ix.remove_node("P", "v", 3);
+        // Ascending; a list has no key; a removed entry is gone.
+        assert_eq!(ix.indexed_ids("P", "v").collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(ix.indexed_ids("P", "w").count(), 0, "another field");
+        assert!(!ix.is_layered());
+        let layer = UnifiedIndex::layered_over(std::sync::Arc::new(ix), BTreeSet::new());
+        assert!(layer.is_layered());
+    }
 
     #[test]
     fn a_layered_index_answers_as_the_reindexed_base() {

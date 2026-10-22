@@ -816,6 +816,31 @@ The first range index or constraint on a store moves it to the V11 snapshot
 format, which 0.9.x cannot read, whether it is declared in Cypher or through the
 API.
 
+**What reads a range index.** With a range index on `(Label, prop)`, a
+`MATCH (n:Label)` whose `WHERE` has one of these as an `AND`-ed part is answered
+from the index instead of a scan of the label:
+
+- `n.prop < x`, `n.prop <= x`, `n.prop > x`, `n.prop >= x`, either way round
+  (`x < n.prop`), and two of them together as a range
+  (`n.prop >= $lo AND n.prop < $hi`);
+- `n.prop STARTS WITH x`.
+
+`x` is a literal or a `$parameter`. So is `ORDER BY n.prop [DESC] … LIMIT k`
+(with or without `SKIP`) over `MATCH (n:Label)`, with no `WHERE` or with a
+`WHERE` made only of the range above on the same property: the index yields the
+first rows of the sort and the rest are never read.
+
+The answer is the scan's, row for row and in the same order: integers and
+floats compare as numbers (`n.prop > 5.5` finds the integer 10), a string bound
+finds only strings, and `Date`, `LocalDateTime` and `DateTime` values range in
+their own order. A node without the property is still sorted where `ORDER BY`
+puts it (last ascending, first descending). A `Duration`, `Bool`, list or `null`
+bound is answered by the scan, which finds nothing for it, since those values
+are not ordered. The index is not read for `n.key`, `n.id` or `n.label`, inside
+a transaction, through a reader whose recent commits are not yet folded, or
+across a relationship (`MATCH (n:L)-[:R]->(m) WHERE n.prop > 1`); those scan,
+with the same answer.
+
 **Where they run.** A statement that changes the schema is a write: it runs
 through `GraphDb::query_write`, HTTP `/query` and the MCP `query` tool with a
 full token, Bolt auto-commit and `mushroomdb query`. It is refused inside a
@@ -1202,7 +1227,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
-| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; see [Schema statements](#schema-statements-ddl) |
+| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; `WHERE` ranges, `STARTS WITH` and `ORDER BY … LIMIT` on it read the index; see [Schema statements](#schema-statements-ddl) |
 | `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
 | `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
