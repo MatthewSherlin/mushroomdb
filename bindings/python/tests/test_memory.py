@@ -31,6 +31,7 @@ def test_remember_then_recall_returns_the_note_as_a_row(db):
     assert report["provisional"] == ["matthew"], "an unknown subject is stubbed, not refused"
     assert report["provisional_capped"] == []
     assert report["same_as"] == [] and report["same_as_lost"] == []
+    assert report["same_as_unread"] is None
     assert db.node_info("matthew")["label"] == "Entity"
     assert db.neighbors(report["note"], "ABOUT", "out") == ["matthew"]
 
@@ -241,6 +242,7 @@ def test_upsert_entity_maintains_aliases_and_clears_a_provisional_mark(db):
         "created": True,
         "updated_fields": 0,
         "same_as_lost": [],
+        "same_as_unread": None,
     }
     props = db.node_info("ada")["props"]
     assert props["id"] == "ada", "`id` repeats the key, whatever props said"

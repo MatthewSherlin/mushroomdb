@@ -206,6 +206,12 @@ pub struct RememberReport {
     /// key and name do not imply. Reported so a write that costs an identity
     /// says so, rather than only naming what it gained.
     pub same_as_lost: Vec<SameAsPair>,
+    /// Set when the write committed but the `SAME_AS` links could not be read
+    /// back afterwards: the error's text. Then [`same_as`](Self::same_as) and
+    /// [`same_as_lost`](Self::same_as_lost) are empty because nothing was
+    /// read, not because nothing changed. `None` on every call whose read
+    /// succeeded.
+    pub same_as_unread: Option<String>,
 }
 
 /// Refuse a key that is empty, or only whitespace: it names nothing, and a
@@ -321,6 +327,10 @@ pub struct UpsertOutcome {
     /// `SAME_AS` claims the node held before an update and does not after it.
     /// Empty on a create and on a store without the identity preset.
     pub same_as_lost: Vec<SameAsPair>,
+    /// Set when the update committed but the node's `SAME_AS` links could not
+    /// be read back afterwards: the error's text. Then `same_as_lost` is
+    /// empty because nothing was read, not because nothing was retracted.
+    pub same_as_unread: Option<String>,
 }
 
 /// Create or update one entity by key, with the policy every surface shares.
@@ -352,8 +362,21 @@ pub fn upsert_entity<F: Fs>(
     db: &mut GraphDb<F>,
     key: &str,
     label: Option<&str>,
+    row: BTreeMap<String, Value>,
+    aliases: &[String],
+) -> Result<UpsertOutcome> {
+    upsert_entity_reading(db, key, label, row, aliases, same_as_pairs)
+}
+
+/// [`upsert_entity`] with the `SAME_AS` read passed in, so a test can make it
+/// fail before or after the write.
+fn upsert_entity_reading<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
     mut row: BTreeMap<String, Value>,
     aliases: &[String],
+    read_same_as: impl Fn(&GraphDb<F>, &[String]) -> Result<Vec<SameAsPair>>,
 ) -> Result<UpsertOutcome> {
     refuse_blank(key, || "key".to_string())?;
     row.remove("id");
@@ -396,15 +419,15 @@ pub fn upsert_entity<F: Fs>(
         // outcome can name the links this update retracted: a changed name
         // takes a full-name link below the floor.
         let keys = [key.to_string()];
-        let same_as_before = same_as_pairs(db, &keys)?;
+        let same_as_before = read_same_as(db, &keys)?;
         describe_entity_with_aliases(db, key, None, &to_set, aliases)?;
-        // The write has committed: a failed read here cannot undo it, so the
-        // outcome names no retracted link and the failure is logged.
-        let same_as_lost = match same_as_pairs(db, &keys) {
-            Ok(after) => same_as_lost(&same_as_before, &after),
+        // The write has committed: a failed read here cannot undo it, so it
+        // is reported in the outcome (and logged), not returned.
+        let (same_as_lost, same_as_unread) = match read_same_as(db, &keys) {
+            Ok(after) => (same_as_lost(&same_as_before, &after), None),
             Err(e) => {
                 eprintln!("[mushroomdb] same_as_pairs error after commit: {e}");
-                Vec::new()
+                (Vec::new(), Some(e.to_string()))
             }
         };
         Ok(UpsertOutcome {
@@ -412,6 +435,7 @@ pub fn upsert_entity<F: Fs>(
             created: false,
             updated_fields,
             same_as_lost,
+            same_as_unread,
         })
     } else {
         let Some(label) = label else {
@@ -427,6 +451,7 @@ pub fn upsert_entity<F: Fs>(
             created: true,
             updated_fields: 0,
             same_as_lost: Vec::new(),
+            same_as_unread: None,
         })
     }
 }
@@ -450,6 +475,16 @@ pub fn upsert_entity<F: Fs>(
 /// Also ensures full-text search is enabled on `Note.text`, so a store whose
 /// very first write is a `remember` call can still be recalled from.
 pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result<RememberReport> {
+    remember_reading(db, input, same_as_pairs)
+}
+
+/// [`remember`] with the `SAME_AS` read passed in, so a test can make it fail
+/// before or after the commit.
+fn remember_reading<F: Fs>(
+    db: &mut GraphDb<F>,
+    input: &RememberInput<'_>,
+    read_same_as: impl Fn(&GraphDb<F>, &[String]) -> Result<Vec<SameAsPair>>,
+) -> Result<RememberReport> {
     let text = input.text.trim();
     let len = text.chars().count();
     if !(MIN_TEXT_CHARS..=MAX_TEXT_CHARS).contains(&len) {
@@ -636,7 +671,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // names only the ones this commit made — and the ones it retracted. Stubs
     // are new by definition, so only the entities can have any yet.
     let entity_key_list: Vec<String> = input.entities.iter().map(|e| e.key.clone()).collect();
-    let same_as_before = same_as_pairs(db, &entity_key_list)?;
+    let same_as_before = read_same_as(db, &entity_key_list)?;
 
     let mut report = RememberReport {
         note: key.clone(),
@@ -790,9 +825,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     let mut touched = entity_key_list;
     touched.extend(report.provisional.iter().cloned());
-    // The commit is done: a failed read cannot undo it, so the report names
-    // no links and the failure is logged.
-    match same_as_pairs(db, &touched) {
+    // The commit is done: a failed read cannot undo it, so the report says so
+    // in `same_as_unread` (and the failure is logged) rather than returning.
+    match read_same_as(db, &touched) {
         Ok(same_as_after) => {
             report.same_as_lost = same_as_lost(&same_as_before, &same_as_after);
             report.same_as = same_as_after
@@ -800,7 +835,10 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
                 .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
                 .collect();
         }
-        Err(e) => eprintln!("[mushroomdb] same_as_pairs error after commit: {e}"),
+        Err(e) => {
+            eprintln!("[mushroomdb] same_as_pairs error after commit: {e}");
+            report.same_as_unread = Some(e.to_string());
+        }
     }
 
     Ok(report)
@@ -848,6 +886,129 @@ fn note_key(ts: i64, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    type Db = GraphDb<core_storage::fs::RealFs>;
+
+    fn scratch_store() -> (Db, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mdb-remember-reading-{}-{nanos}",
+            std::process::id()
+        ));
+        (GraphDb::open(&dir).unwrap(), dir)
+    }
+
+    fn corrupt() -> GraphError {
+        GraphError::Corrupt {
+            detail: "injected".into(),
+        }
+    }
+
+    /// A reader that answers the first `ok_reads` calls with no links and
+    /// fails every call after.
+    fn fails_after(ok_reads: usize) -> impl Fn(&Db, &[String]) -> Result<Vec<SameAsPair>> {
+        let calls = Cell::new(0usize);
+        move |_, _| {
+            calls.set(calls.get() + 1);
+            if calls.get() > ok_reads {
+                Err(corrupt())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn note_input<'a>(about: &'a [String]) -> RememberInput<'a> {
+        RememberInput {
+            text: "Ada wrote the first program",
+            about,
+            kind: "note",
+            ts: 7,
+            source: None,
+            entities: &[],
+            facts: &[],
+        }
+    }
+
+    #[test]
+    fn remember_refuses_when_the_read_before_the_commit_fails() {
+        let (mut db, dir) = scratch_store();
+        let about = vec!["ada".to_string()];
+        let input = note_input(&about);
+        let refused = remember_reading(&mut db, &input, fails_after(0));
+        assert!(
+            matches!(refused, Err(GraphError::Corrupt { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            !db.has_node("ada"),
+            "nothing was written: not even the stub"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remember_reports_a_failed_read_after_the_commit() {
+        let (mut db, dir) = scratch_store();
+        let about = vec!["ada".to_string()];
+        let report = remember_reading(&mut db, &note_input(&about), fails_after(1)).unwrap();
+        assert!(db.has_node(&report.note), "the write committed");
+        assert!(report.same_as.is_empty() && report.same_as_lost.is_empty());
+        assert!(
+            report
+                .same_as_unread
+                .as_deref()
+                .is_some_and(|e| e.contains("injected")),
+            "{:?}",
+            report.same_as_unread
+        );
+        let ok = remember_reading(&mut db, &note_input(&about), same_as_pairs).unwrap();
+        assert_eq!(ok.same_as_unread, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_refuses_when_the_read_before_the_write_fails() {
+        let (mut db, dir) = scratch_store();
+        upsert_entity(&mut db, "ada", Some("Person"), BTreeMap::new(), &[]).unwrap();
+        let row = BTreeMap::from([("name".to_string(), Value::Str("Ada".into()))]);
+        let refused = upsert_entity_reading(&mut db, "ada", None, row, &[], fails_after(0));
+        assert!(
+            matches!(refused, Err(GraphError::Corrupt { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(db.get_prop("ada", "name"), None, "nothing was written");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_reports_a_failed_read_after_the_write() {
+        let (mut db, dir) = scratch_store();
+        upsert_entity(&mut db, "ada", Some("Person"), BTreeMap::new(), &[]).unwrap();
+        let row = BTreeMap::from([("name".to_string(), Value::Str("Ada".into()))]);
+        let outcome =
+            upsert_entity_reading(&mut db, "ada", None, row, &[], fails_after(1)).unwrap();
+        assert_eq!(outcome.updated_fields, 1);
+        assert!(outcome.same_as_lost.is_empty());
+        assert!(
+            outcome
+                .same_as_unread
+                .as_deref()
+                .is_some_and(|e| e.contains("injected")),
+            "{:?}",
+            outcome.same_as_unread
+        );
+        assert_eq!(
+            db.get_prop("ada", "name"),
+            Some(Value::Str("Ada".into())),
+            "the write committed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn the_key_is_a_function_of_ts_and_text_alone() {

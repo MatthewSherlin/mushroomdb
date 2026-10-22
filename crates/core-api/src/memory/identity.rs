@@ -688,19 +688,19 @@ pub fn identity_clusters<F: Fs>(db: &GraphDb<F>, floor: f64) -> IdentityReport {
 mod tests {
     use super::*;
 
-    fn empty_store() -> GraphDb<core_storage::fs::RealFs> {
+    fn empty_store() -> (GraphDb<core_storage::fs::RealFs>, std::path::PathBuf) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir =
             std::env::temp_dir().join(format!("mdb-sameas-err-{}-{nanos}", std::process::id()));
-        GraphDb::open(&dir).unwrap()
+        (GraphDb::open(&dir).unwrap(), dir)
     }
 
     #[test]
     fn same_as_pairs_returns_a_read_error_instead_of_no_links() {
-        let db = empty_store();
+        let (db, dir) = empty_store();
         let keys = vec!["a".to_string()];
         let corrupt = same_as_pairs_reading(&db, &keys, |_| {
             Err(GraphError::Corrupt {
@@ -711,17 +711,19 @@ mod tests {
             matches!(corrupt, Err(GraphError::Corrupt { .. })),
             "{corrupt:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn same_as_pairs_skips_a_key_that_does_not_exist() {
-        let db = empty_store();
+        let (db, dir) = empty_store();
         let keys = vec!["ghost".to_string()];
         assert_eq!(same_as_pairs(&db, &keys).unwrap(), vec![]);
         let missing = same_as_pairs_reading(&db, &keys, |k| {
             Err(GraphError::KeyNotFound { key: k.into() })
         });
         assert_eq!(missing.unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
