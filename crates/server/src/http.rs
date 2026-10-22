@@ -26,8 +26,8 @@ use axum::{Json, Router};
 use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
     BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
-    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value,
-    WccConfig, SUGGEST_DEFAULT_SEED,
+    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SchemaError, SchemaErrorKind,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -1907,40 +1907,37 @@ fn refuse_schema_write(identity: &AuthIdentity) -> Option<Response> {
     }
 }
 
-/// A schema write's error as HTTP: a bad name or shape is 400 (what
-/// `graph_err` gives a `QueryError`), a name that exists, an index a
-/// constraint owns, existing duplicates and an index or constraint a view
-/// owns are 409, and a name nothing answers to is 404.
-fn schema_err(e: GraphError) -> Response {
-    let detail = match &e {
-        GraphError::QueryError { detail } | GraphError::RuleInvalid { detail } => detail.as_str(),
-        GraphError::RuleNotFound { .. } => return schema_error_body(StatusCode::NOT_FOUND, e),
-        GraphError::ConstraintCreationConflict { .. } => {
-            return schema_error_body(StatusCode::CONFLICT, e)
-        }
-        _ => return graph_err(e),
+/// A schema write's error as HTTP, by the kind the engine decided from the
+/// state it found: a name nothing answers to is 404, a collision with what
+/// exists (a taken name or pair, an index a constraint backs, existing
+/// duplicates, a view-owned property) is 409, and a malformed request is 400.
+fn schema_err(e: SchemaError) -> Response {
+    let status = match e.kind {
+        SchemaErrorKind::NotFound => StatusCode::NOT_FOUND,
+        SchemaErrorKind::Conflict => StatusCode::CONFLICT,
+        SchemaErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        SchemaErrorKind::Other => return graph_err(e.error),
     };
-    let status = if detail.starts_with("no ") {
-        StatusCode::NOT_FOUND
-    } else if detail.contains("already")
-        || detail.contains("backs unique constraint")
-        || detail.contains("is owned by view")
-        || detail.contains("names more than one index")
-        || detail.contains("is range index")
-    {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::BAD_REQUEST
-    };
-    schema_error_body(status, e)
-}
-
-fn schema_error_body(status: StatusCode, e: GraphError) -> Response {
-    let detail = match e {
+    let detail = match e.error {
         GraphError::QueryError { detail } | GraphError::RuleInvalid { detail } => detail,
         other => other.to_string(),
     };
     (status, Json(json!({ "error": detail }))).into_response()
+}
+
+/// The refusal for a schema body that is not an object, or carries a field
+/// outside `allowed`, naming it.
+fn schema_body_check(body: &Js, allowed: &[&str]) -> std::result::Result<(), String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "the body must be a JSON object".to_string())?;
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(unknown) => Err(format!(
+            "unknown field '{unknown}'; this route takes: {}",
+            allowed.join(", ")
+        )),
+        None => Ok(()),
+    }
 }
 
 /// A required, non-empty string field of a schema request body.
@@ -1985,6 +1982,9 @@ async fn schema_index_create(
     if let Some(refusal) = refuse_schema_write(&identity) {
         return refusal;
     }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "kind"]) {
+        return err_response(e);
+    }
     let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
         (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
         (Err(e), _) | (_, Err(e)) => return err_response(e),
@@ -2005,20 +2005,11 @@ async fn schema_index_create(
             },
         };
     let kind = kind.to_string();
-    if kind == "equality" {
-        // An equality index has no name of its own: it is listed as eq_<label>_<property>.
-        let listed = format!("eq_{label}_{property}");
-        if name.as_deref().is_some_and(|n| n != listed) {
-            return err_response(format!(
-                "an equality index is named {listed}; omit name or give exactly that"
-            ));
-        }
-    }
     let db = state.db.clone();
     let created = tokio::task::spawn_blocking(move || {
         let mut g = db.write();
         match kind.as_str() {
-            "equality" => g.schema_create_equality_index(&label, &property),
+            "equality" => g.schema_create_equality_index(name.as_deref(), &label, &property),
             _ => g.schema_create_range_index(name.as_deref(), &label, &property),
         }
         .map(|listed| (listed, kind, label, property))
@@ -2061,6 +2052,9 @@ async fn schema_constraint_create(
 ) -> Response {
     if let Some(refusal) = refuse_schema_write(&identity) {
         return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "type"]) {
+        return err_response(e);
     }
     let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
         (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),

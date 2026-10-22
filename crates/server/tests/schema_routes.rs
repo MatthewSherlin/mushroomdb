@@ -428,3 +428,193 @@ async fn gets_are_narrowed_for_roles_exactly_like_show() {
     let (_, rows) = call(&app, "GET", "/schema/constraints", "rtok", None).await;
     assert_eq!(rows, json!([]));
 }
+
+#[tokio::test]
+async fn unknown_fields_and_wrong_types_are_400_naming_the_field() {
+    let (app, db) = open("unknown");
+    for (uri, body, named) in [
+        (
+            "/schema/indexes",
+            json!({"label": "P", "proprty": "a"}),
+            "proprty",
+        ),
+        (
+            "/schema/indexes",
+            json!({"label": "P", "property": "a", "unique": true}),
+            "unique",
+        ),
+        (
+            "/schema/constraints",
+            json!({"name": "c", "label": "P", "property": "a", "unique": true}),
+            "unique",
+        ),
+        (
+            "/schema/constraints",
+            json!({"name": "c", "label": "P", "propery": "a"}),
+            "propery",
+        ),
+    ] {
+        let (status, err) = call(&app, "POST", uri, "full", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(err["error"].as_str().unwrap().contains(named), "{err}");
+    }
+    for (uri, body) in [
+        ("/schema/indexes", json!([1, 2])),
+        ("/schema/indexes", json!("x")),
+        ("/schema/indexes", json!({"label": 5, "property": "a"})),
+        ("/schema/indexes", json!({"label": "P", "property": ["a"]})),
+        (
+            "/schema/indexes",
+            json!({"label": "P", "property": "a", "name": 7}),
+        ),
+        (
+            "/schema/constraints",
+            json!({"name": "c", "label": "P", "property": "a", "type": 1}),
+        ),
+        (
+            "/schema/constraints",
+            json!({"name": true, "label": "P", "property": "a"}),
+        ),
+    ] {
+        let (status, err) = call(&app, "POST", uri, "full", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {err}");
+    }
+    assert!(db.read().range_indexes().is_empty());
+    assert!(db.read().constraints().is_empty());
+}
+
+#[tokio::test]
+async fn each_engine_error_maps_by_kind() {
+    let (app, db) = open("kinds-map");
+    let post = |uri: &'static str, body: Json| call(&app, "POST", uri, "full", Some(body));
+    // Conflict: a constraint's own index cannot be dropped, naming the constraint.
+    assert_eq!(
+        post(
+            "/schema/constraints",
+            json!({"name": "uc", "label": "P", "property": "e"})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let (status, err) = call(&app, "DELETE", "/schema/indexes/eq_P_e", "full", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(err["error"].as_str().unwrap().contains("'uc'"), "{err}");
+    // Conflict: an equality index declared twice, and over a range-indexed pair.
+    let eq = json!({"label": "P", "property": "q", "kind": "equality"});
+    assert_eq!(
+        post("/schema/indexes", eq.clone()).await.0,
+        StatusCode::CREATED
+    );
+    assert_eq!(post("/schema/indexes", eq).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        post(
+            "/schema/indexes",
+            json!({"name": "r1", "label": "P", "property": "r"})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post(
+            "/schema/indexes",
+            json!({"label": "P", "property": "r", "kind": "equality"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    // Conflict: a constraint over a property a view owns, and an index over it.
+    db.write()
+        .create_view(mushroomdb::ViewDef {
+            name: "deg".into(),
+            label: "U".into(),
+            view_prop: "deg".into(),
+            source: mushroomdb::ViewSource::Degree {
+                edge_type: "KNOWS".into(),
+                direction: mushroomdb::Direction::Out,
+            },
+        })
+        .unwrap();
+    for (uri, body) in [
+        (
+            "/schema/constraints",
+            json!({"name": "vc", "label": "U", "property": "deg"}),
+        ),
+        ("/schema/indexes", json!({"label": "U", "property": "deg"})),
+        (
+            "/schema/indexes",
+            json!({"label": "U", "property": "deg", "kind": "equality"}),
+        ),
+    ] {
+        let (status, err) = post(uri, body.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}: {err}");
+    }
+    // Conflict: a name two listed indexes share (`eq_A_b_c`).
+    for (l, f) in [("A_b", "c"), ("A", "b_c")] {
+        let body = json!({"label": l, "property": f, "kind": "equality"});
+        assert_eq!(post("/schema/indexes", body).await.0, StatusCode::CREATED);
+    }
+    let (status, err) = call(&app, "DELETE", "/schema/indexes/eq_A_b_c", "full", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    // Invalid: a reserved name.
+    let (status, _) = post(
+        "/schema/indexes",
+        json!({"name": "eq_z", "label": "P", "property": "z"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // NotFound.
+    for uri in ["/schema/indexes/none", "/schema/constraints/none"] {
+        assert_eq!(
+            call(&app, "DELETE", uri, "full", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[tokio::test]
+async fn names_with_slash_and_percent_round_trip_in_the_delete_path() {
+    let (app, _db) = open("encoded");
+    // Not an identifier, never created, so 404 once decoded.
+    for uri in [
+        "/schema/indexes/a%2Fb",
+        "/schema/indexes/%25",
+        "/schema/constraints/a%2Fb",
+    ] {
+        assert_eq!(
+            call(&app, "DELETE", uri, "full", None).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    // An equality index over a label with a space, a slash and a percent is
+    // listed under a name that is none of an identifier; it drops by that name, encoded.
+    for (label, encoded) in [
+        ("My Label", "eq_My%20Label_p"),
+        ("a/b", "eq_a%2Fb_p"),
+        ("50%", "eq_50%25_p"),
+    ] {
+        let body = json!({"label": label, "property": "p", "kind": "equality"});
+        let (status, created) = call(&app, "POST", "/schema/indexes", "full", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (_, rows) = call(&app, "GET", "/schema/indexes", "full", None).await;
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == created["name"]));
+        let (status, err) = call(
+            &app,
+            "DELETE",
+            &format!("/schema/indexes/{encoded}"),
+            "full",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{encoded}: {err}");
+    }
+    let (_, rows) = call(&app, "GET", "/schema/indexes", "full", None).await;
+    assert_eq!(rows, json!([]));
+}

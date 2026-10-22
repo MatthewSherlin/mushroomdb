@@ -58,6 +58,47 @@ pub(crate) fn reserved_index_name(name: &str) -> Option<GraphError> {
         })
 }
 
+/// How a failed schema change relates to the store's state, for a caller that
+/// answers in HTTP: decided from the state the call found, never from the
+/// wording of the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaErrorKind {
+    /// The name, or what it addresses, does not exist.
+    NotFound,
+    /// The change collides with what exists: a taken name or pair, an index a
+    /// constraint is checked against, existing duplicates, a view-owned property.
+    Conflict,
+    /// The request itself is malformed (a reserved name, say).
+    Invalid,
+    /// None of those; the error stands on its own.
+    Other,
+}
+
+impl SchemaErrorKind {
+    /// The kind of an error no state check explained: by variant only.
+    fn of_error(e: &GraphError) -> Self {
+        match e {
+            GraphError::RuleNotFound { .. } => SchemaErrorKind::NotFound,
+            GraphError::RuleInvalid { .. } | GraphError::ConstraintCreationConflict { .. } => {
+                SchemaErrorKind::Conflict
+            }
+            GraphError::QueryError { .. } => SchemaErrorKind::Invalid,
+            _ => SchemaErrorKind::Other,
+        }
+    }
+}
+
+/// A schema change that failed: the engine's error, unchanged, and its kind.
+#[derive(Debug)]
+pub struct SchemaError {
+    pub kind: SchemaErrorKind,
+    pub error: GraphError,
+}
+
+fn ddl_reserved(name: &str) -> bool {
+    reserved_index_name(name).is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexKind {
     Range,
@@ -268,54 +309,139 @@ impl<F: Fs> GraphDb<F> {
         name: Option<&str>,
         label: &str,
         field: &str,
-    ) -> Result<String> {
+    ) -> std::result::Result<String, SchemaError> {
         let listed = name
             .map(str::to_string)
             .unwrap_or_else(|| auto_index_name(label, field));
-        self.exec_ddl(DdlStatement::CreateIndex {
+        let ran = self.exec_ddl(DdlStatement::CreateIndex {
             name: name.map(str::to_string),
             label: label.to_string(),
             field: field.to_string(),
             if_not_exists: false,
-        })?;
-        Ok(listed)
+        });
+        match ran {
+            Ok(_) => Ok(listed),
+            Err(e) => {
+                let kind = if ddl_reserved(&listed) {
+                    SchemaErrorKind::Invalid
+                } else if self.prop_index.range_index(&listed).is_some()
+                    || self.prop_index.range_index_on(label, field).is_some()
+                    || self.view_owns(label, field)
+                {
+                    SchemaErrorKind::Conflict
+                } else {
+                    SchemaErrorKind::of_error(&e)
+                };
+                Err(SchemaError { kind, error: e })
+            }
+        }
     }
 
     /// Declare the equality index on `(label, field)`, which `SHOW INDEXES`
-    /// lists as `eq_<label>_<field>` (Cypher DDL creates range indexes only).
-    /// Returns that name.
-    pub fn schema_create_equality_index(&mut self, label: &str, field: &str) -> Result<String> {
-        self.enable_index(label, field)?;
-        Ok(equality_index_name(label, field))
+    /// lists as `eq_<label>_<field>`. Cypher DDL creates range indexes only,
+    /// so this calls [`enable_index`](Self::enable_index) rather than
+    /// `exec_ddl`; the listing, the drop and the errors are the DDL's. `name`,
+    /// when given, must be that listed name. Returns it.
+    pub fn schema_create_equality_index(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        field: &str,
+    ) -> std::result::Result<String, SchemaError> {
+        let listed = equality_index_name(label, field);
+        if name.is_some_and(|n| n != listed) {
+            return Err(SchemaError {
+                kind: SchemaErrorKind::Invalid,
+                error: GraphError::QueryError {
+                    detail: format!(
+                        "an equality index is named {listed}; omit name or give exactly that"
+                    ),
+                },
+            });
+        }
+        match self.enable_index(label, field) {
+            Ok(()) => Ok(listed),
+            Err(e) => {
+                let kind = if self.view_owns(label, field) {
+                    SchemaErrorKind::Conflict
+                } else {
+                    SchemaErrorKind::of_error(&e)
+                };
+                Err(SchemaError { kind, error: e })
+            }
+        }
     }
 
     /// `DROP INDEX name`, for any listed kind.
-    pub fn schema_drop_index(&mut self, name: &str) -> Result<()> {
-        self.exec_ddl(DdlStatement::DropIndex {
+    pub fn schema_drop_index(&mut self, name: &str) -> std::result::Result<(), SchemaError> {
+        let ran = self.exec_ddl(DdlStatement::DropIndex {
             name: name.to_string(),
             if_exists: false,
-        })
-        .map(|_| ())
+        });
+        let Err(e) = ran else { return Ok(()) };
+        let listing = self.schema_listing();
+        let kind = match listing.indexes_named(name).as_slice() {
+            [] => SchemaErrorKind::NotFound,
+            [one] => {
+                let backs_constraint = one.kind == IndexKind::Equality
+                    && self
+                        .constraints
+                        .iter()
+                        .any(|c| c.label == one.label && c.field == one.field);
+                if backs_constraint {
+                    SchemaErrorKind::Conflict
+                } else {
+                    SchemaErrorKind::of_error(&e)
+                }
+            }
+            _ => SchemaErrorKind::Conflict,
+        };
+        Err(SchemaError { kind, error: e })
     }
 
     /// `CREATE CONSTRAINT name FOR (n:label) REQUIRE n.field IS UNIQUE`.
-    pub fn schema_create_constraint(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
-        self.exec_ddl(DdlStatement::CreateConstraint {
+    pub fn schema_create_constraint(
+        &mut self,
+        name: &str,
+        label: &str,
+        field: &str,
+    ) -> std::result::Result<(), SchemaError> {
+        let ran = self.exec_ddl(DdlStatement::CreateConstraint {
             name: name.to_string(),
             label: label.to_string(),
             field: field.to_string(),
             if_not_exists: false,
-        })
-        .map(|_| ())
+        });
+        let Err(e) = ran else { return Ok(()) };
+        let kind =
+            if self.constraints.iter().any(|c| c.name == name) || self.view_owns(label, field) {
+                SchemaErrorKind::Conflict
+            } else {
+                SchemaErrorKind::of_error(&e)
+            };
+        Err(SchemaError { kind, error: e })
     }
 
     /// `DROP CONSTRAINT name`.
-    pub fn schema_drop_constraint(&mut self, name: &str) -> Result<()> {
-        self.exec_ddl(DdlStatement::DropConstraint {
+    pub fn schema_drop_constraint(&mut self, name: &str) -> std::result::Result<(), SchemaError> {
+        let ran = self.exec_ddl(DdlStatement::DropConstraint {
             name: name.to_string(),
             if_exists: false,
-        })
-        .map(|_| ())
+        });
+        let Err(e) = ran else { return Ok(()) };
+        let kind = if self.constraints.iter().any(|c| c.name == name) {
+            SchemaErrorKind::of_error(&e)
+        } else {
+            SchemaErrorKind::NotFound
+        };
+        Err(SchemaError { kind, error: e })
+    }
+
+    /// Whether a view owns `(label, field)`, which no index or constraint may cover.
+    fn view_owns(&self, label: &str, field: &str) -> bool {
+        self.view_store
+            .views()
+            .any(|v| v.label == label && v.view_prop == field)
     }
 
     /// Run a parsed DDL statement. `SHOW …` answers from the live state; the

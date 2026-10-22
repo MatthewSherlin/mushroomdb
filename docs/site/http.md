@@ -1264,7 +1264,7 @@ Highest first.
 
 A `GET` needs read access, and a role-bound token or a `read` key sees only the rows `SHOW` shows it (those whose label it can see a node of). A `POST` or `DELETE` is a write: a full token, an `admin` key or a `write` key may; a role-bound token or a `read` key gets 403.
 
-Errors: a missing or empty field, an unknown `kind` or `type`, a `name` that is not letters, digits and underscores, or a range-index name beginning `eq_` or `ft_` (reserved for the names `SHOW INDEXES` lists equality and full-text indexes under) is `400`. A name that already exists, a pair that already has a range index, an index a unique constraint is checked against, and a constraint over properties that already hold duplicates are `409`. A name nothing answers to on `DELETE` is `404`. Each carries `{"error": "..."}`.
+Errors: a body that is not an object, a field the route does not take (the error names it), a field of the wrong type, a missing or empty field, an unknown `kind` or `type`, a `name` that is not letters, digits and underscores, or a range-index name beginning `eq_` or `ft_` (reserved for the names `SHOW INDEXES` lists equality and full-text indexes under) is `400`. A name that already exists, a pair that already has a range index, an index a unique constraint is checked against, and a constraint over properties that already hold duplicates are `409`. A name nothing answers to on `DELETE` is `404`. Each carries `{"error": "..."}`.
 
 ### `GET /schema/indexes`
 
