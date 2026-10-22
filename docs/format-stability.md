@@ -96,7 +96,7 @@ Section ids (fixed):
 | 15 | EDGES_SWEPT | 4 bytes, `MSWP`. Written by every snapshot from 0.7.2 on. It says the writer removes a deleted node's edges from the snapshot it was working over, so the topology holds no edge to or from a retired id. An open of a snapshot without it — one 0.7.1 or earlier wrote — looks for such edges and drops them (ledger row 95) |
 | 16 | PROV_RECONCILED | 4 bytes, `MREC`. Optional (0.9.2+). It says the state the snapshot holds has had the lost-provenance repair of ledger rows 111 and 113: no rule counts an edge the graph does not hold, and no top-k source is short of an edge 0.8.0 took from it. Written only by a writer that ran the repair, opened a snapshot that says so, or opened none. An open of a snapshot with it skips the repair, which on such a state changes nothing; an open of one without it — or a reader that does not know the id — runs the repair at the first write (ledger row 116) |
 | 17 | DERIVED_BITS | Magic `MDRV`, then one bit per `u32` of the TOPOLOGY section (bit `i` is bit `i % 8` of byte `i / 8` after the magic). Bit `i` is set when the four bytes at offset `4 * i` of the TOPOLOGY section are a neighbour entry — in an out-row or in an in-row — of an edge some rule owns. Optional (0.10+): written by a snapshot whose state has at least one such edge, left out otherwise. With it, a reader answers whether a base edge is rule-derived from the bit at that edge's own entry, with no search and nothing built at open or first read. A snapshot without it — one an earlier version wrote, or one with no derived edge — is read by building the answer from PROVENANCE at the first read that needs it. A reader that does not know the id ignores it; a 0.9.x writer snapshotting such a store leaves it out, so it never goes stale beside the topology it indexes. Unlike the other large sections it is validated eagerly, once per base on first use: the magic, the length (the magic plus one bit per `u32` of the topology section) and the CRC32 against its directory entry. On any mismatch the reader warns once and answers from PROVENANCE instead, so it never returns a wrong answer from damaged bits, and `verify` reports the mismatch |
-| 18 | DECLARATIONS | Magic `MDCL`, then bincode `SnapshotDeclarations { multiplicity: bool, constraints: Vec<UniqueConstraint { name, label, field }> }`. V11 only: every V11 snapshot writes it and no other version does, so a store that never opted in writes what 0.9.x writes. The open applies its constraints before the WAL replays and takes its `multiplicity` flag as the V10 stamp's fact (a V11 store cannot say it with its version). So a snapshot whose WAL was archived away before its baseline WAL was written still carries both. New fields are appended with `#[serde(default)]`. Small: its CRC32 is checked on every read, and a section that fails it, or does not decode, refuses the open rather than drop a constraint. A reader that does not know the id is a reader that refuses V11 already |
+| 18 | DECLARATIONS | Magic `MDCL`, a `u16` LE section version (2 in 0.10), then the fields of `SnapshotDeclarations` one after another in bincode: `multiplicity: bool`, `constraints: Vec<UniqueConstraint { name, label, field }>` (version 1), then `indexes: Vec<(label, field)>` and `range_indexes: Vec<(name, label, field)>` (version 2). V11 only: every V11 snapshot writes it and no other version does, so a store that never opted in writes what 0.9.x writes. The open applies these declarations at the point of the WAL the snapshot was taken at — after the frames a keep-WAL snapshot holds, before the first one it does not — and takes `multiplicity` as the V10 stamp's fact (a V11 store cannot say it with its version). So a snapshot whose WAL was archived away before its baseline WAL was written still carries the store's constraints, indexes and opt-in. **Adding a field:** append it, with a default that means "not declared", and bump the version; a reader decodes the fields it knows in order, reads a field the payload ends before as its default (an older writer), and ignores bytes after the last field it knows (a newer writer). Any other change needs a new section id. Small: its CRC32 is checked on every read, and a section that fails it, has no magic or version, or whose fields do not decode, refuses the open rather than drop a constraint. A reader that does not know the id is a reader that refuses V11 already |
 
 Resolution rule for string columns, in one sentence: **if the shared table is
 present it is the table; otherwise the column's own `strings` is.** That is what
@@ -224,9 +224,16 @@ ingest, Cypher, HTTP, Python, `create_constraint`, `enable_range_index`):
   `DateTime` offset beyond ±18:00, a constraint whose data conflicts — does not
   upgrade. A write refused after the upgrade (a unique-constraint violation)
   leaves the store V11 with nothing V11 written: the safe direction.
-- If the V11 snapshot fails, the write fails, nothing is appended, and the
-  handle stays non-V11. A V11 snapshot that did reach disk costs an older reader
-  a refusal and nothing else.
+- If the V11 snapshot fails, the write fails and nothing is appended. The handle
+  stays non-V11 unless the V11 snapshot did reach disk, in which case it stays
+  V11 (and so does every later snapshot it takes); that costs an older reader a
+  refusal and nothing else.
+- The WAL is fsynced before the upgrade's snapshot is written, so the snapshot
+  holds no frame that is not durable. A group commit (`SharedDb::submit_batch`,
+  `GraphDb::commit_group`) whose submissions carry the store's first 0.10 value
+  upgrades **before the group's first append**, so the snapshot never holds a
+  submission of that group: if the group fsync then fails, every submission of
+  the group is gone, as the group-commit contract says.
 - **V11 is sticky.** Every later snapshot is V11, whatever the store's data
   holds: dropping the last constraint or range index, or overwriting the last
   typed value, does not move it back, because its WAL and archives still hold
@@ -235,6 +242,17 @@ ingest, Cypher, HTTP, Python, `create_constraint`, `enable_range_index`):
   `GraphDb::is_v11()` reports it.
 - A 0.9.x binary opening a V11 store stops at `snapshot: unsupported version 11`
   and **leaves the WAL byte-identical**.
+- **0.9.x `open_at` / `mushroomdb asof`.** A 0.9.x `open_at` reaches a commit
+  inside a WAL archive by replaying the archives from empty state, on the
+  strength of the `wal.genesis` marker alone and without reading `snapshot.bin`;
+  its WAL decoder silently drops every frame from the first one it cannot read.
+  Beside archives that hold V11 records that would answer with the wrong
+  history. So a V11 store keeps its genesis marker as **`wal.genesis.v11`**,
+  renamed from `wal.genesis` before any snapshot a V11 store takes (and so before
+  any archive can hold a V11 record). 0.9.x does not read that name: it refuses
+  every archive-resident commit with `commit N is out of range`, and every other
+  commit goes through the snapshot, which it refuses with `snapshot: unsupported
+  version 11`. 0.10 reads either name. Backups and restores copy both.
 
 A store that never writes a V11-only record keeps writing V9 (or V10), byte for
 byte what 0.9.x writes, and stays readable by 0.9.x indefinitely. There is no
@@ -259,6 +277,7 @@ files alongside `snapshot.bin` and `wal.bin`:
 | `wal.<N>.archive` | each `archive_wal` snapshot | renamed WAL file; N = cumulative end-frame index |
 | `wal.floor` | first retention prune | 8-byte LE u64 horizon floor |
 | `wal.genesis` | first archive, also the store's first-ever snapshot | empty marker: archive chain covers genesis |
+| `wal.genesis.v11` | the same, on a V11 store (0.10+); `wal.genesis` is renamed to it | the same marker under a name 0.9.x does not read (see *V11 is opt-in and sticky*) |
 
 The genesis marker is written only when the first archive snapshot is also the
 store's very first snapshot (no `snapshot.bin` existed before it).  This rule

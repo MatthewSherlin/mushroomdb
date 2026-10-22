@@ -1954,6 +1954,13 @@ pub struct GraphDb<F: Fs> {
     /// dropping the last constraint or range index does not move the store
     /// back, because its WAL and archives still hold V11 records.
     v11_features: bool,
+    /// Set while a submission of a group commit is applied without its own
+    /// fsync. The V11 upgrade must not run then: its snapshot would hold the
+    /// group's earlier submissions before their fsync, and a failed group
+    /// fsync would leave them durable after their submitters were told `Err`.
+    /// The group upgrades ahead of its first append instead
+    /// ([`upgrade_to_v11_for_ops`](Self::upgrade_to_v11_for_ops)).
+    in_nosync_group: bool,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -2913,6 +2920,7 @@ impl<F: Fs> GraphDb<F> {
             constraints: Vec::new(),
             dropped_view_indexes: Vec::new(),
             v11_features: false,
+            in_nosync_group: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -3257,22 +3265,20 @@ impl<F: Fs> GraphDb<F> {
         db.fulltext_rebuild_follows = !db.fulltext_loaded;
         db.fulltext_reindexed_a_node = false;
         db.replaying_at_open = true;
-        // The constraints a V11 snapshot carries, ahead of the WAL: the WAL
-        // repeats them as declarations (each skipped as already declared), but
-        // a WAL archived away before its baseline was written does not, and a
-        // dropped constraint is never in the section, so a `DropConstraint`
-        // the WAL holds is all there is to undo. A declaration is never
-        // checked against the data, here or in the replay.
-        let restored = snapshot_declarations.as_ref().map_or(Ok(()), |decls| {
-            decls.constraints.iter().try_for_each(|c| {
-                db.apply(&WalRecord::CreateConstraint {
-                    name: c.name.clone(),
-                    label: c.label.clone(),
-                    field: c.field.clone(),
-                })
-            })
-        });
-        let replayed = restored.and_then(|()| db.apply_frames_over(records, held));
+        // The declarations a V11 snapshot carries (section 18) are the state at
+        // the point of the WAL the snapshot was taken at, so they are applied
+        // there: after the `held` frames, before the first frame the snapshot
+        // does not hold. Earlier would let a held declaration that was later
+        // replaced be skipped as already declared, and the reopened store
+        // would differ from the never-closed one. For a WAL that was replaced
+        // (`held == 0`) the WAL repeats them as its baseline, and for one
+        // archived away before its baseline was written they are all there is.
+        // A declaration is never checked against the data.
+        let section_recs = snapshot_declarations
+            .as_ref()
+            .map(declarations_as_records)
+            .unwrap_or_default();
+        let replayed = db.apply_frames_at(records, held, section_recs);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
         let replayed = replayed?;
@@ -3450,6 +3456,32 @@ impl<F: Fs> GraphDb<F> {
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
         self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames_over`], applying `at_held` — the declarations a
+    /// snapshot carries — at the `held` boundary, the point of the WAL the
+    /// snapshot was taken at.
+    fn apply_frames_at(
+        &mut self,
+        records: Vec<WalRecord>,
+        held: usize,
+        at_held: Vec<WalRecord>,
+    ) -> Result<usize> {
+        if at_held.is_empty() {
+            return self.apply_frames_over(records, held);
+        }
+        let held = held.min(records.len());
+        let mut records = records;
+        let after = records.split_off(held);
+        let before_count = records.len();
+        // The held prefix is numbered and its declarations applied, exactly
+        // as `apply_frames_over` would; nothing in it is otherwise applied.
+        let mut applied = self.apply_frames_over(records, before_count)?;
+        for rec in &at_held {
+            self.apply(rec)?;
+        }
+        applied += self.apply_frames_over(after, 0)?;
+        Ok(applied)
     }
 
     /// [`Self::apply_frames`] over a base that already holds the first `held`
@@ -4323,6 +4355,15 @@ impl<F: Fs> GraphDb<F> {
             let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal)?.0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+            // A V11 stamp makes the as-of handle V11 like a live one (C9),
+            // whether or not the replayed prefix holds a V11 record.
+            if snap_header.len() >= 6
+                && &snap_header[0..4] == b"GDB1"
+                && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                    >= core_storage::snapshot::VERSION_11
+            {
+                db.v11_features = true;
+            }
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
                 && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
@@ -6036,6 +6077,16 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         if carries_v11 {
+            if self.in_nosync_group {
+                // Unreachable through `commit_group` and the drain, which
+                // upgrade ahead of the group; refused rather than snapshot a
+                // state the group has not made durable.
+                return Err(GraphError::QueryError {
+                    detail: "the V11 format upgrade cannot run inside a group commit; the \
+                             group did not upgrade ahead of its first write"
+                        .into(),
+                });
+            }
             self.upgrade_to_v11()?;
         }
         let syms_checkpoint = self.syms.len();
@@ -8423,7 +8474,10 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None, None).map(inserted_pair)
+        self.in_nosync_group = true;
+        let result = self.commit_logged_batch(ops, None, None).map(inserted_pair);
+        self.in_nosync_group = false;
+        result
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -8458,6 +8512,9 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> (Vec<Result<(usize, usize)>>, Option<GraphError>) {
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return (group_refusal(e, groups.len()), None);
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
@@ -10006,15 +10063,76 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // What the snapshot holds must be durable first: under a batched
+        // fsync policy the WAL may hold acknowledged frames not yet synced,
+        // and the snapshot is durable the moment it is written.
+        match self.fs.sync(FileId::Wal) {
+            Ok(()) => self.note_wal_synced(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(GraphError::Io(e)),
+        }
         self.v11_features = true;
         let snapshot = self.snapshot_with(SnapshotOptions {
             keep_wal: true,
             ..SnapshotOptions::default()
         });
         if snapshot.is_err() {
-            self.v11_features = false;
+            // Once a V11 stamp is on disk the store stays V11 (C9), even
+            // though nothing V11 was written: a later snapshot from this handle
+            // must not write V9 over it.
+            let on_disk = self
+                .fs
+                .read_prefix(FileId::Snapshot, 6)
+                .ok()
+                .filter(|h| h.len() >= 6 && &h[0..4] == b"GDB1")
+                .map(|h| u16::from_le_bytes([h[4], h[5]]));
+            self.v11_features = on_disk == Some(core_storage::snapshot::VERSION_11);
         }
         snapshot
+    }
+
+    /// Move the store to V11 ahead of a group commit whose submissions carry a
+    /// V11-only value, so the upgrade snapshot holds only state that is
+    /// already durable — never a submission of the group itself.
+    ///
+    /// Called by [`commit_group`](Self::commit_group) and by the
+    /// [`SharedDb`](crate::SharedDb) drain before the group's first append.
+    /// `BatchOp` cannot declare a constraint or range index, so a value is
+    /// the only V11-only record a group can carry.
+    pub(crate) fn upgrade_to_v11_for_ops<'a>(
+        &mut self,
+        groups: impl IntoIterator<Item = &'a [BatchOp]>,
+    ) -> Result<()> {
+        if self.v11_features || self.read_only {
+            return Ok(());
+        }
+        let carries = |op: &BatchOp| match op {
+            BatchOp::InsertNode { props, .. } | BatchOp::InsertNodeOnConflict { props, .. } => {
+                props
+                    .iter()
+                    .any(|(_, v)| core_storage::v11_only_type(v).is_some())
+            }
+            BatchOp::SetProp { value, .. } => core_storage::v11_only_type(value).is_some(),
+            _ => false,
+        };
+        if groups.into_iter().any(|ops| ops.iter().any(carries)) {
+            self.upgrade_to_v11()?;
+        }
+        Ok(())
+    }
+
+    /// What a V11 snapshot's section 18 carries for this store.
+    fn snapshot_declarations(&self) -> core_storage::v8::SnapshotDeclarations {
+        core_storage::v8::SnapshotDeclarations {
+            multiplicity: self.multiplicity,
+            constraints: self.constraints.clone(),
+            indexes: self.prop_index.equality_pairs().cloned().collect(),
+            range_indexes: self
+                .prop_index
+                .range_indexes()
+                .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+                .collect(),
+        }
     }
 
     /// Whether this store records insert-count multiplicity.
@@ -12092,6 +12210,8 @@ impl<F: Fs> GraphDb<F> {
         try_copy("wal.bin")?;
         try_copy("wal.floor")?;
         try_copy("wal.genesis")?;
+        // A V11 store's genesis marker (see `Fs::use_v11_genesis_marker`).
+        try_copy("wal.genesis.v11")?;
         try_copy("roles.json")?;
         // The map from commit to wall-clock time. Without it the copy cannot
         // resolve a date to a commit, and answers `NoRecordedTime` for history
@@ -16854,6 +16974,12 @@ impl<F: Fs> GraphDb<F> {
         if self.lock_denied {
             return Err(self.lock_denied_error());
         }
+        // A V11 store keeps its genesis marker under a name 0.9.x does not
+        // read, before any snapshot can archive a WAL that holds V11 records
+        // (see `Fs::use_v11_genesis_marker`).
+        if self.v11_features {
+            self.fs.use_v11_genesis_marker()?;
+        }
         // From here `snapshot.bin` and `wal.bin` may be between states on disk.
         // A reader outside the engine pairing the two (the backup worker) waits
         // until the mark drops, on every exit from this function.
@@ -17013,8 +17139,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
                 v11,
-                constraints: self.constraints.clone(),
-                multiplicity: self.multiplicity,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -17146,8 +17271,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
                 v11,
-                constraints: self.constraints.clone(),
-                multiplicity: self.multiplicity,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf = Vec::new();
             let encoded = encode_v8(
@@ -17711,6 +17835,47 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
         | WalRecord::EnableRangeIndex { .. }
         | WalRecord::DisableRangeIndex { .. } => None,
     }
+}
+
+/// One `Err` per submission of a group refused as a whole by `e`: the first
+/// submission gets `e` itself, the rest its text.
+pub(crate) fn group_refusal<T>(e: GraphError, n: usize) -> Vec<Result<T>> {
+    let detail = format!("group refused: {e}");
+    let mut out = Vec::with_capacity(n);
+    out.push(Err(e));
+    for _ in 1..n {
+        out.push(Err(GraphError::Io(std::io::Error::other(detail.clone()))));
+    }
+    out.truncate(n);
+    out
+}
+
+/// The declarations a snapshot's section 18 carries, as the records that make
+/// them, in the order a baseline WAL writes them: equality indexes, range
+/// indexes, then constraints, so each constraint finds its index declared.
+fn declarations_as_records(d: &core_storage::v8::SnapshotDeclarations) -> Vec<WalRecord> {
+    let mut recs = Vec::new();
+    for (label, field) in &d.indexes {
+        recs.push(WalRecord::EnableIndex {
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for (name, label, field) in &d.range_indexes {
+        recs.push(WalRecord::EnableRangeIndex {
+            name: name.clone(),
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for c in &d.constraints {
+        recs.push(WalRecord::CreateConstraint {
+            name: c.name.clone(),
+            label: c.label.clone(),
+            field: c.field.clone(),
+        });
+    }
+    recs
 }
 
 /// Whether `rec` is a V11-only record: it carries a format-V11 value (see

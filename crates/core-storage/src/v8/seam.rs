@@ -584,8 +584,7 @@ mod tests {
             wal_mark: Vec::new(),
             prov_reconciled: false,
             v11: false,
-            constraints: Vec::new(),
-            multiplicity: false,
+            declarations: Default::default(),
         }
     }
 

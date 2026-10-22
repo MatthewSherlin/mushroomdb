@@ -65,8 +65,9 @@ pub const VERSION_10: u16 = 10;
 ///   section as the existing `Mixed` shape (a bincode map whose values carry
 ///   discriminants 6–10). The archived layout of the section does not move.
 /// * **Section 18, DECLARATIONS** ([`crate::v8::SECTION_DECLARATIONS`]): the
-///   unique constraints and the multiplicity opt-in, so a snapshot carries
-///   them itself rather than only through the WAL baseline it writes after.
+///   unique constraints, equality and range indexes and the multiplicity
+///   opt-in, so a snapshot carries them itself rather than only through the
+///   WAL baseline it writes after.
 /// * **A WAL that may carry discriminants 24–27** (constraint and range-index
 ///   declarations) and values with bincode discriminants 6–10.
 ///
@@ -335,8 +336,7 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         wal_mark: Vec::new(),
         prov_reconciled: false,
         v11: false,
-        constraints: Vec::new(),
-        multiplicity: false,
+        declarations: Default::default(),
     };
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(

@@ -29,7 +29,7 @@
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
 //!  13 = FULLTEXT (the full-text index's own blob; only when a pair is declared)
 //!  14–17 = WAL_MARK, EDGES_SWEPT, PROV_RECONCILED, DERIVED_BITS (optional)
-//!  18 = DECLARATIONS (constraints + multiplicity; V11 only, see `V8Meta::v11`)
+//!  18 = DECLARATIONS (versioned: multiplicity, constraints, indexes; V11 only, see `V8Meta::v11`)
 //!
 //! A V11 snapshot also writes columns of the five 0.10 value types (pack tags
 //! 5–9) into section 1 in the `Mixed` shape; any other version refuses them.
@@ -123,17 +123,12 @@ pub struct V8Meta {
     /// writes exactly what 0.9.x writes.
     #[serde(skip)]
     pub v11: bool,
-    /// The declared unique constraints, written to section 18 of a V11
-    /// snapshot. Not in the bincode META section: a field there would add
-    /// bytes to every snapshot, V9 included, and V9 stays byte-identical to
-    /// 0.9.x. Ignored unless `v11`.
+    /// The store's declarations, written to section 18 of a V11 snapshot. Not
+    /// in the bincode META section: a field there would add bytes to every
+    /// snapshot, V9 included, and V9 stays byte-identical to 0.9.x. Ignored
+    /// unless `v11`.
     #[serde(skip)]
-    pub constraints: Vec<crate::types::UniqueConstraint>,
-    /// The store records insert-count multiplicity, written to section 18 of a
-    /// V11 snapshot (a V10 snapshot says it with its version). Ignored unless
-    /// `v11`.
-    #[serde(skip)]
-    pub multiplicity: bool,
+    pub declarations: crate::v8::SnapshotDeclarations,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,11 +287,7 @@ pub fn encode_v8<W: Write>(
         &[]
     };
     let declarations = if meta.v11 {
-        crate::v8::SnapshotDeclarations {
-            multiplicity: meta.multiplicity,
-            constraints: meta.constraints.clone(),
-        }
-        .encode()?
+        meta.declarations.encode()?
     } else {
         Vec::new()
     };
@@ -688,21 +679,24 @@ fn columnstore_to_data(store: &ColumnStore, v11: bool) -> Result<(ColumnsData, S
         if let ColumnData::Mixed(ref blob) = field.col {
             let map: HashMap<u32, Value> =
                 bincode::deserialize(blob.as_slice()).unwrap_or_default();
-            // A mixed column (an `Int` beside a `Date`, a list of dates) is
-            // the one other way a 0.10 value type reaches this section.
-            if !v11 {
-                if let Some(type_name) = map.values().find_map(crate::types::v11_only_type) {
-                    return Err(GraphError::Corrupt {
-                        detail: format!(
-                            "v8: column '{}' holds {type_name} values, which only a V11 \
-                             snapshot can store",
-                            field.name
-                        ),
-                    });
-                }
-            }
             if let Some(vec_col) = try_promote_to_vector(&map) {
+                // Every value is a list of floats: nothing V11 in it, and the
+                // walk that proved it was the promotion's own.
                 field.col = vec_col;
+            } else {
+                // A mixed column (an `Int` beside a `Date`, a list of dates) is
+                // the one other way a 0.10 value type reaches this section.
+                if !v11 {
+                    if let Some(type_name) = map.values().find_map(crate::types::v11_only_type) {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "v8: column '{}' holds {type_name} values, which only a V11 \
+                                 snapshot can store",
+                                field.name
+                            ),
+                        });
+                    }
+                }
             }
         }
     }

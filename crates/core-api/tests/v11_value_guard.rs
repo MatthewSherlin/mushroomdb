@@ -63,8 +63,8 @@ fn v11_values() -> Vec<(&'static str, Value)> {
 
 fn expected_refusal(type_name: &str) -> String {
     format!(
-        "not supported in mushroomdb 0.10 yet: {type_name} values cannot be stored until the \
-         V11 format lands"
+        "{type_name} values cannot be used in a role predicate: roles.json carries no format \
+         version, so a 0.9.x reader would report it as corrupt"
     )
 }
 
@@ -310,7 +310,7 @@ fn roles_json_with_a_v11_value_does_not_parse() {
         let err = serde_json::from_str::<PropPredicate>(j).unwrap_err();
         assert!(
             err.to_string()
-                .contains("cannot be stored until the V11 format lands"),
+                .contains("cannot be used in a role predicate"),
             "{err}"
         );
     }

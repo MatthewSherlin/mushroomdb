@@ -134,54 +134,116 @@ pub const RECONCILED_MAGIC: &[u8; 4] = b"MREC";
 pub const SECTION_DERIVED_BITS: u8 = 17;
 /// The first four bytes of [`SECTION_DERIVED_BITS`].
 pub const DERIVED_BITS_MAGIC: &[u8; 4] = b"MDRV";
-/// The store's V11-era declarations: [`DECLARATIONS_MAGIC`], then a bincode
-/// [`SnapshotDeclarations`]. Written by every V11 snapshot and by no other, so
-/// a store that never opted in to V11 writes the bytes 0.9.x writes. The open
-/// restores the unique constraints and the multiplicity opt-in from it before
-/// the WAL replays, so a snapshot whose WAL was archived away before its
-/// baseline was written still carries them. Small, and CRC-checked on every
-/// read; a damaged one refuses the open rather than drop a constraint.
+/// The store's declarations, carried by the snapshot itself:
+/// [`DECLARATIONS_MAGIC`], a `u16` LE section version, then the fields of
+/// [`SnapshotDeclarations`] one after another in bincode. Written by every V11
+/// snapshot and by no other, so a store that never opted in to V11 writes the
+/// bytes 0.9.x writes. The open applies it at the point of the WAL the
+/// snapshot was taken at, so a snapshot whose WAL was archived away before its
+/// baseline was written still carries the store's constraints, indexes and
+/// multiplicity opt-in. Small, and CRC-checked on every read; a damaged one
+/// refuses the open rather than drop a constraint.
+///
+/// **Adding a field:** append it to the end of [`SnapshotDeclarations`], give
+/// it a `Default` that means "not declared", write it last in
+/// [`SnapshotDeclarations::encode`] and read it last in
+/// [`SnapshotDeclarations::decode`], and bump [`DECLARATIONS_VERSION`]. A
+/// reader decodes the fields it knows in order: a field the payload ends
+/// before (an older writer) reads as its default, and bytes after the last
+/// field it knows (a newer writer) are ignored. A change that is not an append
+/// needs a new section id.
 pub const SECTION_DECLARATIONS: u8 = 18;
 /// The first four bytes of [`SECTION_DECLARATIONS`].
 pub const DECLARATIONS_MAGIC: &[u8; 4] = b"MDCL";
-
-/// The payload of [`SECTION_DECLARATIONS`], after its magic.
+/// The version of the [`SECTION_DECLARATIONS`] payload this build writes.
 ///
-/// New fields go at the end, with `#[serde(default)]`: the section is bincode,
-/// and a reader of an older payload must still find every field it knows.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// 1 carried `multiplicity` and `constraints`; 2 appended `indexes` and
+/// `range_indexes`.
+pub const DECLARATIONS_VERSION: u16 = 2;
+
+mod erased {
+    /// One field of the declarations section, written in bincode.
+    pub trait Field {
+        fn write(&self, out: &mut Vec<u8>) -> bincode::Result<()>;
+    }
+    impl<T: serde::Serialize> Field for T {
+        fn write(&self, out: &mut Vec<u8>) -> bincode::Result<()> {
+            bincode::serialize_into(out, self)
+        }
+    }
+}
+
+/// The payload of [`SECTION_DECLARATIONS`], after its magic and version.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotDeclarations {
     /// The store records insert-count multiplicity. V11 carries this fact
     /// here because V11 is above V10, so the V10 stamp can no longer say it.
     pub multiplicity: bool,
     /// The declared unique constraints, in declaration order.
     pub constraints: Vec<crate::types::UniqueConstraint>,
+    /// The declared equality indexes as `(label, field)` (version 2).
+    pub indexes: Vec<(String, String)>,
+    /// The declared range indexes as `(name, label, field)` (version 2).
+    pub range_indexes: Vec<(String, String, String)>,
 }
 
 impl SnapshotDeclarations {
-    /// The section payload: the magic, then the bincode body.
+    /// The section payload: the magic, the version, then each field.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = DECLARATIONS_MAGIC.to_vec();
-        bincode::serialize_into(&mut out, self).map_err(|e| GraphError::Corrupt {
-            detail: format!("v8: declarations serialize: {e}"),
-        })?;
+        out.extend_from_slice(&DECLARATIONS_VERSION.to_le_bytes());
+        let fields: [&dyn erased::Field; 4] = [
+            &self.multiplicity,
+            &self.constraints,
+            &self.indexes,
+            &self.range_indexes,
+        ];
+        for f in fields {
+            f.write(&mut out).map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: declarations serialize: {e}"),
+            })?;
+        }
         Ok(out)
     }
 
-    /// Read a section payload written by [`encode`](Self::encode).
+    /// Read a section payload of any version: see [`SECTION_DECLARATIONS`]
+    /// for the rule. Returns the payload's version beside the declarations.
     ///
     /// # Errors
-    /// [`GraphError::Corrupt`] for a payload without the magic or whose body
-    /// does not decode.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let body = bytes
+    /// [`GraphError::Corrupt`] for a payload without the magic or a version,
+    /// with version 0, or whose fields do not decode.
+    pub fn decode(bytes: &[u8]) -> Result<(u16, Self)> {
+        let corrupt = |why: String| GraphError::Corrupt {
+            detail: format!("v8: declarations section: {why}"),
+        };
+        let rest = bytes
             .strip_prefix(DECLARATIONS_MAGIC.as_slice())
-            .ok_or_else(|| GraphError::Corrupt {
-                detail: "v8: declarations section: bad magic".into(),
-            })?;
-        bincode::deserialize(body).map_err(|e| GraphError::Corrupt {
-            detail: format!("v8: declarations section: {e}"),
-        })
+            .ok_or_else(|| corrupt("bad magic".into()))?;
+        if rest.len() < 2 {
+            return Err(corrupt("no version".into()));
+        }
+        let version = u16::from_le_bytes([rest[0], rest[1]]);
+        if version == 0 {
+            return Err(corrupt("version 0".into()));
+        }
+        let mut body = &rest[2..];
+        /// The next field, or its default when the payload has ended before it.
+        fn field<T: serde::de::DeserializeOwned + Default>(body: &mut &[u8]) -> Result<T> {
+            if body.is_empty() {
+                return Ok(T::default());
+            }
+            bincode::deserialize_from(body).map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: declarations section: {e}"),
+            })
+        }
+        let decls = Self {
+            multiplicity: field(&mut body)?,
+            constraints: field(&mut body)?,
+            indexes: field(&mut body)?,
+            range_indexes: field(&mut body)?,
+        };
+        // Anything left is fields a newer writer appended: ignored by rule.
+        Ok((version, decls))
     }
 }
 
@@ -1015,7 +1077,7 @@ impl MappedBase {
                 detail: "v8: declarations section: CRC mismatch".into(),
             });
         }
-        SnapshotDeclarations::decode(bytes).map(Some)
+        SnapshotDeclarations::decode(bytes).map(|(_, decls)| Some(decls))
     }
 
     /// The WAL mark this snapshot carries (section 14), if it carries one
@@ -1164,6 +1226,75 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_declarations() -> SnapshotDeclarations {
+        SnapshotDeclarations {
+            multiplicity: true,
+            constraints: vec![crate::types::UniqueConstraint {
+                name: "c".into(),
+                label: "L".into(),
+                field: "f".into(),
+            }],
+            indexes: vec![("L".into(), "f".into())],
+            range_indexes: vec![("r".into(), "L".into(), "g".into())],
+        }
+    }
+
+    #[test]
+    fn declarations_round_trip_at_the_current_version() {
+        let d = sample_declarations();
+        let bytes = d.encode().unwrap();
+        assert_eq!(&bytes[..4], DECLARATIONS_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            DECLARATIONS_VERSION
+        );
+        assert_eq!(
+            SnapshotDeclarations::decode(&bytes).unwrap(),
+            (DECLARATIONS_VERSION, d)
+        );
+    }
+
+    /// An older writer's payload ends before the fields it did not know; a
+    /// reader gives each of them its default ("not declared").
+    #[test]
+    fn an_older_declarations_version_reads_missing_fields_as_default() {
+        let d = sample_declarations();
+        let mut v1 = DECLARATIONS_MAGIC.to_vec();
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        bincode::serialize_into(&mut v1, &d.multiplicity).unwrap();
+        bincode::serialize_into(&mut v1, &d.constraints).unwrap();
+        let (version, back) = SnapshotDeclarations::decode(&v1).unwrap();
+        assert_eq!(version, 1);
+        assert!(back.multiplicity);
+        assert_eq!(back.constraints, d.constraints);
+        assert!(back.indexes.is_empty() && back.range_indexes.is_empty());
+    }
+
+    /// A newer writer appends fields after the last one this reader knows;
+    /// the reader decodes its own and ignores the rest.
+    #[test]
+    fn a_newer_declarations_version_ignores_appended_fields() {
+        let d = sample_declarations();
+        let mut v3 = d.encode().unwrap();
+        v3[4..6].copy_from_slice(&(DECLARATIONS_VERSION + 1).to_le_bytes());
+        bincode::serialize_into(&mut v3, &vec!["a field from the future".to_string()]).unwrap();
+        bincode::serialize_into(&mut v3, &42u64).unwrap();
+        let (version, back) = SnapshotDeclarations::decode(&v3).unwrap();
+        assert_eq!(version, DECLARATIONS_VERSION + 1);
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn a_declarations_payload_without_magic_or_version_is_refused() {
+        assert!(SnapshotDeclarations::decode(b"MDCX\x02\x00").is_err());
+        assert!(SnapshotDeclarations::decode(b"MDCL").is_err());
+        assert!(SnapshotDeclarations::decode(b"MDCL\x00\x00").is_err());
+        // A truncated field is corrupt, not a default.
+        let mut cut = sample_declarations().encode().unwrap();
+        cut.truncate(cut.len() - 1);
+        assert!(SnapshotDeclarations::decode(&cut).is_err());
+    }
     use crate::columns::ColumnStore;
     use crate::idmap::IdMap;
     use crate::interner::Interner;
@@ -1189,8 +1320,7 @@ mod tests {
             wal_mark: Vec::new(),
             prov_reconciled: false,
             v11: false,
-            constraints: Vec::new(),
-            multiplicity: false,
+            declarations: Default::default(),
         }
     }
 

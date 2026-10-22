@@ -149,8 +149,8 @@ pub fn v11_only_type(v: &Value) -> Option<&'static str> {
 /// version stamp does not cover.
 pub fn v11_type_refusal(type_name: &str) -> String {
     format!(
-        "not supported in mushroomdb 0.10 yet: {type_name} values cannot be stored until the \
-         V11 format lands"
+        "{type_name} values cannot be used in a role predicate: roles.json carries no format \
+         version, so a 0.9.x reader would report it as corrupt"
     )
 }
 
@@ -1187,7 +1187,7 @@ pub(crate) mod pinned {
     }
 
     /// One value of every variant but `Null`, in index order: the types a
-    /// store can hold (the five format-V11 types once V11 lands).
+    /// store can hold (the five format-V11 types on a V11 store).
     pub(crate) fn storable_values() -> Vec<Value> {
         vec![
             Value::Int(-7),
