@@ -16,3 +16,8 @@ criterion = { workspace = true }
 [[bench]]
 name = "engine"
 harness = false
+
+[lints.rust]
+# `mdb_v092`: the concurrency gate's scenario built against the v0.9.2 tag,
+# as the gate's same-machine baseline (see benches/shared/concurrency.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mdb_v092)"] }

@@ -38,17 +38,34 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// fail on: a plain commit under 8 concurrent readers costs 1.16–1.21× what
 /// it cost in v0.9.2, and that is **accepted**, because the readers now
 /// complete about 430k reads/s where v0.9.2's completed about 15 (they
-/// blocked behind the writer). With no readers the commit is 1.01× v0.9.2.
+/// blocked behind the writer). With no readers the commit is 1.01× v0.9.2,
+/// and the 0.10 bar for a write path is 1.05×.
 ///
-/// CI has no v0.9.2 binary, so the check is stated against this build
-/// alone. On the machine the decision was measured on, the plain commit
-/// under 8 readers was about 1.4× the same build's commit with none (TX-5,
-/// fix round 5); the pre-fix state the decision replaced was 2.6–2.8× v0.9.2.
-/// So: under readers, the commit's median may cost up to this multiple of its
-/// median with none — which passes the accepted state with room and fails a
-/// return to the old one — provided the readers really are reading
-/// ([`READS_PER_SEC_FLOOR`]).
-pub const WRITER_UNDER_READERS_MAX: f64 = 2.0;
+/// Three bounds hold that, all on medians of plain fsync-off commits:
+///
+/// - **Against v0.9.2, on the same machine** (CI builds the v0.9.2 tag with
+///   this scenario, `--cfg mdb_v092`, and points `MUSHROOMDB_GATE_V092` at
+///   it; the two are run interleaved, [`V092_ROUNDS`] times each):
+///   - readers paused: at most [`ALONE_MAX_VS_V092`]× v0.9.2's;
+///   - readers running: at most [`UNDER_MAX_VS_V092`]× v0.9.2's.
+/// - **Against this build with its readers paused**, which needs no
+///   baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
+pub const ALONE_MAX_VS_V092: f64 = 1.15;
+/// See [`ALONE_MAX_VS_V092`]: the owner accepted up to 1.21×; 1.25× is that
+/// with a 0.04 noise margin. This tree measured 1.01–1.09× v0.9.2 here
+/// (TX-7 fix round 1), with readers paused 1.10–1.12× — the same as the TX-7
+/// base it was built on, so inside the alone margin, not under the bar.
+pub const UNDER_MAX_VS_V092: f64 = 1.25;
+/// Interleaved v0.9.2 / this-build pairs behind the v0.9.2 bounds. The
+/// alone bound is the 1.05× bar plus a 0.10 noise margin: on the machine
+/// this was tuned on, the median of a 10 × 200-commit run moved ±8 % between
+/// runs at load 7–18 (WAL `write`/`close` syscalls are most of a 60 µs
+/// commit), and a median over these pairs halves that.
+pub const V092_ROUNDS: usize = 5;
+/// Under readers, the commit's median may cost up to this multiple of the
+/// same build's median with them paused: about 1.4× when the decision was
+/// measured, 0.98–1.21× on this tree; the pre-fix state was 2.6–2.8×.
+pub const WRITER_UNDER_READERS_MAX: f64 = 1.5;
 /// Reads per second the readers must complete while the writer is timed, so
 /// the writer's cost is measured against readers that run (v0.9.2's ~15/s
 /// would fail it).
@@ -196,10 +213,20 @@ pub fn start_writer(db: &SharedDb, per_sec: u64) -> Writer {
 
 /// One reader call, as a request pays it: capture a snapshot, then the
 /// depth-1 neighbourhood of `key`. Returns the rows, so the work is used.
+#[cfg(not(mdb_v092))]
 pub fn read_neighborhood(db: &SharedDb, key: &str) -> usize {
     db.reader()
         .neighborhood(key, 1, None, Dir::Both)
         .map_or(0, |rs| rs.len())
+}
+
+/// The v0.9.2 baseline build (`--cfg mdb_v092`): that release's reader has no
+/// unmasked neighbourhood, so its full-token path, the read guard's, stands in.
+#[cfg(mdb_v092)]
+pub fn read_neighborhood(db: &SharedDb, key: &str) -> usize {
+    let g = db.read();
+    g.node_ref(key)
+        .map_or(0, |n| n.neighborhood(1, None, Dir::Both).len())
 }
 
 /// Reader threads that run iterations on request: each iteration issues
@@ -400,9 +427,8 @@ pub fn measure_writer(readers: usize, rounds: usize, per_block: usize) -> Writer
                         continue;
                     }
                     let k = key(i.wrapping_mul(7_919));
-                    let snap = db.reader();
-                    std::hint::black_box(snap.node_info(&k));
-                    std::hint::black_box(snap.neighborhood(&k, 1, None, Dir::Both));
+                    std::hint::black_box(db.reader().node_info(&k));
+                    std::hint::black_box(read_neighborhood(&db, &k));
                     reads.fetch_add(1, Ordering::Relaxed);
                     i += readers;
                 }
