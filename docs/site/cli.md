@@ -74,7 +74,7 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-tok
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
 
 ### `mcp`
 
@@ -214,6 +214,19 @@ mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
 
 Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole
 
+### `keys`
+
+```text
+mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                   issues an access key: prints a new random token once and stores only its
+                   blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                   needs --role, and reads that role's view without ever writing
+mushroomdb keys hash
+                   reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
+```
+
+`keys add` works on every platform (the token comes from the operating system's random source). It writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. The mode and owner check on `keys.json` applies on Unix only; Windows has none. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+
 ### `verify`
 
 ```text
@@ -311,7 +324,7 @@ Print the usage this page is generated from, and exit.
 The notes `--help` prints under its usage:
 
 ```text
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).

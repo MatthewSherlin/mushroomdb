@@ -40,6 +40,9 @@ pub async fn watch(
         )
             .into_response();
     }
+    if let Some(refusal) = crate::http::refuse_write_tier(&identity) {
+        return refusal;
+    }
     let rx = state.watch.subscribe();
     ws.on_upgrade(move |socket| write_events(socket, rx))
         .into_response()

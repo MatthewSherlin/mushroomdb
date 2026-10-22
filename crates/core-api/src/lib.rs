@@ -1,3 +1,4 @@
+pub mod access_keys;
 pub mod algo;
 mod db;
 pub mod digest;
@@ -74,6 +75,7 @@ pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 /// see `cli::run_migrate`, which would otherwise report an opted-in store as
 /// `V10 -> V9`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
+pub use access_keys::{add_key, hash_token, AccessKeys, AccessKeysError, KeyTier, MIN_TOKEN_BYTES};
 pub use durable_wal::{disk_snapshot_ident, disk_wal_ident, WalPosition};
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{

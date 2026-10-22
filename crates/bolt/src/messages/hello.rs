@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use mushroomdb::{AccessKeys, KeyTier};
+
 use super::{PackValue, ServerMessage};
 use crate::error::BoltError;
 
@@ -117,11 +119,18 @@ impl Hello {
 /// Who a connection is, after `HELLO`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// The full-access token.
+    /// The full-access token, or an `admin` key.
     Full,
+    /// A `write` key: reads and writes like [`Full`](Identity::Full), but is
+    /// never given an operator surface. Bolt has none today; when one is
+    /// added (a procedure that reports counters, say) it must refuse this.
+    Write,
     /// A role-bound token. The connection resolves the role's mask from the
     /// store at use, as the HTTP layer does.
     Role(String),
+    /// A `read` key: the role's masked view, and no writes whatever write scope
+    /// the role carries, in auto-commit or in a transaction.
+    ReadOnlyRole(String),
 }
 
 /// Checks whether a role still exists in the store.
@@ -133,6 +142,8 @@ pub type RoleExists = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct TokenAuthenticator {
     full_token: Option<String>,
     role_tokens: HashMap<String, String>,
+    /// The `keys.json` set, shared with the HTTP layer so a reload reaches both.
+    access_keys: Option<AccessKeys>,
     role_exists: Option<RoleExists>,
 }
 
@@ -166,8 +177,16 @@ impl TokenAuthenticator {
         Self {
             full_token: full_token.filter(|t| !t.is_empty()),
             role_tokens,
+            access_keys: None,
             role_exists: None,
         }
+    }
+
+    /// Adds the `keys.json` set: an `admin` key is [`Identity::Full`], a
+    /// `write` key [`Identity::Write`], a `read` key a role-bound identity.
+    pub fn with_access_keys(mut self, keys: AccessKeys) -> Self {
+        self.access_keys = Some(keys);
+        self
     }
 
     /// Refuses a token whose role is no longer in the store.
@@ -176,9 +195,12 @@ impl TokenAuthenticator {
         self
     }
 
-    /// Whether no token of either kind is configured.
+    /// Whether no token of any kind is configured. A key set that has ever held
+    /// a key keeps the door shut even once it is emptied.
     pub fn is_open(&self) -> bool {
-        self.full_token.is_none() && self.role_tokens.is_empty()
+        self.full_token.is_none()
+            && self.role_tokens.is_empty()
+            && !self.access_keys.as_ref().is_some_and(AccessKeys::enforcing)
     }
 
     pub fn authenticate(&self, auth: &AuthToken) -> Result<Identity, BoltError> {
@@ -214,10 +236,28 @@ impl TokenAuthenticator {
             return Ok(Identity::Full);
         }
         match role {
-            Some(name) if self.role_exists.as_ref().is_none_or(|exists| exists(name)) => {
-                Ok(Identity::Role(name.to_string()))
-            }
-            _ => Err(BoltError::Unauthorized),
+            Some(name) => self.role_identity(name),
+            None => match self.access_keys.as_ref().and_then(|k| k.resolve(presented)) {
+                Some(KeyTier::Admin) => Ok(Identity::Full),
+                Some(KeyTier::Write) => Ok(Identity::Write),
+                Some(KeyTier::Read(name)) if self.role_exists(&name) => {
+                    Ok(Identity::ReadOnlyRole(name))
+                }
+                Some(KeyTier::Read(_)) => Err(BoltError::Unauthorized),
+                None => Err(BoltError::Unauthorized),
+            },
+        }
+    }
+
+    fn role_exists(&self, name: &str) -> bool {
+        self.role_exists.as_ref().is_none_or(|exists| exists(name))
+    }
+
+    fn role_identity(&self, name: &str) -> Result<Identity, BoltError> {
+        if self.role_exists(name) {
+            Ok(Identity::Role(name.to_string()))
+        } else {
+            Err(BoltError::Unauthorized)
         }
     }
 }
