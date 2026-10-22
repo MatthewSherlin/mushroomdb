@@ -10017,10 +10017,10 @@ impl<F: Fs> GraphDb<F> {
     /// stamp. On a large store the first V11 write therefore costs one full
     /// snapshot write.
     ///
-    /// An `Err` leaves this handle believing the store is not V11, and nothing
-    /// V11 has been appended; a V11 snapshot may still have reached disk, which
-    /// costs an older reader a refusal and nothing else — the next snapshot of
-    /// a store that never writes a V11 record goes back to V9 or V10.
+    /// An `Err` appends nothing V11. If the V11 snapshot did not reach disk,
+    /// this handle goes on believing the store is not V11; if it did, the store
+    /// is V11 from then on (C9) and later snapshots stay V11, which costs an
+    /// older reader a refusal and nothing else.
     fn upgrade_to_v11(&mut self) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
