@@ -175,10 +175,18 @@ fn main() -> ExitCode {
                     .filter(|s| !s.is_empty())
             });
             if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                return fail(
-                    "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
-                     (see SECURITY.md)",
-                );
+                // An admin key in keys.json is authentication too. Read and
+                // write keys are not: they leave no way to administer the server.
+                let admin_key = match mushroomdb::AccessKeys::load(db_dir.join("keys.json")) {
+                    Ok(keys) => keys.has_admin(),
+                    Err(e) => return fail(&e.to_string()),
+                };
+                if !admin_key {
+                    return fail(
+                        "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
+                         (see SECURITY.md)",
+                    );
+                }
             }
             // Fail before the store is opened: a bad origin list must not be
             // discovered after a long restore or open.

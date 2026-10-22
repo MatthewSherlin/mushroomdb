@@ -13,8 +13,8 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
-listener is accepting. Non-loopback `--addr` requires `--token` or
-`MUSHROOMDB_TOKEN` (see `SECURITY.md`).
+listener is accepting. Non-loopback `--addr` requires `--token`,
+`MUSHROOMDB_TOKEN` or an `admin` key in `keys.json` (see `SECURITY.md`).
 
 ## Authentication
 
@@ -144,7 +144,8 @@ Keys are read the same three ways as the other tokens (header, `?token=`, cookie
 `MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` rather than replacing them. Each token belongs in
 one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
 token is also a key. A server with no env token and no role tokens but at least one key requires
-a key. With no `keys.json` nothing changes, and `serve` installs no SIGHUP handler.
+a key. An `admin` key also satisfies the rule that a non-loopback `--addr` needs a token; a
+`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes, and `serve` installs no SIGHUP handler.
 
 The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
 malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the

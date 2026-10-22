@@ -336,3 +336,62 @@ fn an_invalid_keys_file_stops_serve_before_the_store_is_opened() {
         "the store must not have been opened"
     );
 }
+
+/// Starts `serve` on a non-loopback address and says whether it got as far as
+/// listening. The wildcard address binds on any host; the server is killed.
+fn serves_on_wildcard(dir: &Path) -> (bool, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("serve")
+        .arg(dir)
+        .args(["--addr", "0.0.0.0:0", "--no-ui"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mushroomdb serve");
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let listening = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.starts_with("listening on"));
+        let _ = tx.send(listening);
+    });
+    let listening = rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|_| panic!("serve neither listened nor exited"));
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut message = String::new();
+    let _ = stderr.read_to_string(&mut message);
+    (listening, message)
+}
+
+const NON_LOOPBACK_MESSAGE: &str = "non-loopback --addr requires --token or MUSHROOMDB_TOKEN";
+
+#[test]
+fn an_admin_key_alone_lets_serve_bind_a_non_loopback_address() {
+    let dir = tmp("wild-admin");
+    keys_add(&dir, "ops", "admin", None);
+    let (listening, stderr) = serves_on_wildcard(&dir);
+    assert!(listening, "stderr: {stderr}");
+}
+
+#[test]
+fn read_and_write_keys_alone_do_not_satisfy_the_non_loopback_rule() {
+    let dir = tmp("wild-readwrite");
+    keys_add(&dir, "app", "write", None);
+    keys_add(&dir, "tenant", "read", Some("tenant_a"));
+    let (listening, stderr) = serves_on_wildcard(&dir);
+    assert!(!listening);
+    assert!(stderr.contains(NON_LOOPBACK_MESSAGE), "{stderr}");
+}
+
+#[test]
+fn nothing_configured_still_refuses_a_non_loopback_address() {
+    let dir = tmp("wild-none");
+    let (listening, stderr) = serves_on_wildcard(&dir);
+    assert!(!listening);
+    assert!(stderr.contains(NON_LOOPBACK_MESSAGE), "{stderr}");
+}

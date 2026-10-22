@@ -67,7 +67,7 @@ A background Tokio task (`BackupWorker`) runs alongside the serve loop and does 
    `watch::Sender<BackupTrigger>` each time `snapshot_automatically()`, an explicit snapshot or the
    graceful-shutdown snapshot completes (after the atomic rename). It uploads the new
    `snapshot.bin`, any new `wal.N.archive` (immutable; never re-uploaded) and the small side files
-   (`commit_times.bin`, `roles.json`, `keys.json`, `wal.genesis`, `wal.floor`). A truncating
+   (`commit_times.bin`, `roles.json`, `wal.genesis`, `wal.floor`; never `keys.json`, which holds key hashes and stays out of every backup). A truncating
    snapshot replaces `wal.bin`; the worker starts a new `generation` (a counter stored in the
    manifest) so segment offsets restart at 0 without colliding.
 3. **Writes manifests.** After each snapshot upload, and every `MUSHROOMDB_BACKUP_MANIFEST_INTERVAL_S`
@@ -482,7 +482,7 @@ The smoke test uses the same docker-compose MinIO image as the template, so temp
 
 **Time travel / as-of:** Archives are the WAL segments that `asof` queries replay into. Backing them up is exactly what enables remote PITR. Restoring with `--at <commit-seq>` downloads archives only up to that seq and uses the existing `open_at` path — no format change. One constraint: an `--at` target earlier than the oldest archive in the backup is not restorable (the manifest records the oldest retained commit; the CLI errors loudly if the target is before it).
 
-**Scoped visibility:** `roles.json` is in every backup manifest. A restore includes it, so role-based visibility works identically after restore. The new `keys.json` sidecar is also included in backups (added to the file list in `BackupWorker`).
+**Scoped visibility:** `roles.json` is in every backup manifest. A restore includes it, so role-based visibility works identically after restore. The new `keys.json` sidecar is **not** included in backups: it holds key hashes, and `GraphDb::backup_to` and `BackupWorker` both leave it out (a test pins this). A restore does not bring keys back; reissue them or copy the file deliberately.
 
 **Snapshots + WAL replay:** The backup is built on the snapshot as the base. The `snapshot.intent` crash-window file (row 92) must NOT be included in backups — its presence in a restored store would indicate an interrupted snapshot that didn't happen on the restored machine, which would corrupt the open logic. `BackupWorker` explicitly skips `snapshot.intent`. A backup captured mid-snapshot is safe because: `snapshot_automatically()` is atomic from the Fs layer's perspective (rename-based); the trigger channel fires only after the atomic rename completes, so the backup worker never sees a partial snapshot.
 

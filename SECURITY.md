@@ -5,8 +5,8 @@
 mushroomdb is local-first by design. The embedded Rust core has no network
 stack; it reads and writes a local directory only. When you run
 `mushroomdb serve`, the HTTP server binds to `127.0.0.1:8080` by default (not
-`0.0.0.0`). Binding to a non-loopback interface requires `--token` or
-`MUSHROOMDB_TOKEN`. Loopback binds may omit a token. When a token is
+`0.0.0.0`). Binding to a non-loopback interface requires `--token`,
+`MUSHROOMDB_TOKEN` or an `admin` key in the store's `keys.json`. Loopback binds may omit a token. When a token is
 configured, every HTTP request except `GET /health` must present
 `Authorization: Bearer <token>`, `?token=`, or `Cookie: mushroomdb_token=`
 (WebSocket `/watch` and `/subscribe` take `?token=`). Open the explorer at

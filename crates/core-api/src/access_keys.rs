@@ -320,6 +320,16 @@ impl AccessKeys {
             .collect()
     }
 
+    /// Whether an `admin` key is in force: authentication that can stand in for
+    /// `--token` where a deployment must have some. `read` and `write` keys
+    /// alone do not count.
+    pub fn has_admin(&self) -> bool {
+        self.current()
+            .entries
+            .iter()
+            .any(|(_, tier)| *tier == KeyTier::Admin)
+    }
+
     /// How many keys are in force.
     pub fn len(&self) -> usize {
         self.current().entries.len()
@@ -534,6 +544,18 @@ mod tests {
         assert_eq!(keys.resolve(&tok("nope")), None);
         assert_eq!(keys.resolve(""), None);
         assert_eq!(keys.resolve(&tok("adm")[..MIN_TOKEN_BYTES - 1]), None);
+    }
+
+    #[test]
+    fn has_admin_is_true_only_for_an_admin_key() {
+        let one = |name: &str, tier: &str, role: Option<&str>| {
+            AccessKeys::from_json(&format!(r#"{{"keys":[{}]}}"#, entry(name, tier, role))).unwrap()
+        };
+        assert!(one("a", "admin", None).has_admin());
+        assert!(!one("w", "write", None).has_admin());
+        assert!(!one("r", "read", Some("x")).has_admin());
+        assert!(!AccessKeys::empty().has_admin());
+        assert!(AccessKeys::from_json(&sample()).unwrap().has_admin());
     }
 
     #[test]
