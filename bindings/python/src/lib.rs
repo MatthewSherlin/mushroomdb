@@ -204,6 +204,19 @@ impl GraphDb {
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
+    /// Declare a unique constraint on a handle with the V11 format unlocked.
+    ///
+    /// Test-only: built with the `test-hooks` feature and never in a wheel.
+    /// Python has no constraint API until the V11 format lands (0.10 TY-12),
+    /// so this is how a test reaches the errors a declaration raises.
+    #[cfg(feature = "test-hooks")]
+    fn _declare_constraint_for_test(&self, name: &str, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| {
+            db.unlock_v11_format_for_test();
+            db.create_constraint(name, label, field)
+        })
+    }
+
     /// Insert `key` if absent, otherwise update it in place.
     ///
     /// Returns `"inserted"` or `"updated"`.  On update, only the fields
@@ -484,7 +497,8 @@ impl GraphDb {
     /// - a `dict` mapping name→value (ergonomic form)
     /// - a list of `(name, value)` tuples (back-compat with `query_with_params`)
     ///
-    /// Values must be `int`, `float`, `str`, `bool`, `list`, or `dict`.
+    /// Values must be `int`, `float`, `str`, `bool`, `None`, `list`, or `dict`;
+    /// `None` binds as a null, so `$p IS NULL` is true for it.
     /// Parameters are bound, never interpolated, so string values are safe
     /// against injection.
     ///
@@ -572,7 +586,7 @@ impl GraphDb {
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         let rs = self.with_scope(|db, mask| match mask {
@@ -3050,13 +3064,14 @@ fn graph_err(e: GraphError) -> PyErr {
                     v.setattr("field", field.as_str())
                 })
             }
-            GraphError::ConstraintCreationConflict { violations } => {
+            GraphError::ConstraintCreationConflict { violations, total } => {
                 err_with(py, ConstraintCreationConflict::new_err(msg), |v| {
                     let pairs = violations
                         .iter()
                         .map(|(key, value)| Ok((key.as_str(), value_to_py(py, value)?)))
                         .collect::<PyResult<Vec<_>>>()?;
-                    v.setattr("violations", pairs)
+                    v.setattr("violations", pairs)?;
+                    v.setattr("total", *total)
                 })
             }
             GraphError::ValueTooLarge { field, size, limit } => {
@@ -3141,6 +3156,33 @@ fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {
     pred.validate_named("where")
         .map_err(PyValueError::new_err)?;
     Ok(pred)
+}
+
+/// A query parameter. `None` binds as [`Value::Null`], at the top level and
+/// inside a list or dict, as a JSON null does over HTTP (QL-17i). Stored
+/// values keep going through [`py_to_value`], which has no null.
+fn py_to_param(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(py_to_param(&item)?);
+        }
+        return Ok(Value::List(out));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                PyTypeError::new_err("dict keys must be str to convert to Value::Map")
+            })?;
+            map.insert(key, py_to_param(&v)?);
+        }
+        return Ok(Value::Map(map));
+    }
+    py_to_value(obj)
 }
 
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
@@ -3490,7 +3532,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
             let name: String = k.extract().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err("params dict keys must be str")
             })?;
-            map.insert(name, py_to_value(&v)?);
+            map.insert(name, py_to_param(&v)?);
         }
         return Ok(map);
     }
@@ -3509,7 +3551,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         return Ok(map);
@@ -3877,7 +3919,7 @@ engine_errors! {
     NoRecordedTime, "no_recorded_time", "A date was given to a history call on a store that records no commit times.\n\nWritten by a release before 0.6.11, or its `commit_times.bin` sidecar was removed. The store is intact and every commit-indexed read still works; only date resolution is unavailable. Pass a commit index instead. Deliberately distinct from `Corrupt`: an absent map is not a damaged one.";
     TimeBeforeFloor, "time_before_floor", "The date predates the oldest commit time the store still records. Carries `.floor_ms` and `.floor_commit`, the oldest entry the map can answer from. Retrying with an earlier instant fails the same way.";
     ConstraintViolation, "constraint_violation", "A write would give two live nodes the same value under a unique constraint. Carries `.constraint` and `.field`. Nothing was written.";
-    ConstraintCreationConflict, "constraint_creation_conflict", "A unique constraint cannot be declared because live nodes already share a value. Carries `.violations`, a list of `(node_key, value)` pairs.";
+    ConstraintCreationConflict, "constraint_creation_conflict", "A unique constraint cannot be declared because live nodes already share a value. Carries `.violations`, the first 100 `(node_key, value)` pairs in node-id order, and `.total`, how many nodes conflict.";
     ValueTooLarge, "value_too_large", "A value is larger than the store accepts. Carries `.field`, `.size` and `.limit`, in bytes. Nothing was written.";
 }
 

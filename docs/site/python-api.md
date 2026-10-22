@@ -44,10 +44,12 @@ write that carries one is refused until the format that holds them lands.
 ### `Params`
 
 ```python
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
 ```
 
 Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value.
 
 ### `Row`
 
@@ -488,7 +490,7 @@ this one call; these arguments are its per-call form.
 
 ```python
 def query_with_params(
-    self, cypher: str, params: Sequence[tuple[str, Scalar]]
+    self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
 ) -> list[Row]
 ```
 
@@ -1579,5 +1581,5 @@ attributes. Classes may be added; a `code` is never respelled.
 | `NoRecordedTime` | — | A date was given to a history call on a store that records no commit times. |
 | `TimeBeforeFloor` | `floor_ms: int`, `floor_commit: int` | The date predates the oldest commit time the store still records. |
 | `ConstraintViolation` | `constraint: str`, `field: str` | A write would give two live nodes the same value under a unique constraint. |
-| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]` | A unique constraint cannot be declared: live nodes already share a value. |
+| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]`, `total: int` | A unique constraint cannot be declared: live nodes already share a value. |
 | `ValueTooLarge` | `field: str`, `size: int`, `limit: int` | A value is larger than the store accepts; `size` and `limit` are bytes. |

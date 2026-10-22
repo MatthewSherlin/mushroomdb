@@ -40,8 +40,10 @@ years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
 write that carries one is refused until the format that holds them lands.
 """
 
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
-"""Query parameters: a name→value dict, a list of (name, value) tuples, or None."""
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
+"""Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value."""
 
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
@@ -281,11 +283,13 @@ class ConstraintViolation(MushroomError):
 class ConstraintCreationConflict(MushroomError):
     """A unique constraint cannot be declared: live nodes already share a value.
 
-    `violations` lists every `(node_key, value)` in conflict.
+    `violations` lists the first 100 `(node_key, value)` in conflict, in node-id
+    order; `total` counts all of them.
     """
 
     code: str
     violations: list[tuple[str, Any]]
+    total: int
 
 class ValueTooLarge(MushroomError):
     """A value is larger than the store accepts; `size` and `limit` are bytes.
@@ -505,7 +509,7 @@ class GraphDb:
         """
 
     def query_with_params(
-        self, cypher: str, params: Sequence[tuple[str, Scalar]]
+        self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
     ) -> list[Row]:
         """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 

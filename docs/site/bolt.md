@@ -1,6 +1,6 @@
 # Bolt protocol
 
-mushroomdb is adding a Bolt listener so that the official graph-database drivers can connect without a configuration change. This page records the version negotiation the listener implements and the audit that fixed it. The listener itself is under construction; this page describes the handshake only.
+mushroomdb is adding a Bolt listener so that the official graph-database drivers can connect without a configuration change. This page records the version negotiation the listener implements and the audit that fixed it. The listener itself is under construction; this page describes the handshake and transactions.
 
 ## Versions the server speaks
 
@@ -43,3 +43,32 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 - The manifest indicator `0x000001FF` is skipped. The server does not run the manifest exchange; it answers with a plain version taken from the other slots, which every current driver accepts.
 - The reply is `[0, 0, minor, major]`, or four zero bytes when no slot matches.
 - After the handshake, messages travel as chunks: a two-byte big-endian length, then that many bytes, ending with a zero-length chunk.
+
+## Transactions and bookmarks
+
+`BEGIN`, `COMMIT` and `ROLLBACK` are supported. A transaction reads a snapshot frozen at `BEGIN`, sees its own writes, and commits as one atomic batch; if another writer changed a node the transaction read or wrote, `COMMIT` fails with a transient error and the driver retries from `BEGIN`.
+
+| `BEGIN` field | Behaviour |
+|---|---|
+| `bookmarks` | `BEGIN` waits until the store has reached the highest bookmark, then freezes its snapshot. The wait is 5 seconds by default; past it the request fails with a transient `DatabaseUnavailable` error. |
+| `db` | Checked against the routing config, as `ROUTE` and `RUN` are: absent, null, empty, the driver default name or the configured database name are accepted; any other name fails with `DatabaseNotFound`. |
+| `mode` | `"w"` (default) or `"r"`. A read transaction refuses write statements. |
+| `tx_timeout`, `tx_metadata` | Checked for shape and otherwise ignored. The connection's idle limit (30 seconds) applies to every transaction. |
+| `imp_user` | Not supported; naming a user fails with `Forbidden`. |
+
+A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `COMMIT` and an auto-commit `PULL` return one; a transaction that wrote nothing returns the commit its snapshot read. Pass it in a later `BEGIN` or `RUN` to read at least that commit.
+
+A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those.
+
+A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
+
+### RESET while a request is running
+
+A `RESET` sent while an earlier request is still running takes effect at the first of these points:
+
+- a bookmark wait ends within 10 ms, and that request is answered `IGNORED`;
+- the next request queued in the same batch is `IGNORED`;
+- otherwise when the running statement or commit returns. A statement inside the engine cannot be interrupted: it finishes and its reply is sent, and a `COMMIT` or auto-commit write that was already submitted stays committed.
+
+The `RESET` is answered `SUCCESS` after every earlier request has been answered, and the connection is then ready; an open transaction is rolled back. A client that disconnects during a request has its transaction rolled back.
+

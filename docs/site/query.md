@@ -773,6 +773,11 @@ POST /query
 }
 ```
 
+A null parameter binds as a null: `None` in Python, JSON `null` over HTTP (top
+level, or inside a list or map), `Value::Null` in Rust, matching Bolt. So
+`WHERE $p IS NULL` is true for it, and the query does not fail with a missing
+parameter.
+
 ### Error: unknown parameter
 
 If `$name` appears in the query but is not supplied, the executor returns:
@@ -1040,7 +1045,7 @@ unexpected-token parse error or other unspecified result.
 
 | Feature | Status |
 |---|---|
-| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (Bolt BEGIN/COMMIT lands with TX-12); snapshot isolation, one atomic commit; some write forms are refused inside a transaction (see REMOVE, SET maps, UNWIND above) |
+| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; some write forms are refused inside a transaction (see REMOVE, SET maps, UNWIND above) |
 | Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, and arithmetic expressions (`n.x + 1`, `n.score * 1.5`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
@@ -1052,6 +1057,8 @@ unexpected-token parse error or other unspecified result.
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
+| Declaring a unique constraint | Scans the label's existing nodes, so it blocks writers for a time proportional to the label's node count (about 1 to 3 seconds at a million nodes); readers are unaffected. Refused, listing the first 100 conflicting nodes and the total, when two already hold equal values |
+| A store whose WAL declares a unique constraint after data that breaks it | Opens normally: replay never checks a record, and a snapshot, a reader's refresh and `open_at` all load it the same way. The duplicates stay as they are. The constraint is in force for new writes: only a value a write changes is judged, so a write that leaves a duplicate's value as it is (another property, or the same value written again) is allowed, and one that gives a node a value another live node holds is refused. To clean up, give all but one holder of each shared value a new value, or delete them; the constraint then holds for the whole label. Only a store written by a build without the create-time scan can be in this state |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |

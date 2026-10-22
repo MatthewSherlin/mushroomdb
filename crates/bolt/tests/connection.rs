@@ -80,6 +80,10 @@ impl OpenTransaction for FakeTx {
         self.rolled_back.store(true, Ordering::SeqCst);
     }
 
+    fn commit(self: Box<Self>) -> Result<u64, BoltError> {
+        Ok(7)
+    }
+
     fn execute(
         &mut self,
         _cypher: &str,
@@ -386,16 +390,23 @@ fn in_tx_rejects_begin_and_route_and_a_second_pull_without_cursor() {
             "a failed tx is rolled back"
         );
     }
-    for kind in [MessageKind::Run, MessageKind::Commit, MessageKind::Rollback] {
+    // RUN needs a store, which this connection has none of.
+    let mut conn = ready();
+    let (tx, _) = fake_tx("t");
+    conn.enter_tx(tx, Instant::now()).ok().unwrap();
+    let out = conn.handle(other(MessageKind::Run));
+    assert_eq!(failure_code(&out), "Neo.DatabaseError.General.UnknownError");
+    // COMMIT and ROLLBACK end the transaction without one.
+    for kind in [MessageKind::Commit, MessageKind::Rollback] {
         let mut conn = ready();
         let (tx, _) = fake_tx("t");
         conn.enter_tx(tx, Instant::now()).ok().unwrap();
         let out = conn.handle(other(kind));
-        assert_eq!(
-            failure_code(&out),
-            "Neo.DatabaseError.General.UnknownError",
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
             "{kind:?}"
         );
+        assert_eq!(conn.state().name(), "Ready");
     }
 }
 

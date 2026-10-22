@@ -112,12 +112,12 @@ export interface ClientOptions {
   token?: string;
 }
 
-/** Parameters for a Cypher query. Values must be JSON scalars. */
-export type QueryParams = Record<string, string | number | boolean>;
+/** Parameters for a Cypher query. Values must be JSON scalars; `null` binds as a null. */
+export type QueryParams = Record<string, string | number | boolean | null>;
 
 /** Options accepted by {@link MushroomClient.query}. */
 export interface QueryOptions {
-  /** Bound parameters. Values must be JSON scalars (string | number | boolean). */
+  /** Bound parameters. Values must be JSON scalars (string | number | boolean | null); `null` binds as a null. */
   params?: QueryParams;
   /**
    * Time-travel: run the query against the graph as it existed at this WAL

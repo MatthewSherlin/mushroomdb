@@ -111,8 +111,9 @@ pub(crate) fn result_set_json(rs: &ResultSet) -> Js {
     json!({ "columns": columns, "rows": rows })
 }
 
-/// Map JSON object values through [`json_to_value`]. Scalars, arrays, and
-/// objects are all accepted; `null` params are silently dropped.
+/// Map JSON object values to query parameters. Scalars, arrays and objects are
+/// all accepted, and a JSON `null` binds as [`Value::Null`] at the top level and
+/// inside lists and maps, matching Bolt (QL-17i).
 pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>, String> {
     let Some(v) = v else {
         return Ok(BTreeMap::new());
@@ -122,16 +123,47 @@ pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>
         .ok_or_else(|| "params must be an object".to_string())?;
     let mut out = BTreeMap::new();
     for (k, val) in obj {
-        match json_to_value(val.clone()).map_err(|e| format!("param {k:?}: {e}"))? {
-            Some(mapped) => {
-                out.insert(k.clone(), mapped);
-            }
-            None => {
-                // null params are silently omitted
-            }
-        }
+        let mapped = param_from_json(val).map_err(|e| format!("param {k:?}: {e}"))?;
+        out.insert(k.clone(), mapped);
     }
     Ok(out)
+}
+
+/// One parameter value. [`json_to_value`] drops nulls (right for stored
+/// fields), so only the shapes that can hold a null are walked here; a typed
+/// object (`{"$date": …}`) and every scalar go through [`json_to_value`].
+fn param_from_json(v: &Js) -> Result<Value, String> {
+    match v {
+        Js::Null => Ok(Value::Null),
+        Js::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| param_from_json(item).map_err(|e| format!("item {i}: {e}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        Js::Object(obj) => {
+            // A single `$`-keyed object may be a typed value; any other result
+            // is a map, which is rebuilt below so its nulls are kept.
+            if obj.len() == 1 && obj.keys().all(|k| k.starts_with('$')) {
+                if let Some(typed) = json_to_value(v.clone())? {
+                    if !matches!(typed, Value::Map(_)) {
+                        return Ok(typed);
+                    }
+                }
+            }
+            obj.iter()
+                .map(|(k, item)| {
+                    param_from_json(item)
+                        .map(|val| (k.clone(), val))
+                        .map_err(|e| format!("key {k:?}: {e}"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map(Value::Map)
+        }
+        scalar => {
+            json_to_value(scalar.clone())?.ok_or_else(|| "value cannot be a parameter".to_string())
+        }
+    }
 }
 
 /// User edges for POST /ingest and MCP `ingest_json`.

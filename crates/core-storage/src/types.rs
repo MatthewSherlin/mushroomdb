@@ -993,9 +993,11 @@ pub enum GraphError {
         field: String,
     },
     /// A unique constraint cannot be declared because live nodes already
-    /// violate it. `violations` lists every `(node_key, value)` in conflict.
+    /// violate it. `violations` lists the first 100 `(node_key, value)` in
+    /// conflict, in node-id order; `total` counts all of them.
     ConstraintCreationConflict {
         violations: Vec<(String, Value)>,
+        total: usize,
     },
     /// A value is larger than the store accepts: `size` bytes for property
     /// `field`, against `limit` (see [`BINARY_MAX_BYTES`]). Nothing was written.
@@ -1141,11 +1143,16 @@ impl std::fmt::Display for GraphError {
                 "constraint violation: property '{field}' is declared unique by constraint \
                  '{constraint}'; a node with that value already exists"
             ),
-            GraphError::ConstraintCreationConflict { violations } => write!(
-                f,
-                "cannot create the constraint: {} existing nodes hold duplicate values",
-                violations.len()
-            ),
+            GraphError::ConstraintCreationConflict { violations, total } => {
+                write!(
+                    f,
+                    "cannot create the constraint: {total} existing nodes hold duplicate values"
+                )?;
+                if violations.len() < *total {
+                    write!(f, " (first {} listed)", violations.len())?;
+                }
+                Ok(())
+            }
             GraphError::ValueTooLarge { field, size, limit } => write!(
                 f,
                 "value too large: property '{field}' is {size} bytes; the limit is {limit} bytes"
