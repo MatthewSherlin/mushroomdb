@@ -93,30 +93,113 @@ fn wait_for(addr: &str, path: &str, token: &str, want: u16) -> bool {
     false
 }
 
-const KEYS: &str = r#"{"keys":[
-    {"token":"adm-key","tier":"admin"},
-    {"token":"wr-key","tier":"write"}]}"#;
+/// Runs `mushroomdb keys add` and returns the token it printed.
+fn keys_add(dir: &Path, name: &str, tier: &str, role: Option<&str>) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mushroomdb"));
+    cmd.arg("keys").arg("add").arg(dir).arg(name);
+    cmd.arg("--tier").arg(tier);
+    if let Some(role) = role {
+        cmd.arg("--role").arg(role);
+    }
+    let out = cmd.output().expect("run keys add");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert_eq!(token.len(), 64, "a 32-byte token in hex");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(&token),
+        "the token is printed once, on stdout"
+    );
+    token
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[test]
+fn keys_add_prints_a_token_once_and_stores_only_its_hash_in_a_private_file() {
+    let dir = tmp("add");
+    let first = keys_add(&dir, "ops", "admin", None);
+    let second = keys_add(&dir, "app", "write", None);
+    let third = keys_add(&dir, "tenant", "read", Some("tenant_a"));
+    assert_ne!(first, second);
+    let path = dir.join("keys.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    for token in [&first, &second, &third] {
+        assert!(!text.contains(token.as_str()), "keys.json holds no token");
+    }
+    assert!(text.contains(&mushroomdb::hash_token(&first).unwrap()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    // A repeated name is refused and leaves the file as it was.
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .args(["keys", "add"])
+        .arg(&dir)
+        .args(["ops", "--tier", "write"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn keys_hash_reads_a_token_from_stdin_and_refuses_a_short_one() {
+    let run = |token: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+            .args(["keys", "hash"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(token.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let token = "t".repeat(40);
+    let out = run(&format!("{token}\n"));
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        mushroomdb::hash_token(&token).unwrap()
+    );
+    let out = run("too-short");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("too-short"));
+}
 
 #[test]
 fn serve_applies_the_key_tiers_and_reloads_them_on_sighup() {
     let dir = tmp("tiers");
-    std::fs::write(dir.join("keys.json"), KEYS).unwrap();
+    let admin = keys_add(&dir, "ops", "admin", None);
+    let write = keys_add(&dir, "app", "write", None);
     let server = start(&dir);
 
-    assert_eq!(status(&server.addr, "/stats", "adm-key"), 200);
-    assert_eq!(status(&server.addr, "/stats", "wr-key"), 403);
+    assert_eq!(status(&server.addr, "/stats", &admin), 200);
+    assert_eq!(status(&server.addr, "/stats", &write), 403);
     assert_eq!(status(&server.addr, "/stats", "unknown"), 401);
 
-    std::fs::write(
-        dir.join("keys.json"),
-        r#"{"keys":[{"token":"new-key","tier":"admin"}]}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        status(&server.addr, "/stats", "new-key"),
-        401,
-        "not read until SIGHUP"
-    );
+    // Issued while the server runs: unknown until SIGHUP.
+    let later = keys_add(&dir, "later", "admin", None);
+    assert_eq!(status(&server.addr, "/stats", &later), 401);
     let signalled = Command::new("kill")
         .arg("-HUP")
         .arg(server.child.id().to_string())
@@ -124,21 +207,118 @@ fn serve_applies_the_key_tiers_and_reloads_them_on_sighup() {
         .unwrap();
     assert!(signalled.success());
     assert!(
-        wait_for(&server.addr, "/stats", "new-key", 200),
+        wait_for(&server.addr, "/stats", &later, 200),
         "the new key never started working"
     );
-    assert_eq!(status(&server.addr, "/stats", "adm-key"), 401);
-    assert_eq!(status(&server.addr, "/stats", "wr-key"), 401);
+    assert_eq!(status(&server.addr, "/stats", &admin), 200);
+    assert_eq!(status(&server.addr, "/stats", &write), 403);
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_refuses_a_keys_file_that_group_or_others_can_read() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
+    let dir = tmp("loose");
+    keys_add(&dir, "ops", "admin", None);
+    let path = dir.join("keys.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("serve")
+        .arg(&dir)
+        .args(["--addr", "127.0.0.1:0", "--no-ui"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+    assert!(stderr.contains("0644"), "{stderr}");
+    assert!(!dir.join("wal.bin").exists(), "the store was not opened");
+}
+
+#[test]
+fn a_plaintext_token_in_keys_json_stops_serve_with_the_conversion() {
+    let dir = tmp("plaintext");
+    let path = dir.join("keys.json");
+    std::fs::write(
+        &path,
+        r#"{"keys":[{"token":"SECRET-TOKEN-0123456789-0123456789-0123","tier":"admin"}]}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("serve")
+        .arg(&dir)
+        .args(["--addr", "127.0.0.1:0", "--no-ui"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("plaintext") && stderr.contains("keys hash"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("SECRET-TOKEN"), "a token was echoed");
+    assert!(!dir.join("wal.bin").exists());
+}
+
+#[test]
+fn a_token_that_is_both_the_env_token_and_a_key_stops_serve() {
+    let dir = tmp("dup");
+    let token = keys_add(&dir, "ops", "admin", None);
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("serve")
+        .arg(&dir)
+        .args(["--addr", "127.0.0.1:0", "--no-ui", "--token", &token])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("one place"), "{stderr}");
+    assert!(!stderr.contains(&token), "a token was echoed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_without_keys_json_still_dies_on_sighup_as_before() {
+    let dir = tmp("nokeys");
+    let mut server = start(&dir);
+    let signalled = Command::new("kill")
+        .arg("-HUP")
+        .arg(server.child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if server.child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no SIGHUP handler may be installed without a keys.json");
 }
 
 #[test]
 fn an_invalid_keys_file_stops_serve_before_the_store_is_opened() {
     let dir = tmp("invalid");
+    let path = dir.join("keys.json");
     std::fs::write(
-        dir.join("keys.json"),
-        r#"{"keys":[{"token":"SECRET-TOKEN-1","tier":"superuser"}]}"#,
+        &path,
+        r#"{"keys":[{"hash":"SECRET-TOKEN-1","tier":"superuser"}]}"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
         .arg("serve")
         .arg(&dir)
@@ -149,7 +329,7 @@ fn an_invalid_keys_file_stops_serve_before_the_store_is_opened() {
         .expect("run mushroomdb serve");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("keys.json"), "stderr: {stderr}");
+    assert!(stderr.contains("keys.json"), "{stderr}");
     assert!(!stderr.contains("SECRET-TOKEN-1"), "a token was echoed");
     assert!(
         !dir.join("wal.bin").exists(),

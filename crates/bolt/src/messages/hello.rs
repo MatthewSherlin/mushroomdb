@@ -128,6 +128,9 @@ pub enum Identity {
     /// A role-bound token. The connection resolves the role's mask from the
     /// store at use, as the HTTP layer does.
     Role(String),
+    /// A `read` key: the role's masked view, and no writes whatever write scope
+    /// the role carries, in auto-commit or in a transaction.
+    ReadOnlyRole(String),
 }
 
 /// Checks whether a role still exists in the store.
@@ -237,14 +240,21 @@ impl TokenAuthenticator {
             None => match self.access_keys.as_ref().and_then(|k| k.resolve(presented)) {
                 Some(KeyTier::Admin) => Ok(Identity::Full),
                 Some(KeyTier::Write) => Ok(Identity::Write),
-                Some(KeyTier::Read(name)) => self.role_identity(&name),
+                Some(KeyTier::Read(name)) if self.role_exists(&name) => {
+                    Ok(Identity::ReadOnlyRole(name))
+                }
+                Some(KeyTier::Read(_)) => Err(BoltError::Unauthorized),
                 None => Err(BoltError::Unauthorized),
             },
         }
     }
 
+    fn role_exists(&self, name: &str) -> bool {
+        self.role_exists.as_ref().is_none_or(|exists| exists(name))
+    }
+
     fn role_identity(&self, name: &str) -> Result<Identity, BoltError> {
-        if self.role_exists.as_ref().is_none_or(|exists| exists(name)) {
+        if self.role_exists(name) {
             Ok(Identity::Role(name.to_string()))
         } else {
             Err(BoltError::Unauthorized)

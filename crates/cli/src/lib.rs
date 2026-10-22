@@ -373,6 +373,15 @@ pub enum Command {
     Migrate {
         db_dir: PathBuf,
     },
+    /// Issue an access key: print a new random token once, store only its hash.
+    KeysAdd {
+        db_dir: PathBuf,
+        name: String,
+        tier: String,
+        role: Option<String>,
+    },
+    /// Print the `keys.json` hash of the token read from standard input.
+    KeysHash,
     /// Validate CRC32 integrity of every section in the V8 snapshot.
     Verify {
         db_dir: PathBuf,
@@ -502,6 +511,12 @@ Usage:
                      folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
                      so node_history, edge_history, was_linked and asof keep reaching it;
                      --truncate discards it instead, --keep-wal leaves wal.bin whole
+  mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                     issues an access key: prints a new random token once and stores only its
+                     blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                     needs --role, and reads that role's view without ever writing
+  mushroomdb keys hash
+                     reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
   mushroomdb build-index <db-dir> [--rule <name>]
                      drives a rule's vector index to completion a slice at a time, for an
                      operator who wants the build finished before traffic arrives; a rule
@@ -888,6 +903,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
+        "keys" => parse_keys(&args[1..]),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
         "import" => parse_import(&args[1..]),
@@ -2723,6 +2739,61 @@ fn parse_positional(
     Ok((db_dir, rest))
 }
 
+fn parse_keys(args: &[&str]) -> Result<Command, String> {
+    match args.first().copied() {
+        Some("hash") if args.len() == 1 => Ok(Command::KeysHash),
+        Some("hash") => Err("keys hash takes no arguments; it reads the token from stdin".into()),
+        Some("add") => {
+            let mut positional: Vec<&str> = Vec::new();
+            let mut tier: Option<String> = None;
+            let mut role: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--tier" | "--role" => {
+                        let flag = args[i];
+                        i += 1;
+                        let value = args
+                            .get(i)
+                            .ok_or_else(|| format!("{flag} requires a value"))?;
+                        let slot = if flag == "--tier" {
+                            &mut tier
+                        } else {
+                            &mut role
+                        };
+                        if slot.replace((*value).to_string()).is_some() {
+                            return Err(format!("{flag} given twice"));
+                        }
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unexpected flag: {flag}"))
+                    }
+                    other => positional.push(other),
+                }
+                i += 1;
+            }
+            let [db_dir, name] = positional.as_slice() else {
+                return Err("keys add requires <db-dir> <name>".into());
+            };
+            let tier = tier.ok_or("keys add requires --tier admin|write|read")?;
+            match (tier.as_str(), role.is_some()) {
+                ("admin" | "write", false) => {}
+                ("admin" | "write", true) => return Err("--role goes only with --tier read".into()),
+                ("read", true) => {}
+                ("read", false) => return Err("--tier read requires --role <name>".into()),
+                _ => return Err("--tier must be admin, write or read".into()),
+            }
+            Ok(Command::KeysAdd {
+                db_dir: PathBuf::from(*db_dir),
+                name: (*name).to_string(),
+                tier,
+                role,
+            })
+        }
+        _ => Err("keys requires a subcommand: add or hash".into()),
+    }
+}
+
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
     let mut db_dir = None;
     for a in args {
@@ -3954,6 +4025,41 @@ mod tests {
             "synced sha",
         ] {
             assert!(!text.contains(stale), "usage still says {stale:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keys_subcommands() {
+        match parse_args(&["keys", "add", "/d", "app", "--tier", "write"]).unwrap() {
+            Command::KeysAdd {
+                name, tier, role, ..
+            } => assert_eq!((name.as_str(), tier.as_str(), role), ("app", "write", None)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["keys", "add", "/d", "t", "--role", "r", "--tier", "read"]).unwrap() {
+            Command::KeysAdd { tier, role, .. } => {
+                assert_eq!((tier.as_str(), role.as_deref()), ("read", Some("r")))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&["keys", "hash"]),
+            Ok(Command::KeysHash)
+        ));
+        for bad in [
+            vec!["keys"],
+            vec!["keys", "hash", "x"],
+            vec!["keys", "add", "/d", "app"],
+            vec!["keys", "add", "/d", "--tier", "write"],
+            vec!["keys", "add", "/d", "app", "--tier", "read"],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--role", "r"],
+            vec!["keys", "add", "/d", "app", "--tier", "root"],
+            vec![
+                "keys", "add", "/d", "app", "--tier", "write", "--tier", "read",
+            ],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--bogus"],
+        ] {
+            assert!(parse_args(&bad).is_err(), "{bad:?}");
         }
     }
 

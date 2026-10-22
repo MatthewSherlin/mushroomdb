@@ -214,6 +214,19 @@ mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
 
 Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole
 
+### `keys`
+
+```text
+mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                   issues an access key: prints a new random token once and stores only its
+                   blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                   needs --role, and reads that role's view without ever writing
+mushroomdb keys hash
+                   reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
+```
+
+`keys add` writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+
 ### `verify`
 
 ```text

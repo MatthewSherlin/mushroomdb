@@ -404,6 +404,30 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::KeysAdd {
+            db_dir,
+            name,
+            tier,
+            role,
+        }) => match run_keys_add(&db_dir, &name, &tier, role.as_deref()) {
+            Ok(token) => {
+                println!("{token}");
+                eprintln!(
+                    "key {name:?} added to {} (tier {tier}). The token above is shown once \
+                     and is not stored; only its hash is. SIGHUP a running server to load it.",
+                    db_dir.join("keys.json").display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::KeysHash) => match run_keys_hash() {
+            Ok(hash) => {
+                println!("{hash}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Ok(Command::Verify { db_dir }) => match run_verify(&db_dir) {
             Ok(msg) => {
                 println!("{msg}");
@@ -592,6 +616,43 @@ fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
     }
 }
 
+/// A new random token: 32 bytes from the operating system, in hex.
+fn random_token() -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| format!("no random source (/dev/urandom): {}", e.kind()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `keys add`: issue a token, store only its hash, return the token to print.
+fn run_keys_add(
+    db_dir: &std::path::Path,
+    name: &str,
+    tier: &str,
+    role: Option<&str>,
+) -> Result<String, String> {
+    let token = random_token()?;
+    let hash = mushroomdb::hash_token(&token).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(db_dir).map_err(|e| format!("{}: {}", db_dir.display(), e.kind()))?;
+    mushroomdb::add_key(&db_dir.join("keys.json"), name, &hash, tier, role)
+        .map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+/// `keys hash`: the hash of a token read from stdin (one trailing newline dropped).
+fn run_keys_hash() -> Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::io::stdin()
+        .take(4096)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("could not read the token: {}", e.kind()))?;
+    let token = text.strip_suffix('\n').unwrap_or(&text);
+    mushroomdb::hash_token(token).map_err(|e| e.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_serve(
     db_dir: PathBuf,
@@ -618,9 +679,24 @@ fn run_serve(
         // `keys.json` beside the store: extra tokens with tiers, re-read on
         // SIGHUP. An invalid file stops the start, before the store is opened,
         // rather than serve with the keys the operator meant to add missing.
-        let access_keys =
-            mushroomdb::AccessKeys::load(db_dir.join("keys.json")).map_err(|e| e.to_string())?;
-        server::watch_sighup(&access_keys);
+        let keys_path = db_dir.join("keys.json");
+        let access_keys = mushroomdb::AccessKeys::load(&keys_path).map_err(|e| e.to_string())?;
+        // A token configured twice, here and as a key, would be ambiguous.
+        if token
+            .iter()
+            .chain(role_tokens.keys())
+            .any(|t| access_keys.resolve(t).is_some())
+        {
+            return Err(format!(
+                "a token given by --token, MUSHROOMDB_TOKEN or a role token is also a key in {}; \
+                 each token may be configured in one place",
+                keys_path.display()
+            ));
+        }
+        // A store with no keys.json behaves exactly as before, SIGHUP included.
+        if keys_path.exists() {
+            server::watch_sighup(&access_keys);
+        }
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         // A shared open takes no lock, so an unwritable data directory would

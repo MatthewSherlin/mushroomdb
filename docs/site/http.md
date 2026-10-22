@@ -105,48 +105,75 @@ denying beats over-granting.
 
 ## Access keys and the write tier
 
-`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token is read-mostly. To hand an
-application a token that can write but cannot read operator data, put a `keys.json` file in the
-store directory, beside `roles.json`:
+`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token can write wherever its role's write
+scope reaches. To hand an application a token that can write but cannot read operator data, or a
+token that can only read, issue access keys. They live in `keys.json` in the store directory, beside
+`roles.json`, and the file holds **hashes, never tokens**.
+
+```text
+mushroomdb keys add <db-dir> app --tier write
+mushroomdb keys add <db-dir> tenant --tier read --role tenant_a
+```
+
+Each command generates a random 32-byte token, prints it once on standard output, and appends only
+its blake3 hash to `keys.json`, creating the file with mode 0600. The token cannot be shown again.
+A running server picks the new key up on SIGHUP.
 
 ```json
 {
   "keys": [
-    { "token": "tok-admin", "tier": "admin" },
-    { "token": "tok-app",   "tier": "write" },
-    { "token": "tok-tenant", "tier": "read", "role": "tenant_a" }
+    { "name": "ops",    "hash": "<64 hex characters>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex characters>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex characters>", "tier": "read", "role": "tenant_a" }
   ]
 }
 ```
+
+To bring a token you already have, hash it: `printf %s "$TOKEN" | mushroomdb keys hash` prints the
+`hash` to put in the file. A token must be at least 32 bytes; a shorter one is refused by `keys hash`
+and never matches. A file with a plaintext `"token"` field is refused, and the message says how to
+convert it.
 
 | Tier | What it is |
 |---|---|
 | `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
 | `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
-| `read` | Read-only and masked by the `role` it names, exactly as a role token. A `read` key must name a role. |
+| `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
 
-Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They are
-additive: `MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` keep working, and when one token is in
-both places the full token wins. A server with no env token and no role tokens but at least one key
-requires a key. With no `keys.json` nothing changes.
+Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
+`MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` rather than replacing them. Each token belongs in
+one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
+token is also a key. A server with no env token and no role tokens but at least one key requires
+a key. With no `keys.json` nothing changes, and `serve` installs no SIGHUP handler.
 
-The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, an empty
-or repeated token, or an unknown field refuses the whole file; `serve` then exits with status 1
-before it opens the store. Error messages never contain a token.
+The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
+malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the
+whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must not be
+accessible by group or others, as `ssh` requires of a private key: a file with any group or world bit
+set is refused with a message naming the path and its mode (`chmod 600` fixes it). Error messages
+never contain a token.
 
 **Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
 The new set replaces the old one in a single step, so a request sees one set or the other, never a
-mix. If the new file does not parse, the old keys stay in force and the error is logged. Removing
-every key locks the server rather than opening it: once a key has been loaded, authentication stays
-required. On a platform without SIGHUP, restart to reload.
+mix. If the new file does not parse or is not private, the old keys stay in force and the error is
+logged. Removing every key locks the server rather than opening it: once a key has been loaded,
+authentication stays required. A server started with no `keys.json` does not watch for SIGHUP, so
+create the file and restart it once to start using keys. On a platform without SIGHUP, restart to
+reload.
+
+**What a reload does not reach.** HTTP resolves the key on every request, so a revoked key is
+refused on its next request. A WebSocket (`/watch`, `/subscribe`) opened with an admin key, and a
+Bolt connection, keep the access they were granted until they close: a Bolt connection
+authenticates once, at `HELLO`, and a stream does not look again. Close them yourself, or restart,
+when you revoke an admin key.
 
 **Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
 tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
-`read` key is its role, which cannot run statements in an explicit transaction. A Bolt connection
-authenticates once, at `HELLO`, so a key removed by a reload stops being accepted for new connections;
-connections already open keep the tier they had until they close.
+`read` key reads under its role and is refused every statement that writes (and every statement in an
+explicit transaction) with `Neo.ClientError.Security.Forbidden`.
 
-Keep `keys.json` private (mode 0600): it holds the tokens in plain text.
+`keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
+keys back, so reissue or copy the file deliberately.
 
 ## Write scopes for role-bound tokens
 

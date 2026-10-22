@@ -46,6 +46,12 @@ pub(crate) enum AuthIdentity {
     Anonymous,
 }
 
+/// Marks a request made with a `read`-tier key. It rides beside
+/// [`AuthIdentity::Role`] (the role's mask) and means the request must not
+/// write, whatever write scope the role carries.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadOnlyKey;
+
 /// Router state: the database plus the watch broadcast fan-out.
 #[derive(Clone)]
 struct AppState {

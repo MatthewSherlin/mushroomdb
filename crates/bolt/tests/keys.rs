@@ -9,12 +9,42 @@ use bolt::connection::Connection;
 use bolt::messages::hello::{AuthToken, Hello, Identity, TokenAuthenticator};
 use bolt::messages::{ClientMessage, MessageKind, ServerMessage};
 use bolt::packstream::PackValue;
-use mushroomdb::{AccessKeys, RoleDef, Schema, SharedDb, Value};
+use mushroomdb::{AccessKeys, RoleDef, Schema, SharedDb, Value, WriteScope};
 
-const KEYS: &str = r#"{"keys":[
-    {"token":"adm-key","tier":"admin"},
-    {"token":"wr-key","tier":"write"},
-    {"token":"rd-key","tier":"read","role":"viewer"}]}"#;
+const ADM: &str = "adm-key-0123456789abcdef0123456789abcdef";
+const WR: &str = "wr-key-0123456789abcdef0123456789abcdef";
+const RD: &str = "rd-key-0123456789abcdef0123456789abcdef";
+const NEW: &str = "new-key-0123456789abcdef0123456789abcdef";
+
+/// A key file's text: hashes only.
+fn keys_text(entries: &[(&str, &str, Option<&str>)]) -> String {
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|(token, tier, role)| {
+            let role = role.map_or(String::new(), |r| format!(r#","role":"{r}""#));
+            format!(
+                r#"{{"hash":"{}","tier":"{tier}"{role}}}"#,
+                mushroomdb::hash_token(token).unwrap()
+            )
+        })
+        .collect();
+    format!(r#"{{"keys":[{}]}}"#, keys.join(","))
+}
+
+fn keys_json() -> String {
+    keys_text(&[
+        (ADM, "admin", None),
+        (WR, "write", None),
+        (RD, "read", Some("viewer")),
+    ])
+}
+
+/// Writes `text` as a private file, as the CLI does.
+fn write_private(path: &std::path::Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, text).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
 
 fn authenticator(keys: &AccessKeys) -> Arc<TokenAuthenticator> {
     Arc::new(
@@ -48,7 +78,11 @@ fn db_with_viewer() -> (SharedDb, tempfile::TempDir) {
                 labels: vec!["Doc".into()],
                 visible_where: None,
                 namespaces: None,
-                write: None,
+                // A scope the `read` key must still not get to use.
+                write: Some(WriteScope {
+                    create_labels: vec!["Doc".into()],
+                    ..WriteScope::default()
+                }),
             }],
         })
         .unwrap();
@@ -111,23 +145,17 @@ fn docs(db: &SharedDb) -> Value {
 
 #[test]
 fn each_key_tier_resolves_to_its_identity() {
-    let keys = AccessKeys::from_json(KEYS).unwrap();
+    let keys = AccessKeys::from_json(&keys_json()).unwrap();
     let auth = authenticator(&keys);
     let basic = |token: &str| AuthToken::Basic {
         principal: None,
         credentials: token.into(),
     };
+    assert_eq!(auth.authenticate(&basic(ADM)).unwrap(), Identity::Full);
+    assert_eq!(auth.authenticate(&basic(WR)).unwrap(), Identity::Write);
     assert_eq!(
-        auth.authenticate(&basic("adm-key")).unwrap(),
-        Identity::Full
-    );
-    assert_eq!(
-        auth.authenticate(&basic("wr-key")).unwrap(),
-        Identity::Write
-    );
-    assert_eq!(
-        auth.authenticate(&basic("rd-key")).unwrap(),
-        Identity::Role("viewer".into())
+        auth.authenticate(&basic(RD)).unwrap(),
+        Identity::ReadOnlyRole("viewer".into())
     );
     assert_eq!(
         auth.authenticate(&basic("env-token")).unwrap(),
@@ -139,8 +167,8 @@ fn each_key_tier_resolves_to_its_identity() {
 #[test]
 fn a_write_key_writes_in_auto_commit_and_in_a_transaction() {
     let (db, _dir) = db_with_viewer();
-    let keys = AccessKeys::from_json(KEYS).unwrap();
-    let mut conn = connected(&db, &keys, "wr-key");
+    let keys = AccessKeys::from_json(&keys_json()).unwrap();
+    let mut conn = connected(&db, &keys, WR);
 
     let out = conn.handle(run("CREATE (n:Doc {id: 'a'})"));
     assert!(
@@ -179,9 +207,9 @@ fn a_read_key_reads_but_cannot_write() {
             vec![("id".into(), Value::Str("seed".into()))],
         )
         .unwrap();
-    let keys = AccessKeys::from_json(KEYS).unwrap();
+    let keys = AccessKeys::from_json(&keys_json()).unwrap();
 
-    let mut conn = connected(&db, &keys, "rd-key");
+    let mut conn = connected(&db, &keys, RD);
     let out = conn.handle(run("MATCH (n:Doc) RETURN COUNT(n)"));
     assert!(
         matches!(out.as_slice(), [ServerMessage::Success(_)]),
@@ -189,52 +217,66 @@ fn a_read_key_reads_but_cannot_write() {
     );
     conn.handle(pull_all());
 
-    let mut conn = connected(&db, &keys, "rd-key");
-    let out = conn.handle(run("CREATE (n:Doc {id: 'x'})"));
-    assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
-    assert_eq!(docs(&db), Value::Int(1), "nothing was written");
+    // The role's own write scope must not reach a read key, by any statement.
+    for statement in [
+        "CREATE (n:Doc {id: 'x'})",
+        "MATCH (n:Doc {id: 'seed'}) SET n.age = 1",
+        "MATCH (n:Doc {id: 'seed'}) DETACH DELETE n",
+        "MERGE (n:Doc {id: 'm'})",
+    ] {
+        let mut conn = connected(&db, &keys, RD);
+        let out = conn.handle(run(statement));
+        assert_eq!(
+            failure_code(&out),
+            "Neo.ClientError.Security.Forbidden",
+            "{statement}"
+        );
+        assert_eq!(docs(&db), Value::Int(1), "{statement} wrote");
 
-    let mut conn = connected(&db, &keys, "rd-key");
-    conn.handle(begin());
-    let out = conn.handle(run("CREATE (n:Doc {id: 'y'})"));
-    assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
-    assert_eq!(docs(&db), Value::Int(1));
+        let mut conn = connected(&db, &keys, RD);
+        conn.handle(begin());
+        let out = conn.handle(run(statement));
+        assert_eq!(
+            failure_code(&out),
+            "Neo.ClientError.Security.Forbidden",
+            "in a transaction: {statement}"
+        );
+        assert_eq!(
+            docs(&db),
+            Value::Int(1),
+            "{statement} wrote in a transaction"
+        );
+    }
 }
 
 #[test]
 fn an_unknown_key_is_unauthorized_and_a_reload_changes_who_may_log_in() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keys.json");
-    std::fs::write(&path, KEYS).unwrap();
+    write_private(&path, &keys_json());
     let keys = AccessKeys::load(&path).unwrap();
     let auth = authenticator(&keys);
     let basic = |token: &str| AuthToken::Bearer {
         credentials: token.into(),
     };
-    assert_eq!(
-        auth.authenticate(&basic("wr-key")).unwrap(),
-        Identity::Write
-    );
+    assert_eq!(auth.authenticate(&basic(WR)).unwrap(), Identity::Write);
 
-    std::fs::write(&path, r#"{"keys":[{"token":"new-key","tier":"write"}]}"#).unwrap();
+    write_private(&path, &keys_text(&[(NEW, "write", None)]));
     keys.reload().unwrap();
-    assert!(auth.authenticate(&basic("wr-key")).is_err());
-    assert_eq!(
-        auth.authenticate(&basic("new-key")).unwrap(),
-        Identity::Write
-    );
+    assert!(auth.authenticate(&basic(WR)).is_err());
+    assert_eq!(auth.authenticate(&basic(NEW)).unwrap(), Identity::Write);
 }
 
 #[test]
 fn a_server_with_only_keys_is_not_open_even_after_they_are_all_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keys.json");
-    std::fs::write(&path, KEYS).unwrap();
+    write_private(&path, &keys_json());
     let keys = AccessKeys::load(&path).unwrap();
     let auth =
         Arc::new(TokenAuthenticator::new(None, HashMap::new()).with_access_keys(keys.clone()));
     assert!(!auth.is_open());
-    std::fs::write(&path, r#"{"keys":[]}"#).unwrap();
+    write_private(&path, r#"{"keys":[]}"#);
     keys.reload().unwrap();
     assert!(
         !auth.is_open(),

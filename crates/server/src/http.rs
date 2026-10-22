@@ -15,7 +15,7 @@ use crate::json::{
     params_from_json, parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace,
     stamp_namespace_row,
 };
-use crate::{AppState, AuthIdentity};
+use crate::{AppState, AuthIdentity, ReadOnlyKey};
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -669,6 +669,7 @@ pub async fn serve_tls(
 /// listener is closed regardless; an unbounded grace period would let one
 /// stuck request hold a restart open forever.
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_tls_with_shutdown(
     db: SharedDb,
     addr: SocketAddr,
@@ -1162,7 +1163,7 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
 
     // Check role-bound tokens.
     if let Some(tok) = presented.as_deref() {
-        if let Some(role_name) = state.role_tokens.get(tok) {
+        if let Some(role_name) = role_for_token(&state.role_tokens, tok) {
             // Early-deny paths whose handlers use WebSocket upgrade: the WS
             // extraction consumes the request before the handler body runs, so
             // the handler-level identity check is unreachable in those cases.
@@ -1209,7 +1210,12 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
                 if ws_path {
                     return forbidden("role-bound token: this endpoint is not permitted");
                 }
+                // A role may carry a write scope; a read key never writes.
+                if !read_key_may(req.method(), path) {
+                    return forbidden(READ_TIER_REFUSAL);
+                }
                 req.extensions_mut().insert(AuthIdentity::Role(role_name));
+                req.extensions_mut().insert(ReadOnlyKey);
                 return next.run(req).await;
             }
         }
@@ -1218,6 +1224,36 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
     // Nothing matched → 401.
     unauthorized()
 }
+
+/// The role bound to `presented`, comparing it with every role token in
+/// constant time (a hash-map lookup would stop at the first difference).
+fn role_for_token<'a>(
+    role_tokens: &'a HashMap<String, String>,
+    presented: &str,
+) -> Option<&'a String> {
+    let mut found = None;
+    for (token, role) in role_tokens {
+        if constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+            found = Some(role);
+        }
+    }
+    found
+}
+
+/// Whether a read-tier key may make this request at all. An allowlist, so a
+/// route added later is refused to read keys until someone decides otherwise:
+/// reads (`GET`), and the two `POST` routes that carry a read (`/query`, whose
+/// handler refuses a write statement, and `/find_similar`).
+fn read_key_may(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::GET | Method::HEAD => true,
+        Method::POST => path == "/query" || path == "/find_similar",
+        _ => false,
+    }
+}
+
+/// The 403 detail a read-tier key gets on a write.
+pub(crate) const READ_TIER_REFUSAL: &str = "read-tier key: writes are not permitted";
 
 fn request_token(req: &Request) -> Option<String> {
     presented_bearer_or_query(req).or_else(|| presented_cookie(req))
@@ -1525,6 +1561,7 @@ fn format_query_result(rs: ResultSet, format: &str) -> Response {
 async fn query(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
+    read_only_key: Option<Extension<ReadOnlyKey>>,
     Query(qs): Query<BTreeMap<String, String>>,
     Json(body): Json<Js>,
 ) -> Response {
@@ -1593,6 +1630,9 @@ async fn query(
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
+        if is_write && read_only_key.is_some() {
+            return forbidden(READ_TIER_REFUSAL);
+        }
         if as_of.is_some() && is_write {
             return err_response("as_of (time-travel) queries are read-only");
         }
