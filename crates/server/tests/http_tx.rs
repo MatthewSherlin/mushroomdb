@@ -34,6 +34,7 @@ fn limits(max_open: usize, idle_ms: u64) -> TxLimits {
     TxLimits {
         max_open,
         idle_timeout: Duration::from_millis(idle_ms),
+        max_lifetime: Duration::from_secs(300),
     }
 }
 
@@ -354,6 +355,7 @@ async fn a_concurrent_write_makes_commit_a_409() {
     let c = s.post(&id, None, "commit").await;
     assert_eq!(c.status, 409, "{}", c.body);
     assert!(c.body["error"].as_str().unwrap().contains("CAS conflict"));
+    assert_eq!(c.body["code"], json!("conflict"));
     // The transaction ended with the conflict.
     assert_eq!(s.post(&id, None, "rollback").await.status, 404);
     let v = s
@@ -520,4 +522,110 @@ async fn a_role_token_reads_under_its_role_and_cannot_write() {
             .status,
         404
     );
+}
+
+/// A statement that takes a good while: every pair of `Big` nodes.
+const SLOW: &str = "MATCH (a:Big), (b:Big) WHERE a.id <> b.id RETURN count(a) AS c";
+
+fn seed_big(db: &SharedDb, n: usize) {
+    let ops = (0..n)
+        .map(|i| mushroomdb::BatchOp::InsertNode {
+            label: "Big".into(),
+            key: format!("big{i}"),
+            props: vec![("id".into(), Value::Str(format!("big{i}")))],
+        })
+        .collect();
+    db.submit_batch(ops).unwrap();
+}
+
+/// Drops the request future after `ms`, as a client that hangs up does.
+async fn cancelled_run(s: &Srv, id: &str, ms: u64) {
+    let fut = s.run(id, None, SLOW);
+    let _ = tokio::time::timeout(Duration::from_millis(ms), fut).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_run_hands_the_transaction_back() {
+    let s = plain("cancel-run", limits(100, 30_000)).await;
+    seed_big(&s.db, 1_500);
+    let id = s.begin_id(None).await;
+    cancelled_run(&s, &id, 50).await;
+    // The statement finishes without its request, and the transaction is
+    // usable again, with that statement counted.
+    let mut counted = false;
+    for _ in 0..600 {
+        let info = s.call("GET", &format!("/tx/{id}"), None, None).await;
+        assert_eq!(info.status, 200, "{}", info.body);
+        if info.body["op_count"] == json!(1) {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(counted, "the transaction never came back");
+    assert_eq!(s.run(&id, None, "RETURN 1 AS x").await.status, 200);
+    assert_eq!(s.post(&id, None, "commit").await.status, 200);
+}
+
+#[tokio::test]
+async fn a_cancelled_commit_still_ends_the_transaction() {
+    let s = plain("cancel-commit", limits(1, 30_000)).await;
+    seed_big(&s.db, 10);
+    let id = s.begin_id(None).await;
+    s.run(&id, None, "CREATE (n:Person {id: 'cc1'})").await;
+    // Hang up at once: the commit may or may not have started, but the
+    // handler's drop must not strand the slot.
+    let fut = s.post(&id, None, "commit");
+    let _ = tokio::time::timeout(Duration::from_millis(1), fut).await;
+    for _ in 0..200 {
+        // Either the commit ran (the slot is free) or the request never
+        // reached the handler (the transaction is still ours to end).
+        let r = s.post(&id, None, "rollback").await;
+        if r.status != 409 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(s.begin(None).await.status, 200, "slot was stranded");
+}
+
+#[tokio::test]
+async fn cancelled_requests_do_not_exhaust_the_open_limit() {
+    // Limit 2, 400 ms idle: eight transactions, each hung up on mid-statement
+    // and left to expire, only succeed if every abandoned slot is reclaimed.
+    let s = plain("cancel-many", limits(2, 400)).await;
+    seed_big(&s.db, 1_500);
+    for round in 0..8 {
+        let mut id = None;
+        for _ in 0..200 {
+            let r = s.begin(None).await;
+            if r.status == 200 {
+                id = Some(r.body["tx_id"].as_str().unwrap().to_string());
+                break;
+            }
+            assert_eq!(r.status, 503, "round {round}: {}", r.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let id = id.unwrap_or_else(|| panic!("round {round}: no slot ever came free"));
+        cancelled_run(&s, &id, 30).await;
+    }
+}
+
+#[tokio::test]
+async fn a_second_request_while_one_runs_is_busy() {
+    let s = plain("busy", limits(100, 30_000)).await;
+    seed_big(&s.db, 1_500);
+    let id = s.begin_id(None).await;
+    let slow = s.run(&id, None, SLOW);
+    let probe = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.run(&id, None, "RETURN 1 AS x").await
+    };
+    let (slow, probe) = tokio::join!(slow, probe);
+    assert_eq!(slow.status, 200, "{}", slow.body);
+    assert_eq!(probe.status, 409, "{}", probe.body);
+    assert_eq!(probe.body["code"], json!("busy"));
+    assert_eq!(probe.body["error"], json!("transaction busy"));
+    // The busy answer changed nothing: the transaction is still ours.
+    assert_eq!(s.run(&id, None, "RETURN 1 AS x").await.status, 200);
 }

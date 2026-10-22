@@ -11,7 +11,9 @@
 //!
 //! # Rules the store enforces
 //!
-//! - **Ownership.** A transaction belongs to the credential that began it. Any
+//! - **Ownership.** A transaction belongs to the credential that began it (the
+//!   bearer token itself is the owner key; a server with no authentication has
+//!   one shared owner, so every caller can reach every transaction). Any
 //!   other caller gets 404 for it, the answer for an id that never existed, so
 //!   an id reveals nothing to someone who is not its owner.
 //! - **Idle timeout.** `MUSHROOMDB_TX_TIMEOUT_SECS` (default 30) from the last
@@ -20,9 +22,21 @@
 //!   back itself. An expired id answers 410 to its owner for a while, then 404.
 //! - **Limit.** At most `MUSHROOMDB_TX_MAX` (default 100) open at once; a
 //!   `begin` beyond it is 503 with `Retry-After`.
+//! - **Lifetime.** `MUSHROOMDB_TX_MAX_LIFETIME_SECS` (default 300) from `begin`,
+//!   however often it is used: a client that runs a statement every few
+//!   seconds cannot pin its snapshot and write buffer forever. Past it the
+//!   transaction is rolled back, even if a request is running on it.
+//! - **Memory.** An open transaction holds its snapshot and every write it
+//!   buffered, up to a request body (64 MiB) per statement. The cap on open
+//!   transactions and the lifetime bound the total; they do not make one
+//!   transaction small.
 //! - **One request at a time.** A request on a transaction checks it out of the
 //!   map and puts it back when it ends. A second request in between is 409
 //!   "transaction busy": two statements never interleave on one transaction.
+//!   The hand-back runs on the blocking thread that ran the statement, not in
+//!   the request's future, so a request that is cancelled (client gone, 408,
+//!   load shed) cannot strand the transaction; a drop guard ends it if the
+//!   statement panics.
 //! - **Shutdown.** [`TxStore::close`] rolls back every open transaction and
 //!   makes `begin` answer 503. The server calls it when the shutdown signal
 //!   arrives, which is the start of the drain phase. A transaction that is
@@ -59,15 +73,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Environment variable: seconds a transaction may sit idle.
 pub const TX_TIMEOUT_ENV: &str = "MUSHROOMDB_TX_TIMEOUT_SECS";
+/// Environment variable: seconds a transaction may live, used or not.
+pub const TX_MAX_LIFETIME_ENV: &str = "MUSHROOMDB_TX_MAX_LIFETIME_SECS";
 /// Environment variable: most transactions open at once.
 pub const TX_MAX_ENV: &str = "MUSHROOMDB_TX_MAX";
 
 const DEFAULT_IDLE_SECS: u64 = 30;
 const DEFAULT_MAX_OPEN: usize = 100;
+const DEFAULT_LIFETIME_SECS: u64 = 300;
 /// How many expired ids are remembered, so their owner hears 410 and not 404.
 const MAX_TOMBSTONES: usize = 10_000;
 /// The text of a bookmark; the Bolt `COMMIT` reply carries the same one.
 const BOOKMARK_PREFIX: &str = "mushroomdb:commit:";
+
+/// A commit number as the text a client hands to a later request.
+fn bookmark_text(seq: u64) -> String {
+    format!("{BOOKMARK_PREFIX}{seq}")
+}
 
 /// The limits on open transactions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +98,8 @@ pub struct TxLimits {
     pub max_open: usize,
     /// How long a transaction may sit idle before it is rolled back.
     pub idle_timeout: Duration,
+    /// How long a transaction may live from `begin`, however busy.
+    pub max_lifetime: Duration,
 }
 
 impl Default for TxLimits {
@@ -83,22 +107,29 @@ impl Default for TxLimits {
         Self {
             max_open: DEFAULT_MAX_OPEN,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_SECS),
+            max_lifetime: Duration::from_secs(DEFAULT_LIFETIME_SECS),
         }
     }
 }
 
 impl TxLimits {
-    /// The limits `MUSHROOMDB_TX_MAX` and `MUSHROOMDB_TX_TIMEOUT_SECS` name. A
+    /// The limits `MUSHROOMDB_TX_MAX`, `MUSHROOMDB_TX_TIMEOUT_SECS` and
+    /// `MUSHROOMDB_TX_MAX_LIFETIME_SECS` name. A
     /// value that is unset keeps the default; one that is not a positive
     /// integer keeps the default too and logs a warning.
     pub fn from_env() -> Self {
         Self::from_values(
             std::env::var(TX_MAX_ENV).ok().as_deref(),
             std::env::var(TX_TIMEOUT_ENV).ok().as_deref(),
+            std::env::var(TX_MAX_LIFETIME_ENV).ok().as_deref(),
         )
     }
 
-    fn from_values(max_open: Option<&str>, idle_secs: Option<&str>) -> Self {
+    fn from_values(
+        max_open: Option<&str>,
+        idle_secs: Option<&str>,
+        lifetime_secs: Option<&str>,
+    ) -> Self {
         let positive = |name: &str, raw: Option<&str>| -> Option<u64> {
             let raw = raw?;
             match raw.trim().parse::<u64>() {
@@ -116,6 +147,8 @@ impl TxLimits {
             }),
             idle_timeout: positive(TX_TIMEOUT_ENV, idle_secs)
                 .map_or(defaults.idle_timeout, Duration::from_secs),
+            max_lifetime: positive(TX_MAX_LIFETIME_ENV, lifetime_secs)
+                .map_or(defaults.max_lifetime, Duration::from_secs),
         }
     }
 }
@@ -135,6 +168,8 @@ pub(crate) enum TxBody {
 
 struct Slot {
     owner: String,
+    /// When `begin` ran; the absolute lifetime counts from here.
+    born: Instant,
     deadline: Instant,
     deadline_wall: SystemTime,
     op_count: usize,
@@ -193,7 +228,13 @@ impl IntoResponse for TxError {
                 format!("too many open transactions (limit {limit}); retry"),
             ),
         };
-        let mut res = (status, Json(json!({ "error": message }))).into_response();
+        let mut body = json!({ "error": message });
+        if self == Self::Busy {
+            // Told apart from a commit conflict (`"conflict"`): nothing is
+            // wrong with the transaction, the request can be retried.
+            body["code"] = json!("busy");
+        }
+        let mut res = (status, Json(body)).into_response();
         if status == StatusCode::SERVICE_UNAVAILABLE {
             res.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -229,6 +270,23 @@ impl TxStore {
         }
     }
 
+    /// Whether a `begin` could be accepted right now. Checked before the
+    /// snapshot is frozen, so a flood of begins at the limit does no work.
+    pub(crate) fn has_room(&self) -> Result<(), TxError> {
+        let mut state = lock(&self.inner.state);
+        if state.closed {
+            return Err(TxError::Closed);
+        }
+        let reaped = self.reap_locked(&mut state, Instant::now());
+        let full = state.open.len() >= self.inner.limits.max_open;
+        drop(state);
+        drop(reaped);
+        if full {
+            return Err(TxError::TooMany(self.inner.limits.max_open));
+        }
+        Ok(())
+    }
+
     /// Register a new transaction for `owner`; returns its id and when it
     /// expires.
     pub(crate) fn begin(
@@ -239,7 +297,7 @@ impl TxStore {
         self.start_reaper();
         let now = Instant::now();
         let id = format!("{:032x}", rand::random::<u128>());
-        let (deadline, deadline_wall) = self.next_deadline(now);
+        let (deadline, deadline_wall) = self.next_deadline(now, now);
         let reaped = {
             let mut state = lock(&self.inner.state);
             if state.closed {
@@ -256,6 +314,7 @@ impl TxStore {
                 id.clone(),
                 Slot {
                     owner,
+                    born: now,
                     deadline,
                     deadline_wall,
                     op_count: 0,
@@ -297,7 +356,7 @@ impl TxStore {
     /// the request in `op_count`. If the server began shutting down meanwhile
     /// the transaction is rolled back and the request is refused.
     pub(crate) fn checkin(&self, id: &str, body: TxBody, ran: bool) -> Result<(), TxError> {
-        let (deadline, deadline_wall) = self.next_deadline(Instant::now());
+        let now = Instant::now();
         let mut state = lock(&self.inner.state);
         if state.closed {
             let slot = state.open.remove(id);
@@ -305,14 +364,18 @@ impl TxStore {
             drop((slot, body));
             return Err(TxError::Closed);
         }
+        let was_expired = state.expired.contains_key(id);
         match state.open.get_mut(id) {
             Some(slot) => {
+                let (deadline, deadline_wall) = self.next_deadline(now, slot.born);
                 slot.body = Some(body);
                 slot.deadline = deadline;
                 slot.deadline_wall = deadline_wall;
                 slot.op_count += usize::from(ran);
                 Ok(())
             }
+            // Removed while the statement ran: past its lifetime.
+            None if was_expired => Err(TxError::Expired),
             None => Err(TxError::NotFound),
         }
     }
@@ -375,9 +438,14 @@ impl TxStore {
         lock(&self.inner.state).open.len()
     }
 
-    fn next_deadline(&self, now: Instant) -> (Instant, SystemTime) {
-        let idle = self.inner.limits.idle_timeout;
-        (now + idle, SystemTime::now() + idle)
+    /// The idle deadline from `now`, never past `born` plus the lifetime.
+    fn next_deadline(&self, now: Instant, born: Instant) -> (Instant, SystemTime) {
+        let limits = &self.inner.limits;
+        let deadline = (now + limits.idle_timeout).min(born + limits.max_lifetime);
+        (
+            deadline,
+            SystemTime::now() + deadline.saturating_duration_since(now),
+        )
     }
 
     /// The answer for an id that is not open: 410 to the owner of an id that
@@ -425,7 +493,13 @@ impl TxStore {
         let due: Vec<String> = state
             .open
             .iter()
-            .filter(|(_, slot)| slot.body.is_some() && slot.deadline <= now)
+            .filter(|(_, slot)| {
+                // Idle past its deadline, or past its lifetime even while a
+                // request holds it (which also frees a slot whose request was
+                // lost some other way).
+                (slot.body.is_some() && slot.deadline <= now)
+                    || slot.born + self.inner.limits.max_lifetime <= now
+            })
             .map(|(id, _)| id.clone())
             .collect();
         due.iter()
@@ -517,6 +591,10 @@ async fn begin(
     Extension(who): Extension<Principal>,
     read_only_key: Option<Extension<ReadOnlyKey>>,
 ) -> Response {
+    // Before the snapshot is frozen: a begin that will be refused does no work.
+    if let Err(e) = state.txs.has_room() {
+        return e.into_response();
+    }
     let db = state.db.clone();
     let body = match identity {
         AuthIdentity::Role(role) => {
@@ -613,6 +691,22 @@ fn execute(
     }
 }
 
+/// Ends a transaction's slot when dropped unless disarmed. The hand-back
+/// runs on a blocking thread; this covers that thread panicking.
+struct Lease<'a> {
+    store: &'a TxStore,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.finish(self.id);
+        }
+    }
+}
+
 async fn run(
     State(state): State<AppState>,
     Extension(who): Extension<Principal>,
@@ -630,17 +724,27 @@ async fn run(
         Ok(body) => body,
         Err(e) => return e.into_response(),
     };
+    // Nothing awaits between the checkout and this spawn. The statement and
+    // the hand-back both run inside the blocking task, which finishes even if
+    // this future is dropped (client gone, 408, load shed), so the slot
+    // cannot be stranded checked out.
+    let store = state.txs.clone();
     let joined = tokio::task::spawn_blocking(move || {
+        let mut lease = Lease {
+            store: &store,
+            id: &id,
+            armed: true,
+        };
         let out = execute(&mut body, &cypher, &params);
-        (body, out)
+        let handed_back = store.checkin(&id, body, out.is_ok());
+        lease.armed = false;
+        (out, handed_back)
     })
     .await;
-    let Ok((body, out)) = joined else {
-        // The transaction was lost with the panicked task.
-        state.txs.finish(&id);
+    let Ok((out, handed_back)) = joined else {
         return err_response("statement task panicked; transaction rolled back");
     };
-    if let Err(e) = state.txs.checkin(&id, body, out.is_ok()) {
+    if let Err(e) = handed_back {
         return e.into_response();
     }
     match out {
@@ -658,22 +762,30 @@ async fn commit(
         Ok(body) => body,
         Err(e) => return e.into_response(),
     };
-    let joined = tokio::task::spawn_blocking(move || match body {
-        TxBody::Full(tx) => tx.commit(),
-        // A scoped transaction wrote nothing: its bookmark is the commit it read.
-        TxBody::Scoped { snapshot, .. } => Ok(snapshot.commit_seq()),
+    let store = state.txs.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        // The transaction is consumed whatever the outcome, even if the
+        // request that asked is gone.
+        let _lease = Lease {
+            store: &store,
+            id: &id,
+            armed: true,
+        };
+        match body {
+            TxBody::Full(tx) => tx.commit(),
+            // A scoped transaction wrote nothing: its bookmark is the commit it read.
+            TxBody::Scoped { snapshot, .. } => Ok(snapshot.commit_seq()),
+        }
     })
     .await;
-    // The transaction is consumed whatever the outcome.
-    state.txs.finish(&id);
     match joined {
         Ok(Ok(seq)) => json_ok(json!({
             "bookmark": seq,
-            "bookmark_text": format!("{BOOKMARK_PREFIX}{seq}"),
+            "bookmark_text": bookmark_text(seq),
         })),
         Ok(Err(conflict @ GraphError::CasConflict { .. })) => (
             StatusCode::CONFLICT,
-            Json(json!({"error": conflict.to_string()})),
+            Json(json!({"error": conflict.to_string(), "code": "conflict"})),
         )
             .into_response(),
         Ok(Err(e)) => graph_err(e),
@@ -706,6 +818,7 @@ mod tests {
         TxStore::new(TxLimits {
             max_open,
             idle_timeout: Duration::from_millis(idle_ms),
+            max_lifetime: Duration::from_secs(300),
         })
     }
 
@@ -717,13 +830,16 @@ mod tests {
 
     #[test]
     fn limits_default_and_parse() {
-        assert_eq!(TxLimits::from_values(None, None), TxLimits::default());
-        let l = TxLimits::from_values(Some("7"), Some(" 5 "));
-        assert_eq!((l.max_open, l.idle_timeout), (7, Duration::from_secs(5)));
+        assert_eq!(TxLimits::from_values(None, None, None), TxLimits::default());
+        let l = TxLimits::from_values(Some("7"), Some(" 5 "), Some("9"));
+        assert_eq!(
+            (l.max_open, l.idle_timeout, l.max_lifetime),
+            (7, Duration::from_secs(5), Duration::from_secs(9))
+        );
         // Zero, text and negative numbers keep the default.
         for bad in ["0", "x", "-1", ""] {
             assert_eq!(
-                TxLimits::from_values(Some(bad), Some(bad)),
+                TxLimits::from_values(Some(bad), Some(bad), Some(bad)),
                 TxLimits::default(),
                 "{bad:?}"
             );
@@ -813,5 +929,59 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(s.open_count(), 0);
+    }
+
+    #[test]
+    fn the_lifetime_ends_a_transaction_that_keeps_being_used() {
+        let s = TxStore::new(TxLimits {
+            max_open: 10,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_secs(100),
+        });
+        let (b, _dir) = body();
+        let (id, expires) = s.begin("a".into(), b).unwrap();
+        // The reported expiry is the nearer of the two bounds.
+        assert!(expires <= SystemTime::now() + Duration::from_secs(61));
+        let held = s.checkout(&id, "a").unwrap();
+        s.checkin(&id, held, true).unwrap();
+        // Past the lifetime it goes, even though it was just used.
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(101)), 1);
+        assert_eq!(s.checkout(&id, "a").err(), Some(TxError::Expired));
+    }
+
+    #[test]
+    fn a_slot_whose_request_was_lost_is_freed_at_the_lifetime() {
+        let s = TxStore::new(TxLimits {
+            max_open: 1,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_secs(100),
+        });
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        // Checked out and never returned.
+        drop(s.checkout(&id, "a").unwrap());
+        assert_eq!(s.checkout(&id, "a").err(), Some(TxError::Busy));
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(101)), 1);
+        let (b2, _d2) = body();
+        assert!(s.begin("a".into(), b2).is_ok());
+    }
+
+    #[test]
+    fn has_room_follows_the_limit_and_close() {
+        let s = store(1, 60_000);
+        assert_eq!(s.has_room(), Ok(()));
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        assert_eq!(s.has_room(), Err(TxError::TooMany(1)));
+        s.finish(&id);
+        assert_eq!(s.has_room(), Ok(()));
+        s.close();
+        assert_eq!(s.has_room(), Err(TxError::Closed));
+    }
+
+    #[test]
+    fn bookmark_text_is_the_form_a_bolt_commit_returns() {
+        // The same literal the Bolt tests pin.
+        assert_eq!(bookmark_text(7), "mushroomdb:commit:7");
     }
 }

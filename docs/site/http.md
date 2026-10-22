@@ -1066,16 +1066,24 @@ The state is in the server's memory. A transaction is not durable until it commi
 rolls back every open one.
 
 - **Ownership.** A transaction belongs to the credential that began it: the full token, one
-  `keys.json` key, or one role token. Anyone else asking for its id gets `404`, the same answer as
+  `keys.json` key, or one role token (a server with no authentication has one shared owner, so every
+  caller reaches every transaction). Anyone else asking for its id gets `404`, the same answer as
   for an id that never existed.
 - **Idle timeout.** A transaction not touched for `MUSHROOMDB_TX_TIMEOUT_SECS` seconds (default 30)
   is rolled back. Every `run` restarts the clock; `GET /tx/{id}` does not. The owner of an expired id
   hears `410` (`transaction expired: idle too long, rolled back`) for a while afterwards, then `404`.
+- **Lifetime.** A transaction is rolled back `MUSHROOMDB_TX_MAX_LIFETIME_SECS` seconds after `begin`
+  (default 300) however often it is used, even while a statement is running on it. `expires_at` is the
+  nearer of the idle deadline and this one. A transaction holds its snapshot and every write it has
+  buffered in memory (up to a request body, 64 MiB, per statement), so keep them short; the open limit
+  and the lifetime bound the total, not the size of one.
 - **Limit.** At most `MUSHROOMDB_TX_MAX` transactions are open at once (default 100). `POST /tx/begin`
-  beyond that is `503` with `Retry-After: 1` and `too many open transactions (limit N); retry`. Both variables are read when the server starts; a value
+  beyond that is `503` with `Retry-After: 1` and `too many open transactions (limit N); retry`. The three variables are read when the server starts; a value
   that is not a positive integer is ignored with a warning.
 - **One request at a time.** A second request on a transaction while another is still running on it
-  is `409` with `{"error": "transaction busy"}`. Statements never interleave. Retry once the first
+  is `409` with `{"error": "transaction busy", "code": "busy"}`. A commit conflict is `409` with
+  `"code": "conflict"`. A request the client abandons (it hung up, or the 120 s deadline hit) does not
+  strand the transaction: the statement finishes and the transaction is usable again. Statements never interleave. Retry once the first
   returns.
 - **Shutdown.** When the server is told to stop, it rolls back every open transaction at the start of
   the drain and answers `POST /tx/begin` with `503`. A statement already running finishes, and then
@@ -1083,7 +1091,9 @@ rolls back every open one.
 - **Read-tier keys and role tokens.** A `read`-tier key or a role token may begin a transaction.
   Its reads go through the role's mask, on the snapshot the transaction began on. It cannot write: a
   write statement is `403`, with the same message `/query` gives (`read-tier key: writes are not
-  permitted` for a key), and the transaction stays open. Its commit writes nothing and returns the
+  permitted` for a key), and the transaction stays open. This holds for a role token whose role
+  carries a write scope too, although `POST /query` would let it write: a transaction has no
+  role-aware commit yet (ledger row 140, planned for 0.11). Its commit writes nothing and returns the
   commit number it read. `write`-tier and `admin` keys and the full token run the transaction engine
   itself.
 - **Schema statements.** `CREATE` and `DROP` of an index or constraint are refused inside a

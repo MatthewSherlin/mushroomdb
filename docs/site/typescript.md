@@ -99,7 +99,7 @@ try {
 }
 ```
 
-`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. Both extend `MushroomError`. The client does not retry. If a rollback fails after the callback threw, the callback's error is still the one rethrown, with the rollback failure on its `rollbackError` property. If `commit()` fails at the network level its outcome is unknown and the handle refuses further use; a failed `rollback()` can be retried.
+`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`; a request that raced another on the same transaction (the server answers 409 with `code: "busy"`) throws a plain `MushroomError` with `code === "busy"` and leaves the handle open, so it can be retried; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. Both extend `MushroomError`. The client does not retry. If a rollback fails after the callback threw, the callback's error is still the one rethrown, with the rollback failure on its `rollbackError` property. If `commit()` fails at the network level its outcome is unknown and the handle refuses further use; a failed `rollback()` can be retried.
 
 ## What it does not wrap
 
