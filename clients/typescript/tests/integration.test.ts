@@ -132,24 +132,23 @@ describe.skipIf(NO_SERVER)("write via query", () => {
   });
 });
 
-// Until TY-12 the engine refuses to store a format-V11 value; the tagged JSON
-// is parsed, so the refusal names the type. TY-12 turns this into a round trip.
-describe.skipIf(NO_SERVER)("tagged V11 values on write", () => {
+// A format-V11 value written in its tagged JSON form reads back in the same
+// form (TY-12): the first such write moves the store to the V11 format.
+describe.skipIf(NO_SERVER)("tagged V11 values round-trip", () => {
   it.each([
     ["Date", { $date: "2024-01-15" }],
-    ["LocalDateTime", { $ldt: "2024-01-15T12:34:56" }],
-    ["DateTime", { $dt: "2024-01-15T12:34:56+05:30" }],
-    ["Duration", { $dur: "P1M" }],
+    ["LocalDateTime", { $ldt: "2024-01-15T12:34:56.789012" }],
+    ["DateTime", { $dt: "2024-01-15T12:34:56.789012+05:30" }],
+    ["Duration", { $dur: "P1Y2M3DT4H5M6.789S" }],
     ["Binary", { $binary: "3q2+7w==" }],
-  ] as const)("a %s prop is refused with the type named", async (name, value) => {
-    const err = await client
-      .createNode("TsTyped", `ts-typed-${name}-${Date.now()}`, { v: value })
-      .then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-    expect(err).toBeInstanceOf(MushroomError);
-    expect((err as MushroomError).message).toContain(`${name} values cannot be stored`);
+  ] as const)("a %s prop is stored and read back unchanged", async (name, value) => {
+    const key = `ts-typed-${name}-${Date.now()}`;
+    await client.createNode("TsTyped", key, { v: value });
+    const result = await client.query("MATCH (n:TsTyped) WHERE n.id = $k RETURN n.v AS v", {
+      params: { k: key },
+    });
+    expect(result.columns).toEqual(["v"]);
+    expect(result.rows).toEqual([[value]]);
   });
 });
 

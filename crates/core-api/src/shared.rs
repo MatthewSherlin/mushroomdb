@@ -1391,6 +1391,32 @@ fn drain_loop(
             }
         }
 
+        // ── Step 1c: The V11 upgrade, ahead of the group (0.10 TY-12) ────────
+        //
+        // A group whose submissions carry the store's first 0.10 value moves
+        // the store to V11 here, before its first append: the upgrade's
+        // snapshot is durable the moment it is written, so it may hold only
+        // state that already is — never a submission of this group, which a
+        // failed group fsync below would truncate and report as failed.
+        let upgrade = {
+            let mut db = write_publishing(&inner, &published);
+            db.upgrade_to_v11_for_ops(submissions.iter().map(|(_, _, ops, _)| ops.as_slice()))
+        };
+        if let Err(e) = upgrade {
+            {
+                let mut db = write_publishing(&inner, &published);
+                db.end_write_lock();
+            }
+            drop(wal_guard);
+            let detail = format!("the V11 format upgrade ahead of this group failed: {e}");
+            for sub in group {
+                let _ = sub
+                    .done
+                    .send(Err(GraphError::Io(std::io::Error::other(detail.clone()))));
+            }
+            continue;
+        }
+
         // Snapshot WAL size while holding wal_mu — no concurrent WAL append
         // is possible, so this offset is a stable pre-group boundary.
         let pre_group_wal_len = std::fs::metadata(dir.join("wal.bin"))

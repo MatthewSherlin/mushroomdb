@@ -707,17 +707,6 @@ impl Column {
     }
 
     fn pack(&self, intern: &StrIntern, out: &mut Vec<u8>) -> StoreResult<()> {
-        debug_assert!(
-            !matches!(
-                self,
-                Column::Date { .. }
-                    | Column::Ldt { .. }
-                    | Column::Dt { .. }
-                    | Column::Dur { .. }
-                    | Column::Binary { .. }
-            ) || cfg!(test),
-            "pack tags 5-9 require the V11 snapshot format (TY-12)"
-        );
         match self {
             Column::Int { data, present, .. } => {
                 out.push(0);
@@ -743,10 +732,10 @@ impl Column {
                 push_u32s(out, ids);
                 present.pack(out);
             }
-            // Tags 5-9 exist only in a V11 snapshot (TY-12 owns the version
-            // bump). Until then no store can hold one of these columns: the
-            // WAL choke point refuses every new-type value, so a V9/V10
-            // image written by this code never reaches these arms.
+            // Tags 5-9 reach disk only in a V11 snapshot: the snapshot encoder
+            // (`v8::encode::decode_all_columns`) refuses them for any other
+            // version, and a store that writes one of these values is moved to
+            // V11 at the WAL choke point before the value is appended.
             Column::Date { data, present, .. } => {
                 out.push(5);
                 push_records(out, data, 4, |v, o| o.extend_from_slice(&v.to_le_bytes()));
@@ -1207,6 +1196,32 @@ impl ColumnStore {
             pos,
         ))
     }
+}
+
+/// Read one packed column holding a pack tag 5-9 type — `Date`,
+/// `LocalDateTime`, `DateTime`, `Duration` or `Binary` — starting at its tag
+/// byte, as the node-to-value map those values make.
+///
+/// The snapshot encoder writes these columns into the COLUMNS section in the
+/// `Mixed` shape, so the archived layout of the section does not move.
+///
+/// # Errors
+/// [`GraphError::Corrupt`] for a truncated column, or for a tag that is not
+/// one of 5-9.
+pub(crate) fn unpack_typed_column_map(
+    src: &[u8],
+    pos: &mut usize,
+) -> StoreResult<HashMap<u32, Value>> {
+    let tag = src.get(*pos).copied();
+    if !matches!(tag, Some(5..=9)) {
+        return Err(GraphError::Corrupt {
+            detail: format!("columns: expected a typed-value column tag 5-9, found {tag:?}"),
+        });
+    }
+    let col = Column::unpack(src, pos)?;
+    // No `Str` column comes through here, so nothing resolves against the
+    // intern table.
+    Ok(col.to_map(&StrIntern::default()))
 }
 
 /// The refusal a column encoder gives a null value (query-only, never stored).

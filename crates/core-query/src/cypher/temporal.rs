@@ -9,9 +9,9 @@
 //! null, never an error. Only a wrong argument count, and `time()` /
 //! `localtime()`, are errors.
 //!
-//! A temporal value is storable only once the V11 format lands; until then a
-//! write carrying one is refused at the write path's choke point, so these
-//! functions are free to produce one in a query result.
+//! Storing a temporal value moves the store to the V11 snapshot format, at
+//! the write path's choke point; a query result carrying one changes nothing
+//! on disk.
 
 use super::ast::ArithOp;
 use core_storage::types::{

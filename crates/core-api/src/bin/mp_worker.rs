@@ -12,6 +12,10 @@
 //! mp_worker <dir> busy <wait_ms>       try to take the write lock; exit 3 on Busy
 //! mp_worker <dir> snapshot             take a snapshot (plain handle-lifetime lock)
 //! mp_worker <dir> snapshot-shared      snapshot through a SharedDb write guard
+//! mp_worker <dir> v11-write            store a Date, declare a constraint and a
+//!                                      range index (moves the store to V11)
+//! mp_worker <dir> v11-read             print "v11=<bool> constraints=<n>
+//!                                      ranges=<n> on=<value>"
 //! ```
 //!
 //! Exit codes: `0` success, `3` [`GraphError::Busy`], `1` any other failure.
@@ -73,6 +77,8 @@ fn main() {
             },
         ),
         "snapshot-shared" => run_snapshot_shared(dir),
+        "v11-write" => run_v11_write(dir),
+        "v11-read" => run_v11_read(dir),
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -220,4 +226,58 @@ fn run_snapshot_shared(dir: &Path) -> i32 {
         }
     };
     code
+}
+
+/// Move the store to V11 from this process: a Date, a unique constraint and a
+/// range index, each through `SharedDb`'s write guard (0.10 TY-12).
+fn run_v11_write(dir: &Path) -> i32 {
+    let db = match SharedDb::open(dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("open: {e}");
+            return exit_code(&e);
+        }
+    };
+    let result = (|| {
+        let mut w = db.write();
+        w.insert_node(
+            "Event",
+            "peer",
+            vec![("on".into(), mushroomdb::Value::Date(19_737))],
+        )?;
+        w.create_constraint("uniq_on", "Event", "on")?;
+        w.enable_range_index("by_on", "Event", "on")
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("v11-write: {e}");
+            exit_code(&e)
+        }
+    }
+}
+
+/// What this process sees of a V11 store opened fresh.
+fn run_v11_read(dir: &Path) -> i32 {
+    match SharedDb::open(dir) {
+        Ok(db) => {
+            let r = db.read();
+            let on = r
+                .node_info("peer")
+                .and_then(|n| n.props.get("on").cloned())
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "none".into());
+            println!(
+                "v11={} constraints={} ranges={} on={on}",
+                r.is_v11(),
+                r.constraints().len(),
+                r.range_indexes().len()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("open: {e}");
+            exit_code(&e)
+        }
+    }
 }

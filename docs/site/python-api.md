@@ -36,10 +36,12 @@ A value the store can hold: int, float, str, bool, bytes, date, datetime, Durati
 blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
 is a local date-time; an aware one is a date-time that keeps its UTC offset
 (within +-18:00, whole seconds). A value that cannot be held exactly, such as an
-offset with a fractional second, raises `ValueError` rather than being rounded.
-Reading one back gives the same Python type; a stored date outside Python's
-years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
-write that carries one is refused until the format that holds them lands.
+offset with a fractional second or a `pandas.Timestamp` with a nonzero
+`nanosecond`, raises `ValueError` rather than being rounded. Reading one back
+gives the same Python type; a stored date outside Python's years 1 to 9999
+raises `ValueError`. The first write of a `bytes`, `date`, `datetime` or
+`Duration` value moves the store to the V11 snapshot format, which 0.9.x cannot
+read.
 
 ### `Params`
 

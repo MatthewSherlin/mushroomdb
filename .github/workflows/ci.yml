@@ -34,11 +34,10 @@ jobs:
       # compiles it, so the TLS tests (gated on the feature) run here.
       - run: cargo test -p mushroomdb-server --features tls --test tls
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
-      # Tests that need a store in a state no current write path produces —
-      # one 0.8.0 left behind (ledger row 107), or one holding format-V11
-      # records before the V11 format lands (unique constraints, 0.10 TY-5;
-      # range indexes, TY-8) — build it through a hook that exists only behind
-      # `test-hooks`, so a plain workspace run skips them.
+      # Tests that need a hook that exists only behind `test-hooks` — a store
+      # 0.8.0 left behind (ledger row 107), or a range index's postings read
+      # directly (0.10 TY-8) — so a plain workspace run skips them. The
+      # constraint tests no longer need it (0.10 TY-12) and run here as well.
       - run: cargo test -p mushroomdb --features test-hooks --test shared_edge_rules --test constraints --test range_index
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run

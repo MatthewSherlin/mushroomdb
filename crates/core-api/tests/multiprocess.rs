@@ -832,3 +832,62 @@ fn a_peers_constraint_over_older_duplicates_is_absorbed_not_checked() {
     assert_eq!(reopened.constraints().len(), 1);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ── V11 across processes (0.10 TY-12) ─────────────────────────────────────────
+
+/// A store this process moved to V11 — a Date, a unique constraint and a
+/// range index — is read in full by a peer process opening it fresh.
+#[test]
+fn a_peer_reads_a_store_another_handle_moved_to_v11() {
+    let d = tmp("v11-peer-reads");
+    let shared = SharedDb::open(&d).unwrap();
+    {
+        let mut w = shared.write();
+        w.insert_node("Event", "peer", vec![("on".into(), Value::Date(19_737))])
+            .unwrap();
+        w.create_constraint("uniq_on", "Event", "on").unwrap();
+        w.enable_range_index("by_on", "Event", "on").unwrap();
+        assert!(w.is_v11());
+    }
+    let (code, out) = run_worker(&d, &["v11-read"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "v11=true constraints=1 ranges=1 on=Date(19737)");
+    // And again after a truncating snapshot, where only the snapshot (and
+    // its section 18) says it.
+    shared.write().snapshot().unwrap();
+    let (code, out) = run_worker(&d, &["v11-read"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "v11=true constraints=1 ranges=1 on=Date(19737)");
+}
+
+/// A peer process moves the store to V11 while this process holds it open:
+/// this handle picks up the V11 snapshot, the value and both declarations
+/// on refresh, and the constraint binds its own writes.
+#[test]
+fn a_handle_follows_a_peer_that_moved_the_store_to_v11() {
+    let d = tmp("v11-peer-writes");
+    let shared = SharedDb::open(&d).unwrap();
+    shared
+        .write()
+        .insert_node("Event", "mine", vec![("n".into(), Value::Int(1))])
+        .unwrap();
+    assert!(!shared.read().is_v11());
+    let (code, out) = run_worker(&d, &["v11-write"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(mushroomdb::snapshot_version_at(&d).unwrap(), Some(11));
+    let mut db = shared.write();
+    db.refresh().expect("reload over the peer's V11 snapshot");
+    assert!(db.is_v11());
+    assert_eq!(db.get_prop("peer", "on"), Some(Value::Date(19_737)));
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(db.range_indexes().len(), 1);
+    assert!(matches!(
+        db.insert_node("Event", "dup", vec![("on".into(), Value::Date(19_737))]),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
+    db.insert_node("Event", "other", vec![("on".into(), Value::Date(1))])
+        .unwrap();
+    db.snapshot().unwrap();
+    drop(db);
+    assert_eq!(mushroomdb::snapshot_version_at(&d).unwrap(), Some(11));
+}

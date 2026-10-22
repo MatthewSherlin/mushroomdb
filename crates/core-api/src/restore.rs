@@ -32,12 +32,13 @@ pub enum RestoreOutcome {
 ///
 /// Kept in the same order, so a restore writes them the way a backup wrote
 /// them. Archives are found by name at copy time, since their count varies.
-const RESTORE_FILES: [&str; 8] = [
+const RESTORE_FILES: [&str; 9] = [
     "snapshot.bin",
     "snapshot.bin.bak",
     "wal.bin",
     "wal.floor",
     "wal.genesis",
+    "wal.genesis.v11",
     "roles.json",
     "commit_times.bin",
     "snapshot.intent",

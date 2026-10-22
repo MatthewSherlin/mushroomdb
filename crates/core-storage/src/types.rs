@@ -23,8 +23,8 @@ pub enum Value {
     Map(BTreeMap<String, Value>),
     // The five variants below are format V11 types (bincode tags 6–10). They
     // are appended, never inserted, so every older tag keeps its encoding.
-    // Until the V11 format lands, a write carrying one is refused before it
-    // reaches the WAL (see `v11_only_type`).
+    // The first write carrying one moves the store to the V11 snapshot format
+    // before the value reaches the WAL (see `v11_only_type`).
     /// Calendar date: days since 1970-01-01. JSON form `{"$date": "2024-01-15"}`.
     Date(i32),
     /// Date and time with no time zone: microseconds since 1970-01-01T00:00:00.
@@ -127,9 +127,9 @@ impl ValueKey {
 /// The name of the first format-V11 value type inside `v`, if any.
 ///
 /// Recurses into lists and maps: a list of dates is as V11-only as a date.
-/// This is what the write path checks so that, until the V11 format lands, no
-/// such value is ever appended to the WAL, where a 0.9.x reader would stop
-/// replaying at the frame it cannot decode.
+/// This is what the write path checks so that such a value is appended to the
+/// WAL only behind a V11 snapshot, which a 0.9.x reader refuses by name rather
+/// than stop replaying at the frame it cannot decode.
 pub fn v11_only_type(v: &Value) -> Option<&'static str> {
     match v {
         Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_) => None,
@@ -144,23 +144,13 @@ pub fn v11_only_type(v: &Value) -> Option<&'static str> {
     }
 }
 
-/// The refusal a write gets when it carries a format-V11 value type before the
-/// V11 format exists.
+/// The refusal a format-V11 value type gets where it still cannot be stored:
+/// a role predicate, which persists to `roles.json`, a file the snapshot's
+/// version stamp does not cover.
 pub fn v11_type_refusal(type_name: &str) -> String {
     format!(
-        "not supported in mushroomdb 0.10 yet: {type_name} values cannot be stored until the \
-         V11 format lands"
-    )
-}
-
-/// The refusal a write gets when it would append a format-V11 record — a unique
-/// constraint declaration or withdrawal — before the V11 format exists.
-///
-/// `what` names the declaration in the plural ("unique constraints").
-pub fn v11_record_refusal(what: &str) -> String {
-    format!(
-        "not supported in mushroomdb 0.10 yet: {what} cannot be declared until the V11 format \
-         lands"
+        "{type_name} values cannot be used in a role predicate: roles.json carries no format \
+         version, so a 0.9.x reader would report it as corrupt"
     )
 }
 
@@ -1197,7 +1187,7 @@ pub(crate) mod pinned {
     }
 
     /// One value of every variant but `Null`, in index order: the types a
-    /// store can hold (the five format-V11 types once V11 lands).
+    /// store can hold (the five format-V11 types on a V11 store).
     pub(crate) fn storable_values() -> Vec<Value> {
         vec![
             Value::Int(-7),

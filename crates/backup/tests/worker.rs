@@ -1323,3 +1323,62 @@ async fn retention_cost_does_not_grow_with_the_segments_of_a_generation() {
     );
     assert_bucket_sound(&store, "flat retention").await;
 }
+
+/// A store moved to V11 (0.10 TY-12) backs up and restores as V11: the
+/// restored store is V11, holds the typed value, the constraint and the range
+/// index, carries the V11 genesis marker, and keeps writing V11 snapshots.
+#[tokio::test]
+async fn a_v11_store_restores_as_v11() {
+    use mushroomdb::Value;
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let store = mem();
+    let mut w = worker(&store, &db, dir.path());
+    db.write().insert_node("Event", "a", vec![]).unwrap();
+    // An archive first, on a store that has never snapshotted: the genesis
+    // marker, renamed when the store moves to V11.
+    db.write().snapshot_with(ARCHIVING).unwrap();
+    w.run_once().await.unwrap();
+    {
+        let mut g = db.write();
+        g.insert_node("Event", "b", vec![("on".into(), Value::Date(19_737))])
+            .unwrap();
+        g.create_constraint("uniq_on", "Event", "on").unwrap();
+        g.enable_range_index("by_on", "Event", "on").unwrap();
+        assert!(g.is_v11());
+    }
+    w.run_once().await.unwrap();
+    db.write().snapshot_with(ARCHIVING).unwrap();
+    db.write()
+        .insert_node("Event", "c", vec![("on".into(), Value::Date(1))])
+        .unwrap();
+    w.run_once().await.unwrap();
+    w.flush().await;
+    assert!(dir.path().join("wal.genesis.v11").exists());
+
+    let restored = tempfile::tempdir().unwrap();
+    let m = restore_latest(&store, restored.path()).await;
+    assert!(
+        m.files.iter().any(|f| f.name == "wal.genesis.v11"),
+        "the V11 genesis marker travels with the restore point: {:?}",
+        m.files.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        mushroomdb::snapshot_version_at(restored.path()).unwrap(),
+        Some(11)
+    );
+    assert_eq!(counts_of(restored.path()), counts(&db));
+    let mut back = GraphDb::open(restored.path()).unwrap();
+    assert!(back.is_v11());
+    assert_eq!(back.get_prop("b", "on"), Some(Value::Date(19_737)));
+    assert_eq!(back.get_prop("c", "on"), Some(Value::Date(1)));
+    assert_eq!(back.constraints().len(), 1);
+    assert_eq!(back.range_indexes().len(), 1);
+    // It stays V11: a plain write and a snapshot write V11 again.
+    back.insert_node("Event", "d", vec![]).unwrap();
+    back.snapshot().unwrap();
+    assert_eq!(
+        mushroomdb::snapshot_version_at(restored.path()).unwrap(),
+        Some(11)
+    );
+}
