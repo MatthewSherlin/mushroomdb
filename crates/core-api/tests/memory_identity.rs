@@ -1148,7 +1148,7 @@ fn a_declared_alias_links_the_stub_it_names_entity_first() {
         "one directed edge, entity to stub, at the exact claim's weight"
     );
     assert_eq!(
-        same_as_pairs(&db, &strings(&["matt", "matthew-sherlin"])),
+        same_as_pairs(&db, &strings(&["matt", "matthew-sherlin"])).unwrap(),
         the_claim(),
         "asked from both ends, it is still one claim"
     );
@@ -1202,7 +1202,7 @@ fn describe_entity_declares_a_claim_on_create_and_on_update() {
     )
     .unwrap();
     assert_eq!(
-        same_as_pairs(&db, &strings(&["matthew-sherlin"])),
+        same_as_pairs(&db, &strings(&["matthew-sherlin"])).unwrap(),
         the_claim()
     );
     describe_entity_with_aliases(&mut db, "matthew-sherlin", None, &[], &strings(&["sherl"]))
@@ -1213,7 +1213,9 @@ fn describe_entity_declares_a_claim_on_create_and_on_update() {
         "declared aliases accumulate"
     );
     assert_eq!(
-        same_as_pairs(&db, &strings(&["matthew-sherlin"])).len(),
+        same_as_pairs(&db, &strings(&["matthew-sherlin"]))
+            .unwrap()
+            .len(),
         2,
         "the second claim links the second stub"
     );
@@ -1765,7 +1767,7 @@ fn a_described_ex_stub_is_still_linked_by_a_declared_alias() {
     describe_entity(&mut db, "matt", Some("Person"), &described).unwrap();
     assert_eq!(label_of(&db, "matt"), "Entity");
     assert_eq!(
-        same_as_pairs(&db, &strings(&["matt"])),
+        same_as_pairs(&db, &strings(&["matt"])).unwrap(),
         the_claim(),
         "describing the stub does not retract the claim on it"
     );
@@ -1884,7 +1886,9 @@ fn declaring_a_nickname_keeps_the_full_name_stub_linked() {
         report.same_as_lost
     );
     assert_eq!(
-        same_as_pairs(&db, &strings(&["matthew-sherlin"])).len(),
+        same_as_pairs(&db, &strings(&["matthew-sherlin"]))
+            .unwrap()
+            .len(),
         2,
         "the full-name stub and the nickname stub"
     );
@@ -1911,7 +1915,10 @@ fn a_write_that_retracts_nothing_reports_nothing_lost() {
     );
     let report = remember_people(&mut db, "both declare", both());
     assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
-    assert_eq!(same_as_pairs(&db, &strings(&["msherlin"])).len(), 1);
+    assert_eq!(
+        same_as_pairs(&db, &strings(&["msherlin"])).unwrap().len(),
+        1
+    );
     let report = remember_people(&mut db, "again", both());
     assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
 }

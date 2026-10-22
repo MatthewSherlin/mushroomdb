@@ -11,7 +11,7 @@ use core_query::cypher::{
     RetVal, WriteStatement,
 };
 use core_query::{
-    eval_cmp, eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
 };
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
@@ -1060,7 +1060,28 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(init, out);
             operand_node_vars(list, out);
         }
+        Operand::Pred(expr) => expr_node_vars(expr, out),
         Operand::Lit(_) | Operand::Param(_) => {}
+    }
+}
+
+/// [`operand_node_vars`] for every operand of a predicate.
+fn expr_node_vars(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_node_vars(a, out);
+            expr_node_vars(b, out);
+        }
+        Expr::Not(e) => expr_node_vars(e, out),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_node_vars(lhs, out);
+            operand_node_vars(rhs, out);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_node_vars(o, out),
+        Expr::In { expr, list } => {
+            operand_node_vars(expr, out);
+            operand_node_vars(list, out);
+        }
     }
 }
 
@@ -1149,7 +1170,7 @@ const REDUCE_IN_WRITE_RETURN: &str =
 /// or `reduce()`) found in an expression, if any.
 fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
         }
         Expr::Not(e) => expr_write_return_refusal(e),
@@ -1157,8 +1178,9 @@ fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
             operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
         }
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
-        Expr::In { expr, list } => operand_write_return_refusal(expr)
-            .or_else(|| list.iter().find_map(operand_write_return_refusal)),
+        Expr::In { expr, list } => {
+            operand_write_return_refusal(expr).or_else(|| operand_write_return_refusal(list))
+        }
     }
 }
 
@@ -1183,6 +1205,7 @@ fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
                 expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
             })
             .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Pred(expr) => expr_write_return_refusal(expr),
         Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
     }
 }
@@ -1246,7 +1269,7 @@ fn eval_set_return_operand<F: Fs>(
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params, 0)? {
+                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params)? {
                     return eval_set_return_operand(db, match_rs, row, rel_vars, value, params);
                 }
             }
@@ -1285,6 +1308,14 @@ fn eval_set_return_operand<F: Fs>(
             }
             Ok(Some(Value::Map(out)))
         }
+        Operand::Pred(expr) => {
+            let value = core_query::cypher::eval_predicate(
+                expr,
+                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+                &|detail| GraphError::QueryError { detail },
+            )?;
+            Ok(value.map(Value::Bool))
+        }
     }
 }
 
@@ -1308,6 +1339,8 @@ fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A CASE WHEN condition in a write statement's RETURN: true takes the
+/// branch; false and null do not. Three-valued, as in a read query.
 fn eval_set_return_expr<F: Fs>(
     db: &GraphDb<F>,
     match_rs: &ResultSet,
@@ -1315,94 +1348,13 @@ fn eval_set_return_expr<F: Fs>(
     rel_vars: &[String],
     expr: &Expr,
     params: &BTreeMap<String, Value>,
-    depth: u32,
 ) -> Result<bool> {
-    if depth > 256 {
-        return Err(GraphError::QueryError {
-            detail: "expression nesting too deep".into(),
-        });
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        Expr::Not(inner) => Ok(!eval_set_return_expr(
-            db,
-            match_rs,
-            row,
-            rel_vars,
-            inner,
-            params,
-            depth + 1,
-        )?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = eval_set_return_operand(db, match_rs, row, rel_vars, lhs, params)?;
-            let r = eval_set_return_operand(db, match_rs, row, rel_vars, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-                Some(Value::Binary(b)) => !b.is_empty(),
-                // A temporal value is a present value, never "empty".
-                Some(
-                    Value::Date(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime { .. }
-                    | Value::Duration { .. },
-                ) => true,
-                Some(Value::Null) => false,
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => {
-            let Some(needle) = eval_set_return_operand(db, match_rs, row, rel_vars, expr, params)?
-            else {
-                return Ok(false);
-            };
-            for item_op in list {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item_op, params)? {
-                    None => {}
-                    Some(Value::List(items)) => {
-                        for item in items {
-                            if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Some(item) if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) => {
-                        return Ok(true);
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(false)
-        }
-    }
+    let value = core_query::cypher::eval_predicate(
+        expr,
+        &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+        &|detail| GraphError::QueryError { detail },
+    )?;
+    Ok(value == Some(true))
 }
 
 fn eval_set_return_arith(
@@ -13172,6 +13124,8 @@ impl<F: Fs> GraphDb<F> {
                         },
                         chain: vec![],
                         shortest: false,
+                        path_var: None,
+                        continues_match: false,
                     }
                 })
                 .collect();
@@ -14231,6 +14185,8 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     )],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,
@@ -14361,6 +14317,8 @@ impl<F: Fs> GraphDb<F> {
                     },
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,

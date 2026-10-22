@@ -145,7 +145,7 @@ REMOVE n.prop [, n.prop2, ...]
 | `startNode(r)` | Takes rel variable; returns `Node` cell — caller must not `RETURN` it directly, only via property access; see §3.2 note |
 | `endNode(r)` | As above |
 | `nodes(path)` | Takes named path variable; returns `List<String>` (node keys in path order) |
-| `relationships(path)` | Takes named path variable; returns `List<String>` (rel type in path order) |
+| `relationships(path)` | Takes named path variable; returns `List<Map>`, one `{type, start, end}` per relationship in path order (as delivered by QL-07) |
 | `length(path)` | Already implicitly supported via `Cell::Path`; expose as explicit function |
 
 **Aggregate additions:**
@@ -186,7 +186,7 @@ The relationship pattern is matched as a whole; if no such edge exists between t
 ```cypher
 MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN nodes(p), length(p)
 ```
-`p` binds to a new `Cell::NamedPath { node_ids: Vec<u32>, rel_types: Vec<u32>, hops: u8 }`. The planner emits a `BindPath` op after `VarExpand`/`ShortestPath`. `nodes(p)` and `relationships(p)` materialise from the cell; the mask is applied to each constituent node id before including it in the result list (hidden nodes make the path invisible — the whole row is filtered, matching openCypher scoping semantics).
+`p` binds to a path **map** `{nodes, relationships, length}` held in an ordinary `Cell::Scalar`. The planner emits a `BindPath` op after the pattern's last hop; `nodes(p)` and `relationships(p)` read the map's fields. The mask is applied to each constituent node id when the path is bound (hidden nodes make the path invisible — the whole row is filtered, matching openCypher scoping semantics). a path is a plain `Value::Map` `{nodes: List<String> (node keys, walk order), relationships: List<Map {type, start, end}> (start/end are node keys in the stored direction), length: Int}`, bound as an ordinary `Cell::Scalar` after `PlanOp::BindPath { path_var, start_var, hops: Vec<PathHop { rel_var, to_var, trail_var }> }`. There is no `Cell::NamedPath` (a `Box` variant cost the two-hop aggregate about 9 percent). The mask is checked at `BindPath`, so the row is already dropped when a node is hidden.
 
 #### UNWIND general expression
 ```cypher
@@ -257,7 +257,7 @@ pub struct MatchSetMapStmt {
 }
 ```
 
-#### Cell extension for named paths
+#### Cell extension for named paths (superseded by QL-07: no `Cell` variant was added; the path is a `Cell::Scalar(Value::Map)`. The block below is the original proposal.)
 
 ```rust
 // exec.rs Cell enum
@@ -276,7 +276,7 @@ enum Cell {
 #### Plan ops additions
 ```rust
 // plan.rs PlanOp additions
-BindPath { path_var: String, node_var: String, rel_var: Option<String> },
+BindPath { path_var: String, start_var: String, hops: Vec<PathHop> },  // as delivered; the first form could not describe a chain
 // Emitted after VarExpand/ShortestPath when the pattern is a named path.
 // Collects Cell::Node and Cell::Rel from the binding table into Cell::NamedPath.
 
@@ -374,7 +374,7 @@ The planner currently emits `ScanLabel` before applying the key filter (`plan.rs
 - **API breaks:** `WriteStatement` enum gains two new variants (`MatchRemove`, `MatchSetMap`). Any code matching on `WriteStatement` exhaustively must add arms. This is a Rust compiler error, not a silent break — all such callers are in `core-api/src/db.rs` (the write dispatcher). No public Rust API break because `WriteStatement` is not re-exported from the `mushroomdb` crate's public surface (it is in `core-query`, an internal crate).
 - **`UnwindExpr` gains a new variant.** Internal only; same analysis as above.
 - **`AggFunc` gains `StDev`, `StDevP`, `PercentileCont`, `PercentileDisc`.** Internal only.
-- **`Cell` gains `NamedPath`.** Internal to the executor; no public API break.
+- **`Cell` gains no variant for named paths** (QL-07 delivered the path as a `Value::Map` in a `Cell::Scalar`); no public API break.
 - **`SCALAR_FUNCS` constant** (`exec.rs:1687`) must be updated with every new function name so the error message stays accurate.
 
 ---
@@ -432,7 +432,7 @@ The 1M-node benchmark must be run against v0.9.x to record the baseline, then ag
 | QL-03b | Scalar functions: math batch (`floor`, `ceil`, `sign`, `sqrt`, `log`, `log10`, `exp`, `sin`, `cos`, `tan`, `atan`, `atan2`, `pi`, `e`, `rand`) | S | `core-query/src/cypher/exec.rs` | QL-01 | exec.rs SCALAR_FUNCS block |
 | QL-03c | Scalar functions: list/map batch (`head`, `tail`, `last`, `range`, `keys`, `properties`) | S | `core-query/src/cypher/exec.rs`, `ast.rs` | QL-01 | exec.rs, ast.rs |
 | QL-03d | Scalar functions: type-conversion batch (`toBoolean`, `toBooleanOrNull`, `toIntegerOrNull`, `toFloatOrNull`) | S | `core-query/src/cypher/exec.rs` | QL-01 | exec.rs SCALAR_FUNCS block |
-| QL-03e | Scalar functions: node/rel/path functions (`elementId`, `startNode`, `endNode`, `nodes`, `relationships`, `length`) | M | `core-query/src/cypher/exec.rs`, `ast.rs` (Cell::NamedPath prereq from QL-07) | QL-01, QL-07 | exec.rs, ast.rs |
+| QL-03e | Scalar functions: node/rel/path functions (`elementId`, `startNode`, `endNode`, `nodes`, `relationships`, `length`) | M | `core-query/src/cypher/exec.rs`, `ast.rs` (the path map from QL-07) | QL-01, QL-07 | exec.rs, ast.rs |
 | QL-04 | Aggregate additions: `stdev`, `stdevp`, `percentile_cont`, `percentile_disc` | S | `core-query/src/cypher/{ast,exec}.rs` | QL-01 | ast.rs AggFunc, exec.rs accumulator |
 | QL-05 | REMOVE statement: AST, parser, executor, WAL dispatch | M | `core-query/src/cypher/{ast,parser,exec}.rs`, `core-api/src/db.rs` | QL-01 | ast.rs WriteStatement, db.rs write dispatcher |
 | QL-06 | SET map forms (`SET n = map`, `SET n += map`) | M | `core-query/src/cypher/{ast,parser,exec}.rs`, `core-api/src/db.rs` | QL-01, QL-05 | same as QL-05 |
