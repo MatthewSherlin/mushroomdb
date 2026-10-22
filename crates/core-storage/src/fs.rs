@@ -128,6 +128,14 @@ pub trait Fs {
         Ok(None)
     }
 
+    /// [`wal_len`](Fs::wal_len) and [`wal_ident`](Fs::wal_ident) together:
+    /// what a write scope checks before every append. `RealFs` reads both
+    /// from one look at the file, so a commit pays one `stat` for them, not
+    /// two.
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        Ok((self.wal_len()?, self.wal_ident()?))
+    }
+
     /// Read `file` from byte offset `from` to the end.
     ///
     /// Returns an empty `Vec` when `from` is at or past the end of the file.
@@ -514,6 +522,14 @@ impl Fs for RealFs {
         }
     }
 
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        match std::fs::metadata(self.path(FileId::Wal)) {
+            Ok(m) => Ok((m.len(), file_ident(&m))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
+            Err(e) => Err(e),
+        }
+    }
+
     fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut f = match File::open(self.path(file)) {
@@ -771,5 +787,28 @@ mod tests {
         fs.write_atomic(FileId::Snapshot, b"snap1").unwrap();
         fs.write_atomic(FileId::Snapshot, b"snap2").unwrap();
         assert_eq!(fs.read(FileId::Snapshot).unwrap(), b"snap2");
+    }
+
+    /// The one-look pair a write scope reads is exactly the two separate
+    /// looks: missing, grown, and replaced by a rename.
+    #[test]
+    fn wal_len_and_ident_answer_as_the_two_separate_looks() {
+        let d = std::env::temp_dir().join(format!("graphdb-fs-walident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut fs = RealFs::new(&d).unwrap();
+        let separate = |fs: &RealFs| (fs.wal_len().unwrap(), fs.wal_ident().unwrap());
+        assert_eq!(fs.wal_len_and_ident().unwrap(), (0, None));
+        assert_eq!(fs.wal_len_and_ident().unwrap(), separate(&fs));
+        fs.append(FileId::Wal, b"abc").unwrap();
+        let grown = fs.wal_len_and_ident().unwrap();
+        assert_eq!(grown, separate(&fs));
+        assert_eq!(grown.0, 3);
+        fs.write_atomic(FileId::Wal, b"abcdef").unwrap();
+        let replaced = fs.wal_len_and_ident().unwrap();
+        assert_eq!(replaced, separate(&fs));
+        assert_eq!(replaced.0, 6);
+        #[cfg(unix)]
+        assert_ne!(replaced.1, grown.1, "a rename gives the WAL a new identity");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
