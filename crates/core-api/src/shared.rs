@@ -288,12 +288,12 @@ impl Drop for DrainHandle {
 
 /// How long a published version no reader has asked for waits for the
 /// background builder: it builds the latest such version once per delay.
+#[cfg(not(test))]
 const LAZY_BUILD_DELAY: Duration = Duration::from_millis(2);
-
-/// How long the background builder keeps ticking with nothing to build
-/// before it sleeps until a publish wakes it. Longer than a slow commit, so a
-/// writer committing back to back does not wake it once per commit.
-const BUILDER_IDLE_SPELL: Duration = Duration::from_millis(100);
+/// Longer under the unit tests, whose debug commits take milliseconds: what
+/// they pin is commits arriving faster than the tick.
+#[cfg(test)]
+const LAZY_BUILD_DELAY: Duration = Duration::from_millis(100);
 
 // ── Published snapshot ────────────────────────────────────────────────────────
 
@@ -323,8 +323,11 @@ pub(crate) struct Published {
     /// it has published; see [`Self::current`].
     writing: AtomicBool,
     /// Set by every capture; cleared by the next publish, which hands its
-    /// version to the builder at once only if it was set — a reader read
-    /// since the last publish, so one is likely to read this version too.
+    /// version to the builder at once only if it was set. A hint, not a
+    /// guarantee: a reader having read since the last publish makes one
+    /// reading this version likely, nothing more, and the flag is read and
+    /// written without ordering. Getting it wrong changes only when the
+    /// builder builds, never what a capture is served.
     demand: AtomicBool,
     builder: Arc<Builder>,
 }
@@ -465,7 +468,8 @@ impl Published {
     /// for the build in flight or do it itself, never twice.
     ///
     /// The builder is woken for this version only when a reader has captured
-    /// since the last publish (see [`Self::note_reader`]). Otherwise the
+    /// since the last publish (see [`Self::note_reader`]: a hint that one is
+    /// waiting). Otherwise the
     /// version waits for the builder's own schedule ([`LAZY_BUILD_DELAY`]):
     /// back-to-back commits nobody reads then cost no wake-up and no build
     /// each, and the builder builds the latest of them once per delay. The
@@ -518,12 +522,13 @@ impl Published {
 /// one not yet started, so builds never queue. A superseded version is built,
 /// if anyone reads it, by its first reader, as before.
 ///
-/// A publish a reader is likely to read wakes it at once. Any other waits
-/// for the thread's next tick: after each build it checks for a new version
-/// every [`LAZY_BUILD_DELAY`], and only after [`BUILDER_IDLE_SPELL`] with
-/// nothing to build does it sleep until a publish wakes it. So a writer
-/// committing back to back with no reader wakes it about once, not once per
-/// commit.
+/// A publish made while a reader seems to be waiting (see
+/// [`Published::note_reader`]) wakes it at once. Any other waits for the
+/// thread's next tick: one [`LAZY_BUILD_DELAY`] after each build it builds
+/// the latest queued version, and when that tick finds nothing it sleeps
+/// until a publish wakes it. So a writer committing faster than the tick
+/// with no reader wakes it about once, not once per commit; a slower one
+/// costs it the wake-up that builds each commit and one empty tick.
 ///
 /// It also drops the states a publish replaced. Dropping a snapshot releases
 /// one reference on each of its `Arc`s — the fold, every delta of the tail —
@@ -538,6 +543,9 @@ pub(crate) struct Builder {
     /// Publishes that woke the builder thread.
     #[cfg(test)]
     wakes: AtomicU64,
+    /// Times the builder thread returned from a wait, timed or not.
+    #[cfg(test)]
+    thread_wakes: AtomicU64,
     /// Publishes handed to the builder at once because a reader had read
     /// since the publish before.
     #[cfg(test)]
@@ -563,6 +571,8 @@ impl Builder {
             #[cfg(test)]
             wakes: AtomicU64::new(0),
             #[cfg(test)]
+            thread_wakes: AtomicU64::new(0),
+            #[cfg(test)]
             eager: AtomicU64::new(0),
         })
     }
@@ -571,8 +581,11 @@ impl Builder {
     /// dropping. `eager`: build it at once rather than on the thread's own
     /// schedule.
     ///
-    /// When no reader asked for `old` and the fold is unchanged, `old` (and a
-    /// queued state `state` supersedes) is dropped here instead. No capture is
+    /// When the publish is not `eager` — by the hint, no reader asked for
+    /// `old` — and the fold is unchanged, `old` (and a queued state `state`
+    /// supersedes) is dropped here instead. Should a reader hold it after
+    /// all, dropping here releases only this reference; the reader keeps the
+    /// state. No capture is
     /// updating its counts, and its fold and deltas live on in `state`, so
     /// that drop is a few reference counts. Queued until the next tick, it
     /// would hold the built layer the next build moves, and a reader building
@@ -624,11 +637,10 @@ impl Builder {
     fn run(self: Arc<Self>) {
         let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            // Wait for a reason to build: a wake-up, or a tick of the delay
-            // finding something to build. Tick on while publishes may still
-            // come; sleep only after a whole idle spell found none.
-            let built_at = Instant::now();
-            let mut tick_end = built_at + LAZY_BUILD_DELAY;
+            // Wait for a reason to build: a wake-up, or the tick after the
+            // last build finding something to build. A tick that finds
+            // nothing sleeps until a publish wakes it.
+            let tick_end = Instant::now() + LAZY_BUILD_DELAY;
             loop {
                 if self.shutdown.load(Ordering::Acquire) {
                     // No reader is left to want a build; drop what is queued
@@ -649,13 +661,15 @@ impl Builder {
                         .wait_timeout(queue, tick_end - now)
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
+                    #[cfg(test)]
+                    self.thread_wakes.fetch_add(1, Ordering::Relaxed);
                 } else if work {
                     break;
-                } else if now < built_at + BUILDER_IDLE_SPELL {
-                    tick_end = now + LAZY_BUILD_DELAY;
                 } else {
                     queue.sleeping = true;
                     queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+                    #[cfg(test)]
+                    self.thread_wakes.fetch_add(1, Ordering::Relaxed);
                 }
             }
             queue.urgent = false;
@@ -1822,7 +1836,7 @@ mod tests {
         let db = SharedDb::open(&dir).unwrap();
         db.write().insert_node("N", "a", vec![]).unwrap();
         // Let the builder finish and fall asleep: the first commit wakes it.
-        std::thread::sleep(BUILDER_IDLE_SPELL * 2);
+        std::thread::sleep(LAZY_BUILD_DELAY * 4);
         let (wakes0, eager0) = builder_counts(&db);
         let commits = 200;
         for i in 0..commits {
@@ -1889,14 +1903,53 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
-        // Let the builder let go of the version it built.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Wait until only the slot holds the version: the builder has let
+        // go of what it built.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while replaced.strong_count() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the builder kept the version it built"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
         db.write().set_prop("a", "v", Value::Int(2)).unwrap();
         assert!(
             replaced.upgrade().is_none(),
             "the replaced version is still held after the commit that replaced it"
         );
         assert_eq!(value_of(&db.reader(), "a"), Some(Value::Int(2)));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TX-5c fix round 1: with no reader, a writer slower than the tick does
+    /// not keep the builder ticking. Each commit costs it the wake-up that
+    /// builds it and one empty tick, then it sleeps; between commits it does
+    /// not wake at all.
+    #[test]
+    fn the_builder_sleeps_between_commits_no_reader_waits_for() {
+        let dir = tmp("idle");
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("N", "a", vec![]).unwrap();
+        let thread_wakes = || db.published.builder.thread_wakes.load(Ordering::Relaxed);
+        let gap = LAZY_BUILD_DELAY * 4;
+        std::thread::sleep(gap);
+        let before = thread_wakes();
+        let commits = 5;
+        for i in 0..commits {
+            db.write().set_prop("a", "v", Value::Int(i)).unwrap();
+            std::thread::sleep(gap);
+        }
+        let woke = thread_wakes() - before;
+        assert!(
+            woke <= 2 * commits as u64 + 1,
+            "the builder woke {woke} times for {commits} commits {gap:?} apart with no reader"
+        );
+        // Idle: no commit, no wake.
+        let idle = thread_wakes();
+        std::thread::sleep(gap);
+        assert_eq!(thread_wakes(), idle, "the builder woke with nothing to do");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
