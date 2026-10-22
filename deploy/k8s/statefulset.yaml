@@ -1,0 +1,115 @@
+# mushroomdb on Kubernetes: ConfigMap, Secret placeholder, Service, StatefulSet.
+#
+# SINGLE WRITER - replicas must be 1. mushroomdb is single-writer: a second pod
+# on the same store contends for the write lock, and a ReadWriteOnce volume
+# attaches to one node anyway. Do not scale the StatefulSet.
+#
+# No HorizontalPodAutoscaler is shipped on purpose: autoscaling would add
+# writers. Do not add one.
+#
+# Replace the Secret value below before applying, or create the Secret yourself
+# and delete that document:
+#   kubectl create secret generic mushroomdb --from-literal=MUSHROOMDB_TOKEN=...
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mushroomdb
+data:
+  # Non-secret settings only.
+  MUSHROOMDB_LOG_FORMAT: json
+  # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
+  # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mushroomdb
+type: Opaque
+stringData:
+  # Placeholder. Never commit a real value to this file.
+  MUSHROOMDB_TOKEN: "<set-me>"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mushroomdb
+spec:
+  type: ClusterIP
+  selector:
+    app: mushroomdb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    # The Bolt port is added by HO-15.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mushroomdb
+spec:
+  serviceName: mushroomdb
+  # SINGLE WRITER - replicas must be 1. Do NOT scale to more than one.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mushroomdb
+  template:
+    metadata:
+      labels:
+        app: mushroomdb
+    spec:
+      securityContext:
+        # The image runs as uid 65532 and has no shell, so it cannot chown its
+        # own volume. fsGroup makes Kubernetes give the volume to that group and
+        # set it group-writable at mount time.
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        # Only re-own the volume when the root directory's owner is wrong, so a
+        # large store does not pay a recursive chown on every pod start.
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: mushroomdb
+          image: ghcr.io/matthewsherlin/mushroomdb:latest
+          # Explicit command: no --demo-if-empty, so a production volume is
+          # never seeded. The image ENTRYPOINT is the mushroomdb binary.
+          args: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
+          ports:
+            - name: http
+              containerPort: 8080
+            # The Bolt port is added by HO-15.
+          envFrom:
+            - configMapRef:
+                name: mushroomdb
+          env:
+            - name: MUSHROOMDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mushroomdb
+                  key: MUSHROOMDB_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

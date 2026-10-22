@@ -122,3 +122,34 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
     assert!(template("railway/Dockerfile").contains("#   PORT               8080"));
     assert!(template("fly/fly.toml").contains("internal_port = 8080"));
 }
+
+#[test]
+fn k8s_statefulset_is_single_writer_with_ready_and_health_probes() {
+    let text = template("k8s/statefulset.yaml");
+    assert!(text.contains("SINGLE WRITER - replicas must be 1"));
+    assert!(text.contains("  replicas: 1\n"));
+    assert!(text.contains("path: /ready"));
+    assert!(text.contains("path: /health"));
+    assert!(text.contains("ReadWriteOnce"));
+    assert!(text.contains("fsGroup: 65532"));
+    assert!(text.contains("fsGroupChangePolicy: OnRootMismatch"));
+    assert!(text.contains("ghcr.io/matthewsherlin/mushroomdb:latest"));
+    assert!(
+        !text.contains("HorizontalPodAutoscaler\n"),
+        "no HPA resource"
+    );
+    assert!(!text.contains("7687"), "Bolt is added by HO-15");
+}
+
+#[test]
+fn k8s_statefulset_runs_an_explicit_serve_command_and_holds_no_secret_value() {
+    let text = template("k8s/statefulset.yaml");
+    let args = text
+        .lines()
+        .find(|l| l.contains("args: [\"serve\", \"/data\""))
+        .expect("explicit serve args");
+    assert!(!args.contains("--demo-if-empty") && !args.trim_start().starts_with('#'));
+    assert!(text.contains("secretKeyRef"));
+    assert!(text.contains("MUSHROOMDB_TOKEN: \"<set-me>\""));
+    assert!(text.contains("TODO(HO-14/HO-15)"));
+}
