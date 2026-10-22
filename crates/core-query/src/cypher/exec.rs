@@ -4001,10 +4001,11 @@ impl AggAcc {
             AggAcc::StDev {
                 population, n, m2, ..
             } => {
-                // A sample deviation needs two values, a population one needs one.
+                // Fewer than two values (none, for stDevP) have no spread: 0.0,
+                // as openCypher has it, never null.
                 let divisor = if population { n } else { n.saturating_sub(1) };
                 if divisor == 0 {
-                    None
+                    Some(Value::Float(0.0))
                 } else {
                     Some(Value::Float((m2 / divisor as f64).sqrt()))
                 }

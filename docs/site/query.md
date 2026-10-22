@@ -924,8 +924,8 @@ Four statistical aggregates read a numeric property or alias: `stDev(x)` (sample
 standard deviation) and `stDevP(x)` (population standard deviation), and
 `percentileCont(x, p)` and `percentileDisc(x, p)`. Names are case-insensitive.
 Nulls are skipped; ints and floats mix; any other value is a type error naming the
-function. `stDev` is null with fewer than two values and `stDevP` with none, and a
-percentile of no values is null. `p` is a number from 0 to 1, a literal or a
+function. `stDev` and `stDevP` are `0.0` with fewer than two non-null values
+(including none), and a percentile of no values is null. `p` is a number from 0 to 1, a literal or a
 parameter, the same for every row; anything else is an error, even over no rows.
 `percentileDisc` is the nearest-rank value (the input value, with its own type);
 `percentileCont` interpolates linearly between the two nearest ranks and is always

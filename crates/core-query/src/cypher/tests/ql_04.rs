@@ -80,13 +80,16 @@ fn function_names_are_case_insensitive() {
 }
 
 #[test]
-fn stdev_needs_two_values_and_stdevp_one() {
+fn stdev_of_fewer_than_two_values_is_zero_not_null() {
     let one_val = floats(&[3.0]);
-    assert_eq!(one(&one_val, "MATCH (n:N) RETURN stDev(n.score)"), None);
+    assert_close(one(&one_val, "MATCH (n:N) RETURN stDev(n.score)"), 0.0);
     assert_close(one(&one_val, "MATCH (n:N) RETURN stDevP(n.score)"), 0.0);
     let none = Fx::new();
-    assert_eq!(one(&none, "MATCH (n:N) RETURN stDev(n.score)"), None);
-    assert_eq!(one(&none, "MATCH (n:N) RETURN stDevP(n.score)"), None);
+    assert_close(one(&none, "MATCH (n:N) RETURN stDev(n.score)"), 0.0);
+    assert_close(one(&none, "MATCH (n:N) RETURN stDevP(n.score)"), 0.0);
+    // all-null input is the same as no input
+    let nulls = fx_scores(&[Value::Null, Value::Null]);
+    assert_close(one(&nulls, "MATCH (n:N) RETURN stDev(n.score)"), 0.0);
 }
 
 #[test]
@@ -264,7 +267,7 @@ fn grouping_distinct_and_with() {
     )
     .unwrap();
     assert_eq!(rs.len(), 1);
-    assert_eq!(rs.get(0, "a"), None);
+    assert_eq!(rs.get(0, "a"), Some(&Value::Float(0.0)));
     assert_eq!(rs.get(0, "b"), None);
     assert_eq!(rs.get(0, "c"), Some(&Value::Int(0)));
 }
