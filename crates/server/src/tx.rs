@@ -439,8 +439,7 @@ impl TxStore {
     }
 
     /// How many transactions are open.
-    #[cfg(test)]
-    fn open_count(&self) -> usize {
+    pub(crate) fn open_count(&self) -> usize {
         lock(&self.inner.state).open.len()
     }
 

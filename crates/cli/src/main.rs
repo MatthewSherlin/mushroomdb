@@ -1435,6 +1435,13 @@ fn start_backup(
         worker.adopt_lease(lease.detach());
     }
     let handle = worker.start(rx);
+    // `GET /metrics` reports the worker's counters as `mushroomdb_backup_*`.
+    server::register_backup_metrics(server::BackupMetrics {
+        error_count: handle.error_count.clone(),
+        last_success_ts: handle.last_success_ts.clone(),
+        lag_s: handle.lag_s.clone(),
+        healthy: handle.healthy.clone(),
+    });
     Ok((Some((tx, handle, budget)), plan))
 }
 
