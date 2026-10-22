@@ -107,6 +107,22 @@ pub enum AggFunc {
     /// `collect(x)` — gather each row's value of `x` into a list, skipping
     /// nulls. Per group when grouping keys are present.
     Collect,
+    /// `stDev(x)` — sample standard deviation (n - 1) of the non-null
+    /// numeric values; `0.0` with fewer than two values.
+    StDev,
+    /// `stDevP(x)` — population standard deviation (n) of the non-null
+    /// numeric values; `0.0` with none.
+    StDevP,
+    /// `percentileCont(x, p)` — the `p`th percentile (`p` in `[0,1]`) with
+    /// linear interpolation between the two nearest ranks; always a float.
+    PercentileCont {
+        p: Operand,
+    },
+    /// `percentileDisc(x, p)` — the nearest-rank `p`th percentile
+    /// (`p` in `[0,1]`); an input value, with its own type.
+    PercentileDisc {
+        p: Operand,
+    },
 }
 
 /// Argument to an aggregate function.

@@ -1454,9 +1454,18 @@ impl<'a> Parser<'a> {
                 "min" => Some(AggFunc::Min),
                 "max" => Some(AggFunc::Max),
                 "collect" => Some(AggFunc::Collect),
+                "stdev" => Some(AggFunc::StDev),
+                "stdevp" => Some(AggFunc::StDevP),
+                // `p` is filled in after the first argument is parsed.
+                "percentilecont" => Some(AggFunc::PercentileCont {
+                    p: Operand::Lit(Value::Null),
+                }),
+                "percentiledisc" => Some(AggFunc::PercentileDisc {
+                    p: Operand::Lit(Value::Null),
+                }),
                 _ => None,
             };
-            if let Some(func) = func {
+            if let Some(mut func) = func {
                 self.pos += 1; // consume the function name
                 self.expect(&Tok::LParen, "expected '(' after aggregate function name")?;
                 // `count(DISTINCT t)` — DISTINCT is an ordinary identifier to
@@ -1487,6 +1496,14 @@ impl<'a> Parser<'a> {
                 } else {
                     arg
                 };
+                if let AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } = &mut func {
+                    if !self.eat(&Tok::Comma) {
+                        return Err(
+                            self.err("expected ',' and a percentile `p` after the argument")
+                        );
+                    }
+                    *p = self.value_expr()?;
+                }
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
                     Some(self.binding("expected alias identifier after AS")?)
