@@ -351,6 +351,7 @@ impl AccessKeys {
 
 /// Whether a key file with this `mode` and owner may be trusted by a process
 /// running as `euid`: owned by that user and closed to group and others.
+#[cfg(unix)]
 fn private_enough(path: &Path, mode: u32, owner: u32, euid: u32) -> Result<(), AccessKeysError> {
     let mode = mode & 0o777;
     if mode & 0o077 != 0 {
