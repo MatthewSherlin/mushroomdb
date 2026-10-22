@@ -10,6 +10,7 @@ pub mod import;
 pub mod ingest_git;
 pub mod install;
 pub mod recall;
+pub mod serve_bolt;
 pub mod structure;
 
 use export::ExportFormat;
@@ -275,6 +276,9 @@ pub enum Command {
         tls_cert: Option<PathBuf>,
         /// Path to PEM private key for native TLS (`--tls-key`). Requires `--tls-cert`.
         tls_key: Option<PathBuf>,
+        /// The `--bolt-*` flags; resolved against the environment by
+        /// [`serve_bolt::resolve_bolt_settings`].
+        bolt: serve_bolt::BoltFlags,
     },
     Mcp {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
@@ -563,9 +567,18 @@ Usage:
                                       existing directory, otherwise <dest> is the file path itself
                                       (nodes + edges only; rules have no GraphML analogue)
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+                   [--bolt-port <port>] [--bolt-tls | --bolt-plaintext] [--bolt-advertised-host <host>] [--bolt-advertised-port <port>]
+                   [--bolt-database <name>] [--bolt-max-connections <n>] [--bolt-tx-timeout-secs <secs>] [--bookmark-timeout-secs <secs>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
+                     --bolt-port (or MUSHROOMDB_BOLT_PORT) also serves Bolt on --addr's IP; off when unset
+                     Bolt is TLS when --tls-cert is given, unless --bolt-plaintext (MUSHROOMDB_BOLT_TLS=on|off)
+                     --bolt-advertised-host/-port (MUSHROOMDB_BOLT_ADVERTISED_HOST/_PORT) are the address ROUTE
+                     hands drivers; a wildcard --addr needs the host. --bolt-max-connections (default 256,
+                     MUSHROOMDB_BOLT_MAX_CONNECTIONS); --bolt-database names the store (default mushroomdb);
+                     --bolt-tx-timeout-secs (default 30) ends an idle transaction; --bookmark-timeout-secs
+                     (default 5) bounds a bookmark wait
   mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
                     [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                     [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
@@ -982,6 +995,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut bolt = serve_bolt::BoltFlags::default();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -1086,6 +1100,8 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--tls-key=") {
             tls_key = Some(PathBuf::from(val));
             i += 1;
+        } else if let Some(used) = parse_bolt_flag(args, i, &mut bolt)? {
+            i += used;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1116,7 +1132,68 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         restore_from,
         tls_cert,
         tls_key,
+        bolt,
     })
+}
+
+/// Reads one `--bolt-*` flag (or `--bookmark-timeout-secs`) at `args[i]` into
+/// `bolt`, as `--flag value` or `--flag=value`. Returns how many arguments it
+/// used, or `None` when `args[i]` is not one of them.
+fn parse_bolt_flag(
+    args: &[&str],
+    i: usize,
+    bolt: &mut serve_bolt::BoltFlags,
+) -> Result<Option<usize>, String> {
+    let arg = args[i];
+    match arg {
+        "--bolt-tls" | "--bolt-plaintext" => {
+            let tls = arg == "--bolt-tls";
+            if bolt.tls == Some(!tls) {
+                return Err("cannot combine --bolt-tls and --bolt-plaintext".into());
+            }
+            bolt.tls = Some(tls);
+            return Ok(Some(1));
+        }
+        _ => {}
+    }
+    const VALUED: [&str; 7] = [
+        "--bolt-port",
+        "--bolt-advertised-host",
+        "--bolt-advertised-port",
+        "--bolt-database",
+        "--bolt-max-connections",
+        "--bolt-tx-timeout-secs",
+        "--bookmark-timeout-secs",
+    ];
+    let (flag, value, used) = match arg.split_once('=') {
+        Some((flag, value)) if VALUED.contains(&flag) => (flag, value, 1),
+        _ if VALUED.contains(&arg) => {
+            let value = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| format!("missing value for {arg}"))?;
+            (arg, value, 2)
+        }
+        _ => return Ok(None),
+    };
+    let invalid = || format!("invalid {flag}: {value}");
+    let port = || value.parse::<u16>().map_err(|_| invalid());
+    let seconds = || match value.parse::<u64>() {
+        Ok(0) | Err(_) => Err(format!("{flag} must be a positive number of seconds")),
+        Ok(secs) => Ok(Duration::from_secs(secs)),
+    };
+    match flag {
+        "--bolt-port" => bolt.port = Some(port()?),
+        "--bolt-advertised-host" => bolt.advertised_host = Some(value.to_string()),
+        "--bolt-advertised-port" => bolt.advertised_port = Some(port()?),
+        "--bolt-database" => bolt.database = Some(value.to_string()),
+        "--bolt-max-connections" => {
+            bolt.max_connections = Some(value.parse().map_err(|_| invalid())?)
+        }
+        "--bolt-tx-timeout-secs" => bolt.tx_timeout = Some(seconds()?),
+        _ => bolt.bookmark_timeout = Some(seconds()?),
+    }
+    Ok(Some(used))
 }
 
 fn parse_role_token(val: &str) -> Result<(String, String), String> {
@@ -3718,6 +3795,7 @@ mod tests {
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
@@ -3729,6 +3807,7 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -3748,6 +3827,7 @@ mod tests {
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3762,6 +3842,7 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -3781,6 +3862,7 @@ mod tests {
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3795,6 +3877,7 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -4201,6 +4284,57 @@ mod tests {
         // 25 s with backup: the backup keeps a real share.
         let p = shutdown_plan(s(25), s(22));
         assert!(p.backup >= s(9) && p.drain >= s(10), "{p:?}");
+    }
+
+    #[test]
+    fn serve_parses_the_bolt_flags_in_both_spellings() {
+        let bolt = |args: &[&str]| match parse_args(args).unwrap() {
+            Command::Serve { bolt, .. } => bolt,
+            other => panic!("{other:?}"),
+        };
+        let flags = bolt(&[
+            "serve",
+            "/tmp/db",
+            "--bolt-port",
+            "7687",
+            "--bolt-tls",
+            "--bolt-advertised-host=db.example.test",
+            "--bolt-advertised-port",
+            "17687",
+            "--bolt-database=orders",
+            "--bolt-max-connections",
+            "8",
+            "--bolt-tx-timeout-secs=12",
+            "--bookmark-timeout-secs",
+            "3",
+        ]);
+        assert_eq!(
+            flags,
+            serve_bolt::BoltFlags {
+                port: Some(7687),
+                tls: Some(true),
+                advertised_host: Some("db.example.test".into()),
+                advertised_port: Some(17687),
+                database: Some("orders".into()),
+                max_connections: Some(8),
+                tx_timeout: Some(Duration::from_secs(12)),
+                bookmark_timeout: Some(Duration::from_secs(3)),
+            }
+        );
+        assert_eq!(
+            bolt(&["serve", "/tmp/db", "--bolt-port=0", "--bolt-plaintext"]).tls,
+            Some(false)
+        );
+        for bad in [
+            &["serve", "/tmp/db", "--bolt-port", "70000"][..],
+            &["serve", "/tmp/db", "--bolt-port"],
+            &["serve", "/tmp/db", "--bolt-tls", "--bolt-plaintext"],
+            &["serve", "/tmp/db", "--bolt-tx-timeout-secs", "0"],
+            &["serve", "/tmp/db", "--bookmark-timeout-secs=x"],
+            &["serve", "/tmp/db", "--bolt-max-connections", "-1"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

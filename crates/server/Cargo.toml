@@ -15,7 +15,7 @@ name = "server"
 [features]
 default = []
 embed-ui = ["dep:include_dir"]
-tls = ["dep:axum-server"]
+tls = ["dep:axum-server", "dep:rustls"]
 
 [dependencies]
 mushroomdb = { path = "../core-api", version = "0.9.2" }
@@ -23,6 +23,10 @@ arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
+# The one TLS config HTTP and Bolt both serve (`tls::load_server_config`).
+# Already in the tree through axum-server; `aws-lc-rs` is the provider that
+# feature brings, used when the process has not installed one.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

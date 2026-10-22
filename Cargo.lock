@@ -1466,8 +1466,13 @@ name = "mushroomdb-bolt"
 version = "0.9.2"
 dependencies = [
  "mushroomdb",
+ "rcgen",
+ "rustls",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1480,6 +1485,7 @@ dependencies = [
  "getrandom 0.3.4",
  "mushroomdb",
  "mushroomdb-backup",
+ "mushroomdb-bolt",
  "mushroomdb-cli",
  "mushroomdb-extract",
  "mushroomdb-server",

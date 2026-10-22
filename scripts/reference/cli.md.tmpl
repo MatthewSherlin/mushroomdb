@@ -45,7 +45,7 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 
 {{usage serve}}
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables
 
 ### `mcp`
 

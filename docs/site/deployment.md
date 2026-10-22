@@ -100,6 +100,21 @@ or terminate TLS at a reverse proxy (see docs/site/deployment.md)
 
 ---
 
+## Exposing the Bolt port
+
+The Bolt listener is off unless `--bolt-port` (or `MUSHROOMDB_BOLT_PORT`) is set; 7687 is the usual port. It binds `--addr`'s IP, so it is reachable exactly where HTTP is, and the same authentication rule applies: a non-loopback `--addr` needs `--token`, `MUSHROOMDB_TOKEN` or an `admin` key. See [Bolt protocol](bolt.md) for every flag.
+
+- **Publish the port** next to the HTTP one: `-p 7687:7687` for Docker, a second service port on a platform. A reverse proxy for HTTP does not carry Bolt: Bolt is its own TCP protocol, so it needs a TCP (layer 4) route, or is reached directly.
+- **TLS.** With `--tls-cert`/`--tls-key`, Bolt serves the same certificate and is TLS unless `--bolt-plaintext` is given. When TLS ends at a TCP proxy in front of the server instead, run Bolt plaintext behind it.
+- **The advertised address.** In a container `--addr` is usually `0.0.0.0`, which cannot be handed to a driver, so `serve` refuses to start Bolt there without `--bolt-advertised-host` (the host name clients use). When the published port differs from the listener's, also give `--bolt-advertised-port`.
+
+```text
+mushroomdb serve /data --addr 0.0.0.0:8080 --token "$MUSHROOMDB_TOKEN" \
+  --bolt-port 7687 --bolt-advertised-host db.example.com
+```
+
+---
+
 ## Browser access (CORS)
 
 A web page on another origin can call the HTTP API only if the server says so.
@@ -377,7 +392,7 @@ On SIGTERM or SIGINT `serve` stops in three phases, all inside one deadline,
 
 | Phase | What happens | Bound at the defaults |
 | --- | --- | --- |
-| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. Whatever is still open at the bound is cut off. | 25 s |
+| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. The Bolt listener stops accepting too and closes each connection between requests, rolling back an open transaction. Whatever is still open at the bound is cut off. | 25 s |
 | 2. Snapshot | Write the shutdown snapshot. If it has not finished by its bound it is skipped: the WAL holds every commit and the next open replays it. | 8 s (what is left) |
 | 3. Backup | Tell the backup worker to stop. It uploads the last WAL segment and the new snapshot, writes a final restore point, and deletes the bucket lease (only if it still names this instance). | 22 s |
 

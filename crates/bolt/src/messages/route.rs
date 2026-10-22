@@ -9,7 +9,8 @@
 //! driver that is handed `0.0.0.0:7687` would dial itself.
 //!
 //! Database names: `null`, `""`, the drivers' default name and the configured
-//! store name select this store; any other name is `DatabaseNotFound`.
+//! store name select this store; any other name is `DatabaseNotFound`. Names are
+//! compared without regard to ASCII case, as the drivers' servers compare them.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -47,6 +48,8 @@ impl std::error::Error for RoutingConfigError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingConfig {
     advertised: String,
+    /// The host part of `advertised`, kept so the port can be replaced.
+    host: String,
     store_name: String,
 }
 
@@ -75,8 +78,16 @@ impl RoutingConfig {
         }
         Ok(Self {
             advertised: format!("{host}:{}", bind.port()),
+            host,
             store_name: store_name.to_string(),
         })
+    }
+
+    /// Advertises `port` instead of the bind port: for a listener reached
+    /// through a port mapping (a container's `-p 17687:7687`).
+    pub fn with_advertised_port(mut self, port: u16) -> Self {
+        self.advertised = format!("{}:{port}", self.host);
+        self
     }
 
     /// Returns the host in the form it takes before `:port` (an IPv6 literal
@@ -125,11 +136,16 @@ impl RoutingConfig {
     }
 
     /// Whether `requested` selects this store: `None`, `""`, the drivers'
-    /// default name, or the store name.
+    /// default name, or the store name, either name in any ASCII case.
     pub fn check_database(&self, requested: Option<&str>) -> Result<(), BoltError> {
         match requested {
-            None | Some("") | Some(DRIVER_DEFAULT_DATABASE) => Ok(()),
-            Some(name) if name == self.store_name => Ok(()),
+            None | Some("") => Ok(()),
+            Some(name)
+                if name.eq_ignore_ascii_case(DRIVER_DEFAULT_DATABASE)
+                    || name.eq_ignore_ascii_case(&self.store_name) =>
+            {
+                Ok(())
+            }
             Some(name) => Err(BoltError::DatabaseNotFound(format!(
                 "database {name:?} does not exist"
             ))),
@@ -329,6 +345,38 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn database_names_are_compared_without_regard_to_case() {
+        let cfg = RoutingConfig::new("127.0.0.1:7687".parse().unwrap(), None, "Orders").unwrap();
+        let shouted = DRIVER_DEFAULT_DATABASE.to_ascii_uppercase();
+        for name in ["orders", "ORDERS", "Orders", shouted.as_str()] {
+            assert!(cfg.check_database(Some(name)).is_ok(), "{name}");
+            assert!(cfg.route(Some(name)).is_ok(), "{name}");
+        }
+        assert!(cfg.check_database(Some("orders2")).is_err());
+    }
+
+    #[test]
+    fn the_advertised_port_can_differ_from_the_bind_port() {
+        // A container maps host port 17687 to the listener's 7687.
+        let cfg = RoutingConfig::new(
+            "0.0.0.0:7687".parse().unwrap(),
+            Some("db.example.test"),
+            "mushroomdb",
+        )
+        .unwrap()
+        .with_advertised_port(17687);
+        assert_eq!(cfg.advertised_address(), "db.example.test:17687");
+        let reply = cfg.route(None).unwrap();
+        for (_, addrs) in servers(&reply) {
+            assert_eq!(addrs, vec!["db.example.test:17687".to_string()]);
+        }
+        let v6 = RoutingConfig::new("[::1]:7687".parse().unwrap(), None, "mushroomdb")
+            .unwrap()
+            .with_advertised_port(9);
+        assert_eq!(v6.advertised_address(), "[::1]:9");
     }
 
     #[test]

@@ -18,15 +18,15 @@
 #        - Repository name: mushroomdb
 #        - Workflow filename: publish.yml
 #      Do this for: mushroomdb-storage, mushroomdb-rules, mushroomdb-query,
-#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-extract,
-#        mushroomdb-backup, mushroomdb-cli
+#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-bolt,
+#        mushroomdb-extract, mushroomdb-backup, mushroomdb-cli
 #   FIRST-PUBLISH BOOTSTRAP: crates.io Trusted Publishing requires the crate
 #   to already exist on the registry before a trusted publisher can be added.
 #   Bootstrap via: cargo login <your-api-token> && cargo publish -p <crate>
 #   (publishing once with a token, then switching to Trusted Publishing for all
 #   subsequent releases). Publish in dependency order:
 #     mushroomdb-storage → mushroomdb-rules → mushroomdb-query → mushroomdb
-#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-extract
+#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-bolt → mushroomdb-extract
 #     → mushroomdb-backup → mushroomdb-cli
 #   Wait ~30 seconds between each publish for the index to update.
 #
@@ -121,7 +121,7 @@ jobs:
           # mushroomdb-extract = "^0.8.2"` and published on the third attempt.
           # So that error is retried, every two minutes for up to fourteen.
           for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
-                   mushroomdb mushroomdb-arrow mushroomdb-server \
+                   mushroomdb mushroomdb-arrow mushroomdb-server mushroomdb-bolt \
                    mushroomdb-extract mushroomdb-backup mushroomdb-cli; do
             echo "── publishing $c ──"
             attempt=1

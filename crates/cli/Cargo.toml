@@ -24,7 +24,7 @@ doc = false
 [features]
 default = []
 embed-ui = ["server/embed-ui"]
-tls = ["server/tls"]
+tls = ["server/tls", "bolt/tls"]
 # Test-only hooks in the binary (a slow shutdown snapshot). Enabled for this
 # package's own tests through the self dev-dependency below; never default.
 test-hooks = []
@@ -43,6 +43,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 mushroomdb = { path = "../core-api", version = "0.9.2" }
 code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.9.2" }
 server = { package = "mushroomdb-server", path = "../server", version = "0.9.2" }
+# `serve --bolt-port`: the Bolt listener beside the HTTP server.
+bolt = { package = "mushroomdb-bolt", path = "../bolt", version = "0.9.2" }
 backup = { package = "mushroomdb-backup", path = "../backup", version = "0.9.2" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
