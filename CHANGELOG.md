@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.9.3 — a filtered scan with LIMIT sees every node a snapshot holds
+
+No format version change. A 0.9.2 store opens under 0.9.3, and a 0.9.3 snapshot opens under 0.9.2: the fix is in how a query reads, and no byte a snapshot or the WAL writes has changed.
+
+**Upgrade if you run a filtered query with LIMIT on a store that has ever been snapshotted.** A query of the shape `MATCH (n:L) WHERE n.prop <op> value … LIMIT k` — one comparison of a property with a literal, `<op>` one of `<>`, `<`, `<=`, `>` or `>=`, a LIMIT and no ORDER BY — returned only the nodes whose property was written since the last snapshot, and said nothing. Every 0.2.0–0.9.2 release has it, on every surface that runs Cypher: the CLI, the MCP `query` tool, HTTP, Python, TypeScript and the Rust library, live, after a reopen, through readers, `open_at` and role or namespace scopes (row 139).
+
+### Fixed
+
+- **A filtered scan with LIMIT no longer drops the nodes a snapshot holds.** Two nodes, `snapshot()`, a third: `MATCH (n:L) WHERE n.val <> 3 RETURN n LIMIT 5` returned only the third. That shape runs a fused scan-and-filter that read the property column written since the last snapshot and never the snapshot itself. It now reads what every other property read does, and returns what the same filter returns without LIMIT. The same filter with `=`, with ORDER BY, without LIMIT, or combined with another condition was always right (row 139).
+
+### Deprecated
+
+- **`mushroomdb-storage`: `ColumnsView::column`.** It reads post-snapshot values only, which is how the scan above went wrong; the engine no longer calls it. `ColumnsView::view_column` reads the snapshot too. `column` keeps its signature in 0.9.x.
+
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
