@@ -14,6 +14,18 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const HTTP_RS: &str = include_str!("../src/http.rs");
+const TX_RS: &str = include_str!("../src/tx.rs");
+
+/// The `/tx/*` routes, which `tx.rs` registers and `http.rs` merges in.
+fn tx_router_source() -> &'static str {
+    let start = TX_RS
+        .find("fn routes() -> Router<AppState>")
+        .expect("tx.rs no longer has `fn routes() -> Router<AppState>`");
+    let end = TX_RS[start..]
+        .find(".route_layer(")
+        .expect("the tx routes no longer end in `.route_layer(`");
+    &TX_RS[start..start + end]
+}
 
 /// The part of `http.rs` that builds the router: from the first
 /// `Router::new()` to the end of the WebSocket router that follows it.
@@ -224,7 +236,8 @@ fn a_route_heading_with_a_query_string_after_it_is_refused() {
 
 #[test]
 fn the_http_page_and_the_router_name_the_same_routes() {
-    let routed = routes_in(router_source());
+    let mut routed = routes_in(router_source());
+    routed.extend(routes_in(tx_router_source()));
     let documented = routes_documented(&http_page());
     let show = |set: &BTreeSet<(String, String)>, other: &BTreeSet<(String, String)>| {
         set.difference(other)

@@ -540,6 +540,54 @@ impl<K: Ord + Clone, V: Clone> CowMap<K, V> {
         }
     }
 
+    /// The entries within `range`, in descending key order — `range(range)`
+    /// reversed, read lazily from its upper end. Panics on an inverted range,
+    /// as [`Self::range`] does.
+    pub fn range_rev<R: RangeBounds<K>>(&self, range: R) -> RevRange<'_, K, V> {
+        let start = range.start_bound().cloned();
+        let end = range.end_bound().cloned();
+        if let (Bound::Included(s) | Bound::Excluded(s), Bound::Included(e) | Bound::Excluded(e)) =
+            (&start, &end)
+        {
+            let both_excluded = matches!((&start, &end), (Bound::Excluded(_), Bound::Excluded(_)));
+            assert!(
+                s < e || (s == e && !both_excluded),
+                "range start is greater than range end in CowMap"
+            );
+        }
+        let mut it = RevRange {
+            stack: Vec::new(),
+            keys: &[],
+            vals: &[],
+            start,
+        };
+        let Some(mut node) = self.root.as_deref() else {
+            return it;
+        };
+        loop {
+            match node {
+                Node::Internal { bounds, kids } => {
+                    let i = match &end {
+                        Bound::Included(k) | Bound::Excluded(k) => route(bounds, k),
+                        Bound::Unbounded => kids.len() - 1,
+                    };
+                    it.stack.push((kids, i));
+                    node = &kids[i];
+                }
+                Node::Leaf { keys, vals } => {
+                    let to = match &end {
+                        Bound::Included(k) => keys.partition_point(|x| x <= k),
+                        Bound::Excluded(k) => keys.partition_point(|x| x < k),
+                        Bound::Unbounded => keys.len(),
+                    };
+                    it.keys = &keys[..to];
+                    it.vals = &vals[..to];
+                    return it;
+                }
+            }
+        }
+    }
+
     /// Build from entries already in strictly ascending key order.
     pub fn from_sorted(entries: impl IntoIterator<Item = (K, V)>) -> Self {
         let per = NODE_MAX * 3 / 4;
@@ -707,6 +755,67 @@ impl<'a, K: Ord, V> Iterator for Range<'a, K, V> {
                     Node::Internal { kids, .. } => {
                         self.stack.push((kids, 1));
                         node = &kids[0];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The entries of a [`CowMap`] within a range, in descending key order.
+pub struct RevRange<'a, K, V> {
+    /// The internal nodes above the current leaf, each with how many of its
+    /// children, from the left, are still to visit.
+    stack: Vec<Frame<'a, K, V>>,
+    /// What is left of the current leaf, read from its end.
+    keys: &'a [K],
+    vals: &'a [V],
+    start: Bound<K>,
+}
+
+impl<'a, K: Ord, V> Iterator for RevRange<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let (Some((k, keys)), Some((v, vals))) =
+                (self.keys.split_last(), self.vals.split_last())
+            {
+                let past = match &self.start {
+                    Bound::Included(s) => k < s,
+                    Bound::Excluded(s) => k <= s,
+                    Bound::Unbounded => false,
+                };
+                if past {
+                    self.stack.clear();
+                    self.keys = &[];
+                    self.vals = &[];
+                    return None;
+                }
+                self.keys = keys;
+                self.vals = vals;
+                return Some((k, v));
+            }
+            // The leaf is spent: the next one is the rightmost leaf under the
+            // nearest ancestor's previous child.
+            let (kids, left) = self.stack.last_mut()?;
+            if *left == 0 {
+                self.stack.pop();
+                continue;
+            }
+            *left -= 1;
+            let mut node: &'a Node<K, V> = &kids[*left];
+            loop {
+                match node {
+                    Node::Leaf { keys, vals } => {
+                        self.keys = keys;
+                        self.vals = vals;
+                        break;
+                    }
+                    Node::Internal { kids, .. } => {
+                        let last = kids.len() - 1;
+                        self.stack.push((kids, last));
+                        node = &kids[last];
                     }
                 }
             }
@@ -1115,6 +1224,17 @@ mod tests {
             assert!(m.range(a..=b).eq(plain.range(a..=b)), "{a}..={b}");
             assert!(m.range(a..).eq(plain.range(a..)), "{a}..");
             assert!(m.range(..b).eq(plain.range(..b)), "..{b}");
+            assert!(
+                m.range_rev(a..b).eq(plain.range(a..b).rev()),
+                "rev {a}..{b}"
+            );
+            assert!(
+                m.range_rev(a..=b).eq(plain.range(a..=b).rev()),
+                "rev {a}..={b}"
+            );
+            assert!(m.range_rev(a..).eq(plain.range(a..).rev()), "rev {a}..");
+            assert!(m.range_rev(..b).eq(plain.range(..b).rev()), "rev ..{b}");
+            assert!(m.range_rev(..).eq(plain.iter().rev()), "rev ..");
             assert_eq!(m.get(&a), plain.get(&a));
         }
         // Every clone kept its own contents while the original moved on.

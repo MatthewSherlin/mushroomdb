@@ -4,7 +4,7 @@ use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
     OrderTarget, RetItem, RetVal, UnwindExpr,
 };
-use crate::cypher::plan::{PathHop, PlanOp};
+use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
@@ -12,7 +12,7 @@ use crate::result::ResultSet;
 use crate::traverse::{expand, Dir, EdgeRef};
 use crate::value_ops::{cmp_optional, values_equal};
 use crate::view::GraphView;
-use core_storage::{Value, ValueKey};
+use core_storage::{UnifiedIndex, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // Test-only counter incremented each time the fused ScanLabel+Filter arm
@@ -43,6 +43,50 @@ pub static INDEX_SCAN_FIRES: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub static INDEX_INTERSECT_FIRES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static RANGE_INDEX_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an `IndexRangeScan` was answered by a range
+/// index rather than by its label-scan fallback. Per thread, so a test can
+/// read it around its own queries while other tests run; not a metric.
+#[doc(hidden)]
+pub fn range_index_scans() -> u64 {
+    RANGE_INDEX_SCANS.with(|c| c.get())
+}
+
+fn count_range_index_scan() {
+    RANGE_INDEX_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    static RANGE_TOP_K_STOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an `ORDER BY … LIMIT` over a range index
+/// stopped reading the index before its end. Per thread, for tests.
+#[doc(hidden)]
+pub fn range_top_k_stops() -> u64 {
+    RANGE_TOP_K_STOPS.with(|c| c.get())
+}
+
+thread_local! {
+    static PULL_PROBE_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(4096) };
+}
+
+/// How many node slots a bounded (`LIMIT`, no `ORDER BY`) `IndexRangeScan`
+/// scans before it reads the range index.
+fn pull_probe_slots() -> usize {
+    PULL_PROBE_SLOTS.with(|c| c.get())
+}
+
+/// Set [`pull_probe_slots`] for this thread and return the previous value.
+/// For tests that need the index path on graphs smaller than the probe.
+#[doc(hidden)]
+pub fn set_pull_probe_slots(slots: usize) -> usize {
+    PULL_PROBE_SLOTS.with(|c| c.replace(slots))
+}
 
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
@@ -627,6 +671,9 @@ fn execute_inner(
                     value,
                     params,
                 )?;
+            }
+            PlanOp::IndexRangeScan { .. } => {
+                rows = scan_range(view, &vars, &rows, op, params)?;
             }
             PlanOp::IndexIntersect {
                 var,
@@ -1305,6 +1352,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 vars.intern(var);
                 intern_operand(&mut vars, value);
             }
+            PlanOp::IndexRangeScan { var, .. } => {
+                vars.intern(var);
+            }
             PlanOp::IndexIntersect {
                 var, equalities, ..
             } => {
@@ -1806,6 +1856,228 @@ fn index_scan_ids(
     Ok(out)
 }
 
+/// An `IndexRangeScan`'s operands, borrowed from the op.
+struct RangeScan<'a> {
+    label: &'a str,
+    field: &'a str,
+    lo: Option<&'a RangeBound>,
+    hi: Option<&'a RangeBound>,
+    prefix: Option<&'a Operand>,
+    order: Option<&'a RangeOrder>,
+}
+
+impl<'a> RangeScan<'a> {
+    fn of(op: &'a PlanOp) -> Option<(&'a str, RangeScan<'a>)> {
+        match op {
+            PlanOp::IndexRangeScan {
+                var,
+                label,
+                field,
+                lo,
+                hi,
+                prefix,
+                order,
+            } => Some((
+                var.as_str(),
+                RangeScan {
+                    label,
+                    field,
+                    lo: lo.as_ref(),
+                    hi: hi.as_ref(),
+                    prefix: prefix.as_ref(),
+                    order: order.as_ref(),
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a range bound is of a class the index orders (numbers, strings,
+/// the temporal types except `Duration`, binary). Any other bound — `Bool`,
+/// list, map, `Duration` — the scan answers.
+fn orderable_bound(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Binary(_)
+    )
+}
+
+/// Whether two values of one class sort as one run for a top-k cut: equal as
+/// `ORDER BY` compares them, except that `DateTime`s at one instant are one
+/// run whatever their offsets, since the index yields such a run by node id
+/// rather than by offset.
+fn same_run(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::DateTime { micros_utc: x, .. }, Value::DateTime { micros_utc: y, .. }) => x == y,
+        _ => crate::value_ops::cmp_values(a, b) == std::cmp::Ordering::Equal,
+    }
+}
+
+/// The candidate node ids of an `IndexRangeScan`, ascending — a superset of
+/// the nodes its `Filter` keeps, and, with an `order`, of the first `s + k`
+/// rows its `ORDER BY` sorts.
+///
+/// Answered by the range index when [`GraphView::range_index`] gives one and
+/// every bound resolves to a value of a class the index orders. `None` when
+/// it is not: the caller then scans the label exactly as `ScanLabel` does.
+fn range_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    scan: &RangeScan<'_>,
+    params: &Params,
+) -> Result<Option<Vec<u32>>, String> {
+    let Some(index) = view.range_index(scan.label, scan.field) else {
+        return Ok(None);
+    };
+    let Some(sym) = view.sym(scan.label) else {
+        return Ok(Some(Vec::new()));
+    };
+    let bound = |b: Option<&RangeBound>| -> Result<Option<Option<(Value, bool)>>, String> {
+        let Some(b) = b else {
+            return Ok(Some(None));
+        };
+        Ok(resolve_operand(view, vars, row, &b.value, params)?
+            .filter(orderable_bound)
+            .map(|v| Some((v, b.inclusive))))
+    };
+    // `None`: a bound the index cannot take (null, Bool, Duration, …).
+    let (Some(lo), Some(hi)) = (bound(scan.lo)?, bound(scan.hi)?) else {
+        return Ok(None);
+    };
+    let prefix = match scan.prefix {
+        None => None,
+        Some(op) => match resolve_operand(view, vars, row, op, params)? {
+            Some(Value::Str(s)) => Some(s),
+            _ => return Ok(None),
+        },
+    };
+    let keeps = |id: u32| view.visible(id) && view.label_sym(id) == Some(sym);
+    let bounded = lo.is_some() || hi.is_some() || prefix.is_some();
+    let lo = lo.as_ref().map(|(v, incl)| (v, *incl));
+    let hi = hi.as_ref().map(|(v, incl)| (v, *incl));
+    let keep = scan
+        .order
+        .and_then(|o| skip_limit_bound(o.skip.as_ref(), Some(&o.limit), params));
+    let mut ids: Vec<u32> = match (scan.order, keep) {
+        (Some(order), Some(keep)) => {
+            let desc = order.descending;
+            let walk: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) if desc => {
+                    // A prefix's matches are one run of keys, read forwards.
+                    let mut all: Vec<u32> =
+                        index.lookup_prefix(scan.label, scan.field, p).collect();
+                    all.reverse();
+                    Box::new(all.into_iter())
+                }
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_ordered(scan.label, scan.field, lo, hi, desc)),
+            };
+            let (mut ids, cut) = top_k(view, scan.field, walk, keep, &keeps);
+            // With a range, a node with no index entry fails it. Without
+            // one, such nodes (no property, or a list, map or `Duration`)
+            // sort among the rows: descending, nulls come first; ascending,
+            // after numbers, strings and Bools — so only a cut past those
+            // can need them.
+            let settled_before_unindexed = !desc
+                && matches!(
+                    cut,
+                    Some(Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_))
+                );
+            if !bounded && !settled_before_unindexed {
+                ids.extend(unindexed_ids(view, index, scan));
+            }
+            ids.sort_unstable();
+            ids
+        }
+        _ if !bounded => return Ok(None),
+        _ => {
+            let source: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_range(scan.label, scan.field, lo, hi)),
+            };
+            let mut ids: Vec<u32> = source.filter(|&id| keeps(id)).collect();
+            ids.sort_unstable();
+            ids
+        }
+    };
+    ids.dedup();
+    count_range_index_scan();
+    Ok(Some(ids))
+}
+
+/// [`range_scan_ids`], or the label scan when the index cannot answer.
+fn range_or_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    scan: &RangeScan<'_>,
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    Ok(range_scan_ids(view, vars, row, scan, params)?
+        .unwrap_or_else(|| scan_ids(view, Some(scan.label))))
+}
+
+/// The first `keep` of `ids` — given in the order `ORDER BY field` sorts
+/// them — that pass `keeps`, plus every later one in the same run as the
+/// last of them: every row a stable sort could put at position `keep` or
+/// before. Stops reading `ids` there. Also returns the value the cut fell on
+/// (`None` when fewer than `keep` came).
+fn top_k(
+    view: &GraphView,
+    field: &str,
+    ids: impl Iterator<Item = u32>,
+    keep: usize,
+    keeps: &dyn Fn(u32) -> bool,
+) -> (Vec<u32>, Option<Value>) {
+    let mut out = Vec::new();
+    if keep == 0 {
+        return (out, None);
+    }
+    let value = |id: u32| view.prop(id, field).map(|v| v.into_value());
+    let mut cut: Option<Option<Value>> = None;
+    for id in ids.filter(|&id| keeps(id)) {
+        if let Some(last) = &cut {
+            let in_run = match (last, value(id)) {
+                (Some(a), Some(b)) => same_run(a, &b),
+                // Not readable as a value: keep it, a candidate too many is
+                // harmless.
+                _ => true,
+            };
+            if !in_run {
+                RANGE_TOP_K_STOPS.with(|c| c.set(c.get() + 1));
+                break;
+            }
+        }
+        out.push(id);
+        if cut.is_none() && out.len() >= keep {
+            cut = Some(value(id));
+        }
+    }
+    (out, cut.flatten())
+}
+
+/// The visible nodes of the label with no index entry — no property, or a
+/// list, map or `Duration` — by one merge walk of two ascending id lists.
+fn unindexed_ids(view: &GraphView, index: &UnifiedIndex, scan: &RangeScan<'_>) -> Vec<u32> {
+    let mut indexed = index.indexed_ids(scan.label, scan.field).peekable();
+    let mut out = Vec::new();
+    for id in view.nodes_with_label(scan.label) {
+        while indexed.next_if(|&e| e < id).is_some() {}
+        if indexed.next_if_eq(&id).is_none() && view.visible(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Tagged `IndexScan` mode for `field ∈ {key, id}` (`IdentityEq`).
 ///
 /// ScanKey the resolved string, keep the node only if stored-wins identity
@@ -1886,6 +2158,40 @@ fn scan_index(
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
     let mut out = Vec::new();
+    for row in rows {
+        for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            let mut next = row.clone();
+            next[slot] = Some(Cell::Node(id));
+            out.push(next);
+        }
+    }
+    Ok(out)
+}
+
+/// Execute an `IndexRangeScan`: seed rows from its candidates (see
+/// [`range_scan_ids`]). The bounds are row-independent.
+fn scan_range(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    op: &PlanOp,
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let Some((var, scan)) = RangeScan::of(op) else {
+        return Err(format!("not a range scan: {op:?}"));
+    };
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let ids = range_or_scan_ids(view, vars, first, &scan, params)?;
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
     for row in rows {
         for &id in &ids {
             if out.len() >= cap {
@@ -4420,6 +4726,21 @@ fn agg_stream(
                 agg_stream(ctx, rest, &next, acc)?;
             }
         }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let ids = range_or_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
         PlanOp::ScanKey { var, key, label } => {
             let slot = ctx
                 .vars
@@ -4963,6 +5284,21 @@ fn group_stream(
                 group_stream(ctx, rest, &next, groups, key_order)?;
             }
         }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let ids = range_or_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
         PlanOp::ScanKey { var, key, label } => {
             let slot = ctx
                 .vars
@@ -5202,6 +5538,154 @@ fn group_stream(
     Ok(())
 }
 
+/// `pull_rows` for a `ScanLabel` of `var` over `label`, then `rest`: a lazy
+/// walk of the label array, with a `Prop op Lit` filter that follows fused
+/// into it unless `fuse` is false. Only the node slots in `window`
+/// (`start..end`) are walked; a whole scan passes `0..usize::MAX`.
+#[allow(clippy::too_many_arguments)]
+fn pull_scan_label(
+    ctx: &PullCtx<'_>,
+    var: &str,
+    label: Option<&str>,
+    window: std::ops::Range<usize>,
+    fuse: bool,
+    rest: &[PlanOp],
+    row: &mut Row,
+    result: &mut Vec<Vec<Option<Value>>>,
+) -> Result<(), String> {
+    let slot = ctx
+        .vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    // Resolve the label to an interned symbol once. If the label is
+    // specified but unknown, there are no matching nodes — return early.
+    let want_sym = label.and_then(|l| ctx.view.sym(l));
+    if label.is_some() && want_sym.is_none() {
+        return Ok(());
+    }
+    // Save the slot value so we can restore it after the loop.
+    let prev = row[slot].clone();
+
+    // Fast path: if the immediately following op is a simple
+    // `Prop op Lit` comparison on this scan variable, fuse the filter
+    // into the scan loop.  Pre-resolving the property column once
+    // (hashing the field name once instead of per-node) eliminates the
+    // outer HashMap string-hash on every candidate row.
+    let fused_filter = rest.first().and_then(|next_op| {
+        if let PlanOp::Filter {
+            expr:
+                Expr::Cmp {
+                    lhs:
+                        Operand::Prop {
+                            var: ref fv,
+                            field: ref f,
+                        },
+                    op: ref cmp_op_ref,
+                    rhs: Operand::Lit(ref lit),
+                },
+        } = *next_op
+        {
+            if fv == var {
+                return Some((f.as_str(), cmp_op_ref, lit));
+            }
+        }
+        None
+    });
+
+    // `n.key` / `n.id` / `n.label` are not columns, so the fused path
+    // would see an empty column and drop every row. Fall through to
+    // the generic path, which goes through `resolve_prop`.
+    let fused_filter = fused_filter.filter(|(f, _, _)| fuse && !is_identity_field(f));
+    if let Some((field, cmp_op_ref, lit)) = fused_filter {
+        // Fused scan+filter: column resolved once, comparison done
+        // inline — no recursive call into pull_rows for the Filter arm.
+        // The column reads layer, overlay and snapshot base, as
+        // `resolve_prop` does (ledger row 139).
+        #[cfg(test)]
+        FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
+        let col = ctx.view.props.column(field);
+        let rest_after_filter = &rest[1..];
+        macro_rules! fused_scan {
+            ($syms:expr) => {
+                for (i, sym) in $syms
+                    .enumerate()
+                    .skip(window.start)
+                    .take(window.end.saturating_sub(window.start))
+                {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
+                    if col.test(id, |v| eval_cmp(cmp_op_ref, v, lit)) {
+                        row[slot] = Some(Cell::Node(id));
+                        pull_rows(ctx, rest_after_filter, row, result)?;
+                    }
+                }
+            };
+        }
+        // Without a layer the label array is the whole answer: walk
+        // it as a plain slice, the scan's hot loop unchanged.
+        match ctx.view.layer {
+            None => fused_scan!(ctx.view.labels.iter().copied()),
+            Some(_) => fused_scan!(ctx.view.label_syms()),
+        }
+    } else {
+        // Generic path: iterate label array lazily, no Vec allocation,
+        // with early exit when the row bound is satisfied.
+        macro_rules! scan {
+            ($syms:expr) => {
+                for (i, sym) in $syms
+                    .enumerate()
+                    .skip(window.start)
+                    .take(window.end.saturating_sub(window.start))
+                {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    // Skip tombstone / gap slots (u32::MAX sentinel).
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    // Filter by label symbol when a label is requested.
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
+                    row[slot] = Some(Cell::Node(id));
+                    pull_rows(ctx, rest, row, result)?;
+                }
+            };
+        }
+        match ctx.view.layer {
+            None => scan!(ctx.view.labels.iter().copied()),
+            Some(_) => scan!(ctx.view.label_syms()),
+        }
+    }
+    // SAFETY: the `?` inside both scan loops propagates Err directly to
+    // `execute_pull`, which drops `initial_row` — the skipped restore is
+    // unobservable.  This invariant MUST stay true: no call site between
+    // here and `execute_pull` may catch an Err and re-use the row.
+    // Future refactors adding mid-stream error recovery must audit this site.
+    row[slot] = prev;
+    Ok(())
+}
+
 /// Recursively pull rows through `ops`, projecting into `result` until
 /// `result.len() >= ctx.bound`.
 ///
@@ -5238,128 +5722,16 @@ fn pull_rows(
     };
     match op {
         PlanOp::ScanLabel { var, label } => {
-            let slot = ctx
-                .vars
-                .slot(var)
-                .ok_or_else(|| format!("unbound variable `{var}`"))?;
-            // Resolve the label to an interned symbol once. If the label is
-            // specified but unknown, there are no matching nodes — return early.
-            let want_sym = label.as_deref().and_then(|l| ctx.view.sym(l));
-            if label.is_some() && want_sym.is_none() {
-                return Ok(());
-            }
-            // Save the slot value so we can restore it after the loop.
-            let prev = row[slot].clone();
-
-            // Fast path: if the immediately following op is a simple
-            // `Prop op Lit` comparison on this scan variable, fuse the filter
-            // into the scan loop.  Pre-resolving the property column once
-            // (hashing the field name once instead of per-node) eliminates the
-            // outer HashMap string-hash on every candidate row.
-            let fused_filter = rest.first().and_then(|next_op| {
-                if let PlanOp::Filter {
-                    expr:
-                        Expr::Cmp {
-                            lhs:
-                                Operand::Prop {
-                                    var: ref fv,
-                                    field: ref f,
-                                },
-                            op: ref cmp_op_ref,
-                            rhs: Operand::Lit(ref lit),
-                        },
-                } = *next_op
-                {
-                    if fv == var {
-                        return Some((f.as_str(), cmp_op_ref, lit));
-                    }
-                }
-                None
-            });
-
-            // `n.key` / `n.id` / `n.label` are not columns, so the fused path
-            // would see an empty column and drop every row. Fall through to
-            // the generic path, which goes through `resolve_prop`.
-            let fused_filter = fused_filter.filter(|(f, _, _)| !is_identity_field(f));
-            if let Some((field, cmp_op_ref, lit)) = fused_filter {
-                // Fused scan+filter: column resolved once, comparison done
-                // inline — no recursive call into pull_rows for the Filter arm.
-                #[cfg(test)]
-                FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
-                let col = ctx.view.props.column(field);
-                let rest_after_filter = &rest[1..];
-                macro_rules! fused_scan {
-                    ($syms:expr) => {
-                        for (i, sym) in $syms.enumerate() {
-                            if result.len() >= ctx.bound {
-                                break;
-                            }
-                            if sym == u32::MAX {
-                                continue;
-                            }
-                            if let Some(ws) = want_sym {
-                                if sym != ws {
-                                    continue;
-                                }
-                            }
-                            let id = i as u32;
-                            if !ctx.view.visible(id) {
-                                continue;
-                            }
-                            if let Some(v) = col.get(id) {
-                                if eval_cmp(cmp_op_ref, v, lit) {
-                                    row[slot] = Some(Cell::Node(id));
-                                    pull_rows(ctx, rest_after_filter, row, result)?;
-                                }
-                            }
-                        }
-                    };
-                }
-                // Without a layer the label array is the whole answer: walk
-                // it as a plain slice, the scan's hot loop unchanged.
-                match ctx.view.layer {
-                    None => fused_scan!(ctx.view.labels.iter().copied()),
-                    Some(_) => fused_scan!(ctx.view.label_syms()),
-                }
-            } else {
-                // Generic path: iterate label array lazily, no Vec allocation,
-                // with early exit when the row bound is satisfied.
-                macro_rules! scan {
-                    ($syms:expr) => {
-                        for (i, sym) in $syms.enumerate() {
-                            if result.len() >= ctx.bound {
-                                break;
-                            }
-                            // Skip tombstone / gap slots (u32::MAX sentinel).
-                            if sym == u32::MAX {
-                                continue;
-                            }
-                            // Filter by label symbol when a label is requested.
-                            if let Some(ws) = want_sym {
-                                if sym != ws {
-                                    continue;
-                                }
-                            }
-                            let id = i as u32;
-                            if !ctx.view.visible(id) {
-                                continue;
-                            }
-                            row[slot] = Some(Cell::Node(id));
-                            pull_rows(ctx, rest, row, result)?;
-                        }
-                    };
-                }
-                match ctx.view.layer {
-                    None => scan!(ctx.view.labels.iter().copied()),
-                    Some(_) => scan!(ctx.view.label_syms()),
-                }
-            }
-            // SAFETY: the `?` inside both scan loops propagates Err directly to
-            // `execute_pull`, which drops `initial_row` — the skipped restore is
-            // unobservable.  This invariant MUST stay true: no call site between
-            // here and `execute_pull` may catch an Err and re-use the row.
-            // Future refactors adding mid-stream error recovery must audit this site.
-            row[slot] = prev;
+            pull_scan_label(
+                ctx,
+                var,
+                label.as_deref(),
+                0..usize::MAX,
+                true,
+                rest,
+                row,
+                result,
+            )?;
         }
         PlanOp::ScanKey { var, key, label } => {
             let slot = ctx
@@ -5374,6 +5746,52 @@ fn pull_rows(
                 pull_rows(ctx, rest, row, result)?;
                 row[slot] = prev;
             }
+        }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let label = Some(scan.label);
+            // A `LIMIT` with no `ORDER BY`: a range that most nodes satisfy
+            // fills the bound within the first few nodes of a scan, sooner
+            // than the index lists the range. So the first slots are scanned
+            // first, and the index answers only for the nodes after them —
+            // in id order either way, as the scan gives them.
+            let probe = if ctx.view.range_index(scan.label, scan.field).is_some() {
+                pull_probe_slots()
+            } else {
+                usize::MAX
+            };
+            //
+            // The probe does not fuse the filter into the walk: the fused
+            // walk reads the column overlay only, and with an index there is a
+            // snapshot base under it.
+            if probe == usize::MAX {
+                // No index to read: the lazy label walk, with its fused filter.
+                return pull_scan_label(ctx, var, label, 0..probe, true, rest, row, result);
+            }
+            pull_scan_label(ctx, var, label, 0..probe, false, rest, row, result)?;
+            if result.len() >= ctx.bound {
+                return Ok(());
+            }
+            let Some(ids) = range_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)? else {
+                // A bound the index cannot take: scan the rest.
+                let rest_of_label = probe..usize::MAX;
+                return pull_scan_label(ctx, var, label, rest_of_label, false, rest, row, result);
+            };
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            let prev = row[slot].clone();
+            for id in ids.into_iter().filter(|&id| id as usize >= probe) {
+                if result.len() >= ctx.bound {
+                    break;
+                }
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+            }
+            row[slot] = prev;
         }
         PlanOp::IndexScan {
             var,

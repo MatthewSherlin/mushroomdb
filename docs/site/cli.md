@@ -69,12 +69,28 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 
 ```text
 mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+                 [--bolt-port <port>] [--bolt-tls | --bolt-plaintext] [--bolt-advertised-host <host>] [--bolt-advertised-port <port>]
+                 [--bolt-database <name>] [--bolt-max-connections <n>] [--bolt-tx-timeout-secs <secs>] [--bookmark-timeout-secs <secs>]
+                 [--tx-max <n>] [--tx-timeout-secs <secs>] [--tx-max-lifetime-secs <secs>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
+                   MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix restores the newest backup there into an
+                   empty <db-dir> before the port is bound, as a new lineage that keeps backing up beside
+                   it; a prefix with no backup starts an empty store, any other failure exits 1
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
+                   --bolt-port (or MUSHROOMDB_BOLT_PORT) also serves Bolt on --addr's IP; off when unset
+                   Bolt is TLS when --tls-cert is given, unless --bolt-plaintext (MUSHROOMDB_BOLT_TLS=on|off)
+                   --bolt-advertised-host/-port (MUSHROOMDB_BOLT_ADVERTISED_HOST/_PORT) are the address ROUTE
+                   hands drivers; a wildcard --addr needs the host. --bolt-max-connections (default 256,
+                   MUSHROOMDB_BOLT_MAX_CONNECTIONS); --bolt-database names the store (default mushroomdb);
+                   --bolt-tx-timeout-secs (default 30) ends an idle transaction; --bookmark-timeout-secs
+                   (default 5) bounds a bookmark wait
+                   --tx-max (default 100) open HTTP transactions at once; --tx-timeout-secs (default 30)
+                   ends an idle one and --tx-max-lifetime-secs (default 300) any one; each flag wins over
+                   MUSHROOMDB_TX_MAX, MUSHROOMDB_TX_TIMEOUT_SECS and MUSHROOMDB_TX_MAX_LIFETIME_SECS
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
 
 ### `mcp`
 
@@ -181,6 +197,8 @@ Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHAN
 ### `schema`
 
 ```text
+mushroomdb schema indexes <db-dir>
+mushroomdb schema constraints <db-dir>
 mushroomdb schema apply <db-dir> <schema.json>
 mushroomdb schema apply <db-dir> --memory-defaults
                                  applies the built-in memory schema to an existing store;
@@ -191,6 +209,8 @@ mushroomdb schema apply <db-dir> --memory-identity
 ```
 
 Idempotently apply a schema file (rules, views, fulltext indexes), the built-in memory schema, or the identity preset; prints a diff
+
+`schema indexes` and `schema constraints` print what `SHOW INDEXES` and `SHOW CONSTRAINTS` list, as a table with one row per index (`name | type | label | property | state`) or unique constraint (`name | type | label | property`) and the header alone when there are none. They open the store read-only: they write nothing and run while `mushroomdb serve` holds the store. Create and drop with the Cypher statements (`mushroomdb query`) or the [HTTP routes](http.md#schema-indexes-and-constraints).
 
 ### `build-index`
 

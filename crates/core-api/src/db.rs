@@ -39,6 +39,7 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 const NS_DEFAULT_IDX: u32 = 0;
 
 mod ddl;
+pub use ddl::{SchemaError, SchemaErrorKind};
 mod row_eval;
 mod unwind_write;
 
@@ -2467,7 +2468,8 @@ pub struct SnapshotOptions {
 /// Derive the scan-label sym for the commit-skip fast-path.
 ///
 /// Walks `ops` to find the plan's leading scan op (`ScanLabel`, `IndexScan`,
-/// or `IndexIntersect`) with a concrete label string, then interns it.
+/// `IndexIntersect` or `IndexRangeScan`) with a concrete label string, then
+/// interns it.
 ///
 /// Returns `None` in all cases where skipping is unsafe:
 /// - Any `Expand` op is present (edge traversal; edges change results regardless
@@ -2493,6 +2495,7 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
             PlanOp::IndexIntersect {
                 label: Some(label), ..
             } => return Some(syms.intern(label)),
+            PlanOp::IndexRangeScan { label, .. } => return Some(syms.intern(label)),
             _ => {}
         }
     }
@@ -2570,6 +2573,7 @@ impl GraphDb<RealFs> {
     }
 
     fn open_dir(dir: &std::path::Path, opts: OpenOptions, hold_lock: bool) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
@@ -2640,6 +2644,7 @@ impl GraphDb<RealFs> {
     /// - [`GraphError::CommitOutOfRange`] if `commit >= wal_commit_count` (including
     ///   when the WAL is empty after a snapshot).
     pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         Self::open_at_with(RealFs::new(dir)?, commit)
     }
 

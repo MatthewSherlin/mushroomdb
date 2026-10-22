@@ -18,6 +18,8 @@ import {
   TransactionExpiredError,
   type AlgoReport,
   type BackupReport,
+  type ConstraintInfo,
+  type CreateIndexOptions,
   type CreateNodeResult,
   type DegreeConfig,
   type DegreeReport,
@@ -26,6 +28,7 @@ import {
   type FindSimilarOptions,
   type FindSimilarResult,
   type HealthReport,
+  type IndexInfo,
   type IngestReport,
   type IngestRequest,
   type MetricsReport,
@@ -61,6 +64,8 @@ export type {
   AlgoReport,
   BackupReport,
   CellValue,
+  ConstraintInfo,
+  CreateIndexOptions,
   CreateNodeResult,
   DegreeConfig,
   DegreeReport,
@@ -73,6 +78,7 @@ export type {
   HealthReport,
   HistoryChange,
   HistoryEntry,
+  IndexInfo,
   IngestEdge,
   IngestOptions,
   IngestReport,
@@ -369,7 +375,9 @@ export class MushroomClient {
     if (!resp.ok) {
       const detail: string =
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail, resp.status);
+      const code: string | undefined =
+        typeof body?.code === "string" ? body.code : undefined;
+      throw new MushroomError(detail, resp.status, code);
     }
     return body as T;
   }
@@ -492,6 +500,86 @@ export class MushroomClient {
     await this.fetchJson("/rules", {
       method: "POST",
       body: JSON.stringify(def),
+    });
+  }
+
+  /**
+   * List every index (range, equality and full-text), as `SHOW INDEXES` does.
+   *
+   * Wraps `GET /schema/indexes`. A role-bound token sees only the labels it
+   * can see a node of.
+   */
+  async indexes(): Promise<IndexInfo[]> {
+    return this.fetchJson<IndexInfo[]>("/schema/indexes");
+  }
+
+  /**
+   * Declare an index on `label.property`.
+   *
+   * Wraps `POST /schema/indexes`. Needs write access: a role-bound token or a
+   * `read` key gets a {@link MushroomError} (403). A name that exists is 409.
+   *
+   * @returns The row {@link MushroomClient.indexes} lists for it.
+   */
+  async createIndex(
+    label: string,
+    property: string,
+    opts?: CreateIndexOptions,
+  ): Promise<IndexInfo> {
+    return this.fetchJson<IndexInfo>("/schema/indexes", {
+      method: "POST",
+      body: JSON.stringify({ label, property, ...opts }),
+    });
+  }
+
+  /**
+   * Drop the index listed under `name`, of any kind.
+   *
+   * Wraps `DELETE /schema/indexes/{name}`. 404 for an unknown name; 409 for an
+   * equality index a unique constraint is checked against.
+   */
+  async dropIndex(name: string): Promise<void> {
+    this.checkPathSeg(name);
+    await this.fetchJson(`/schema/indexes/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * List every unique constraint, as `SHOW CONSTRAINTS` does.
+   *
+   * Wraps `GET /schema/constraints`.
+   */
+  async constraints(): Promise<ConstraintInfo[]> {
+    return this.fetchJson<ConstraintInfo[]>("/schema/constraints");
+  }
+
+  /**
+   * Declare a unique constraint on `label.property`.
+   *
+   * Wraps `POST /schema/constraints`. Needs write access. 409 when the name
+   * exists or live nodes already hold duplicate values.
+   */
+  async createConstraint(
+    name: string,
+    label: string,
+    property: string,
+  ): Promise<ConstraintInfo> {
+    return this.fetchJson<ConstraintInfo>("/schema/constraints", {
+      method: "POST",
+      body: JSON.stringify({ name, label, property, type: "unique" }),
+    });
+  }
+
+  /**
+   * Withdraw a unique constraint.
+   *
+   * Wraps `DELETE /schema/constraints/{name}`. 404 for an unknown name.
+   */
+  async dropConstraint(name: string): Promise<void> {
+    this.checkPathSeg(name);
+    await this.fetchJson(`/schema/constraints/${encodeURIComponent(name)}`, {
+      method: "DELETE",
     });
   }
 
@@ -926,8 +1014,12 @@ export class MushroomClient {
       return await this.fetchJson<T>(path, init);
     } catch (err) {
       if (err instanceof MushroomError) {
-        if (err.status === 409) {
-          throw new TransactionConflictError(err.detail, err.status);
+        // `busy` is a request that raced another on the same transaction:
+        // nothing is wrong with the transaction, so it is not a conflict and
+        // the handle stays open. Any other 409 (`conflict`, or no code from an
+        // older server) is a commit conflict.
+        if (err.status === 409 && err.code !== "busy") {
+          throw new TransactionConflictError(err.detail, err.status, err.code);
         }
         if (expiredOnMissing && (err.status === 404 || err.status === 410)) {
           throw new TransactionExpiredError(err.detail, err.status);

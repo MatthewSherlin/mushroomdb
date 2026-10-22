@@ -4,7 +4,9 @@
 //! [`Connection`] holds no I/O. It takes one [`ClientMessage`] and returns the
 //! responses to send, so every transition is testable without a socket.
 //! [`serve_connection`] is the loop around it: handshake, deframe, dispatch,
-//! write, plus the one-second tick that expires an idle transaction.
+//! write, plus the one-second tick that expires an idle transaction. Given a
+//! stop signal ([`ConnectionConfig::shutdown`]) it closes at its next idle
+//! point, which rolls back an open transaction.
 //!
 //! States follow the Bolt 4.4/5.0 server state machine:
 //! `NotAuthenticated` (the spec's CONNECTED), `Ready`, `Streaming`, `InTx`
@@ -760,6 +762,13 @@ pub struct ConnectionConfig {
     pub routing: Option<RoutingConfig>,
     /// How long a statement waits for the store to reach a bookmark.
     pub bookmark_timeout: Duration,
+    /// The server's stop signal. Once it reads `true`, or its sender is
+    /// dropped, the connection closes at its next idle point: while it waits
+    /// for the handshake or for the client's next message, or right after it
+    /// has sent the replies to the batch it was running. Closing drops the
+    /// connection's state, which rolls back an open transaction. `None` never
+    /// stops.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl Default for ConnectionConfig {
@@ -773,7 +782,26 @@ impl Default for ConnectionConfig {
             pre_auth_max_message_bytes: DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES,
             routing: None,
             bookmark_timeout: DEFAULT_BOOKMARK_TIMEOUT,
+            shutdown: None,
         }
+    }
+}
+
+/// Whether the stop signal has been given (or its sender is gone).
+fn stopping(shutdown: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown
+        .as_ref()
+        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+}
+
+/// Resolves once the stop signal is given; never, without one.
+pub(crate) async fn stop_signalled(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown {
+        // An error means the sender is gone, which counts as the signal.
+        Some(rx) => {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -788,7 +816,7 @@ const TICK: Duration = Duration::from_secs(1);
 /// the same two bytes. The buffer always starts at a message boundary, where a
 /// zero chunk can only be a keep-alive, so they are consumed here: a client
 /// that sends only keep-alives neither grows the buffer nor is waited on.
-fn keepalive_len(buf: &[u8]) -> usize {
+pub(crate) fn keepalive_len(buf: &[u8]) -> usize {
     buf.chunks_exact(2)
         .take_while(|pair| pair[0] == 0 && pair[1] == 0)
         .count()
@@ -831,9 +859,14 @@ where
 {
     // Tokio's clock, so a paused test clock drives every deadline here.
     let started = tokio::time::Instant::now();
+    let mut shutdown = config.shutdown.clone();
     let mut request = [0u8; handshake::HANDSHAKE_LEN];
     let read = tokio::time::timeout(config.hello_timeout, stream.read_exact(&mut request));
-    match read.await {
+    let read = tokio::select! {
+        read = read => read,
+        _ = stop_signalled(&mut shutdown) => return Ok(()),
+    };
+    match read {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => return Err(err),
         Err(_) => return Err(timed_out("handshake not received in time")),
@@ -865,6 +898,11 @@ where
     // When the bytes now in `buf` began to wait for the rest of their message.
     let mut partial_since: Option<tokio::time::Instant> = None;
     loop {
+        if stopping(&shutdown) {
+            // Dropping `connection` rolls back an open transaction.
+            let _ = stream.shutdown().await;
+            return Ok(());
+        }
         let authenticated = connection.identity().is_some();
         if !authenticated && started.elapsed() >= config.hello_timeout {
             return Err(timed_out("HELLO not received in time"));
@@ -875,7 +913,11 @@ where
         if std::mem::take(&mut unprocessed) {
             // The read already happened, while the last batch ran.
         } else {
-            match tokio::time::timeout(TICK, stream.read_buf(&mut buf)).await {
+            let read = tokio::select! {
+                read = tokio::time::timeout(TICK, stream.read_buf(&mut buf)) => read,
+                _ = stop_signalled(&mut shutdown) => continue,
+            };
+            match read {
                 Ok(Ok(0)) => return Ok(()),
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => return Err(err),

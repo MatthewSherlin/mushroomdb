@@ -24,8 +24,12 @@ services:
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
-      # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+      # Continuous backup to the bundled object store (docs/site/deployment.md):
+      # MUSHROOMDB_BACKUP_S3_URL: minio://mushroomdb/backup
+      # Restore on boot: an empty volume restores the newest backup there before serving.
+      # MUSHROOMDB_RESTORE_FROM_S3: minio://mushroomdb/backup
+      # TODO(HO-14/HO-15): the rest of the backup settings go here. Nothing in
+      # this file turns backup on yet.
     # Local development: explicit command, no --demo-if-empty. For a throwaway
     # demo store, append "--demo-if-empty" here. Production never does.
     restart: unless-stopped

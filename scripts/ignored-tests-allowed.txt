@@ -76,3 +76,7 @@ core-api/tests/cypher_bool_exprs.rs::bench_where_predicates_at_100k — measurem
 # concurrency_gate.rs — the gate's v0.9.2 baseline probe; run by concurrency_gate, not by name
 core-bench/tests/concurrency_gate.rs::writer_probe — baseline probe: the concurrency-gate CI job builds it against the v0.9.2 tag and concurrency_gate spawns it (MUSHROOMDB_GATE_V092)
 cli/tests/export_round_trip.rs::jsonl_import_throughput_above_50k_per_second — builds a 100k-node JSONL file (1M with MUSHROOMDB_IMPORT_BENCH_NODES) and times its import; run in release with --ignored
+
+# range_query.rs — TY-10 range planner; 1M-node correctness (TY-14 times it) and 100k timings
+core-api/tests/range_query.rs::test_range_query_1000_results_latency — release only: inserts 1M nodes and checks a 101k-row range answered from the index (release, --ignored); TY-14 measures its latency
+core-api/tests/range_query.rs::bench_range_and_top_k_at_100k — measurement by hand: prints range and ORDER BY … LIMIT timings at 100k nodes with and without the index (release, --ignored), nothing asserted

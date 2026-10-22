@@ -7,10 +7,13 @@ mod json;
 mod mcp;
 mod mcp_tasks;
 mod subscribe;
+#[cfg(feature = "tls")]
+pub mod tls;
 mod ws;
 
 use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
 
+pub use http::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 
 /// The root this crate's `tracing` events are filtered by.
@@ -76,6 +79,8 @@ struct AppState {
     /// True at every construction site except the `serve` command, which
     /// starts it false and sets it once the store is open.
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Open interactive transactions (`/tx/*`).
+    txs: http::TxStore,
 }
 
 pub use access_keys::watch_sighup;
@@ -84,10 +89,10 @@ pub use cors::{cors_layer_from_env, parse_cors_origins, CORS_ORIGINS_ENV};
 #[allow(deprecated)]
 pub use http::{
     router, router_with_access_keys, router_with_auth, router_with_cors, router_with_ready_flag,
-    router_with_role_tokens, router_with_ui, router_with_ui_tls, serve, serve_with_role_tokens,
-    serve_with_role_tokens_and_shutdown, serve_with_role_tokens_and_shutdown_with_ready_flag,
-    serve_with_shutdown, serve_with_ui, serve_with_ui_and_role_tokens,
-    serve_with_ui_and_role_tokens_and_shutdown,
+    router_with_role_tokens, router_with_tx_limits, router_with_ui, router_with_ui_tls, serve,
+    serve_with_role_tokens, serve_with_role_tokens_and_shutdown,
+    serve_with_role_tokens_and_shutdown_with_ready_flag, serve_with_shutdown, serve_with_ui,
+    serve_with_ui_and_role_tokens, serve_with_ui_and_role_tokens_and_shutdown,
     serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag,
 };
 #[cfg(feature = "embed-ui")]
@@ -97,3 +102,5 @@ pub use http::{
 };
 #[cfg(feature = "tls")]
 pub use http::{serve_tls, serve_tls_with_shutdown, serve_tls_with_shutdown_with_ready_flag};
+#[cfg(feature = "tls")]
+pub use tls::load_server_config;

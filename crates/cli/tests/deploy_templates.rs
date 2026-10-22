@@ -57,18 +57,38 @@ fn deploy_templates_hold_no_bolt_port_and_no_secret_values() {
     }
 }
 
+/// The backup and restore-on-boot variables are shown, commented out, each
+/// with what it does; nothing turns them on, and the rest of the backup
+/// settings are still to come (HO-14/HO-15).
 #[test]
-fn deploy_templates_do_not_reference_the_unmerged_backup_worker_variables() {
-    for name in TEMPLATES.iter().filter(|n| **n != "railway/railway.json") {
+fn deploy_templates_show_backup_and_restore_on_boot_commented_out() {
+    let commented = TEMPLATES
+        .iter()
+        .filter(|n| **n != "railway/railway.json")
+        .chain(&["k8s/statefulset.yaml"]);
+    for name in commented {
         let text = template(name);
         for variable in ["MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3"] {
-            assert!(!text.contains(variable), "{name} references {variable}");
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains(variable)).collect();
+            assert!(!lines.is_empty(), "{name} does not show {variable}");
+            for line in lines {
+                assert!(
+                    line.trim_start().starts_with('#'),
+                    "{name}: {variable} must stay commented out: {line}"
+                );
+            }
         }
+        assert!(
+            text.contains("restore on boot: an empty")
+                || text.contains("Restore on boot: an empty"),
+            "{name} does not say what restore on boot does"
+        );
         assert!(
             text.contains("TODO(HO-14/HO-15)"),
             "{name} lacks the placeholder"
         );
     }
+    assert!(!template("railway/railway.json").contains("MUSHROOMDB_"));
 }
 
 #[test]
@@ -121,6 +141,71 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
     assert!(template("render/render.yaml").contains("key: PORT\n        value: \"8080\""));
     assert!(template("railway/Dockerfile").contains("#   PORT               8080"));
     assert!(template("fly/fly.toml").contains("internal_port = 8080"));
+}
+
+/// `serve` drains, snapshots, then flushes the backup and releases its lease
+/// (about 22 s of backup alone at the defaults); a platform that kills it
+/// sooner leaves the lease behind.
+#[test]
+fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
+    for (name, needle) in [
+        ("fly/fly.toml", "\nkill_timeout = 60\n"),
+        (
+            "docker-compose/docker-compose.yml",
+            "stop_grace_period: 60s",
+        ),
+    ] {
+        assert!(
+            template(name).contains(needle),
+            "{name} must contain {needle}"
+        );
+    }
+}
+
+/// flyctl lowers a check's `grace_period` over 60 s to 60 s, so the template
+/// states the value Fly really uses.
+#[test]
+fn the_fly_template_keeps_its_check_grace_period_within_flys_limit() {
+    let text = template("fly/fly.toml");
+    let periods: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("grace_period = "))
+        .collect();
+    assert_eq!(periods, ["\"60s\""], "fly.toml grace_period lines");
+}
+
+/// A Render service with a persistent disk gets a fixed 30 s shutdown delay;
+/// `maxShutdownDelaySeconds` is refused with a disk, so it must not be set,
+/// and `serve` is told to finish inside the window instead.
+#[test]
+fn the_render_template_fits_its_fixed_shutdown_window() {
+    let text = template("render/render.yaml");
+    assert!(text.contains("disk:"), "the template has a persistent disk");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("maxShutdownDelaySeconds")),
+        "maxShutdownDelaySeconds is not allowed with a disk"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("dockerCommand:")
+                && l.contains("--shutdown-timeout-secs 25")),
+        "serve must be told to finish inside Render's 30 s"
+    );
+}
+
+/// Railway drains the old deployment for `drainingSeconds` before SIGKILL;
+/// it must cover `serve`'s default 55 s shutdown budget.
+#[test]
+fn the_railway_template_drains_long_enough_for_the_shutdown_sequence() {
+    let text = template("railway/railway.json");
+    let seconds: u64 = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"drainingSeconds\":"))
+        .and_then(|v| v.trim().trim_end_matches(',').parse().ok())
+        .expect("railway.json sets deploy.drainingSeconds");
+    assert!(seconds >= 55, "drainingSeconds {seconds} < 55");
 }
 
 /// The k8s manifest as JSON documents. Parsing is done by python3's PyYAML (no
@@ -273,57 +358,4 @@ fn k8s_governing_service_is_headless() {
         .find(|d| d["kind"] == "Service" && d["metadata"]["name"] == governing)
         .expect("governing Service");
     assert_eq!(service["spec"]["clusterIP"], "None");
-}
-
-/// `serve` drains, snapshots, then flushes the backup and releases its lease
-/// (about 22 s of backup alone at the defaults); a platform that kills it
-/// sooner leaves the lease behind.
-#[test]
-fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
-    for (name, needle) in [
-        ("fly/fly.toml", "\nkill_timeout = 60\n"),
-        (
-            "docker-compose/docker-compose.yml",
-            "stop_grace_period: 60s",
-        ),
-    ] {
-        assert!(
-            template(name).contains(needle),
-            "{name} must contain {needle}"
-        );
-    }
-}
-
-/// A Render service with a persistent disk gets a fixed 30 s shutdown delay;
-/// `maxShutdownDelaySeconds` is refused with a disk, so it must not be set,
-/// and `serve` is told to finish inside the window instead.
-#[test]
-fn the_render_template_fits_its_fixed_shutdown_window() {
-    let text = template("render/render.yaml");
-    assert!(text.contains("disk:"), "the template has a persistent disk");
-    assert!(
-        !text
-            .lines()
-            .any(|l| l.trim_start().starts_with("maxShutdownDelaySeconds")),
-        "maxShutdownDelaySeconds is not allowed with a disk"
-    );
-    assert!(
-        text.lines()
-            .any(|l| l.trim_start().starts_with("dockerCommand:")
-                && l.contains("--shutdown-timeout-secs 25")),
-        "serve must be told to finish inside Render's 30 s"
-    );
-}
-
-/// Railway drains the old deployment for `drainingSeconds` before SIGKILL;
-/// it must cover `serve`'s default 55 s shutdown budget.
-#[test]
-fn the_railway_template_drains_long_enough_for_the_shutdown_sequence() {
-    let text = template("railway/railway.json");
-    let seconds: u64 = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("\"drainingSeconds\":"))
-        .and_then(|v| v.trim().trim_end_matches(',').parse().ok())
-        .expect("railway.json sets deploy.drainingSeconds");
-    assert!(seconds >= 55, "drainingSeconds {seconds} < 55");
 }

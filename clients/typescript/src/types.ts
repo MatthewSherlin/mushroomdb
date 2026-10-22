@@ -875,6 +875,8 @@ export class MushroomError extends Error {
     public readonly detail: string,
     /** HTTP status of the response that caused the error, when there was one. */
     public readonly status?: number,
+    /** The server's machine-readable `code` for the error, when it sent one (`conflict`, `busy`). */
+    public readonly code?: string,
   ) {
     super(detail);
     this.name = "MushroomError";
@@ -888,8 +890,8 @@ export class MushroomError extends Error {
  * retry for you.
  */
 export class TransactionConflictError extends MushroomError {
-  constructor(detail: string, status?: number) {
-    super(detail, status);
+  constructor(detail: string, status?: number, code?: string) {
+    super(detail, status, code);
     this.name = "TransactionConflictError";
   }
 }
@@ -917,4 +919,32 @@ export interface TxBeginResponse {
 export interface TxCommitResponse {
   /** The commit number of the transaction's one WAL frame. */
   bookmark: number;
+}
+
+/**
+ * One row of `GET /schema/indexes` — the columns `SHOW INDEXES` lists.
+ * `type` is `"range"`, `"equality"` or `"fulltext"`.
+ */
+export interface IndexInfo {
+  name: string;
+  type: "range" | "equality" | "fulltext";
+  label: string;
+  property: string;
+  state: "online";
+}
+
+/** Options for {@link MushroomClient.createIndex}. */
+export interface CreateIndexOptions {
+  /** Range index name; `idx_<label>_<property>` when omitted. An equality index is always `eq_<label>_<property>`. */
+  name?: string;
+  /** `"range"` (default) or `"equality"`. */
+  kind?: "range" | "equality";
+}
+
+/** One row of `GET /schema/constraints` — the columns `SHOW CONSTRAINTS` lists. */
+export interface ConstraintInfo {
+  name: string;
+  type: "unique";
+  label: string;
+  property: string;
 }

@@ -43,5 +43,12 @@ services:
         sync: false
       - key: MUSHROOMDB_LOG_FORMAT
         value: json
-      # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
-      # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+      # Continuous backup (docs/site/deployment.md); the AWS_* credentials are
+      # entered in the dashboard (sync: false), never here:
+      # - key: MUSHROOMDB_BACKUP_S3_URL
+      #   value: s3://<bucket>/<prefix>
+      # Restore on boot: an empty disk restores the newest backup there before serving.
+      # - key: MUSHROOMDB_RESTORE_FROM_S3
+      #   value: s3://<bucket>/<prefix>
+      # TODO(HO-14/HO-15): the rest of the backup settings go here. Nothing in
+      # this file turns backup on yet.

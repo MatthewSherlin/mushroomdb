@@ -16,7 +16,9 @@
 //!
 //! [`restore_from_s3`] reads a restore point back — the newest, or the one
 //! holding a point in time — verifies every object, and installs it as a
-//! store with a new backup lineage (see [`restore`]).
+//! store with a new backup lineage (see [`restore`]). [`boot::restore_on_boot`]
+//! does the same into an empty data directory when a server starts, and
+//! hands the bucket lease it took to the worker (see [`boot`]).
 //!
 //! The worker never takes an engine lock and never writes to the store; a
 //! failed upload is retried with back-off and reported through
@@ -25,6 +27,7 @@
 /// The object-store crate this one builds on, for callers that read the bucket.
 pub use object_store;
 
+pub mod boot;
 pub mod disk;
 pub mod lease;
 pub mod manifest;
@@ -33,6 +36,7 @@ pub mod segment;
 pub mod store;
 pub mod worker;
 
+pub use boot::{restore_on_boot, BootError, BootLease, BootRestore};
 pub use lease::{BucketLease, Exclusion, LeaseError};
 pub use manifest::{FileEntry, Manifest, SegmentEntry, MANIFEST_VERSION};
 pub use restore::{

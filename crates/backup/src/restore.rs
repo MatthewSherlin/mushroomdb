@@ -39,6 +39,16 @@
 //! next restore into the same target removes such leftovers no running
 //! restore holds. A target that holds anything is refused before anything is
 //! downloaded.
+//!
+//! A restore on boot ([`crate::boot`]) installs in place instead: its target
+//! is a server's data directory, often a volume's mount point, which no
+//! rename can replace and whose parent may not be writable. It stages inside
+//! the data directory, records the restore point it came from
+//! ([`crate::disk::PARENT_FILE`]), and moves the staged files into the
+//! directory under an install marker ([`INSTALL_MARKER`]) naming them. The
+//! marker is removed last: a data directory holding it holds a part of a
+//! store, and the next boot removes exactly the files it names
+//! ([`undo_interrupted_install`]) before restoring again.
 
 use crate::disk;
 use crate::lease::new_instance_id;
@@ -151,6 +161,9 @@ pub enum RestoreS3Error {
     Verify(String),
     /// The target directory already holds something.
     IntoNotEmpty { into: PathBuf },
+    /// A restore on boot: the data directory holds no store, but holds files
+    /// a restore must not mix with (`entries`, by name).
+    DataDirNotEmpty { dir: PathBuf, entries: Vec<String> },
     /// `--at` names a commit below the oldest one the backup still holds.
     BeforeOldestArchive { target: u64, oldest: u64 },
     /// `--at` names a commit past the newest one in the backup, which holds
@@ -197,6 +210,13 @@ impl std::fmt::Display for RestoreS3Error {
                 f,
                 "{} is not empty; restore into a new or empty directory",
                 into.display()
+            ),
+            RestoreS3Error::DataDirNotEmpty { dir, entries } => write!(
+                f,
+                "{} holds no store but is not empty ({}); a restore on boot installs only \
+                 into an empty data directory. Move those away and start again",
+                dir.display(),
+                entries.join(", ")
             ),
             RestoreS3Error::BeforeOldestArchive { target, oldest } => write!(
                 f,
@@ -316,8 +336,52 @@ pub async fn restore_from_store(
     at: Option<RestoreTarget>,
     into: &Path,
 ) -> Result<RestoreS3Outcome, RestoreS3Error> {
-    check_into(into)?;
-    let swept = sweep_stale_staging(into);
+    restore_with(store, prefix, at, into, Mode::Beside).await
+}
+
+/// Restore the newest restore point of `prefix` into the data directory
+/// `dir`, in place (see the [module docs](self)), recording where it came
+/// from in [`crate::disk::PARENT_FILE`]. `dir` may be absent, empty, or hold
+/// only `lost+found`, a `LOCK` file, an empty `wal.bin` and the leftovers of
+/// killed restores into it.
+pub async fn restore_in_place(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    dir: &Path,
+) -> Result<RestoreS3Outcome, RestoreS3Error> {
+    restore_with(store, prefix, None, dir, Mode::InPlace).await
+}
+
+/// Where a restore stages and how it installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `restore --from`: stage beside the target, install with one rename.
+    Beside,
+    /// Restore on boot: stage inside the data directory, install under the
+    /// marker, and record the parent restore point.
+    InPlace,
+}
+
+impl Mode {
+    /// The directory the staging directory and its lock file go in.
+    fn staging_root(self, into: &Path) -> PathBuf {
+        match self {
+            Mode::Beside => parent_of(into),
+            Mode::InPlace => into.to_path_buf(),
+        }
+    }
+}
+
+async fn restore_with(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    at: Option<RestoreTarget>,
+    into: &Path,
+    mode: Mode,
+) -> Result<RestoreS3Outcome, RestoreS3Error> {
+    if mode == Mode::Beside {
+        check_into(into)?;
+    }
     let bucket = Bucket { store, prefix };
     let Some(latest_target) = bucket.get_text(&latest_key(prefix)).await? else {
         return Err(RestoreS3Error::NoBackup {
@@ -328,6 +392,15 @@ pub async fn restore_from_store(
             },
         });
     };
+    // Only once there is something to restore: a restore that cannot start
+    // leaves what killed ones left alone. The sweep can delete gigabytes, so
+    // not on a runtime thread.
+    let (root, name) = (mode.staging_root(into), name_of(into));
+    let swept = blocking(move || Ok(sweep_stale_staging(&root, &name))).await?;
+    if mode == Mode::InPlace {
+        let dir = into.to_path_buf();
+        blocking(move || check_in_place(&dir)).await?;
+    }
     let latest = bucket.manifest(&latest_target).await?;
     // The segments after the newest manifest matter unless the target is a
     // commit the manifest already holds; only then are they skipped.
@@ -379,7 +452,10 @@ pub async fn restore_from_store(
         tracing::warn!(note = %note, "the segments after the newest manifest stop early");
     }
 
-    let staging = Staging::beside(into)?;
+    let staging = {
+        let into = into.to_path_buf();
+        blocking(move || Staging::new(&into, mode)).await?
+    };
     let mut out = RestoreS3Outcome {
         into: into.to_path_buf(),
         manifest: key,
@@ -401,6 +477,11 @@ pub async fn restore_from_store(
     let lineage = out.lineage.clone();
     let cut = target;
     let manifest_key = out.manifest.clone();
+    let parent = (mode == Mode::InPlace).then(|| disk::ParentRecord {
+        lineage: out.source_lineage.clone(),
+        manifest: out.manifest.clone(),
+        commit_seq: expect,
+    });
     blocking(move || -> Result<(), RestoreS3Error> {
         if let Some(n) = cut {
             cut_at_commit(&dir, n).map_err(|e| match e {
@@ -427,6 +508,9 @@ pub async fn restore_from_store(
         mushroomdb::restore::trim_commit_times(&dir, expect)
             .map_err(|e| RestoreS3Error::Io(std::io::Error::other(e.to_string())))?;
         disk::create_lineage(&dir, &lineage)?;
+        if let Some(parent) = &parent {
+            disk::create_parent(&dir, parent)?;
+        }
         let opened = mushroomdb::GraphDb::open_with_options(
             &dir,
             mushroomdb::OpenOptions {
@@ -450,9 +534,15 @@ pub async fn restore_from_store(
     if !out.files.iter().any(|f| f == disk::LINEAGE_FILE) {
         out.files.push(disk::LINEAGE_FILE.to_string());
     }
+    if mode == Mode::InPlace {
+        out.files.push(disk::PARENT_FILE.to_string());
+    }
     let dir = staging.path().to_path_buf();
     let target_dir = into.to_path_buf();
-    out.install_note = blocking(move || install(&dir, &target_dir)).await?;
+    out.install_note = match mode {
+        Mode::Beside => blocking(move || install(&dir, &target_dir)).await?,
+        Mode::InPlace => blocking(move || install_in_place(&dir, &target_dir)).await?,
+    };
     staging.installed();
     Ok(out)
 }
@@ -821,11 +911,16 @@ impl Bucket<'_> {
 /// A name a manifest may restore a file to: one plain file name, and none
 /// the restore writes itself or must never restore.
 fn is_store_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\'])
-        && !matches!(name, "wal.bin" | "snapshot.intent" | "LOCK")
+    is_plain_name(name)
+        && !matches!(
+            name,
+            "wal.bin" | "snapshot.intent" | "LOCK" | disk::PARENT_FILE | INSTALL_MARKER
+        )
+}
+
+/// One plain file name: not empty, not `.` or `..`, no separator.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
 // ── The target ──────────────────────────────────────────────────────────────
@@ -848,6 +943,47 @@ fn check_into(into: &Path) -> Result<(), RestoreS3Error> {
             format!("{}: {e}", into.display()),
         ))),
     }
+}
+
+/// Refuse a data directory to restore into in place unless it holds nothing
+/// but what an empty data directory may hold: `lost+found` (a new ext4
+/// volume has one), a `LOCK` file and an empty `wal.bin` (an open that
+/// stopped before its first commit), and staging directories and lock files
+/// of restores into it.
+fn check_in_place(dir: &Path) -> Result<(), RestoreS3Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(RestoreS3Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", dir.display()),
+            )))
+        }
+    };
+    let name = name_of(dir);
+    let mut others = Vec::new();
+    for e in entries {
+        let e = e?;
+        let entry = e.file_name().to_string_lossy().into_owned();
+        let empty_file =
+            |n: &str| entry == n && e.metadata().is_ok_and(|m| m.is_file() && m.len() == 0);
+        let allowed = entry == "lost+found"
+            || entry == "LOCK"
+            || empty_file("wal.bin")
+            || staging_stem(&entry, &name).is_some();
+        if !allowed {
+            others.push(entry);
+        }
+    }
+    if others.is_empty() {
+        return Ok(());
+    }
+    others.sort();
+    Err(RestoreS3Error::DataDirNotEmpty {
+        dir: dir.to_path_buf(),
+        entries: others,
+    })
 }
 
 /// The parent directory a target sits in; `.` for a bare relative name.
@@ -880,31 +1016,63 @@ fn staging_stem(entry: &str, name: &str) -> Option<String> {
     ok.then(|| format!(".{name}.restore-{stem}"))
 }
 
+/// How old an unlocked lock file, or a staging directory without one, must
+/// be before a sweep counts it as a killed restore's. A restore creates its
+/// lock file, then locks it, then creates its directory: one younger than
+/// this may be a restore between those steps.
+pub const STALE_STAGING_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `path` was last modified at least `age` ago. Unknown is no.
+fn older_than(path: &Path, age: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|elapsed| elapsed >= age)
+}
+
 /// Remove the staging directories, and their lock files, that earlier
-/// restores into `into` left beside it when they were killed: those whose
-/// lock file no process holds. A restore still running holds its lock, and
-/// its staging directory is left alone. Returns what was removed.
-fn sweep_stale_staging(into: &Path) -> Vec<PathBuf> {
-    let parent = parent_of(into);
-    let name = name_of(into);
-    let Ok(entries) = std::fs::read_dir(&parent) else {
+/// restores into `name` left in `root` when they were killed. Removed: one
+/// whose lock file no process holds and is older than
+/// [`STALE_STAGING_AFTER`], and one with no lock file that old itself. Left
+/// alone: one whose lock is held (a restore still running), a young one, and
+/// one whose lock cannot be tried (a filesystem without advisory locks: a
+/// running restore there cannot be told from a killed one). Returns what was
+/// removed.
+fn sweep_stale_staging(root: &Path, name: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
     let mut stems = std::collections::BTreeSet::new();
     for e in entries.flatten() {
-        if let Some(stem) = staging_stem(&e.file_name().to_string_lossy(), &name) {
+        if let Some(stem) = staging_stem(&e.file_name().to_string_lossy(), name) {
             stems.insert(stem);
         }
     }
     let mut removed = Vec::new();
     for stem in stems {
-        let dir = parent.join(&stem);
-        let lock = parent.join(format!("{stem}.lock"));
-        let held = match std::fs::OpenOptions::new().write(true).open(&lock) {
-            Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        let dir = root.join(&stem);
+        let lock = root.join(format!("{stem}.lock"));
+        let stale = match std::fs::OpenOptions::new().write(true).open(&lock) {
+            Ok(f) => match f.try_lock() {
+                Ok(()) => older_than(&lock, STALE_STAGING_AFTER),
+                Err(std::fs::TryLockError::WouldBlock) => false,
+                Err(std::fs::TryLockError::Error(e)) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "cannot tell whether a restore staging directory is in use \
+                         (no advisory locks here); left in place"
+                    );
+                    false
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                older_than(&dir, STALE_STAGING_AFTER)
+            }
             Err(_) => false,
         };
-        if held {
+        if !stale {
             continue;
         }
         if dir.is_dir() && std::fs::remove_dir_all(&dir).is_ok() {
@@ -918,46 +1086,83 @@ fn sweep_stale_staging(into: &Path) -> Vec<PathBuf> {
     removed
 }
 
-/// The staging directory beside the target, `.<name>.restore-<pid>-<tag>`,
-/// with a lock file of the same name plus `.lock` that this restore holds
-/// locked for as long as it runs, so a later restore can tell a killed
-/// restore's leftovers from a running one's. Dropped without
+/// Sweep what killed restores on boot left inside the data directory `dir`
+/// ([`sweep_stale_staging`] with the in-place staging root).
+pub(crate) fn sweep_in_place(dir: &Path) -> Vec<PathBuf> {
+    sweep_stale_staging(dir, &name_of(dir))
+}
+
+/// Staging directories and lock files of restores into `dir` still inside
+/// it: ones a sweep had to leave (too young, or no advisory locks).
+pub(crate) fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+    let name = name_of(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| staging_stem(&e.file_name().to_string_lossy(), &name).is_some())
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The staging directory, `.<name>.restore-<pid>-<tag>` in the mode's
+/// staging root, with a lock file of the same name plus `.lock` that this
+/// restore holds locked for as long as it runs, so a later restore can tell
+/// a killed restore's leftovers from a running one's. Dropped without
 /// [`installed`](Self::installed), the directory and its lock file are
 /// removed, and so are the directories above it that the restore created.
 struct Staging {
     path: PathBuf,
     lock_path: PathBuf,
-    _lock: std::fs::File,
-    /// Ancestors of the target this restore created, deepest first.
+    _lock: Option<std::fs::File>,
+    /// Directories this restore created, deepest first.
     created: Vec<PathBuf>,
 }
 
 impl Staging {
-    fn beside(into: &Path) -> Result<Self, RestoreS3Error> {
-        let parent = parent_of(into);
-        let created: Vec<PathBuf> = parent
-            .ancestors()
-            .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
-            .map(Path::to_path_buf)
-            .collect();
-        std::fs::create_dir_all(&parent)?;
+    fn new(into: &Path, mode: Mode) -> Result<Self, RestoreS3Error> {
+        let root = mode.staging_root(into);
         let stem = format!(
             ".{}.restore-{}-{}",
             name_of(into),
             std::process::id(),
             &new_instance_id()[..8]
         );
-        let path = parent.join(&stem);
-        let lock_path = parent.join(format!("{stem}.lock"));
-        // The lock first: a sweep never sees this directory unlocked.
-        let lock = std::fs::File::create(&lock_path)?;
-        lock.lock()?;
-        let staging = Self {
-            path,
-            lock_path,
-            _lock: lock,
-            created,
+        // The struct first: whatever fails below, Drop removes what was made.
+        let mut staging = Self {
+            path: root.join(&stem),
+            lock_path: root.join(format!("{stem}.lock")),
+            _lock: None,
+            created: root
+                .ancestors()
+                .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+                .map(Path::to_path_buf)
+                .collect(),
         };
+        std::fs::create_dir_all(&root)?;
+        // The lock before the directory: a sweep never sees the directory
+        // unlocked, and leaves a lock file alone while it is young.
+        let lock = std::fs::File::create(&staging.lock_path)?;
+        let locked = if take_fault(into, Fault::Lock) {
+            Err(std::io::Error::other("injected lock failure"))
+        } else {
+            lock.lock()
+        };
+        if let Err(e) = locked {
+            // Some network and FUSE filesystems have no advisory locks. The
+            // restore still works there; a concurrent restore into the same
+            // target just cannot tell this one from a killed one, and leaves
+            // it alone.
+            tracing::warn!(
+                path = %staging.lock_path.display(),
+                error = %e,
+                "cannot lock the restore's lock file; restoring without it"
+            );
+        }
+        staging._lock = Some(lock);
         std::fs::create_dir(&staging.path)?;
         Ok(staging)
     }
@@ -966,8 +1171,8 @@ impl Staging {
         &self.path
     }
 
-    /// The restore is in place: the staging directory became the target, and
-    /// the directories above it stay.
+    /// The restore is in place: the staging directory became the target, or
+    /// was emptied into it, and the directories above it stay.
     fn installed(mut self) {
         self.created.clear();
     }
@@ -996,20 +1201,13 @@ impl Drop for Staging {
 /// replaced: the rename fails and the target is left as it was.
 fn install(staging: &Path, into: &Path) -> Result<Option<String>, RestoreS3Error> {
     // The read-only verification open may have left its lock file.
-    match std::fs::remove_file(staging.join("LOCK")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    remove_if_present(&staging.join("LOCK"))?;
     #[cfg(unix)]
     std::fs::File::open(staging)?.sync_all()?;
     // The target may have been filled since the start; it is checked again.
     check_into(into)?;
-    if take_install_fault(into) {
-        return Err(RestoreS3Error::Io(std::io::Error::other(format!(
-            "installing into {}: injected failure",
-            into.display()
-        ))));
+    if take_fault(into, Fault::BeforeRename) {
+        return Err(injected(into));
     }
     #[cfg(not(unix))]
     let replaced_empty = if into.exists() {
@@ -1041,40 +1239,266 @@ fn install(staging: &Path, into: &Path) -> Result<Option<String>, RestoreS3Error
     }
     // From here the store is in place: nothing below is a failure of the
     // restore, only a doubt about how durable its directory entry is.
+    let parent = parent_of(into);
+    Ok(sync_dir(into, &parent).err().map(|e| {
+        let note = format!(
+            "the restored store is in place in {}, but syncing its parent directory {} \
+             failed ({e}): its directory entry may not survive a power loss",
+            into.display(),
+            parent.display()
+        );
+        tracing::warn!(note = %note, "restore installed");
+        note
+    }))
+}
+
+/// The file in a data directory that says a restore on boot is moving a
+/// store into it: one line per file it moves, `<name>\t<size>\t<mtime ns>`,
+/// as the file was staged. [`mushroomdb::GraphDb::open`] refuses a directory
+/// holding it.
+pub use mushroomdb::restore::INSTALL_MARKER;
+
+/// Move the staged store into the data directory `dir`, in place.
+///
+/// The marker naming every staged file (with its size and modification
+/// time) is written and fsynced first; the files are renamed in
+/// (`snapshot.bin` and `wal.bin`, which make the directory a store, last),
+/// the directory fsynced, the marker removed and the directory fsynced
+/// again. The install has succeeded only once that last fsync has: until
+/// then a power loss can bring the marker back, and the next boot would undo
+/// the install, so a failed last fsync fails the restore and the server does
+/// not start. A failure before the marker's removal removes what it moved,
+/// makes that durable, and only then removes the marker, so the directory is
+/// as it was. A crash leaves the marker, and the next restore on boot
+/// removes the files it names ([`undo_interrupted_install`]).
+fn install_in_place(staging: &Path, dir: &Path) -> Result<Option<String>, RestoreS3Error> {
+    remove_if_present(&staging.join("LOCK"))?;
     #[cfg(unix)]
+    std::fs::File::open(staging)?.sync_all()?;
+    check_in_place(dir)?;
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(staging)? {
+        names.push(e?.file_name().to_string_lossy().into_owned());
+    }
+    // The files that make a directory a store go in last.
+    names.sort_by_key(|n| (matches!(n.as_str(), "snapshot.bin" | "wal.bin"), n.clone()));
+    if take_fault(dir, Fault::BeforeRename) {
+        return Err(injected(dir));
+    }
+    let mut lines = Vec::new();
+    for name in &names {
+        let (size, mtime) = disk::ident_of(&std::fs::metadata(staging.join(name))?);
+        lines.push(format!("{name}\t{size}\t{mtime}"));
+    }
+    let marker = dir.join(INSTALL_MARKER);
     {
-        let parent = parent_of(into);
-        if let Err(e) = std::fs::File::open(&parent).and_then(|d| d.sync_all()) {
-            let note = format!(
-                "the restored store is in place in {}, but syncing its parent directory {} \
-                 failed ({e}): its directory entry may not survive a power loss",
-                into.display(),
-                parent.display()
-            );
-            tracing::warn!(note = %note, "restore installed");
-            return Ok(Some(note));
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&marker)?;
+        f.write_all(lines.join("\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    let mut moved: Vec<&str> = Vec::new();
+    let result = (|| -> Result<(), RestoreS3Error> {
+        sync_dir(dir, dir)?;
+        for name in &names {
+            if take_fault(dir, Fault::AfterMoving(moved.len())) {
+                return Err(injected(dir));
+            }
+            std::fs::rename(staging.join(name), dir.join(name)).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("moving {name} into {}: {e}", dir.display()),
+                )
+            })?;
+            moved.push(name);
         }
+        sync_dir(dir, dir)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        for name in &moved {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        // The marker goes only once the removals are durable: otherwise a
+        // power loss could keep a part of a store and lose the marker.
+        if sync_dir(dir, dir).is_ok() {
+            let _ = std::fs::remove_file(&marker);
+            let _ = sync_dir(dir, dir);
+        }
+        return Err(e);
+    }
+    if !take_fault(dir, Fault::KeepMarker) {
+        std::fs::remove_file(&marker)?;
+    }
+    if let Err(e) = sync_marker_removal(dir) {
+        return Err(RestoreS3Error::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "the restored store is in {}, but syncing the directory after removing the \
+                 install marker failed ({e}); not served, since a power loss could bring the \
+                 marker back. Start again: the next boot serves the store, or restores it \
+                 again if the marker came back",
+                dir.display()
+            ),
+        )));
     }
     Ok(None)
 }
 
-/// Targets whose next install fails just before the rename (tests only).
-static INSTALL_FAULTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+fn sync_marker_removal(dir: &Path) -> std::io::Result<()> {
+    if take_fault(dir, Fault::MarkerRemovalSync) {
+        return Err(std::io::Error::other("injected fsync failure"));
+    }
+    sync_dir(dir, dir)
+}
+
+/// Whether `dir` holds a restore on boot that stopped while it moved its
+/// files in ([`INSTALL_MARKER`]): what the directory holds is then a part of
+/// a store, and must not be opened.
+pub fn install_interrupted(dir: &Path) -> bool {
+    dir.join(INSTALL_MARKER).exists()
+}
+
+/// Undo a restore on boot that stopped while it moved its files into `dir`:
+/// remove the files its [`INSTALL_MARKER`] names, then the marker. Returns
+/// the files removed; nothing when there is no marker. Only plain file names
+/// directly in `dir` are touched.
+///
+/// # Errors
+///
+/// Nothing is removed when a file the marker names is no longer the file the
+/// restore staged (another size or modification time) or a store file it
+/// does not name has appeared: the store has changed since the install, so
+/// it may have served writes, and deleting it could lose them. The error says
+/// so and how to go on.
+pub fn undo_interrupted_install(dir: &Path) -> std::io::Result<Vec<String>> {
+    let marker = dir.join(INSTALL_MARKER);
+    let listed = match std::fs::read_to_string(&marker) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut entries: Vec<(&str, Option<disk::Ident>)> = Vec::new();
+    for line in listed.lines() {
+        let mut fields = line.split('\t').map(str::trim);
+        let Some(name) = fields.next().filter(|n| is_plain_name(n)) else {
+            continue;
+        };
+        let size = fields.next().and_then(|v| v.parse::<u64>().ok());
+        let mtime = fields.next().and_then(|v| v.parse::<u64>().ok());
+        entries.push((name, size.zip(mtime)));
+    }
+    let changed = |why: String| {
+        std::io::Error::other(format!(
+            "{} holds the install marker of a restore on boot ({}), but {why} since that \
+             install: the store may have served writes, so nothing was removed. If the store \
+             is the one you want, delete {}; to restore again, empty the directory",
+            dir.display(),
+            marker.display(),
+            marker.display()
+        ))
+    };
+    for (name, ident) in &entries {
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(name)) else {
+            continue;
+        };
+        if let Some(staged) = ident {
+            // An empty file is what an empty data directory may hold before
+            // the install (an empty `wal.bin`): it holds no writes.
+            if meta.is_file() && meta.len() > 0 && disk::ident_of(&meta) != *staged {
+                return Err(changed(format!("{name} has changed")));
+            }
+        }
+    }
+    for written in ["snapshot.bin", "wal.bin"] {
+        if !entries.iter().any(|(n, _)| *n == written) && dir.join(written).exists() {
+            return Err(changed(format!("{written} has appeared")));
+        }
+    }
+    let mut removed = Vec::new();
+    for (name, _) in &entries {
+        let path = dir.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            std::fs::remove_file(&path)?;
+            removed.push(name.to_string());
+        }
+    }
+    sync_dir(dir, dir)?;
+    std::fs::remove_file(&marker)?;
+    sync_dir(dir, dir)?;
+    Ok(removed)
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// fsync the directory `dir` (a no-op off Unix). `target` keys the test
+/// hook's injected failure.
+fn sync_dir(target: &Path, dir: &Path) -> std::io::Result<()> {
+    if take_fault(target, Fault::DirSync) {
+        return Err(std::io::Error::other("injected fsync failure"));
+    }
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+fn injected(into: &Path) -> RestoreS3Error {
+    RestoreS3Error::Io(std::io::Error::other(format!(
+        "installing into {}: injected failure",
+        into.display()
+    )))
+}
+
+/// A failure a test can make the next restore into a target hit.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Just before the install moves anything, the store staged and fsynced.
+    BeforeRename,
+    /// An in-place install, after it moved this many files in.
+    AfterMoving(usize),
+    /// The next directory fsync.
+    DirSync,
+    /// Locking the staging lock file.
+    Lock,
+    /// An in-place install: the fsync after the marker's removal.
+    MarkerRemovalSync,
+    /// An in-place install: the marker is not removed, yet the install
+    /// reports success, as after a power loss that undid the removal.
+    KeepMarker,
+}
+
+/// Faults to inject, by target (tests only).
+static FAULTS: std::sync::Mutex<Vec<(PathBuf, Fault)>> = std::sync::Mutex::new(Vec::new());
 
 /// Make the next restore into `into` fail at the last step, with the whole
 /// store staged and fsynced and nothing yet moved. For tests of what a failed
 /// install leaves behind.
 #[doc(hidden)]
 pub fn fail_next_install_into(into: &Path) {
-    INSTALL_FAULTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(into.to_path_buf());
+    inject_fault(into, Fault::BeforeRename);
 }
 
-fn take_install_fault(into: &Path) -> bool {
-    let mut faults = INSTALL_FAULTS.lock().unwrap_or_else(|p| p.into_inner());
-    match faults.iter().position(|p| p == into) {
+/// Make the next restore into `into` hit `fault` (tests only).
+#[doc(hidden)]
+pub fn inject_fault(into: &Path, fault: Fault) {
+    FAULTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((into.to_path_buf(), fault));
+}
+
+fn take_fault(into: &Path, fault: Fault) -> bool {
+    let mut faults = FAULTS.lock().unwrap_or_else(|p| p.into_inner());
+    match faults.iter().position(|(p, f)| p == into && *f == fault) {
         Some(i) => {
             faults.remove(i);
             true

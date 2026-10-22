@@ -340,6 +340,20 @@ impl<'a> GraphView<'a> {
         Some(ids)
     }
 
+    /// The range index a range or ordered scan of `(label, field)` may read:
+    /// `Some` only when a range index is declared on the pair, and the index
+    /// describes exactly the nodes this view reads: it is not a reader's
+    /// layered index (whose range lookups see only the layer's own entries),
+    /// and no node layer (a delta tail, a transaction's writes) lies over the
+    /// view. `None` means scan. The caller applies the mask.
+    pub fn range_index(&self, label: &str, field: &str) -> Option<&UnifiedIndex> {
+        let index = self.prop_index?;
+        let usable = self.layer.is_none()
+            && !index.is_layered()
+            && index.kind_of(label, field) == Some(core_storage::IndexKind::Range);
+        usable.then_some(index)
+    }
+
     pub fn nodes_with_label(&self, label: &str) -> Vec<u32> {
         let Some(sym) = self.sym(label) else {
             return Vec::new();

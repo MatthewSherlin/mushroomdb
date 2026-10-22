@@ -26,8 +26,8 @@ use axum::{Json, Router};
 use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
     BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
-    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value,
-    WccConfig, SUGGEST_DEFAULT_SEED,
+    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SchemaError, SchemaErrorKind,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -36,6 +36,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
+
+// The `/tx/*` routes and the open-transaction store. Declared here, not in
+// `lib.rs`, so the module reaches this file's private helpers (`graph_err`,
+// `forbidden`, ...) instead of widening each of them to `pub(crate)`.
+#[path = "tx.rs"]
+mod tx;
+pub(crate) use tx::TxStore;
+pub use tx::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
 
 /// Build the HTTP router over `db`. The graph read endpoints (`/query`,
 /// `/node/{key}`, its `/edges` and `/neighborhood`), `/health`, `/metrics` and
@@ -150,6 +158,31 @@ pub fn router_with_cors(
         Arc::new(AtomicBool::new(true)),
         cors,
         None,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`router_with_access_keys`] with the open-transaction limits given instead
+/// of read from `MUSHROOMDB_TX_MAX` and `MUSHROOMDB_TX_TIMEOUT_SECS`. For an
+/// embedder that serves several routers, and for tests that need a short idle
+/// timeout.
+pub fn router_with_tx_limits(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    keys: Option<AccessKeys>,
+    limits: TxLimits,
+) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        keys,
+        TxStore::new(limits),
     )
 }
 
@@ -297,6 +330,7 @@ pub async fn serve(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -322,6 +356,7 @@ pub async fn serve_with_role_tokens(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -352,6 +387,7 @@ pub async fn serve_with_ui(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -375,6 +411,7 @@ pub async fn serve_with_ui_and_role_tokens(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -401,6 +438,7 @@ pub async fn serve_with_embedded_ui(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -435,6 +473,7 @@ pub async fn serve_with_shutdown(
         Some(shutdown),
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -457,6 +496,7 @@ pub async fn serve_with_role_tokens_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -472,6 +512,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -483,6 +524,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -507,6 +549,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -523,6 +566,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -534,6 +578,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -557,6 +602,7 @@ pub async fn serve_with_embedded_ui_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -573,6 +619,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -584,6 +631,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -606,6 +654,7 @@ async fn serve_inner(
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -613,7 +662,18 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app_with_ready(db, token, role_tokens, ui, local, false, ready_flag, keys);
+    let txs = TxStore::new(tx_limits);
+    let app = build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        local,
+        false,
+        ready_flag,
+        keys,
+        txs.clone(),
+    );
     match shutdown {
         None => axum::serve(listener, app).await,
         // Stop accepting, then let every request already in flight finish.
@@ -623,6 +683,9 @@ async fn serve_inner(
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.await;
+                    // The start of the drain: open transactions roll back and
+                    // a new `begin` is refused.
+                    txs.close();
                 })
                 .await
         }
@@ -646,9 +709,7 @@ pub async fn serve_tls(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let config = crate::tls::http_rustls_config(&cert_path, &key_path)?;
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
@@ -691,6 +752,7 @@ pub async fn serve_tls_with_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -709,17 +771,17 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let config = crate::tls::http_rustls_config(&cert_path, &key_path)?;
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     if ready.send(local).is_err() {
         eprintln!("serve_tls: readiness receiver dropped before bind notify");
     }
-    let app = build_app_with_ready(
+    let txs = TxStore::new(tx_limits);
+    let app = build_app_with_ready_and_txs(
         db,
         token,
         role_tokens,
@@ -728,12 +790,14 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
         true,
         ready_flag,
         keys,
+        txs.clone(),
     );
     let handle = axum_server::Handle::new();
     tokio::spawn({
         let handle = handle.clone();
         async move {
             let _ = shutdown.await;
+            txs.close();
             handle.graceful_shutdown(Some(TLS_GRACE));
         }
     });
@@ -785,6 +849,33 @@ fn build_app_with_ready(
     ready: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
 ) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        ready,
+        keys,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`build_app_with_ready`] over a transaction store the caller holds, so the
+/// serve loop can close it when the shutdown signal arrives.
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_ready_and_txs(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    txs: TxStore,
+) -> Router {
     // The CLI validates the variable before it opens the store; an invalid value
     // reaching here (library use) fails closed: no CORS, and an error logged.
     let cors = crate::cors::cors_layer_from_env().unwrap_or_else(|e| {
@@ -801,6 +892,7 @@ fn build_app_with_ready(
         ready,
         cors,
         keys,
+        txs,
     )
 }
 
@@ -815,6 +907,7 @@ fn build_app_with_cors(
     ready: Arc<AtomicBool>,
     cors: Option<tower_http::cors::CorsLayer>,
     keys: Option<AccessKeys>,
+    txs: TxStore,
 ) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
@@ -839,11 +932,24 @@ fn build_app_with_cors(
         started_at: std::time::Instant::now(),
         ready,
         access_keys: keys,
+        txs,
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready_handler))
         .route("/query", post(query))
+        .route("/schema/indexes", get(schema_indexes_list))
+        .route("/schema/indexes", post(schema_index_create))
+        .route(
+            "/schema/indexes/{name}",
+            axum::routing::delete(schema_index_drop),
+        )
+        .route("/schema/constraints", get(schema_constraints_list))
+        .route("/schema/constraints", post(schema_constraint_create))
+        .route(
+            "/schema/constraints/{name}",
+            axum::routing::delete(schema_constraint_drop),
+        )
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/ingest", post(ingest))
@@ -881,6 +987,7 @@ fn build_app_with_cors(
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
         .route("/backup", post(backup))
+        .merge(tx::routes())
         .with_state(state.clone());
 
     // The two WebSocket routes are built separately and merged unlayered: a
@@ -1242,12 +1349,14 @@ fn role_for_token<'a>(
 
 /// Whether a read-tier key may make this request at all. An allowlist, so a
 /// route added later is refused to read keys until someone decides otherwise:
-/// reads (`GET`), and the two `POST` routes that carry a read (`/query`, whose
-/// handler refuses a write statement, and `/find_similar`).
+/// reads (`GET`), the two `POST` routes that carry a read (`/query`, whose
+/// handler refuses a write statement, and `/find_similar`), and the `/tx/*`
+/// routes: a read key may hold a transaction, whose handler refuses a write.
 fn read_key_may(method: &Method, path: &str) -> bool {
     match *method {
         Method::GET | Method::HEAD => true,
-        Method::POST => path == "/query" || path == "/find_similar",
+        Method::POST => path == "/query" || path == "/find_similar" || path.starts_with("/tx/"),
+        Method::DELETE => path.starts_with("/tx/"),
         _ => false,
     }
 }
@@ -1819,6 +1928,276 @@ async fn query(
     };
 
     format_query_result(rs, format)
+}
+
+// ── /schema/indexes and /schema/constraints (TY-11) ─────────────────────────
+//
+// Each route runs what the matching Cypher DDL statement runs
+// (`GraphDb::schema_*`, `SHOW …`), so HTTP, Cypher and the CLI cannot
+// disagree: a row has the fields and values `SHOW` gives it, a role-bound
+// caller sees what its `SHOW` shows, and a write is refused to the callers a
+// DDL write is refused to.
+
+/// The rows of `SHOW INDEXES` / `SHOW CONSTRAINTS` as objects, narrowed to
+/// what `identity` can see exactly as the same statement through `/query` is.
+fn schema_listing_response(state: &AppState, identity: &AuthIdentity, statement: &str) -> Response {
+    let params = BTreeMap::new();
+    let rs = match identity {
+        AuthIdentity::Role(role_name) => {
+            let snap = state.db.reader();
+            let role_mask = match snap.mask_for_role(role_name) {
+                Ok(m) => m,
+                Err(e) => return role_mask_err(e),
+            };
+            snap.query_masked(statement, &params, &role_mask)
+        }
+        AuthIdentity::Full | AuthIdentity::Write => state.db.reader().query(statement, &params),
+        AuthIdentity::Anonymous => return forbidden("this endpoint requires a token"),
+    };
+    let rs = match rs {
+        Ok(rs) => rs,
+        Err(e) => return graph_err(e),
+    };
+    let columns: Vec<&String> = rs.columns().iter().collect();
+    let rows: Vec<Js> = (0..rs.len())
+        .map(|i| {
+            let obj: serde_json::Map<String, Js> = columns
+                .iter()
+                .zip(rs.row(i))
+                .map(|(col, cell)| {
+                    let v = cell.as_ref().map_or(Js::Null, crate::json::value_to_json);
+                    ((*col).clone(), v)
+                })
+                .collect();
+            Js::Object(obj)
+        })
+        .collect();
+    json_ok(Js::Array(rows))
+}
+
+async fn schema_indexes_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW INDEXES")
+}
+
+async fn schema_constraints_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW CONSTRAINTS")
+}
+
+/// 403 for a role-bound token on a schema write, as a DDL statement gives it.
+const SCHEMA_ROLE_REFUSAL: &str =
+    "role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP \
+     CONSTRAINT) are not permitted";
+
+/// The refusal a schema write gets for `identity`, if any. A read-tier key never
+/// reaches here (the auth middleware refuses it first), but carries a role.
+fn refuse_schema_write(identity: &AuthIdentity) -> Option<Response> {
+    match identity {
+        AuthIdentity::Role(_) => Some(forbidden(SCHEMA_ROLE_REFUSAL)),
+        AuthIdentity::Anonymous => Some(forbidden("this endpoint requires a token")),
+        AuthIdentity::Full | AuthIdentity::Write => None,
+    }
+}
+
+/// A schema write's error as HTTP, by the kind the engine decided from the
+/// state it found: a name nothing answers to is 404, a collision with what
+/// exists (a taken name or pair, an index a constraint backs, existing
+/// duplicates, a view-owned property) is 409, and a malformed request is 400.
+fn schema_err(e: SchemaError) -> Response {
+    let status = match e.kind {
+        SchemaErrorKind::NotFound => StatusCode::NOT_FOUND,
+        SchemaErrorKind::Conflict => StatusCode::CONFLICT,
+        SchemaErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        SchemaErrorKind::Other => return graph_err(e.error),
+    };
+    let detail = match e.error {
+        GraphError::QueryError { detail } | GraphError::RuleInvalid { detail } => detail,
+        other => other.to_string(),
+    };
+    (status, Json(json!({ "error": detail }))).into_response()
+}
+
+/// The refusal for a schema body that is not an object, or carries a field
+/// outside `allowed`, naming it.
+fn schema_body_check(body: &Js, allowed: &[&str]) -> std::result::Result<(), String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "the body must be a JSON object".to_string())?;
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(unknown) => Err(format!(
+            "unknown field '{unknown}'; this route takes: {}",
+            allowed.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A required, non-empty string field of a schema request body.
+fn schema_text<'a>(body: &'a Js, field: &str) -> std::result::Result<&'a str, String> {
+    match body.get(field).and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(format!(
+            "{field} is required and must be a non-empty string"
+        )),
+    }
+}
+
+/// An optional `name`: absent or null is `None`; otherwise it must be an
+/// identifier, so every surface (HTTP path, Cypher `DROP INDEX name`) can
+/// address it.
+fn schema_name(body: &Js) -> std::result::Result<Option<&str>, String> {
+    match body.get("name") {
+        None | Some(Js::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some(s) if is_schema_identifier(s) => Ok(Some(s)),
+            _ => Err(
+                "name must be a string of letters, digits and underscores, not starting with a digit"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn is_schema_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+async fn schema_index_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "kind"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    let name = match schema_name(&body) {
+        Ok(n) => n.map(str::to_string),
+        Err(e) => return err_response(e),
+    };
+    let kind =
+        match body.get("kind") {
+            None | Some(Js::Null) => "range",
+            Some(v) => match v.as_str() {
+                Some(k @ ("range" | "equality")) => k,
+                _ => return err_response(
+                    "kind must be \"range\" or \"equality\"; full-text indexes are not created \
+                     over this route",
+                ),
+            },
+        };
+    let kind = kind.to_string();
+    let db = state.db.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        let mut g = db.write();
+        match kind.as_str() {
+            "equality" => g.schema_create_equality_index(name.as_deref(), &label, &property),
+            _ => g.schema_create_range_index(name.as_deref(), &label, &property),
+        }
+        .map(|listed| (listed, kind, label, property))
+    })
+    .await;
+    match created {
+        Ok(Ok((listed, kind, label, property))) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": listed, "type": kind, "label": label,
+                "property": property, "state": "online"
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_index_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_index(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "type"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    // A constraint needs a name (Cypher DDL requires one), so there is none to invent.
+    let name = match schema_name(&body) {
+        Ok(Some(n)) => n.to_string(),
+        Ok(None) => return err_response("name is required for a constraint"),
+        Err(e) => return err_response(e),
+    };
+    match body.get("type") {
+        None | Some(Js::Null) => {}
+        Some(v) if v.as_str() == Some("unique") => {}
+        Some(_) => return err_response("type must be \"unique\", the only constraint type"),
+    }
+    let db = state.db.clone();
+    let reply = json!({
+        "name": name, "type": "unique", "label": label, "property": property
+    });
+    match tokio::task::spawn_blocking(move || {
+        db.write()
+            .schema_create_constraint(&name, &label, &property)
+    })
+    .await
+    {
+        Ok(Ok(())) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_constraint(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
 }
 
 /// An unmasked, live (non-`as_of`) read query, on the lock-free reader. An

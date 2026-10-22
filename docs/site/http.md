@@ -80,6 +80,8 @@ Role-token behavior per endpoint:
 | `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
+| `GET /schema/indexes`, `GET /schema/constraints` | 200 — only the rows whose label the role can see a node of, as `SHOW` lists them |
+| `POST`/`DELETE /schema/indexes`, `/schema/constraints` | 403 (schema changes are not permitted to a role token) |
 | `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
@@ -137,7 +139,7 @@ convert it.
 | Tier | What it is |
 |---|---|
 | `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
-| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/schema/*`, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
 | `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
 
 Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
@@ -315,11 +317,12 @@ An error the server's own handlers raise is one JSON object, `{"error": "<what w
 | 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
 | 403 | A role-bound token asked for something outside its role. The message says what |
 | 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
-| 409 | `POST /nodes/{key}/rename` onto a key that is taken, or a write that would give a second node a value a unique constraint covers |
+| 409 | `POST /nodes/{key}/rename` onto a key that is taken, or a write that would give a second node a value a unique constraint covers; on `/tx/*`, a commit conflict or a transaction that is busy |
+| 410 | On `/tx/*`, a transaction rolled back after sitting idle past its timeout |
 | 413 | A request body over 64 MiB, or a `Binary` value over 1 MiB |
 | 415 | A route that takes a JSON body was sent without `Content-Type: application/json` |
 | 500 | The store is corrupt, or `roles.json` is misconfigured |
-| 503 | Another process holds the write lock (`Retry-After: 1`), or the server is at its concurrency limit |
+| 503 | Another process holds the write lock (`Retry-After: 1`), the server is at its concurrency limit, or, on `POST /tx/begin`, it is at its open-transaction limit or shutting down (`Retry-After: 1`) |
 
 What is refused before a handler runs is not that object. A body that is not valid JSON is
 400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, the
@@ -353,6 +356,12 @@ may not see and a key that does not exist are told apart for no one.
 | `GET` | [`/node/{key}/history`](#get-nodekeyhistory) | Every change to a node |
 | `GET` | [`/history/edge`](#get-historyedge) | When edges between two nodes came and went |
 | `GET` | [`/history/was_linked`](#get-historywas_linked) | Whether two nodes were linked on a date or at a commit |
+| `POST` | [`/tx/begin`](#post-txbegin) | Open an interactive transaction |
+| `POST` | [`/tx/{id}/run`](#post-txidrun) | Run one Cypher statement inside it |
+| `POST` | [`/tx/{id}/commit`](#post-txidcommit) | Commit it as one write |
+| `POST` | [`/tx/{id}/rollback`](#post-txidrollback) | Discard it |
+| `DELETE` | [`/tx/{id}`](#delete-txid) | Discard it (same as rollback) |
+| `GET` | [`/tx/{id}`](#get-txid) | Its expiry and how many statements ran |
 | `POST` | [`/nodes`](#post-nodes) | Create a node |
 | `DELETE` | [`/node/{key}`](#delete-nodekey) | Delete a node |
 | `PUT` | [`/node/{key}/prop/{field}`](#put-nodekeypropfield) | Set a property |
@@ -1047,6 +1056,110 @@ first WAL frame after the snapshot. Use
 `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
 snapshots, or `archive_wal: true` to keep it in archives.
 
+## Transactions
+
+An interactive transaction groups several Cypher statements into one atomic write. `POST /tx/begin`
+freezes the store as it is; each statement runs against that frozen state plus the transaction's own
+uncommitted writes; `POST /tx/{id}/commit` writes them all as one commit, or fails and writes nothing.
+Isolation is snapshot isolation: a commit fails with a conflict when a node the transaction read or
+wrote has changed since `begin`.
+
+The state is in the server's memory. A transaction is not durable until it commits, and a restart
+rolls back every open one.
+
+- **Ownership.** A transaction belongs to the credential that began it: the full token, one
+  `keys.json` key, or one role token (a server with no authentication has one shared owner, so every
+  caller reaches every transaction). Anyone else asking for its id gets `404`, the same answer as
+  for an id that never existed.
+- **Idle timeout.** A transaction not touched for `MUSHROOMDB_TX_TIMEOUT_SECS` seconds (default 30)
+  is rolled back. Every `run` restarts the clock; `GET /tx/{id}` does not. The owner of an expired id
+  hears `410` (`transaction expired: idle too long, rolled back`) for a while afterwards, then `404`.
+- **Lifetime.** A transaction is rolled back `MUSHROOMDB_TX_MAX_LIFETIME_SECS` seconds after `begin`
+  (default 300) however often it is used, even while a statement is running on it. `expires_at` is the
+  nearer of the idle deadline and this one. A transaction holds its snapshot and every write it has
+  buffered in memory (up to a request body, 64 MiB, per statement), so keep them short; the open limit
+  and the lifetime bound the total, not the size of one.
+- **Limit.** At most `MUSHROOMDB_TX_MAX` transactions are open at once (default 100). `POST /tx/begin`
+  beyond that is `503` with `Retry-After: 1` and `too many open transactions (limit N); retry`. The three variables are read when the server starts; a value
+  that is not a positive integer is ignored with a warning. `mushroomdb serve` takes the same limits as flags,
+  `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs`; a flag wins over its variable, and must be a
+  positive integer.
+- **One request at a time.** A second request on a transaction while another is still running on it
+  is `409` with `{"error": "transaction busy", "code": "busy"}`. A commit conflict is `409` with
+  `"code": "conflict"`. A request the client abandons (it hung up, or the 120 s deadline hit) does not
+  strand the transaction: the statement finishes and the transaction is usable again. Statements never interleave. Retry once the first
+  returns.
+- **Shutdown.** When the server is told to stop, it rolls back every open transaction at the start of
+  the drain and answers `POST /tx/begin` with `503`. A statement already running finishes, and then
+  its transaction is rolled back too.
+- **Read-tier keys and role tokens.** A `read`-tier key or a role token may begin a transaction.
+  Its reads go through the role's mask, on the snapshot the transaction began on. It cannot write: a
+  write statement is `403`, with the same message `/query` gives (`read-tier key: writes are not
+  permitted` for a key), and the transaction stays open. This holds for a role token whose role
+  carries a write scope too, although `POST /query` would let it write: a transaction has no
+  role-aware commit yet (ledger row 140, planned for 0.11). Its commit writes nothing and returns the
+  commit number it read. `write`-tier and `admin` keys and the full token run the transaction engine
+  itself.
+- **Schema statements.** `CREATE` and `DROP` of an index or constraint are refused inside a
+  transaction, with a `400` that says so. `SHOW` is allowed.
+
+The routes take no request body except `run`. The status codes: `404` unknown or not yours, `410`
+expired, `409` commit conflict or busy, `503` limit or shutdown. A `409` from a commit is transient:
+nothing was written, and the whole transaction can be retried from `begin`.
+
+### `POST /tx/begin`
+
+No body. Opens a transaction.
+
+```json
+{ "tx_id": "9f3c1c7e0b2a4d5e8a61f0c4d2b7a913", "expires_at": "2026-10-22T12:00:30.000Z" }
+```
+
+`tx_id` is 32 hex characters, unguessable. `expires_at` is the idle deadline, UTC, ISO 8601; it moves
+forward with each `run`.
+
+### `POST /tx/{id}/run`
+
+```json
+{ "cypher": "CREATE (n:Person {id: $id})", "params": { "id": "p1" } }
+```
+
+`params` is optional and as in [`POST /query`](#post-query). The answer is the shape
+`POST /query?format=json` gives: `{"columns": [...], "rows": [[...]]}`. A statement that fails (`400`,
+or `403` for a write on a scoped transaction) changes nothing, restarts no clock, and leaves the
+transaction open.
+
+### `POST /tx/{id}/commit`
+
+No body. Writes everything the transaction buffered as one commit and ends the transaction.
+
+```json
+{ "bookmark": 42, "bookmark_text": "mushroomdb:commit:42" }
+```
+
+`bookmark` is the commit number of that write (for a transaction that wrote nothing, the commit it
+read). `bookmark_text` is the same number in the text form a Bolt `COMMIT` returns, so either can be
+handed to the other protocol. A node the transaction read or wrote that changed after `begin` makes
+the commit `409` and writes nothing; the transaction is over either way.
+
+### `POST /tx/{id}/rollback`
+
+No body. Discards the transaction. Answers `200` with `{"rolled_back": true}`; an expired one is `410`,
+an unknown one `404`.
+
+### `DELETE /tx/{id}`
+
+The same as `POST /tx/{id}/rollback`.
+
+### `GET /tx/{id}`
+
+```json
+{ "tx_id": "9f3c1c7e0b2a4d5e8a61f0c4d2b7a913", "expires_at": "2026-10-22T12:00:30.000Z", "op_count": 2 }
+```
+
+`op_count` is the number of statements that ran successfully. Reading it does not restart the idle
+clock.
+
 ## Writing nodes and edges
 
 ### `POST /nodes`
@@ -1255,6 +1368,58 @@ only leave edges out; the score is a count.
 ```
 
 Highest first.
+
+## Schema indexes and constraints
+
+`/schema/indexes` and `/schema/constraints` list, create and drop the same things the Cypher statements `SHOW INDEXES`, `CREATE INDEX`, `DROP INDEX`, `SHOW CONSTRAINTS`, `CREATE CONSTRAINT` and `DROP CONSTRAINT` do, through the same code: a row has the fields and values `SHOW` gives it, and a request fails as the statement does. See [Cypher query language](query.md) for the statements.
+
+A `GET` needs read access, and a role-bound token or a `read` key sees only the rows `SHOW` shows it (those whose label it can see a node of). A `POST` or `DELETE` is a write: a full token, an `admin` key or a `write` key may; a role-bound token or a `read` key gets 403.
+
+Errors: a body that is not an object, a field the route does not take (the error names it), a field of the wrong type, a missing or empty field, an unknown `kind` or `type`, a `name` that is not letters, digits and underscores, or a range-index name beginning `eq_` or `ft_` (reserved for the names `SHOW INDEXES` lists equality and full-text indexes under) is `400`. A name that already exists, a pair that already has a range index, an index a unique constraint is checked against, and a constraint over properties that already hold duplicates are `409`. A name nothing answers to on `DELETE` is `404`. Each carries `{"error": "..."}`.
+
+### `GET /schema/indexes`
+
+Every index, range, equality and full-text, sorted by name.
+
+```json
+[{"name": "idx_Person_age", "type": "range", "label": "Person", "property": "age", "state": "online"}]
+```
+
+### `POST /schema/indexes`
+
+Declare an index.
+
+```json
+{"name": "by_age", "label": "Person", "property": "age", "kind": "range"}
+```
+
+`label` and `property` are required. `kind` is `"range"` (the default) or `"equality"`; full-text indexes are declared in a schema file, not here. `name` is optional for a range index and is `idx_<label>_<property>` without it. An equality index has no name of its own and is listed as `eq_<label>_<property>`: omit `name` or give exactly that. Answers `201` with the row `GET` lists.
+
+### `DELETE /schema/indexes/{name}`
+
+Drop the index listed under `name`, of any kind. `204` with no body. An equality index that a unique constraint is checked against is `409` naming the constraint: drop the constraint first.
+
+### `GET /schema/constraints`
+
+Every unique constraint, sorted by name.
+
+```json
+[{"name": "uc_email", "type": "unique", "label": "User", "property": "email"}]
+```
+
+### `POST /schema/constraints`
+
+Declare a unique constraint.
+
+```json
+{"name": "uc_email", "label": "User", "property": "email", "type": "unique"}
+```
+
+`name`, `label` and `property` are required; `type` is `"unique"`, the only one, and may be left out. Answers `201` with the row `GET` lists. Its equality index is created with it.
+
+### `DELETE /schema/constraints/{name}`
+
+Withdraw the constraint. `204` with no body. Its equality index stays.
 
 ## Live streams
 
