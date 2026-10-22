@@ -314,9 +314,9 @@ def test_constraint_and_size_errors_have_their_own_classes():
 
 
 def test_constraint_creation_conflict_carries_the_conflicting_pairs(tmp_path):
-    # Python has no constraint API until the V11 format lands, so this runs only
-    # on a build with the `test-hooks` feature (maturin develop --features
-    # test-hooks) and is skipped on a wheel.
+    # Python has no constraint API of its own yet, so this runs only on a build
+    # with the `test-hooks` feature (maturin develop --features test-hooks) and
+    # is skipped on a wheel.
     db = GraphDb.open(str(tmp_path / "db"))
     if not hasattr(db, "_declare_constraint_for_test"):
         pytest.skip("built without the test-hooks feature")

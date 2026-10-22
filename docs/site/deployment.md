@@ -170,6 +170,21 @@ recipes are the most reliable routes known, written without a live account.
 They are confirmed or corrected at the release gate by a real deploy on each
 platform, and this page changes with what that shows.
 
+## Kubernetes
+
+`deploy/k8s/statefulset.yaml` runs one replica as a StatefulSet with a ReadWriteOnce volume. The token is not in the file: create it first, or the pod stays in `CreateContainerConfigError`.
+
+```text
+kubectl create secret generic mushroomdb-token --from-literal=token="$(openssl rand -hex 32)"
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
+
+- **Pin the image.** `:latest` is only the manifest default; set a version tag.
+- **One replica.** mushroomdb is single-writer; the manifest ships no autoscaler.
+- **Volume ownership.** `fsGroup: 65532` gives the non-root image a writable volume. A storage class that ignores `fsGroup` shows as a permission-denied crash loop on `/data`.
+- **Placeholder token.** `serve` refuses the literal `<set-me>` as a token and exits with status 1.
+- **Not yet verified on a live cluster.**
+
 ## One writer per backup bucket (the lease)
 
 When `MUSHROOMDB_BACKUP_S3_URL` turns on continuous backup, `serve` takes a lease

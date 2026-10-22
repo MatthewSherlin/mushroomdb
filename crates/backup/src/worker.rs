@@ -136,19 +136,21 @@ use tokio::time::Instant;
 ///
 /// `snapshot.intent` is deliberately absent: it describes one machine's
 /// half-finished snapshot and must never be restored onto another (W4 §4).
-pub const SIDE_FILES: [&str; 6] = [
+pub const SIDE_FILES: [&str; 7] = [
     LINEAGE_FILE,
     "commit_times.bin",
     "roles.json",
     "keys.json",
     "wal.genesis",
+    // A V11 store's genesis marker, a name 0.9.x does not read (TY-12).
+    "wal.genesis.v11",
     "wal.floor",
 ];
 
 /// The side files that describe the archive chain. They change only at a
 /// snapshot, and they belong to the generation they were read with: captured
 /// once, when the generation starts, never refreshed under it.
-const CHAIN_FILES: [&str; 2] = ["wal.genesis", "wal.floor"];
+const CHAIN_FILES: [&str; 3] = ["wal.genesis", "wal.genesis.v11", "wal.floor"];
 
 /// Consecutive failed steps after which the worker reports itself unhealthy.
 pub const UNHEALTHY_AFTER_FAILURES: u32 = 3;

@@ -191,3 +191,155 @@ fn the_railway_template_drains_long_enough_for_the_shutdown_sequence() {
         .expect("railway.json sets deploy.drainingSeconds");
     assert!(seconds >= 55, "drainingSeconds {seconds} < 55");
 }
+
+/// The k8s manifest as JSON documents. Parsing is done by python3's PyYAML (no
+/// YAML crate may be added); the test is skipped with a message where that is
+/// unavailable, and fails when `CI` is set.
+fn k8s_documents() -> Option<Vec<serde_json::Value>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s/statefulset.yaml");
+    let script =
+        "import sys, json, yaml; print(json.dumps(list(yaml.safe_load_all(open(sys.argv[1])))))";
+    let out = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(&path)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).expect("json")),
+        other => {
+            // A skip in CI would leave the manifest unchecked without anyone seeing it.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "python3 with PyYAML is required in CI: {other:?}"
+            );
+            eprintln!("skipping: python3 with PyYAML unavailable: {other:?}");
+            None
+        }
+    }
+}
+
+fn k8s_statefulset(documents: &[serde_json::Value]) -> &serde_json::Value {
+    documents
+        .iter()
+        .find(|d| d["kind"] == "StatefulSet")
+        .expect("a StatefulSet")
+}
+
+#[test]
+fn k8s_statefulset_is_single_writer_with_ready_and_health_probes() {
+    let text = template("k8s/statefulset.yaml");
+    assert!(text.contains("SINGLE WRITER - replicas must be 1"));
+    assert!(!text.contains("7687"), "Bolt is added by HO-15");
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    assert!(
+        documents
+            .iter()
+            .all(|d| d["kind"] != "HorizontalPodAutoscaler"),
+        "no HPA resource"
+    );
+    let set = k8s_statefulset(&documents);
+    assert_eq!(set["spec"]["replicas"], 1);
+    assert_eq!(
+        set["spec"]["volumeClaimTemplates"][0]["spec"]["accessModes"][0],
+        "ReadWriteOnce"
+    );
+    let pod = &set["spec"]["template"]["spec"];
+    assert_eq!(pod["securityContext"]["fsGroup"], 65532);
+    assert_eq!(
+        pod["securityContext"]["fsGroupChangePolicy"],
+        "OnRootMismatch"
+    );
+    assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(pod["terminationGracePeriodSeconds"], 120);
+    let container = &pod["containers"][0];
+    assert_eq!(
+        container["image"],
+        "ghcr.io/matthewsherlin/mushroomdb:latest"
+    );
+    assert_eq!(container["readinessProbe"]["httpGet"]["path"], "/ready");
+    assert_eq!(container["readinessProbe"]["initialDelaySeconds"], 60);
+    assert_eq!(container["livenessProbe"]["httpGet"]["path"], "/health");
+    assert_eq!(container["livenessProbe"]["initialDelaySeconds"], 30);
+    assert_eq!(container["startupProbe"]["httpGet"]["path"], "/health");
+}
+
+#[test]
+fn k8s_statefulset_runs_an_explicit_serve_command() {
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    let container = &k8s_statefulset(&documents)["spec"]["template"]["spec"]["containers"][0];
+    let args: Vec<&str> = container["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert_eq!(&args[..2], ["serve", "/data"]);
+    assert!(!args.contains(&"--demo-if-empty"));
+}
+
+#[test]
+fn k8s_token_comes_from_an_external_required_secret_and_no_secret_object_ships() {
+    let text = template("k8s/statefulset.yaml");
+    assert!(!text.contains("<set-me>"), "no placeholder token value");
+    assert!(!text.contains("stringData"));
+    assert!(text.contains("TODO(HO-14/HO-15)"));
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    assert!(documents.iter().all(|d| d["kind"] != "Secret"));
+    let container = &k8s_statefulset(&documents)["spec"]["template"]["spec"]["containers"][0];
+    let token = container["env"]
+        .as_array()
+        .expect("env")
+        .iter()
+        .find(|e| e["name"] == "MUSHROOMDB_TOKEN")
+        .expect("MUSHROOMDB_TOKEN env");
+    assert!(token.get("value").is_none(), "token must not be inline");
+    let reference = &token["valueFrom"]["secretKeyRef"];
+    assert_eq!(reference["name"], "mushroomdb-token");
+    assert_eq!(reference["key"], "token");
+    assert!(
+        reference.get("optional").is_none() || reference["optional"] == false,
+        "the Secret must be required so the pod fails closed"
+    );
+}
+
+#[test]
+fn k8s_container_is_hardened_and_has_resources() {
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    let pod = &k8s_statefulset(&documents)["spec"]["template"]["spec"];
+    let container = &pod["containers"][0];
+    let security = &container["securityContext"];
+    assert_eq!(security["allowPrivilegeEscalation"], false);
+    assert_eq!(security["readOnlyRootFilesystem"], true);
+    assert_eq!(security["capabilities"]["drop"][0], "ALL");
+    assert_eq!(security["seccompProfile"]["type"], "RuntimeDefault");
+    assert!(container["resources"]["requests"]["memory"].is_string());
+    assert!(container["resources"]["requests"]["cpu"].is_string());
+    assert!(container["resources"]["limits"]["memory"].is_string());
+    let mounts: Vec<&str> = container["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["mountPath"].as_str().unwrap())
+        .collect();
+    assert!(mounts.contains(&"/data") && mounts.contains(&"/tmp"));
+}
+
+#[test]
+fn k8s_governing_service_is_headless() {
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    let governing = k8s_statefulset(&documents)["spec"]["serviceName"].clone();
+    let service = documents
+        .iter()
+        .find(|d| d["kind"] == "Service" && d["metadata"]["name"] == governing)
+        .expect("governing Service");
+    assert_eq!(service["spec"]["clusterIP"], "None");
+}

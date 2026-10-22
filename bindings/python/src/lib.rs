@@ -204,17 +204,15 @@ impl GraphDb {
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
-    /// Declare a unique constraint on a handle with the V11 format unlocked.
+    /// Declare a unique constraint.
     ///
     /// Test-only: built with the `test-hooks` feature and never in a wheel.
-    /// Python has no constraint API until the V11 format lands (0.10 TY-12),
-    /// so this is how a test reaches the errors a declaration raises.
+    /// Python has no constraint API of its own yet, so this is how a test
+    /// reaches the errors a declaration raises. Like any declaration, it moves
+    /// the store to the V11 snapshot format.
     #[cfg(feature = "test-hooks")]
     fn _declare_constraint_for_test(&self, name: &str, label: &str, field: &str) -> PyResult<()> {
-        self.with_mut(|db| {
-            db.unlock_v11_format_for_test();
-            db.create_constraint(name, label, field)
-        })
+        self.with_mut(|db| db.create_constraint(name, label, field))
     }
 
     /// Insert `key` if absent, otherwise update it in place.
@@ -2097,9 +2095,11 @@ impl GraphDb {
     /// `matched`, `derived`, `provisional`, `provisional_capped` (keys past
     /// the per-call cap of 20, **not** created), `fulltext_declared`,
     /// `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-    /// the identity links this call made, and the ones it retracted). A
-    /// `score` is the raw float (`0.6666666666666666`); the MCP tool prints
-    /// the same score to two decimals.
+    /// the identity links this call made, and the ones it retracted), and
+    /// `same_as_unread` (`None`, or the error text when the write committed
+    /// but its links could not be read back, so both lists are empty because
+    /// nothing was read). A `score` is the raw float (`0.6666666666666666`);
+    /// the MCP tool prints the same score to two decimals.
     ///
     /// Raises `IngestError` when the text is empty or over 4,000 characters,
     /// the `kind` is unknown, an entity's `props` carry `aliases` or
@@ -2218,10 +2218,13 @@ impl GraphDb {
     /// is a `ValueError`.
     ///
     /// Returns `{"key", "label", "created", "updated_fields",
-    /// "same_as_lost"}`. `same_as_lost` lists the identity links this update
-    /// retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-    /// full-name link below the floor. A `score` is the raw float
-    /// (`0.6666666666666666`); the MCP tool prints it to two decimals.
+    /// "same_as_lost", "same_as_unread"}`. `same_as_lost` lists the identity
+    /// links this update retracted, as `{"a", "b", "score"}`: a changed `name`
+    /// can take a full-name link below the floor. `same_as_unread` is `None`,
+    /// or the error text when the update committed but the links could not be
+    /// read back afterwards, so `same_as_lost` is empty because nothing was
+    /// read. A `score` is the raw float (`0.6666666666666666`); the MCP tool
+    /// prints it to two decimals.
     ///
     /// `aliases` or `alias_keys` inside `props` raise `IngestError`: the
     /// store maintains both. So does a `key` that is empty or only
@@ -2281,6 +2284,7 @@ impl GraphDb {
             lost.append(pd)?;
         }
         d.set_item("same_as_lost", lost)?;
+        d.set_item("same_as_unread", &outcome.same_as_unread)?;
         Ok(d.unbind())
     }
 
@@ -3441,6 +3445,17 @@ fn datetime_to_py<'py>(
 /// cannot hold exactly instead of rounding it.
 fn datetime_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     let field = |name: &str| obj.getattr(name)?.extract::<i64>();
+    // A `pandas.Timestamp` is a `datetime` that also carries nanoseconds the
+    // `datetime` fields leave out. The engine holds microseconds, so a nonzero
+    // remainder is refused rather than rounded away.
+    if let Ok(nanos) = obj.getattr("nanosecond") {
+        if nanos.extract::<i64>().unwrap_or(0) != 0 {
+            return Err(PyValueError::new_err(
+                "datetime has a nonzero nanosecond part, which a DateTime or LocalDateTime \
+                 cannot hold exactly: it holds microseconds",
+            ));
+        }
+    }
     let days = days_from_civil(field("year")?, field("month")? as u8, field("day")? as u8);
     let local_micros = days
         .checked_mul(MICROS_PER_DAY)
@@ -3923,33 +3938,10 @@ engine_errors! {
     ValueTooLarge, "value_too_large", "A value is larger than the store accepts. Carries `.field`, `.size` and `.limit`, in bytes. Nothing was written.";
 }
 
-/// Test hook: convert `value` to the engine's `Value` and straight back.
-///
-/// Exercises the same two conversions a write and a read use, without the
-/// engine's V11 write refusal in between. Not part of the supported API.
-#[pyfunction]
-fn _value_roundtrip<'py>(
-    py: Python<'py>,
-    value: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    value_to_py(py, &py_to_value(value)?)
-}
-
-/// Test hook: the ISO 8601 or base64 text the engine prints for `value`, with
-/// its wire tag, or `None` for a type that has none.
-#[pyfunction]
-fn _value_tagged_text(value: &Bound<'_, PyAny>) -> PyResult<Option<(String, String)>> {
-    core_storage::tagged_text(&py_to_value(value)?)
-        .map(|tagged| tagged.map(|(tag, text)| (tag.to_string(), text)))
-        .map_err(PyValueError::new_err)
-}
-
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
     m.add_class::<Duration>()?;
-    m.add_function(wrap_pyfunction!(_value_roundtrip, m)?)?;
-    m.add_function(wrap_pyfunction!(_value_tagged_text, m)?)?;
     register_errors(m)?;
     Ok(())
 }

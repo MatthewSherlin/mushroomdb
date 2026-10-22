@@ -1993,6 +1993,12 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             if let Some(line) = same_as_lost_line(&report.same_as_lost) {
                 rendered.push_str(&line);
             }
+            if let Some(unread) = &report.same_as_unread {
+                rendered.push_str(&format!(
+                    "unread   identity links not checked after commit: {}\n",
+                    digest::sanitize(unread)
+                ));
+            }
             if !report.fulltext_declared.is_empty() {
                 rendered.push_str(&format!(
                     "indexed  {} — full-text search enabled for the first time\n",
@@ -2024,6 +2030,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                         .collect::<Vec<_>>(),
                     "same_as_lost": same_as_lost_json(&report.same_as_lost),
                     "same_as_lost_total": report.same_as_lost.len(),
+                    "same_as_unread": report.same_as_unread,
                 }),
                 |_| rendered,
             )

@@ -36,10 +36,12 @@ A value the store can hold: int, float, str, bool, bytes, date, datetime, Durati
 blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
 is a local date-time; an aware one is a date-time that keeps its UTC offset
 (within +-18:00, whole seconds). A value that cannot be held exactly, such as an
-offset with a fractional second, raises `ValueError` rather than being rounded.
-Reading one back gives the same Python type; a stored date outside Python's
-years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
-write that carries one is refused until the format that holds them lands.
+offset with a fractional second or a `pandas.Timestamp` with a nonzero
+`nanosecond`, raises `ValueError` rather than being rounded. Reading one back
+gives the same Python type; a stored date outside Python's years 1 to 9999
+raises `ValueError`. The first write of a `bytes`, `date`, `datetime` or
+`Duration` value moves the store to the V11 snapshot format, which 0.9.x cannot
+read.
 
 ### `Params`
 
@@ -1354,9 +1356,11 @@ which is what the MCP tool's JSON reply calls it), `created`,
 `matched`, `derived`, `provisional`, `provisional_capped` (keys past
 the per-call cap of 20, **not** created), `fulltext_declared`,
 `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-the identity links this call made, and the ones it retracted). A
-`score` is the raw float (`0.6666666666666666`); the MCP tool prints
-the same score to two decimals.
+the identity links this call made, and the ones it retracted), and
+`same_as_unread` (`None`, or the error text when the write committed
+but its links could not be read back, so both lists are empty because
+nothing was read). A `score` is the raw float (`0.6666666666666666`);
+the MCP tool prints the same score to two decimals.
 
 Raises `IngestError` when the text is empty or over 4,000 characters,
 the `kind` is unknown, an entity's `props` carry `aliases` or
@@ -1445,10 +1449,13 @@ node its own namespace is a no-op and another raises
 is a `ValueError`.
 
 Returns `{"key", "label", "created", "updated_fields",
-"same_as_lost"}`. `same_as_lost` lists the identity links this update
-retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-full-name link below the floor. A `score` is the raw float
-(`0.6666666666666666`); the MCP tool prints it to two decimals.
+"same_as_lost", "same_as_unread"}`. `same_as_lost` lists the identity
+links this update retracted, as `{"a", "b", "score"}`: a changed `name`
+can take a full-name link below the floor. `same_as_unread` is `None`,
+or the error text when the update committed but the links could not be
+read back afterwards, so `same_as_lost` is empty because nothing was
+read. A `score` is the raw float (`0.6666666666666666`); the MCP tool
+prints it to two decimals.
 
 `aliases` or `alias_keys` inside `props` raise `IngestError`: the
 store maintains both. So does a `key` that is empty or only

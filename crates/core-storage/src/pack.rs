@@ -26,22 +26,6 @@ pub fn push_u32s(out: &mut Vec<u8>, v: &[u32]) {
     }
 }
 
-pub fn push_i64s(out: &mut Vec<u8>, v: &[i64]) {
-    push_len(out, v.len());
-    out.reserve(v.len().saturating_mul(8));
-    for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
-pub fn push_f64s(out: &mut Vec<u8>, v: &[f64]) {
-    push_len(out, v.len());
-    out.reserve(v.len().saturating_mul(8));
-    for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
 pub fn push_str(out: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     push_len(out, b.len());

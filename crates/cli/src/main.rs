@@ -175,6 +175,14 @@ fn main() -> ExitCode {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+            // The documentation placeholder is a publicly known value; a deploy
+            // that forgot to replace it must not come up authenticated by it.
+            if token.as_deref() == Some(PLACEHOLDER_TOKEN) {
+                return fail(
+                    "the token is the documentation placeholder `<set-me>`; \
+                     set --token or MUSHROOMDB_TOKEN to a real secret",
+                );
+            }
             if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                 return fail(
                     "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
@@ -569,6 +577,9 @@ fn print_or_fail(r: Result<String, cli::CliError>) -> ExitCode {
         Err(e) => fail(&e.to_string()),
     }
 }
+
+/// The placeholder the deploy templates and docs show where a token goes.
+const PLACEHOLDER_TOKEN: &str = "<set-me>";
 
 fn fail(msg: &str) -> ExitCode {
     let _ = writeln!(io::stderr(), "{msg}");

@@ -52,44 +52,120 @@ pub const VERSION_9: u16 = 9;
 /// A store that never opts in keeps writing [`VERSION_9`] and stays readable by
 /// v0.6.9 indefinitely. See [`version_for`].
 pub const VERSION_10: u16 = 10;
+/// V11: the V9 container written by a store that has opted in to the 0.10
+/// value types, unique constraints or range indexes — the format a 0.9.x
+/// reader cannot follow.
+///
+/// The container is V9's — same `GDB1` magic, 4 KB header page, 16-byte
+/// directory entries and per-section CRC — and `decode` reads it through the
+/// same path. What V11 adds:
+///
+/// * **Columns of the five new value types.** `Date`, `LocalDateTime`,
+///   `DateTime`, `Duration` and `Binary` columns are written into the COLUMNS
+///   section as the existing `Mixed` shape (a bincode map whose values carry
+///   discriminants 6–10). The archived layout of the section does not move.
+/// * **Section 18, DECLARATIONS** ([`crate::v8::SECTION_DECLARATIONS`]): the
+///   unique constraints, equality and range indexes and the multiplicity
+///   opt-in, so a snapshot carries them itself rather than only through the
+///   WAL baseline it writes after.
+/// * **A WAL that may carry discriminants 24–27** (constraint and range-index
+///   declarations) and values with bincode discriminants 6–10.
+///
+/// The version moves for the reason V10's did: a 0.9.x reader meeting a frame
+/// it cannot deserialise treats it as a corrupt tail and, with `repair_wal`,
+/// truncates the WAL there. A V11 stamp makes it stop at `snapshot:
+/// unsupported version 11` first, with the WAL untouched.
+///
+/// **V11 is sticky** (contract C9). A store becomes V11 at its first V11-only
+/// record of any kind and every later snapshot it takes is V11, even after the
+/// last constraint or range index is dropped: its WAL and archives still hold
+/// V11 records. A store that never writes one keeps writing [`VERSION_9`] or
+/// [`VERSION_10`], byte for byte what 0.9.x writes. See [`version_for`].
+pub const VERSION_11: u16 = 11;
 /// Current default encoding version — what a store that has opted in to nothing
 /// writes. [`version_for`] is what decides per store.
 pub const VERSION: u16 = VERSION_9;
 
 /// The versions that share the mmap-able V8 container, oldest first.
 ///
-/// V9 added section 12 and V10 added nothing but its own stamp, so one header
-/// parser and one decode path serve all three. Every reader that decides
-/// whether a snapshot can be mapped zero-copy asks this — the open path, the
-/// as-of path and [`crate::v8::MappedBase`] — so the answer cannot drift
-/// between them. A version missing here is read through the full-decode path
-/// instead, which is correct but loads the whole graph onto the heap.
+/// V9 added section 12, V10 added nothing but its own stamp and V11 added
+/// section 18 and the typed-value columns, so one header parser and one decode
+/// path serve all four. Every reader that decides whether a snapshot can be
+/// mapped zero-copy asks this — the open path, the as-of path and
+/// [`crate::v8::MappedBase`] — so the answer cannot drift between them. A
+/// version missing here is read through the full-decode path instead, which is
+/// correct but loads the whole graph onto the heap.
 ///
 /// **This list is the only place the set is written down.** [`decode`]'s
 /// container arm is a `match` *guard* calling [`is_mmap_container`] rather than
 /// an arm listing the versions, so adding the next container version is one
 /// edit here and nothing else. A slice, not a fixed-size array, so the length
 /// is not a second thing to keep in step.
-pub const MMAP_CONTAINER_VERSIONS: &[u16] = &[VERSION_8, VERSION_9, VERSION_10];
+pub const MMAP_CONTAINER_VERSIONS: &[u16] = &[VERSION_8, VERSION_9, VERSION_10, VERSION_11];
 
 /// Whether `version` is one of the [`MMAP_CONTAINER_VERSIONS`].
 pub fn is_mmap_container(version: u16) -> bool {
     MMAP_CONTAINER_VERSIONS.contains(&version)
 }
 
+/// What a store has opted in to — the facts [`version_for`] reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreFeatures {
+    /// The store records insert-count multiplicity (WAL discriminant 23).
+    pub multiplicity: bool,
+    /// The store has written a V11-only record. Sticky: once set it is never
+    /// cleared, so it alone keeps a store V11 after its last constraint or
+    /// range index is dropped.
+    pub has_v11_types: bool,
+    /// The store declares at least one unique constraint.
+    pub has_constraints: bool,
+    /// The store declares at least one range index.
+    pub has_range_indexes: bool,
+}
+
+impl StoreFeatures {
+    /// Whether these features need the V11 format.
+    pub fn needs_v11(&self) -> bool {
+        self.has_v11_types || self.has_constraints || self.has_range_indexes
+    }
+}
+
 /// The snapshot version a store must be written at.
 ///
-/// `multiplicity` is the only thing that moves it today: a store that records
-/// insert-count multiplicity writes [`VERSION_10`] so that a reader which does
-/// not know WAL discriminant 23 refuses the open instead of truncating the WAL.
-/// Every other store writes [`VERSION_9`] — that is the property the downgrade
-/// path rests on, and it is not a default to be widened casually.
-pub fn version_for(multiplicity: bool) -> u16 {
-    if multiplicity {
+/// [`VERSION_11`] for a store with any V11 feature; else [`VERSION_10`] for a
+/// store that records insert-count multiplicity, so that a reader which does
+/// not know WAL discriminant 23 refuses the open instead of truncating the
+/// WAL; else [`VERSION_9`]. A V11 store that also records multiplicity is V11:
+/// every reader that refuses V10 refuses V11 too, and the multiplicity opt-in
+/// travels in section 18. Every store that opted in to nothing writes
+/// [`VERSION_9`] — that is the property the downgrade path rests on, and it is
+/// not a default to be widened casually.
+pub fn version_for(features: StoreFeatures) -> u16 {
+    if features.needs_v11() {
+        VERSION_11
+    } else if features.multiplicity {
         VERSION_10
     } else {
         VERSION_9
     }
+}
+
+/// The refusal for a snapshot version this binary does not read.
+///
+/// Every refusal starts `snapshot: unsupported version {N}` — the text 0.9.x
+/// prints for V11, and what callers match on. Versions above the newest this
+/// binary writes add why and what to do; V3 and V4 say they are retired.
+pub fn unsupported_version_detail(version: u16) -> String {
+    let hint = match version {
+        3 => " — V3 snapshot is no longer supported; re-snapshot with a V8 binary",
+        4 => " — V4 snapshot is no longer supported; re-snapshot with a V8 binary",
+        v if v > VERSION_11 => {
+            " — this store was written by a newer mushroomdb than this binary. To read it, \
+             upgrade your binary. Downgrade is not supported: see docs/format-stability.md."
+        }
+        _ => "",
+    };
+    format!("snapshot: unsupported version {version}{hint}")
 }
 
 /// Rewrite the version stamp of an encoded V8-family container in place,
@@ -259,6 +335,8 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         fulltext_blob: Vec::new(),
         wal_mark: Vec::new(),
         prov_reconciled: false,
+        v11: false,
+        declarations: Default::default(),
     };
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(
@@ -355,9 +433,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
         VERSION_7 => decode_v7(&bytes[6..]),
         // The mmap-able container family shares one decode path;
         // `decode_v8_from_mapped` reads the shared string section when the
-        // directory carries one. V9 added section 12 and V10 added nothing at
+        // directory carries one. V9 added section 12, V10 added nothing at
         // all — it only declares that the store's WAL may carry discriminant
-        // 23.
+        // 23 — and V11 added section 18 and the typed-value columns.
         //
         // A guard, not an arm listing the versions: a `match` guard *can* call
         // a function, and `MMAP_CONTAINER_VERSIONS` is then the single place
@@ -370,18 +448,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
             let mapped = crate::v8::MappedBase::from_bytes(bytes.to_vec())?;
             decode_v8_from_mapped(&mapped)
         }
-        other => {
-            let hint = if other == 3 {
-                " — V3 snapshot is no longer supported; re-snapshot with a V8 binary"
-            } else if other == 4 {
-                " — V4 snapshot is no longer supported; re-snapshot with a V8 binary"
-            } else {
-                ""
-            };
-            Err(GraphError::Corrupt {
-                detail: format!("snapshot: unsupported version {other}{hint}"),
-            })
-        }
+        other => Err(GraphError::Corrupt {
+            detail: unsupported_version_detail(other),
+        }),
     }
 }
 
@@ -716,10 +785,39 @@ mod tests {
     /// `version_for` is the single place the encoder's choice is made, and its
     /// default is the one the downgrade path depends on.
     #[test]
-    fn only_multiplicity_moves_the_version() {
-        assert_eq!(version_for(false), VERSION_9);
-        assert_eq!(version_for(true), VERSION_10);
+    fn only_opted_in_features_move_the_version() {
+        let none = StoreFeatures::default();
+        assert_eq!(version_for(none), VERSION_9);
+        assert_eq!(
+            version_for(StoreFeatures {
+                multiplicity: true,
+                ..none
+            }),
+            VERSION_10
+        );
         assert_eq!(VERSION, VERSION_9);
+    }
+
+    /// Any one V11 feature makes the store V11, with or without multiplicity —
+    /// V11 is above V10, so a reader that refuses V10 refuses it too.
+    #[test]
+    fn any_v11_feature_writes_v11() {
+        for multiplicity in [false, true] {
+            for (types, constraints, ranges) in [
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
+                let f = StoreFeatures {
+                    multiplicity,
+                    has_v11_types: types,
+                    has_constraints: constraints,
+                    has_range_indexes: ranges,
+                };
+                assert_eq!(version_for(f), VERSION_11, "{f:?}");
+            }
+        }
     }
 
     /// Every version the encoder can write must be mappable, or the store it
@@ -728,14 +826,45 @@ mod tests {
     #[test]
     fn every_version_the_encoder_writes_is_mmap_able() {
         for multiplicity in [false, true] {
-            let v = version_for(multiplicity);
-            assert!(
-                is_mmap_container(v),
-                "V{v} is written but not in MMAP_CONTAINER_VERSIONS"
-            );
+            for has_v11_types in [false, true] {
+                let v = version_for(StoreFeatures {
+                    multiplicity,
+                    has_v11_types,
+                    ..StoreFeatures::default()
+                });
+                assert!(
+                    is_mmap_container(v),
+                    "V{v} is written but not in MMAP_CONTAINER_VERSIONS"
+                );
+            }
         }
         assert!(!is_mmap_container(VERSION_7));
-        assert!(!is_mmap_container(VERSION_10 + 1));
+        assert!(!is_mmap_container(VERSION_11 + 1));
+    }
+
+    /// A version above the newest this binary writes is refused with the
+    /// `snapshot: unsupported version {N}` prefix every caller matches on,
+    /// and says what to do. V11 itself is read, not refused.
+    #[test]
+    fn a_newer_version_is_refused_by_name_with_the_upgrade_hint() {
+        let v9 = encode(&tiny_state()).unwrap();
+        let mut v12 = v9.clone();
+        stamp_container_version(&mut v12, VERSION_11 + 1).unwrap();
+        let err = match decode(&v12) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("V12 must be refused"),
+        };
+        assert!(err.contains("snapshot: unsupported version 12 — "), "{err}");
+        assert!(err.contains("upgrade your binary"), "{err}");
+        assert!(err.contains("docs/format-stability.md"), "{err}");
+        let mut v11 = v9;
+        stamp_container_version(&mut v11, VERSION_11).unwrap();
+        assert!(decode(&v11).unwrap().is_some(), "V11 is read");
+        assert_eq!(
+            unsupported_version_detail(4),
+            "snapshot: unsupported version 4 — V4 snapshot is no longer supported; \
+             re-snapshot with a V8 binary"
+        );
     }
 
     /// `decode`'s dispatch must agree with `MMAP_CONTAINER_VERSIONS` — over
@@ -759,7 +888,7 @@ mod tests {
         let state = tiny_state();
         let v9 = encode(&state).unwrap();
 
-        // Sweep past the versions that exist: 11..=16 are the ones a later
+        // Sweep past the versions that exist: 12..=16 are the ones a later
         // release will claim, and they must track the list, not a literal.
         for v in 0u16..=16 {
             let mut buf = v9.clone();

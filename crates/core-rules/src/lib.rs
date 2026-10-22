@@ -9,7 +9,7 @@ pub use def::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, MAX_KEYMATCH_LIST,
 };
 pub use engine::{
-    BuildProgress, EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport,
+    BuildProgress, CowMut, EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport,
     MAX_CHAIN_DEPTH,
 };
 pub use hnsw::HnswIndex;

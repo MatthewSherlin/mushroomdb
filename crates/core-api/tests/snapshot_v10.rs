@@ -334,8 +334,10 @@ fn a_0_6_9_reader_refuses_a_v10_snapshot() {
     );
 
     // ── Test: an unknown snapshot version refuses, and writes nothing. ──
+    // 12, not 11: this binary reads V11 (0.10 TY-12), and the point is a
+    // version the reader does not know.
     let mut snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
-    core_storage::snapshot::stamp_container_version(&mut snap, 11).unwrap();
+    core_storage::snapshot::stamp_container_version(&mut snap, 12).unwrap();
     std::fs::write(dir.join("snapshot.bin"), &snap).unwrap();
 
     let msg = match GraphDb::open_with_options(&dir, OpenOptions::default()) {
@@ -343,7 +345,7 @@ fn a_0_6_9_reader_refuses_a_v10_snapshot() {
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("unsupported version 11"),
+        msg.contains("unsupported version 12"),
         "the refusal must name the version; got: {msg}"
     );
     assert_eq!(

@@ -148,6 +148,7 @@ fn main() {
         }
     }
     let pairwise: BTreeSet<Pair> = same_as_pairs(&db, &keys)
+        .expect("read same_as pairs")
         .into_iter()
         .map(|p| pair(&p.a, &p.b))
         .collect();

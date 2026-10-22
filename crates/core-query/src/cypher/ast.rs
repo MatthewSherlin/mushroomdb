@@ -144,6 +144,13 @@ pub struct Pattern {
     pub chain: Vec<(RelPat, NodePat)>,
     /// True when parsed as `MATCH shortestPath(...)`.
     pub shortest: bool,
+    /// The name bound before `=` in `MATCH p = (a)-[r]->(b)`.
+    pub path_var: Option<String>,
+    /// True for the second and later comma-separated parts of one MATCH
+    /// clause (`MATCH (a)-[r]->(b), (c)-[s]->(d)`). The parts of one clause
+    /// share relationship uniqueness: no relationship is bound twice across
+    /// them. A pattern that starts a new MATCH clause has `false`.
+    pub continues_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +183,8 @@ pub struct RelPat {
 pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// `a XOR b`: true when exactly one side is true.
+    Xor(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Cmp {
         lhs: Operand,
@@ -192,10 +201,13 @@ pub enum Expr {
     IsNull(Operand),
     /// `operand IS NOT NULL` — true iff the operand is non-null.
     IsNotNull(Operand),
-    /// `expr IN [a, b, $p]` or `expr IN $list` (`$list` is `Value::List`).
+    /// `expr IN list`: `list` is one list-valued expression, `[a, b, $p]`,
+    /// `$list`, `n.tags` or `[1] + [2]`. Its elements are compared whole, so
+    /// `[1, 2] IN [[1, 2]]` is true and `1 IN [[1]]` is false. A `list` that
+    /// is not a list at all is compared as one element.
     In {
         expr: Operand,
-        list: Vec<Operand>,
+        list: Operand,
     },
 }
 
@@ -284,6 +296,14 @@ pub enum Operand {
         branches: Vec<(Expr, Operand)>,
         default: Option<Box<Operand>>,
     },
+    /// A predicate in a value position: `RETURN n.age > 18 AS adult`,
+    /// `[x IN l | x > 1]`, `SET n.flag = NOT n.done`. Evaluates three-valued
+    /// to `Bool(true)`, `Bool(false)` or null: a comparison or `IN` with a
+    /// null side is null, `NOT null` is null, `null AND false` is false and
+    /// `null OR true` is true. A WHERE never holds one at its top: the parser
+    /// unwraps it to the `Expr` itself, which WHERE evaluates the same
+    /// three-valued way, keeping a row only when it is true.
+    Pred(Box<Expr>),
 }
 
 /// The column name an operand gets in a RETURN or WITH item that has no
@@ -312,6 +332,7 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::MapLit(_) => "<map>".to_string(),
         Operand::ListComprehension { .. } => "<listcomp>".to_string(),
         Operand::Reduce { .. } => "<reduce>".to_string(),
+        Operand::Pred(_) => "<pred>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }

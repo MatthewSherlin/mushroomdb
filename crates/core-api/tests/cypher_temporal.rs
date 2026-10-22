@@ -1,7 +1,7 @@
 //! QL-13: temporal functions through the public API. A query may produce a
-//! temporal value; storing one is refused until the V11 format lands.
+//! temporal value, and storing one moves the store to the V11 format (TY-12).
 
-use mushroomdb::{GraphDb, GraphError, Value};
+use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -44,32 +44,51 @@ fn a_query_returns_temporal_values() {
 }
 
 #[test]
-fn setting_a_temporal_value_gets_the_named_v11_refusal() {
+fn setting_a_temporal_value_stores_it_and_moves_the_store_to_v11() {
     let dir = tmp("set");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("T", "a", vec![("x".into(), Value::Int(1))])
         .unwrap();
     let before = wal_len(&dir);
-    for expr in [
-        "date('2024-01-01')",
-        "datetime('2024-01-01T00:00:00Z')",
-        "localdatetime('2024-01-01T00:00:00')",
-        "duration({days: 1})",
+    for (expr, expected) in [
+        ("date('2024-01-01')", Value::Date(19_723)),
+        (
+            "datetime('2024-01-01T00:00:00Z')",
+            Value::DateTime {
+                micros_utc: 1_704_067_200_000_000,
+                offset_seconds: 0,
+            },
+        ),
+        (
+            "localdatetime('2024-01-01T00:00:00')",
+            Value::LocalDateTime(1_704_067_200_000_000),
+        ),
+        (
+            "duration({days: 1})",
+            Value::Duration {
+                months: 0,
+                days: 1,
+                nanos: 0,
+            },
+        ),
     ] {
-        let err = db
-            .query_write(&format!("MATCH (n:T) SET n.d = {expr}"), &no_params())
-            .unwrap_err();
-        match err {
-            GraphError::QueryError { detail } => assert!(
-                detail.contains("not supported in mushroomdb 0.10 yet")
-                    && detail.contains("cannot be stored until the V11 format lands"),
-                "{expr}: {detail}"
-            ),
-            other => panic!("{expr}: expected the V11 refusal, got {other:?}"),
-        }
+        db.query_write(&format!("MATCH (n:T) SET n.d = {expr}"), &no_params())
+            .unwrap();
+        assert_eq!(db.get_prop("a", "d"), Some(expected), "{expr}");
     }
-    assert_eq!(wal_len(&dir), before, "a refused write reached the WAL");
-    assert_eq!(db.get_prop("a", "d"), None);
+    assert!(wal_len(&dir) > before);
+    assert!(db.is_v11());
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    drop(db);
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        reopened.get_prop("a", "d"),
+        Some(Value::Duration {
+            months: 0,
+            days: 1,
+            nanos: 0
+        })
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

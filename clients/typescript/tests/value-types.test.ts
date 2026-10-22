@@ -1,8 +1,8 @@
 // The five format-V11 value types as the server's JSON tags carry them.
 //
 // Pure unit tests: no server. The shapes are the ones crates/server/src/json.rs
-// emits (`tagged_json`) and accepts (`json_to_value`). A write that carries one
-// is refused by the engine until TY-12 — see integration.test.ts.
+// emits (`tagged_json`) and accepts (`json_to_value`). The round trip through
+// a real store is in integration.test.ts.
 
 import { describe, expect, it } from "vitest";
 import {

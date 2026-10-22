@@ -66,11 +66,13 @@ pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 /// Exposed so CLI and tooling can print `V<SNAPSHOT_VERSION>` without depending
 /// directly on `core-storage`.
 ///
-/// Since v0.6.10 this build writes 9 **or** 10 depending on the store
+/// This build writes 9, 10 or 11 depending on the store
 /// (`core_storage::snapshot::version_for`: a store that has called
-/// `GraphDb::enable_multiplicity` writes 10) and reads 5 through 10. Compare a
-/// store's stamp against this with `>=`, never `==` — see `cli::run_migrate`,
-/// which would otherwise report an opted-in store as `V10 -> V9`.
+/// `GraphDb::enable_multiplicity` writes 10, and one that has used a 0.10
+/// value type, unique constraint or range index writes 11) and reads 5
+/// through 11. Compare a store's stamp against this with `>=`, never `==` —
+/// see `cli::run_migrate`, which would otherwise report an opted-in store as
+/// `V10 -> V9`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
 pub use durable_wal::{disk_snapshot_ident, disk_wal_ident, WalPosition};
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};

@@ -741,6 +741,14 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             crate::mcp_tasks::SAME_AS_LOST_REMEDY
         ));
     }
+    // Absent unless the read-back failed, so an ordinary reply is unchanged.
+    if let Some(unread) = &outcome.same_as_unread {
+        reply["same_as_unread"] = json!(unread);
+        reply["same_as_unread_note"] = json!(format!(
+            "this write committed, but its SAME_AS links could not be read afterwards, \
+             so same_as_lost is not known: {unread}"
+        ));
+    }
     CallOutcome::ToolOk(reply)
 }
 

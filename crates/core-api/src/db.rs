@@ -11,7 +11,7 @@ use core_query::cypher::{
     RetVal, WriteStatement,
 };
 use core_query::{
-    eval_cmp, eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
 };
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
@@ -1060,7 +1060,28 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(init, out);
             operand_node_vars(list, out);
         }
+        Operand::Pred(expr) => expr_node_vars(expr, out),
         Operand::Lit(_) | Operand::Param(_) => {}
+    }
+}
+
+/// [`operand_node_vars`] for every operand of a predicate.
+fn expr_node_vars(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_node_vars(a, out);
+            expr_node_vars(b, out);
+        }
+        Expr::Not(e) => expr_node_vars(e, out),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_node_vars(lhs, out);
+            operand_node_vars(rhs, out);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_node_vars(o, out),
+        Expr::In { expr, list } => {
+            operand_node_vars(expr, out);
+            operand_node_vars(list, out);
+        }
     }
 }
 
@@ -1149,7 +1170,7 @@ const REDUCE_IN_WRITE_RETURN: &str =
 /// or `reduce()`) found in an expression, if any.
 fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
         }
         Expr::Not(e) => expr_write_return_refusal(e),
@@ -1157,8 +1178,9 @@ fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
             operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
         }
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
-        Expr::In { expr, list } => operand_write_return_refusal(expr)
-            .or_else(|| list.iter().find_map(operand_write_return_refusal)),
+        Expr::In { expr, list } => {
+            operand_write_return_refusal(expr).or_else(|| operand_write_return_refusal(list))
+        }
     }
 }
 
@@ -1183,6 +1205,7 @@ fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
                 expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
             })
             .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Pred(expr) => expr_write_return_refusal(expr),
         Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
     }
 }
@@ -1246,7 +1269,7 @@ fn eval_set_return_operand<F: Fs>(
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params, 0)? {
+                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params)? {
                     return eval_set_return_operand(db, match_rs, row, rel_vars, value, params);
                 }
             }
@@ -1285,6 +1308,14 @@ fn eval_set_return_operand<F: Fs>(
             }
             Ok(Some(Value::Map(out)))
         }
+        Operand::Pred(expr) => {
+            let value = core_query::cypher::eval_predicate(
+                expr,
+                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+                &|detail| GraphError::QueryError { detail },
+            )?;
+            Ok(value.map(Value::Bool))
+        }
     }
 }
 
@@ -1308,6 +1339,8 @@ fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A CASE WHEN condition in a write statement's RETURN: true takes the
+/// branch; false and null do not. Three-valued, as in a read query.
 fn eval_set_return_expr<F: Fs>(
     db: &GraphDb<F>,
     match_rs: &ResultSet,
@@ -1315,94 +1348,13 @@ fn eval_set_return_expr<F: Fs>(
     rel_vars: &[String],
     expr: &Expr,
     params: &BTreeMap<String, Value>,
-    depth: u32,
 ) -> Result<bool> {
-    if depth > 256 {
-        return Err(GraphError::QueryError {
-            detail: "expression nesting too deep".into(),
-        });
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        Expr::Not(inner) => Ok(!eval_set_return_expr(
-            db,
-            match_rs,
-            row,
-            rel_vars,
-            inner,
-            params,
-            depth + 1,
-        )?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = eval_set_return_operand(db, match_rs, row, rel_vars, lhs, params)?;
-            let r = eval_set_return_operand(db, match_rs, row, rel_vars, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-                Some(Value::Binary(b)) => !b.is_empty(),
-                // A temporal value is a present value, never "empty".
-                Some(
-                    Value::Date(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime { .. }
-                    | Value::Duration { .. },
-                ) => true,
-                Some(Value::Null) => false,
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => {
-            let Some(needle) = eval_set_return_operand(db, match_rs, row, rel_vars, expr, params)?
-            else {
-                return Ok(false);
-            };
-            for item_op in list {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item_op, params)? {
-                    None => {}
-                    Some(Value::List(items)) => {
-                        for item in items {
-                            if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Some(item) if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) => {
-                        return Ok(true);
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(false)
-        }
-    }
+    let value = core_query::cypher::eval_predicate(
+        expr,
+        &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+        &|detail| GraphError::QueryError { detail },
+    )?;
+    Ok(value == Some(true))
 }
 
 fn eval_set_return_arith(
@@ -1735,23 +1687,26 @@ fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
     }
 }
 
+/// The engine's view of the store. Pass the store's `&mut Arc`s, not
+/// `Arc::make_mut` of them: the engine copies a structure the fold shares
+/// only when it writes to it (ledger row 126).
 fn make_graph_mut<'a>(
     ids: &'a IdMap,
-    syms: &'a mut Interner,
+    syms: impl Into<core_rules::CowMut<'a, Interner>>,
     labels: &'a [u32],
     props: core_storage::v8::seam::ColumnsView<'a>,
-    topo: &'a mut Topology,
+    topo: impl Into<core_rules::CowMut<'a, Topology>>,
     base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
-    edge_props: &'a mut EdgeProps,
+    edge_props: impl Into<core_rules::CowMut<'a, EdgeProps>>,
 ) -> GraphMut<'a> {
     GraphMut {
         ids,
-        syms,
+        syms: syms.into(),
         labels,
         props,
-        topo,
+        topo: topo.into(),
         base_topo: base_csr(base),
-        edge_props,
+        edge_props: edge_props.into(),
     }
 }
 
@@ -1943,14 +1898,24 @@ pub struct GraphDb<F: Fs> {
     /// since the refusal. Not persisted: a reopen finds the same pairs again
     /// until a snapshot stops re-emitting their declarations.
     dropped_view_indexes: Vec<(String, String)>,
-    /// Lets format-V11 values and records reach the WAL on this handle.
+    /// The store has opted in to the V11 format: it has written, or holds, a
+    /// V11-only record — a value of one of the five 0.10 types, a unique
+    /// constraint or a range index (contract C9).
     ///
-    /// Always `false` outside tests: until the V11 format lands (0.10 TY-12)
-    /// the dense rewrite refuses them, because a 0.9.x reader cannot decode
-    /// the frame. Set only by
-    /// [`unlock_v11_format_for_test`](Self::unlock_v11_format_for_test), so the
-    /// unique-constraint machinery can be exercised end to end before then.
-    v11_unlocked: bool,
+    /// Set at open when the snapshot is V11 or the WAL replays such a record,
+    /// and on the first write of one, in
+    /// [`rewrite_wal_dense_planned`](Self::rewrite_wal_dense_planned), which
+    /// writes the V11 snapshot before the record is appended. Never cleared:
+    /// dropping the last constraint or range index does not move the store
+    /// back, because its WAL and archives still hold V11 records.
+    v11_features: bool,
+    /// Set while a submission of a group commit is applied without its own
+    /// fsync. The V11 upgrade must not run then: its snapshot would hold the
+    /// group's earlier submissions before their fsync, and a failed group
+    /// fsync would leave them durable after their submitters were told `Err`.
+    /// The group upgrades ahead of its first append instead
+    /// ([`upgrade_to_v11_for_ops`](Self::upgrade_to_v11_for_ops)).
+    in_nosync_group: bool,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -2911,7 +2876,8 @@ impl<F: Fs> GraphDb<F> {
             multiplicity: false,
             constraints: Vec::new(),
             dropped_view_indexes: Vec::new(),
-            v11_unlocked: false,
+            v11_features: false,
+            in_nosync_group: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -3002,6 +2968,8 @@ impl<F: Fs> GraphDb<F> {
         // Cleared like every other declaration: a reload replays the store's own
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
+        // Like the multiplicity opt-in: the snapshot and the WAL say it again.
+        self.v11_features = false;
         self.constraints = Vec::new();
         self.dropped_view_indexes = Vec::new();
         self.commit_seq = 0;
@@ -3099,6 +3067,15 @@ impl<F: Fs> GraphDb<F> {
         } else {
             None
         };
+        // A V11 snapshot is the store's own word that it has opted in (C9);
+        // the replay below finds the same from any V11-only record it meets.
+        if snapshot_version.is_some_and(|v| v >= core_storage::snapshot::VERSION_11) {
+            db.v11_features = true;
+        }
+        // The declarations a V11 snapshot carries itself (section 18), applied
+        // at the `held` boundary of the replay below — the point of the WAL
+        // the snapshot was taken at. `None` for every earlier snapshot.
+        let mut snapshot_declarations = None;
         // No snapshot means no snapshot has ever truncated the WAL, so this
         // handle can prove the history is whole. Once a snapshot exists that
         // this handle did not take, it cannot: see `snapshot_preserved_history`.
@@ -3133,6 +3110,12 @@ impl<F: Fs> GraphDb<F> {
             }
             db.load_fulltext_from_base();
             trace_open!("full-text index read from the snapshot", _t0);
+            snapshot_declarations = db
+                .base
+                .as_ref()
+                .map(|b| b.declarations())
+                .transpose()?
+                .flatten();
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -3240,7 +3223,20 @@ impl<F: Fs> GraphDb<F> {
         db.fulltext_rebuild_follows = !db.fulltext_loaded;
         db.fulltext_reindexed_a_node = false;
         db.replaying_at_open = true;
-        let replayed = db.apply_frames_over(records, held);
+        // The declarations a V11 snapshot carries (section 18) are the state at
+        // the point of the WAL the snapshot was taken at, so they are applied
+        // there: after the `held` frames, before the first frame the snapshot
+        // does not hold. Earlier would let a held declaration that was later
+        // replaced be skipped as already declared, and the reopened store
+        // would differ from the never-closed one. For a WAL that was replaced
+        // (`held == 0`) the WAL repeats them as its baseline, and for one
+        // archived away before its baseline was written they are all there is.
+        // A declaration is never checked against the data.
+        let section_recs = snapshot_declarations
+            .as_ref()
+            .map(declarations_as_records)
+            .unwrap_or_default();
+        let replayed = db.apply_frames_at(records, held, section_recs);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
         let replayed = replayed?;
@@ -3296,10 +3292,17 @@ impl<F: Fs> GraphDb<F> {
         //
         // What this recovery cannot do is make the opt-in atomic; it is not,
         // and `enable_multiplicity` says so. See defects #32-#34.
-        if !db.multiplicity
-            && snapshot_version == Some(core_storage::snapshot::VERSION_10)
-            && !db.fs.list_archives()?.is_empty()
-        {
+        //
+        // A V11 store says it in section 18 rather than with its version: V11
+        // is above V10, and a store with any V11 feature writes V11 whether it
+        // counts multiplicity or not. The section's flag is written from the
+        // same `self.multiplicity` the V10 stamp is, so it carries exactly the
+        // fact the stamp did, and the recovery is the same one.
+        let stamped_multiplicity = snapshot_version == Some(core_storage::snapshot::VERSION_10)
+            || snapshot_declarations
+                .as_ref()
+                .is_some_and(|d: &core_storage::v8::SnapshotDeclarations| d.multiplicity);
+        if !db.multiplicity && stamped_multiplicity && !db.fs.list_archives()?.is_empty() {
             db.multiplicity = true;
         }
         // The cursor sits at the end of the valid prefix, not the end of the
@@ -3411,6 +3414,32 @@ impl<F: Fs> GraphDb<F> {
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
         self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames_over`], applying `at_held` — the declarations a
+    /// snapshot carries — at the `held` boundary, the point of the WAL the
+    /// snapshot was taken at.
+    fn apply_frames_at(
+        &mut self,
+        records: Vec<WalRecord>,
+        held: usize,
+        at_held: Vec<WalRecord>,
+    ) -> Result<usize> {
+        if at_held.is_empty() {
+            return self.apply_frames_over(records, held);
+        }
+        let held = held.min(records.len());
+        let mut records = records;
+        let after = records.split_off(held);
+        let before_count = records.len();
+        // The held prefix is numbered and its declarations applied, exactly
+        // as `apply_frames_over` would; nothing in it is otherwise applied.
+        let mut applied = self.apply_frames_over(records, before_count)?;
+        for rec in &at_held {
+            self.apply(rec)?;
+        }
+        applied += self.apply_frames_over(after, 0)?;
+        Ok(applied)
     }
 
     /// [`Self::apply_frames`] over a base that already holds the first `held`
@@ -3577,10 +3606,23 @@ impl<F: Fs> GraphDb<F> {
             return Ok(0);
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
-        let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
+        // Before an append the WAL's identity is always checked, so both come
+        // from one look at the file; otherwise only when the WAL grew.
+        let (wal_len, appending_ident) = if before_append {
+            let (len, ident) = self.fs.wal_len_and_ident().map_err(GraphError::Io)?;
+            (len, Some(ident))
+        } else {
+            (self.fs.wal_len().map_err(GraphError::Io)?, None)
+        };
         let wal_replaced = || -> Result<bool> {
-            Ok((before_append || wal_len > self.wal_consumed)
-                && self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident)
+            let ident = match appending_ident {
+                Some(ident) => ident,
+                None if wal_len > self.wal_consumed => {
+                    self.fs.wal_ident().map_err(GraphError::Io)?
+                }
+                None => return Ok(false),
+            };
+            Ok(ident != self.wal_ident)
         };
         if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
             // The WAL no longer continues our state: rebuild from disk. State
@@ -4284,6 +4326,15 @@ impl<F: Fs> GraphDb<F> {
             let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal)?.0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+            // A V11 stamp makes the as-of handle V11 like a live one (C9),
+            // whether or not the replayed prefix holds a V11 record.
+            if snap_header.len() >= 6
+                && &snap_header[0..4] == b"GDB1"
+                && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                    >= core_storage::snapshot::VERSION_11
+            {
+                db.v11_features = true;
+            }
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
                 && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
@@ -4714,6 +4765,13 @@ impl<F: Fs> GraphDb<F> {
         if !is_declaration(rec) {
             self.populate_indexes_before_write();
         }
+        // A V11-only record makes the store V11 however it arrives: a live
+        // write has already been upgraded at the choke point, so this is for
+        // replay — at open, on refresh and in `open_at` — of a WAL that holds
+        // one (contract C9). A `Batch` is checked through its inner records.
+        if !self.v11_features && !matches!(rec, WalRecord::Batch(_)) && rec_is_v11(rec) {
+            self.v11_features = true;
+        }
         match rec {
             WalRecord::InsertNode { label, key, props } => {
                 let id = Arc::make_mut(&mut self.ids).try_insert(key)?;
@@ -4745,12 +4803,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -4836,12 +4894,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -4885,12 +4943,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
@@ -5017,12 +5075,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -5110,12 +5168,12 @@ impl<F: Fs> GraphDb<F> {
                     {
                         let mut gm = make_graph_mut(
                             &self.ids,
-                            Arc::make_mut(&mut self.syms),
+                            &mut self.syms,
                             &self.labels,
                             build_props_view(&self.props, &self.base),
-                            Arc::make_mut(&mut self.topo),
+                            &mut self.topo,
                             &self.base,
-                            Arc::make_mut(&mut self.edge_props),
+                            &mut self.edge_props,
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
                     }
@@ -5165,12 +5223,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
                 }
@@ -5249,12 +5307,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.create_rule(def, &mut gm)
                 };
@@ -5295,12 +5353,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.delete_rule(name, &mut gm)
                 };
@@ -5365,12 +5423,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
                 }
@@ -5473,12 +5531,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -5520,12 +5578,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_removed(n, &mut gm);
                 }
@@ -5632,12 +5690,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.rebuild(name, &mut gm)
                 };
@@ -5950,9 +6008,17 @@ impl<F: Fs> GraphDb<F> {
     /// This is the one function every value-carrying WAL record passes through
     /// on its way to the WAL — `insert_node` and `set_prop` via `log_dense`,
     /// every batch, ingest and Cypher write via `commit_logged_batch` — so it
-    /// is where a format-V11 value is refused (see [`v11_only_value`]). The
-    /// check runs first, before anything is interned, so a refused write
-    /// leaves no state behind. Replay never comes here.
+    /// is where the store moves to the V11 format (contract C9): the first
+    /// frame carrying a V11-only record (see [`rec_is_v11`]) writes a V11
+    /// snapshot, keeping the WAL, before anything is interned or appended. A
+    /// 0.9.x reader then stops at `snapshot: unsupported version 11` and
+    /// never reaches the frame it could not decode. Replay never comes here.
+    ///
+    /// The upgrade runs before the frame's other checks that need the dense
+    /// ids — a unique-constraint violation found after it still refuses the
+    /// write, and leaves the store V11 with nothing V11 written. That is the
+    /// safe direction: the stamp costs an older reader a refusal, never a
+    /// commit.
     ///
     /// It is also where unique constraints are enforced (0.10 TY-5), for the
     /// same reason: it sees every frame a write produces, whole, after its keys
@@ -5960,13 +6026,9 @@ impl<F: Fs> GraphDb<F> {
     /// duplicate — against committed state or inside the frame — refuses the
     /// whole frame before anything is appended.
     fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
+        let mut carries_v11 = false;
         for rec in &recs {
             if let PlannedRec::Rec(rec) = rec {
-                if !self.v11_unlocked {
-                    if let Some(detail) = v11_refusal(rec) {
-                        return Err(GraphError::QueryError { detail });
-                    }
-                }
                 if let Some((field, size)) = oversized_binary(rec, &self.syms) {
                     return Err(GraphError::ValueTooLarge {
                         field,
@@ -5974,7 +6036,29 @@ impl<F: Fs> GraphDb<F> {
                         limit: BINARY_MAX_BYTES,
                     });
                 }
+                if let Some(offset_seconds) = out_of_range_offset(rec) {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "DateTime offset of {offset_seconds} s is outside ±18:00; a \
+                             DateTime cannot be stored with it"
+                        ),
+                    });
+                }
+                carries_v11 = carries_v11 || (!self.v11_features && rec_is_v11(rec));
             }
+        }
+        if carries_v11 {
+            if self.in_nosync_group {
+                // Unreachable through `commit_group` and the drain, which
+                // upgrade ahead of the group; refused rather than snapshot a
+                // state the group has not made durable.
+                return Err(GraphError::QueryError {
+                    detail: "the V11 format upgrade cannot run inside a group commit; the \
+                             group did not upgrade ahead of its first write"
+                        .into(),
+                });
+            }
+            self.upgrade_to_v11()?;
         }
         let syms_checkpoint = self.syms.len();
         let result = self
@@ -6760,12 +6844,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.reconcile_lost_provenance(&mut gm);
         }
@@ -6913,11 +6997,11 @@ impl<F: Fs> GraphDb<F> {
         if self.intent_unsettled {
             self.settle_snapshot_intent()?;
         }
-        // Backstop for the refusal in `rewrite_wal_dense_planned`: a path that
+        // Backstop for the upgrade in `rewrite_wal_dense_planned`: a path that
         // reached the WAL without passing through it would show up here.
         debug_assert!(
-            self.v11_unlocked || v11_refusal(&rec).is_none(),
-            "a format-V11 value or record reached the WAL append without the dense rewrite"
+            self.v11_features || !rec_is_v11(&rec),
+            "a format-V11 value or record reached the WAL append without the V11 upgrade"
         );
         // Fallible only for a record that carries a null property value, which
         // `rewrite_wal_dense` has already refused; nothing is appended then.
@@ -8361,7 +8445,10 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None, None).map(inserted_pair)
+        self.in_nosync_group = true;
+        let result = self.commit_logged_batch(ops, None, None).map(inserted_pair);
+        self.in_nosync_group = false;
+        result
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -8396,6 +8483,9 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> (Vec<Result<(usize, usize)>>, Option<GraphError>) {
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return (group_refusal(e, groups.len()), None);
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
@@ -8427,6 +8517,12 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> Vec<Result<(usize, usize)>> {
+        // Ahead of the first append, as `commit_group` and the drain do: the
+        // upgrade fsyncs the WAL before its snapshot, so the snapshot holds
+        // only durable state, never a submission of this group.
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return group_refusal(e, groups.len());
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
@@ -8770,12 +8866,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.populate_indexes(&gm);
         }
@@ -8800,12 +8896,12 @@ impl<F: Fs> GraphDb<F> {
         let finished = {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.pump_index_build(&mut gm)
         };
@@ -8827,12 +8923,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.register_incomplete_hnsw_builds(&extra, &gm);
         }
@@ -9472,10 +9568,13 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
     /// - [`GraphError::QueryError`]: a range index named `name` already
-    ///   exists; `(label, field)` already has a range index; a view owns
-    ///   `(label, field)`; or, until the V11 format lands, always — an
-    ///   `EnableRangeIndex` record is format-V11 and a 0.9.x reader cannot
-    ///   decode it.
+    ///   exists; `(label, field)` already has a range index; or a view owns
+    ///   `(label, field)`.
+    ///
+    /// # Format
+    /// An `EnableRangeIndex` record is format-V11: the first declaration on a
+    /// store that is not V11 yet writes a V11 snapshot first, and from then on
+    /// the store cannot be read by 0.9.x (see [`is_v11`](Self::is_v11)).
     pub fn enable_range_index(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -9520,8 +9619,7 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - [`GraphError::QueryError`]: no range index is named `name`; or, until
-    ///   the V11 format lands, the refusal `enable_range_index` documents.
+    /// - [`GraphError::QueryError`]: no range index is named `name`.
     pub fn disable_range_index(&mut self, name: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -9587,8 +9685,12 @@ impl<F: Fs> GraphDb<F> {
     /// - [`GraphError::ConstraintCreationConflict`]: live nodes of `label` already
     ///   hold equal values for `field`; `violations` is each `(node_key, value)`.
     /// - [`GraphError::QueryError`]: a constraint named `name` already exists;
-    ///   a view owns `(label, field)`; or, until the V11 format lands, always — a `CreateConstraint` record
-    ///   is format-V11 and a 0.9.x reader cannot decode it.
+    ///   or a view owns `(label, field)`.
+    ///
+    /// # Format
+    /// A `CreateConstraint` record is format-V11: the first declaration on a
+    /// store that is not V11 yet writes a V11 snapshot first, and from then on
+    /// the store cannot be read by 0.9.x (see [`is_v11`](Self::is_v11)).
     pub fn create_constraint(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -9611,13 +9713,6 @@ impl<F: Fs> GraphDb<F> {
                      constraint cannot cover it",
                     view.name
                 ),
-            });
-        }
-        // Ahead of the scan: a refused declaration does no O(label) work, and
-        // a pre-V11 caller gets the refusal whatever the data holds.
-        if !self.v11_unlocked {
-            return Err(GraphError::QueryError {
-                detail: core_storage::v11_record_refusal("unique constraints"),
             });
         }
         let (violations, total) = self.existing_unique_violations(label, field);
@@ -9731,8 +9826,7 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - [`GraphError::QueryError`]: no constraint is named `name`; or, until
-    ///   the V11 format lands, the refusal `create_constraint` documents.
+    /// - [`GraphError::QueryError`]: no constraint is named `name`.
     pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -9750,19 +9844,16 @@ impl<F: Fs> GraphDb<F> {
         &self.constraints
     }
 
-    /// Let format-V11 values and records — the five new value types, and the
-    /// unique-constraint records — reach the WAL on this handle.
+    /// Whether this store has opted in to the V11 snapshot format — it has
+    /// written a value of one of the five 0.10 types, a unique constraint or
+    /// a range index, at any point in its history.
     ///
-    /// Until the V11 format lands (0.10 TY-12) the write path refuses them,
-    /// because a 0.9.x reader cannot decode the frame; this lifts that refusal
-    /// so the machinery behind it can be tested end to end first. A store
-    /// written after this call is not readable by 0.9.x, which is why it is a
-    /// test hook and not an API: TY-12 replaces the refusal with the V11
-    /// upgrade and removes this.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn unlock_v11_format_for_test(&mut self) {
-        self.v11_unlocked = true;
+    /// `false` on every store that has not, which keeps writing the snapshot
+    /// version 0.9.x reads (V9, or V10 after
+    /// [`enable_multiplicity`](Self::enable_multiplicity)). Once `true` it
+    /// stays `true`: see `docs/format-stability.md`.
+    pub fn is_v11(&self) -> bool {
+        self.v11_features
     }
 
     /// Whether `(label, field)` currently has an equality index.
@@ -9927,6 +10018,98 @@ impl<F: Fs> GraphDb<F> {
             self.multiplicity = false;
         }
         forced
+    }
+
+    /// Move this store to the V11 snapshot format, ahead of the first V11-only
+    /// record it appends (contract C9).
+    ///
+    /// The same move [`enable_multiplicity`](Self::enable_multiplicity) makes
+    /// for V10, for the same reason: a 0.9.x reader does not refuse a WAL
+    /// frame it cannot decode, it truncates the WAL there. So the V11 snapshot
+    /// goes first, keeping the WAL (`keep_wal: true` — moving to V11 is not a
+    /// compaction, and `open_at` keeps its history), and the record follows.
+    /// At no interruption point does the store hold the record without the
+    /// stamp. On a large store the first V11 write therefore costs one full
+    /// snapshot write.
+    ///
+    /// An `Err` appends nothing V11. If the V11 snapshot did not reach disk,
+    /// this handle goes on believing the store is not V11; if it did, the store
+    /// is V11 from then on (C9) and later snapshots stay V11, which costs an
+    /// older reader a refusal and nothing else.
+    fn upgrade_to_v11(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        // What the snapshot holds must be durable first: under a batched
+        // fsync policy the WAL may hold acknowledged frames not yet synced,
+        // and the snapshot is durable the moment it is written.
+        match self.fs.sync(FileId::Wal) {
+            Ok(()) => self.note_wal_synced(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(GraphError::Io(e)),
+        }
+        self.v11_features = true;
+        let snapshot = self.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        });
+        if snapshot.is_err() {
+            // Once a V11 stamp is on disk the store stays V11 (C9), even
+            // though nothing V11 was written: a later snapshot from this handle
+            // must not write V9 over it.
+            let on_disk = self
+                .fs
+                .read_prefix(FileId::Snapshot, 6)
+                .ok()
+                .filter(|h| h.len() >= 6 && &h[0..4] == b"GDB1")
+                .map(|h| u16::from_le_bytes([h[4], h[5]]));
+            self.v11_features = on_disk == Some(core_storage::snapshot::VERSION_11);
+        }
+        snapshot
+    }
+
+    /// Move the store to V11 ahead of a group commit whose submissions carry a
+    /// V11-only value, so the upgrade snapshot holds only state that is
+    /// already durable — never a submission of the group itself.
+    ///
+    /// Called by [`commit_group`](Self::commit_group) and by the
+    /// [`SharedDb`](crate::SharedDb) drain before the group's first append.
+    /// `BatchOp` cannot declare a constraint or range index, so a value is
+    /// the only V11-only record a group can carry.
+    pub(crate) fn upgrade_to_v11_for_ops<'a>(
+        &mut self,
+        groups: impl IntoIterator<Item = &'a [BatchOp]>,
+    ) -> Result<()> {
+        if self.v11_features || self.read_only {
+            return Ok(());
+        }
+        let carries = |op: &BatchOp| match op {
+            BatchOp::InsertNode { props, .. } | BatchOp::InsertNodeOnConflict { props, .. } => {
+                props
+                    .iter()
+                    .any(|(_, v)| core_storage::v11_only_type(v).is_some())
+            }
+            BatchOp::SetProp { value, .. } => core_storage::v11_only_type(value).is_some(),
+            _ => false,
+        };
+        if groups.into_iter().any(|ops| ops.iter().any(carries)) {
+            self.upgrade_to_v11()?;
+        }
+        Ok(())
+    }
+
+    /// What a V11 snapshot's section 18 carries for this store.
+    fn snapshot_declarations(&self) -> core_storage::v8::SnapshotDeclarations {
+        core_storage::v8::SnapshotDeclarations {
+            multiplicity: self.multiplicity,
+            constraints: self.constraints.clone(),
+            indexes: self.prop_index.equality_pairs().cloned().collect(),
+            range_indexes: self
+                .prop_index
+                .range_indexes()
+                .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+                .collect(),
+        }
     }
 
     /// Whether this store records insert-count multiplicity.
@@ -12004,6 +12187,8 @@ impl<F: Fs> GraphDb<F> {
         try_copy("wal.bin")?;
         try_copy("wal.floor")?;
         try_copy("wal.genesis")?;
+        // A V11 store's genesis marker (see `Fs::use_v11_genesis_marker`).
+        try_copy("wal.genesis.v11")?;
         try_copy("roles.json")?;
         // The map from commit to wall-clock time. Without it the copy cannot
         // resolve a date to a commit, and answers `NoRecordedTime` for history
@@ -13174,6 +13359,8 @@ impl<F: Fs> GraphDb<F> {
                         },
                         chain: vec![],
                         shortest: false,
+                        path_var: None,
+                        continues_match: false,
                     }
                 })
                 .collect();
@@ -14233,6 +14420,8 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     )],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,
@@ -14363,6 +14552,8 @@ impl<F: Fs> GraphDb<F> {
                     },
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,
@@ -16686,10 +16877,10 @@ impl<F: Fs> GraphDb<F> {
     /// writes — the **floor**, not the whole answer.
     ///
     /// It is not "the version this binary writes", and it is not "the version
-    /// this binary reads". Since v0.6.10 this binary writes 9 **or** 10
-    /// depending on the store — [`snapshot::version_for`] decides, and a store
-    /// that has called [`enable_multiplicity`](Self::enable_multiplicity)
-    /// writes 10 — and it reads 5 through 10. A caller comparing a store's
+    /// this binary reads". This binary writes 9, 10 or 11 depending on the
+    /// store — [`snapshot::version_for`] decides: a store that has called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) writes 10, and one
+    /// that is [V11](Self::is_v11) writes 11 — and it reads 5 through 11. A caller comparing a store's
     /// stamp against this value must use `>=`, not `==`, or it will report an
     /// opted-in store as needing a migration *down*; `cli::run_migrate` is the
     /// worked example.
@@ -16766,6 +16957,12 @@ impl<F: Fs> GraphDb<F> {
         if self.lock_denied {
             return Err(self.lock_denied_error());
         }
+        // A V11 store keeps its genesis marker under a name 0.9.x does not
+        // read, before any snapshot can archive a WAL that holds V11 records
+        // (see `Fs::use_v11_genesis_marker`).
+        if self.v11_features {
+            self.fs.use_v11_genesis_marker()?;
+        }
         // From here `snapshot.bin` and `wal.bin` may be between states on disk.
         // A reader outside the engine pairing the two (the backup worker) waits
         // until the mark drops, on every exit from this function.
@@ -16818,11 +17015,19 @@ impl<F: Fs> GraphDb<F> {
             self.archive_genesis_chain = true;
         }
         // Which version this store writes. V9 unless it has opted in to
-        // multiplicity, in which case V10 — the stamp that makes a reader which
+        // something: V10 for multiplicity — the stamp that makes a reader which
         // does not know WAL discriminant 23 refuse the open instead of
-        // truncating the WAL at the first such frame. The container is
-        // identical either way; only these two header bytes move.
-        let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
+        // truncating the WAL at the first such frame — and V11 for any V11
+        // feature. V9 and V10 share every byte but these two header bytes; V11
+        // adds section 18 and may hold the 0.10 value types in its columns.
+        let snapshot_version =
+            core_storage::snapshot::version_for(core_storage::snapshot::StoreFeatures {
+                multiplicity: self.multiplicity,
+                has_v11_types: self.v11_features,
+                has_constraints: !self.constraints.is_empty(),
+                has_range_indexes: self.prop_index.has_range_indexes(),
+            });
+        let v11 = snapshot_version == core_storage::snapshot::VERSION_11;
         // A snapshot that leaves the WAL where it is records how much of it
         // it holds, so the next open does not apply those writes again on top
         // of the state they produced. This handle holds the write lock, so
@@ -16916,6 +17121,8 @@ impl<F: Fs> GraphDb<F> {
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
+                v11,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -17046,6 +17253,8 @@ impl<F: Fs> GraphDb<F> {
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
+                v11,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf = Vec::new();
             let encoded = encode_v8(
@@ -17569,11 +17778,10 @@ fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
 /// The first format-V11 value type (`Date`, `LocalDateTime`, `DateTime`,
 /// `Duration`, `Binary`) a WAL record would write, at any depth.
 ///
-/// Until the V11 format lands, no such value may reach the WAL: a 0.9.x reader
-/// cannot decode the frame and stops replaying there, silently losing every
-/// later commit, while the store carries no stamp telling it to refuse. The
-/// match names every record kind so a new kind that carries a value cannot be
-/// added without deciding here.
+/// A 0.9.x reader cannot decode a frame carrying one and stops replaying
+/// there, so such a value reaches the WAL only behind a V11 snapshot (see
+/// [`rec_is_v11`]). The match names every record kind so a new kind that
+/// carries a value cannot be added without deciding here.
 fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
     match rec {
         WalRecord::InsertNode { props, .. } => props
@@ -17612,21 +17820,92 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
     }
 }
 
-/// Why `rec` may not be appended to the WAL until the V11 format lands, if it
-/// may not: it carries a format-V11 value (see [`v11_only_value`]), or it is a
-/// format-V11 record — a unique-constraint declaration or withdrawal
-/// (discriminants 24 and 25) or a range-index one (26 and 27), which a 0.9.x
-/// reader cannot decode either.
-fn v11_refusal(rec: &WalRecord) -> Option<String> {
+/// One `Err` per submission of a group refused as a whole by `e`: the first
+/// submission gets `e` itself, the rest its text.
+pub(crate) fn group_refusal<T>(e: GraphError, n: usize) -> Vec<Result<T>> {
+    let detail = format!("group refused: {e}");
+    let mut out = Vec::with_capacity(n);
+    out.push(Err(e));
+    for _ in 1..n {
+        out.push(Err(GraphError::Io(std::io::Error::other(detail.clone()))));
+    }
+    out.truncate(n);
+    out
+}
+
+/// The declarations a snapshot's section 18 carries, as the records that make
+/// them, in the order a baseline WAL writes them: equality indexes, range
+/// indexes, then constraints, so each constraint finds its index declared.
+fn declarations_as_records(d: &core_storage::v8::SnapshotDeclarations) -> Vec<WalRecord> {
+    let mut recs = Vec::new();
+    for (label, field) in &d.indexes {
+        recs.push(WalRecord::EnableIndex {
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for (name, label, field) in &d.range_indexes {
+        recs.push(WalRecord::EnableRangeIndex {
+            name: name.clone(),
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for c in &d.constraints {
+        recs.push(WalRecord::CreateConstraint {
+            name: c.name.clone(),
+            label: c.label.clone(),
+            field: c.field.clone(),
+        });
+    }
+    recs
+}
+
+/// Whether `rec` is a V11-only record: it carries a format-V11 value (see
+/// [`v11_only_value`]), or it is a format-V11 record — a unique-constraint
+/// declaration or withdrawal (discriminants 24 and 25) or a range-index one
+/// (26 and 27). A 0.9.x reader can decode none of them, so the first one a
+/// store writes moves it to the V11 snapshot format (contract C9).
+fn rec_is_v11(rec: &WalRecord) -> bool {
     match rec {
-        WalRecord::CreateConstraint { .. } | WalRecord::DropConstraint { .. } => {
-            Some(core_storage::v11_record_refusal("unique constraints"))
+        WalRecord::CreateConstraint { .. }
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. } => true,
+        WalRecord::Batch(inner) => recs_are_v11(inner),
+        _ => v11_only_value(rec).is_some(),
+    }
+}
+
+/// Whether any of `recs` is a V11-only record ([`rec_is_v11`]), recursing into
+/// `Batch` inners.
+fn recs_are_v11(recs: &[WalRecord]) -> bool {
+    recs.iter().any(rec_is_v11)
+}
+
+/// The first `DateTime` offset in `rec`, at any depth, outside the ±18:00 a
+/// `DateTime` holds. Every surface that parses one refuses it already; this
+/// is the write-path check for a value built directly.
+fn out_of_range_offset(rec: &WalRecord) -> Option<i32> {
+    fn bad(v: &Value) -> Option<i32> {
+        match v {
+            Value::DateTime { offset_seconds, .. }
+                if offset_seconds.unsigned_abs()
+                    > core_storage::MAX_OFFSET_SECONDS.unsigned_abs() =>
+            {
+                Some(*offset_seconds)
+            }
+            Value::List(items) => items.iter().find_map(bad),
+            Value::Map(m) => m.values().find_map(bad),
+            _ => None,
         }
-        WalRecord::EnableRangeIndex { .. } | WalRecord::DisableRangeIndex { .. } => {
-            Some(core_storage::v11_record_refusal("range indexes"))
-        }
-        WalRecord::Batch(inner) => inner.iter().find_map(v11_refusal),
-        _ => v11_only_value(rec).map(core_storage::v11_type_refusal),
+    }
+    match rec {
+        WalRecord::InsertNode { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
+        WalRecord::InsertNodeId { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
+        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => bad(value),
+        WalRecord::Batch(inner) => inner.iter().find_map(out_of_range_offset),
+        _ => None,
     }
 }
 
@@ -17748,6 +18027,78 @@ enum NodeAuthzStatus {
     Absent,
 }
 
+/// An edge as a batch names it: `(edge type, source key, destination key)`.
+type EdgeKey = (String, String, String);
+
+/// A set of batch edges that can also be found by either endpoint.
+///
+/// A node delete or rename in a batch has to find the edges the batch
+/// already added or deleted at that node. Filtering the whole set for them
+/// made a batch of N edge inserts and M node deletes cost O(N × M) (ledger
+/// row 130); the endpoint index finds them in O(log N + edges at the node).
+#[derive(Default)]
+struct EdgeKeys {
+    edges: BTreeSet<EdgeKey>,
+    /// `(endpoint key, edge)` for each endpoint of each edge in `edges`: once
+    /// for a self-loop.
+    by_endpoint: BTreeSet<(String, EdgeKey)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries [`EdgeKeys::take_touching`] visited, for the test that pins it
+    /// to the edges at the node.
+    static EDGE_KEYS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl EdgeKeys {
+    fn contains(&self, k: &EdgeKey) -> bool {
+        self.edges.contains(k)
+    }
+
+    fn insert(&mut self, k: EdgeKey) {
+        if self.edges.contains(&k) {
+            return;
+        }
+        self.by_endpoint.insert((k.1.clone(), k.clone()));
+        if k.2 != k.1 {
+            self.by_endpoint.insert((k.2.clone(), k.clone()));
+        }
+        self.edges.insert(k);
+    }
+
+    fn remove(&mut self, k: &EdgeKey) {
+        if !self.edges.remove(k) {
+            return;
+        }
+        self.by_endpoint.remove(&(k.1.clone(), k.clone()));
+        self.by_endpoint.remove(&(k.2.clone(), k.clone()));
+    }
+
+    /// Remove and return every edge with `key` at either end.
+    fn take_touching(&mut self, key: &str) -> Vec<EdgeKey> {
+        let start = (
+            key.to_string(),
+            (String::new(), String::new(), String::new()),
+        );
+        let touching: Vec<EdgeKey> = self
+            .by_endpoint
+            .range(start..)
+            // Counts every entry the walk reads, the one that ends it too.
+            .inspect(|_| {
+                #[cfg(test)]
+                EDGE_KEYS_VISITED.with(|v| v.set(v.get() + 1));
+            })
+            .take_while(|(endpoint, _)| endpoint == key)
+            .map(|(_, edge)| edge.clone())
+            .collect();
+        for edge in &touching {
+            self.remove(edge);
+        }
+        touching
+    }
+}
+
 /// Overlay of ops already accepted earlier in the same batch. Never written
 /// back to the database — validation only.
 #[derive(Default)]
@@ -17765,8 +18116,8 @@ struct Overlay {
     renamed_from: BTreeMap<String, String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
-    extra_edges: BTreeSet<(String, String, String)>,
-    deleted_edges: BTreeSet<(String, String, String)>,
+    extra_edges: EdgeKeys,
+    deleted_edges: EdgeKeys,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
     /// `rule name → (via_edge, edge_type)` for every via-hop rule accepted
@@ -18447,12 +18798,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.deleted_keys.insert(key.to_string());
         self.overlay.take_props_of(key);
         self.overlay.take_removed_props_of(key);
-        self.overlay
-            .extra_edges
-            .retain(|(_, s, d)| s != key && d != key);
-        self.overlay
-            .deleted_edges
-            .retain(|(_, s, d)| s != key && d != key);
+        self.overlay.extra_edges.take_touching(key);
+        self.overlay.deleted_edges.take_touching(key);
     }
 
     fn note_create_rule(&mut self, def: &RuleDef) {
@@ -18509,14 +18856,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
         // Edges the batch added or deleted follow the node to its new key.
         let follow = |k: String| if k == old { new_str.clone() } else { k };
-        self.overlay.extra_edges = std::mem::take(&mut self.overlay.extra_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
-        self.overlay.deleted_edges = std::mem::take(&mut self.overlay.deleted_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
+        for set in [
+            &mut self.overlay.extra_edges,
+            &mut self.overlay.deleted_edges,
+        ] {
+            for (t, s, d) in set.take_touching(old) {
+                set.insert((t, follow(s), follow(d)));
+            }
+        }
         if let Some(origin) = origin {
             self.overlay.renamed_from.insert(new_str, origin);
         }
@@ -18852,6 +19199,85 @@ fn copy_lock_failure(err: &GraphError) -> Option<GraphError> {
 mod tests {
     use super::*;
     use core_rules::Predicate;
+
+    /// Ledger row 126: a property write that derives nothing leaves the
+    /// topology, edge properties and interner shared with the fold, on a
+    /// store with no snapshot (every edge in the overlay) and with a rule
+    /// installed, so the engine runs. A write that derives an edge copies the
+    /// topology, and the fold keeps its own.
+    #[test]
+    fn a_write_that_derives_nothing_copies_no_topology() {
+        let dir = tmp_dir("row126-topo");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(fk_rule()).unwrap();
+        let mut b = db.batch();
+        for i in 0..50 {
+            b.insert_node("Person", &format!("p{i}"), vec![]);
+        }
+        b.insert_node("Org", "acme", vec![]);
+        for i in 0..49 {
+            b.insert_edge("KNOWS", &format!("p{i}"), &format!("p{}", i + 1));
+        }
+        b.commit().unwrap();
+        // The field's name is interned here, before the fold: a write that
+        // names a new symbol writes the interner, and copies it.
+        db.set_prop("p3", "age", Value::Int(6)).unwrap();
+        db.fold_now();
+        let fold = Arc::clone(db.fold_overlay.as_ref().unwrap());
+        db.set_prop("p3", "age", Value::Int(7)).unwrap();
+        assert!(Arc::ptr_eq(&db.topo, &fold.topo), "topology copied");
+        assert!(
+            Arc::ptr_eq(&db.edge_props, &fold.edge_props),
+            "edge props copied"
+        );
+        assert!(Arc::ptr_eq(&db.syms, &fold.syms), "interner copied");
+        // A write the rule derives from: the writer copies, the fold does not move.
+        db.set_prop("p4", "org_id", Value::Str("acme".into()))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&db.topo, &fold.topo));
+        assert_eq!(
+            db.neighbors("p4", "WORKS_AT", Direction::Out).unwrap(),
+            ["acme"]
+        );
+        let org = fold.ids.get("acme").unwrap();
+        let p4 = fold.ids.get("p4").unwrap();
+        let et = fold.syms.get("WORKS_AT");
+        assert!(et.is_none_or(|et| !fold.topo.neighbors(et, Direction::Out, p4).contains(&org)));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ledger row 130: a node delete in a batch finds the batch's edges at
+    /// that node through the endpoint index. 201 deletes, each looking in the
+    /// added and the deleted edge sets, read at most the edges at the node and
+    /// the one entry that ends each walk (403 here), not the 200 × 200 a full
+    /// walk reads (20,300 with the old `retain`).
+    #[test]
+    fn a_batch_node_delete_visits_only_the_batch_edges_at_that_node() {
+        let dir = tmp_dir("row130-visits");
+        let mut db = GraphDb::open(&dir).unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("Old", &format!("old{i}"), vec![]);
+        }
+        b.commit().unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("P", &format!("s{i}"), vec![])
+                .insert_node("P", &format!("d{i}"), vec![])
+                .insert_edge("KNOWS", &format!("s{i}"), &format!("d{i}"))
+                .delete_node(&format!("old{i}"));
+        }
+        b.delete_node("s0");
+        EDGE_KEYS_VISITED.with(|v| v.set(0));
+        b.commit().unwrap();
+        let visited = EDGE_KEYS_VISITED.with(|v| v.get());
+        assert!(visited <= 2 * 201 + 1, "{visited} entries read");
+        assert_eq!(db.edge_count(), 199);
+        assert!(db.node_info("s0").is_none() && db.node_info("old7").is_none());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let d =

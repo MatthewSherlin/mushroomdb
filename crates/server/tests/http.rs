@@ -6629,82 +6629,180 @@ async fn ready_is_200_on_a_router_built_without_a_flag() {
 }
 
 // ---------------------------------------------------------------------------
-// Format-V11 values (0.10 TY-1): the JSON wire forms parse and print, but until
-// the V11 format lands no write may store one — every HTTP write path refuses
-// it before anything reaches the WAL.
+// Format-V11 values (0.10 TY-1, TY-12): every HTTP write path stores a tagged
+// value, the store moves to the V11 snapshot format before the value reaches
+// the WAL, and a read returns the value in the wire form it was written in —
+// live and after a reopen.
 // ---------------------------------------------------------------------------
-
-const V11_DATE_REFUSAL: &str = "not supported in mushroomdb 0.10 yet: Date values cannot be \
-                                stored until the V11 format lands";
 
 fn wal_bytes(dir: &std::path::Path) -> Vec<u8> {
     std::fs::read(dir.join("wal.bin")).unwrap_or_default()
 }
 
-async fn assert_v11_write_refused(name: &str, uri: &str, body: Json) {
+/// One wire form of each 0.10 value type.
+fn v11_wire_forms() -> Vec<Json> {
+    vec![
+        json!({"$date": "2024-01-15"}),
+        json!({"$ldt": "2024-01-15T12:34:56.789012"}),
+        json!({"$dt": "2024-01-15T12:34:56.789012+05:30"}),
+        json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
+        json!({"$binary": "3q2+7w=="}),
+    ]
+}
+
+/// `key.born` read back over `/query`, as JSON.
+async fn read_born(app: &Router, key: &str) -> Json {
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:Person) WHERE n.id = $k RETURN n.born AS born",
+        json!({"k": key}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v["rows"][0][0].clone()
+}
+
+/// Write `form` through `uri` onto `key`, then read it back live and after a
+/// reopen.
+async fn assert_v11_write_round_trips(name: &str, uri: &str, body: Json, key: &str, form: &Json) {
     let dir = tmp(name);
     let db = SharedDb::open(&dir).unwrap();
     seed_person(&db, "alice");
+    let app = router(db.clone());
     let before = wal_bytes(&dir);
-    let (status, resp, _) = send(router(db.clone()), json_req("POST", uri, body)).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "{}",
+    let (status, resp, _) = send(app.clone(), json_req("POST", uri, body)).await;
+    assert!(
+        status.is_success(),
+        "{uri}: {status} {}",
         String::from_utf8_lossy(&resp)
     );
-    let err = parse_json(&resp)["error"].as_str().unwrap().to_string();
-    assert!(err.contains(V11_DATE_REFUSAL), "{err}");
     assert_eq!(
-        wal_bytes(&dir),
-        before,
-        "a refused write appended to the WAL"
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
+        Some(11),
+        "{uri}: the write moves the store to V11"
     );
-    assert_eq!(db.read().node_count(), 1);
+    assert!(
+        wal_bytes(&dir).starts_with(&before),
+        "{uri}: the WAL is kept"
+    );
+    assert_eq!(&read_born(&app, key).await, form, "{uri}: live");
+    drop(app);
+    drop(db);
+    let reopened = router(SharedDb::open(&dir).unwrap());
+    assert_eq!(&read_born(&reopened, key).await, form, "{uri}: reopened");
 }
 
 #[tokio::test]
-async fn ingest_with_a_tagged_date_is_refused_and_writes_nothing() {
-    assert_v11_write_refused(
-        "v11-ingest",
-        "/ingest",
-        json!({
-            "label": "Person",
-            "rows": [{"id": "bob", "born": {"$date": "2024-01-15"}}],
-            "options": {"auto_fk": "off"}
-        }),
-    )
-    .await;
+async fn ingest_with_a_tagged_value_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-ingest-{i}"),
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [{"id": "bob", "born": form}],
+                "options": {"auto_fk": "off"}
+            }),
+            "bob",
+            form,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn create_node_with_a_tagged_date_is_refused_and_writes_nothing() {
-    assert_v11_write_refused(
-        "v11-create-node",
-        "/nodes",
-        json!({"label": "Person", "key": "bob", "props": {"born": {"$date": "2024-01-15"}}}),
-    )
-    .await;
+async fn create_node_with_a_tagged_value_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-create-node-{i}"),
+            "/nodes",
+            json!({"label": "Person", "key": "bob", "props": {"born": form}}),
+            "bob",
+            form,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn cypher_set_with_a_tagged_date_param_is_refused_and_writes_nothing() {
-    assert_v11_write_refused(
-        "v11-cypher-set",
-        "/query",
-        json!({
-            "cypher": "MATCH (n:Person) WHERE n.id = 'alice' SET n.born = $d",
-            "params": {"d": {"$date": "2024-01-15"}}
-        }),
-    )
-    .await;
+async fn cypher_set_with_a_tagged_param_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-cypher-set-{i}"),
+            "/query",
+            json!({
+                "cypher": "MATCH (n:Person) WHERE n.id = 'alice' SET n.born = $d",
+                "params": {"d": form}
+            }),
+            "alice",
+            form,
+        )
+        .await;
+    }
+}
+
+/// Arrow: stored typed values come back over the default `/query` format, one
+/// row per type, as the text the bridge renders them in — live and after a
+/// reopen of the V11 store.
+#[tokio::test]
+async fn stored_v11_values_round_trip_through_arrow() {
+    let dir = tmp("v11-arrow");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db.clone());
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        let (status, resp, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/nodes",
+                json!({"label": "Typed", "key": format!("t{i}"), "props": {"i": i, "v": form}}),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{}", String::from_utf8_lossy(&resp));
+    }
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    let expected = [
+        "2024-01-15",
+        "2024-01-15T12:34:56.789012",
+        "2024-01-15T12:34:56.789012+05:30",
+        "P1Y2M3DT4H5M6.789S",
+        "3q2+7w==",
+    ];
+    async fn arrow_column(app: &Router) -> Vec<String> {
+        let (status, body, ctype) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query",
+                json!({"cypher": "MATCH (n:Typed) RETURN n.v AS v ORDER BY n.i"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ctype.as_deref(),
+            Some("application/vnd.apache.arrow.stream")
+        );
+        let mut reader = StreamReader::try_new(Cursor::new(body), None).unwrap();
+        let batch = reader.next().expect("one batch").unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("a mixed column of V11 values is Utf8");
+        (0..col.len()).map(|i| col.value(i).to_string()).collect()
+    }
+    assert_eq!(arrow_column(&app).await, expected, "live");
+    drop(app);
+    drop(db);
+    let reopened = router(SharedDb::open(&dir).unwrap());
+    assert_eq!(arrow_column(&reopened).await, expected, "reopened");
 }
 
 // ---------------------------------------------------------------------------
 // Unique constraints (0.10 TY-5): every HTTP write path is refused with 409 and
-// appends nothing when it would duplicate a constrained value. The constraint
-// is declared through the test hook, because until the V11 format lands its
-// WAL record is refused like a V11 value.
+// appends nothing when it would duplicate a constrained value.
 // ---------------------------------------------------------------------------
 
 const CONSTRAINT_VIOLATION: &str = "constraint violation: property 'email' is declared unique \
@@ -6716,7 +6814,6 @@ async fn assert_constraint_refused(name: &str, method: &str, uri: &str, body: Js
     let db = SharedDb::open(&dir).unwrap();
     {
         let mut w = db.write();
-        w.unlock_v11_format_for_test();
         w.create_constraint("uniq_email", "User", "email").unwrap();
         w.insert_node(
             "User",
@@ -6784,7 +6881,6 @@ async fn http_put_prop_refuses_a_unique_constraint_duplicate() {
     let db = SharedDb::open(&dir).unwrap();
     {
         let mut w = db.write();
-        w.unlock_v11_format_for_test();
         w.create_constraint("uniq_email", "User", "email").unwrap();
         w.insert_node(
             "User",
@@ -6826,7 +6922,6 @@ async fn http_put_prop_refuses_a_unique_constraint_duplicate() {
 async fn http_binary_over_the_limit_is_413() {
     let dir = tmp("value-too-large");
     let db = SharedDb::open(&dir).unwrap();
-    db.write().unlock_v11_format_for_test();
     let before = wal_bytes(&dir);
     let big = mushroomdb::tagged_json(&Value::Binary(vec![0u8; mushroomdb::BINARY_MAX_BYTES + 1]))
         .unwrap()
@@ -7123,6 +7218,29 @@ async fn query_json_renders_a_null_list_element_as_null() {
     let v = parse_json(&body);
     assert_eq!(v["columns"], json!(["l", "m", "v"]));
     assert_eq!(v["rows"], json!([[[1, null], {"a": null}, null]]));
+}
+
+// ── QL-BX: a predicate is a value in a projection ──────────────────────────
+
+#[tokio::test]
+async fn query_json_returns_a_predicate_as_a_boolean_or_null() {
+    let (app, _db) = open("query-predicate-value");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "RETURN $p IS NULL AS a, $p > 1 AS b, NOT (null = 1) AS c, [x IN [1, 2] | x > 1] AS d",
+                "params": {"p": 5}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["a", "b", "c", "d"]));
+    assert_eq!(v["rows"], json!([[false, true, null, [false, true]]]));
 }
 
 // ── The `id` property mirrors the key (ledger row 128) ──────────────────────

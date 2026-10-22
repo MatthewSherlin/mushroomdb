@@ -44,12 +44,12 @@ impl Fx {
     fn g(&mut self) -> GraphMut<'_> {
         GraphMut {
             ids: &self.ids,
-            syms: &mut self.syms,
+            syms: (&mut self.syms).into(),
             labels: &self.labels,
             props: ColumnsView::owned(&self.props),
-            topo: &mut self.topo,
+            topo: (&mut self.topo).into(),
             base_topo: None,
-            edge_props: &mut self.eprops,
+            edge_props: (&mut self.eprops).into(),
         }
     }
 }

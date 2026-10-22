@@ -8,11 +8,9 @@
 //! the store reads the same live as after a reopen.
 //!
 //! `CreateConstraint` / `DropConstraint` are format-V11 WAL records, which a
-//! 0.9.x reader cannot decode. Until the V11 format lands (TY-12) the write
-//! path refuses them like a V11 value, so a default build cannot declare a
-//! constraint at all — the first test below holds that. Everything else runs
-//! on a handle the `test-hooks` hook unlocks, which is the path TY-12 opens
-//! for real: `cargo test -p mushroomdb --features test-hooks --test constraints`.
+//! 0.9.x reader cannot decode, so the first declaration moves the store to
+//! the V11 snapshot format before its record is appended (TY-12) — the first
+//! test below holds that.
 
 use mushroomdb::{GraphError, RealFs, Value};
 use std::path::{Path, PathBuf};
@@ -36,12 +34,9 @@ fn wal_bytes(dir: &Path) -> Vec<u8> {
     std::fs::read(dir.join("wal.bin")).unwrap_or_default()
 }
 
-const CONSTRAINT_REFUSAL: &str = "not supported in mushroomdb 0.10 yet: unique constraints \
-                                  cannot be declared until the V11 format lands";
-
 #[test]
-fn create_constraint_is_refused_until_the_v11_format_lands() {
-    let dir = tmp("locked");
+fn create_constraint_moves_the_store_to_v11_before_its_record() {
+    let dir = tmp("upgrade");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node(
         "User",
@@ -50,34 +45,30 @@ fn create_constraint_is_refused_until_the_v11_format_lands() {
     )
     .unwrap();
     let before = wal_bytes(&dir);
-    match db.create_constraint("uniq_email", "User", "email") {
-        Err(GraphError::QueryError { detail }) => assert_eq!(detail, CONSTRAINT_REFUSAL),
-        other => panic!("expected the V11 record refusal, got {other:?}"),
-    }
-    assert_eq!(
-        wal_bytes(&dir),
-        before,
-        "a refused declaration was appended"
-    );
-    assert!(db.constraints().is_empty());
+    assert!(!db.is_v11());
+    db.create_constraint("uniq_email", "User", "email").unwrap();
+    assert!(db.is_v11());
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    let after = wal_bytes(&dir);
     assert!(
-        !db.is_index_enabled("User", "email"),
-        "the backing index comes with the record, so a refused record leaves none"
+        after.starts_with(&before) && after.len() > before.len(),
+        "the upgrade keeps the WAL and the declaration is appended to it"
     );
-    // Nothing is enforced: the declaration never happened.
-    db.insert_node(
+    assert!(db.is_index_enabled("User", "email"));
+    match db.insert_node(
         "User",
         "bob",
         vec![("email".into(), Value::Str("a@x".into()))],
-    )
-    .unwrap();
+    ) {
+        Err(GraphError::ConstraintViolation { .. }) => {}
+        other => panic!("expected a violation, got {other:?}"),
+    }
     drop(db);
     let reopened = GraphDb::open(&dir).unwrap();
-    assert!(reopened.constraints().is_empty());
-    assert_eq!(reopened.node_count(), 2);
+    assert_eq!(reopened.constraints().len(), 1);
+    assert_eq!(reopened.node_count(), 1);
 }
 
-#[cfg(feature = "test-hooks")]
 mod unlocked {
     use super::*;
     use mushroomdb::{
@@ -94,8 +85,7 @@ mod unlocked {
 
     fn open_temp(name: &str) -> (PathBuf, GraphDb) {
         let dir = tmp(name);
-        let mut db = GraphDb::open(&dir).unwrap();
-        db.unlock_v11_format_for_test();
+        let db = GraphDb::open(&dir).unwrap();
         (dir, db)
     }
 
@@ -522,7 +512,6 @@ mod unlocked {
         let db = SharedDb::open(&dir).unwrap();
         {
             let mut w = db.write();
-            w.unlock_v11_format_for_test();
             w.create_constraint("uniq_email", "User", "email").unwrap();
             w.insert_node("User", "alice", email("a@x")).unwrap();
         }
@@ -727,7 +716,6 @@ mod unlocked {
         wal.extend_from_slice(&record);
         std::fs::write(dir.join("wal.bin"), wal).unwrap();
         let mut db = GraphDb::open(&dir).expect("replay must never fail");
-        db.unlock_v11_format_for_test();
         db.insert_node("User", "carol", email("c@x")).unwrap();
         let live_count = db.node_count();
         drop(db);
@@ -771,9 +759,9 @@ mod unlocked {
         db.insert_node("User", "carol", email("c@x")).unwrap();
         drop(db);
         append_constraint_record(&dir);
-        let mut db = GraphDb::open(&dir).expect("replay must never fail");
-        db.unlock_v11_format_for_test();
+        let db = GraphDb::open(&dir).expect("replay must never fail");
         assert_eq!(db.constraints().len(), 1);
+        assert!(db.is_v11(), "the replayed declaration makes the handle V11");
         (dir, db)
     }
 
@@ -833,7 +821,6 @@ mod unlocked {
         db.snapshot().unwrap();
         drop(db);
         let mut reopened = GraphDb::open(&dir).expect("a snapshot of such a store opens");
-        reopened.unlock_v11_format_for_test();
         assert_eq!(reopened.constraints().len(), 1);
         assert_eq!(reopened.node_count(), 3);
         for key in ["alice", "bob"] {
@@ -1216,7 +1203,6 @@ mod unlocked {
         db.insert_node("N", "a", num(Value::Int(2))).unwrap();
         drop(db);
         let mut db = GraphDb::open(&dir).unwrap();
-        db.unlock_v11_format_for_test();
         assert!(is_violation(&db.insert_node(
             "N",
             "b",
@@ -1289,21 +1275,26 @@ mod unlocked {
     }
 
     #[test]
-    fn a_locked_handle_enforces_a_replayed_constraint_and_refuses_to_drop_it() {
-        // A store whose WAL already holds a constraint, opened by a handle
-        // without the hook: the constraint is enforced, and withdrawing it —
-        // another V11 record — is refused at the same choke point.
-        let (dir, db) = constrained("locked-reopen");
+    fn a_reopened_handle_enforces_a_replayed_constraint_and_can_drop_it() {
+        // A store whose WAL already holds a constraint: the reopened handle is
+        // V11 already, enforces the constraint, and withdrawing it — another
+        // V11 record — needs no second upgrade.
+        let (dir, db) = constrained("reopen-drop");
         drop(db);
-        let mut locked = GraphDb::open(&dir).unwrap();
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        assert!(reopened.is_v11());
         let before = wal_bytes(&dir);
-        assert_violation(locked.insert_node("User", "bob", email("a@x")));
-        match locked.drop_constraint("uniq_email") {
-            Err(GraphError::QueryError { detail }) => assert_eq!(detail, CONSTRAINT_REFUSAL),
-            other => panic!("expected the V11 record refusal, got {other:?}"),
-        }
+        assert_violation(reopened.insert_node("User", "bob", email("a@x")));
         assert_eq!(wal_bytes(&dir), before);
-        assert_eq!(locked.constraints().len(), 1);
+        let snapshot_before = std::fs::read(dir.join("snapshot.bin")).unwrap();
+        reopened.drop_constraint("uniq_email").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("snapshot.bin")).unwrap(),
+            snapshot_before,
+            "a V11 store is not snapshotted again for its next V11 record"
+        );
+        assert!(reopened.constraints().is_empty());
+        reopened.insert_node("User", "bob", email("a@x")).unwrap();
     }
 
     #[test]
@@ -1524,7 +1515,6 @@ mod unlocked {
         assert_eq!(live.len(), 2);
         drop(db);
         let mut reopened = GraphDb::open(&dir).unwrap();
-        reopened.unlock_v11_format_for_test();
         assert_eq!(
             sorted(conflict(reopened.create_constraint(
                 "uniq_email",
@@ -1601,7 +1591,6 @@ mod unlocked {
         check(&mut db);
         drop(db);
         let mut reopened = GraphDb::open(&dir).unwrap();
-        reopened.unlock_v11_format_for_test();
         check(&mut reopened);
     }
 
@@ -1645,15 +1634,18 @@ mod unlocked {
     }
 
     #[test]
-    fn a_refused_declaration_does_no_scan_before_the_v11_gate() {
-        // Locked handle, duplicates present: the refusal, not the conflict.
-        let dir = tmp("locked-dups");
+    fn a_declaration_the_data_refuses_does_not_move_the_store_to_v11() {
+        // Duplicates present: the conflict, found before any record is built,
+        // so the store is not upgraded for a declaration that never lands.
+        let dir = tmp("conflict-no-upgrade");
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("User", "alice", email("a@x")).unwrap();
         db.insert_node("User", "bob", email("a@x")).unwrap();
-        match db.create_constraint("uniq_email", "User", "email") {
-            Err(GraphError::QueryError { detail }) => assert_eq!(detail, CONSTRAINT_REFUSAL),
-            other => panic!("expected the V11 record refusal, got {other:?}"),
-        }
+        assert!(matches!(
+            db.create_constraint("uniq_email", "User", "email"),
+            Err(GraphError::ConstraintCreationConflict { .. })
+        ));
+        assert!(!db.is_v11());
+        assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), None);
     }
 }
