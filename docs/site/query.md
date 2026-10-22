@@ -151,9 +151,27 @@ zero-length variable-length paths are not supported; minimum hop count is 1
 ### Semantics
 
 - **BFS expansion** — each hop expands all neighbours of the current frontier.
-- **Per-path edge uniqueness** — a relationship may not appear twice within the
-  same path (Cypher relationship isomorphism).  This guarantees termination on
-  cyclic graphs.
+- **Relationship uniqueness** — within one `MATCH` clause no relationship is
+  bound twice (Cypher relationship isomorphism): not twice in one walk, not by
+  two hops of a pattern, fixed or variable-length, and not by two
+  comma-separated parts of the clause. So a named path never lists a
+  relationship twice, and `MATCH (a)-[r]->(b), (c)-[s]->(d)` never binds `r`
+  and `s` to the same relationship. Separate clauses do not share the rule:
+  `MATCH (a)-[r]->(b) MATCH (c)-[s]->(d)` may bind both to one relationship,
+  and so may an `OPTIONAL MATCH` that follows a `MATCH`. A relationship
+  variable an earlier clause bound (`MATCH (x)-[r]->(y) MATCH (a)-[r]->(b)`)
+  matches that same relationship again; naming one relationship variable for
+  two hops of one `MATCH` (`MATCH (a)-[r]->(b)-[r]->(c)`) is the error
+  ``relationship variable `r` is used for more than one relationship in the
+  same MATCH``. A write driven by the
+  match (`MATCH … SET`, `MATCH … DETACH DELETE`) sees the same rows. An
+  undirected self-loop is one relationship, walked once. This guarantees
+  termination on cyclic graphs.
+- **The end node is filtered, the nodes in between are not** — the
+  destination's label and inline properties (`(b:Person {active: true})`,
+  `{id: $id}`) apply to the node each path ends at.  A path may pass through
+  nodes that fail them.  This holds in every hop form, for a hop in the middle
+  of a pattern, in `OPTIONAL MATCH`, and with a named path.
 - **Intermediate-row budget** — if the output row count reaches 1,000,000 the
   query is aborted with an error naming the limit.  Use tighter ranges or a
   `WHERE` filter to stay within budget on dense graphs.
@@ -188,9 +206,11 @@ MATCH shortestPath((a)-[r:T*..5]->(b))
 RETURN r.length
 ```
 
-Bind the two endpoints with **separate** `MATCH` clauses. Comma-separated
-patterns in a single `MATCH` (`MATCH (a), (b)`) are not supported and fail to
-parse.
+Bind the two endpoints first: with earlier `MATCH` clauses, as above, or with
+an earlier comma-separated part of the same `MATCH`
+(`MATCH (a)-[r]->(b), p = shortestPath((a)-[*..5]-(b))`). In the same `MATCH`
+the search never uses a relationship the other parts bound, so there it finds
+the shortest path that avoids `r`.
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.
@@ -203,6 +223,54 @@ parse.
   storage order) and is not guaranteed to be stable across re-opens or inserts.
 - The `*..max` range cap still applies (max ≤ 10).
 - Returns zero rows when no path exists within the hop limit.
+
+---
+
+## Named paths
+
+Bind a whole pattern to a name with `p = …` and return it, or read it with
+`.length`, `.nodes` and `.relationships`:
+
+```cypher
+MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person)
+RETURN p
+```
+
+```cypher
+MATCH p = (a:Person {id: 'ada'})-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company)
+WHERE p.length = 2
+RETURN p.nodes
+```
+
+A path is a **map** with three fields, so it comes back the same way on every
+surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
+
+| Field | Value |
+|---|---|
+| `nodes` | the node keys, in walk order |
+| `relationships` | one map per relationship: `type`, `start` and `end` (the keys of its stored direction) |
+| `length` | the number of relationships |
+
+`p = (a)` is a path of one node with length 0. A path works in `RETURN`,
+`WITH`, `WHERE`, `ORDER BY`, `DISTINCT`, `count(p)` and `collect(p)`, and with
+`shortestPath`: `MATCH p = shortestPath((a)-[:T*..5]->(b))`. In `OPTIONAL
+MATCH` a named path works for fixed-length hops (a pattern that finds nothing
+gives a null path); an `OPTIONAL MATCH` with a variable-length hop is a
+separate limit that is not lifted here.
+
+- **Masks.** A path through a node the caller cannot see does not exist: the
+  whole row is dropped, never returned with that node left out.
+- **Ordering.** `ORDER BY p` sorts paths as maps, which puts shorter paths first.
+- **A new name.** A path name that is already bound, by an earlier path, a node,
+  a relationship or an alias, is an error: ``variable `p` is already bound``.
+- **Not a node or a relationship.** `key(p)`, `labels(p)` and `type(p)` are
+  errors that name `p`.
+- **Storing.** `SET x.r = p` is refused like any bare variable on the right of
+  `SET`. A path nested in a list or map (`SET x.r = [p]`) is an ordinary map and
+  is stored as one.
+- **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
+- Relationship properties are not part of a path; match the relationship with
+  its own variable to read them.
 
 ---
 
@@ -921,7 +989,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
-| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
+| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
@@ -960,6 +1028,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
+| Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
@@ -1053,7 +1122,7 @@ unexpected-token parse error or other unspecified result.
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
-| Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
+| Multiple patterns in one MATCH | Supported, comma-separated — as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. Still a named error after CREATE |
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |

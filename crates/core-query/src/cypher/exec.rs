@@ -4,7 +4,7 @@ use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
     OrderTarget, RetItem, RetVal, UnwindExpr,
 };
-use crate::cypher::plan::PlanOp;
+use crate::cypher::plan::{PathHop, PlanOp};
 use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
@@ -57,6 +57,108 @@ enum Cell {
     Path(u8),
     /// Scalar value produced by a WITH projection (property alias, aggregate result, etc.).
     Scalar(Value),
+}
+
+/// The nodes and relationships of a path, in walk order: `nodes.len()` is
+/// `rels.len() + 1`.
+#[derive(Clone, Debug, PartialEq)]
+struct PathVal {
+    nodes: Vec<u32>,
+    rels: Vec<EdgeRef>,
+}
+
+impl PathVal {
+    /// The hidden binding that carries one variable-length or shortest-path
+    /// hop's walk to `BindPath` and to the later hops of its MATCH clause:
+    /// the relationships in walk order, flat as `[etype, src, dst, ...]`.
+    /// The nodes are not stored; `BindPath` derives them from the hop's start
+    /// (see `walk_nodes`), which keeps the binding small on the hot path. An
+    /// ordinary scalar cell, so the binding table gains no variant (a `Box`
+    /// variant stopped the row clone and drop from inlining and cost the
+    /// two-hop aggregate about 9 %).
+    fn to_trail(rels: &[EdgeRef]) -> Cell {
+        Self::to_trail_then(rels, None)
+    }
+
+    /// `to_trail` of `rels` followed by `last`, built in one allocation.
+    fn to_trail_then(rels: &[EdgeRef], last: Option<&EdgeRef>) -> Cell {
+        let mut flat = Vec::with_capacity(3 * (rels.len() + 1));
+        for e in rels.iter().chain(last) {
+            flat.extend([e.etype, e.src, e.dst].map(|x| Value::Int(x.into())));
+        }
+        Cell::Scalar(Value::List(flat))
+    }
+
+    /// Whether a trail (see `to_trail`) walked `e`, read in place.
+    fn trail_has_edge(cell: &Cell, e: &EdgeRef) -> bool {
+        let Cell::Scalar(Value::List(rels)) = cell else {
+            return false;
+        };
+        let (etype, src, dst) = (i64::from(e.etype), i64::from(e.src), i64::from(e.dst));
+        rels.chunks_exact(3).any(|c| {
+            matches!(c, [Value::Int(t), Value::Int(s), Value::Int(d)]
+                if *t == etype && *s == src && *d == dst)
+        })
+    }
+
+    fn from_trail(cell: &Cell) -> Option<Vec<EdgeRef>> {
+        let Cell::Scalar(Value::List(rels)) = cell else {
+            return None;
+        };
+        let id = |v: &Value| match v {
+            Value::Int(n) => u32::try_from(*n).ok(),
+            _ => None,
+        };
+        rels.chunks_exact(3)
+            .map(|c| {
+                Some(EdgeRef {
+                    etype: id(&c[0])?,
+                    src: id(&c[1])?,
+                    dst: id(&c[2])?,
+                })
+            })
+            .collect()
+    }
+
+    /// Extend `nodes` (ending at the walk's start) along `rels`: each
+    /// relationship leads to its other end, whichever way it was walked; a
+    /// self-loop stays put.
+    fn walk_nodes(nodes: &mut Vec<u32>, rels: &[EdgeRef]) {
+        for e in rels {
+            let at = nodes.last().copied().unwrap_or(e.src);
+            nodes.push(if e.src == at { e.dst } else { e.src });
+        }
+    }
+}
+
+/// A path as a query result: a map, so it renders on every surface (Rust,
+/// HTTP JSON, Python, TypeScript, Arrow, Bolt) as the existing `Value::Map`
+/// does, with no new `Value` variant. Nodes are their keys, as a bare node
+/// variable is.
+fn path_value(view: &GraphView, path: &PathVal) -> Value {
+    let key = |id: u32| Value::Str(view.try_key_of(id).unwrap_or_default().to_owned());
+    let rels = path
+        .rels
+        .iter()
+        .map(|e| {
+            Value::Map(BTreeMap::from([
+                (
+                    "type".to_owned(),
+                    Value::Str(view.sym_name(e.etype).unwrap_or_default().to_owned()),
+                ),
+                ("start".to_owned(), key(e.src)),
+                ("end".to_owned(), key(e.dst)),
+            ]))
+        })
+        .collect();
+    Value::Map(BTreeMap::from([
+        (
+            "nodes".to_owned(),
+            Value::List(path.nodes.iter().map(|id| key(*id)).collect()),
+        ),
+        ("relationships".to_owned(), Value::List(rels)),
+        ("length".to_owned(), Value::Int(path.rels.len() as i64)),
+    ]))
 }
 
 /// Binding-table row: one slot per interned variable. Cheaper to clone than
@@ -214,17 +316,118 @@ fn group_cap_err() -> String {
 ///
 /// `Int(n)` and `Float(n as f64)` produce the same `FloatBits` key so that
 /// nodes with `score = 1` (Int) and `score = 1.0` (Float) land in the same
-/// group, matching openCypher's `1 = 1.0` equality rule.
-///
-/// Note: integers whose magnitude exceeds 2^53 lose precision when cast to
-/// `f64`, so two large integers that differ only beyond the float mantissa
-/// width could be incorrectly unified. This is a known limitation documented
-/// in `docs/site/query.md`.
+/// group, matching openCypher's `1 = 1.0` equality rule, and the two zeros
+/// are one value. An `Int` that no `f64` holds exactly (beyond 2^53) keeps an
+/// exact key, so two such `Int`s that differ stay two groups, as `=` says.
 fn group_key_normalize(v: &Value) -> Option<ValueKey> {
     match v {
-        Value::Int(n) => Some(ValueKey::FloatBits((*n as f64).to_bits())),
-        Value::Float(f) => Some(ValueKey::FloatBits(f.to_bits())),
+        Value::Int(n) => Some(match exact_float(*n) {
+            Some(f) => ValueKey::FloatBits(float_key_bits(f)),
+            None => ValueKey::Int(*n),
+        }),
+        Value::Float(f) => Some(ValueKey::FloatBits(float_key_bits(*f))),
+        // A list or map has no index key, but it is a real value: two
+        // different ones must not share the null group. A path renders as a
+        // map, so `RETURN DISTINCT p` and `count(p)` per group rely on this.
+        Value::List(_) | Value::Map(_) => {
+            let mut bytes = COMPOSITE_KEY_PREFIX.to_vec();
+            encode_composite_key(v, &mut bytes);
+            Some(ValueKey::BinaryBytes(bytes))
+        }
         _ => ValueKey::from_value(v),
+    }
+}
+
+/// `n` as an `f64`, when the `f64` is exactly `n`.
+fn exact_float(n: i64) -> Option<f64> {
+    let f = n as f64;
+    (f as i128 == i128::from(n)).then_some(f)
+}
+
+/// The bit pattern two numbers that `=` finds equal share: `-0.0` is `0.0`.
+fn float_key_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
+/// Marks a [`ValueKey::BinaryBytes`] that stands for a list or a map. A real
+/// binary value would have to begin with these exact bytes to share a group
+/// with one.
+const COMPOSITE_KEY_PREFIX: &[u8] = b"\xFFcomposite\x00";
+
+/// A canonical byte form of `v` for grouping, equal exactly when the scan's
+/// equality (`values_equal`) says two values are, recursively: numbers follow
+/// [`group_key_normalize`] (`2` and `2.0` meet, the zeros meet, `Int`s past
+/// 2^53 stay apart), a `DateTime` is its UTC instant whatever its offset, and
+/// a null is equal to a null (grouping, as openCypher has it). Every element
+/// is length-prefixed so two different values never encode alike.
+fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
+    let text = |out: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
+        out.push(tag);
+        out.extend((bytes.len() as u64).to_le_bytes());
+        out.extend(bytes);
+    };
+    match v {
+        Value::Int(n) => match exact_float(*n) {
+            Some(f) => {
+                out.push(1);
+                out.extend(float_key_bits(f).to_le_bytes());
+            }
+            None => {
+                out.push(7);
+                out.extend(n.to_le_bytes());
+            }
+        },
+        Value::Float(f) => {
+            out.push(1);
+            out.extend(float_key_bits(*f).to_le_bytes());
+        }
+        Value::Str(s) => text(out, 2, s.as_bytes()),
+        Value::Bool(b) => out.extend([3, u8::from(*b)]),
+        Value::List(items) => {
+            out.push(4);
+            out.extend((items.len() as u64).to_le_bytes());
+            for item in items {
+                encode_composite_key(item, out);
+            }
+        }
+        Value::Map(entries) => {
+            out.push(5);
+            out.extend((entries.len() as u64).to_le_bytes());
+            for (key, value) in entries {
+                out.extend((key.len() as u64).to_le_bytes());
+                out.extend(key.as_bytes());
+                encode_composite_key(value, out);
+            }
+        }
+        Value::Null => out.push(0),
+        Value::Date(d) => {
+            out.push(8);
+            out.extend(d.to_le_bytes());
+        }
+        Value::LocalDateTime(us) => {
+            out.push(9);
+            out.extend(us.to_le_bytes());
+        }
+        // The offset is display-only: one instant is one value.
+        Value::DateTime { micros_utc, .. } => {
+            out.push(10);
+            out.extend(micros_utc.to_le_bytes());
+        }
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            out.push(11);
+            out.extend(months.to_le_bytes());
+            out.extend(days.to_le_bytes());
+            out.extend(nanos.to_le_bytes());
+        }
+        Value::Binary(bytes) => text(out, 12, bytes),
     }
 }
 
@@ -449,30 +652,18 @@ fn execute_inner(
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, &vars, &rows, op, params)?;
             }
-            PlanOp::VarExpand {
-                from,
-                rel_var,
-                etypes,
-                dir,
-                to,
-                min,
-                max,
-            } => {
-                rows = exec_var_expand(
-                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *min, *max,
-                )?;
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, &vars, &rows, op, params)?;
             }
-            PlanOp::ShortestPath {
-                from,
-                rel_var,
-                etypes,
-                dir,
-                to,
-                max_hops,
+            PlanOp::ShortestPath { .. } => {
+                rows = exec_shortest_path(view, &vars, &rows, op)?;
+            }
+            PlanOp::BindPath {
+                path_var,
+                start_var,
+                hops,
             } => {
-                rows = exec_shortest_path(
-                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *max_hops,
-                )?;
+                rows = exec_bind_path(view, &vars, &rows, path_var, start_var, hops)?;
             }
             PlanOp::Filter { expr } => {
                 rows = exec_filter(view, &vars, &rows, expr, params)?;
@@ -761,6 +952,7 @@ fn execute_inner(
                     params,
                     func,
                     arg,
+                    op_edges: OpEdges::new(&[], &vars),
                 };
                 let mut acc = AggAcc::for_arg(func, arg);
                 for row in &rows {
@@ -857,7 +1049,7 @@ fn execute_inner(
 /// without the routing checks, aggregate fast-paths, or `check_params` (those
 /// are handled by the outer call).  Only the ops that can appear inside an
 /// OPTIONAL MATCH inner plan are needed: ScanLabel, JoinBound, LookupProps,
-/// Expand, Filter.
+/// Expand, VarExpand, BindPath, Filter.
 fn exec_left_outer_inner(
     view: &GraphView,
     vars: &VarTable,
@@ -881,6 +1073,16 @@ fn exec_left_outer_inner(
             }
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::BindPath {
+                path_var,
+                start_var,
+                hops,
+            } => {
+                rows = exec_bind_path(view, vars, &rows, path_var, start_var, hops)?;
             }
             PlanOp::Filter { expr } => {
                 rows = exec_filter(view, vars, &rows, expr, params)?;
@@ -926,6 +1128,9 @@ fn collect_params_from_ops(
             PlanOp::LookupProps { props, .. }
             | PlanOp::JoinBound { props, .. }
             | PlanOp::Expand {
+                to_props: props, ..
+            }
+            | PlanOp::VarExpand {
                 to_props: props, ..
             } => {
                 for (_, operand) in props {
@@ -1125,22 +1330,43 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             }
             PlanOp::VarExpand {
-                from, rel_var, to, ..
+                from,
+                rel_var,
+                to,
+                to_props,
+                trail_var,
+                ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
                 if let Some(r) = rel_var {
                     vars.intern(r);
+                }
+                if let Some(t) = trail_var {
+                    vars.intern(t);
+                }
+                for (_, operand) in to_props {
+                    intern_operand(&mut vars, operand);
                 }
             }
             PlanOp::ShortestPath {
-                from, rel_var, to, ..
+                from,
+                rel_var,
+                to,
+                trail_var,
+                ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
                 if let Some(r) = rel_var {
                     vars.intern(r);
                 }
+                if let Some(t) = trail_var {
+                    vars.intern(t);
+                }
+            }
+            PlanOp::BindPath { path_var, .. } => {
+                vars.intern(path_var);
             }
             PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
             PlanOp::Project { items } => {
@@ -1285,8 +1511,24 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 vars.intern(r);
                             }
                         }
+                        PlanOp::VarExpand {
+                            from,
+                            rel_var,
+                            to,
+                            trail_var,
+                            ..
+                        } => {
+                            vars.intern(from);
+                            vars.intern(to);
+                            for name in rel_var.iter().chain(trail_var) {
+                                vars.intern(name);
+                            }
+                        }
                         PlanOp::JoinBound { var, .. } | PlanOp::LookupProps { var, .. } => {
                             vars.intern(var);
+                        }
+                        PlanOp::BindPath { path_var, .. } => {
+                            vars.intern(path_var);
                         }
                         PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
                         _ => {}
@@ -3046,9 +3288,71 @@ fn neighbor(from: u32, e: &EdgeRef, dir: RelDir) -> u32 {
     }
 }
 
-fn row_has_edge(row: &Row, e: &EdgeRef) -> bool {
-    row.iter()
-        .any(|c| matches!(c, Some(Cell::Rel(existing)) if existing == e))
+/// The edges one hop must not use: those bound by the earlier hops of its
+/// MATCH clause (openCypher relationship uniqueness, across every hop and
+/// every comma-separated part of the clause, and never across clauses).
+///
+/// Each slot holds a fixed hop's `Cell::Rel` or a variable-length or
+/// shortest-path hop's trail. A first hop has none, so it checks nothing.
+#[derive(Default)]
+struct ClauseEdges {
+    slots: Vec<usize>,
+}
+
+impl ClauseEdges {
+    fn resolve(vars: &VarTable, names: &[String]) -> Self {
+        ClauseEdges {
+            slots: names.iter().filter_map(|n| vars.slot(n)).collect(),
+        }
+    }
+
+    /// True when `row` already binds `e` to an earlier hop of the clause.
+    fn holds(&self, row: &Row, e: &EdgeRef) -> bool {
+        self.slots.iter().any(|&slot| match row.get(slot) {
+            Some(Some(Cell::Rel(bound))) => bound == e,
+            Some(Some(cell @ Cell::Scalar(_))) => PathVal::trail_has_edge(cell, e),
+            _ => false,
+        })
+    }
+}
+
+/// Every `Expand` of a producer slice with its `ClauseEdges`, resolved once
+/// before a streaming executor recurses through the slice, so that a fixed
+/// hop looks no variable up per row. The executors pass suffixes of the
+/// slice, and an op is found by the length of the suffix it heads.
+struct OpEdges<'a> {
+    ops: &'a [PlanOp],
+    edges: Vec<ClauseEdges>,
+}
+
+impl<'a> OpEdges<'a> {
+    fn new(ops: &'a [PlanOp], vars: &VarTable) -> Self {
+        let edges = ops
+            .iter()
+            .map(|op| match op {
+                PlanOp::Expand { distinct_from, .. } => ClauseEdges::resolve(vars, distinct_from),
+                _ => ClauseEdges::default(),
+            })
+            .collect();
+        OpEdges { ops, edges }
+    }
+
+    /// The entry of the op that heads `suffix`.
+    fn at(&self, suffix: &[PlanOp]) -> &ClauseEdges {
+        let i = self.ops.len() - suffix.len();
+        debug_assert!(std::ptr::eq(&self.ops[i], &suffix[0]));
+        &self.edges[i]
+    }
+}
+
+/// The relationship a fixed hop's variable already holds when the hop runs:
+/// an earlier clause bound it, so this hop must match that relationship
+/// rather than rebind the name.
+fn bound_rel(row: &Row, rel_slot: Option<usize>) -> Option<EdgeRef> {
+    match rel_slot.and_then(|slot| row.get(slot)) {
+        Some(Some(Cell::Rel(e))) => Some(*e),
+        _ => None,
+    }
 }
 
 fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
@@ -3076,10 +3380,12 @@ fn exec_expand(
         to,
         to_label,
         to_props,
+        distinct_from,
     } = op
     else {
         return Err("internal: expected Expand".into());
     };
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(*dir);
     let to_slot = vars
@@ -3097,8 +3403,9 @@ fn exec_expand(
             }
             None => None,
         };
+        let bound_rel = bound_rel(row, rel_slot);
         for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
-            if row_has_edge(row, &e) {
+            if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                 continue;
             }
             let nbr = neighbor(from_id, &e, *dir);
@@ -3131,31 +3438,49 @@ fn exec_expand(
     Ok(out)
 }
 
-/// BFS variable-length expand with per-path edge-uniqueness (Cypher
-/// relationship isomorphism).  A single path never reuses the same `EdgeRef`;
-/// node revisits are allowed.
+/// BFS variable-length expand with relationship uniqueness (Cypher
+/// relationship isomorphism). A walk never reuses an `EdgeRef`, neither one
+/// it walked already nor one an earlier hop of its MATCH clause bound; node
+/// revisits are allowed.
 ///
-/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`.
+/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`
+/// and the end node passes the destination's label and inline properties.
+/// Nodes a walk passes through are not filtered.
 /// The 1 M intermediate-row budget applies to `out.len()`.
-#[allow(clippy::too_many_arguments)]
 fn exec_var_expand(
     view: &GraphView,
     vars: &VarTable,
     rows: &[Row],
-    from: &str,
-    rel_var: &Option<String>,
-    etypes: &[String],
-    dir: RelDir,
-    to: &str,
-    min: u8,
-    max: u8,
+    op: &PlanOp,
+    params: &Params,
 ) -> Result<Vec<Row>, String> {
+    let PlanOp::VarExpand {
+        from,
+        rel_var,
+        etypes,
+        dir,
+        to,
+        to_label,
+        to_props,
+        min,
+        max,
+        trail_var,
+        distinct_from,
+    } = op
+    else {
+        return Err("internal: expected VarExpand".into());
+    };
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
+    let (dir, min, max) = (*dir, *min, *max);
+    // Checked once so an unfiltered hop pays nothing per emitted row.
+    let dest_filtered = to_label.is_some() || !to_props.is_empty();
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let to_slot = vars
         .slot(to)
         .ok_or_else(|| format!("unbound variable `{to}`"))?;
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let trail_slot = trail_var.as_ref().and_then(|tv| vars.slot(tv));
     let cap = max_intermediate_rows();
     let mut out: Vec<Row> = Vec::new();
 
@@ -3189,8 +3514,9 @@ fn exec_var_expand(
             let mut next_frontier: Vec<PathState> = Vec::new();
             for state in &frontier {
                 for e in expand(view, state.node, etypes.as_deref(), exp_dir) {
-                    // Per-path edge-uniqueness: reject edges already used in this path.
-                    if state.edges.contains(&e) {
+                    // Relationship uniqueness: an edge this walk already used,
+                    // or one an earlier hop of the clause bound, is skipped.
+                    if state.edges.contains(&e) || clause_edges.holds(row, &e) {
                         continue;
                     }
                     let nbr = neighbor(state.node, &e, dir);
@@ -3206,7 +3532,16 @@ fn exec_var_expand(
                         let dest_matches = match bound_to {
                             Some(want) => nbr == want,
                             None => true,
-                        };
+                        } && (!dest_filtered
+                            || node_matches(
+                                view,
+                                vars,
+                                row,
+                                nbr,
+                                to_label.as_deref(),
+                                to_props,
+                                params,
+                            )?);
                         if dest_matches {
                             if out.len() >= cap {
                                 return Err(row_cap_err(cap));
@@ -3216,6 +3551,9 @@ fn exec_var_expand(
                                 next[slot] = Some(Cell::Path(depth));
                             }
                             next[to_slot] = Some(Cell::Node(nbr));
+                            if let Some(slot) = trail_slot {
+                                next[slot] = Some(PathVal::to_trail_then(&state.edges, Some(&e)));
+                            }
                             out.push(next);
                         }
                     }
@@ -3250,22 +3588,33 @@ fn exec_var_expand(
 ///
 /// Uses standard BFS with a visited-node set for efficiency.  Since BFS
 /// expands nodes level-by-level, the first time `to` is reached is the
-/// shortest path.  Emits exactly 0 or 1 rows.
-#[allow(clippy::too_many_arguments)]
+/// shortest path.  Emits exactly 0 or 1 rows. The search never uses an edge
+/// an earlier hop of its MATCH clause bound.
 fn exec_shortest_path(
     view: &GraphView,
     vars: &VarTable,
     rows: &[Row],
-    from: &str,
-    rel_var: &Option<String>,
-    etypes: &[String],
-    dir: RelDir,
-    to: &str,
-    max_hops: u8,
+    op: &PlanOp,
 ) -> Result<Vec<Row>, String> {
+    let PlanOp::ShortestPath {
+        from,
+        rel_var,
+        etypes,
+        dir,
+        to,
+        max_hops,
+        trail_var,
+        distinct_from,
+    } = op
+    else {
+        return Err("internal: expected ShortestPath".into());
+    };
+    let (dir, max_hops) = (*dir, *max_hops);
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let trail_slot = trail_var.as_ref().and_then(|tv| vars.slot(tv));
     let mut out: Vec<Row> = Vec::new();
 
     for row in rows {
@@ -3276,11 +3625,16 @@ fn exec_shortest_path(
         let mut visited = std::collections::BTreeSet::new();
         visited.insert(from_id);
         let mut frontier: Vec<u32> = vec![from_id];
+        // How each visited node was first reached, to rebuild the path.
+        let mut reached_by: BTreeMap<u32, (u32, EdgeRef)> = BTreeMap::new();
 
         'bfs: for depth in 1u8..=max_hops {
             let mut next_frontier: Vec<u32> = Vec::new();
             for &node in &frontier {
                 for e in expand(view, node, etypes.as_deref(), exp_dir) {
+                    if clause_edges.holds(row, &e) {
+                        continue;
+                    }
                     let nbr = neighbor(node, &e, dir);
                     // Hidden nodes are non-existent under the mask — do not traverse
                     // through them (paths through hidden nodes do not exist).
@@ -3294,11 +3648,25 @@ fn exec_shortest_path(
                         if let Some(slot) = rel_slot {
                             next[slot] = Some(Cell::Path(depth));
                         }
+                        if let Some(slot) = trail_slot {
+                            let mut rels = vec![e];
+                            let mut at = node;
+                            while at != from_id {
+                                let (prev, edge) = reached_by[&at];
+                                rels.push(edge);
+                                at = prev;
+                            }
+                            rels.reverse();
+                            next[slot] = Some(PathVal::to_trail(&rels));
+                        }
                         out.push(next);
                         break 'bfs;
                     }
                     if !visited.contains(&nbr) {
                         visited.insert(nbr);
+                        if trail_slot.is_some() {
+                            reached_by.insert(nbr, (node, e));
+                        }
                         next_frontier.push(nbr);
                     }
                 }
@@ -3308,6 +3676,49 @@ fn exec_shortest_path(
                 break;
             }
         }
+    }
+    Ok(out)
+}
+
+/// Assemble a named path from the cells the pattern's ops bound. A row whose
+/// path would touch a node the mask hides is dropped whole: the mask is
+/// checked here, at materialisation, as well as inside the expansions.
+fn exec_bind_path(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    path_var: &str,
+    start_var: &str,
+    hops: &[PathHop],
+) -> Result<Vec<Row>, String> {
+    let path_slot = vars
+        .slot(path_var)
+        .ok_or_else(|| format!("unbound variable `{path_var}`"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    'rows: for row in rows {
+        let mut nodes = vec![require_node(row, vars, start_var)?];
+        let mut rels: Vec<EdgeRef> = Vec::new();
+        for hop in hops {
+            if let Some(trail_var) = &hop.trail_var {
+                let Some(walk) = PathVal::from_trail(require_cell(row, vars, trail_var)?) else {
+                    return Err(format!("internal: `{trail_var}` holds no walk"));
+                };
+                PathVal::walk_nodes(&mut nodes, &walk);
+                rels.extend_from_slice(&walk);
+            } else {
+                match require_cell(row, vars, &hop.rel_var)? {
+                    Cell::Rel(e) => rels.push(*e),
+                    _ => return Err(format!("variable `{}` is not a relationship", hop.rel_var)),
+                }
+                nodes.push(require_node(row, vars, &hop.to_var)?);
+            }
+        }
+        if nodes.iter().any(|id| !view.visible(*id)) {
+            continue 'rows;
+        }
+        let mut next = row.clone();
+        next[path_slot] = Some(Cell::Scalar(path_value(view, &PathVal { nodes, rels })));
+        out.push(next);
     }
     Ok(out)
 }
@@ -3349,6 +3760,7 @@ struct PullCtx<'a> {
     project_items: &'a [RetItem],
     params: &'a Params<'a>,
     bound: usize,
+    op_edges: OpEdges<'a>,
 }
 
 fn execute_pull(
@@ -3377,6 +3789,7 @@ fn execute_pull(
         project_items,
         params,
         bound,
+        op_edges: OpEdges::new(producers, &vars),
     };
     let mut initial_row: Row = vec![None; vars.names.len()];
     let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
@@ -3507,6 +3920,7 @@ struct AggStreamCtx<'a> {
     params: &'a Params<'a>,
     func: &'a AggFunc,
     arg: &'a AggArg,
+    op_edges: OpEdges<'a>,
 }
 
 /// Streaming accumulator executor for a single aggregate.
@@ -3537,6 +3951,7 @@ fn execute_aggregate(
         params,
         func,
         arg,
+        op_edges: OpEdges::new(producers, &vars),
     };
     let initial_row: Row = vec![None; vars.names.len()];
     let mut acc = AggAcc::for_arg(func, arg);
@@ -3849,8 +4264,10 @@ fn agg_stream(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -3865,8 +4282,9 @@ fn agg_stream(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -3924,50 +4342,37 @@ fn agg_stream(
                 agg_stream(ctx, rest, row, acc)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
         }
-        PlanOp::ShortestPath {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            max_hops,
+        PlanOp::BindPath {
+            path_var,
+            start_var,
+            hops,
         } => {
-            let new_rows = exec_shortest_path(
+            let new_rows = exec_bind_path(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *max_hops,
+                path_var,
+                start_var,
+                hops,
             )?;
+            for nr in &new_rows {
+                agg_stream(ctx, rest, nr, acc)?;
+            }
+        }
+        PlanOp::ShortestPath { .. } => {
+            let new_rows = exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), op)?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
@@ -4045,6 +4450,7 @@ struct GroupStreamCtx<'a> {
     params: &'a Params<'a>,
     keys: &'a [(String, RetItem)],
     aggs: &'a [(AggFunc, AggArg, String)],
+    op_edges: OpEdges<'a>,
 }
 
 /// Build the `Projected` output table from a finished group map.
@@ -4230,6 +4636,7 @@ fn execute_group_aggregate(
         params,
         keys,
         aggs,
+        op_edges: OpEdges::new(producers, &vars),
     };
     group_stream(&ctx, producers, &initial_row, &mut groups, &mut key_order)?;
     // openCypher: aggregates with no group-key items on empty input must
@@ -4398,8 +4805,10 @@ fn group_stream(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -4414,8 +4823,9 @@ fn group_stream(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -4473,50 +4883,37 @@ fn group_stream(
                 group_stream(ctx, rest, row, groups, key_order)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 group_stream(ctx, rest, nr, groups, key_order)?;
             }
         }
-        PlanOp::ShortestPath {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            max_hops,
+        PlanOp::BindPath {
+            path_var,
+            start_var,
+            hops,
         } => {
-            let new_rows = exec_shortest_path(
+            let new_rows = exec_bind_path(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *max_hops,
+                path_var,
+                start_var,
+                hops,
             )?;
+            for nr in &new_rows {
+                group_stream(ctx, rest, nr, groups, key_order)?;
+            }
+        }
+        PlanOp::ShortestPath { .. } => {
+            let new_rows = exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), op)?;
             for nr in &new_rows {
                 group_stream(ctx, rest, nr, groups, key_order)?;
             }
@@ -4815,8 +5212,10 @@ fn pull_rows(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -4831,11 +5230,12 @@ fn pull_rows(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
                 if result.len() >= ctx.bound {
                     break;
                 }
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -4946,6 +5346,13 @@ fn pull_rows(
             return Err(
                 "pull executor: VarExpand reached pull_rows — variable-length path \
                  plans must use the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
+        PlanOp::BindPath { .. } => {
+            return Err(
+                "pull executor: BindPath reached pull_rows — named-path plans must use \
+                 the staged path (row_bound returns None)"
                     .to_string(),
             );
         }
@@ -5347,6 +5754,18 @@ mod ql_14;
 mod ql_15;
 
 #[cfg(test)]
+#[path = "tests/ql_07.rs"]
+mod ql_07;
+
+#[cfg(test)]
+#[path = "tests/ql_vl.rs"]
+mod ql_vl;
+
+#[cfg(test)]
+#[path = "tests/ql_ru.rs"]
+mod ql_ru;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -5362,7 +5781,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     pub(super) struct Fx {
-        ids: IdMap,
+        pub(super) ids: IdMap,
         syms: Interner,
         labels: Vec<u32>,
         props: ColumnStore,
@@ -5393,7 +5812,7 @@ mod tests {
             id
         }
 
-        fn edge(&mut self, etype: &str, src: u32, dst: u32, props: Vec<(&str, Value)>) {
+        pub(super) fn edge(&mut self, etype: &str, src: u32, dst: u32, props: Vec<(&str, Value)>) {
             let et = self.syms.intern(etype);
             self.topo.add_edge(et, src, dst);
             for (f, v) in props {
@@ -5415,7 +5834,7 @@ mod tests {
             }
         }
 
-        fn view_indexed<'a>(
+        pub(super) fn view_indexed<'a>(
             &'a self,
             index: &'a core_storage::property_index::PropertyIndex,
         ) -> GraphView<'a> {
@@ -6350,6 +6769,7 @@ LIMIT 10";
                 to: "b".into(),
                 to_label: None,
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::Project {
                 items: vec![RetItem {
@@ -8003,6 +8423,7 @@ LIMIT 10";
             project_items: &project_items,
             params: &params,
             bound: 100,
+            op_edges: super::OpEdges::new(&[], &vars),
         };
         let ops = vec![PlanOp::VarExpand {
             from: "a".into(),
@@ -8010,8 +8431,12 @@ LIMIT 10";
             etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
+            to_label: None,
+            to_props: vec![],
             min: 1,
             max: 3,
+            trail_var: None,
+            distinct_from: vec![],
         }];
         let mut row = vec![None; vars.names.len()];
         let mut result = Vec::new();
@@ -8039,6 +8464,7 @@ LIMIT 10";
             project_items: &project_items,
             params: &params,
             bound: 100,
+            op_edges: super::OpEdges::new(&[], &vars),
         };
         let ops = vec![PlanOp::ShortestPath {
             from: "a".into(),
@@ -8047,6 +8473,8 @@ LIMIT 10";
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             max_hops: 5,
+            trail_var: None,
+            distinct_from: vec![],
         }];
         let mut row = vec![None; vars.names.len()];
         let mut result = Vec::new();
@@ -9998,7 +10426,8 @@ LIMIT 10";
     }
 
     /// Comma-separated patterns and a run of separate MATCH clauses parse to
-    /// the same query.
+    /// the same patterns; only the clause boundary differs, which decides how
+    /// far relationship uniqueness reaches (QL-RU).
     #[test]
     fn comma_patterns_equal_separate_match_clauses() {
         let commas =
@@ -10006,7 +10435,11 @@ LIMIT 10";
         let clauses =
             parse(&lex("MATCH (a:A)-[:X]->(b:B) MATCH (a)-[:Y]->(b) RETURN a.key").unwrap())
                 .unwrap();
-        assert_eq!(commas.matches, clauses.matches);
+        assert!(commas.matches[1].continues_match);
+        assert!(!clauses.matches[1].continues_match);
+        let mut joined = commas.matches.clone();
+        joined[1].continues_match = false;
+        assert_eq!(joined, clauses.matches);
     }
 
     // ── Task 17 fix round 1 ──────────────────────────────────────────────

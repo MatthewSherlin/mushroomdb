@@ -13172,6 +13172,8 @@ impl<F: Fs> GraphDb<F> {
                         },
                         chain: vec![],
                         shortest: false,
+                        path_var: None,
+                        continues_match: false,
                     }
                 })
                 .collect();
@@ -14231,6 +14233,8 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     )],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,
@@ -14361,6 +14365,8 @@ impl<F: Fs> GraphDb<F> {
                     },
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,

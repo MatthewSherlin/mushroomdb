@@ -11,6 +11,16 @@ use super::ast::{
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
 
+/// One hop of a named path: the relationship binding and the node it lands
+/// on. A variable-length or shortest-path hop also names the hidden variable
+/// that holds the walk, since its `rel_var` only carries a hop count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathHop {
+    pub rel_var: String,
+    pub to_var: String,
+    pub trail_var: Option<String>,
+}
+
 /// One operator in the logical plan. Patterns compile left-to-right into
 /// scan / join / expand ops; WHERE is a single `Filter`; then `Project`,
 /// rewritten `OrderBy`, `Skip`, `Limit` in that order.
@@ -65,6 +75,10 @@ pub enum PlanOp {
     /// If `to` is already bound in the row, the executor keeps only edges
     /// that land on that bound id (JoinBound semantics *inside* Expand).
     /// `rel_var` is always `Some` after planning: user name or `_rN`.
+    ///
+    /// `distinct_from` names the relationship bindings of the earlier hops
+    /// of the same MATCH clause (see [`PlanOp::VarExpand`]); an edge any of
+    /// them holds is skipped.
     Expand {
         from: String,
         rel_var: Option<String>,
@@ -73,6 +87,7 @@ pub enum PlanOp {
         to: String,
         to_label: Option<String>,
         to_props: Vec<(String, Operand)>,
+        distinct_from: Vec<String>,
     },
     /// Pattern-*start* node whose var is already bound: label/prop re-check only.
     JoinBound {
@@ -144,6 +159,16 @@ pub enum PlanOp {
     /// allowed.  `rel_var`, when present, is bound to a virtual path cell
     /// whose sole accessible property is `length` (hop count as `Int`).
     ///
+    /// The destination's label and inline properties (`to_label` /
+    /// `to_props`) are checked on the node a walk ends at, never on the nodes
+    /// it passes through: a walk may continue through a node that fails them.
+    ///
+    /// Relationship uniqueness spans the whole MATCH clause (openCypher): a
+    /// walk also skips every edge bound by an earlier hop of the same clause,
+    /// all comma-separated parts included. `distinct_from` names those
+    /// bindings: a fixed hop's relationship variable, or a variable-length or
+    /// shortest-path hop's trail variable. Earlier clauses are not listed.
+    ///
     /// Always executes via the **staged path** regardless of LIMIT.
     /// The 1 M intermediate-row budget applies to the output row count.
     VarExpand {
@@ -152,8 +177,15 @@ pub enum PlanOp {
         etypes: Vec<String>,
         dir: RelDir,
         to: String,
+        to_label: Option<String>,
+        to_props: Vec<(String, Operand)>,
         min: u8,
         max: u8,
+        /// When set, the hidden variable that receives the nodes and
+        /// relationships this hop walked: the pattern is a named path, or a
+        /// later hop of the same MATCH clause must not reuse those edges.
+        trail_var: Option<String>,
+        distinct_from: Vec<String>,
     },
     /// Shortest path between two already-bound nodes via BFS.
     ///
@@ -173,6 +205,19 @@ pub enum PlanOp {
         dir: RelDir,
         to: String,
         max_hops: u8,
+        /// As on `VarExpand`: the hidden variable that receives the walk.
+        trail_var: Option<String>,
+        /// As on `VarExpand`: the search never uses an edge these hold.
+        distinct_from: Vec<String>,
+    },
+    /// Bind a named path (`MATCH p = (a)-[r]->(b)`): assemble the nodes and
+    /// relationships the pattern's other ops bound, in pattern order, into
+    /// one path value bound to `path_var`. Emitted after the pattern's last
+    /// hop. A zero-hop pattern (`p = (a)`) has no `hops`.
+    BindPath {
+        path_var: String,
+        start_var: String,
+        hops: Vec<PathHop>,
     },
     /// Non-aggregate WITH: apply filter / order / skip / limit to the current
     /// row set without projecting. Node bindings in the row survive as-is so
@@ -278,6 +323,10 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     {
         return None;
     }
+    // A named path is assembled from the whole binding table.
+    if ops.iter().any(|op| matches!(op, PlanOp::BindPath { .. })) {
+        return None;
+    }
     // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
     // path so that intermediate rows are correctly bounded and sequenced.
     if ops.iter().any(|op| {
@@ -371,16 +420,14 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     let mut node_anon = 0u32;
     let mut rel_anon = 0u32;
 
-    for pat in &q.matches {
-        compile_pattern(
-            pat,
-            &mut ops,
-            &mut bound,
-            &mut rel_bound,
-            &mut node_anon,
-            &mut rel_anon,
-        )?;
-    }
+    compile_match_clauses(
+        &q.matches,
+        &mut ops,
+        &mut bound,
+        &mut rel_bound,
+        &mut node_anon,
+        &mut rel_anon,
+    )?;
 
     // OPTIONAL MATCH clauses (after required MATCHes).
     for oc in &q.optional_clauses {
@@ -731,9 +778,7 @@ fn compile_with_stage(
     }
 
     // MATCH clauses that follow this WITH.
-    for pat in &stage.matches {
-        compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon)?;
-    }
+    compile_match_clauses(&stage.matches, ops, bound, rel_bound, node_anon, rel_anon)?;
     // OPTIONAL MATCH clauses that follow those MATCHes.
     for oc in &stage.optional_clauses {
         compile_optional_clause(oc, ops, bound, rel_bound, node_anon, rel_anon)?;
@@ -1138,6 +1183,103 @@ fn invert_dir(d: RelDir) -> RelDir {
     }
 }
 
+/// Relationship uniqueness for one MATCH clause: the bindings of the hops
+/// compiled so far, and the relationship types of the hops still to come.
+///
+/// Two hops can only bind the same edge when their type sets overlap (an
+/// untyped hop overlaps every hop), so a hop lists only the earlier bindings
+/// it overlaps, and a walk keeps its edges only for a later hop it overlaps.
+/// Directions are not pruned: one edge can be walked by a `->` hop and a
+/// `<-` hop.
+struct ClauseScope {
+    /// A fixed hop's relationship variable, or a variable-length or
+    /// shortest-path hop's trail variable, with that hop's types.
+    earlier: Vec<(String, Vec<String>)>,
+    /// The types of every hop of the clause, in pattern order.
+    hop_types: Vec<Vec<String>>,
+    /// How many hops have been compiled.
+    done: usize,
+    /// Relationship variables the user named in this clause so far.
+    named: Vec<String>,
+}
+
+/// Whether two hops' type lists can match one edge.
+fn types_overlap(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t))
+}
+
+impl ClauseScope {
+    fn new(parts: &[Pattern]) -> Self {
+        ClauseScope {
+            earlier: Vec::new(),
+            hop_types: parts
+                .iter()
+                .flat_map(|p| p.chain.iter().map(|(rel, _)| rel.etypes.clone()))
+                .collect(),
+            done: 0,
+            named: Vec::new(),
+        }
+    }
+
+    /// Start compiling the next hop, `rel`: the earlier bindings it must not
+    /// reuse, and whether a later hop of the clause could bind one of its
+    /// edges. A relationship variable named twice in one clause is the
+    /// openCypher error, not a pattern that never matches.
+    fn next_hop(&mut self, rel: &RelPat) -> Result<(Vec<String>, bool), String> {
+        if let Some(name) = &rel.var {
+            if self.named.contains(name) {
+                return Err(format!(
+                    "relationship variable `{name}` is used for more than one relationship \
+                     in the same MATCH"
+                ));
+            }
+            self.named.push(name.clone());
+        }
+        self.done += 1;
+        let distinct_from = self
+            .earlier
+            .iter()
+            .filter(|(_, types)| types_overlap(types, &rel.etypes))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let later_overlaps = self.hop_types[self.done.min(self.hop_types.len())..]
+            .iter()
+            .any(|types| types_overlap(types, &rel.etypes));
+        Ok((distinct_from, later_overlaps))
+    }
+
+    /// Record the binding a later hop checks this hop's edges against.
+    fn bound(&mut self, binding: String, rel: &RelPat) {
+        self.earlier.push((binding, rel.etypes.clone()));
+    }
+}
+
+/// Compile a run of MATCH patterns, one uniqueness scope per MATCH clause:
+/// a pattern with `continues_match` joins the clause of the one before it.
+fn compile_match_clauses(
+    patterns: &[Pattern],
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    rel_bound: &mut BTreeSet<String>,
+    node_anon: &mut u32,
+    rel_anon: &mut u32,
+) -> Result<(), String> {
+    let mut start = 0;
+    while start < patterns.len() {
+        let len = 1 + patterns[start + 1..]
+            .iter()
+            .take_while(|p| p.continues_match)
+            .count();
+        let clause = &patterns[start..start + len];
+        let mut scope = ClauseScope::new(clause);
+        for pat in clause {
+            compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon, &mut scope)?;
+        }
+        start += len;
+    }
+    Ok(())
+}
+
 fn compile_pattern(
     pat: &Pattern,
     ops: &mut Vec<PlanOp>,
@@ -1145,6 +1287,7 @@ fn compile_pattern(
     rel_bound: &mut BTreeSet<String>,
     node_anon: &mut u32,
     rel_anon: &mut u32,
+    scope: &mut ClauseScope,
 ) -> Result<(), String> {
     let start = name_node(&pat.start, node_anon, bound);
     if pat.shortest {
@@ -1176,13 +1319,16 @@ fn compile_pattern(
     {
         // Expand-from-bound: leftmost unbound, rightmost dest already bound,
         // single-rel *fixed-hop* pattern. Start from dest, invert dir, expand
-        // toward start. Variable-length (`*min..max`) is not reversed: VarExpand
-        // has no dest label/prop filter, so reversing would drop start checks.
+        // toward start. Variable-length (`*min..max`) is not reversed: the walk
+        // runs in pattern order and the start's filter is applied by its scan.
         let (rel, dest) = &pat.chain[0];
         let dest_name = name_node(dest, node_anon, bound);
+        let dest_name_for_path = dest_name.clone();
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
+        let (distinct_from, _) = scope.next_hop(rel)?;
+        scope.bound(rel_name.clone(), rel);
         if dest.label.is_some() || !dest.props.is_empty() {
             ops.push(PlanOp::JoinBound {
                 var: dest_name.clone(),
@@ -1192,14 +1338,24 @@ fn compile_pattern(
         }
         ops.push(PlanOp::Expand {
             from: dest_name,
-            rel_var: Some(rel_name),
+            rel_var: Some(rel_name.clone()),
             etypes: rel.etypes.clone(),
             dir: invert_dir(rel.dir),
             to: start.clone(),
             to_label: pat.start.label.clone(),
             to_props: pat.start.props.clone(),
+            distinct_from,
         });
-        bound.insert(start);
+        bound.insert(start.clone());
+        if let Some(path_var) = &pat.path_var {
+            // The walk reads start -> dest, the order the pattern is written in.
+            let hops = vec![PathHop {
+                rel_var: rel_name.clone(),
+                to_var: dest_name_for_path,
+                trail_var: None,
+            }];
+            bind_path(ops, bound, path_var, start, hops)?;
+        }
         return Ok(());
     } else if let Some(key) = id_lookup(&pat.start.props) {
         ops.push(PlanOp::ScanKey {
@@ -1237,12 +1393,25 @@ fn compile_pattern(
         bound.insert(start.clone());
     }
 
+    let path_start = start.clone();
+    let mut path_hops: Vec<PathHop> = Vec::new();
     let mut from = start;
     for (rel, dest) in &pat.chain {
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
         let to = name_node(dest, node_anon, bound);
+        let (distinct_from, later_hops) = scope.next_hop(rel)?;
+        // A variable-length or shortest-path hop's edges travel in a hidden
+        // trail when a named path needs them or a later hop must avoid them.
+        let trail_var = (rel.hops.is_some() && (pat.path_var.is_some() || later_hops))
+            .then(|| format!("{rel_name}#trail"));
+        scope.bound(trail_var.clone().unwrap_or_else(|| rel_name.clone()), rel);
+        path_hops.push(PathHop {
+            rel_var: rel_name.clone(),
+            to_var: to.clone(),
+            trail_var: trail_var.clone(),
+        });
 
         if let Some(hops) = rel.hops {
             if pat.shortest {
@@ -1264,6 +1433,15 @@ fn compile_pattern(
                         hops.min
                     ));
                 }
+                // The destination is already bound; its pattern label and
+                // properties still have to hold (defect-ledger row 132).
+                if dest.label.is_some() || !dest.props.is_empty() {
+                    ops.push(PlanOp::JoinBound {
+                        var: to.clone(),
+                        label: dest.label.clone(),
+                        props: dest.props.clone(),
+                    });
+                }
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
@@ -1271,6 +1449,8 @@ fn compile_pattern(
                     dir: rel.dir,
                     to: to.clone(),
                     max_hops: hops.max,
+                    trail_var,
+                    distinct_from,
                 });
             } else {
                 ops.push(PlanOp::VarExpand {
@@ -1279,8 +1459,12 @@ fn compile_pattern(
                     etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
+                    to_label: dest.label.clone(),
+                    to_props: dest.props.clone(),
                     min: hops.min,
                     max: hops.max,
+                    trail_var,
+                    distinct_from,
                 });
                 bound.insert(to.clone());
             }
@@ -1293,11 +1477,39 @@ fn compile_pattern(
                 to: to.clone(),
                 to_label: dest.label.clone(),
                 to_props: dest.props.clone(),
+                distinct_from,
             });
             bound.insert(to.clone());
         }
         from = to;
     }
+    if let Some(path_var) = &pat.path_var {
+        bind_path(ops, bound, path_var, path_start, path_hops)?;
+    }
+    Ok(())
+}
+
+/// Emit the `BindPath` op for a named path and put its name in scope.
+///
+/// A path name is a new variable: one already bound (an earlier path, a node
+/// or relationship of this or an earlier pattern, an alias) is an error, as
+/// openCypher has it, rather than a silent rebinding.
+fn bind_path(
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    path_var: &str,
+    start_var: String,
+    hops: Vec<PathHop>,
+) -> Result<(), String> {
+    if bound.contains(path_var) {
+        return Err(format!("variable `{path_var}` is already bound"));
+    }
+    bound.insert(path_var.to_owned());
+    ops.push(PlanOp::BindPath {
+        path_var: path_var.to_owned(),
+        start_var,
+        hops,
+    });
     Ok(())
 }
 
@@ -1320,6 +1532,9 @@ fn compile_optional_clause(
     let mut inner_rel_bound = rel_bound.clone();
     let mut inner_ops: Vec<PlanOp> = Vec::new();
 
+    // One OPTIONAL MATCH is one clause: its parts share one uniqueness scope,
+    // and it does not share it with the clauses before it.
+    let mut scope = ClauseScope::new(&oc.patterns);
     for pat in &oc.patterns {
         compile_pattern(
             pat,
@@ -1328,6 +1543,7 @@ fn compile_optional_clause(
             &mut inner_rel_bound,
             node_anon,
             rel_anon,
+            &mut scope,
         )?;
     }
     if let Some(expr) = &oc.where_expr {
@@ -1933,6 +2149,7 @@ LIMIT 10";
                 to: "c".into(),
                 to_label: Some("Company".into()),
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::JoinBound {
                 var: "c".into(),
@@ -1947,6 +2164,7 @@ LIMIT 10";
                 to: "t".into(),
                 to_label: None,
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::Filter {
                 expr: Expr::And(
@@ -2030,6 +2248,7 @@ LIMIT 10";
                     to: "a".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Expand {
                     from: "a".into(),
@@ -2039,6 +2258,7 @@ LIMIT 10";
                     to: "_n1".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {
@@ -2218,9 +2438,9 @@ LIMIT 10";
         }
     }
 
-    /// VarExpand has no dest label/prop filter. Reversing
-    /// `MATCH (c:Company)-[*1..2]->(t)` would drop `:Company` and bind
-    /// non-Company `c`. Keep LTR: ScanLabel Company then VarExpand.
+    /// A variable-length hop is not reversed onto a bound end:
+    /// `MATCH (c:Company)-[*1..2]->(t)` stays LTR, ScanLabel Company then
+    /// VarExpand, so `:Company` is applied by the start scan.
     #[test]
     fn plan_does_not_reverse_variable_length_from_bound() {
         let cy = "MATCH (t {id: $tid}) MATCH (c:Company)-[*1..2]->(t) RETURN c";
@@ -2414,6 +2634,7 @@ LIMIT 10";
                     to: "b".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![
@@ -2454,6 +2675,7 @@ LIMIT 10";
                     to: "c".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {
@@ -2553,6 +2775,8 @@ LIMIT 10";
                 },
                 chain: vec![],
                 shortest: false,
+                path_var: None,
+                continues_match: false,
             }],
             optional_clauses: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
