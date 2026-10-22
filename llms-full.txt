@@ -5554,8 +5554,9 @@ A comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IS NULL`, `IS NOT NULL`, `IN`,
 `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `NOT`, `AND`, `OR` and `XOR` work in every
 expression position, not only in `WHERE`: `RETURN` and `WITH` items, `ORDER BY`
 keys, list and map elements, a list comprehension's filter and projection, a
-`reduce` body, function arguments, `CASE` branches, `SET` values, the property
-values of a per-row `CREATE` or `MERGE` after `UNWIND`, and an `UNWIND` source.
+`reduce` body, function arguments, `CASE` branches, `SET` values, `CREATE` and
+`MERGE` property values (in a plain `CREATE` / `MERGE` the value reads no variable,
+property or `$param`, and is evaluated before the write), and an `UNWIND` source.
 
 ```cypher
 MATCH (n:Person) RETURN n.name, n.age >= 18 AS adult
@@ -5578,10 +5579,25 @@ for nested literals).
 As a value a predicate is three-valued: true, false or null. A comparison or `IN`
 with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
 `NOT null` is null; `null AND false` is false and `null OR true` is true;
-`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Values that
-do not order (`1 < 'a'`) compare as null; values of different types are unequal
-(`1 = 'a'` is false). A non-boolean operand of `NOT`, `AND`, `OR` or `XOR` reads
-as it does in `WHERE` (a non-empty string or list, or a non-zero number, is true).
+`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Only numbers,
+strings, temporal values of one type, and binary values order; any other pair
+compares as null under `<`, `<=`, `>` and `>=`, so `1 < 'a'`, `false < true` and
+`[1] < [2]` are all null (booleans and lists do not order). Values of different
+types are unequal (`1 = 'a'` is false).
+
+The operands of `NOT`, `AND`, `OR` and `XOR` must be booleans or null: any other
+value is the named error `type error: AND expects boolean operands, got an integer (…)`
+(`RETURN 1 AND true`, `WHERE n.age AND n.active`, `NOT 'a'`). A whole `WHERE`,
+`CASE WHEN` or comprehension filter that is a bare value, not a predicate
+(`WHERE n.flag`), reads a non-boolean as true unless it is empty or zero.
+
+`x IN list` takes one list on the right, an additive expression: `IN [a, b]`,
+`IN $list`, `IN n.tags`, `IN [1, 2] + [3]`. Each element is compared whole, so
+`[1, 2] IN [[1, 2], [3]]` is true and `1 IN [[1]]` is false. It is true when an
+element equals `x`; otherwise null if `x`, an element or the list is null; otherwise
+false. `null IN []` is false and `null IN [[]]` is null. A written list is read in
+order and the scan stops at the first match, so an element after it is never
+evaluated.
 
 `WHERE` evaluates its predicate the same three-valued way and keeps the row only
 when it is true: false and null both drop it, `NOT` included. So
@@ -5649,7 +5665,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
 | `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
-| `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List` |
+| `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List`; a list element is compared whole (`n.tags IN [[1, 2]]`), see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
 | `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
 | `WHERE AND / OR / XOR` | `WHERE n.a = 1 AND n.b = 2`, `WHERE n.a XOR n.b` |
 | Comparisons and boolean operators as values | `RETURN n.age >= 18 AS adult`, `[x IN l \| x > 1]`, `SET n.flag = n.score > 10`, `coalesce(n.a IS NULL, false)`, `CASE WHEN … THEN n.a > 1 END` — every expression position; three-valued (`RETURN null > 1` is null, `NOT null` is null, `null IS NULL` is true); see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
@@ -5679,7 +5695,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
+| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression that reads no variable, property or `$param` (`{flag: 1 > 0, n: 2 + 3}`); it is evaluated before the write, and a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A value that evaluates to null is a named error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |

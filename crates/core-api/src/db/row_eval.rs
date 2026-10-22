@@ -429,7 +429,7 @@ fn map_expr(expr: &Expr, leaf: &mut dyn FnMut(&Operand) -> Option<Operand>) -> E
         Expr::IsNotNull(o) => Expr::IsNotNull(map_leaves(o, leaf)),
         Expr::In { expr, list } => Expr::In {
             expr: map_leaves(expr, leaf),
-            list: list.iter().map(|o| map_leaves(o, leaf)).collect(),
+            list: map_leaves(list, leaf),
         },
     }
 }

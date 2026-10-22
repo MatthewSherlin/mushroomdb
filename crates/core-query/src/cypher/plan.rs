@@ -1410,15 +1410,12 @@ fn check_expr_bound_in(expr: &Expr, bound: &BTreeSet<String>, clause: &str) -> R
         Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, clause),
         Expr::In { expr, list } => {
             check_operand_bound(expr, bound, clause)?;
-            for item in list {
-                check_operand_bound(item, bound, clause)?;
-            }
-            Ok(())
+            check_operand_bound(list, bound, clause)
         }
     }
 }
 
-fn check_operand_bound(
+pub(crate) fn check_operand_bound(
     operand: &Operand,
     bound: &BTreeSet<String>,
     clause: &str,
@@ -1783,7 +1780,7 @@ fn inline_aliases_expr(expr: &Expr, returns: &[RetItem]) -> Expr {
         Expr::IsNotNull(o) => Expr::IsNotNull(go(o)),
         Expr::In { expr, list } => Expr::In {
             expr: go(expr),
-            list: list.iter().map(go).collect(),
+            list: go(list),
         },
     }
 }

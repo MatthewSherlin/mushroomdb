@@ -452,6 +452,62 @@ fn in_reads_its_elements_lazily_as_where_always_did() {
 }
 
 #[test]
+fn in_does_not_flatten_list_valued_elements() {
+    // A written list's elements are compared whole, as openCypher does.
+    assert_eq!(eval("[1, 2] IN [[1, 2], [3]]"), b(true));
+    assert_eq!(eval("1 IN [[1]]"), b(false));
+    assert_eq!(eval("[] IN [[]]"), b(true));
+    assert_eq!(eval("null IN [[]]"), None);
+    assert_eq!(eval("null IN []"), b(false));
+    assert_eq!(eval("1 IN ['a', [1, 2]]"), b(false));
+    // `$l` is [1, 2, 3]: `IN $l` reads its elements, `IN [$l]` has one.
+    assert_eq!(eval("1 IN $l"), b(true));
+    assert_eq!(eval("1 IN [$l]"), b(false));
+    assert_eq!(eval("[1, 2, 3] IN [$l]"), b(true));
+    // The right-hand side is an additive expression.
+    assert_eq!(eval("3 IN [1, 2] + [3]"), b(true));
+    assert_eq!(eval("4 IN [1, 2] + [3]"), b(false));
+    let fx = people();
+    assert_eq!(
+        keys(
+            &fx,
+            "MATCH (n:P) WHERE NOT (CASE WHEN n.age > 18 THEN 1 ELSE 0 END IN [n.score, [1, 2]]) RETURN n.key AS k ORDER BY k"
+        ),
+        // a: 1 IN [12, [1, 2]] is false (flattened, it was true); c: null.
+        vec!["a", "b"]
+    );
+}
+
+#[test]
+fn and_or_not_xor_refuse_a_non_boolean_operand() {
+    for (expr, op) in [
+        ("1 AND true", "AND"),
+        ("true OR 'a'", "OR"),
+        ("NOT 5", "NOT"),
+        ("[1] XOR false", "XOR"),
+    ] {
+        let err = super::tests::eval_err(expr);
+        assert!(
+            err.contains("type error") && err.contains(op),
+            "`{expr}`: {err}"
+        );
+    }
+    // Null stays null, and a boolean is fine.
+    assert_eq!(eval("NOT n.missing"), None);
+    assert_eq!(eval("null AND true"), None);
+    assert_eq!(eval("true AND NOT false"), b(true));
+    // In a WHERE too.
+    let fx = people();
+    let err = run(
+        &fx.view(),
+        "MATCH (n:P) WHERE n.age AND true RETURN n.key AS k",
+        &BTreeMap::new(),
+    )
+    .expect_err("a number is not a boolean");
+    assert!(err.contains("type error"), "{err}");
+}
+
+#[test]
 fn where_keeps_exactly_the_rows_a_projection_calls_true() {
     let fx = people();
     assert_eq!(
@@ -605,6 +661,22 @@ fn operand() -> impl Strategy<Value = (String, Operand)> {
     ]
 }
 
+fn bool_operand() -> impl Strategy<Value = (String, Operand)> {
+    prop_oneof![
+        Just((
+            "n.f".to_string(),
+            Operand::Prop {
+                var: "n".into(),
+                field: "f".into(),
+            }
+        )),
+        Just(("true".to_string(), Operand::Lit(Value::Bool(true)))),
+        Just(("false".to_string(), Operand::Lit(Value::Bool(false)))),
+        Just(("null".to_string(), Operand::Lit(Value::Null))),
+        Just(("$q".to_string(), Operand::Param("q".into()))),
+    ]
+}
+
 fn cmp_op() -> impl Strategy<Value = (&'static str, CmpOp)> {
     prop_oneof![
         Just(("=", CmpOp::Eq)),
@@ -631,11 +703,18 @@ fn leaf() -> impl Strategy<Value = P> {
                 format!("{t} IN [{at}, {bt}]"),
                 Expr::In {
                     expr: o,
-                    list: vec![a, b],
+                    // The old grammar's `Vec` of elements is now one list
+                    // literal, folded to a constant when both are constants.
+                    list: match (a, b) {
+                        (Operand::Lit(a), Operand::Lit(b)) => Operand::Lit(Value::List(vec![a, b])),
+                        (a, b) => Operand::ListLit(vec![a, b]),
+                    },
                 },
             )
         }),
-        operand().prop_map(|(t, o)| P::Leaf(t, Expr::Truthy(o))),
+        // A bare operand is an operand of NOT / AND / OR, so it is a
+        // boolean (or null): anything else is a type error.
+        bool_operand().prop_map(|(t, o)| P::Leaf(t, Expr::Truthy(o))),
         Just(P::Leaf(
             "n.s STARTS WITH 'a'".to_string(),
             Expr::Truthy(Operand::FuncCall {
@@ -686,6 +765,9 @@ fn mixed() -> Fx {
             if n % 2 == 0 {
                 props.push(("s", Value::Str("abc".into())));
             }
+            if n % 3 != 2 {
+                props.push(("f", Value::Bool(n % 3 == 0)));
+            }
             fx.add("M", &format!("k{n:02}"), props);
             n += 1;
         }
@@ -706,7 +788,10 @@ proptest! {
     #[test]
     fn where_keeps_the_rows_where_the_projection_is_true(p in predicate()) {
         let fx = mixed();
-        let params = BTreeMap::from([("p".to_string(), Value::Int(1))]);
+        let params = BTreeMap::from([
+            ("p".to_string(), Value::Int(1)),
+            ("q".to_string(), Value::Bool(true)),
+        ]);
         let w = p.text();
         let kept = col_with(
             &fx,

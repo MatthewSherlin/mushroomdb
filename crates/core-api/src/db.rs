@@ -1080,9 +1080,7 @@ fn expr_node_vars(expr: &Expr, out: &mut Vec<String>) {
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_node_vars(o, out),
         Expr::In { expr, list } => {
             operand_node_vars(expr, out);
-            for o in list {
-                operand_node_vars(o, out);
-            }
+            operand_node_vars(list, out);
         }
     }
 }
@@ -1180,8 +1178,9 @@ fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
             operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
         }
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
-        Expr::In { expr, list } => operand_write_return_refusal(expr)
-            .or_else(|| list.iter().find_map(operand_write_return_refusal)),
+        Expr::In { expr, list } => {
+            operand_write_return_refusal(expr).or_else(|| operand_write_return_refusal(list))
+        }
     }
 }
 
@@ -1313,9 +1312,7 @@ fn eval_set_return_operand<F: Fs>(
             let value = core_query::cypher::eval_predicate(
                 expr,
                 &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
-                &|| GraphError::QueryError {
-                    detail: "expression nesting too deep".into(),
-                },
+                &|detail| GraphError::QueryError { detail },
             )?;
             Ok(value.map(Value::Bool))
         }
@@ -1355,9 +1352,7 @@ fn eval_set_return_expr<F: Fs>(
     let value = core_query::cypher::eval_predicate(
         expr,
         &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
-        &|| GraphError::QueryError {
-            detail: "expression nesting too deep".into(),
-        },
+        &|detail| GraphError::QueryError { detail },
     )?;
     Ok(value == Some(true))
 }

@@ -194,10 +194,13 @@ pub enum Expr {
     IsNull(Operand),
     /// `operand IS NOT NULL` — true iff the operand is non-null.
     IsNotNull(Operand),
-    /// `expr IN [a, b, $p]` or `expr IN $list` (`$list` is `Value::List`).
+    /// `expr IN list`: `list` is one list-valued expression, `[a, b, $p]`,
+    /// `$list`, `n.tags` or `[1] + [2]`. Its elements are compared whole, so
+    /// `[1, 2] IN [[1, 2]]` is true and `1 IN [[1]]` is false. A `list` that
+    /// is not a list at all is compared as one element.
     In {
         expr: Operand,
-        list: Vec<Operand>,
+        list: Operand,
     },
 }
 

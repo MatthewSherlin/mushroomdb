@@ -14,17 +14,20 @@ use core_storage::Value;
 const MAX_DEPTH: u32 = 256;
 
 /// Evaluate `expr` three-valued. `resolve` gives an operand's value (`None` is
-/// null); `too_deep` builds the error for a predicate nested past the limit.
+/// null); `error` builds the error for a predicate nested past the limit and
+/// for a non-boolean operand of `AND`, `OR`, `XOR` or `NOT`.
 pub fn eval_predicate<E>(
     expr: &Expr,
     resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
-    too_deep: &dyn Fn() -> E,
+    error: &dyn Fn(String) -> E,
 ) -> Result<Option<bool>, E> {
-    eval(expr, resolve, too_deep, 0)
+    eval(expr, resolve, error, 0)
 }
 
-/// How a non-boolean value reads as a predicate; the same table WHERE uses.
-/// A null element is null.
+/// How a value reads as a whole predicate (the root of a WHERE, a CASE WHEN
+/// or a comprehension filter, `WHERE n.flag`): a boolean is itself, null is
+/// null, and any other value is true unless it is empty or zero. An operand of
+/// `AND`, `OR`, `XOR` or `NOT` is not read this way; it must be a boolean.
 pub fn truthy(value: &Value) -> Option<bool> {
     Some(match value {
         Value::Null => return None,
@@ -43,21 +46,39 @@ pub fn truthy(value: &Value) -> Option<bool> {
     })
 }
 
+/// The name of a value's type, for a type error.
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Int(_) => "an integer",
+        Value::Float(_) => "a float",
+        Value::Str(_) => "a string",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Binary(_) => "binary",
+        Value::Date(_) => "a date",
+        Value::LocalDateTime(_) => "a local datetime",
+        Value::DateTime { .. } => "a datetime",
+        Value::Duration { .. } => "a duration",
+    }
+}
+
 fn eval<E>(
     expr: &Expr,
     resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
-    too_deep: &dyn Fn() -> E,
+    error: &dyn Fn(String) -> E,
     depth: u32,
 ) -> Result<Option<bool>, E> {
     if depth > MAX_DEPTH {
-        return Err(too_deep());
+        return Err(error("expression nesting too deep".to_string()));
     }
-    let sub = |e: &Expr, resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>| {
-        eval(e, resolve, too_deep, depth + 1)
-    };
     Ok(match expr {
         Expr::And(l, r) => {
-            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
+            let (l, r) = (
+                bool_operand(l, "AND", resolve, error, depth)?,
+                bool_operand(r, "AND", resolve, error, depth)?,
+            );
             match (l, r) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -65,7 +86,10 @@ fn eval<E>(
             }
         }
         Expr::Or(l, r) => {
-            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
+            let (l, r) = (
+                bool_operand(l, "OR", resolve, error, depth)?,
+                bool_operand(r, "OR", resolve, error, depth)?,
+            );
             match (l, r) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -73,13 +97,16 @@ fn eval<E>(
             }
         }
         Expr::Xor(l, r) => {
-            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
+            let (l, r) = (
+                bool_operand(l, "XOR", resolve, error, depth)?,
+                bool_operand(r, "XOR", resolve, error, depth)?,
+            );
             match (l, r) {
                 (Some(a), Some(b)) => Some(a != b),
                 _ => None,
             }
         }
-        Expr::Not(inner) => sub(inner, resolve)?.map(|b| !b),
+        Expr::Not(inner) => bool_operand(inner, "NOT", resolve, error, depth)?.map(|b| !b),
         Expr::Cmp { lhs, op, rhs } => {
             let (l, r) = (resolve(lhs)?, resolve(rhs)?);
             match (l, r) {
@@ -97,55 +124,107 @@ fn eval<E>(
     })
 }
 
-/// `needle IN list`: true on a match; otherwise null if the needle, an
-/// element, or the list itself was null; otherwise false. `null IN []` is
-/// false. Each list operand is a single element, or a list whose elements
-/// all count (`IN $list`).
+/// An operand of `AND`, `OR`, `XOR` or `NOT`: a predicate, or a value that
+/// must be a boolean or null (openCypher raises a type error for anything
+/// else).
+#[inline]
+fn bool_operand<E>(
+    expr: &Expr,
+    op: &str,
+    resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
+    error: &dyn Fn(String) -> E,
+    depth: u32,
+) -> Result<Option<bool>, E> {
+    match expr {
+        Expr::Truthy(o) => match resolve(o)? {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(b)),
+            Some(other) => Err(error(not_a_boolean(op, &other))),
+        },
+        other => eval(other, resolve, error, depth + 1),
+    }
+}
+
+/// The type error for a non-boolean operand of `op`.
+#[cold]
+fn not_a_boolean(op: &str, value: &Value) -> String {
+    format!(
+        "type error: {op} expects boolean operands, got {} ({value:?})",
+        type_name(value)
+    )
+}
+
+/// `needle IN list`: true when an element equals the needle (a list element
+/// is compared whole: `[1, 2] IN [[1, 2]]` is true, `1 IN [[1]]` is false);
+/// otherwise null if the needle, an element or the list is null; otherwise
+/// false. `null IN []` is false and `null IN [[]]` is null. A `list` that is
+/// not a list is compared as one element.
 ///
-/// The operands are read lazily, in order, as a WHERE always read them: the
-/// scan stops at the first match. A null needle against two or more written
-/// elements is null without reading any of them; against one operand, that
-/// operand is read to learn whether it is an empty list. So an operand the
-/// answer does not depend on is never evaluated and cannot raise an error.
+/// A written list (`[a, n.x]`) is read lazily, as a WHERE always read it: the
+/// scan stops at the first match, and a null needle reads none of it (the
+/// list is not empty, so the answer is null). An element the answer does not
+/// depend on is never evaluated and cannot raise an error. A constant list is
+/// borrowed, not copied.
 fn in_list<E>(
     needle: Option<&Value>,
-    list: &[Operand],
+    list: &Operand,
     resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
 ) -> Result<Option<bool>, E> {
-    if needle.is_none() && list.len() > 1 {
-        return Ok(None);
-    }
-    let mut unknown = false;
-    for item_op in list {
-        let value = match resolve(item_op)? {
-            // `x IN null` is null.
-            None => {
-                if needle.is_none() {
-                    return Ok(None);
-                }
-                unknown = true;
-                continue;
-            }
-            Some(value) => value,
-        };
+    if let Operand::ListLit(items) = list {
         let Some(needle) = needle else {
-            if matches!(&value, Value::List(items) if items.is_empty()) {
-                continue;
-            }
-            return Ok(None);
+            return Ok(if items.is_empty() { Some(false) } else { None });
         };
-        // One element, or a list whose elements all count; no allocation.
-        let items = match &value {
-            Value::List(items) => items.as_slice(),
-            other => std::slice::from_ref(other),
-        };
+        let mut unknown = false;
         for item in items {
-            match eval_cmp3(&CmpOp::Eq, needle, item) {
-                Some(true) => return Ok(Some(true)),
+            match resolve(item)? {
                 None => unknown = true,
-                Some(false) => {}
+                Some(value) => match eval_cmp3(&CmpOp::Eq, needle, &value) {
+                    Some(true) => return Ok(Some(true)),
+                    None => unknown = true,
+                    Some(false) => {}
+                },
             }
         }
+        return Ok(if unknown { None } else { Some(false) });
     }
-    Ok(if unknown { None } else { Some(false) })
+    let resolved;
+    let value = match list {
+        Operand::Lit(Value::Null) => return Ok(None),
+        Operand::Lit(value) => value,
+        other => match resolve(other)? {
+            // `x IN null` is null.
+            None => return Ok(None),
+            Some(value) => {
+                resolved = value;
+                &resolved
+            }
+        },
+    };
+    let items = match value {
+        Value::List(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    Ok(in_values(needle, items))
+}
+
+/// [`in_list`] over values already in hand.
+fn in_values(needle: Option<&Value>, items: &[Value]) -> Option<bool> {
+    let needle = match needle {
+        None if items.is_empty() => return Some(false),
+        None => return None,
+        Some(needle) => needle,
+    };
+    let mut unknown = false;
+    for item in items {
+        match eval_cmp3(&CmpOp::Eq, needle, item) {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            Some(false) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
 }

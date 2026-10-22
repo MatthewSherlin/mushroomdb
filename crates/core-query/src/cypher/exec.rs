@@ -1075,9 +1075,7 @@ fn collect_expr(
         }
         Expr::In { expr, list } => {
             collect_operand(expr, names, seen);
-            for item in list {
-                collect_operand(item, names, seen);
-            }
+            collect_operand(list, names, seen);
             Ok(())
         }
     }
@@ -1415,9 +1413,7 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
         Expr::IsNull(op) | Expr::IsNotNull(op) => intern_operand(vars, op),
         Expr::In { expr, list } => {
             intern_operand(vars, expr);
-            for item in list {
-                intern_operand(vars, item);
-            }
+            intern_operand(vars, list);
         }
     }
 }
@@ -2625,6 +2621,51 @@ pub fn eval_operand(
     resolve_operand(view, &vars, &row, operand, params)
 }
 
+/// Why an expression could not be folded to a constant.
+#[derive(Debug)]
+pub(crate) enum FoldError {
+    /// It names a `$parameter`.
+    Param,
+    /// It reads a variable or a property.
+    Variable,
+    /// Evaluating it failed.
+    Eval(String),
+}
+
+/// Evaluate an expression that reads nothing but itself (no variable, no
+/// property, no `$parameter`): `1 > 0`, `'a' + 'b'`, `[1, 2 * 3]`. A plain
+/// `CREATE` or `MERGE` property map folds its values with this, so the store
+/// sees the evaluated value and a MERGE matches against it.
+pub(crate) fn fold_constant(operand: &Operand) -> Result<Option<Value>, FoldError> {
+    if crate::cypher::plan::check_operand_bound(operand, &BTreeSet::new(), "CREATE").is_err() {
+        return Err(FoldError::Variable);
+    }
+    let ids = core_storage::IdMap::new();
+    let syms = core_storage::Interner::new();
+    let props = core_storage::ColumnStore::new();
+    let topo = core_storage::Topology::new();
+    let edge_props = core_storage::EdgeProps::new();
+    let view = GraphView {
+        ids: &ids,
+        syms: &syms,
+        labels: &[],
+        props: core_storage::v8::seam::ColumnsView::owned(&props),
+        topo: core_storage::v8::seam::TopologyView::owned(&topo),
+        edge_props: core_storage::v8::seam::EdgePropsView::owned(&edge_props),
+        mask: None,
+        prop_index: None,
+        layer: None,
+    };
+    let no_params = BTreeMap::new();
+    eval_operand(&view, operand, &Params(&no_params), &[]).map_err(|e| {
+        if e.starts_with("missing parameter") {
+            FoldError::Param
+        } else {
+            FoldError::Eval(e)
+        }
+    })
+}
+
 /// Intern the variables the list comprehensions and `reduce`s in `operand`
 /// bind, and nothing else.
 fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
@@ -2701,9 +2742,7 @@ fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => intern_local_vars(vars, o),
         Expr::In { expr, list } => {
             intern_local_vars(vars, expr);
-            for o in list {
-                intern_local_vars(vars, o);
-            }
+            intern_local_vars(vars, list);
         }
     }
 }
@@ -2847,7 +2886,7 @@ fn resolve_operand(
             let value = super::predicate::eval_predicate(
                 expr,
                 &mut |op| resolve_operand(view, vars, row, op, params),
-                &|| "expression nesting too deep".to_string(),
+                &|e| e,
             )?;
             Ok(value.map(Value::Bool))
         }
@@ -5016,7 +5055,7 @@ fn eval_expr(
     let value = super::predicate::eval_predicate(
         expr,
         &mut |op| resolve_operand(view, vars, row, op, params),
-        &|| "expression nesting too deep".to_string(),
+        &|e| e,
     )?;
     Ok(value == Some(true))
 }

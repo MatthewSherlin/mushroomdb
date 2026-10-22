@@ -952,24 +952,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the list operand of `IN`: `[a, b, $p]` or a single operand (`$cities`).
-    fn in_list(&mut self) -> Result<Vec<Operand>, String> {
-        if self.eat(&Tok::LBracket) {
-            let mut items = Vec::new();
-            if !self.eat(&Tok::RBracket) {
-                loop {
-                    items.push(self.value_expr()?);
-                    if self.eat(&Tok::Comma) {
-                        continue;
-                    }
-                    self.expect(&Tok::RBracket, "expected ']' to close IN list")?;
-                    break;
-                }
-            }
-            Ok(items)
-        } else {
-            Ok(vec![self.arith_expr()?])
-        }
+    /// The right-hand side of `IN`: one additive expression, as in openCypher,
+    /// so `IN [a, b]`, `IN $list` and `IN [1] + [2]` all name one list.
+    fn in_list(&mut self) -> Result<Operand, String> {
+        self.arith_expr()
     }
 
     // ── Arithmetic expression parsing (precedence: ^ > * / % > + -) ──────────────
@@ -1625,7 +1611,10 @@ impl<'a> Parser<'a> {
         Ok(CreateNode { var, label, props })
     }
 
-    /// Parse `{key: literal, …}` where all values must be literals (no params, no props).
+    /// Parse the `{key: value, …}` of a plain CREATE or MERGE. A value is a
+    /// literal, or any expression that reads no variable, property or
+    /// `$parameter` (`1 > 0`, `'a' + 'b'`), which is evaluated here so the
+    /// write (and a MERGE's match) sees the value.
     fn literal_props(&mut self) -> Result<Vec<(String, Value)>, String> {
         self.expect(&Tok::LBrace, "expected '{'")?;
         let mut out = Vec::new();
@@ -1635,7 +1624,7 @@ impl<'a> Parser<'a> {
         loop {
             let key = self.ident("expected property key")?;
             self.expect(&Tok::Colon, "expected ':' after property key")?;
-            let val = self.literal_value("property value")?;
+            let val = self.property_value(&key)?;
             out.push((key, val));
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1644,6 +1633,43 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RBrace, "expected '}' to close property map")?;
         Ok(out)
+    }
+
+    /// One value of [`literal_props`](Self::literal_props). A plain literal
+    /// keeps its own parse (and its named errors: a `null` value, a `$param`,
+    /// a variable); anything else is a constant expression.
+    fn property_value(&mut self, key: &str) -> Result<Value, String> {
+        const WHAT: &str = "property value";
+        let start = self.pos;
+        let literal = self.literal_value(WHAT);
+        if let Ok(value) = &literal {
+            if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RBrace)) {
+                return Ok(value.clone());
+            }
+        }
+        let literal_err = literal.err();
+        self.pos = start;
+        let operand = match self.value_expr() {
+            // A bare `null` keeps the literal parse's error.
+            Ok(Operand::Lit(Value::Null)) | Err(_) => {
+                self.pos = start;
+                return Err(literal_err.unwrap_or_else(|| self.err("expected a property value")));
+            }
+            Ok(operand) => operand,
+        };
+        match super::exec::fold_constant(&operand) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(self.err(&format!(
+                "property `{key}` evaluated to null (a CREATE or MERGE property value cannot be null)"
+            ))),
+            Err(super::exec::FoldError::Param) => Err(self.err(&format!(
+                "parameter references are not supported in {WHAT} (v1 limitation: use literals only)"
+            ))),
+            Err(super::exec::FoldError::Variable) => Err(self.err(&format!(
+                "expression RHS not supported in {WHAT} (v1 limitation: use literals only)"
+            ))),
+            Err(super::exec::FoldError::Eval(e)) => Err(format!("property `{key}`: {e}")),
+        }
     }
 
     /// Parse a literal value (int, float, string, boolean or list). Parameters and property
@@ -3055,16 +3081,22 @@ LIMIT 10";
                         field: "city".into()
                     }
                 );
-                assert_eq!(list.len(), 2);
-                assert_eq!(list[0], Operand::Lit(Value::Str("Austin".into())));
-                assert_eq!(list[1], Operand::Param("c".into()));
+                // One list-valued right-hand side (QL-BX): a written list
+                // with a non-constant element stays a list literal.
+                assert_eq!(
+                    list,
+                    Operand::ListLit(vec![
+                        Operand::Lit(Value::Str("Austin".into())),
+                        Operand::Param("c".into()),
+                    ])
+                );
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
         let q2 = parse_src("MATCH (n) WHERE n.city IN $cities RETURN n").unwrap();
         match q2.where_expr {
             Some(Expr::In { list, .. }) => {
-                assert_eq!(list, vec![Operand::Param("cities".into())]);
+                assert_eq!(list, Operand::Param("cities".into()));
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
