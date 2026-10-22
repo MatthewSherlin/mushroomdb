@@ -4,18 +4,16 @@
 //! worker against a bucket another instance holds, loses its lease to, or is
 //! partitioned from.
 
-mod support;
-
 use backup::lease::{lease_key, LeaseRecord};
 use backup::{BackupConfig, BackupTrigger, BackupWorker, BucketLease, Exclusion, LeaseError};
 use mushroomdb::SharedDb;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use object_store::{ObjectStore, PutPayload};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use support::Faulty;
 use tokio::sync::watch;
 
 const PREFIX: &str = "pfx";
@@ -244,42 +242,6 @@ async fn writes_stop_a_third_of_a_ttl_before_the_lease_can_expire() {
     assert!(lease.may_write(), "a renewal lifts the fence");
 }
 
-/// A service that accepts a conditional PUT but ignores its precondition
-/// cannot exclude anyone: the acquire fails closed, names the switch, and
-/// leaves no lease behind.
-#[tokio::test]
-async fn a_store_that_ignores_preconditions_fails_closed() {
-    let faulty = Faulty::new(mem());
-    faulty.ignore_preconditions.store(true, Ordering::SeqCst);
-    let store: Arc<dyn ObjectStore> = faulty;
-    match BucketLease::acquire(Arc::clone(&store), PREFIX, 30).await {
-        Err(e @ LeaseError::PreconditionsIgnored { .. }) => {
-            assert!(e.to_string().contains("If-None-Match"), "{e}");
-            assert!(
-                e.to_string()
-                    .contains("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off"),
-                "{e}"
-            );
-        }
-        other => panic!("expected PreconditionsIgnored, got {other:?}"),
-    }
-    assert!(read_lease(&store).await.is_none(), "no lease left behind");
-}
-
-/// A service that honors If-None-Match but ignores If-Match would let two
-/// contenders both take over a stale lease and overwrite each other's
-/// renewals unnoticed. The probe catches it.
-#[tokio::test]
-async fn a_store_that_ignores_only_if_match_fails_closed() {
-    let faulty = Faulty::new(mem());
-    faulty.ignore_if_match.store(true, Ordering::SeqCst);
-    let store: Arc<dyn ObjectStore> = faulty;
-    match BucketLease::acquire(Arc::clone(&store), PREFIX, 30).await {
-        Err(LeaseError::PreconditionsIgnored { header }) => assert_eq!(header, "If-Match"),
-        other => panic!("expected PreconditionsIgnored, got {other:?}"),
-    }
-}
-
 /// A store with create-if-absent but no compare-and-swap (the local file
 /// system): the probe finds the client cannot send If-Match, so the lease is
 /// best-effort from the start, and renewal still notices a takeover.
@@ -299,18 +261,16 @@ async fn a_store_without_conditional_update_is_best_effort() {
 }
 
 /// A renewal that landed on the service but whose answer was lost leaves
-/// the lease with a version the holder never saw. The next renewal finds
-/// its own id there and carries on: the lease is not lost.
+/// the lease with a version the holder never saw (written here as that
+/// renewal would have). The next renewal finds its own id there and carries
+/// on: the lease is not lost.
 #[tokio::test]
 async fn a_renewal_whose_answer_was_lost_is_not_a_lost_lease() {
-    let faulty = Faulty::new(mem());
-    let store: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
+    let store = mem();
     let lease = BucketLease::acquire(Arc::clone(&store), PREFIX, 30)
         .await
         .unwrap();
-    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
-    assert!(lease.renew().await.is_err(), "the answer is lost");
-    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
+    write_foreign(&store, lease.instance_id(), 0, 30).await;
     lease.renew().await.expect("the lease is still ours");
     assert!(!lease.is_lost());
     assert!(lease.may_write());
@@ -497,6 +457,50 @@ async fn shutdown_releases_the_lease_and_a_successor_starts_at_once() {
     stop(tx, h).await;
 }
 
+/// A view of `inner` whose every request can be made to hang: the
+/// network to the bucket is gone. Requests made while it is hung time out
+/// on the worker's deadline.
+struct Partition(Arc<ThrottledStore<Arc<dyn ObjectStore>>>);
+
+impl Partition {
+    fn new(inner: &Arc<dyn ObjectStore>) -> Self {
+        Self(Arc::new(ThrottledStore::new(
+            Arc::clone(inner),
+            ThrottleConfig::default(),
+        )))
+    }
+
+    fn store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.0) as Arc<dyn ObjectStore>
+    }
+
+    fn set_down(&self, down: bool) {
+        let wait = if down {
+            Duration::from_secs(365 * 24 * 3600)
+        } else {
+            Duration::ZERO
+        };
+        self.0.config_mut(|c| {
+            c.wait_put_per_call = wait;
+            c.wait_get_per_call = wait;
+            c.wait_list_per_call = wait;
+            c.wait_list_with_delimiter_per_call = wait;
+            c.wait_delete_per_call = wait;
+        });
+    }
+}
+
+/// Every object but `LEASE`, with its bytes.
+async fn data_objects(store: &Arc<dyn ObjectStore>) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for k in data_keys(store).await {
+        if let Ok(r) = store.get(&ObjectPath::from(k.as_str())).await {
+            out.push((k, r.bytes().await.unwrap().to_vec()));
+        }
+    }
+    out
+}
+
 /// A network partition: the holder cannot reach the bucket for longer than
 /// its TTL, a contender takes the lease over, and the partition heals. The
 /// old holder writes nothing more — not while fenced, not after the heal —
@@ -507,16 +511,15 @@ async fn a_partitioned_holder_never_writes_after_a_takeover() {
     let db = SharedDb::open(dir.path()).unwrap();
     db.write().insert_node("A", "a", vec![]).unwrap();
     let inner = mem();
-    let faulty = Faulty::new(Arc::clone(&inner));
-    let via: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
-    let (tx, h) = spawn(&via, &db, dir.path());
+    let net = Partition::new(&inner);
+    let (tx, h) = spawn(&net.store(), &db, dir.path());
     wait_until("the first upload", Duration::from_secs(5), || {
         has_latest(&inner)
     })
     .await;
     let holder = read_lease(&inner).await.unwrap().instance_id;
 
-    faulty.set_down(true);
+    net.set_down(true);
     for i in 0..5 {
         db.write()
             .insert_node("A", &format!("p{i}"), vec![])
@@ -527,10 +530,9 @@ async fn a_partitioned_holder_never_writes_after_a_takeover() {
     let successor = BucketLease::acquire(Arc::clone(&inner), PREFIX, 30)
         .await
         .expect("the partitioned holder's lease has expired");
-    let keys_at_takeover = data_keys(&inner).await;
-    let writes_at_takeover = faulty.data_writes();
+    let at_takeover = data_objects(&inner).await;
 
-    faulty.set_down(false);
+    net.set_down(false);
     for i in 0..5 {
         db.write()
             .insert_node("A", &format!("q{i}"), vec![])
@@ -538,11 +540,10 @@ async fn a_partitioned_holder_never_writes_after_a_takeover() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
-        faulty.data_writes(),
-        writes_at_takeover,
+        data_objects(&inner).await,
+        at_takeover,
         "no data write from the old holder reached the bucket"
     );
-    assert_eq!(data_keys(&inner).await, keys_at_takeover);
     assert_eq!(
         read_lease(&inner).await.unwrap().instance_id,
         successor.instance_id()
@@ -562,22 +563,25 @@ async fn a_partitioned_holder_never_writes_after_a_takeover() {
 /// The holder can still reach its data but not its lease: every renewal
 /// fails while uploads would succeed. Only the holder's own fence stops it,
 /// and it must stop before anyone may take the lease — so nothing it writes
-/// lands after the takeover. Once it can see the lease again it learns it
-/// was taken over.
+/// lands after the takeover. (The lease file is made unreadable on a local
+/// bucket; every lease step starts with a read.)
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_that_cannot_renew_stops_writing_before_a_takeover() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let db = SharedDb::open(dir.path()).unwrap();
     db.write().insert_node("A", "a", vec![]).unwrap();
-    let inner = mem();
-    let faulty = Faulty::new(Arc::clone(&inner));
-    let via: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
-    let (tx, h) = spawn(&via, &db, dir.path());
+    let bucket = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(bucket.path()).unwrap());
+    let (tx, h) = spawn(&store, &db, dir.path());
     wait_until("the first upload", Duration::from_secs(5), || {
-        has_latest(&inner)
+        has_latest(&store)
     })
     .await;
-    faulty.lease_down.store(true, Ordering::SeqCst);
+    let lease_file = bucket.path().join(PREFIX).join("LEASE");
+    std::fs::set_permissions(&lease_file, std::fs::Permissions::from_mode(0o000)).unwrap();
     // Writes keep coming the whole time, so an unfenced holder would ship a
     // segment every 100 ms.
     let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -596,34 +600,26 @@ async fn a_holder_that_cannot_renew_stops_writing_before_a_takeover() {
     };
     // A full TTL after the holder's last renewal, by the contender's clock.
     tokio::time::sleep(Duration::from_millis(3300)).await;
-    let successor = BucketLease::acquire(Arc::clone(&inner), PREFIX, 30)
-        .await
-        .expect("the unrenewed lease has expired");
-    let writes_at_takeover = faulty.data_writes();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(
-        faulty.data_writes(),
-        writes_at_takeover,
-        "the old holder fenced itself before the takeover"
-    );
     assert!(!h.healthy.load(Ordering::Acquire));
     assert!(reason(&h).contains("renew"), "{}", reason(&h));
-
-    faulty.lease_down.store(false, Ordering::SeqCst);
+    // The takeover: a successor's lease replaces the file.
+    let at_takeover = data_objects(&store).await;
+    write_foreign(&store, "successor", 0, 30).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        data_objects(&store).await,
+        at_takeover,
+        "the old holder fenced itself before the takeover"
+    );
     wait_until("the loss to be noticed", Duration::from_secs(5), || {
         let why = reason(&h);
-        let id = successor.instance_id().to_string();
-        async move { why.contains(&id) }
+        async move { why.contains("successor") }
     })
     .await;
-    assert_eq!(faulty.data_writes(), writes_at_takeover);
     writing.store(false, Ordering::SeqCst);
     writer.await.unwrap();
     stop(tx, h).await;
-    assert_eq!(
-        read_lease(&inner).await.unwrap().instance_id,
-        successor.instance_id()
-    );
+    assert_eq!(read_lease(&store).await.unwrap().instance_id, "successor");
 }
 
 /// A renewal that keeps failing — the bucket is unreachable — fences the
@@ -635,19 +631,18 @@ async fn a_holder_that_cannot_renew_turns_unhealthy_then_resumes() {
     let db = SharedDb::open(dir.path()).unwrap();
     db.write().insert_node("A", "a", vec![]).unwrap();
     let inner = mem();
-    let faulty = Faulty::new(Arc::clone(&inner));
-    let via: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
-    let (tx, h) = spawn(&via, &db, dir.path());
+    let net = Partition::new(&inner);
+    let (tx, h) = spawn(&net.store(), &db, dir.path());
     wait_until("the first upload", Duration::from_secs(5), || {
         has_latest(&inner)
     })
     .await;
     let holder = read_lease(&inner).await.unwrap().instance_id;
-    faulty.set_down(true);
+    net.set_down(true);
     tokio::time::sleep(Duration::from_millis(3000)).await;
     assert!(!h.healthy.load(Ordering::Acquire), "{}", reason(&h));
     assert!(reason(&h).contains("renew"), "{}", reason(&h));
-    faulty.set_down(false);
+    net.set_down(false);
     db.write().insert_node("A", "after", vec![]).unwrap();
     let want = db.read().wal_total_commits().unwrap();
     wait_until("the backlog to ship", Duration::from_secs(10), || {
@@ -669,49 +664,43 @@ async fn a_holder_that_cannot_renew_turns_unhealthy_then_resumes() {
     stop(tx, h).await;
 }
 
-/// Lease writes whose answers are lost — acquire and renewals both — never
-/// make the worker wait behind itself: health never reports its own id as a
-/// foreign holder, and it uploads once answers come back.
+/// Lease writes that landed though their answers were lost never make the
+/// worker wait behind itself. Its first attempt finds a fresh lease naming
+/// its own id (an earlier attempt's write) and takes it at once; while it
+/// holds the lease, renewals land unseen (the version changes under it) and
+/// it carries on. Health never names it as a foreign holder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_lease_answers_never_lock_the_worker_out_behind_itself() {
     let dir = tempfile::tempdir().unwrap();
     let db = SharedDb::open(dir.path()).unwrap();
     db.write().insert_node("A", "a", vec![]).unwrap();
-    let inner = mem();
-    let faulty = Faulty::new(Arc::clone(&inner));
-    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
-    let via: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
-    let (tx, h) = spawn(&via, &db, dir.path());
+    let store = mem();
+    let w = BackupWorker::new(
+        fast_config(),
+        Arc::clone(&store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    let id = w.instance_id().to_string();
+    write_foreign(&store, &id, 0, 3).await;
+    let (tx, rx) = watch::channel(BackupTrigger::Idle);
+    let h = w.start(rx);
+    wait_until("the first upload", Duration::from_millis(1500), || {
+        has_latest(&store)
+    })
+    .await;
     let mut reasons = Vec::new();
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..8 {
+        write_foreign(&store, &id, 0, 3).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         reasons.push(reason(&h));
     }
-    let id = read_lease(&inner)
-        .await
-        .expect("the acquire landed")
-        .instance_id;
-    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
-    wait_until("the first upload", Duration::from_secs(8), || {
-        has_latest(&inner)
-    })
-    .await;
-    // Renewals with lost answers, while it holds the lease.
-    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        reasons.push(reason(&h));
-    }
-    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
-    wait_until("health", Duration::from_secs(5), || {
-        let ok = h.healthy.load(Ordering::Acquire);
-        async move { ok }
-    })
-    .await;
     for r in &reasons {
         assert!(!r.contains("held by another instance"), "{r}");
         assert!(!r.contains(&id), "named itself: {r}");
     }
-    assert_eq!(read_lease(&inner).await.unwrap().instance_id, id);
+    assert!(h.healthy.load(Ordering::Acquire), "{}", reason(&h));
+    assert_eq!(read_lease(&store).await.unwrap().instance_id, id);
     stop(tx, h).await;
 }

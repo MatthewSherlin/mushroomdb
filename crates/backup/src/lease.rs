@@ -367,14 +367,10 @@ impl BucketLease {
             (PutMode::Create, "If-None-Match"),
             (PutMode::Update(fake), "If-Match"),
         ] {
-            match put(&self.store, &self.key, record, mode).await {
-                Err(object_store::Error::AlreadyExists { .. })
-                | Err(object_store::Error::Precondition { .. }) => {}
-                Err(object_store::Error::NotImplemented) => {
-                    self.lock().exclusion = Exclusion::BestEffort;
-                }
-                Ok(_) => return Err(LeaseError::PreconditionsIgnored { header }),
-                Err(e) => return Err(e.into()),
+            let answer = put(&self.store, &self.key, record, mode).await;
+            match probe_verdict(answer, header)? {
+                Exclusion::Conditional => {}
+                Exclusion::BestEffort => self.lock().exclusion = Exclusion::BestEffort,
             }
         }
         Ok(())
@@ -582,6 +578,22 @@ async fn put(
         .await
 }
 
+/// What one probe write says about the service: a refusal is real
+/// exclusion; `NotImplemented` (the client cannot send the header) is
+/// best-effort; an accepted write means the service ignores `header`.
+fn probe_verdict(
+    answer: Result<PutResult, object_store::Error>,
+    header: &'static str,
+) -> Result<Exclusion, LeaseError> {
+    match answer {
+        Err(object_store::Error::AlreadyExists { .. })
+        | Err(object_store::Error::Precondition { .. }) => Ok(Exclusion::Conditional),
+        Err(object_store::Error::NotImplemented) => Ok(Exclusion::BestEffort),
+        Ok(_) => Err(LeaseError::PreconditionsIgnored { header }),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Whether a foreign record keeps this contender out. A fresh record does,
 /// unless it is suspect and has sat unchanged for one of our TTLs.
 fn foreign_blocks(
@@ -668,6 +680,61 @@ mod tests {
         garbage.renewed_at = "yesterday".into();
         assert!(!garbage.is_fresh(now));
         assert!(record(now, u64::MAX).is_fresh(now));
+    }
+
+    /// A service that accepts the probe's write ignores the header: the
+    /// lease fails closed. (A store that ignores preconditions is not
+    /// available to the tests; the decision is checked here.)
+    #[test]
+    fn the_probe_fails_closed_when_a_precondition_is_ignored() {
+        let accepted = || {
+            Ok(PutResult {
+                e_tag: None,
+                version: None,
+            })
+        };
+        for header in ["If-None-Match", "If-Match"] {
+            match probe_verdict(accepted(), header) {
+                Err(e @ LeaseError::PreconditionsIgnored { .. }) => {
+                    let shown = e.to_string();
+                    assert!(shown.contains(header), "{shown}");
+                    assert!(
+                        shown.contains("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off"),
+                        "{shown}"
+                    );
+                }
+                other => panic!("{header}: expected PreconditionsIgnored, got {other:?}"),
+            }
+        }
+        let refused = |e| probe_verdict(Err(e), "If-Match").unwrap();
+        assert_eq!(
+            refused(object_store::Error::Precondition {
+                path: "p".into(),
+                source: "no".into()
+            }),
+            Exclusion::Conditional
+        );
+        assert_eq!(
+            refused(object_store::Error::AlreadyExists {
+                path: "p".into(),
+                source: "no".into()
+            }),
+            Exclusion::Conditional
+        );
+        assert_eq!(
+            refused(object_store::Error::NotImplemented),
+            Exclusion::BestEffort
+        );
+        assert!(matches!(
+            probe_verdict(
+                Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: "503".into()
+                }),
+                "If-Match"
+            ),
+            Err(LeaseError::Store(_))
+        ));
     }
 
     #[test]

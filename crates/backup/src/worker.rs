@@ -584,6 +584,12 @@ impl BackupWorker {
         }
     }
 
+    /// The instance id this worker takes the bucket lease under, the same
+    /// for every attempt.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     /// Test hook: allow `n` more requests that change the bucket (PUTs and
     /// DELETEs), then fail every one as if the process had been killed just
     /// before it. Drop the worker after the first failure to model a kill

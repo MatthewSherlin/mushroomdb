@@ -12881,8 +12881,9 @@ service:
 
 **One store per prefix.** The first backup of a store gives it a lineage, the
 `backup.lineage` file in the data directory, and every restore point names it.
-A store restored from the prefix keeps the lineage, and continues the backup
-where it left off. The worker refuses the prefix in three cases:
+Once HO-09/HO-10 land, a restore from the prefix will start a new lineage.
+Until then, restore into a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for the
+restored store somewhere fresh. The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -12905,10 +12906,14 @@ just written or the one `LATEST` names.
 - **On a best-effort service**, two writers overlapping until the next renewal
   can overwrite each other's objects. A restore point can then fail to
   verify. Run best-effort only where a single writer is otherwise assured.
-- **A store restored from an older backup that has since written more commits
-  than the prefix's newest restore point** passes the commit check. Its new
+- **A store restored from an older backup, which has since written more commits
+  than the prefix's newest restore point,** passes the commit check. Its new
   restore points are its own and verify. The prefix's older history is not
   removed, though, so give such a store a new prefix.
+
+This rewound-store case is tracked as row 138 of the
+[defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
+a release blocker that closes when every restore gets a new lineage.
 
 ## Loopback-first posture
 

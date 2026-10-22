@@ -6,8 +6,6 @@
 //! store's archives. And the bucket itself refuses a stale writer's
 //! conditional writes.
 
-mod support;
-
 use backup::lease::lease_key;
 use backup::manifest::{crc32_hex, latest_key, parse_segment_key};
 use backup::{BackupConfig, BackupError, BackupWorker, Manifest};

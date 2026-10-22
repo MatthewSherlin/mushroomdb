@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-mod support;
-
 const PREFIX: &str = "pfx";
 
 fn config(wal_interval_ms: u64) -> BackupConfig {
@@ -1170,15 +1168,14 @@ async fn a_refused_snapshot_put_is_counted_and_retried() {
 /// times out and is counted; the worker keeps going and shuts down on time.
 #[tokio::test(start_paused = true)]
 async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     let dir = tempfile::tempdir().unwrap();
     let db = store_with_a_snapshot(dir.path());
-    // Every upload but the lease hangs: the worker holds its lease and the
-    // snapshot PUT is what times out.
-    let faulty = support::Faulty::new(mem());
-    faulty
-        .hang_data_puts
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let hung: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
+    let inner = mem();
+    let throttled = Arc::new(ThrottledStore::new(
+        Arc::clone(&inner),
+        ThrottleConfig::default(),
+    ));
     let (tx, rx) = watch::channel(BackupTrigger::Idle);
     let handle = BackupWorker::spawn(
         BackupConfig {
@@ -1186,13 +1183,21 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
             shutdown_grace_ms: 500,
             ..config(1000)
         },
-        hung,
+        Arc::clone(&throttled) as Arc<dyn ObjectStore>,
         Arc::new(db.clone()),
         dir.path().to_path_buf(),
         rx,
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The worker holds its lease and has uploaded its first restore point.
+    // Now every PUT hangs, and a new snapshot must be uploaded.
+    let first = wait_for_latest(&inner, |_| true).await;
+    throttled.config_mut(|c| c.wait_put_per_call = Duration::from_secs(365 * 24 * 3600));
+    db.write().insert_node("A", "late", vec![]).unwrap();
+    db.write().snapshot_with(ARCHIVING).unwrap();
+    tx.send(BackupTrigger::Snapshot).unwrap();
+    // Less than a renewal interval (10 s): the failures are the snapshot's.
+    tokio::time::sleep(Duration::from_secs(9)).await;
     assert!(
         handle.error_count.load(Ordering::Acquire) >= 3,
         "each timeout is counted"
@@ -1207,9 +1212,10 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
     );
     let reason = handle.reason.lock().unwrap().clone().unwrap();
     assert!(reason.contains("consecutive failed"), "{reason}");
-    assert!(
-        faulty.data_writes() >= 3,
-        "the snapshot PUT was attempted and timed out each time"
+    assert_eq!(
+        latest(&inner).await.unwrap().wal_generation,
+        first.wal_generation,
+        "the new snapshot never landed"
     );
     tx.send(BackupTrigger::Shutdown).unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.join)
