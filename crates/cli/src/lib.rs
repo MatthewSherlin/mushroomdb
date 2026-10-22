@@ -264,6 +264,10 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// `--shutdown-timeout-secs`: the whole graceful shutdown (drain,
+        /// snapshot, backup flush, lease release) must finish within this.
+        /// Default [`DEFAULT_SHUTDOWN_TIMEOUT_SECS`].
+        shutdown_timeout: Duration,
         /// Seed an empty `db_dir` from the newest backup under this directory
         /// before opening it. See [`restore_if_empty`]. `None` = off (default).
         restore_from: Option<PathBuf>,
@@ -541,7 +545,7 @@ Usage:
                                       graphml writes one file: <dest>/graph.graphml if <dest> is an
                                       existing directory, otherwise <dest> is the file path itself
                                       (nodes + edges only; rules have no GraphML analogue)
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
@@ -952,6 +956,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
@@ -1019,6 +1024,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--shutdown-timeout-secs" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --shutdown-timeout-secs".to_string())?;
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--shutdown-timeout-secs=") {
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 1;
         } else if a == "--restore-from" {
             let val = args
                 .get(i + 1)
@@ -1075,6 +1090,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        shutdown_timeout,
         restore_from,
         tls_cert,
         tls_key,
@@ -1092,6 +1108,75 @@ fn parse_role_token(val: &str) -> Result<(String, String), String> {
         return Err("--role-token: ROLE must not be empty".to_string());
     }
     Ok((tok.to_string(), role.to_string()))
+}
+
+/// Default for `serve --shutdown-timeout-secs`: drain up to 25 s, snapshot in
+/// what is left of the budget (8 s with the default backup bounds), then flush
+/// the backup and release the lease within 22 s.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 55;
+/// The drain phase's share at the default timeout, and its cap at any timeout.
+pub const SHUTDOWN_DRAIN_SECS: u64 = 25;
+/// The snapshot phase's nominal share, used to scale the phases down when the
+/// timeout is shorter than drain + snapshot + backup.
+const SHUTDOWN_SNAPSHOT_NOMINAL: Duration = Duration::from_secs(8);
+/// A backup flush keeps at least this much of any timeout, so the lease
+/// release is still attempted under a tight one.
+const SHUTDOWN_BACKUP_FLOOR: Duration = Duration::from_secs(2);
+
+/// How a shutdown's time is divided: the three phases, in order, and the
+/// most each may take. They sum to at most the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// Longest the drain of in-flight requests may take.
+    pub drain: Duration,
+    /// Snapshot's share; unused drain time also goes to it at run time.
+    pub snapshot: Duration,
+    /// Backup flush and lease release. Zero without backup.
+    pub backup: Duration,
+}
+
+/// Divide `total` between the phases. `backup_bound` is the backup's own
+/// shutdown bound (`BackupConfig::shutdown_budget`), zero without backup.
+///
+/// With room (`total` at least drain cap + 8 s + `backup_bound`) the drain gets
+/// its cap, the backup its bound, and the snapshot the rest. With less, all
+/// three scale down in proportion, except that the backup keeps a floor
+/// ([`SHUTDOWN_BACKUP_FLOOR`], never more than its bound) and the drain gives
+/// way first: it is the phase a stuck client can stretch.
+pub fn shutdown_plan(total: Duration, backup_bound: Duration) -> ShutdownPlan {
+    let cap = Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    let nominal = cap + SHUTDOWN_SNAPSHOT_NOMINAL + backup_bound;
+    if total >= nominal {
+        return ShutdownPlan {
+            drain: cap,
+            snapshot: total - cap - backup_bound,
+            backup: backup_bound,
+        };
+    }
+    let scaled = |d: Duration| d.mul_f64(total.as_secs_f64() / nominal.as_secs_f64());
+    let backup = if backup_bound.is_zero() {
+        Duration::ZERO
+    } else {
+        scaled(backup_bound)
+            .max(SHUTDOWN_BACKUP_FLOOR.min(backup_bound))
+            .min(total)
+    };
+    let drain = scaled(cap).min(total - backup);
+    ShutdownPlan {
+        drain,
+        snapshot: total - backup - drain,
+        backup,
+    }
+}
+
+fn parse_shutdown_timeout(val: &str) -> Result<Duration, String> {
+    let secs: u64 = val
+        .parse()
+        .map_err(|_| format!("invalid --shutdown-timeout-secs: {val}"))?;
+    if secs == 0 {
+        return Err("--shutdown-timeout-secs must be a positive number of seconds".into());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
@@ -3447,6 +3532,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3476,6 +3562,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3508,6 +3595,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3900,6 +3988,65 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_shutdown_plan_uses_the_nominal_split_with_room_and_scales_without() {
+        let s = Duration::from_secs;
+        // Default timeout, default backup bound: 25 + 8 + 22.
+        let p = shutdown_plan(s(55), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(8), s(22)));
+        // More room goes to the snapshot.
+        let p = shutdown_plan(s(100), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(53), s(22)));
+        // Less room: every phase shrinks, and the sum never exceeds the timeout.
+        for total in [1, 2, 5, 10, 25, 40, 54] {
+            for bound in [0, 1, 3, 22, 60] {
+                let p = shutdown_plan(s(total), s(bound));
+                assert!(
+                    p.drain + p.snapshot + p.backup <= s(total),
+                    "{total}/{bound}: {p:?}"
+                );
+                assert!(p.drain <= s(SHUTDOWN_DRAIN_SECS));
+                if bound == 0 {
+                    assert_eq!(p.backup, Duration::ZERO);
+                } else {
+                    assert!(p.backup <= s(bound).min(s(total)));
+                    assert!(p.backup >= s(2).min(s(bound)).min(s(total)), "{p:?}");
+                }
+            }
+        }
+        // 25 s with backup: the backup keeps a real share.
+        let p = shutdown_plan(s(25), s(22));
+        assert!(p.backup >= s(9) && p.drain >= s(10), "{p:?}");
+    }
+
+    #[test]
+    fn serve_shutdown_timeout_parses_seconds_and_defaults_to_55() {
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(55)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", "90"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(90)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs=7"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(7)),
+            other => panic!("{other:?}"),
+        }
+        for bad in ["0", "nope"] {
+            let err =
+                parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", bad]).unwrap_err();
+            assert!(err.contains("shutdown-timeout-secs"), "{err}");
+        }
+        assert!(parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs"]).is_err());
     }
 
     #[test]
