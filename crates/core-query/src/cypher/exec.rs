@@ -4029,14 +4029,28 @@ impl AggAcc {
                     Some(Value::Float(a + (b - a) * frac))
                 } else {
                     // Nearest rank: the ⌈p·N⌉-th smallest, the smallest for p = 0.
-                    let rank = (p * values.len() as f64).ceil() as usize;
-                    let (_, value) = values.swap_remove(rank.saturating_sub(1).min(last));
+                    let rank = nearest_rank(p, values.len());
+                    let (_, value) = values.swap_remove(rank - 1);
                     Some(value)
                 }
             }
             AggAcc::Distinct { inner, .. } => inner.finish(),
         }
     }
+}
+
+/// The 1-based nearest rank `⌈p·n⌉`, clamped to `[1, n]`. `p·n` is snapped to
+/// the nearest integer when it is within float error of one, so `0.07 * 100`
+/// (7.000000000000001) is rank 7, not 8.
+fn nearest_rank(p: f64, n: usize) -> usize {
+    let exact = p * n as f64;
+    let nearest = exact.round();
+    let snapped = if (exact - nearest).abs() <= 1e-9 * nearest.max(1.0) {
+        nearest
+    } else {
+        exact.ceil()
+    };
+    (snapped as usize).clamp(1, n)
 }
 
 /// The `p` of a percentile aggregate: a number in `[0,1]`, given as a

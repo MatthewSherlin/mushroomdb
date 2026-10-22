@@ -5633,7 +5633,9 @@ function. `stDev` and `stDevP` are `0.0` with fewer than two non-null values
 parameter, the same for every row; anything else is an error, even over no rows.
 `percentileDisc` is the nearest-rank value (the input value, with its own type);
 `percentileCont` interpolates linearly between the two nearest ranks and is always
-a float. All four work with grouping keys, `DISTINCT` and aggregate `WITH`.
+a float. A percentile holds every value of its group in memory until the group is
+done; `stDev` and `stDevP` keep constant state. All four work with grouping keys,
+`DISTINCT` and aggregate `WITH`.
 
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (read or write RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine

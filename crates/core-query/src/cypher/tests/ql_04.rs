@@ -271,3 +271,41 @@ fn grouping_distinct_and_with() {
     assert_eq!(rs.get(0, "b"), None);
     assert_eq!(rs.get(0, "c"), Some(&Value::Int(0)));
 }
+
+#[test]
+fn percentile_disc_picks_the_exact_rank_at_a_boundary() {
+    let q = |p: f64| format!("MATCH (n:N) RETURN percentileDisc(n.score, {p:?})");
+    // 0.07 * 100 is 7.000000000000001 in floating point: still the 7th value.
+    let hundred = ints(&(1..=100).collect::<Vec<_>>());
+    assert_eq!(one(&hundred, &q(0.07)), Some(Value::Int(7)));
+    for n in [1usize, 2, 3, 7, 10, 100] {
+        let fx = ints(&(1..=n as i64).rev().collect::<Vec<_>>());
+        assert_eq!(one(&fx, &q(0.0)), Some(Value::Int(1)), "n={n} p=0");
+        assert_eq!(one(&fx, &q(1.0)), Some(Value::Int(n as i64)), "n={n} p=1");
+        for k in 1..=n {
+            let p = k as f64 / n as f64;
+            assert_eq!(one(&fx, &q(p)), Some(Value::Int(k as i64)), "n={n} k={k}");
+        }
+    }
+}
+
+#[test]
+fn percentile_cont_is_continuous_across_a_boundary() {
+    // p * (n - 1) = 7.000000000000001: the interpolation lands on the 8th value.
+    let fx = ints(&(1..=101).collect::<Vec<_>>());
+    assert_close(
+        one(&fx, "MATCH (n:N) RETURN percentileCont(n.score, 0.07)"),
+        8.0,
+    );
+}
+
+#[test]
+fn stdev_is_stable_with_a_large_offset() {
+    let xs: Vec<f64> = WIKI.iter().map(|x| 1e9 + x).collect();
+    let fx = floats(&xs);
+    assert_close(one(&fx, "MATCH (n:N) RETURN stDevP(n.score)"), 2.0);
+    assert_close(
+        one(&fx, "MATCH (n:N) RETURN stDev(n.score)"),
+        (32.0f64 / 7.0).sqrt(),
+    );
+}

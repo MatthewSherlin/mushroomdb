@@ -108,10 +108,10 @@ pub enum AggFunc {
     /// nulls. Per group when grouping keys are present.
     Collect,
     /// `stDev(x)` — sample standard deviation (n - 1) of the non-null
-    /// numeric values; null with fewer than two values.
+    /// numeric values; `0.0` with fewer than two values.
     StDev,
     /// `stDevP(x)` — population standard deviation (n) of the non-null
-    /// numeric values; null with no values.
+    /// numeric values; `0.0` with none.
     StDevP,
     /// `percentileCont(x, p)` — the `p`th percentile (`p` in `[0,1]`) with
     /// linear interpolation between the two nearest ranks; always a float.
