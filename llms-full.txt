@@ -4835,7 +4835,10 @@ zero-length variable-length paths are not supported; minimum hop count is 1
   `MATCH (a)-[r]->(b) MATCH (c)-[s]->(d)` may bind both to one relationship,
   and so may an `OPTIONAL MATCH` that follows a `MATCH`. A relationship
   variable an earlier clause bound (`MATCH (x)-[r]->(y) MATCH (a)-[r]->(b)`)
-  matches that same relationship again. A write driven by the
+  matches that same relationship again; naming one relationship variable for
+  two hops of one `MATCH` (`MATCH (a)-[r]->(b)-[r]->(c)`) is the error
+  ``relationship variable `r` is used for more than one relationship in the
+  same MATCH``. A write driven by the
   match (`MATCH … SET`, `MATCH … DETACH DELETE`) sees the same rows. An
   undirected self-loop is one relationship, walked once. This guarantees
   termination on cyclic graphs.
@@ -4878,9 +4881,11 @@ MATCH shortestPath((a)-[r:T*..5]->(b))
 RETURN r.length
 ```
 
-Bind the two endpoints with **separate** `MATCH` clauses. Comma-separated
-patterns in a single `MATCH` (`MATCH (a), (b)`) are not supported and fail to
-parse.
+Bind the two endpoints first: with earlier `MATCH` clauses, as above, or with
+an earlier comma-separated part of the same `MATCH`
+(`MATCH (a)-[r]->(b), p = shortestPath((a)-[*..5]-(b))`). In the same `MATCH`
+the search never uses a relationship the other parts bound, so there it finds
+the shortest path that avoids `r`.
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.

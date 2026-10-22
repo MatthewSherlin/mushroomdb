@@ -1184,27 +1184,73 @@ fn invert_dir(d: RelDir) -> RelDir {
 }
 
 /// Relationship uniqueness for one MATCH clause: the bindings of the hops
-/// compiled so far, and how many of the clause's hops are still to come.
+/// compiled so far, and the relationship types of the hops still to come.
+///
+/// Two hops can only bind the same edge when their type sets overlap (an
+/// untyped hop overlaps every hop), so a hop lists only the earlier bindings
+/// it overlaps, and a walk keeps its edges only for a later hop it overlaps.
+/// Directions are not pruned: one edge can be walked by a `->` hop and a
+/// `<-` hop.
 struct ClauseScope {
     /// A fixed hop's relationship variable, or a variable-length or
-    /// shortest-path hop's trail variable, in pattern order.
-    earlier: Vec<String>,
-    hops_left: usize,
+    /// shortest-path hop's trail variable, with that hop's types.
+    earlier: Vec<(String, Vec<String>)>,
+    /// The types of every hop of the clause, in pattern order.
+    hop_types: Vec<Vec<String>>,
+    /// How many hops have been compiled.
+    done: usize,
+    /// Relationship variables the user named in this clause so far.
+    named: Vec<String>,
+}
+
+/// Whether two hops' type lists can match one edge.
+fn types_overlap(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t))
 }
 
 impl ClauseScope {
     fn new(parts: &[Pattern]) -> Self {
         ClauseScope {
             earlier: Vec::new(),
-            hops_left: parts.iter().map(|p| p.chain.len()).sum(),
+            hop_types: parts
+                .iter()
+                .flat_map(|p| p.chain.iter().map(|(rel, _)| rel.etypes.clone()))
+                .collect(),
+            done: 0,
+            named: Vec::new(),
         }
     }
 
-    /// Start compiling the next hop: the bindings it must not reuse, and
-    /// whether a later hop of the clause will need this hop's edges.
-    fn next_hop(&mut self) -> (Vec<String>, bool) {
-        self.hops_left = self.hops_left.saturating_sub(1);
-        (self.earlier.clone(), self.hops_left > 0)
+    /// Start compiling the next hop, `rel`: the earlier bindings it must not
+    /// reuse, and whether a later hop of the clause could bind one of its
+    /// edges. A relationship variable named twice in one clause is the
+    /// openCypher error, not a pattern that never matches.
+    fn next_hop(&mut self, rel: &RelPat) -> Result<(Vec<String>, bool), String> {
+        if let Some(name) = &rel.var {
+            if self.named.contains(name) {
+                return Err(format!(
+                    "relationship variable `{name}` is used for more than one relationship \
+                     in the same MATCH"
+                ));
+            }
+            self.named.push(name.clone());
+        }
+        self.done += 1;
+        let distinct_from = self
+            .earlier
+            .iter()
+            .filter(|(_, types)| types_overlap(types, &rel.etypes))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let later_overlaps = self.hop_types[self.done.min(self.hop_types.len())..]
+            .iter()
+            .any(|types| types_overlap(types, &rel.etypes));
+        Ok((distinct_from, later_overlaps))
+    }
+
+    /// Record the binding a later hop checks this hop's edges against.
+    fn bound(&mut self, binding: String, rel: &RelPat) {
+        self.earlier.push((binding, rel.etypes.clone()));
     }
 }
 
@@ -1281,8 +1327,8 @@ fn compile_pattern(
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
-        let (distinct_from, _) = scope.next_hop();
-        scope.earlier.push(rel_name.clone());
+        let (distinct_from, _) = scope.next_hop(rel)?;
+        scope.bound(rel_name.clone(), rel);
         if dest.label.is_some() || !dest.props.is_empty() {
             ops.push(PlanOp::JoinBound {
                 var: dest_name.clone(),
@@ -1355,14 +1401,12 @@ fn compile_pattern(
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
         let to = name_node(dest, node_anon, bound);
-        let (distinct_from, later_hops) = scope.next_hop();
+        let (distinct_from, later_hops) = scope.next_hop(rel)?;
         // A variable-length or shortest-path hop's edges travel in a hidden
         // trail when a named path needs them or a later hop must avoid them.
         let trail_var = (rel.hops.is_some() && (pat.path_var.is_some() || later_hops))
             .then(|| format!("{rel_name}#trail"));
-        scope
-            .earlier
-            .push(trail_var.clone().unwrap_or_else(|| rel_name.clone()));
+        scope.bound(trail_var.clone().unwrap_or_else(|| rel_name.clone()), rel);
         path_hops.push(PathHop {
             rel_var: rel_name.clone(),
             to_var: to.clone(),

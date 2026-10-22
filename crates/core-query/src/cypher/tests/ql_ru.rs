@@ -380,7 +380,71 @@ fn a_relationship_variable_bound_by_an_earlier_clause_is_that_relationship() {
     assert_eq!(rows(&fx, q), vec![vec![int(3)]]);
     let q = "MATCH (x)-[r]->(y) MATCH (a)-[r]->(b) RETURN a LIMIT 10";
     assert_eq!(rows(&fx, q).len(), 3);
-    // One clause cannot bind one relationship to two hops.
-    let q = "MATCH (a)-[r]->(b)-[r]->(c) RETURN a";
-    assert_eq!(rows(&fx, q), Rows::new());
+    // One clause cannot name one relationship variable for two hops: the
+    // openCypher error, not a pattern that never matches.
+    for q in [
+        "MATCH (a)-[r]->(b)-[r]->(c) RETURN a",
+        "MATCH (a)-[r]->(b), (c)-[r]->(d) RETURN a",
+        "MATCH (a)-[r*1..2]->(b)-[r]->(c) RETURN a",
+        "MATCH (x) OPTIONAL MATCH (x)-[r]->(b)-[r]->(c) RETURN x",
+    ] {
+        let query = crate::cypher::parse(&crate::cypher::lex(q).unwrap()).unwrap();
+        let err = crate::cypher::plan::plan(&query).expect_err(q);
+        assert!(
+            err.contains("relationship variable `r` is used for more than one relationship"),
+            "{q}: {err}"
+        );
+    }
+}
+
+#[test]
+fn hops_whose_types_cannot_overlap_skip_the_check() {
+    use crate::cypher::plan::{plan, PlanOp};
+    use crate::cypher::{lex, parse};
+    let compile = |q: &str| plan(&parse(&lex(q).unwrap()).unwrap()).unwrap();
+    let hops = |ops: &[PlanOp]| -> Vec<(Option<String>, Vec<String>)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                PlanOp::Expand { distinct_from, .. } => Some((None, distinct_from.clone())),
+                PlanOp::VarExpand {
+                    trail_var,
+                    distinct_from,
+                    ..
+                } => Some((trail_var.clone(), distinct_from.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    // Disjoint types: no trail, nothing to check.
+    let ops = compile("MATCH (a)-[:E*1..2]->(b)-[:F]->(c) RETURN count(*) AS n");
+    assert_eq!(hops(&ops), vec![(None, vec![]), (None, vec![])]);
+    // Overlapping (shared type, an alternation, or an untyped hop): kept.
+    for q in [
+        "MATCH (a)-[:E*1..2]->(b)-[:E]->(c) RETURN c",
+        "MATCH (a)-[:E*1..2]->(b)-[:F|E]->(c) RETURN c",
+        "MATCH (a)-[:E*1..2]->(b)-[]->(c) RETURN c",
+        "MATCH (a)-[*1..2]->(b)-[:F]->(c) RETURN c",
+    ] {
+        let got = hops(&compile(q));
+        assert_eq!(got[0].0.as_deref(), Some("_r0#trail"), "{q}");
+        assert_eq!(got[1].1, vec!["_r0#trail".to_owned()], "{q}");
+    }
+    // Opposite directions still overlap: one edge can be walked both ways.
+    let got = hops(&compile("MATCH (a)-[r:E]->(b)<-[s:E]-(c) RETURN c"));
+    assert_eq!(got[1].1, vec!["r".to_owned()]);
+    // Only the overlapping earlier hops are listed.
+    let got = hops(&compile(
+        "MATCH (a)-[r:E]->(b)-[s:F]->(c)-[t:E]->(d) RETURN d",
+    ));
+    assert_eq!(got[2].1, vec!["r".to_owned()]);
+    // And the rows agree with the unpruned answer.
+    let mut fx = Fx::new();
+    let a = fx.add("A", "a", vec![]);
+    let b = fx.add("A", "b", vec![]);
+    fx.edge("E", a, b, vec![]);
+    fx.edge("F", b, a, vec![]);
+    let q = "MATCH (x)-[:E*1..2]->(y)-[:F]->(z) RETURN x, y, z";
+    assert_eq!(rows(&fx, q), vec![vec![s("a"), s("b"), s("a")]]);
+    let q = "MATCH (x)-[:E|F*1..2]->(y)-[:F]->(z) RETURN x, y, z";
+    assert_eq!(rows(&fx, q), vec![vec![s("a"), s("b"), s("a")]]);
 }

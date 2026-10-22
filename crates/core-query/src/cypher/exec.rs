@@ -77,12 +77,16 @@ impl PathVal {
     /// variant stopped the row clone and drop from inlining and cost the
     /// two-hop aggregate about 9 %).
     fn to_trail(rels: &[EdgeRef]) -> Cell {
-        Cell::Scalar(Value::List(
-            rels.iter()
-                .flat_map(|e| [e.etype, e.src, e.dst])
-                .map(|x| Value::Int(x.into()))
-                .collect(),
-        ))
+        Self::to_trail_then(rels, None)
+    }
+
+    /// `to_trail` of `rels` followed by `last`, built in one allocation.
+    fn to_trail_then(rels: &[EdgeRef], last: Option<&EdgeRef>) -> Cell {
+        let mut flat = Vec::with_capacity(3 * (rels.len() + 1));
+        for e in rels.iter().chain(last) {
+            flat.extend([e.etype, e.src, e.dst].map(|x| Value::Int(x.into())));
+        }
+        Cell::Scalar(Value::List(flat))
     }
 
     /// Whether a trail (see `to_trail`) walked `e`, read in place.
@@ -3548,10 +3552,7 @@ fn exec_var_expand(
                             }
                             next[to_slot] = Some(Cell::Node(nbr));
                             if let Some(slot) = trail_slot {
-                                let mut rels = Vec::with_capacity(state.edges.len() + 1);
-                                rels.extend_from_slice(&state.edges);
-                                rels.push(e);
-                                next[slot] = Some(PathVal::to_trail(&rels));
+                                next[slot] = Some(PathVal::to_trail_then(&state.edges, Some(&e)));
                             }
                             out.push(next);
                         }

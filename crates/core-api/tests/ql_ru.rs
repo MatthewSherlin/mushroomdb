@@ -281,6 +281,8 @@ struct RefNode {
 }
 
 struct RefGraph {
+    /// Whether self-loops may occur.
+    loops: bool,
     nodes: Vec<RefNode>,
     /// `(type, src, dst)`; at most one edge per triple, as in the store.
     edges: Vec<(&'static str, usize, usize)>,
@@ -303,7 +305,11 @@ fn random_graph(rng: &mut Rng) -> RefGraph {
             edges.push(edge);
         }
     }
-    RefGraph { nodes, edges }
+    RefGraph {
+        loops,
+        nodes,
+        edges,
+    }
 }
 
 fn load(g: &RefGraph, dir: &std::path::Path, indexed: bool) -> Db {
@@ -366,21 +372,25 @@ impl Len {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Hop {
+    /// A user relationship variable: a fixed hop's is returned as `type(r)`,
+    /// a variable-length hop's as `r.length`.
+    var: Option<String>,
     types: &'static [&'static str],
     dir: Dir,
     len: Len,
 }
 
 impl Hop {
-    fn text(self) -> String {
+    fn text(&self) -> String {
         let types = if self.types.is_empty() {
             String::new()
         } else {
             format!(":{}", self.types.join("|"))
         };
-        let inner = format!("[{types}{}]", self.len.text());
+        let var = self.var.as_deref().unwrap_or("");
+        let inner = format!("[{var}{types}{}]", self.len.text());
         match self.dir {
             Dir::Right => format!("-{inner}->"),
             Dir::Left => format!("<-{inner}-"),
@@ -390,7 +400,7 @@ impl Hop {
 
     /// The node this hop reaches over edge `i` from `at`, if it may take it.
     /// An undirected self-loop is one relationship, taken once.
-    fn step(self, g: &RefGraph, i: usize, at: usize) -> Option<usize> {
+    fn step(&self, g: &RefGraph, i: usize, at: usize) -> Option<usize> {
         let (t, src, dst) = g.edges[i];
         if !self.types.is_empty() && !self.types.contains(&t) {
             return None;
@@ -413,6 +423,8 @@ struct NodeP {
     label: Option<&'static str>,
     active: Option<bool>,
     param: bool,
+    /// `{active: $act}`, a parameter in the node's map.
+    act_param: bool,
 }
 
 impl NodeP {
@@ -422,6 +434,7 @@ impl NodeP {
             label: None,
             active: None,
             param: false,
+            act_param: false,
         }
     }
 
@@ -434,6 +447,9 @@ impl NodeP {
         if self.param {
             props.push("id: $id".to_owned());
         }
+        if self.act_param {
+            props.push("active: $act".to_owned());
+        }
         let props = if props.is_empty() {
             String::new()
         } else {
@@ -442,11 +458,12 @@ impl NodeP {
         format!("({}{label}{props})", self.var)
     }
 
-    fn ok(&self, g: &RefGraph, n: usize, id: usize) -> bool {
+    fn ok(&self, g: &RefGraph, n: usize, p: Params) -> bool {
         let node = &g.nodes[n];
         self.label.is_none_or(|l| node.label == l)
             && self.active.is_none_or(|a| node.active == Some(a))
-            && (!self.param || n == id)
+            && (!self.param || n == p.id)
+            && (!self.act_param || node.active == Some(p.act))
     }
 }
 
@@ -455,6 +472,8 @@ struct Part {
     path: Option<String>,
     start: NodeP,
     hops: Vec<(Hop, NodeP)>,
+    /// `shortestPath((start)-[hop]-(end))`: one hop, both ends bound.
+    shortest: bool,
 }
 
 impl Part {
@@ -464,10 +483,15 @@ impl Part {
             .as_ref()
             .map(|p| format!("{p} = "))
             .unwrap_or_default();
-        out.push_str(&self.start.text());
+        let mut chain = self.start.text();
         for (hop, node) in &self.hops {
-            out.push_str(&hop.text());
-            out.push_str(&node.text());
+            chain.push_str(&hop.text());
+            chain.push_str(&node.text());
+        }
+        if self.shortest {
+            out.push_str(&format!("shortestPath({chain})"));
+        } else {
+            out.push_str(&chain);
         }
         out
     }
@@ -476,11 +500,24 @@ impl Part {
 struct Clause {
     optional: bool,
     parts: Vec<Part>,
+    /// `WHERE <var>.active = true` after the clause (OPTIONAL only here).
+    where_active: Option<String>,
+}
+
+/// The query's parameters as the reference sees them.
+#[derive(Clone, Copy)]
+struct Params {
+    id: usize,
+    act: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Bind {
     Node(usize),
+    /// A fixed hop's relationship: an edge index.
+    Rel(usize),
+    /// A variable-length hop's relationship list: its length.
+    Len(usize),
     Path(Vec<usize>, usize),
     Null,
 }
@@ -489,13 +526,13 @@ type RefRow = BTreeMap<String, Bind>;
 
 struct Matcher<'g> {
     g: &'g RefGraph,
-    id: usize,
+    p: Params,
 }
 
 impl Matcher<'_> {
     /// Bind `node` to `n`, or check `n` against the binding it already has.
     fn bind(&self, row: &mut RefRow, node: &NodeP, n: usize) -> bool {
-        if !node.ok(self.g, n, self.id) {
+        if !node.ok(self.g, n, self.p) {
             return false;
         }
         match row.get(&node.var) {
@@ -545,6 +582,10 @@ impl Matcher<'_> {
             return;
         };
         let (min, max) = hop.len.bounds();
+        if part.shortest {
+            self.shortest(parts, row, at, max, hop, dest, used, out);
+            return;
+        }
         self.walk(
             parts,
             h,
@@ -552,12 +593,78 @@ impl Matcher<'_> {
             at,
             0,
             (min, max),
-            *hop,
+            hop,
             dest,
             nodes,
             used,
             out,
         );
+    }
+
+    /// `shortestPath`: one row with the least length of an edge-unique walk
+    /// to the bound end that avoids the clause's edges, or none.
+    #[allow(clippy::too_many_arguments)]
+    fn shortest(
+        &self,
+        parts: &[Part],
+        row: &RefRow,
+        at: usize,
+        max: usize,
+        hop: &Hop,
+        dest: &NodeP,
+        used: &mut Vec<usize>,
+        out: &mut Vec<RefRow>,
+    ) {
+        let Some(Bind::Node(end)) = row.get(&dest.var).cloned() else {
+            return;
+        };
+        if !dest.ok(self.g, end, self.p) {
+            return;
+        }
+        fn least(
+            m: &Matcher,
+            hop: &Hop,
+            at: usize,
+            end: usize,
+            left: usize,
+            used: &mut Vec<usize>,
+        ) -> Option<usize> {
+            if left == 0 {
+                return None;
+            }
+            let mut best: Option<usize> = None;
+            for i in 0..m.g.edges.len() {
+                if used.contains(&i) {
+                    continue;
+                }
+                let Some(to) = hop.step(m.g, i, at) else {
+                    continue;
+                };
+                let len = if to == end {
+                    Some(1)
+                } else {
+                    used.push(i);
+                    let rest = least(m, hop, to, end, left - 1, used).map(|n| n + 1);
+                    used.pop();
+                    rest
+                };
+                best = match (best, len) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            best
+        }
+        let Some(len) = least(self, hop, at, end, max, used) else {
+            return;
+        };
+        let mut next = row.clone();
+        if let Some(p) = &parts[0].path {
+            next.insert(p.clone(), Bind::Path(Vec::new(), len));
+        }
+        // The shortest path's own edges are not bound for later parts; the
+        // generator puts nothing after it.
+        self.parts(&parts[1..], &next, used, out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -569,7 +676,7 @@ impl Matcher<'_> {
         at: usize,
         depth: usize,
         (min, max): (usize, usize),
-        hop: Hop,
+        hop: &Hop,
         dest: &NodeP,
         nodes: &mut Vec<usize>,
         used: &mut Vec<usize>,
@@ -578,6 +685,19 @@ impl Matcher<'_> {
         if depth >= min && depth >= 1 {
             let mut next = row.clone();
             if self.bind(&mut next, dest, at) {
+                if let (Some(var), Len::Fixed) = (&hop.var, hop.len) {
+                    let edge = used[used.len() - 1];
+                    match next.get(var) {
+                        // Bound by an earlier clause: the same relationship.
+                        Some(Bind::Rel(bound)) if *bound != edge => return,
+                        Some(Bind::Rel(_)) => {}
+                        _ => {
+                            next.insert(var.clone(), Bind::Rel(edge));
+                        }
+                    }
+                } else if let Some(var) = &hop.var {
+                    next.insert(var.clone(), Bind::Len(depth));
+                }
                 self.hops(parts, h + 1, &next, at, nodes, used, out);
             }
         }
@@ -616,11 +736,17 @@ impl Matcher<'_> {
         for row in rows {
             let mut found = Vec::new();
             self.parts(&clause.parts, &row, &mut Vec::new(), &mut found);
+            if let Some(var) = &clause.where_active {
+                found.retain(|r| {
+                    matches!(r.get(var), Some(Bind::Node(n)) if self.g.nodes[*n].active == Some(true))
+                });
+            }
             if found.is_empty() && clause.optional {
                 let mut nulls = row.clone();
                 for part in &clause.parts {
                     let vars = std::iter::once(&part.start.var)
                         .chain(part.hops.iter().map(|(_, n)| &n.var))
+                        .chain(part.hops.iter().filter_map(|(h, _)| h.var.as_ref()))
                         .chain(&part.path);
                     for v in vars {
                         nulls.entry(v.clone()).or_insert(Bind::Null);
@@ -637,9 +763,13 @@ impl Matcher<'_> {
 struct Case {
     shape: &'static str,
     clauses: Vec<Clause>,
-    /// Columns: node variables, then each path's `nodes` and `length`.
+    /// Columns: node variables, then each relationship variable (`type(r)`
+    /// for a fixed hop, `r.length` for a variable-length one), then each
+    /// path's `nodes` and `length` (only `length` for a shortest path, whose
+    /// node order among equal-length paths is the engine's choice).
     nodes: Vec<String>,
-    paths: Vec<String>,
+    rels: Vec<(String, bool)>,
+    paths: Vec<(String, bool)>,
 }
 
 impl Case {
@@ -653,7 +783,12 @@ impl Case {
                     "MATCH"
                 };
                 let parts: Vec<String> = c.parts.iter().map(Part::text).collect();
-                format!("{kw} {}", parts.join(", "))
+                let filter = c
+                    .where_active
+                    .as_ref()
+                    .map(|v| format!(" WHERE {v}.active = true"))
+                    .unwrap_or_default();
+                format!("{kw} {}{filter}", parts.join(", "))
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -661,15 +796,24 @@ impl Case {
 
     fn cypher(&self) -> String {
         let mut cols: Vec<String> = self.nodes.clone();
-        for p in &self.paths {
-            cols.push(format!("{p}.nodes AS {p}_nodes"));
+        for (r, fixed) in &self.rels {
+            cols.push(if *fixed {
+                format!("type({r}) AS {r}_type")
+            } else {
+                format!("{r}.length AS {r}_len")
+            });
+        }
+        for (p, shortest) in &self.paths {
+            if !shortest {
+                cols.push(format!("{p}.nodes AS {p}_nodes"));
+            }
             cols.push(format!("{p}.length AS {p}_len"));
         }
         format!("{} RETURN {}", self.match_text(), cols.join(", "))
     }
 
-    fn expected(&self, g: &RefGraph, id: usize) -> Rows {
-        let m = Matcher { g, id };
+    fn expected(&self, g: &RefGraph, p: Params) -> Rows {
+        let m = Matcher { g, p };
         let mut rows = vec![RefRow::new()];
         for clause in &self.clauses {
             rows = m.clause(clause, rows);
@@ -686,13 +830,28 @@ impl Case {
                         _ => None,
                     })
                     .collect();
-                for p in &self.paths {
+                for (r, _) in &self.rels {
+                    cells.push(match row.get(r) {
+                        Some(Bind::Rel(i)) => Some(Value::Str(g.edges[*i].0.into())),
+                        Some(Bind::Len(n)) => Some(Value::Int(*n as i64)),
+                        _ => None,
+                    });
+                }
+                for (p, shortest) in &self.paths {
                     match row.get(p) {
                         Some(Bind::Path(nodes, len)) => {
-                            cells.push(Some(Value::List(nodes.iter().map(|n| key(*n)).collect())));
+                            if !shortest {
+                                cells.push(Some(Value::List(
+                                    nodes.iter().map(|n| key(*n)).collect(),
+                                )));
+                            }
                             cells.push(Some(Value::Int(*len as i64)));
                         }
-                        _ => cells.extend([None, None]),
+                        _ => cells.extend(if *shortest {
+                            vec![None]
+                        } else {
+                            vec![None, None]
+                        }),
                     }
                 }
                 cells
@@ -729,6 +888,7 @@ fn random_node(rng: &mut Rng, var: &str) -> NodeP {
             None
         },
         param: false,
+        act_param: false,
     }
 }
 
@@ -750,7 +910,9 @@ fn random_hops(
             } else {
                 Len::Fixed
             };
+            let var = rng.chance(35).then(|| format!("r{}", vars.len()));
             let hop = Hop {
+                var,
                 types: rng.pick(&types),
                 dir: rng.pick(&[Dir::Right, Dir::Left, Dir::Both]),
                 len,
@@ -775,15 +937,17 @@ fn random_case(rng: &mut Rng, shape: &'static str) -> Case {
         })
     };
     let first_hops = 1 + rng.below(if shape == "chain" { 3 } else { 2 });
-    let first = Part {
+    let mut first = Part {
         path: path(rng, &mut paths),
         start: random_node(rng, "v0"),
         hops: random_hops(rng, &mut vars, first_hops, &mut varlen),
+        shortest: false,
     };
     let clauses = match shape {
         "chain" => vec![Clause {
             optional: false,
             parts: vec![first],
+            where_active: None,
         }],
         "commas" | "clauses" => {
             // The second part starts at a node of the first or a new one, and
@@ -803,25 +967,93 @@ fn random_case(rng: &mut Rng, shape: &'static str) -> Case {
                 vars.pop();
                 hops.last_mut().unwrap().1.var = end.clone();
             }
+            // Separate clauses: a fixed hop may name a relationship variable
+            // the first clause bound, which then joins on it.
+            if shape == "clauses" && rng.chance(50) {
+                let fixed = |h: &Hop| matches!(h.len, Len::Fixed);
+                if let (Some(k), Some(hop)) = (
+                    first.hops.iter().position(|(h, _)| fixed(h)),
+                    hops.iter_mut().find(|(h, _)| fixed(h)),
+                ) {
+                    let name = first.hops[k]
+                        .0
+                        .var
+                        .get_or_insert_with(|| format!("r{k}x"))
+                        .clone();
+                    hop.0.var = Some(name);
+                }
+            }
             let second = Part {
                 path: path(rng, &mut paths),
                 start,
                 hops,
+                shortest: false,
             };
             if shape == "commas" {
                 vec![Clause {
                     optional: false,
                     parts: vec![first, second],
+                    where_active: None,
                 }]
             } else {
                 vec![
                     Clause {
                         optional: false,
                         parts: vec![first],
+                        where_active: None,
                     },
                     Clause {
                         optional: false,
                         parts: vec![second],
+                        where_active: None,
+                    },
+                ]
+            }
+        }
+        "shortest" => {
+            // `(v0)-[fixed]-(v1), p = shortestPath((v0)-[…*..k]-(v1))`: the
+            // search must avoid the fixed hop's edge, in one clause or not.
+            let types: [&'static [&'static str]; 4] = [&[], &["X"], &["Y"], &["X", "Y"]];
+            let mut part = first;
+            if part.path.take().is_some() {
+                paths.clear();
+            }
+            part.hops.truncate(1);
+            part.hops[0].0.len = Len::Fixed;
+            let end = part.hops[0].1.var.clone();
+            let p = format!("p{}", paths.len());
+            paths.push(p.clone());
+            let sp = Part {
+                path: Some(p),
+                start: NodeP::plain("v0"),
+                hops: vec![(
+                    Hop {
+                        var: None,
+                        types: rng.pick(&types),
+                        dir: rng.pick(&[Dir::Right, Dir::Left, Dir::Both]),
+                        len: Len::UpTo(1 + rng.below(3)),
+                    },
+                    NodeP::plain(&end),
+                )],
+                shortest: true,
+            };
+            if rng.chance(50) {
+                vec![Clause {
+                    optional: false,
+                    parts: vec![part, sp],
+                    where_active: None,
+                }]
+            } else {
+                vec![
+                    Clause {
+                        optional: false,
+                        parts: vec![part],
+                        where_active: None,
+                    },
+                    Clause {
+                        optional: false,
+                        parts: vec![sp],
+                        where_active: None,
                     },
                 ]
             }
@@ -830,6 +1062,9 @@ fn random_case(rng: &mut Rng, shape: &'static str) -> Case {
             // OPTIONAL MATCH from a bound start, after a plain scan.
             let mut part = first;
             let start = std::mem::replace(&mut part.start, NodeP::plain("v0"));
+            let where_active = rng
+                .chance(30)
+                .then(|| part.hops.last().unwrap().1.var.clone());
             vec![
                 Clause {
                     optional: false,
@@ -837,16 +1072,20 @@ fn random_case(rng: &mut Rng, shape: &'static str) -> Case {
                         path: None,
                         start,
                         hops: vec![],
+                        shortest: false,
                     }],
+                    where_active: None,
                 },
                 Clause {
                     optional: true,
                     parts: vec![part],
+                    where_active,
                 },
             ]
         }
     };
     let mut nodes: Vec<String> = Vec::new();
+    let mut rels: Vec<(String, bool)> = Vec::new();
     for c in &clauses {
         for p in &c.parts {
             for v in std::iter::once(&p.start.var).chain(p.hops.iter().map(|(_, n)| &n.var)) {
@@ -854,18 +1093,46 @@ fn random_case(rng: &mut Rng, shape: &'static str) -> Case {
                     nodes.push(v.clone());
                 }
             }
+            for (h, _) in &p.hops {
+                if let Some(r) = &h.var {
+                    if !rels.iter().any(|(x, _)| x == r) {
+                        rels.push((r.clone(), matches!(h.len, Len::Fixed)));
+                    }
+                }
+            }
         }
     }
+    let shortest = shape == "shortest";
     Case {
         shape,
         clauses,
         nodes,
-        paths,
+        rels,
+        paths: paths.into_iter().map(|p| (p, shortest)).collect(),
     }
 }
 
-/// Put `{id: $id}` on one node of the case (its first occurrence).
+/// Put `{id: $id}` on one node of the case (its first occurrence), or
+/// `{active: $act}` on a hop's destination map.
 fn add_param(rng: &mut Rng, case: &mut Case) {
+    if rng.chance(50) {
+        let dests: Vec<&mut NodeP> = case
+            .clauses
+            .iter_mut()
+            .flat_map(|c| c.parts.iter_mut())
+            .filter(|p| !p.shortest)
+            .flat_map(|p| p.hops.iter_mut().map(|(_, n)| n))
+            .filter(|n| n.active.is_none())
+            .collect();
+        if dests.is_empty() {
+            return;
+        }
+        let k = rng.below(dests.len());
+        if let Some(node) = dests.into_iter().nth(k) {
+            node.act_param = true;
+        }
+        return;
+    }
     let var = case.nodes[rng.below(case.nodes.len())].clone();
     for c in &mut case.clauses {
         for p in &mut c.parts {
@@ -898,22 +1165,55 @@ fn randomized_patterns_match_a_reference_matcher() {
         let mut db = load(&g, &base.join(format!("g{gi}")), false);
         let idb = load(&g, &base.join(format!("g{gi}i")), true);
         for qi in 0..8 {
-            let shape = rng.pick(&["chain", "commas", "clauses", "optional"]);
+            // A shortest path from a node back to itself may take one edge
+            // twice under this engine's node-visited search; graphs with
+            // self-loops (the only way the fixed hop can end where it starts)
+            // skip that shape.
+            let shapes: &[&'static str] = if g.loops {
+                &["chain", "commas", "clauses", "optional"]
+            } else {
+                &["chain", "commas", "clauses", "optional", "shortest"]
+            };
+            let shape = rng.pick(shapes);
             let mut case = random_case(&mut rng, shape);
-            let id = rng.below(g.nodes.len());
-            let param = rng.chance(25);
-            if param {
+            let p = Params {
+                id: rng.below(g.nodes.len()),
+                act: rng.chance(50),
+            };
+            if rng.chance(30) {
                 add_param(&mut rng, &mut case);
             }
-            let params = if param {
-                BTreeMap::from([("id".to_owned(), Value::Str(g.nodes[id].key.clone()))])
-            } else {
-                BTreeMap::new()
-            };
+            let params = BTreeMap::from([
+                ("id".to_owned(), Value::Str(g.nodes[p.id].key.clone())),
+                ("act".to_owned(), Value::Bool(p.act)),
+            ]);
             let q = case.cypher();
-            let want = case.expected(&g, id);
+            let want = case.expected(&g, p);
             let got = engine_rows(&db, &q, &params);
             *counts.entry(case.shape).or_default() += 1;
+            // The features each case exercises, so a gap in coverage shows.
+            let rel_in = |c: &Clause| -> Vec<String> {
+                c.parts
+                    .iter()
+                    .flat_map(|p| p.hops.iter().filter_map(|(h, _)| h.var.clone()))
+                    .collect()
+            };
+            let rejoined = case.clauses.len() == 2 && {
+                let first = rel_in(&case.clauses[0]);
+                rel_in(&case.clauses[1]).iter().any(|r| first.contains(r))
+            };
+            for (feature, on) in [
+                ("feature: rel var", !case.rels.is_empty()),
+                ("feature: rel var rejoined", rejoined),
+                ("feature: optional where", q.contains(" WHERE ")),
+                ("feature: $act in a map", q.contains("$act")),
+                ("feature: $id", q.contains("$id")),
+                ("feature: named path", !case.paths.is_empty()),
+            ] {
+                if on {
+                    *counts.entry(feature).or_default() += 1;
+                }
+            }
             if got.as_ref() != Ok(&want) {
                 failures.push(format!(
                     "[{}] {q}\n  edges {:?}\n  got  {got:?}\n  want {want:?}",
@@ -979,9 +1279,21 @@ fn randomized_patterns_match_a_reference_matcher() {
             .join("\n")
     );
     if graphs >= 120 {
-        for shape in ["chain", "commas", "clauses", "optional", "write"] {
+        for (shape, least) in [
+            ("chain", 100),
+            ("commas", 100),
+            ("clauses", 100),
+            ("optional", 100),
+            ("shortest", 40),
+            ("write", 100),
+            ("feature: rel var", 100),
+            ("feature: rel var rejoined", 20),
+            ("feature: optional where", 20),
+            ("feature: $act in a map", 40),
+            ("feature: $id", 40),
+        ] {
             assert!(
-                counts.get(shape).copied().unwrap_or(0) > 100,
+                counts.get(shape).copied().unwrap_or(0) > least,
                 "{shape}: {counts:?}"
             );
         }
