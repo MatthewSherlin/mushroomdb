@@ -427,10 +427,9 @@ fn main() -> ExitCode {
         },
         Ok(Command::Import {
             db_dir,
-            nodes,
-            relationships,
+            inputs,
             opts,
-        }) => match run_import(&db_dir, nodes.as_deref(), relationships.as_deref(), &opts) {
+        }) => match run_import(&db_dir, &inputs, &opts) {
             Ok(report) => {
                 for w in &report.warnings {
                     eprintln!("warning: {w}");
