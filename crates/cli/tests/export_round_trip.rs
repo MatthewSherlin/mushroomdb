@@ -934,3 +934,96 @@ fn round_trip_ignore_errors_retries_a_rejected_node_batch_row_by_row() {
     let db = GraphDb::open(&dir.join("db")).unwrap();
     assert!(db.has_node("a") && !db.has_node("b") && db.has_node("c"));
 }
+
+/// A float that JSONL import once read one unit in the last place off
+/// (`serde_json` without `float_roundtrip` turns `123456789.12345679` into
+/// `123456789.12345678`).
+#[test]
+fn round_trip_a_float_that_lost_one_ulp_comes_back_bit_exact() {
+    let tricky = 123_456_789.123_456_79_f64;
+    let dir = tmp("float-ulp");
+    let mut db = GraphDb::<RealFs>::open(&dir.join("src")).unwrap();
+    db.write_batch(|b| {
+        b.insert_node("N", "n", vec![("x".into(), Value::Float(tricky))]);
+    })
+    .unwrap();
+    drop(db);
+    for (name, format, inputs) in [
+        (
+            "jsonl",
+            ExportFormat::Jsonl,
+            jsonl_inputs as fn(&Path) -> ImportInputs,
+        ),
+        ("single", ExportFormat::JsonlSingle, stream_inputs),
+        ("csv", ExportFormat::Csv, csv_inputs),
+    ] {
+        let out = dir.join(name);
+        export(&dir.join("src"), &out, format);
+        let dst = dir.join(format!("dst-{name}"));
+        import(&dst, &inputs(&out), 10);
+        let back = GraphDb::<RealFs>::open(&dst).unwrap();
+        let node = &back.all_nodes_for_export()[0];
+        match node.props.get("x") {
+            Some(Value::Float(f)) => assert_eq!(f.to_bits(), tricky.to_bits(), "{name}"),
+            other => panic!("{name}: expected a float, got {other:?}"),
+        }
+    }
+}
+
+/// A property name or map key with `\n` or `\r` once broke the
+/// one-statement-per-line file. The export skips it, counts it, and writes the
+/// rest of the node; every line is still one statement the engine reads.
+#[test]
+fn round_trip_cypher_a_name_with_a_line_break_keeps_the_file_one_statement_per_line() {
+    let dir = tmp("cypher-linebreak");
+    let mut db = GraphDb::<RealFs>::open(&dir.join("src")).unwrap();
+    db.write_batch(|b| {
+        b.insert_node(
+            "N",
+            "n",
+            vec![
+                ("id".into(), Value::Str("n".into())),
+                ("keep".into(), Value::Str("a\nb\rc".into())),
+                ("a\nb".into(), Value::Int(1)),
+                ("c\rd".into(), Value::Int(2)),
+                (
+                    "m".into(),
+                    Value::Map(vec![("k\nx".into(), Value::Int(3))].into_iter().collect()),
+                ),
+                (
+                    "ok".into(),
+                    Value::Map(vec![("k".into(), Value::Int(4))].into_iter().collect()),
+                ),
+            ],
+        );
+    })
+    .unwrap();
+    drop(db);
+    let out = dir.join("out");
+    let summary = export(&dir.join("src"), &out, ExportFormat::Cypher);
+    assert!(
+        summary.contains("3 NaN, infinite or -2^63 numbers"),
+        "{summary}"
+    );
+    let statements = cypher_statements(&out);
+    assert_eq!(statements.len(), 1, "one node, one line: {statements:?}");
+    run_statements(&dir.join("dst"), &statements);
+
+    let back = GraphDb::<RealFs>::open(&dir.join("dst")).unwrap();
+    let nodes = back.all_nodes_for_export();
+    assert_eq!(nodes.len(), 1);
+    let props = &nodes[0].props;
+    assert_eq!(props.get("keep"), Some(&Value::Str("a\nb\rc".into())));
+    assert_eq!(
+        props.get("ok"),
+        Some(&Value::Map(
+            vec![("k".into(), Value::Int(4))].into_iter().collect()
+        ))
+    );
+    for gone in ["a\nb", "c\rd", "m"] {
+        assert!(
+            !props.contains_key(gone),
+            "{gone:?} is reported, not written"
+        );
+    }
+}

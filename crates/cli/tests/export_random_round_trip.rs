@@ -56,8 +56,7 @@ fn text(rng: &mut Rng, max: usize) -> String {
     (0..len).map(|_| *rng.pick(CHARS)).collect()
 }
 
-/// `min_int_ok`: whether `i64::MIN` and line breaks in map keys may appear
-/// (Cypher has no literal for the one and cannot carry the other).
+/// `min_int_ok`: whether `i64::MIN` may appear (Cypher has no literal for it).
 fn value(rng: &mut Rng, depth: usize, min_int_ok: bool) -> Value {
     match rng.below(if depth >= 2 { 4 } else { 6 }) {
         0 => Value::Str(text(rng, 8)),
@@ -86,14 +85,7 @@ fn value(rng: &mut Rng, depth: usize, min_int_ok: bool) -> Value {
         ),
         _ => Value::Map(
             (0..rng.below(4))
-                .map(|_| {
-                    let mut name = text(rng, 4) + "k";
-                    if !min_int_ok {
-                        // Cypher names sit on one line (see `CypherLoss`).
-                        name.retain(|c| c != '\n' && c != '\r');
-                    }
-                    (name, value(rng, depth + 1, min_int_ok))
-                })
+                .map(|_| (text(rng, 4) + "k", value(rng, depth + 1, min_int_ok)))
                 .collect(),
         ),
     }
@@ -212,6 +204,16 @@ fn import(db_dir: &Path, inputs: &ImportInputs, batch_size: usize) {
     run_import_inputs(db_dir, inputs, &opts, &mut |_| {}).unwrap();
 }
 
+fn has_line_break_key(v: &Value) -> bool {
+    match v {
+        Value::List(xs) => xs.iter().any(has_line_break_key),
+        Value::Map(m) => m
+            .iter()
+            .any(|(k, v)| k.contains(['\n', '\r']) || has_line_break_key(v)),
+        _ => false,
+    }
+}
+
 fn assert_same(seed: u64, format: &str, a: &Path, b: &Path, adds_id: bool) {
     let (a, b) = (
         GraphDb::<RealFs>::open(a).unwrap(),
@@ -220,6 +222,10 @@ fn assert_same(seed: u64, format: &str, a: &Path, b: &Path, adds_id: bool) {
     let mut expected = a.all_nodes_for_export();
     if adds_id {
         for node in &mut expected {
+            // Cypher skips (and counts) a property whose name, or a map key in
+            // it, has a line break.
+            node.props
+                .retain(|name, v| !name.contains(['\n', '\r']) && !has_line_break_key(v));
             node.props
                 .entry("id".into())
                 .or_insert_with(|| Value::Str(node.key.clone()));
