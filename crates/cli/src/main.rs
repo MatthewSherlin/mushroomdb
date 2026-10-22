@@ -650,7 +650,7 @@ fn run_serve(
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
-            let backup_tx = backup.as_ref().map(|(tx, _)| tx.clone());
+            let backup_tx = backup.as_ref().map(|(tx, _, _)| tx.clone());
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -851,7 +851,7 @@ fn run_serve(
                 };
             }
         }
-        tokio::select! {
+        let outcome = tokio::select! {
             result = &mut serve => match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -860,6 +860,8 @@ fn run_serve(
             _ = shutdown_signal() => {
                 // Ask the server to stop, then wait for it. In-flight requests
                 // and live subscribers finish; `serve.abort()` cut them off.
+                // Only then is the store quiet: every acknowledged write is in
+                // the WAL, and the backup flush below ships all of it.
                 tracing::info!("shutdown signal received; draining in-flight requests");
                 let _ = stop_tx.send(());
                 match (&mut serve).await {
@@ -871,25 +873,51 @@ fn run_serve(
                 // write lock. Shutting down without one is fine — the WAL holds
                 // every commit, and the next open replays it.
                 match cli::snapshot_shared(&db) {
-                    Ok(()) => {}
+                    Ok(()) => Ok(()),
                     Err(GraphError::Busy { .. }) => {
                         eprintln!(
                             "shutdown snapshot skipped: another process holds the write lock"
                         );
+                        Ok(())
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => Err(e.to_string()),
                 }
-                Ok(())
             }
+        };
+        // However serving ended, the backup worker gets its last flush and
+        // gives the bucket lease back, so a successor starts at once instead
+        // of waiting out the TTL.
+        if let Some(running) = backup {
+            stop_backup(running).await;
         }
+        outcome
     })
 }
 
-/// The backup worker and the sender that drives it, or `None` when
-/// `MUSHROOMDB_BACKUP_S3_URL` is unset.
+/// Send the backup worker `Shutdown` and wait for it, no longer than the
+/// worker's own bound (`BackupConfig::shutdown_budget`). The worker flushes
+/// the last WAL segment and any new snapshot, writes a final manifest, and
+/// deletes its lease. A timeout is logged and ignored: the local store is
+/// already safe, and the lease then expires by itself.
+async fn stop_backup((tx, handle, budget): RunningBackup) {
+    tracing::info!("shutdown: flushing the S3 backup");
+    let _ = tx.send(backup::BackupTrigger::Shutdown);
+    match tokio::time::timeout(budget, handle.join).await {
+        Ok(Ok(())) => tracing::info!("shutdown: backup flushed"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "shutdown: the backup worker failed"),
+        Err(_) => tracing::warn!(
+            budget_s = budget.as_secs(),
+            "shutdown: the S3 flush did not finish in time; the local store is safe"
+        ),
+    }
+}
+
+/// The backup worker, the sender that drives it and the longest its shutdown
+/// may take, or `None` when `MUSHROOMDB_BACKUP_S3_URL` is unset.
 type RunningBackup = (
     tokio::sync::watch::Sender<backup::BackupTrigger>,
     backup::BackupHandle,
+    Duration,
 );
 
 /// Start the backup worker when the environment configures one.
@@ -903,6 +931,7 @@ fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<Runnin
         return Ok(None);
     };
     let store = backup::build_store(&config).map_err(|e| e.to_string())?;
+    let budget = config.shutdown_budget();
     let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
     let handle = backup::BackupWorker::spawn(
         config,
@@ -912,7 +941,7 @@ fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<Runnin
         rx,
     )
     .map_err(|e| e.to_string())?;
-    Ok(Some((tx, handle)))
+    Ok(Some((tx, handle, budget)))
 }
 
 async fn shutdown_signal() {

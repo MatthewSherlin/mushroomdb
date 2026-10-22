@@ -211,6 +211,12 @@ aborted outright, which severed in-flight responses and subscriptions
 mid-stream. Nothing was ever lost — the WAL holds every commit and the next
 open replays it — but a rolling restart cut off work it did not need to.
 
+With continuous backup on, the drain is followed by the shutdown snapshot and
+then a final flush to the bucket, which deletes the bucket lease so a successor
+starts at once. Give the platform's stop timeout room for all of it (60 s or
+more at the defaults); see
+[Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
+
 A TLS server gets 30 seconds of grace before the listener closes regardless, so
 one stuck request cannot hold a restart open indefinitely.
 

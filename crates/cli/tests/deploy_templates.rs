@@ -122,3 +122,22 @@ fn deploy_templates_set_port_8080_on_platforms_that_route_by_port() {
     assert!(template("railway/Dockerfile").contains("#   PORT               8080"));
     assert!(template("fly/fly.toml").contains("internal_port = 8080"));
 }
+
+/// `serve` drains, snapshots, then flushes the backup and releases its lease
+/// (about 22 s of backup alone at the defaults); a platform that kills it
+/// sooner leaves the lease behind.
+#[test]
+fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
+    for (name, needle) in [
+        ("fly/fly.toml", "kill_timeout = \"60s\""),
+        (
+            "docker-compose/docker-compose.yml",
+            "stop_grace_period: 60s",
+        ),
+    ] {
+        assert!(
+            template(name).contains(needle),
+            "{name} must contain {needle}"
+        );
+    }
+}

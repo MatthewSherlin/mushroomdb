@@ -188,9 +188,11 @@ holder can stop renewing because it died, or because it is shutting down in a
 rolling deploy. Either way the waiting instance takes over within one TTL plus
 one check, at most 40 s at the default.
 
-Deleting the lease on a clean shutdown, so that a successor can start at once,
-arrives with graceful shutdown (HO-11). Until then, a stopped holder's lease
-expires after its TTL.
+A clean shutdown (SIGTERM or SIGINT) deletes the lease, so a successor holds it
+within a few seconds instead of waiting out the TTL (see
+[Stopping cleanly](#stopping-cleanly-and-the-grace-period)). A holder that is
+killed, or that cannot reach the bucket in time, leaves the lease to expire
+after its TTL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -260,6 +262,54 @@ just written or the one `LATEST` names.
 This rewound-store case is tracked as row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
 a release blocker that closes when every restore gets a new lineage.
+
+## Stopping cleanly, and the grace period
+
+On SIGTERM or SIGINT `serve` stops in this order, so that no acknowledged write
+is lost:
+
+1. It stops accepting connections and lets every request already in flight
+   finish.
+2. It takes the shutdown snapshot.
+3. If continuous backup is on, it tells the backup worker to stop and waits for
+   it. The worker uploads the last WAL segment and the new snapshot, writes a
+   final restore point, and deletes the bucket lease. The lease is deleted only
+   if it still names this instance.
+
+Step 3 is bounded. The worker abandons an upload still running after
+`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS`, then spends at most one request deadline
+(`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`) on releasing the lease. `serve` waits for
+that, plus 2 s, and no longer. If the bucket is unreachable it logs a warning
+and exits; the local store is already safe, and the lease expires by itself
+after its TTL.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take before the upload in flight is abandoned |
+| `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request, including the lease release |
+
+**Set the platform's stop timeout above the whole sequence.** The backup's part
+is at most `SHUTDOWN_GRACE_MS + OP_TIMEOUT_MS + 2 s`, 22 s at the defaults. The
+drain (step 1) and the snapshot (step 2) come first, and both grow with the
+store and with the slowest request in flight. A platform that kills the process
+earlier cuts the sequence short. Nothing is lost, because the WAL holds every
+commit, but the lease is then left behind and the next start waits for it. Aim
+for at least 60 s at the defaults, and raise it by the same amount if you raise
+either variable.
+
+| Platform | Setting | Template value |
+| --- | --- | --- |
+| Fly.io | `kill_timeout` | `"60s"` |
+| Docker Compose | `stop_grace_period` | `60s` |
+| Kubernetes | `terminationGracePeriodSeconds` | at least `60` (the default, 30, is shorter than the sequence) |
+| Render, Railway | set by the platform | check that it allows the sequence above; Railway's is `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` |
+
+**Backup health never gates `/ready`.** `/ready` answers 503 only until the
+store is open. A rolling deploy starts the new instance while the old one still
+holds the lease, so the new one is backup-unhealthy until the old one stops. If
+`/ready` followed backup health, the platform would never route traffic to the
+new instance and never stop the old one. Watch backup health in the log (it
+warns while the lease is foreign), not through `/ready`.
 
 ## Loopback-first posture
 
