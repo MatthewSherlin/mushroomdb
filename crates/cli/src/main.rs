@@ -615,6 +615,12 @@ fn run_serve(
         // store indexes, so an existing store is never touched here.
         let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
         // `GET /ready` answers 503 until the store is open and its schema is in.
+        // `keys.json` beside the store: extra tokens with tiers, re-read on
+        // SIGHUP. An invalid file stops the start, before the store is opened,
+        // rather than serve with the keys the operator meant to add missing.
+        let access_keys =
+            mushroomdb::AccessKeys::load(db_dir.join("keys.json")).map_err(|e| e.to_string())?;
+        server::watch_sighup(&access_keys);
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         // A shared open takes no lock, so an unwritable data directory would
@@ -756,6 +762,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await;
                 }
@@ -771,6 +778,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        access_keys,
                     );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -791,6 +799,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await
                 }
@@ -803,6 +812,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await
                 }
@@ -817,6 +827,7 @@ fn run_serve(
                             role_tokens,
                             stop_rx,
                             ready_flag,
+                            Some(access_keys),
                         )
                         .await
                     }
@@ -830,6 +841,7 @@ fn run_serve(
                             role_tokens,
                             stop_rx,
                             ready_flag,
+                            Some(access_keys),
                         )
                         .await
                     }

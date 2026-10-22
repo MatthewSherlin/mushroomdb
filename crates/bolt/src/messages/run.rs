@@ -271,7 +271,9 @@ impl QueryService {
         self.wait_for_bookmarks(&request.bookmarks)?;
         let (result, seq) = if is_write {
             let result = match identity {
-                Identity::Full => self.db.write().query_write(&request.query, &params),
+                Identity::Full | Identity::Write => {
+                    self.db.write().query_write(&request.query, &params)
+                }
                 Identity::Role(role) => {
                     self.db
                         .write()
@@ -284,7 +286,7 @@ impl QueryService {
                 // The read the HTTP route makes for a full token (UNION
                 // included). TX-5 moves HTTP and Bolt to the lock-free reader
                 // together; until its parser matches, Bolt follows HTTP.
-                Identity::Full => {
+                Identity::Full | Identity::Write => {
                     let result = self.db.read().query(&request.query, &params);
                     (result, self.db.reader().version)
                 }

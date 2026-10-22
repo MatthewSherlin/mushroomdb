@@ -23,7 +23,7 @@ arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `fs` serves the embedded UI. `timeout` and `limit` are the 0.6.12 hardening:

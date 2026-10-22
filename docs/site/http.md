@@ -103,6 +103,51 @@ predicate, v4 when any role is bound to one or more namespaces). A version this
 binary does not recognise poisons the roles state rather than loading it —
 denying beats over-granting.
 
+## Access keys and the write tier
+
+`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token is read-mostly. To hand an
+application a token that can write but cannot read operator data, put a `keys.json` file in the
+store directory, beside `roles.json`:
+
+```json
+{
+  "keys": [
+    { "token": "tok-admin", "tier": "admin" },
+    { "token": "tok-app",   "tier": "write" },
+    { "token": "tok-tenant", "tier": "read", "role": "tenant_a" }
+  ]
+}
+```
+
+| Tier | What it is |
+|---|---|
+| `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `read` | Read-only and masked by the `role` it names, exactly as a role token. A `read` key must name a role. |
+
+Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They are
+additive: `MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` keep working, and when one token is in
+both places the full token wins. A server with no env token and no role tokens but at least one key
+requires a key. With no `keys.json` nothing changes.
+
+The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, an empty
+or repeated token, or an unknown field refuses the whole file; `serve` then exits with status 1
+before it opens the store. Error messages never contain a token.
+
+**Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
+The new set replaces the old one in a single step, so a request sees one set or the other, never a
+mix. If the new file does not parse, the old keys stay in force and the error is logged. Removing
+every key locks the server rather than opening it: once a key has been loaded, authentication stays
+required. On a platform without SIGHUP, restart to reload.
+
+**Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
+tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
+`read` key is its role, which cannot run statements in an explicit transaction. A Bolt connection
+authenticates once, at `HELLO`, so a key removed by a reload stops being accepted for new connections;
+connections already open keep the tier they had until they close.
+
+Keep `keys.json` private (mode 0600): it holds the tokens in plain text.
+
 ## Write scopes for role-bound tokens
 
 v0.3 lifts the write ban for roles that explicitly declare write scopes in
@@ -1204,7 +1249,7 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
-the WebSocket URL when the client cannot set headers. A role-bound token gets 403.
+the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
 
 ### `GET /subscribe`
 

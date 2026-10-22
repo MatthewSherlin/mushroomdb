@@ -97,6 +97,9 @@ pub async fn subscribe(
         )
             .into_response();
     }
+    if let Some(refusal) = crate::http::refuse_write_tier(&identity) {
+        return refusal;
+    }
     ws.on_upgrade(move |socket| run(socket, state))
         .into_response()
 }
