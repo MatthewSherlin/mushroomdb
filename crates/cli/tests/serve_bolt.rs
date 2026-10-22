@@ -48,6 +48,10 @@ fn serve(dir: &Path, args: &[&str]) -> Command {
 
 struct Server {
     child: Child,
+    /// The HTTP listener's address.
+    http: String,
+    /// The Bolt listener's scheme (`bolt` or `bolt+s`) and address.
+    scheme: String,
     bolt: String,
 }
 
@@ -77,36 +81,60 @@ fn start(dir: &Path, extra: &[&str]) -> Server {
         .expect("spawn mushroomdb serve");
     let mut server = Server {
         child,
+        http: String::new(),
+        scheme: String::new(),
         bolt: String::new(),
     };
     let mut lines = BufReader::new(server.child.stdout.take().unwrap()).lines();
-    match lines.next() {
-        Some(Ok(line)) if line.starts_with("listening on http://") => {}
-        other => panic!("serve did not start: {other:?}"),
-    }
-    match lines.next() {
-        Some(Ok(line)) if line.starts_with("listening on bolt://") => {
-            server.bolt = line["listening on bolt://".len()..].trim().to_string();
+    // `listening on <scheme>://<addr>`.
+    let mut listening = |what: &str| -> (String, String) {
+        match lines.next() {
+            Some(Ok(line)) => match line
+                .strip_prefix("listening on ")
+                .and_then(|rest| rest.trim().split_once("://"))
+            {
+                Some((scheme, addr)) => (scheme.to_string(), addr.to_string()),
+                None => panic!("{what}: unexpected line {line:?}"),
+            },
+            other => panic!("{what} was not reported: {other:?}"),
         }
-        other => panic!("no Bolt listener was reported: {other:?}"),
-    }
+    };
+    let (http_scheme, http) = listening("the HTTP listener");
+    assert_eq!(http_scheme, "http");
+    server.http = http;
+    let (scheme, bolt) = listening("the Bolt listener");
+    assert!(scheme.starts_with("bolt"), "{scheme}");
+    server.scheme = scheme;
+    server.bolt = bolt;
     // Keep draining so the child never blocks on a full pipe.
     std::thread::spawn(move || for _ in lines {});
     server
 }
 
-/// A blocking Bolt client.
-struct Client {
-    stream: TcpStream,
+/// A blocking Bolt client over a socket or a TLS session.
+struct Client<S: Read + Write = TcpStream> {
+    stream: S,
     buf: Vec<u8>,
 }
 
-impl Client {
+/// A loopback socket with a read deadline, so a test cannot hang on it.
+fn socket(addr: &str) -> TcpStream {
+    let stream = TcpStream::connect(addr).expect("connect to the listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+}
+
+impl Client<TcpStream> {
     fn connect(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr).expect("connect to the Bolt port");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        Self::over(socket(addr))
+    }
+}
+
+impl<S: Read + Write> Client<S> {
+    /// Runs the version handshake on `stream`.
+    fn over(stream: S) -> Self {
         let mut client = Self {
             stream,
             buf: Vec::new(),
@@ -194,6 +222,7 @@ impl Client {
 fn serve_answers_hello_run_pull_goodbye_on_the_bolt_port() {
     let dir = tmp("cycle");
     let server = start(&dir, &[]);
+    assert_eq!(server.scheme, "bolt");
     let mut client = Client::connect(&server.bolt);
     assert_eq!(client.hello(TOKEN).tag, TAG_SUCCESS);
     assert_eq!(client.run("CREATE (n:Thing {id: 'b1'})").tag, TAG_SUCCESS);
@@ -337,4 +366,132 @@ fn sigterm_rolls_back_an_open_bolt_transaction_and_exits_within_the_timeout() {
         !reopened.has_node("in-flight"),
         "the open transaction was rolled back"
     );
+}
+
+/// Writes `keys.json` with one `read` key for `role`, private as `serve`
+/// requires.
+fn write_read_key(dir: &Path, token: &str, role: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("keys.json");
+    let text = format!(
+        r#"{{"keys":[{{"hash":"{}","tier":"read","role":"{role}"}}]}}"#,
+        mushroomdb::hash_token(token).unwrap()
+    );
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The HTTP server's `keys.json` reaches the Bolt listener with its tiers: a
+/// `read` key logs in over Bolt and cannot write.
+#[test]
+fn a_read_key_from_keys_json_logs_in_over_bolt_and_cannot_write() {
+    const READ_KEY: &str = "rd-key-0123456789abcdef0123456789abcdef";
+    let dir = tmp("read-key");
+    write_read_key(&dir, READ_KEY, "viewer");
+    let server = start(&dir, &[]);
+    let mut client = Client::connect(&server.bolt);
+    assert_eq!(client.hello(READ_KEY).tag, TAG_SUCCESS);
+    let refused = client.run("CREATE (n:Doc {id: 'nope'})");
+    assert_eq!(refused.tag, TAG_FAILURE);
+    assert!(
+        format!("{refused:?}").contains("Neo.ClientError.Security.Forbidden"),
+        "{refused:?}"
+    );
+    drop(server);
+    assert!(!mushroomdb::GraphDb::open(&dir).unwrap().has_node("nope"));
+}
+
+/// The image's code path: a `tls` build, which installs no crypto provider,
+/// serves HTTPS and Bolt over TLS from one certificate (ledger row 141).
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use std::sync::Arc;
+
+    fn client_config(cert: &rcgen::CertifiedKey) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    }
+
+    fn tls_to(
+        addr: &str,
+        config: &Arc<rustls::ClientConfig>,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let session =
+            rustls::ClientConnection::new(config.clone(), "localhost".try_into().unwrap()).unwrap();
+        rustls::StreamOwned::new(session, socket(addr))
+    }
+
+    #[test]
+    fn serve_over_tls_answers_https_and_bolt_over_tls() {
+        let dir = tmp("tls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let certs = tmp("tls-certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = certs.join("cert.pem");
+        let key_path = certs.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let server = start(
+            &dir,
+            &[
+                "--tls-cert",
+                cert_path.to_str().unwrap(),
+                "--tls-key",
+                key_path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(server.scheme, "bolt+s", "Bolt is TLS when HTTP is");
+        let config = client_config(&cert);
+
+        // HTTPS: the store is open and serving.
+        let mut https = tls_to(&server.http, &config);
+        write!(
+            https,
+            "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut reply = String::new();
+        let _ = https.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+
+        // Bolt over TLS: the whole cycle.
+        let mut client = Client::over(tls_to(&server.bolt, &config));
+        assert_eq!(client.hello(TOKEN).tag, TAG_SUCCESS);
+        assert_eq!(client.run("RETURN 1 AS one").tag, TAG_SUCCESS);
+        let (records, summary) = client.pull_all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(summary.tag, TAG_SUCCESS);
+        client.send(TAG_GOODBYE, vec![]);
+        assert!(client.closed());
+
+        // A plaintext Bolt handshake on the TLS port gets no version back.
+        let mut plain = socket(&server.bolt);
+        plain.write_all(&OFFER).unwrap();
+        let mut got = Vec::new();
+        let _ = plain.read_to_end(&mut got);
+        assert_ne!(got.get(..4), Some(&[0u8, 0, 0, 5][..]), "{got:?}");
+
+        let mut server = server;
+        send_term(&server.child);
+        let started = Instant::now();
+        while server.child.try_wait().unwrap().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

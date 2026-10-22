@@ -70,5 +70,6 @@ proptest = { workspace = true }
 tempfile = "3"
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
-# Install an explicit crypto provider when both ring and aws-lc-rs are compiled in.
+# `tests/tls.rs` installs ring as a test convenience; `tests/tls_no_provider.rs`
+# installs none and is the test of what the shipped binary does.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

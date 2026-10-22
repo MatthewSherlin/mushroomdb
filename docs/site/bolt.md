@@ -67,7 +67,7 @@ Database names: an absent, null or empty name, the drivers' default name, and th
 ## Limits, deadlines and shutdown
 
 - **Handshake deadline.** A client has 10 seconds from connecting to finish the handshake (the TLS handshake gets 10 seconds of its own) and send a `HELLO` that authenticates, or it is closed.
-- **Connection limit.** Past `--bolt-max-connections`, a new client gets its handshake answered and then a transient `DatabaseUnavailable` failure to its first message, and is closed. Drivers retry a transient error.
+- **Connection limit.** Past `--bolt-max-connections`, a new client gets its handshake answered and then a transient `DatabaseUnavailable` failure to its first message, and is closed. Drivers retry a transient error. A client holds its slot from the moment it connects, before it authenticates, so clients that never log in can fill the limit for up to the handshake deadline (20 seconds with TLS).
 - **Isolation.** Each connection is its own task: a failure in one, a panic included, ends that connection only.
 - **Shutdown.** On SIGTERM the Bolt listener stops accepting at the start of the drain phase, with HTTP. Each connection is closed at its next idle point (between requests, or after the replies to the request it is running), and an open transaction is rolled back. Connections still open when the drain bound passes are cut off. The whole sequence stays inside `--shutdown-timeout-secs`; see [Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
 - **Logging.** A storage failure, a busy store or corruption reaches the client as a fixed message; its detail is logged on the server.

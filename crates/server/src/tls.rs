@@ -31,8 +31,30 @@ pub fn load_server_config(cert: &Path, key: &Path) -> Result<Arc<rustls::ServerC
             cert.display()
         ));
     }
-    let private_key = PrivateKeyDer::from_pem_slice(&key_pem)
-        .map_err(|e| format!("--tls-key {}: not a PEM private key: {e}", key.display()))?;
+    // Exactly one key: a file with two is an operator mistake, and taking the
+    // first would serve whichever happens to come first.
+    let mut keys = PrivateKeyDer::pem_slice_iter(&key_pem);
+    let private_key = match keys.next() {
+        Some(Ok(first)) => first,
+        Some(Err(e)) => {
+            return Err(format!(
+                "--tls-key {}: not a PEM private key: {e}",
+                key.display()
+            ))
+        }
+        None => {
+            return Err(format!(
+                "--tls-key {}: the file holds no PEM private key",
+                key.display()
+            ))
+        }
+    };
+    if keys.next().is_some() {
+        return Err(format!(
+            "--tls-key {}: the file holds more than one private key; give it exactly one",
+            key.display()
+        ));
+    }
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));

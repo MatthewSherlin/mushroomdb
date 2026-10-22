@@ -1187,11 +1187,22 @@ impl BoundBolt {
             .unwrap_or_default();
         tracing::info!(addr = %self.bound, %advertised, scheme = self.scheme, "bolt: listening");
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let task =
-            tokio::spawn(
-                self.listener
-                    .serve(db.clone(), self.authenticator, self.config, stop_rx),
-            );
+        let watched = stop_rx.clone();
+        let serving = self
+            .listener
+            .serve(db.clone(), self.authenticator, self.config, stop_rx);
+        let task = tokio::spawn(async move {
+            let ended = serving.await;
+            // The listener returns only when told to stop. Ending any other
+            // way leaves HTTP up with Bolt gone, which must not be silent.
+            if !*watched.borrow() {
+                match &ended {
+                    Ok(()) => tracing::error!("bolt: the listener stopped on its own"),
+                    Err(e) => tracing::error!(error = %e, "bolt: the listener failed"),
+                }
+            }
+            ended
+        });
         RunningBolt { task, stop }
     }
 }

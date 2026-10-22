@@ -30,9 +30,12 @@ jobs:
       # exists behind the `mp-test` feature (so a plain workspace test run never
       # builds it). Cross-process locking has no other coverage.
       - run: cargo test -p mushroomdb --features mp-test --test multiprocess
-      # The published image is built with `--features tls`; nothing else in CI
-      # compiles it, so the TLS tests (gated on the feature) run here.
-      - run: cargo test -p mushroomdb-server --features tls --test tls
+      # The published image is built with `--features tls`, so the TLS tests
+      # (gated on the feature) run here. `tls_no_provider` is its own process
+      # and installs no rustls crypto provider, as the shipped binary does not
+      # (ledger row 141); the Bolt listener's TLS test runs beside it.
+      - run: cargo test -p mushroomdb-server --features tls --test tls --test tls_no_provider
+      - run: cargo test -p mushroomdb-bolt --features tls --test server
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Tests that need a hook that exists only behind `test-hooks` — a store
       # 0.8.0 left behind (ledger row 107), or a range index's postings read
@@ -374,7 +377,11 @@ jobs:
       - run: npm run build
         working-directory: ui
       - run: cargo test -p mushroomdb-server --features embed-ui
-      - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
+      # The Dockerfile's build, features and all: the image ships this binary.
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui,tls --release
+      # The real binary with those features over HTTPS and Bolt over TLS
+      # (ledger row 141: a TLS build that installs no crypto provider).
+      - run: cargo test -p mushroomdb-cli --features embed-ui,tls --test serve_bolt
       - name: demo + serve + curl index, stats, node
         run: |
           set -euo pipefail

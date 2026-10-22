@@ -1490,6 +1490,8 @@ dependencies = [
  "mushroomdb-extract",
  "mushroomdb-server",
  "parquet",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

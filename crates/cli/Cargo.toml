@@ -61,3 +61,7 @@ getrandom = "0.3"
 [dev-dependencies]
 # Self dev-dependency: turns on `test-hooks` for this package's tests only.
 mushroomdb-cli = { path = ".", features = ["test-hooks"] }
+# `tests/serve_bolt.rs` under `tls`: a self-signed certificate and a TLS client
+# for HTTPS and Bolt. Both already in the tree.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
