@@ -17,6 +17,8 @@
 //!
 //! Builds against v0.9.2 as well as 0.10, so the same source is the baseline.
 //!
+//! `EDGES=<k>` adds `k` out-edges per node to the load.
+//!
 //! `CLOCK=cpu` times each commit by the writer thread's CPU time instead of
 //! wall time, which a loaded machine disturbs far less (fsync waits are then
 //! not counted, so read the fsync-off rows). `PASSES=<n>` repeats each pass
@@ -44,6 +46,7 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 /// for `cpu`, else wall time since the first call.
 fn now_ms() -> f64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    #[cfg(unix)]
     if std::env::var("CLOCK").is_ok_and(|v| v == "cpu") {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -77,6 +80,27 @@ fn main() {
                 label: "Person".into(),
                 key: format!("p{i}"),
                 props: vec![("name".into(), Value::Str(format!("person {i}")))],
+            })
+            .collect();
+        db.submit_batch(ops).unwrap();
+    }
+    // `EDGES=<k>`: give every node `k` `LINK` out-edges as well, so a store
+    // with no snapshot holds a topology overlay the size of the graph.
+    let edges: usize = std::env::var("EDGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for chunk in (0..n).step_by(10_000) {
+        if edges == 0 {
+            break;
+        }
+        let ops = (chunk..(chunk + 10_000).min(n))
+            .flat_map(|i| {
+                (1..=edges).map(move |d| BatchOp::InsertEdge {
+                    edge_type: "LINK".into(),
+                    src_key: format!("p{i}"),
+                    dst_key: format!("p{}", (i + d) % n),
+                })
             })
             .collect();
         db.submit_batch(ops).unwrap();

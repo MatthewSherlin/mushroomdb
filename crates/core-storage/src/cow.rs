@@ -894,7 +894,9 @@ impl std::hash::Hasher for PassThrough {
 
 type ByHash = HashMap<u64, u32, std::hash::BuildHasherDefault<PassThrough>>;
 
-/// Shards of a [`HashIndex`], chosen by a hash's top bits.
+/// Shards of a [`HashIndex`], chosen by bits 32–41 of a hash: not the low
+/// bits a shard's table buckets by, nor the top seven it tags entries with,
+/// so a shard's entries still spread over its table.
 const HASH_SHARDS: usize = 1024;
 
 #[cfg(test)]
@@ -904,15 +906,13 @@ thread_local! {
     pub(crate) static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-fn hash_str(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
+fn hash_str(keys: &std::hash::RandomState, s: &str) -> u64 {
+    use std::hash::BuildHasher;
     #[cfg(test)]
     if let Some(h) = FORCED_HASH.with(|f| f.get()) {
         return h;
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    keys.hash_one(s)
 }
 
 /// Strings to dense ids, for a caller that keeps the strings itself (a
@@ -921,9 +921,12 @@ fn hash_str(s: &str) -> u64 {
 /// A string is found by its hash, in one of 1024 shared shards, and confirmed
 /// through `resolve`; the rare string whose hash a different string already
 /// holds is kept by value in `collided`. So a clone copies no string, and a
-/// write copies one shard of about `len / 1024` hashes.
+/// write copies one shard of about `len / 1024` hashes. The hash is keyed per
+/// index (`RandomState`; nothing here is persisted), so keys cannot be
+/// chosen to pile into one shard.
 #[derive(Debug, Clone, Default)]
 pub struct HashIndex {
+    keys: std::hash::RandomState,
     shards: Vec<Arc<ByHash>>,
     collided: Arc<HashMap<String, u32>>,
     len: usize,
@@ -944,17 +947,17 @@ impl HashIndex {
     }
 
     fn shard_of(h: u64) -> usize {
-        (h >> 54) as usize
+        (h >> 32) as usize % HASH_SHARDS
     }
 
     /// The hash [`Self::get_hashed`] and [`Self::insert_hashed`] take, so a
     /// lookup that misses and then inserts hashes the string once.
-    pub fn hash(key: &str) -> u64 {
-        hash_str(key)
+    pub fn hash(&self, key: &str) -> u64 {
+        hash_str(&self.keys, key)
     }
 
     pub fn get<'a>(&self, key: &str, resolve: impl Fn(u32) -> Option<&'a str>) -> Option<u32> {
-        self.get_hashed(key, hash_str(key), resolve)
+        self.get_hashed(key, self.hash(key), resolve)
     }
 
     /// [`Self::get`], given `key`'s [`Self::hash`].
@@ -978,7 +981,7 @@ impl HashIndex {
     /// Index `key` as `id`. The caller has checked `key` is not indexed, and
     /// `resolve` must already answer every other indexed id.
     pub fn insert(&mut self, key: &str, id: u32) {
-        self.insert_hashed(key, hash_str(key), id);
+        self.insert_hashed(key, self.hash(key), id);
     }
 
     /// [`Self::insert`], given `key`'s [`Self::hash`].
@@ -1002,7 +1005,7 @@ impl HashIndex {
         key: &str,
         resolve: impl Fn(u32) -> Option<&'a str>,
     ) -> Option<u32> {
-        let h = hash_str(key);
+        let h = self.hash(key);
         let shard_of = Self::shard_of(h);
         if let Some(&id) = self.shards.get(shard_of).and_then(|s| s.get(&h)) {
             if resolve(id) == Some(key) {

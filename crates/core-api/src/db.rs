@@ -1735,23 +1735,26 @@ fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
     }
 }
 
+/// The engine's view of the store. Pass the store's `&mut Arc`s, not
+/// `Arc::make_mut` of them: the engine copies a structure the fold shares
+/// only when it writes to it (ledger row 126).
 fn make_graph_mut<'a>(
     ids: &'a IdMap,
-    syms: &'a mut Interner,
+    syms: impl Into<core_rules::CowMut<'a, Interner>>,
     labels: &'a [u32],
     props: core_storage::v8::seam::ColumnsView<'a>,
-    topo: &'a mut Topology,
+    topo: impl Into<core_rules::CowMut<'a, Topology>>,
     base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
-    edge_props: &'a mut EdgeProps,
+    edge_props: impl Into<core_rules::CowMut<'a, EdgeProps>>,
 ) -> GraphMut<'a> {
     GraphMut {
         ids,
-        syms,
+        syms: syms.into(),
         labels,
         props,
-        topo,
+        topo: topo.into(),
         base_topo: base_csr(base),
-        edge_props,
+        edge_props: edge_props.into(),
     }
 }
 
@@ -4739,12 +4742,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -4830,12 +4833,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -4879,12 +4882,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
@@ -5011,12 +5014,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -5104,12 +5107,12 @@ impl<F: Fs> GraphDb<F> {
                     {
                         let mut gm = make_graph_mut(
                             &self.ids,
-                            Arc::make_mut(&mut self.syms),
+                            &mut self.syms,
                             &self.labels,
                             build_props_view(&self.props, &self.base),
-                            Arc::make_mut(&mut self.topo),
+                            &mut self.topo,
                             &self.base,
-                            Arc::make_mut(&mut self.edge_props),
+                            &mut self.edge_props,
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
                     }
@@ -5159,12 +5162,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
                 }
@@ -5243,12 +5246,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.create_rule(def, &mut gm)
                 };
@@ -5289,12 +5292,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.delete_rule(name, &mut gm)
                 };
@@ -5359,12 +5362,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
                 }
@@ -5467,12 +5470,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -5514,12 +5517,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_removed(n, &mut gm);
                 }
@@ -5626,12 +5629,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.rebuild(name, &mut gm)
                 };
@@ -6721,12 +6724,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.reconcile_lost_provenance(&mut gm);
         }
@@ -8731,12 +8734,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.populate_indexes(&gm);
         }
@@ -8761,12 +8764,12 @@ impl<F: Fs> GraphDb<F> {
         let finished = {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.pump_index_build(&mut gm)
         };
@@ -8788,12 +8791,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.register_incomplete_hnsw_builds(&extra, &gm);
         }
@@ -17656,11 +17659,14 @@ impl EdgeKeys {
         let touching: Vec<EdgeKey> = self
             .by_endpoint
             .range(start..)
+            // Counts every entry the walk reads, the one that ends it too.
+            .inspect(|_| {
+                #[cfg(test)]
+                EDGE_KEYS_VISITED.with(|v| v.set(v.get() + 1));
+            })
             .take_while(|(endpoint, _)| endpoint == key)
             .map(|(_, edge)| edge.clone())
             .collect();
-        #[cfg(test)]
-        EDGE_KEYS_VISITED.with(|v| v.set(v.get() + touching.len()));
         for edge in &touching {
             self.remove(edge);
         }
@@ -18769,9 +18775,58 @@ mod tests {
     use super::*;
     use core_rules::Predicate;
 
+    /// Ledger row 126: a property write that derives nothing leaves the
+    /// topology, edge properties and interner shared with the fold, on a
+    /// store with no snapshot (every edge in the overlay) and with a rule
+    /// installed, so the engine runs. A write that derives an edge copies the
+    /// topology, and the fold keeps its own.
+    #[test]
+    fn a_write_that_derives_nothing_copies_no_topology() {
+        let dir = tmp_dir("row126-topo");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(fk_rule()).unwrap();
+        let mut b = db.batch();
+        for i in 0..50 {
+            b.insert_node("Person", &format!("p{i}"), vec![]);
+        }
+        b.insert_node("Org", "acme", vec![]);
+        for i in 0..49 {
+            b.insert_edge("KNOWS", &format!("p{i}"), &format!("p{}", i + 1));
+        }
+        b.commit().unwrap();
+        // The field's name is interned here, before the fold: a write that
+        // names a new symbol writes the interner, and copies it.
+        db.set_prop("p3", "age", Value::Int(6)).unwrap();
+        db.fold_now();
+        let fold = Arc::clone(db.fold_overlay.as_ref().unwrap());
+        db.set_prop("p3", "age", Value::Int(7)).unwrap();
+        assert!(Arc::ptr_eq(&db.topo, &fold.topo), "topology copied");
+        assert!(
+            Arc::ptr_eq(&db.edge_props, &fold.edge_props),
+            "edge props copied"
+        );
+        assert!(Arc::ptr_eq(&db.syms, &fold.syms), "interner copied");
+        // A write the rule derives from: the writer copies, the fold does not move.
+        db.set_prop("p4", "org_id", Value::Str("acme".into()))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&db.topo, &fold.topo));
+        assert_eq!(
+            db.neighbors("p4", "WORKS_AT", Direction::Out).unwrap(),
+            ["acme"]
+        );
+        let org = fold.ids.get("acme").unwrap();
+        let p4 = fold.ids.get("p4").unwrap();
+        let et = fold.syms.get("WORKS_AT");
+        assert!(et.is_none_or(|et| !fold.topo.neighbors(et, Direction::Out, p4).contains(&org)));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Ledger row 130: a node delete in a batch finds the batch's edges at
-    /// that node through the endpoint index, so 200 deletes beside 200 batch
-    /// edges visit the one edge at the one deleted endpoint, not 200 × 200.
+    /// that node through the endpoint index. 201 deletes, each looking in the
+    /// added and the deleted edge sets, read at most the edges at the node and
+    /// the one entry that ends each walk (403 here), not the 200 × 200 a full
+    /// walk reads (20,300 with the old `retain`).
     #[test]
     fn a_batch_node_delete_visits_only_the_batch_edges_at_that_node() {
         let dir = tmp_dir("row130-visits");
@@ -18791,7 +18846,8 @@ mod tests {
         b.delete_node("s0");
         EDGE_KEYS_VISITED.with(|v| v.set(0));
         b.commit().unwrap();
-        assert_eq!(EDGE_KEYS_VISITED.with(|v| v.get()), 1);
+        let visited = EDGE_KEYS_VISITED.with(|v| v.get());
+        assert!(visited <= 2 * 201 + 1, "{visited} entries read");
         assert_eq!(db.edge_count(), 199);
         assert!(db.node_info("s0").is_none() && db.node_info("old7").is_none());
         drop(db);

@@ -106,7 +106,7 @@ impl IdMap {
     /// Allocate a dense id for `key`, or return the existing live id.
     /// Fails before wrap when the next id would not fit in `u32`.
     pub fn try_insert(&mut self, key: &str) -> Result<u32> {
-        let h = HashIndex::hash(key);
+        let h = self.to_id.hash(key);
         let to_key = &self.to_key;
         if let Some(id) = self
             .to_id
