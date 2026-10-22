@@ -129,7 +129,8 @@ jobs:
   # scenario (--cfg mdb_v092) and run interleaved with this build on this
   # runner, so the bounds are against v0.9.2 on the same machine: a plain
   # commit within 1.15x v0.9.2's with readers paused (the 1.05x bar plus
-  # noise) and 1.25x with them running (accepted 1.16-1.21x), within 1.5x its
+  # noise; best of 3 sets until TX-5c removes TX-5's per-commit builder cost,
+  # target <= 1.05x) and 1.25x with them running (accepted 1.16-1.21x), within 1.5x its
   # own paused cost, while the readers complete >= 10k reads/s. Threads are
   # capped by the runner's cores, so a small runner times the code, not the
   # scheduler. Release only: the tests are #[ignore]d out of the debug run.

@@ -51,6 +51,15 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// - **Against this build with its readers paused**, which needs no
 ///   baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
 pub const ALONE_MAX_VS_V092: f64 = 1.15;
+/// Sets of [`V092_ROUNDS`] pairs the paused bound may take the best of.
+///
+/// Interim, by the coordinator's ruling of 2026-10-22: the tree sits at
+/// 1.10–1.12× v0.9.2 with readers paused, from TX-5's per-commit publish and
+/// background builder (the TX-7 base measured the same), so one set at
+/// 1.15× fails about one run in three. Until **TX-5c** removes that cost
+/// (target ≤ 1.05× v0.9.2), the paused check passes if any of up to 3 sets
+/// does; the bound itself stays at 1.15×. TX-5c should set this back to 1.
+pub const PAUSED_ATTEMPTS: usize = 3;
 /// See [`ALONE_MAX_VS_V092`]: the owner accepted up to 1.21×; 1.25× is that
 /// with a 0.04 noise margin. This tree measured 1.01–1.09× v0.9.2 here
 /// (TX-7 fix round 1), with readers paused 1.10–1.12× — the same as the TX-7
