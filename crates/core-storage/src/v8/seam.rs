@@ -341,8 +341,8 @@ mod tests {
     }
 
     /// The column handle answers what `get()` answers for every node and
-    /// field: base values, overlay overwrites, overlay tombstones, typed and
-    /// `Mixed` base columns, cached or not (ledger row 139: the handle the
+    /// field: base values, overlay overwrites, overlay tombstones, typed
+    /// (`Vector` included) and `Mixed` base columns, cached or not (ledger row 139: the handle the
     /// fused scan used read the overlay alone).
     #[test]
     fn the_column_handle_reads_what_get_reads() {
@@ -368,6 +368,15 @@ mod tests {
                     name: "x".to_string(),
                     col: ColumnData::Mixed(bincode::serialize(&mixed).unwrap()),
                 },
+                FieldEntry {
+                    name: "v".to_string(),
+                    // Dim 2; nodes 0 and 3 present.
+                    col: ColumnData::Vector {
+                        dim: 2,
+                        data: vec![0.5, 1.5, 0.0, 0.0, 0.0, 0.0, 2.5, 3.5],
+                        present: vec![0b1001],
+                    },
+                },
             ],
         };
         let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&base).expect("rkyv encode");
@@ -380,6 +389,7 @@ mod tests {
         overlay.record_prop_tombstone(2, "n");
         overlay.record_prop_tombstone(3, "x");
         overlay.set(4, "x", Value::Bool(true));
+        overlay.record_prop_tombstone(3, "v");
         let cache = MixedCache::default();
 
         let views = [
@@ -388,7 +398,7 @@ mod tests {
             ColumnsView::owned(&overlay),
         ];
         for (v, view) in views.iter().enumerate() {
-            for field in ["n", "x", "absent"] {
+            for field in ["n", "x", "v", "absent"] {
                 let col = view.view_column(field);
                 for id in 0..6u32 {
                     let want = view.get(id, field).map(ValueRef::into_value);
@@ -406,6 +416,14 @@ mod tests {
         );
         assert_eq!(
             views[0].view_column("n").get(2).map(ValueRef::into_value),
+            None
+        );
+        assert_eq!(
+            views[0].view_column("v").get(0).map(ValueRef::into_value),
+            Some(Value::List(vec![Value::Float(0.5), Value::Float(1.5)]))
+        );
+        assert_eq!(
+            views[0].view_column("v").get(3).map(ValueRef::into_value),
             None
         );
     }

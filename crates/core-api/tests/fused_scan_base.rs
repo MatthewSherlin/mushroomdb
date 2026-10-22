@@ -3,7 +3,10 @@
 //!
 //! `MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k` (no ORDER BY) runs
 //! the pull path's fused scan-and-filter: it resolves the property column once
-//! and compares inline. That column handle read the overlay but never the
+//! and compares inline. Any label scan whose filter is that one comparison is
+//! fused, so `MATCH (m:M), (n:L) WHERE n.f = …` and `MATCH (m:M) MATCH (n:L)
+//! WHERE n.f = …` are too; on a single-node MATCH `=` is lifted into a lookup
+//! before the fusion can see it. That column handle read the overlay but never the
 //! archived base a snapshot leaves behind, so every node whose value
 //! the snapshot held was dropped — silently. Two nodes, `snapshot()`, a third:
 //! `WHERE n.val <> 3 … LIMIT 5` answered only the third.
@@ -39,7 +42,7 @@ const OPS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
 /// map-valued properties are still stored, and compared against these.)
 const LITERALS: [&str; 5] = ["3", "2.5", "'m'", "true", "0"];
 
-/// The fused shape and its unfused twin, for one comparison.
+/// The fused shape and its unfused twin, for one comparison, single-node.
 fn pair(op: &str, lit: &str) -> (String, String) {
     (
         format!("MATCH (n:L) WHERE n.val {op} {lit} RETURN n.key AS k LIMIT 1000"),
@@ -47,6 +50,27 @@ fn pair(op: &str, lit: &str) -> (String, String) {
             "MATCH (n:L) WHERE n.val {op} {lit} AND n.key IS NOT NULL RETURN n.key AS k LIMIT 1000"
         ),
     )
+}
+
+/// Every fused form and its unfused twin, for one comparison: the
+/// single-node MATCH, the same with SKIP, and the filtered node as the second
+/// scan of a MATCH — comma-joined and as a second MATCH — where `=` is fused
+/// too (nothing lifts an equality off a later scan).
+fn forms(op: &str, lit: &str) -> [(String, String); 4] {
+    let cmp = format!("n.val {op} {lit}");
+    let twin = format!("{cmp} AND n.key IS NOT NULL");
+    let both = |head: &str, tail: &str| {
+        (
+            format!("{head} WHERE {cmp} RETURN n.key AS k {tail}"),
+            format!("{head} WHERE {twin} RETURN n.key AS k {tail}"),
+        )
+    };
+    [
+        both("MATCH (n:L)", "LIMIT 1000"),
+        both("MATCH (n:L)", "SKIP 1 LIMIT 1000"),
+        both("MATCH (m:M), (n:L)", "LIMIT 1000"),
+        both("MATCH (m:M) MATCH (n:L)", "LIMIT 1000"),
+    ]
 }
 
 fn keys(rs: &mushroomdb::ResultSet) -> Vec<String> {
@@ -58,8 +82,8 @@ fn keys(rs: &mushroomdb::ResultSet) -> Vec<String> {
         .collect()
 }
 
-/// Every operator against every literal: the fused answer equals the
-/// unfused one. Returns how many comparisons kept at least one row, so a
+/// Every operator against every literal, in every form: the fused answer
+/// equals the unfused one. Returns how many comparisons kept at least one row, so a
 /// caller can tell the fixture was not vacuous.
 fn assert_fused_matches(
     run: &dyn Fn(&str) -> mushroomdb::Result<mushroomdb::ResultSet>,
@@ -68,12 +92,14 @@ fn assert_fused_matches(
     let mut nonempty = 0;
     for op in OPS {
         for lit in LITERALS {
-            let (fused, unfused) = pair(op, lit);
-            let want = keys(&run(&unfused).unwrap_or_else(|e| panic!("{when}: {unfused}: {e}")));
-            let got = keys(&run(&fused).unwrap_or_else(|e| panic!("{when}: {fused}: {e}")));
-            assert_eq!(got, want, "{when}: `n.val {op} {lit}`");
-            if !want.is_empty() {
-                nonempty += 1;
+            for (fused, unfused) in forms(op, lit) {
+                let want =
+                    keys(&run(&unfused).unwrap_or_else(|e| panic!("{when}: {unfused}: {e}")));
+                let got = keys(&run(&fused).unwrap_or_else(|e| panic!("{when}: {fused}: {e}")));
+                assert_eq!(got, want, "{when}: {fused}");
+                if !want.is_empty() {
+                    nonempty += 1;
+                }
             }
         }
     }
@@ -154,6 +180,42 @@ fn the_reported_shape_sees_the_snapshot_base() {
         )
         .unwrap();
     assert_eq!(keys(&rs), vec!["a", "b", "c"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `=` off the first scanned node is fused, so it missed the base too (seen
+/// on the released 0.9.2 binary); on a single-node MATCH it is a lookup and
+/// was right.
+#[test]
+fn an_equality_on_a_later_scan_sees_the_snapshot_base() {
+    let dir = tmp("eq-later");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.insert_node("L", "a", vec![("val".into(), int(3))])
+        .unwrap();
+    db.insert_node("L", "b", vec![("val".into(), int(3))])
+        .unwrap();
+    db.insert_node("M", "m", vec![]).unwrap();
+    db.snapshot().unwrap();
+    db.insert_node("L", "c", vec![("val".into(), int(3))])
+        .unwrap();
+    for q in [
+        "MATCH (m:M), (n:L) WHERE n.val = 3 RETURN n.key AS k LIMIT 10",
+        "MATCH (m:M) MATCH (n:L) WHERE n.val = 3 RETURN n.key AS k LIMIT 10",
+        "MATCH (n:L) WHERE n.val = 3 RETURN n.key AS k LIMIT 10",
+    ] {
+        assert_eq!(
+            keys(&db.query(q, &p()).unwrap()),
+            vec!["a", "b", "c"],
+            "{q}"
+        );
+    }
+    let rs = db
+        .query(
+            "MATCH (n:L) WHERE n.val <> 9 RETURN n.key AS k SKIP 1 LIMIT 10",
+            &p(),
+        )
+        .unwrap();
+    assert_eq!(keys(&rs), vec!["b", "c"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -316,22 +378,27 @@ impl Rng {
 }
 
 /// Random interleavings of writes, overwrites, removals, deletes, snapshots
-/// and reopens; after every step the fused answer equals the unfused one,
-/// through the handle and through a reader taken then.
+/// and reopens; after every step the fused answer equals the unfused one, in
+/// every form, through the handle and through a reader taken then. Step 35 is
+/// a burst of `FOLD_EVERY_K + 1` writes with no snapshot or reopen in it, so a
+/// reader taken after it has folded inside the walk.
 #[test]
 fn randomized_fused_equals_unfused_over_snapshot_interleavings() {
-    for seed in 1..=12u64 {
+    for seed in 1..=16u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let dir = tmp(&format!("rand-{seed}"));
         let mut shared = Some(SharedDb::open(&dir).unwrap());
         // Some seeds keep one type per store (typed base columns), the rest mix.
         let typed = if seed % 3 == 0 { None } else { Some(seed % 6) };
-        for step in 0..60 {
+        for step in 0..70 {
             let db = shared.as_ref().unwrap();
-            let key = format!("k{}", rng.below(16));
-            let what = rng.below(100);
-            let v = value(rng.next(), typed);
-            {
+            let burst = if step == 35 { FOLD_EVERY_K + 1 } else { 1 };
+            let mut what = 0;
+            for _ in 0..burst {
+                let key = format!("k{}", rng.below(16));
+                // A burst writes only: a snapshot or a reopen would restart the fold.
+                what = rng.below(if burst > 1 { 80 } else { 100 });
+                let v = value(rng.next(), typed);
                 let mut w = db.write();
                 let exists = w.has_node(&key);
                 match what {
