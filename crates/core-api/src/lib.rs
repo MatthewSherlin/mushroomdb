@@ -9,6 +9,8 @@ pub mod history;
 mod ingest;
 mod layer;
 pub mod mask;
+/// All functions in this module are memory-API. A plain `GraphDb` with no memory
+/// schema applied imposes none of these behaviours on ordinary nodes.
 pub mod memory;
 pub mod memory_schema;
 pub mod reader;

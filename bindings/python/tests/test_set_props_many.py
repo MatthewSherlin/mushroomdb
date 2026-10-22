@@ -213,7 +213,7 @@ def test_a_read_only_handle_refuses_every_call_as_set_prop_does(tmp_path):
 def test_it_is_a_raw_write_and_does_not_maintain_an_entitys_aliases(db):
     """A pin of today's behaviour, which `set_prop` shares: `aliases` is
     derived by `upsert_entity` and `remember`, not by a property write."""
-    db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person")
+    db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person")
     assert db.node_info("ada")["props"]["aliases"] == ["ada", "ada lovelace", "lovelace"]
 
     db.set_props_many([("ada", {"name": "Ada King"})])
@@ -222,5 +222,5 @@ def test_it_is_a_raw_write_and_does_not_maintain_an_entitys_aliases(db):
     assert props["aliases"] == ["ada", "ada lovelace", "lovelace"], "stale: still the old name"
 
     # The next describing write recomputes them from the name as it stands.
-    db.upsert_entity("ada", {})
+    db.memory.upsert_entity("ada", {})
     assert db.node_info("ada")["props"]["aliases"] == ["ada", "ada king", "king"]
