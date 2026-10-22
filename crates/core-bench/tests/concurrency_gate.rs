@@ -49,6 +49,27 @@ struct WriterSet {
     reads: f64,
     /// This build's paused and running medians over v0.9.2's.
     vs_v092: Option<(f64, f64)>,
+    /// v0.9.2's own running median over its paused one.
+    v092_ratio: Option<f64>,
+}
+
+#[cfg(not(mdb_v092))]
+impl WriterSet {
+    /// The bound on `under / alone`: [`WRITER_UNDER_READERS_MAX`], or
+    /// [`SELF_RATIO_MAX_VS_V092`] times v0.9.2's own ratio when that is higher.
+    fn ratio_bound(&self) -> f64 {
+        self.v092_ratio.map_or(WRITER_UNDER_READERS_MAX, |r| {
+            WRITER_UNDER_READERS_MAX.max(r * SELF_RATIO_MAX_VS_V092)
+        })
+    }
+
+    fn within_bounds(&self) -> bool {
+        self.reads >= READS_PER_SEC_FLOOR
+            && self.under / self.alone <= self.ratio_bound()
+            && self.vs_v092.is_none_or(|(alone_x, under_x)| {
+                alone_x <= ALONE_MAX_VS_V092 && under_x <= UNDER_MAX_VS_V092
+            })
+    }
 }
 
 #[cfg(not(mdb_v092))]
@@ -87,13 +108,14 @@ fn measure_writer_set(baseline: Option<&str>) -> WriterSet {
             alone / b_alone,
             under / b_under
         );
-        (alone / b_alone, under / b_under)
+        (alone / b_alone, under / b_under, b_under / b_alone)
     });
     WriterSet {
         alone,
         under,
         reads,
-        vs_v092,
+        vs_v092: vs_v092.map(|(a, u, _)| (a, u)),
+        v092_ratio: vs_v092.map(|(_, _, r)| r),
     }
 }
 
@@ -140,11 +162,18 @@ fn concurrency_gate() {
     // The writer, paused and running readers alternating; against v0.9.2 on
     // this machine when a baseline build is given, interleaved.
     let baseline = std::env::var("MUSHROOMDB_GATE_V092").ok();
-    let writer = measure_writer_set(baseline.as_deref());
+    // Like the reader gate, the writer gate fails only when it misses twice:
+    // a shared runner's noise can move one set's median past a bound.
+    let mut writer = measure_writer_set(baseline.as_deref());
+    if !writer.within_bounds() {
+        println!("writer: a bound missed in the first set; measuring once more");
+        writer = measure_writer_set(baseline.as_deref());
+    }
     let (alone, under, reads) = (writer.alone, writer.under, writer.reads);
     let ratio = under / alone;
+    let ratio_bound = writer.ratio_bound();
     println!(
-        "writer: plain commit p50 {alone:.4} ms paused, {under:.4} ms under {} readers (>= {reads:.0} reads/s): {ratio:.2}x (bound {WRITER_UNDER_READERS_MAX}x, reads/s floor {READS_PER_SEC_FLOOR})",
+        "writer: plain commit p50 {alone:.4} ms paused, {under:.4} ms under {} readers (>= {reads:.0} reads/s): {ratio:.2}x (bound {ratio_bound:.2}x, reads/s floor {READS_PER_SEC_FLOOR})",
         writer_check_readers()
     );
     let vs_v092 = writer.vs_v092;
@@ -167,8 +196,8 @@ fn concurrency_gate() {
         "the readers completed {reads:.0} reads/s while the writer was timed; the accepted writer cost assumes >= {READS_PER_SEC_FLOOR}"
     );
     assert!(
-        ratio <= WRITER_UNDER_READERS_MAX,
-        "a plain commit under readers costs {ratio:.2}x its cost with them paused; bound {WRITER_UNDER_READERS_MAX}x"
+        ratio <= ratio_bound,
+        "a plain commit under readers costs {ratio:.2}x its cost with them paused; bound {ratio_bound:.2}x"
     );
     if let Some((alone_x, under_x)) = vs_v092 {
         assert!(

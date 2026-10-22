@@ -70,6 +70,11 @@ pub const V092_ROUNDS: usize = 5;
 /// same build's median with them paused: about 1.4× when the decision was
 /// measured, 0.98–1.21× on this tree; the pre-fix state was 2.6–2.8×.
 pub const WRITER_UNDER_READERS_MAX: f64 = 1.5;
+/// When v0.9.2 is measured on the same machine, the under-readers ratio may
+/// also reach this multiple of v0.9.2's own: on a runner with fewer cores
+/// than readers plus the writer, the readers take the writer's CPU whatever
+/// the locking, and v0.9.2 itself measured 2.01× there (CI, 2 cores).
+pub const SELF_RATIO_MAX_VS_V092: f64 = 1.15;
 /// Reads per second the readers must complete while the writer is timed, so
 /// the writer's cost is measured against readers that run (v0.9.2's ~15/s
 /// would fail it).
