@@ -803,3 +803,417 @@ fn an_acknowledged_write_survives_a_forced_second_signal_exit() {
         }
     }
 }
+
+// ── Restore on boot (HO-10) ─────────────────────────────────────────────────
+
+/// A serve, stdout and stderr piped, with `env` added to the S3 credentials.
+/// `MUSHROOMDB_RESTORE_FROM_S3` and `MUSHROOMDB_BACKUP_S3_URL` come from
+/// `env` only.
+fn boot_serve(s3: Option<&S3Env>, dir: &PathBuf, env: &[(&str, &str)]) -> std::process::Child {
+    let mut all: Vec<(&str, &str)> = Vec::new();
+    if let Some(s3) = s3 {
+        all.extend([
+            ("AWS_ENDPOINT_URL", s3.endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", s3.key.as_str()),
+            ("AWS_SECRET_ACCESS_KEY", s3.secret.as_str()),
+            ("MUSHROOMDB_BACKUP_WAL_INTERVAL_MS", "100"),
+            ("MUSHROOMDB_BACKUP_MANIFEST_INTERVAL_S", "0"),
+        ]);
+    }
+    all.extend_from_slice(env);
+    serve(dir, &all)
+        .env_remove("MUSHROOMDB_RESTORE_FROM_S3")
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mushroomdb serve")
+}
+
+/// Collect a child's stderr on a thread; join for the text.
+fn stderr_of(child: &mut std::process::Child) -> std::thread::JoinHandle<String> {
+    let mut err = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        s
+    })
+}
+
+/// Wait for a child that must not start serving; returns its stdout.
+fn exits_without_serving(child: &mut std::process::Child) -> (std::process::ExitStatus, String) {
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve kept running");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    (status, out)
+}
+
+/// Every object under `prefix` but `LATEST` and `LEASE`, with its bytes.
+fn chain_of(
+    rt: &tokio::runtime::Runtime,
+    store: &dyn backup::object_store::ObjectStore,
+    prefix: &str,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    rt.block_on(async {
+        let mut out = std::collections::BTreeMap::new();
+        let mut dirs = vec![ObjectPath::from(prefix)];
+        while let Some(d) = dirs.pop() {
+            let r = store.list_with_delimiter(Some(&d)).await.unwrap();
+            for o in r.objects {
+                let k = o.location.to_string();
+                if k.ends_with("/LATEST") || k.ends_with("/LEASE") {
+                    continue;
+                }
+                let b = store.get(&o.location).await.unwrap().bytes().await.unwrap();
+                out.insert(k, b.to_vec());
+            }
+            dirs.extend(r.common_prefixes);
+        }
+        out
+    })
+}
+
+fn health_nodes(addr: &str) -> u64 {
+    let (status, body) = http(addr, "GET", "/health", "");
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["nodes"].as_u64().unwrap_or_else(|| panic!("{body}"))
+}
+
+/// An empty data directory restores the newest restore point at boot,
+/// before the port is bound: `/ready` is 200 with the restored nodes. The
+/// restored store is a new lineage; its backup continues under the same
+/// prefix, holding the lease the boot took; and the parent's chain is
+/// untouched — its newest restore point still restores the source.
+#[test]
+fn restore_on_boot_empty_dir() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let src = tmp("boot-src");
+    let prefix = src.file_name().unwrap().to_string_lossy().to_string();
+    let url = s3.url(&prefix);
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut first = s3.serve(&src, &prefix);
+    let addr = listening_addr(&mut first);
+    for key in ["a", "b", "c"] {
+        create_node(&addr, key);
+    }
+    terminate(&mut first);
+    let source = mushroomdb::GraphDb::open(&src).unwrap();
+    let source_nodes = source.node_count() as u64;
+    let source_lineage = std::fs::read_to_string(src.join("backup.lineage")).unwrap();
+    drop(source);
+    let parent_latest = rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LATEST"),
+        Duration::from_secs(5),
+    ));
+    let parent = chain_of(&rt, store.as_ref(), &prefix);
+
+    let dir = tmp("boot-dir");
+    let mut child = boot_serve(
+        Some(&s3),
+        &dir,
+        &[
+            ("MUSHROOMDB_RESTORE_FROM_S3", url.as_str()),
+            ("MUSHROOMDB_BACKUP_S3_URL", url.as_str()),
+        ],
+    );
+    let err = stderr_of(&mut child);
+    let addr = listening_addr(&mut child);
+    let (status, body) = http(&addr, "GET", "/ready", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(health_nodes(&addr), source_nodes, "the restored nodes");
+    let lineage = std::fs::read_to_string(dir.join("backup.lineage")).unwrap();
+    assert_ne!(lineage.trim(), source_lineage.trim(), "a new lineage");
+    let lease_of = |bytes: &[u8]| -> (String, String) {
+        let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        (
+            v["instance_id"].as_str().unwrap().to_string(),
+            v["acquired_at"].as_str().unwrap().to_string(),
+        )
+    };
+    let lease = lease_of(&rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LEASE"),
+        Duration::from_secs(5),
+    )));
+
+    // A write ships under the same prefix, as the new lineage.
+    create_node(&addr, "after-restore");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let latest = rt.block_on(wait_for_object(
+            store.as_ref(),
+            &format!("{prefix}/LATEST"),
+            Duration::from_secs(5),
+        ));
+        if latest != parent_latest {
+            let m = rt.block_on(wait_for_object(
+                store.as_ref(),
+                &String::from_utf8(latest).unwrap(),
+                Duration::from_secs(5),
+            ));
+            assert_eq!(
+                backup::Manifest::from_json(&m).unwrap().lineage,
+                lineage.trim()
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "nothing shipped");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let held = lease_of(&rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LEASE"),
+        Duration::from_secs(5),
+    )));
+    assert_eq!(held, lease, "the boot's lease, never taken again");
+    terminate(&mut child);
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("restore-on-boot: restored"), "{stderr}");
+    for secret in [s3.key.as_str(), s3.secret.as_str()] {
+        assert!(!stderr.contains(secret), "a credential was logged");
+    }
+
+    // The parent's chain, byte for byte, and it still restores the source.
+    let now = chain_of(&rt, store.as_ref(), &prefix);
+    for (k, bytes) in &parent {
+        assert_eq!(now.get(k), Some(bytes), "{k} of the parent changed or went");
+    }
+    // A copy of the parent's chain alone, LATEST naming its newest manifest.
+    let replica: std::sync::Arc<dyn backup::object_store::ObjectStore> =
+        std::sync::Arc::new(backup::object_store::memory::InMemory::new());
+    let into = tmp("boot-parent");
+    let out = rt.block_on(async {
+        for (k, bytes) in &parent {
+            replica
+                .put(&ObjectPath::from(k.as_str()), bytes.clone().into())
+                .await
+                .unwrap();
+        }
+        replica
+            .put(
+                &ObjectPath::from(format!("{prefix}/LATEST")),
+                parent_latest.clone().into(),
+            )
+            .await
+            .unwrap();
+        backup::restore_from_store(std::sync::Arc::clone(&replica), &prefix, None, &into).await
+    });
+    assert_eq!(out.unwrap().source_lineage, source_lineage.trim());
+    let restored = mushroomdb::GraphDb::open(&into).unwrap();
+    let source = mushroomdb::GraphDb::open(&src).unwrap();
+    assert_eq!(
+        restored.all_nodes_for_export(),
+        source.all_nodes_for_export()
+    );
+    assert_eq!(
+        restored.wal_total_commits().unwrap(),
+        source.wal_total_commits().unwrap()
+    );
+}
+
+/// A data directory that holds a store is never restored over, and the
+/// bucket is not even contacted: the endpoint here never answers.
+#[test]
+fn restore_on_boot_nonempty_dir() {
+    let dir = tmp("boot-nonempty");
+    {
+        let mut db = mushroomdb::GraphDb::open(&dir).unwrap();
+        db.insert_node("Local", "mine", vec![]).unwrap();
+    }
+    let endpoint = black_hole();
+    let mut child = boot_serve(
+        None,
+        &dir,
+        &[
+            ("MUSHROOMDB_RESTORE_FROM_S3", "minio://bucket/prefix"),
+            ("AWS_ENDPOINT_URL", endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", "k"),
+            ("AWS_SECRET_ACCESS_KEY", "s"),
+        ],
+    );
+    let err = stderr_of(&mut child);
+    let addr = listening_addr(&mut child);
+    assert_eq!(health_nodes(&addr), 1);
+    terminate(&mut child);
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("already holds a store"), "{stderr}");
+    assert!(mushroomdb::GraphDb::open(&dir).unwrap().has_node("mine"));
+}
+
+/// A backup that cannot be restored (LATEST names a manifest that is not
+/// there) exits 1 without serving, and leaves the data directory without a
+/// store.
+#[test]
+fn restore_on_boot_failure_exits_nonzero() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let dir = tmp("boot-broken");
+    let prefix = dir.file_name().unwrap().to_string_lossy().to_string();
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        store.put(
+            &ObjectPath::from(format!("{prefix}/LATEST")),
+            format!("{prefix}/manifest/00000000000000000009.json")
+                .into_bytes()
+                .into(),
+        ),
+    )
+    .unwrap();
+    let url = s3.url(&prefix);
+    let mut child = boot_serve(
+        Some(&s3),
+        &dir,
+        &[
+            ("MUSHROOMDB_RESTORE_FROM_S3", url.as_str()),
+            ("MUSHROOMDB_BACKUP_S3_URL", url.as_str()),
+        ],
+    );
+    let err = stderr_of(&mut child);
+    let (status, stdout) = exits_without_serving(&mut child);
+    assert_eq!(status.code(), Some(1), "{stdout}");
+    assert!(!stdout.contains("listening on"), "{stdout}");
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("restore-on-boot"), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(!mushroomdb::restore::holds_a_store(&dir));
+    // The lease is handed back for a successor.
+    let gone = rt.block_on(store.get(&ObjectPath::from(format!("{prefix}/LEASE"))));
+    assert!(matches!(
+        gone,
+        Err(backup::object_store::Error::NotFound { .. })
+    ));
+}
+
+/// A prefix with no backup at all: a warning, and an empty store serves —
+/// the first deploy of a template.
+#[test]
+fn restore_on_boot_empty_bucket_starts_an_empty_store() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let dir = tmp("boot-first");
+    let prefix = dir.file_name().unwrap().to_string_lossy().to_string();
+    let url = s3.url(&prefix);
+    let mut child = boot_serve(
+        Some(&s3),
+        &dir,
+        &[
+            ("MUSHROOMDB_RESTORE_FROM_S3", url.as_str()),
+            ("MUSHROOMDB_BACKUP_S3_URL", url.as_str()),
+        ],
+    );
+    let err = stderr_of(&mut child);
+    let addr = listening_addr(&mut child);
+    assert_eq!(http(&addr, "GET", "/ready", "").0, 200);
+    assert_eq!(health_nodes(&addr), 0);
+    create_node(&addr, "first");
+    terminate(&mut child);
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("holds no backup"), "{stderr}");
+    assert!(stderr.contains("empty store"), "{stderr}");
+}
+
+/// Another instance's fresh lease: exit 1 naming the holder, nothing
+/// written to the data directory.
+#[test]
+fn restore_on_boot_foreign_lease_exits_nonzero() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let dir = tmp("boot-leased");
+    let prefix = dir.file_name().unwrap().to_string_lossy().to_string();
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let stamp = String::from_utf8(
+        Command::new("date")
+            .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let stamp = stamp.trim();
+    let record = format!(
+        r#"{{"instance_id":"the-live-one","acquired_at":"{stamp}","renewed_at":"{stamp}","ttl_s":600}}"#
+    );
+    rt.block_on(store.put(
+        &ObjectPath::from(format!("{prefix}/LEASE")),
+        record.into_bytes().into(),
+    ))
+    .unwrap();
+    let url = s3.url(&prefix);
+    let mut child = boot_serve(
+        Some(&s3),
+        &dir,
+        &[("MUSHROOMDB_RESTORE_FROM_S3", url.as_str())],
+    );
+    let err = stderr_of(&mut child);
+    let (status, stdout) = exits_without_serving(&mut child);
+    assert_eq!(status.code(), Some(1), "{stdout}");
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("the-live-one"), "{stderr}");
+    assert!(!dir.exists(), "nothing was written to the data directory");
+}
+
+/// Restore on boot does not combine with the other ways of filling an empty
+/// directory, and a malformed URL names the variable: both before anything
+/// is touched.
+#[test]
+fn restore_on_boot_refuses_a_bad_setting_before_anything() {
+    let dir = tmp("boot-bad");
+    for (args, env, needle) in [
+        (vec!["--demo-if-empty"], "minio://b/p", "--demo-if-empty"),
+        (
+            vec!["--restore-from", "/nonexistent"],
+            "minio://b/p",
+            "--restore-from",
+        ),
+        (vec![], "gs://b/p", "MUSHROOMDB_RESTORE_FROM_S3"),
+    ] {
+        let mut child = serve(&dir, &[("MUSHROOMDB_RESTORE_FROM_S3", env)])
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mushroomdb serve");
+        let err = stderr_of(&mut child);
+        let (status, _) = exits_without_serving(&mut child);
+        assert_eq!(status.code(), Some(1), "{args:?}");
+        let stderr = err.join().unwrap();
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+        assert!(!dir.exists(), "{args:?}");
+    }
+}
+
+/// A data directory a restore on boot stopped in the middle of (its install
+/// marker is there) holds a part of a store. Without restore on boot to
+/// finish it, serve refuses it rather than open it.
+#[test]
+fn a_half_installed_restore_is_not_served() {
+    let dir = tmp("boot-half");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), b"part of a store").unwrap();
+    std::fs::write(dir.join(backup::restore::INSTALL_MARKER), "snapshot.bin").unwrap();
+    let mut child = boot_serve(None, &dir, &[]);
+    let err = stderr_of(&mut child);
+    let (status, stdout) = exits_without_serving(&mut child);
+    assert_eq!(status.code(), Some(1));
+    let stderr = err.join().unwrap();
+    assert!(stderr.contains("MUSHROOMDB_RESTORE_FROM_S3"), "{stderr}");
+    assert!(!stdout.contains("listening on"));
+}

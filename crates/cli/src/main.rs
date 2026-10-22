@@ -186,6 +186,24 @@ fn main() -> ExitCode {
             if let Err(e) = server::cors_layer_from_env() {
                 return fail(&e);
             }
+            // Restore on boot, checked before anything fills the directory.
+            let restore_from_s3 = match restore_from_s3_url() {
+                Ok(url) => url,
+                Err(e) => return fail(&e),
+            };
+            if restore_from_s3.is_some() {
+                for (set, flag) in [
+                    (restore_from.is_some(), "--restore-from"),
+                    (demo_if_empty, "--demo-if-empty"),
+                ] {
+                    if set {
+                        return fail(&format!(
+                            "MUSHROOMDB_RESTORE_FROM_S3 and {flag} both fill an empty data \
+                             directory; use one of them"
+                        ));
+                    }
+                }
+            }
             // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
             // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
             // collision (flags are inserted last; HashMap retains last writer).
@@ -251,6 +269,7 @@ fn main() -> ExitCode {
                 shutdown_timeout,
                 tls_cert,
                 tls_key,
+                restore_from_s3,
             ))
         }
         Ok(Command::Mcp {
@@ -608,9 +627,29 @@ fn run_serve(
     shutdown_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    restore_from_s3: Option<String>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = rt.block_on(async {
+        // Restore on boot comes first: before the store is opened and before
+        // the port is bound, so a platform's health check sees a process
+        // still starting, never an empty store.
+        let boot_lease = match &restore_from_s3 {
+            Some(url) => restore_on_boot(url, &db_dir).await?,
+            None => {
+                if backup::restore::install_interrupted(&db_dir) {
+                    return Err(format!(
+                        "{} holds a restore on boot that stopped while it moved its files in \
+                         ({} is there): a part of a store, which serve will not open. Set \
+                         MUSHROOMDB_RESTORE_FROM_S3 to the backup it came from and start again: \
+                         the boot removes what was moved in and restores again",
+                        db_dir.display(),
+                        backup::restore::INSTALL_MARKER
+                    ));
+                }
+                None
+            }
+        };
         // Same guard as `run_mcp`: checked before `open` creates the
         // directory's files, so it tells a brand-new store from one this
         // invocation is merely reopening (or one `--demo-if-empty` /
@@ -651,7 +690,7 @@ fn run_serve(
         }
         // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
         // for the life of the server: dropping the sender stops the worker.
-        let (backup, plan) = start_backup(&db, &db_dir, shutdown_timeout)?;
+        let (backup, plan) = start_backup(&db, &db_dir, shutdown_timeout, boot_lease)?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut snapshot_task = None;
@@ -1021,10 +1060,14 @@ type RunningBackup = (
 /// Also divides `shutdown_timeout` between the shutdown phases. The backup's
 /// flush grace and request deadline are shrunk when its share of a short
 /// timeout is smaller than they are, so the lease release still fits.
+///
+/// `boot_lease` is the bucket lease a restore on boot took on this backup's
+/// prefix: the worker holds it from the start instead of taking one.
 fn start_backup(
     db: &SharedDb,
     db_dir: &std::path::Path,
     shutdown_timeout: Duration,
+    boot_lease: Option<Arc<backup::BucketLease>>,
 ) -> Result<(Option<RunningBackup>, cli::ShutdownPlan), String> {
     let Some(mut config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
         return Ok((None, cli::shutdown_plan(shutdown_timeout, Duration::ZERO)));
@@ -1034,15 +1077,128 @@ fn start_backup(
     let store = backup::build_store(&config).map_err(|e| e.to_string())?;
     let budget = plan.backup;
     let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
-    let handle = backup::BackupWorker::spawn(
+    let mut worker = backup::BackupWorker::new(
         config,
         store,
         std::sync::Arc::new(db.clone()),
         db_dir.to_path_buf(),
-        rx,
     )
     .map_err(|e| e.to_string())?;
+    if let Some(lease) = boot_lease {
+        worker.adopt_lease(lease);
+    }
+    let handle = worker.start(rx);
     Ok((Some((tx, handle, budget)), plan))
+}
+
+/// `MUSHROOMDB_RESTORE_FROM_S3`, checked: `None` when unset or empty.
+fn restore_from_s3_url() -> Result<Option<String>, String> {
+    let Some(url) = std::env::var("MUSHROOMDB_RESTORE_FROM_S3")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    restore_config(&url)?;
+    Ok(Some(url))
+}
+
+/// The configuration a restore on boot from `url` runs with: the bucket
+/// lease settings (`MUSHROOMDB_BACKUP_LEASE_TTL`, `…_LEASE_CONDITIONAL`,
+/// `…_OP_TIMEOUT_MS`) as backup reads them, for the prefix `url` names.
+fn restore_config(url: &str) -> Result<backup::BackupConfig, String> {
+    backup::BackupConfig::from_lookup(|k| match k {
+        "MUSHROOMDB_BACKUP_S3_URL" => Some(url.to_string()),
+        _ => std::env::var(k).ok(),
+    })
+    .map_err(|e| {
+        e.to_string()
+            .replace("MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3")
+    })?
+    .ok_or_else(|| "MUSHROOMDB_RESTORE_FROM_S3 is empty".to_string())
+}
+
+/// Restore on boot from `url` into `db_dir` when it holds no store
+/// ([`backup::restore_on_boot`]), saying what happened on stderr. Returns the
+/// bucket lease to hand to the backup worker when backup continues under
+/// the same prefix; otherwise the lease is released here.
+///
+/// A prefix with no backup is a warning: a first deploy starts an empty
+/// store. Any other failure is an error, and the server does not start.
+async fn restore_on_boot(
+    url: &str,
+    db_dir: &std::path::Path,
+) -> Result<Option<Arc<backup::BucketLease>>, String> {
+    let config = restore_config(url)?;
+    let continues = match backup::BackupConfig::from_env() {
+        Ok(Some(b)) => b.location().ok() == config.location().ok(),
+        _ => false,
+    };
+    let store =
+        backup::build_store(&config).map_err(|e| format!("restore-on-boot from {url}: {e}"))?;
+    let started = std::time::Instant::now();
+    let op_timeout = Duration::from_millis(config.op_timeout_ms);
+    let lease = match backup::restore_on_boot(&config, store, db_dir).await {
+        Ok(backup::BootRestore::Skipped) => {
+            eprintln!(
+                "restore-on-boot: {} already holds a store; not restoring",
+                db_dir.display()
+            );
+            return Ok(None);
+        }
+        Ok(backup::BootRestore::NoBackup { lease }) => {
+            eprintln!("restore-on-boot: warning: {url} holds no backup; starting an empty store");
+            lease
+        }
+        Ok(backup::BootRestore::Restored {
+            outcome,
+            lease,
+            undone,
+        }) => {
+            if !undone.is_empty() {
+                eprintln!(
+                    "restore-on-boot: removed what an interrupted restore had moved in: {}",
+                    undone.join(", ")
+                );
+            }
+            for path in &outcome.swept {
+                eprintln!(
+                    "restore-on-boot: removed a killed restore's leftover: {}",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "restore-on-boot: restored {url} into {}: {} commits from {}, {} bytes in {:.1} s",
+                db_dir.display(),
+                outcome.commits,
+                outcome.manifest,
+                outcome.bytes,
+                started.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "restore-on-boot: lineage {} (new; restored from {})",
+                outcome.lineage, outcome.source_lineage
+            );
+            for note in outcome.tail_note.iter().chain(&outcome.install_note) {
+                eprintln!("restore-on-boot: warning: {note}");
+            }
+            lease
+        }
+        Err(e) => {
+            return Err(format!(
+                "restore-on-boot from {url} failed: {e}. Nothing is served, and {} holds no \
+                 store",
+                db_dir.display()
+            ))
+        }
+    };
+    if continues {
+        Ok(Some(lease.into_lease().await))
+    } else {
+        lease.release(op_timeout).await;
+        Ok(None)
+    }
 }
 
 async fn shutdown_signal() {

@@ -34,9 +34,13 @@ kill_timeout = 60
   #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
   # Structured logs for the platform log shipper:
   MUSHROOMDB_LOG_FORMAT = "json"
-  # TODO(HO-14/HO-15): continuous backup and restore-on-boot settings go here
-  # and in `fly secrets` once the backup worker (HO-07) ships. Nothing in this
-  # file configures backup yet.
+  # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in
+  # `fly secrets set`, never here:
+  # MUSHROOMDB_BACKUP_S3_URL = "s3://<bucket>/<prefix>"
+  # Restore on boot: an empty volume restores the newest backup there before serving.
+  # MUSHROOMDB_RESTORE_FROM_S3 = "s3://<bucket>/<prefix>"
+  # TODO(HO-14/HO-15): the rest of the backup settings go here. Nothing in this
+  # file turns backup on yet.
 
 [processes]
   # Explicit command: no --demo-if-empty, so a production volume is never seeded.
@@ -59,7 +63,7 @@ kill_timeout = 60
   [[services.http_checks]]
     interval = "10s"
     timeout = "5s"
-    grace_period = "120s"   # allow WAL replay before the first check counts
+    grace_period = "120s"   # allow WAL replay (and a restore on boot) before the first check counts
     method = "get"
     path = "/ready"
 

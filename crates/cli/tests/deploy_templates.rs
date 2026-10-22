@@ -57,18 +57,34 @@ fn deploy_templates_hold_no_bolt_port_and_no_secret_values() {
     }
 }
 
+/// The backup and restore-on-boot variables are shown, commented out, each
+/// with what it does; nothing turns them on, and the rest of the backup
+/// settings are still to come (HO-14/HO-15).
 #[test]
-fn deploy_templates_do_not_reference_the_unmerged_backup_worker_variables() {
+fn deploy_templates_show_backup_and_restore_on_boot_commented_out() {
     for name in TEMPLATES.iter().filter(|n| **n != "railway/railway.json") {
         let text = template(name);
         for variable in ["MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3"] {
-            assert!(!text.contains(variable), "{name} references {variable}");
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains(variable)).collect();
+            assert!(!lines.is_empty(), "{name} does not show {variable}");
+            for line in lines {
+                assert!(
+                    line.trim_start().starts_with('#'),
+                    "{name}: {variable} must stay commented out: {line}"
+                );
+            }
         }
+        assert!(
+            text.contains("restore on boot: an empty")
+                || text.contains("Restore on boot: an empty"),
+            "{name} does not say what restore on boot does"
+        );
         assert!(
             text.contains("TODO(HO-14/HO-15)"),
             "{name} lacks the placeholder"
         );
     }
+    assert!(!template("railway/railway.json").contains("MUSHROOMDB_"));
 }
 
 #[test]

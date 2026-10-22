@@ -56,7 +56,20 @@
 //! in the prefix are reused only when their number, length and CRC all match
 //! the local file. Retention reads only this lineage's manifests and deletes
 //! only objects of this lineage's generations, never the manifest it just
-//! wrote or the one `LATEST` names.
+//! wrote or the one `LATEST` names, and never an object another lineage's
+//! manifest names.
+//!
+//! One exception lets a store restored on boot ([`crate::boot`]) back up to
+//! the prefix it came from. It has a lineage of its own and a parent record
+//! ([`disk::PARENT_FILE`]) naming the lineage and manifest it was restored
+//! from. While `LATEST` still names exactly that manifest, the worker adopts
+//! the prefix: it writes its own lineage's objects beside the parent's, under
+//! generation numbers past every one in the prefix, moves `LATEST` to its own
+//! manifests, and never overwrites or deletes anything of the parent's. A
+//! manifest key the parent already holds (the same commit count) is not
+//! written; the next restore point, one commit later, is. If `LATEST` has
+//! moved on since the restore, another instance wrote to the prefix: refused
+//! like any other lineage.
 //!
 //! # Writes the bucket can refuse
 //!
@@ -420,6 +433,12 @@ pub struct BackupWorker {
     watch: LeaseWatch,
     /// The store's lineage, once resume has established it.
     lineage: Option<String>,
+    /// The lineage this store was restored on boot from, when it was: its
+    /// manifests are never overwritten, and a key one holds is passed over.
+    parent_lineage: Option<String>,
+    /// Manifest keys found holding the parent lineage's manifest, not
+    /// written again.
+    parent_keys: HashSet<String>,
     /// Set when resume refused the prefix: the worker uploads nothing more.
     refused: bool,
     /// The version of `LATEST` last written or read, for `If-Match`; `None`
@@ -491,6 +510,8 @@ impl BackupWorker {
             instance_id: new_instance_id(),
             watch: LeaseWatch::default(),
             lineage: None,
+            parent_lineage: None,
+            parent_keys: HashSet::new(),
             refused: false,
             latest_version: None,
             latest_target: None,
@@ -588,6 +609,15 @@ impl BackupWorker {
     /// for every attempt.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Hold `lease`, taken for this prefix by someone else in this process (a
+    /// restore on boot), instead of taking one: the worker renews it from
+    /// now on, and its instance id becomes the lease's. Call before
+    /// [`start`](Self::start), inside a Tokio runtime.
+    pub fn adopt_lease(&mut self, lease: Arc<BucketLease>) {
+        self.instance_id = lease.instance_id().to_string();
+        self.hold(lease);
     }
 
     /// Test hook: allow `n` more requests that change the bucket (PUTs and
@@ -690,7 +720,7 @@ impl BackupWorker {
         );
         let wait = match tokio::time::timeout(limit, acquire).await {
             Ok(Ok(lease)) => {
-                self.hold(lease);
+                self.hold(Arc::new(lease));
                 None
             }
             Ok(Err(LeaseError::ForeignActive { instance_id })) => {
@@ -731,7 +761,7 @@ impl BackupWorker {
 
     /// Hold `lease`: start renewing it, and forget a previous tenure's view
     /// of the bucket.
-    fn hold(&mut self, lease: BucketLease) {
+    fn hold(&mut self, lease: Arc<BucketLease>) {
         if self.tenures > 0 {
             self.reset_tenure();
         }
@@ -749,7 +779,6 @@ impl BackupWorker {
                  instances started together may both upload and overwrite each other's objects"
             ),
         }
-        let lease = Arc::new(lease);
         self.renewer = Some(tokio::spawn(renew_loop(
             Arc::clone(&lease),
             self.op_timeout(),
@@ -764,6 +793,8 @@ impl BackupWorker {
     fn reset_tenure(&mut self) {
         self.resumed = false;
         self.lineage = None;
+        self.parent_lineage = None;
+        self.parent_keys.clear();
         self.latest_version = None;
         self.latest_target = None;
         self.manifest_versions.clear();
@@ -958,9 +989,29 @@ impl BackupWorker {
     async fn resume(&mut self) -> Result<bool, BackupError> {
         let latest = self.latest_manifest().await?;
         let dir = self.dir.clone();
-        let local = blocking(move || disk::read_lineage(&dir)).await?;
+        let (local, parent) =
+            blocking(move || Ok((disk::read_lineage(&dir)?, disk::read_parent(&dir)?))).await?;
+        // A store restored on boot from exactly the restore point `LATEST`
+        // names continues the prefix (see the module docs).
+        let adopt = match (&local, &latest, &parent) {
+            (Some(ours), Some(m), Some(p)) if *ours != m.lineage && p.lineage == m.lineage => {
+                if self.latest_target.as_deref() != Some(p.manifest.as_str()) {
+                    return Err(self.refuse(format!(
+                        "this store was restored from {} of lineage {}, but the backup prefix \
+                         has moved on since (LATEST names {}): another instance has written \
+                         to it. Nothing is uploaded or deleted. Point MUSHROOMDB_BACKUP_S3_URL \
+                         at a new prefix",
+                        p.manifest,
+                        p.lineage,
+                        self.latest_target.as_deref().unwrap_or("nothing")
+                    )));
+                }
+                true
+            }
+            _ => false,
+        };
         let lineage = match (local, &latest) {
-            (Some(ours), Some(m)) if ours != m.lineage => {
+            (Some(ours), Some(m)) if ours != m.lineage && !adopt => {
                 return Err(self.refuse(format!(
                     "this backup prefix holds the backups of another store (lineage {}), \
                      not this one (lineage {ours}); nothing is uploaded or deleted. Point \
@@ -1001,6 +1052,14 @@ impl BackupWorker {
                 id
             }
         };
+        if adopt {
+            tracing::info!(
+                lineage = %lineage,
+                parent = parent.as_ref().map_or("", |p| p.lineage.as_str()),
+                "continuing the backup prefix this store was restored from, as a new lineage"
+            );
+        }
+        self.parent_lineage = parent.map(|p| p.lineage);
         let wal_dir = ObjectPath::from(object_key(&self.prefix, "wal"));
         for p in self.list(&wal_dir).await?.common_prefixes {
             if let Some(g) = p.filename().and_then(|s| s.parse::<u64>().ok()) {
@@ -1018,7 +1077,14 @@ impl BackupWorker {
         let mut highest = self.generations.last().copied();
         if let Some(m) = latest {
             highest = highest.max(Some(m.wal_generation));
-            for f in &m.files {
+            // Another lineage's archives are never reused: a restore point
+            // names only its own lineage's objects.
+            let files = if m.lineage == lineage {
+                m.files
+            } else {
+                Vec::new()
+            };
+            for f in &files {
                 if let Some(n) = parse_archive_name(&f.name) {
                     self.archives.insert(
                         n,
@@ -1336,7 +1402,12 @@ impl BackupWorker {
         // Refuse rather than write a restore point that would not verify.
         manifest.verify_lineage().map_err(BackupError::Manifest)?;
         let key = manifest_key(&self.prefix, manifest.commit_seq);
-        self.put_manifest(&key, manifest.to_json()).await?;
+        if self.parent_keys.contains(&key) || !self.put_manifest(&key, manifest.to_json()).await? {
+            // The parent's restore point at this commit count: the same
+            // state, which `LATEST` may still name. The next commit's
+            // restore point is this lineage's first.
+            return Ok(());
+        }
         self.put_latest(&key).await?;
         self.manifest_dirty = false;
         self.last_manifest_at = Some(Instant::now());
@@ -1376,13 +1447,20 @@ impl BackupWorker {
         keys.sort();
         let ours = self.lineage();
         let mut mine: Vec<(String, Manifest)> = Vec::new();
+        // What other lineages' manifests name: side files are keyed by their
+        // content, so a parent and a child lineage can name the same one.
+        let mut foreign: HashSet<String> = HashSet::new();
         for k in keys {
             let Some(bytes) = self.get(&k).await? else {
                 continue;
             };
             match Manifest::from_json(&bytes) {
                 Ok(m) if m.lineage == ours => mine.push((k, m)),
-                _ => {}
+                Ok(m) => {
+                    foreign.extend(m.files.into_iter().map(|f| f.key));
+                    foreign.extend(m.segments.into_iter().map(|s| s.key));
+                }
+                Err(_) => {}
             }
         }
         if mine.len() <= self.config.retain_n {
@@ -1447,7 +1525,9 @@ impl BackupWorker {
             }
         }
         for k in doomed {
-            self.delete(&k).await?;
+            if !foreign.contains(&k) {
+                self.delete(&k).await?;
+            }
         }
         for g in retiring {
             self.generations.remove(&g);
@@ -1555,8 +1635,22 @@ impl BackupWorker {
     /// Write a manifest: `If-Match` against the version this tenure last
     /// wrote at `key`; otherwise `If-None-Match: *`, and over an existing one
     /// only when it is this lineage's (a previous run's restore point at the
-    /// same commit).
-    async fn put_manifest(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
+    /// same commit). `Ok(false)`, nothing written, when `key` holds the
+    /// manifest of the lineage this store was restored on boot from.
+    async fn put_manifest(&mut self, key: &str, bytes: Vec<u8>) -> Result<bool, BackupError> {
+        // A client without conditional PUT would overwrite: look first.
+        if self.parent_lineage.is_some() && !self.manifest_versions.contains_key(key) {
+            if let Some((b, _)) = self.get_versioned(key).await? {
+                if Manifest::from_json(&b).ok().map(|m| m.lineage) == self.parent_lineage {
+                    tracing::info!(
+                        key,
+                        "the parent lineage's restore point holds this key; not written"
+                    );
+                    self.parent_keys.insert(key.to_string());
+                    return Ok(false);
+                }
+            }
+        }
         let payload = PutPayload::from(bytes);
         let mode = match self.manifest_versions.get(key) {
             Some(v) => PutMode::Update(v.clone()),
@@ -1565,9 +1659,19 @@ impl BackupWorker {
         let written = match self.put_mode(key, payload.clone(), mode).await? {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.get_versioned(key).await?;
-                let ours = existing.as_ref().is_some_and(|(b, _)| {
-                    Manifest::from_json(b).is_ok_and(|m| m.lineage == self.lineage())
-                });
+                let owner = existing
+                    .as_ref()
+                    .and_then(|(b, _)| Manifest::from_json(b).ok())
+                    .map(|m| m.lineage);
+                let ours = owner.as_deref() == Some(self.lineage().as_str());
+                if owner.is_some() && owner == self.parent_lineage {
+                    tracing::info!(
+                        key,
+                        "the parent lineage's restore point holds this key; not written"
+                    );
+                    self.parent_keys.insert(key.to_string());
+                    return Ok(false);
+                }
                 match existing {
                     Some((_, v)) if ours => {
                         self.put_mode(key, payload.clone(), PutMode::Update(v))
@@ -1591,7 +1695,7 @@ impl BackupWorker {
         };
         self.manifest_versions
             .insert(key.to_string(), version_of(r));
-        Ok(())
+        Ok(true)
     }
 
     /// Point `LATEST` at `target`, with `If-Match` against the version last

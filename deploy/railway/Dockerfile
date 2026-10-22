@@ -14,7 +14,12 @@
 #                                 real deploy.
 #
 # The Bolt port (7687) is added by HO-15.
-# TODO(HO-14/HO-15): backup variables go here once the backup worker (HO-07) ships.
+#   MUSHROOMDB_BACKUP_S3_URL    s3://<bucket>/<prefix>   continuous backup, off unless set;
+#                                                        AWS_* credentials as service variables
+#   MUSHROOMDB_RESTORE_FROM_S3  s3://<bucket>/<prefix>   restore on boot: an empty volume restores
+#                                                        the newest backup there before serving
+# (both commented out here: set them in the dashboard; docs/site/deployment.md)
+# TODO(HO-14/HO-15): the rest of the backup variables go here.
 FROM ghcr.io/matthewsherlin/mushroomdb:latest
 # Explicit command: no --demo-if-empty, so a production volume is never seeded.
 CMD ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]

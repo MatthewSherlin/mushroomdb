@@ -490,3 +490,83 @@ async fn s3_refuses_a_stale_writer() {
     }
     assert_eq!(get(&b.store, latest.as_ref()).await, successor.as_bytes());
 }
+
+/// HO-10: a restore on boot over a service used without conditional PUT
+/// (`MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off`, where a create is a plain
+/// overwrite): the restored store's first restore point has the parent's
+/// commit count, and the parent's manifest at that key is still not
+/// overwritten. The next commit's restore point moves `LATEST`, and every
+/// parent object stays byte for byte.
+#[tokio::test]
+async fn s3_a_boot_restore_without_conditional_put_never_overwrites_the_parent() {
+    let Some(b) = bucket_with(false) else { return };
+    let src = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(src.path()).unwrap();
+    let mut w = BackupWorker::new(
+        BackupConfig {
+            manifest_interval_s: 0,
+            ..b.config.clone()
+        },
+        Arc::clone(&b.store),
+        Arc::new(db.clone()),
+        src.path().to_path_buf(),
+    )
+    .unwrap();
+    for i in 0..5 {
+        db.write()
+            .insert_node("A", &format!("a{i}"), vec![])
+            .unwrap();
+    }
+    w.run_once().await.unwrap();
+    drop(w);
+    drop(db);
+    let parent_key = String::from_utf8(get(&b.store, &latest_key(&b.prefix)).await).unwrap();
+    let parent_manifest = get(&b.store, &parent_key).await;
+    let parent = Manifest::from_json(&parent_manifest).unwrap();
+    let mut parent_objects = vec![(parent_key.clone(), parent_manifest.clone())];
+    for k in parent
+        .files
+        .iter()
+        .map(|f| &f.key)
+        .chain(parent.segments.iter().map(|s| &s.key))
+    {
+        parent_objects.push((k.clone(), get(&b.store, k).await));
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("data");
+    let lease = match backup::restore_on_boot(&b.config, Arc::clone(&b.store), &dir)
+        .await
+        .unwrap()
+    {
+        backup::BootRestore::Restored { lease, .. } => lease,
+        other => panic!("expected a restore, got {other:?}"),
+    };
+    let child = SharedDb::open(&dir).unwrap();
+    let mut cw = BackupWorker::new(
+        BackupConfig {
+            manifest_interval_s: 0,
+            ..b.config.clone()
+        },
+        Arc::clone(&b.store),
+        Arc::new(child.clone()),
+        dir.clone(),
+    )
+    .unwrap();
+    cw.adopt_lease(lease.into_lease().await);
+    cw.run_once().await.unwrap();
+    assert_eq!(get(&b.store, &parent_key).await, parent_manifest);
+    assert_eq!(
+        String::from_utf8(get(&b.store, &latest_key(&b.prefix)).await).unwrap(),
+        parent_key
+    );
+    child.write().insert_node("A", "child", vec![]).unwrap();
+    cw.run_once().await.unwrap();
+    let now = String::from_utf8(get(&b.store, &latest_key(&b.prefix)).await).unwrap();
+    assert_ne!(now, parent_key, "LATEST moved to the new lineage");
+    let m = Manifest::from_json(&get(&b.store, &now).await).unwrap();
+    assert_ne!(m.lineage, parent.lineage);
+    for (k, bytes) in &parent_objects {
+        assert_eq!(&get(&b.store, k).await, bytes, "{k} of the parent changed");
+    }
+}

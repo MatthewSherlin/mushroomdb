@@ -164,6 +164,52 @@ pub fn create_lineage(dir: &Path, id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The store file a restore-on-boot writes: which lineage and restore point
+/// the store was restored from. Never uploaded (it is not a side file).
+pub const PARENT_FILE: &str = "backup.parent";
+
+/// What [`PARENT_FILE`] holds.
+///
+/// A store restored at boot has a new lineage of its own, like every restore.
+/// This record is what lets its backup continue under the prefix it was
+/// restored from: the worker adopts that prefix only while `LATEST` still
+/// names exactly this manifest of exactly this lineage, and from then on
+/// writes only objects of its own lineage beside the parent's, which it never
+/// overwrites or deletes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParentRecord {
+    /// The lineage of the backup the store was restored from.
+    pub lineage: String,
+    /// The key of the manifest it was restored from.
+    pub manifest: String,
+    /// The commits the restored store held.
+    pub commit_seq: u64,
+}
+
+/// The store's parent record, or `None` when it has none (or one that does
+/// not parse: it then adopts nothing).
+pub fn read_parent(dir: &Path) -> io::Result<Option<ParentRecord>> {
+    Ok(not_found_is_none(std::fs::read(dir.join(PARENT_FILE)))?
+        .and_then(|b| serde_json::from_slice(&b).ok()))
+}
+
+/// Write [`PARENT_FILE`] as [`create_lineage`] writes the lineage: a
+/// temporary file, fsynced, renamed into place, the directory fsynced.
+pub fn create_parent(dir: &Path, record: &ParentRecord) -> io::Result<()> {
+    use std::io::Write as _;
+    let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let tmp = dir.join(format!("{PARENT_FILE}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(PARENT_FILE))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 /// CRC-32 of a whole file, read from its start; the file is left at its
 /// start again.
 pub fn crc32_of(file: &mut std::fs::File) -> io::Result<String> {
