@@ -14,6 +14,10 @@
 //! an advisory single-writer lock, and while another instance holds a fresh
 //! one it uploads nothing and reports itself unhealthy (see [`lease`]).
 //!
+//! [`restore_from_s3`] reads a restore point back — the newest, or the one
+//! holding a point in time — verifies every object, and installs it as a
+//! store with a new backup lineage (see [`restore`]).
+//!
 //! The worker never takes an engine lock and never writes to the store; a
 //! failed upload is retried with back-off and reported through
 //! [`BackupHandle`], never to the write path.
@@ -24,12 +28,16 @@ pub use object_store;
 pub mod disk;
 pub mod lease;
 pub mod manifest;
+pub mod restore;
 pub mod segment;
 pub mod store;
 pub mod worker;
 
 pub use lease::{BucketLease, Exclusion, LeaseError};
 pub use manifest::{FileEntry, Manifest, SegmentEntry, MANIFEST_VERSION};
+pub use restore::{
+    restore_from_s3, restore_from_store, RestoreS3Error, RestoreS3Outcome, RestoreTarget,
+};
 pub use store::{build_store, BackupConfig, S3Location};
 pub use worker::{
     BackupCounters, BackupHandle, BackupTrigger, BackupWorker, WalSource, SIDE_FILES,

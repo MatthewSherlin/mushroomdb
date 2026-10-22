@@ -253,6 +253,22 @@ mushroomdb backup <db-dir> <dest>   process-local consistent copy of the databas
 
 Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
 
+### `restore`
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                   restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                   which must be new or empty; every object is checked against its manifest first
+                   --at N restores the store as it was right after commit N (as asof --commit counts);
+                   --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                   backup's commit times; an instant past the newest recorded time is refused
+                   when later commits have none
+                   the restored store starts a new backup lineage: back it up to a new prefix
+                   r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+```
+
+Restore a continuous S3 backup, the newest restore point or a point in time, into a new or empty directory. Every object is verified before anything is written there, and the restored store starts a new backup lineage. See [Restoring from the backup](deployment.md#restoring-from-the-backup)
+
 ### `export`
 
 ```text

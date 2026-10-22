@@ -8144,6 +8144,22 @@ mushroomdb backup <db-dir> <dest>   process-local consistent copy of the databas
 
 Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
 
+### `restore`
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                   restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                   which must be new or empty; every object is checked against its manifest first
+                   --at N restores the store as it was right after commit N (as asof --commit counts);
+                   --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                   backup's commit times; an instant past the newest recorded time is refused
+                   when later commits have none
+                   the restored store starts a new backup lineage: back it up to a new prefix
+                   r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+```
+
+Restore a continuous S3 backup, the newest restore point or a point in time, into a new or empty directory. Every object is verified before anything is written there, and the restored store starts a new backup lineage. See [Restoring from the backup](deployment.md#restoring-from-the-backup)
+
 ### `export`
 
 ```text
@@ -13304,9 +13320,10 @@ service:
 
 **One store per prefix.** The first backup of a store gives it a lineage, the
 `backup.lineage` file in the data directory, and every restore point names it.
-Once HO-09/HO-10 land, a restore from the prefix will start a new lineage.
-Until then, restore into a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for the
-restored store somewhere fresh. The worker refuses the prefix in three cases:
+`mushroomdb restore --from` gives the store it restores a new lineage (see
+[Restoring from the backup](#restoring-from-the-backup)), so back a restored
+store up to a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for it somewhere
+fresh. The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -13329,14 +13346,105 @@ just written or the one `LATEST` names.
 - **On a best-effort service**, two writers overlapping until the next renewal
   can overwrite each other's objects. A restore point can then fail to
   verify. Run best-effort only where a single writer is otherwise assured.
-- **A store restored from an older backup, which has since written more commits
-  than the prefix's newest restore point,** passes the commit check. Its new
-  restore points are its own and verify. The prefix's older history is not
-  removed, though, so give such a store a new prefix.
+- **A copy of a store made by hand** (its directory copied with `cp`, say,
+  rather than restored) keeps the original's lineage. If it is older than the
+  prefix's newest restore point and has since written more commits than that
+  restore point holds, it passes the commit check. Its new restore points are
+  its own and verify, but the prefix's other history is not removed. Restore
+  with `mushroomdb restore`, which gives the copy a new lineage, or give such a
+  copy a new prefix.
 
-This rewound-store case is tracked as row 138 of the
+This is tracked as row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
-a release blocker that closes when every restore gets a new lineage.
+a release blocker. It stays open until restore on boot, which is not built
+yet, gives the store it restores a new lineage too.
+
+## Restoring from the backup
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+```
+
+`--from` is the `MUSHROOMDB_BACKUP_S3_URL` the store was backed up to
+(`s3://`, `r2://` or `minio://`). Credentials and the endpoint come from the
+same `AWS_*` variables backup uses. The store is written to `--into`, by
+default `./restored`, which must not exist yet or be an empty directory (not a
+mount point: restore into a directory inside one). A restore never writes over
+anything.
+
+Without `--at`, the newest restore point is restored: the one `LATEST` names,
+plus the segments of its generation uploaded after it, up to the last
+contiguous one. A restore of the newest backup loses at most the segment
+cadence, not the manifest interval.
+
+`--at` picks a point in time:
+
+- `--at 75` restores the store as it was right after commit 75. Commits are
+  numbered as `asof --commit` numbers them, from 0, and the restored store
+  holds 76.
+- `--at 2026-10-01T12:00:00Z` restores the last commit at or before that
+  instant (RFC 3339), resolved through the backup's `commit_times.bin`, as a
+  date query resolves it. A backup without that file cannot restore by time,
+  and the command says so.
+- The times come from the newest restore point's `commit_times.bin`. Segments
+  uploaded after that restore point hold commits with no recorded time. An
+  instant at or after the newest recorded time could fall after some of them,
+  so it is refused with an error naming the last commit with a time, its index
+  and when it was: restore an earlier instant, by commit index
+  (`--at <commit index>`) instead, or without `--at` for the newest. An instant before
+  the newest recorded time resolves as above.
+
+A point in time is restored from the earliest restore point of the backup's
+lineage that holds it, then cut back to that commit. The result is what
+`asof --commit` shows at that commit, as an ordinary store that takes writes.
+A commit is out of reach when it is below the oldest commit the backup holds
+(the error names that commit), past the newest, or before a truncating snapshot
+or archive retention cut the history it needs.
+
+Before anything is written to `--into`, every file and segment is downloaded
+into a staging directory beside it, a hidden `.<name>.restore-…` directory in
+the same parent, and checked against its manifest: size, CRC-32, generation,
+offsets, frames and lineage. Segments uploaded after the newest restore point
+are named by no manifest. They are checked by their own frame checksums, size
+and offsets, and the restore takes them up to the first one that is missing,
+damaged or after a gap, and says so if it stops early. `commit_times.bin` is
+trimmed to the commits restored, so the store stamps its own next commit. The
+copy is then opened and must hold the commits the manifest says it does.
+
+Every file is fsynced, and the staging directory then becomes `--into` in one
+directory rename. So `--into` is always either as it was, absent or empty, or
+the whole restored store, and never part of one, even after a crash.
+
+- An existing empty `--into` is replaced by the staging directory, on every
+  platform, so its permissions and ownership are not kept: the restored
+  directory has the ones the restore created it with. On Unix the replacement
+  is the rename itself. Elsewhere the empty directory is removed first; if the
+  rename then fails, it is created again where possible, and the error says
+  whether it was.
+- Once the rename has happened the restore has succeeded. If syncing the
+  parent directory afterwards fails, the command still succeeds and prints a
+  warning: the store is in place, but its directory entry may not survive a
+  power loss until the system syncs it.
+- A restore that fails removes the staging directory. One killed outright
+  leaves it behind, beside its lock file
+  (`.<name>.restore-<pid>-<tag>.lock`), and it can hold a whole copy of the
+  store. The next restore into the same `--into` removes such leftovers whose
+  lock no running restore holds, and lists what it removed. Nothing else in
+  the directory is touched.
+
+If segments uploaded after the newest restore point exist but cannot be used
+(the first one missing or damaged, or a later one after a gap), the restore of
+the newest point still succeeds with what it can verify and warns, naming how
+many segments and bytes of WAL were not restored and why.
+
+`roles.json` and `keys.json` are restored as the chosen restore point holds
+them. They are not cut back to a point in time: roles and keys are current
+state, not history, as they are for `asof`.
+
+**A restored store is a new lineage.** It gets a new `backup.lineage`, so its
+backups can never be confused with the ones it came from. Pointed at the
+prefix it was restored from, the backup worker refuses it: it uploads nothing
+and deletes nothing there. Back it up to a new prefix.
 
 ## Loopback-first posture
 

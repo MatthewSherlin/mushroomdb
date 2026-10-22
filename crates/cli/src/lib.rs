@@ -391,6 +391,17 @@ pub enum Command {
         db_dir: PathBuf,
         dest: PathBuf,
     },
+    /// Restore a store from a continuous backup in S3-compatible storage
+    /// (`restore --from s3://bucket/prefix`). See [`run_restore_s3`].
+    RestoreS3 {
+        /// `s3://bucket/prefix`, `r2://…` or `minio://…`.
+        from: String,
+        /// `--at`: a commit number or an RFC 3339 timestamp; `None` restores
+        /// the newest restore point.
+        at: Option<String>,
+        /// `--into`; `None` is [`DEFAULT_RESTORE_INTO`].
+        into: Option<PathBuf>,
+    },
     /// Export all nodes, edges, and rules to a destination directory.
     Export {
         db_dir: PathBuf,
@@ -531,6 +542,15 @@ Usage:
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
+  mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                     restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                     which must be new or empty; every object is checked against its manifest first
+                     --at N restores the store as it was right after commit N (as asof --commit counts);
+                     --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                     backup's commit times; an instant past the newest recorded time is refused
+                     when later commits have none
+                     the restored store starts a new backup lineage: back it up to a new prefix
+                     r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
   mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
                                       --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
                                       csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
@@ -911,6 +931,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "keys" => parse_keys(&args[1..]),
         "backup" => parse_backup(&args[1..]),
+        "restore" => parse_restore(&args[1..]),
         "export" => parse_export(&args[1..]),
         "import" => parse_import(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
@@ -2021,6 +2042,34 @@ fn parse_backup(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Backup { db_dir, dest })
 }
 
+/// `restore --from <url> [--at <commit | timestamp>] [--into <dir>]`.
+fn parse_restore(args: &[&str]) -> Result<Command, String> {
+    let (mut from, mut at, mut into) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = flag_value(args, &mut i, "--from")? {
+            from = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--at")? {
+            // Checked here so a typo fails before anything is downloaded.
+            backup::RestoreTarget::parse(v)?;
+            at = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--into")? {
+            into = Some(PathBuf::from(v));
+        } else if args[i].starts_with('-') {
+            return Err(format!("unexpected flag: {}", args[i]));
+        } else {
+            return Err(format!(
+                "unexpected argument: {} (restore takes --from, --at and --into)",
+                args[i]
+            ));
+        }
+    }
+    let from = from
+        .filter(|f| !f.trim().is_empty())
+        .ok_or_else(|| "restore requires --from s3://bucket/prefix".to_string())?;
+    Ok(Command::RestoreS3 { from, at, into })
+}
+
 /// Take the value of `--flag value` or `--flag=value` at `args[*i]`.
 fn flag_value<'a>(args: &[&'a str], i: &mut usize, flag: &str) -> Result<Option<&'a str>, String> {
     let a = args[*i];
@@ -2166,6 +2215,73 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
 pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> {
     let db = GraphDb::open(db_dir)?;
     Ok(db.backup_to(dest)?)
+}
+
+/// Where `restore` writes when `--into` is not given.
+pub const DEFAULT_RESTORE_INTO: &str = "restored";
+
+/// `mushroomdb restore --from s3://…`: download, verify and install a restore
+/// point into `into` (default [`DEFAULT_RESTORE_INTO`]) with
+/// [`backup::restore_from_s3`], and say what was restored.
+pub fn run_restore_s3(
+    from: &str,
+    at: Option<&str>,
+    into: Option<&Path>,
+) -> Result<String, CliError> {
+    let target = at
+        .map(backup::RestoreTarget::parse)
+        .transpose()
+        .map_err(CliError)?;
+    let into = into.map_or_else(|| PathBuf::from(DEFAULT_RESTORE_INTO), Path::to_path_buf);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let out = rt
+        .block_on(backup::restore_from_s3(from, target, &into))
+        .map_err(|e| CliError(format!("restore from {from} failed: {e}")))?;
+    Ok(format_restore_s3(from, target, &out))
+}
+
+/// Format a [`backup::RestoreS3Outcome`] for display.
+pub fn format_restore_s3(
+    from: &str,
+    at: Option<backup::RestoreTarget>,
+    out: &backup::RestoreS3Outcome,
+) -> String {
+    let mut s = String::new();
+    let point = at.map_or_else(|| "the newest restore point".to_string(), |t| t.to_string());
+    writeln!(s, "restored {from} at {point} into {}", out.into.display()).unwrap();
+    writeln!(s, "  manifest: {}", out.manifest).unwrap();
+    writeln!(s, "  commits: {}", out.commits).unwrap();
+    writeln!(s, "  files: {}", out.files.join(", ")).unwrap();
+    writeln!(s, "  segments: {}", out.segments).unwrap();
+    writeln!(s, "  bytes: {}", out.bytes).unwrap();
+    for path in &out.swept {
+        writeln!(
+            s,
+            "  removed a killed restore's leftover: {}",
+            path.display()
+        )
+        .unwrap();
+    }
+    if let Some(note) = &out.install_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    if let Some(note) = &out.tail_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    writeln!(
+        s,
+        "  lineage: {} (new; restored from {})",
+        out.lineage, out.source_lineage
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "back this store up to a new prefix: the one it came from belongs to the source"
+    )
+    .unwrap();
+    s
 }
 
 /// [`mushroomdb::restore::restore_if_empty`], in the CLI's error type.
@@ -4815,6 +4931,72 @@ mod tests {
             }
             other => panic!("backup parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_restore_takes_from_at_and_into() {
+        assert_eq!(
+            parse_args(&["restore", "--from", "s3://b/p"]),
+            Ok(Command::RestoreS3 {
+                from: "s3://b/p".into(),
+                at: None,
+                into: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&[
+                "restore",
+                "--from=minio://b/p",
+                "--at",
+                "75",
+                "--into",
+                "/tmp/r",
+            ]),
+            Ok(Command::RestoreS3 {
+                from: "minio://b/p".into(),
+                at: Some("75".into()),
+                into: Some(PathBuf::from("/tmp/r")),
+            })
+        );
+        match parse_args(&["restore", "--from", "s3://b", "--at=2026-10-01T12:00:00Z"]) {
+            Ok(Command::RestoreS3 { at, .. }) => {
+                assert_eq!(at.as_deref(), Some("2026-10-01T12:00:00Z"))
+            }
+            other => panic!("restore parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_refuses_what_it_cannot_use() {
+        for (args, needle) in [
+            (vec!["restore"], "--from"),
+            (vec!["restore", "--into", "x"], "--from"),
+            (
+                vec!["restore", "--from", "s3://b", "--at", "yesterday"],
+                "RFC 3339",
+            ),
+            (vec!["restore", "--from", "s3://b", "--at"], "missing value"),
+            (
+                vec!["restore", "--from", "s3://b", "extra"],
+                "unexpected argument",
+            ),
+            (
+                vec!["restore", "--from", "s3://b", "--force"],
+                "unexpected flag",
+            ),
+        ] {
+            let e = parse_args(&args).unwrap_err();
+            assert!(e.contains(needle), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn restore_with_a_bad_url_fails_before_touching_anything() {
+        let parent = tmp("restore-bad-url");
+        let into = parent.join("restored");
+        let e = run_restore_s3("gs://b/p", None, Some(&into)).unwrap_err();
+        assert!(e.0.contains("--from"), "{e}");
+        assert!(!into.exists());
     }
 
     #[test]
