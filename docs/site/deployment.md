@@ -183,7 +183,56 @@ kubectl apply -f deploy/k8s/statefulset.yaml
 - **One replica.** mushroomdb is single-writer; the manifest ships no autoscaler.
 - **Volume ownership.** `fsGroup: 65532` gives the non-root image a writable volume. A storage class that ignores `fsGroup` shows as a permission-denied crash loop on `/data`.
 - **Placeholder token.** `serve` refuses the literal `<set-me>` as a token and exits with status 1.
+- **Backup.** `MUSHROOMDB_BACKUP_S3_URL` and `MUSHROOMDB_RESTORE_FROM_S3` are in the ConfigMap, commented out. The `AWS_*` credentials belong in a Secret of your own.
 - **Not yet verified on a live cluster.**
+
+## How CI checks the templates and the backup
+
+The `hosting-templates` workflow (`.github/workflows/hosting-templates.yml`)
+runs on every push and pull request into `main` and `release/**`.
+
+| Job | Runs | What it checks |
+| --- | --- | --- |
+| `s3-backup` | Always | Every S3-gated test against a MinIO started in the job, then `scripts/minio-smoke-test.sh` |
+| `fly-lint` | When `deploy/**`, the `Dockerfile` or the workflow change | `flyctl config validate --strict` on `deploy/fly/fly.toml` |
+| `k8s-lint` | Same | `kubeconform -strict` on `deploy/k8s/statefulset.yaml`, and `docker compose config` on the Compose file |
+| `docker-build` | On pushes that change the image's inputs | `docker build --no-cache`, with `--features tls` as the Dockerfile builds it. On pull requests, the `docker` job in `ci.yml` builds and runs the same Dockerfile |
+
+The S3-gated tests read `MUSHROOMDB_TEST_S3_ENDPOINT`. Without it each one
+prints `skipping the S3 test` and passes, which is why the main workflow,
+which starts no S3 service, never really ran them. `s3-backup` fails if any
+test prints that line. It also fails if a test file that reads the variable
+is outside the targets it runs, or if fewer of the tests pass than it expects.
+
+The smoke script runs the built binary end to end:
+
+1. `serve` with backup on takes 10 writes over HTTP.
+2. `<prefix>/LATEST` appears in the bucket.
+3. `mushroomdb restore --from` returns all 10 nodes.
+4. `serve` stops cleanly on SIGTERM.
+5. A `serve` with `MUSHROOMDB_RESTORE_FROM_S3`, started on an empty directory, serves the same 10 nodes.
+
+To run it locally against any S3-compatible service:
+
+```text
+MUSHROOMDB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 bash scripts/minio-smoke-test.sh
+```
+
+The bucket (`MUSHROOMDB_TEST_S3_BUCKET`, default `mushroomdb-test`) must
+exist. The credentials come from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, and default to MinIO's. Without the endpoint the
+script skips, except when `CI` is set: there, a skip is a failure.
+
+Two of the checks work around tool limits:
+
+- `kubectl apply --dry-run=client` still asks an API server for its schema,
+  so the manifest is checked with kubeconform instead. It needs no cluster and
+  validates against the Kubernetes 1.31 schemas at a pinned commit.
+- `flyctl config validate` will not start without a token. It makes no API
+  call for this command, so the job gives it a dummy one.
+
+Every tool is pinned: flyctl and kubeconform by version and SHA-256, the
+actions by commit, and the MinIO image by digest.
 
 ## One writer per backup bucket (the lease)
 

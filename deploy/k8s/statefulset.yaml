@@ -23,8 +23,13 @@ metadata:
 data:
   # Non-secret settings only.
   MUSHROOMDB_LOG_FORMAT: json
-  # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
-  # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+  # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in a
+  # Secret you create, never here:
+  # MUSHROOMDB_BACKUP_S3_URL: s3://<bucket>/<prefix>
+  # Restore on boot: an empty volume restores the newest backup there before serving.
+  # MUSHROOMDB_RESTORE_FROM_S3: s3://<bucket>/<prefix>
+  # TODO(HO-14/HO-15): the rest of the backup settings go here. Nothing in this
+  # file turns backup on yet.
 ---
 apiVersion: v1
 kind: Service
@@ -122,8 +127,8 @@ spec:
               memory: 512Mi
             limits:
               memory: 1Gi
-          # Slow opens of a large store: no liveness or readiness check runs
-          # until this passes, up to 30 x 10s = 5 minutes.
+          # Slow opens of a large store (and a restore on boot): no liveness or
+          # readiness check runs until this passes, up to 30 x 10s = 5 minutes.
           startupProbe:
             httpGet:
               path: /health

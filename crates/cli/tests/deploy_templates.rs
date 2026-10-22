@@ -62,7 +62,11 @@ fn deploy_templates_hold_no_bolt_port_and_no_secret_values() {
 /// settings are still to come (HO-14/HO-15).
 #[test]
 fn deploy_templates_show_backup_and_restore_on_boot_commented_out() {
-    for name in TEMPLATES.iter().filter(|n| **n != "railway/railway.json") {
+    let commented = TEMPLATES
+        .iter()
+        .filter(|n| **n != "railway/railway.json")
+        .chain(&["k8s/statefulset.yaml"]);
+    for name in commented {
         let text = template(name);
         for variable in ["MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3"] {
             let lines: Vec<&str> = text.lines().filter(|l| l.contains(variable)).collect();

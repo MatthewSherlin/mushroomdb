@@ -1,0 +1,205 @@
+name: hosting-templates
+# Two things the main ci workflow cannot see:
+#
+# - The S3 backup paths. Every S3-gated test (crates/backup/tests/minio.rs,
+#   crates/cli/tests/serve_backup.rs) returns early without
+#   MUSHROOMDB_TEST_S3_ENDPOINT, and nothing else in CI starts an S3 service,
+#   so they passed by skipping. `s3-backup` runs them against MinIO on every
+#   push and PR into main and release/**, and fails on any skip.
+# - The deploy templates, linted when deploy/**, the Dockerfile or this file
+#   change (decided by the `changes` job: GitHub's path filters apply to a
+#   whole workflow, and s3-backup must never be filtered).
+#
+# Third-party actions are pinned by commit SHA, downloaded tools by version
+# and SHA-256, and the MinIO image by digest.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      templates: ${{ steps.diff.outputs.templates }}
+      image: ${{ steps.diff.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$PUSH_BEFORE" ;;
+            *) base="" ;;
+          esac
+          # A new branch, a manual run or an unknown base: check everything.
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "templates=true" >> "$GITHUB_OUTPUT"
+            echo "image=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$base"...HEAD)"
+          printf '%s\n' "$files"
+          any() { grep -qE "$1" <<<"$files" && echo true || echo false; }
+          echo "templates=$(any '^(deploy/|Dockerfile$|\.github/workflows/hosting-templates\.yml$)')" >> "$GITHUB_OUTPUT"
+          echo "image=$(any '^(deploy/|Dockerfile$|crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|ui/|\.github/workflows/hosting-templates\.yml$)')" >> "$GITHUB_OUTPUT"
+
+  # Every S3-gated cargo test against a real MinIO, plus the end-to-end smoke
+  # script. Never path-filtered. MinIO is started with `docker run` rather than
+  # a `services:` container because a service container cannot be given the
+  # `server /data` command this image needs.
+  s3-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Throwaway credentials for a MinIO that lives only inside this job.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      MUSHROOMDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      MUSHROOMDB_TEST_S3_BUCKET: mushroomdb-test
+      MINIO_IMAGE: cgr.dev/chainguard/minio@sha256:d88920d6a50bd0b088223b688be3b76c63e6205dbe494437f67ba1240ea12880
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Toolchain version comes from rust-toolchain.toml — keep the two in sync.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      # A test file that reads MUSHROOMDB_TEST_S3_ENDPOINT outside the targets
+      # run below would skip here unseen. Add its target below, then here.
+      - name: every S3-gated test file is run by this job
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            case "$f" in
+              crates/backup/*|crates/cli/tests/serve_backup.rs) echo "covered: $f" ;;
+              *) echo "::error file=$f::reads MUSHROOMDB_TEST_S3_ENDPOINT but the s3-backup job does not run it"; bad=1 ;;
+            esac
+          done < <(grep -rl --include='*.rs' MUSHROOMDB_TEST_S3_ENDPOINT crates)
+          exit "$bad"
+      - name: start MinIO and create the bucket
+        run: |
+          set -euo pipefail
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            "$MINIO_IMAGE" server /data
+          for _ in $(seq 1 60); do
+            curl -sf "$MUSHROOMDB_TEST_S3_ENDPOINT/minio/health/live" && break
+            sleep 1
+          done
+          curl -sf "$MUSHROOMDB_TEST_S3_ENDPOINT/minio/health/live"
+          printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" |
+            curl -sf -K - --aws-sigv4 "aws:amz:$AWS_REGION:s3" -X PUT \
+              "$MUSHROOMDB_TEST_S3_ENDPOINT/$MUSHROOMDB_TEST_S3_BUCKET"
+      # serve -> 10 writes -> shipped -> restore --from -> 10 nodes, then
+      # restore on boot into an empty directory -> 10 nodes. Built without the
+      # test-hooks feature the cargo tests below turn on.
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb
+      - run: bash scripts/minio-smoke-test.sh
+      # --show-output prints what each passing test wrote, so a skip line
+      # reaches the log; any skip fails the job.
+      - name: S3-gated tests (backup worker, lease, restore, restore on boot, serve)
+        run: |
+          set -euo pipefail
+          cargo test -p mushroomdb-backup -- --show-output 2>&1 | tee "$RUNNER_TEMP/s3-tests.log"
+          cargo test -p mushroomdb-cli --test serve_backup -- --show-output 2>&1 | tee -a "$RUNNER_TEMP/s3-tests.log"
+      - name: no S3 test skipped
+        run: |
+          set -euo pipefail
+          if grep -n 'skipping the S3 test' "$RUNNER_TEMP/s3-tests.log"; then
+            echo "::error::an S3-gated test skipped although MinIO was up"
+            exit 1
+          fi
+          # And they ran at all: minio.rs's eight s3_ tests (at the time of
+          # writing) and serve's restore on boot passed.
+          ran="$(grep -cE '^test s3_[a-z0-9_]+ \.\.\. ok$' "$RUNNER_TEMP/s3-tests.log" || true)"
+          echo "s3_ tests passed: $ran"
+          test "$ran" -ge 8
+          grep -qE '^test restore_on_boot_empty_dir \.\.\. ok$' "$RUNNER_TEMP/s3-tests.log"
+      - if: failure()
+        run: docker logs minio 2>&1 | tail -n 100 || true
+
+  # fly.toml: `flyctl config validate --strict` checks the file locally
+  # (unknown keys and sections included). flyctl refuses to start without some
+  # token but makes no API call for this command, so a dummy one is given.
+  fly-lint:
+    needs: [changes]
+    if: needs.changes.outputs.templates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLYCTL_VERSION: 0.4.121
+      FLYCTL_SHA256: cb17b6baddaf70791c47579cde416ef033caa991d63d8f4c7dc46c74f268d72f
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install flyctl (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          tarball="flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/$tarball"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" flyctl
+      - name: flyctl config validate
+        env:
+          FLY_API_TOKEN: not-a-real-token
+        run: |
+          "$RUNNER_TEMP/flyctl" config validate --strict -c deploy/fly/fly.toml
+
+  # The K8s manifest. `kubectl apply --dry-run=client` still needs an API
+  # server (for its OpenAPI schema and resource discovery), so a pinned
+  # kubeconform validates it offline-of-any-cluster instead, strictly (unknown
+  # fields fail), against the Kubernetes 1.31 schemas at a pinned commit.
+  # The Compose file goes through `docker compose config`.
+  k8s-lint:
+    needs: [changes]
+    if: needs.changes.outputs.templates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KUBECONFORM_VERSION: 0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      K8S_SCHEMA_COMMIT: b2ba4defe30ed5a0104987433896f1fd32807304
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install kubeconform (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          tarball=kubeconform-linux-amd64.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/$tarball"
+          echo "$KUBECONFORM_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" kubeconform
+      - name: kubeconform deploy/k8s
+        run: |
+          "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version 1.31.0 \
+            -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
+            deploy/k8s/statefulset.yaml
+      - name: docker compose config
+        env:
+          MUSHROOMDB_TOKEN: not-a-real-token
+        run: docker compose -f deploy/docker-compose/docker-compose.yml config -q
+
+  # The image, with --features tls as the Dockerfile builds it. On pull
+  # requests ci.yml's `docker` job already builds and runs the same Dockerfile,
+  # so this one runs on pushes, where ci.yml runs only for main.
+  docker-build:
+    needs: [changes]
+    if: github.event_name != 'pull_request' && needs.changes.outputs.image == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build --no-cache -t mushroomdb:hosting-templates .
