@@ -298,8 +298,24 @@ mod tests {
         ]
     }
 
+    /// Held by every test here that reaches one of `From<GraphError>`'s log
+    /// sites. A site's first use registers it and caches whether any
+    /// subscriber wants it; a registration on another thread, with no
+    /// subscriber in scope, can race the logging test's subscriber and cache
+    /// the site as never enabled, so that test would miss its own line. Run
+    /// one at a time, the logging test's subscriber (which re-evaluates every
+    /// registered site as it is installed) always sees each site settled.
+    static LOG_SITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn log_sites() -> std::sync::MutexGuard<'static, ()> {
+        LOG_SITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn every_engine_error_maps_to_its_documented_code_and_class() {
+        let _sites = log_sites();
         for err in every_variant("x") {
             let want = expected(&err);
             let label = format!("{err:?}");
@@ -318,6 +334,7 @@ mod tests {
 
     #[test]
     fn only_conflict_and_unavailable_are_retried_by_drivers() {
+        let _sites = log_sites();
         let retried: Vec<_> = every_variant("x")
             .into_iter()
             .map(|e| (format!("{e:?}"), BoltError::from(e)))
@@ -332,6 +349,7 @@ mod tests {
 
     #[test]
     fn host_detail_never_reaches_the_message() {
+        let _sites = log_sites();
         let secret = "/var/lib/mushroomdb/secret-token-abc/wal.log";
         for err in every_variant(secret) {
             let mapped = BoltError::from(err);
@@ -365,6 +383,7 @@ mod tests {
     /// The detail a client never sees is written to the server's log instead.
     #[test]
     fn withheld_detail_is_logged_where_it_is_dropped() {
+        let _sites = log_sites();
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -401,6 +420,7 @@ mod tests {
 
     #[test]
     fn to_pack_is_a_code_and_message_map() {
+        let _sites = log_sites();
         let err = BoltError::from(GraphError::Busy { holder: None });
         assert_eq!(
             err.to_pack(),
