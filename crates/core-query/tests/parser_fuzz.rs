@@ -57,6 +57,9 @@ const VALID: &[&str] = &[
     "UNWIND [1, null, 3] AS x RETURN x",
     // query without MATCH: RETURN first; `null` as a backtick-quoted key
     "RETURN {`null`: null, `x``y`: [true, false]} AS m, null AS v",
+    // predicates as values (QL-BX): comparison, NOT, XOR, IS NULL, IN, parens
+    "MATCH (n) RETURN n.a > 1 AS a, NOT n.b AS b, [x IN [1, 2] | x = 1 XOR (x IS NULL)] AS c, \
+     coalesce(n.c IN [1, null], false) AS d ORDER BY n.a <> 2",
 ];
 
 /// An identifier as source text: bare when it lexes back to itself, otherwise

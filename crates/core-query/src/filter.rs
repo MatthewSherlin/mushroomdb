@@ -62,6 +62,29 @@ pub fn eval_cmp(op: &CmpOp, lhs: &Value, rhs: &Value) -> bool {
     }
 }
 
+/// A comparison, three-valued: `None` is null. Equality is
+/// [`equality`]; an ordering of a pair that does not order (`1 < 'a'`) is
+/// null. [`eval_cmp`] is this with null read as false.
+pub fn eval_cmp3(op: &CmpOp, lhs: &Value, rhs: &Value) -> Option<bool> {
+    match op {
+        CmpOp::Eq => equality(lhs, rhs),
+        CmpOp::Ne => equality(lhs, rhs).map(|eq| !eq),
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+            if !is_orderable_pair(lhs, rhs) {
+                return None;
+            }
+            let c = crate::value_ops::cmp_values(lhs, rhs);
+            Some(match op {
+                CmpOp::Lt => c == Ordering::Less,
+                CmpOp::Le => c != Ordering::Greater,
+                CmpOp::Gt => c == Ordering::Greater,
+                CmpOp::Ge => c != Ordering::Less,
+                _ => unreachable!(),
+            })
+        }
+    }
+}
+
 /// Missing field or non-comparable pair → false (no 3VL in v1).
 /// `Ne` on a missing field is false, not true — absence is not a differing value.
 pub fn eval_filter(f: &Filter, get: &dyn Fn(&str) -> Option<Value>) -> bool {

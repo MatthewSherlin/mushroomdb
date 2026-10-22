@@ -1242,6 +1242,10 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             collect_operand(list, names, seen);
             collect_operand(body, names, seen);
         }
+        Operand::Pred(expr) => {
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(expr, names, seen, 0);
+        }
         _ => {}
     }
 }
@@ -1256,7 +1260,7 @@ fn collect_expr(
         return Err("expression nesting too deep".into());
     }
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             collect_expr(lhs, names, seen, depth + 1)?;
             collect_expr(rhs, names, seen, depth + 1)
         }
@@ -1276,9 +1280,7 @@ fn collect_expr(
         }
         Expr::In { expr, list } => {
             collect_operand(expr, names, seen);
-            for item in list {
-                collect_operand(item, names, seen);
-            }
+            collect_operand(list, names, seen);
             Ok(())
         }
     }
@@ -1610,6 +1612,7 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             intern_operand(vars, list);
             intern_operand(vars, body);
         }
+        Operand::Pred(expr) => intern_expr(vars, expr),
     }
 }
 
@@ -1639,7 +1642,7 @@ fn agg_arg_label(arg: &AggArg) -> String {
 
 fn intern_expr(vars: &mut VarTable, expr: &Expr) {
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             intern_expr(vars, lhs);
             intern_expr(vars, rhs);
         }
@@ -1652,9 +1655,7 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
         Expr::IsNull(op) | Expr::IsNotNull(op) => intern_operand(vars, op),
         Expr::In { expr, list } => {
             intern_operand(vars, expr);
-            for item in list {
-                intern_operand(vars, item);
-            }
+            intern_operand(vars, list);
         }
     }
 }
@@ -2862,6 +2863,51 @@ pub fn eval_operand(
     resolve_operand(view, &vars, &row, operand, params)
 }
 
+/// Why an expression could not be folded to a constant.
+#[derive(Debug)]
+pub(crate) enum FoldError {
+    /// It names a `$parameter`.
+    Param,
+    /// It reads a variable or a property.
+    Variable,
+    /// Evaluating it failed.
+    Eval(String),
+}
+
+/// Evaluate an expression that reads nothing but itself (no variable, no
+/// property, no `$parameter`): `1 > 0`, `'a' + 'b'`, `[1, 2 * 3]`. A plain
+/// `CREATE` or `MERGE` property map folds its values with this, so the store
+/// sees the evaluated value and a MERGE matches against it.
+pub(crate) fn fold_constant(operand: &Operand) -> Result<Option<Value>, FoldError> {
+    if crate::cypher::plan::check_operand_bound(operand, &BTreeSet::new(), "CREATE").is_err() {
+        return Err(FoldError::Variable);
+    }
+    let ids = core_storage::IdMap::new();
+    let syms = core_storage::Interner::new();
+    let props = core_storage::ColumnStore::new();
+    let topo = core_storage::Topology::new();
+    let edge_props = core_storage::EdgeProps::new();
+    let view = GraphView {
+        ids: &ids,
+        syms: &syms,
+        labels: &[],
+        props: core_storage::v8::seam::ColumnsView::owned(&props),
+        topo: core_storage::v8::seam::TopologyView::owned(&topo),
+        edge_props: core_storage::v8::seam::EdgePropsView::owned(&edge_props),
+        mask: None,
+        prop_index: None,
+        layer: None,
+    };
+    let no_params = BTreeMap::new();
+    eval_operand(&view, operand, &Params(&no_params), &[]).map_err(|e| {
+        if e.starts_with("missing parameter") {
+            FoldError::Param
+        } else {
+            FoldError::Eval(e)
+        }
+    })
+}
+
 /// Intern the variables the list comprehensions and `reduce`s in `operand`
 /// bind, and nothing else.
 fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
@@ -2920,12 +2966,13 @@ fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
             intern_local_vars(vars, list);
             intern_local_vars(vars, body);
         }
+        Operand::Pred(expr) => intern_local_vars_expr(vars, expr),
     }
 }
 
 fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             intern_local_vars_expr(vars, a);
             intern_local_vars_expr(vars, b);
         }
@@ -2937,9 +2984,7 @@ fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
         Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => intern_local_vars(vars, o),
         Expr::In { expr, list } => {
             intern_local_vars(vars, expr);
-            for o in list {
-                intern_local_vars(vars, o);
-            }
+            intern_local_vars(vars, list);
         }
     }
 }
@@ -3017,7 +3062,7 @@ fn resolve_operand(
                     other => Some(Cell::Scalar(other)),
                 };
                 if let Some(f) = filter {
-                    if !eval_expr(view, vars, &scoped, f, params, 0)? {
+                    if !eval_expr(view, vars, &scoped, f, params)? {
                         continue;
                     }
                 }
@@ -3070,7 +3115,7 @@ fn resolve_operand(
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_expr(view, vars, row, cond, params, 0)? {
+                if eval_expr(view, vars, row, cond, params)? {
                     return resolve_operand(view, vars, row, value, params);
                 }
             }
@@ -3078,6 +3123,14 @@ fn resolve_operand(
                 Some(d) => resolve_operand(view, vars, row, d, params),
                 None => Ok(None),
             }
+        }
+        Operand::Pred(expr) => {
+            let value = super::predicate::eval_predicate(
+                expr,
+                &mut |op| resolve_operand(view, vars, row, op, params),
+                &|e| e,
+            )?;
+            Ok(value.map(Value::Bool))
         }
         Operand::BinArith { op, left, right } => {
             use super::ast::ArithOp;
@@ -3732,7 +3785,7 @@ fn exec_filter(
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if eval_expr(view, vars, row, expr, params, 0)? {
+        if eval_expr(view, vars, row, expr, params)? {
             out.push(row.clone());
         }
     }
@@ -4318,7 +4371,7 @@ fn agg_stream(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 agg_stream(ctx, rest, row, acc)?;
             }
         }
@@ -4859,7 +4912,7 @@ fn group_stream(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 group_stream(ctx, rest, row, groups, key_order)?;
             }
         }
@@ -5271,7 +5324,7 @@ fn pull_rows(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 pull_rows(ctx, rest, row, result)?;
             }
         }
@@ -5395,98 +5448,23 @@ fn pull_rows(
     Ok(())
 }
 
+/// A WHERE predicate (or a CASE WHEN condition, or a comprehension filter):
+/// true keeps the row; false and null both drop it. Evaluated three-valued,
+/// exactly as the same predicate is as a value, so `NOT (null)` is null and
+/// drops the row.
 fn eval_expr(
     view: &GraphView,
     vars: &VarTable,
     row: &Row,
     expr: &Expr,
     params: &Params,
-    depth: u32,
 ) -> Result<bool, String> {
-    if depth > 256 {
-        return Err("expression nesting too deep".into());
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        Expr::Not(inner) => Ok(!eval_expr(view, vars, row, inner, params, depth + 1)?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = resolve_operand(view, vars, row, lhs, params)?;
-            let r = resolve_operand(view, vars, row, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-                Some(Value::Binary(b)) => !b.is_empty(),
-                // A temporal value is a present value, never "empty".
-                Some(
-                    Value::Date(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime { .. }
-                    | Value::Duration { .. },
-                ) => true,
-                Some(Value::Null) => false,
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => eval_in(view, vars, row, expr, list, params),
-    }
-}
-
-fn eval_in(
-    view: &GraphView,
-    vars: &VarTable,
-    row: &Row,
-    expr: &Operand,
-    list: &[Operand],
-    params: &Params,
-) -> Result<bool, String> {
-    let Some(needle) = resolve_operand(view, vars, row, expr, params)? else {
-        return Ok(false);
-    };
-    for item_op in list {
-        match resolve_operand(view, vars, row, item_op, params)? {
-            None => {}
-            Some(Value::List(items)) => {
-                for item in items {
-                    if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) {
-                        return Ok(true);
-                    }
-                }
-            }
-            Some(item) if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) => {
-                return Ok(true);
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(false)
+    let value = super::predicate::eval_predicate(
+        expr,
+        &mut |op| resolve_operand(view, vars, row, op, params),
+        &|e| e,
+    )?;
+    Ok(value == Some(true))
 }
 
 /// Deduplicate projected rows. Numeric Int/Float unify matches grouping.
@@ -5764,6 +5742,10 @@ mod ql_vl;
 #[cfg(test)]
 #[path = "tests/ql_ru.rs"]
 mod ql_ru;
+
+#[cfg(test)]
+#[path = "tests/ql_bx.rs"]
+mod ql_bx;
 
 #[cfg(test)]
 mod tests {

@@ -185,7 +185,7 @@ impl<'a> Parser<'a> {
             unwinds.push(clause);
         }
         let post_unwind_where = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -308,7 +308,7 @@ impl<'a> Parser<'a> {
                 return Err(self.err(&format!("duplicate property key `{key}`")));
             }
             self.expect(&Tok::Colon, "expected ':' after property key")?;
-            let value = self.arith_expr()?;
+            let value = self.value_expr()?;
             out.push((key, value));
             if self.eat(&Tok::Comma) {
                 continue;
@@ -510,7 +510,7 @@ impl<'a> Parser<'a> {
             let merge = self.eat(&Tok::Plus);
             self.expect(&Tok::Eq, "expected '=' in SET clause")?;
             self.require_node(scope, &var, "SET")?;
-            let value = self.arith_expr()?;
+            let value = self.value_expr()?;
             if self.peek() == Some(&Tok::Comma) {
                 return Err(
                     "not supported in mushroomdb 0.10: a SET map form followed by another SET item; \

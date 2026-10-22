@@ -18,6 +18,13 @@ use core_storage::{Value, NS_PROP};
 /// Max parenthesized-expression nesting. Deeper input is `Err`, not a stack overflow.
 const MAX_PAREN_DEPTH: usize = 64;
 
+/// Max nesting of expressions of any kind (parentheses, function arguments,
+/// list and map elements, CASE branches), counted together. Deeper input is
+/// `Err`, not a stack overflow. Measured at 63 levels: about 1.1 MiB of stack in
+/// a debug build (16-18 KiB a level) and 0.3 MiB in a release build, so the
+/// limit fits a 2 MiB thread.
+const MAX_EXPR_DEPTH: usize = MAX_PAREN_DEPTH;
+
 /// Parse a tokenized Cypher subset query. Every failure is `Err(String)`; this
 /// function never panics on a well-formed `&[Tok]` (including empty / garbage).
 pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
@@ -25,6 +32,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         toks: tokens,
         pos: 0,
         literal_depth: 0,
+        expr_depth: 0,
     };
     let q = p.query()?;
     if p.pos < p.toks.len() {
@@ -56,6 +64,7 @@ pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
         toks: tokens,
         pos: 0,
         literal_depth: 0,
+        expr_depth: 0,
     };
     let mut parts = vec![p.query()?];
     let mut all_flags = Vec::new();
@@ -81,6 +90,7 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
         toks: tokens,
         pos: 0,
         literal_depth: 0,
+        expr_depth: 0,
     };
     p.write_statement()
 }
@@ -143,6 +153,20 @@ fn is_null_literal(name: &str) -> bool {
     name.eq_ignore_ascii_case("null")
 }
 
+/// A predicate in a value position.
+fn pred(expr: Expr) -> Operand {
+    Operand::Pred(Box::new(expr))
+}
+
+/// The predicate an expression stands for in a WHERE: a predicate is itself;
+/// any other value is read for its truthiness.
+fn into_predicate(op: Operand) -> Expr {
+    match op {
+        Operand::Pred(expr) => *expr,
+        other => Expr::Truthy(other),
+    }
+}
+
 /// Reads a `{key: value, …}` map whose values are of type `V`.
 type PropsParser<'a, V> = fn(&mut Parser<'a>) -> Result<Vec<(String, V)>, String>;
 
@@ -162,6 +186,9 @@ struct Parser<'a> {
     pos: usize,
     /// How many list/map literals enclose the position being parsed.
     literal_depth: usize,
+    /// How many expressions (parentheses, arguments, elements, branches)
+    /// enclose the position being parsed.
+    expr_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -252,7 +279,7 @@ impl<'a> Parser<'a> {
         // is legal.  Parse it here, then parse OPTIONAL MATCHes, then check
         // again in case WHERE follows the OPTIONAL MATCHes instead.
         let where_expr_pre = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -265,7 +292,7 @@ impl<'a> Parser<'a> {
         let where_expr = if where_expr_pre.is_some() {
             where_expr_pre
         } else if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -276,7 +303,7 @@ impl<'a> Parser<'a> {
         }
         // Optional WHERE that follows UNWIND (references UNWIND aliases).
         let post_unwind_where = if !unwinds.is_empty() && self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -375,7 +402,7 @@ impl<'a> Parser<'a> {
         let patterns = vec![self.match_pattern()?];
         // Optional WHERE inside the optional scope.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -395,7 +422,7 @@ impl<'a> Parser<'a> {
         }
         // Optional WHERE / HAVING immediately after WITH items.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -464,7 +491,7 @@ impl<'a> Parser<'a> {
             && (!matches.is_empty() || !optional_clauses.is_empty() || !stage_unwinds.is_empty())
         {
             self.pos += 1; // consume WHERE
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -491,7 +518,7 @@ impl<'a> Parser<'a> {
                 return Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)));
             }
         }
-        match self.arith_expr()? {
+        match self.value_expr()? {
             Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
             Operand::Prop { var, field } => Ok(UnwindExpr::Prop { var, field }),
             Operand::Var(name) => Ok(UnwindExpr::Var(name)),
@@ -781,101 +808,137 @@ impl<'a> Parser<'a> {
         Ok(HopRange { min, max })
     }
 
-    fn expr(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let mut left = self.term(paren_depth)?;
+    // ── Expression grammar (QL-BX) ─────────────────────────────────────────────
+    //
+    // One grammar serves every expression position. From loosest to tightest:
+    //   or_expr   = xor_expr (OR xor_expr)*
+    //   xor_expr  = and_expr (XOR and_expr)*
+    //   and_expr  = not_expr (AND not_expr)*
+    //   not_expr  = NOT* cmp_expr
+    //   cmp_expr  = pred_expr [cmp_op pred_expr]
+    //   pred_expr = arith_expr (IS [NOT] NULL | IN in_list
+    //                          | STARTS WITH arith | ENDS WITH arith | CONTAINS arith)*
+    //   arith_expr … arith_atom, where arith_atom includes `( or_expr )`.
+    //
+    // A predicate is an `Expr`; in a value position it is carried as
+    // `Operand::Pred`. A WHERE takes the same tree back out (`into_predicate`),
+    // so its `Expr` is exactly what the WHERE-only grammar built before.
+
+    /// A WHERE (or CASE WHEN, or comprehension WHERE) predicate.
+    fn where_expr(&mut self) -> Result<Expr, String> {
+        Ok(into_predicate(self.value_expr()?))
+    }
+
+    /// A full expression, in any value position.
+    fn value_expr(&mut self) -> Result<Operand, String> {
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            return Err(self.err("expression nesting too deep"));
+        }
+        self.expr_depth += 1;
+        let out = self.or_expr();
+        self.expr_depth -= 1;
+        out
+    }
+
+    fn or_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.xor_expr()?;
         while self.eat(&Tok::Or) {
-            let right = self.term(paren_depth)?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+            let right = self.xor_expr()?;
+            left = pred(Expr::Or(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
         }
         Ok(left)
     }
 
-    fn term(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let mut left = self.factor(paren_depth)?;
+    /// `XOR` is an ordinary identifier to the lexer; after an operand it can
+    /// only be the operator.
+    fn xor_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.and_expr()?;
+        while self.eat_ident_kw("xor") {
+            let right = self.and_expr()?;
+            left = pred(Expr::Xor(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
+        }
+        Ok(left)
+    }
+
+    fn and_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.not_expr()?;
         while self.eat(&Tok::And) {
-            let right = self.factor(paren_depth)?;
-            left = Expr::And(Box::new(left), Box::new(right));
+            let right = self.not_expr()?;
+            left = pred(Expr::And(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
         }
         Ok(left)
     }
 
-    fn factor(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let negated = self.eat(&Tok::Not);
-        let inner = if self.eat(&Tok::LParen) {
-            if paren_depth >= MAX_PAREN_DEPTH {
+    /// `NOT` binds looser than a comparison: `NOT a = b` is `NOT (a = b)`.
+    fn not_expr(&mut self) -> Result<Operand, String> {
+        let mut nots = 0usize;
+        while self.eat(&Tok::Not) {
+            nots += 1;
+            if nots > MAX_PAREN_DEPTH {
                 return Err(self.err("expression nesting too deep"));
             }
-            let e = self.expr(paren_depth + 1)?;
-            self.expect(
-                &Tok::RParen,
-                "expected ')' to close parenthesized expression",
-            )?;
-            e
-        } else {
-            self.cmp()?
-        };
-        if negated {
-            Ok(Expr::Not(Box::new(inner)))
-        } else {
-            Ok(inner)
         }
+        let mut inner = self.cmp_expr()?;
+        for _ in 0..nots {
+            inner = pred(Expr::Not(Box::new(into_predicate(inner))));
+        }
+        Ok(inner)
     }
 
-    fn cmp(&mut self) -> Result<Expr, String> {
-        let lhs = self.arith_expr()?;
-        // Check for IS NULL / IS NOT NULL postfix.
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s.eq_ignore_ascii_case("is") {
-                self.pos += 1; // consume "IS"
-                               // Optional NOT.
+    fn cmp_expr(&mut self) -> Result<Operand, String> {
+        let lhs = self.pred_expr()?;
+        let Some(op) = self.peek_cmp_op() else {
+            return Ok(lhs);
+        };
+        self.pos += 1;
+        let rhs = self.pred_expr()?;
+        Ok(pred(Expr::Cmp { lhs, op, rhs }))
+    }
+
+    /// The postfix predicates: `IS [NOT] NULL`, `IN`, and the infix string
+    /// predicates, which bind tighter than a comparison.
+    fn pred_expr(&mut self) -> Result<Operand, String> {
+        let mut lhs = self.arith_expr()?;
+        loop {
+            if self.eat_ident_kw("is") {
                 let negated = self.eat(&Tok::Not);
-                // Expect NULL identifier.
-                match self.peek() {
-                    Some(Tok::Ident(n)) if n.eq_ignore_ascii_case("null") => {
-                        self.pos += 1; // consume "NULL"
-                        return Ok(if negated {
-                            Expr::IsNotNull(lhs)
-                        } else {
-                            Expr::IsNull(lhs)
-                        });
-                    }
-                    _ => {
-                        return Err(self.err(if negated {
-                            "expected NULL after IS NOT"
-                        } else {
-                            "expected NULL after IS"
-                        }));
-                    }
+                if !self.eat_ident_kw("null") {
+                    return Err(self.err(if negated {
+                        "expected NULL after IS NOT"
+                    } else {
+                        "expected NULL after IS"
+                    }));
                 }
-            }
-        }
-        // `IN [a, b, $p]` or `IN $list`.
-        if self.eat_ident_kw("in") {
-            let list = self.in_list()?;
-            return Ok(Expr::In { expr: lhs, list });
-        }
-        // Infix string predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`.
-        // These desugar to the scalar functions of the same name that the
-        // executor already implements, so null- and non-string handling is
-        // shared with the `startsWith(a, b)` call spelling. Only the infix
-        // form is what an assistant writes, and it used to be a parse error.
-        if let Some(name) = self.eat_infix_string_op()? {
-            let rhs = self.arith_expr()?;
-            return Ok(Expr::Truthy(Operand::FuncCall {
-                name: name.to_string(),
-                args: vec![lhs, rhs],
-            }));
-        }
-        // If no comparison operator follows, treat the operand as a standalone
-        // boolean predicate (Expr::Truthy).  This enables:
-        //   WHERE textMatches(n.bio, 'query')
-        // without requiring an explicit `= true` or similar.
-        match self.cmp_op() {
-            Ok(op) => {
+                lhs = pred(if negated {
+                    Expr::IsNotNull(lhs)
+                } else {
+                    Expr::IsNull(lhs)
+                });
+            } else if self.eat_ident_kw("in") {
+                // `IN [a, b, $p]` or `IN $list`.
+                let list = self.in_list()?;
+                lhs = pred(Expr::In { expr: lhs, list });
+            } else if let Some(name) = self.eat_infix_string_op()? {
+                // `STARTS WITH`, `ENDS WITH`, `CONTAINS` desugar to the
+                // scalar functions of the same name, so null and non-string
+                // handling is shared with the `startsWith(a, b)` spelling.
                 let rhs = self.arith_expr()?;
-                Ok(Expr::Cmp { lhs, op, rhs })
+                lhs = Operand::FuncCall {
+                    name: name.to_string(),
+                    args: vec![lhs, rhs],
+                };
+            } else {
+                return Ok(lhs);
             }
-            Err(_) => Ok(Expr::Truthy(lhs)),
         }
     }
 
@@ -912,24 +975,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the list operand of `IN`: `[a, b, $p]` or a single operand (`$cities`).
-    fn in_list(&mut self) -> Result<Vec<Operand>, String> {
-        if self.eat(&Tok::LBracket) {
-            let mut items = Vec::new();
-            if !self.eat(&Tok::RBracket) {
-                loop {
-                    items.push(self.arith_expr()?);
-                    if self.eat(&Tok::Comma) {
-                        continue;
-                    }
-                    self.expect(&Tok::RBracket, "expected ']' to close IN list")?;
-                    break;
-                }
-            }
-            Ok(items)
-        } else {
-            Ok(vec![self.arith_expr()?])
-        }
+    /// The right-hand side of `IN`: one additive expression, as in openCypher,
+    /// so `IN [a, b]`, `IN $list` and `IN [1] + [2]` all name one list.
+    fn in_list(&mut self) -> Result<Operand, String> {
+        self.arith_expr()
     }
 
     // ── Arithmetic expression parsing (precedence: ^ > * / % > + -) ──────────────
@@ -940,7 +989,7 @@ impl<'a> Parser<'a> {
     //   arith_mul   = arith_pow ((* | / | %) arith_pow)*
     //   arith_pow   = arith_unary (^ arith_unary)*
     //   arith_unary = - arith_atom | arith_atom
-    //   arith_atom  = literal | param | ident | ident.field | ident(args…) | (arith_add)
+    //   arith_atom  = literal | param | ident | ident.field | ident(args…) | ( value_expr )
 
     /// Parse a full arithmetic expression (additive level).
     fn arith_expr(&mut self) -> Result<Operand, String> {
@@ -1032,10 +1081,14 @@ impl<'a> Parser<'a> {
 
     /// Parse an atomic operand (leaf of the arithmetic expression tree).
     fn arith_atom(&mut self) -> Result<Operand, String> {
-        // Parenthesized arithmetic expression.
+        // A parenthesized expression: arithmetic or a predicate.
         if self.eat(&Tok::LParen) {
-            let inner = self.arith_expr()?;
-            self.expect(&Tok::RParen, "expected ')' to close arithmetic expression")?;
+            // `value_expr` bounds the nesting.
+            let inner = self.value_expr()?;
+            self.expect(
+                &Tok::RParen,
+                "expected ')' to close parenthesized expression",
+            )?;
             return Ok(inner);
         }
         let atom = match self.peek() {
@@ -1072,7 +1125,7 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         if !self.eat(&Tok::RBracket) {
             loop {
-                items.push(self.arith_expr()?);
+                items.push(self.value_expr()?);
                 if self.eat(&Tok::Comma) {
                     if self.peek() == Some(&Tok::RBracket) {
                         return Err(self.err("trailing comma in a list literal is not allowed"));
@@ -1103,14 +1156,14 @@ impl<'a> Parser<'a> {
     fn list_comprehension(&mut self) -> Result<Operand, String> {
         let var = self.ident("expected a comprehension variable")?;
         self.eat_ident_kw("in");
-        let list = self.arith_expr()?;
+        let list = self.value_expr()?;
         let filter = if self.eat(&Tok::Where) {
-            Some(Box::new(self.expr(0)?))
+            Some(Box::new(self.where_expr()?))
         } else {
             None
         };
         let map = if self.eat(&Tok::Pipe) {
-            self.arith_expr()?
+            self.value_expr()?
         } else {
             Operand::Var(var.clone())
         };
@@ -1133,7 +1186,7 @@ impl<'a> Parser<'a> {
         self.enter_literal()?;
         let acc_var = self.ident(SHAPE)?;
         self.expect(&Tok::Eq, SHAPE)?;
-        let init = self.arith_expr()?;
+        let init = self.value_expr()?;
         self.expect(&Tok::Comma, SHAPE)?;
         let iter_var = self.ident(SHAPE)?;
         if !self.eat_ident_kw("in") {
@@ -1142,9 +1195,9 @@ impl<'a> Parser<'a> {
         if acc_var == iter_var {
             return Err(self.err("reduce() accumulator and element variables must differ"));
         }
-        let list = self.arith_expr()?;
+        let list = self.value_expr()?;
         self.expect(&Tok::Pipe, SHAPE)?;
-        let body = self.arith_expr()?;
+        let body = self.value_expr()?;
         self.expect(&Tok::RParen, "expected ')' to close reduce()")?;
         self.literal_depth -= 1;
         Ok(Operand::Reduce {
@@ -1171,7 +1224,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err(&format!("duplicate map key `{key}` in a map literal")));
                 }
                 self.expect(&Tok::Colon, "expected ':' after a map key")?;
-                let value = self.arith_expr()?;
+                let value = self.value_expr()?;
                 entries.push((key, value));
                 if self.eat(&Tok::Comma) {
                     if self.peek() == Some(&Tok::RBrace) {
@@ -1205,7 +1258,7 @@ impl<'a> Parser<'a> {
     /// non-null for the list shapes the graph stores.
     fn subscripts(&mut self, mut base: Operand) -> Result<Operand, String> {
         while self.eat(&Tok::LBracket) {
-            let index = self.arith_expr()?;
+            let index = self.value_expr()?;
             self.expect(&Tok::RBracket, "expected ']' to close a list subscript")?;
             base = Operand::Index {
                 base: Box::new(base),
@@ -1215,18 +1268,17 @@ impl<'a> Parser<'a> {
         Ok(base)
     }
 
-    fn cmp_op(&mut self) -> Result<CmpOp, String> {
-        let op = match self.peek() {
-            Some(Tok::Eq) => CmpOp::Eq,
-            Some(Tok::Ne) => CmpOp::Ne,
-            Some(Tok::Lt) => CmpOp::Lt,
-            Some(Tok::Le) => CmpOp::Le,
-            Some(Tok::Gt) => CmpOp::Gt,
-            Some(Tok::Ge) => CmpOp::Ge,
-            _ => return Err(self.err("expected comparison operator")),
-        };
-        self.pos += 1;
-        Ok(op)
+    /// The comparison operator at the cursor, if one is there.
+    fn peek_cmp_op(&self) -> Option<CmpOp> {
+        Some(match self.peek()? {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Ne => CmpOp::Ne,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            _ => return None,
+        })
     }
 
     /// Parse a single atomic operand (no arithmetic wrapping — use `arith_expr`
@@ -1276,9 +1328,9 @@ impl<'a> Parser<'a> {
                     self.pos += 1; // consume '('
                     let mut args = Vec::new();
                     if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.arith_expr()?);
+                        args.push(self.value_expr()?);
                         while self.eat(&Tok::Comma) {
-                            args.push(self.arith_expr()?);
+                            args.push(self.value_expr()?);
                         }
                     }
                     self.expect(&Tok::RParen, "expected ')' to close function call")?;
@@ -1309,12 +1361,12 @@ impl<'a> Parser<'a> {
         let mut branches = Vec::new();
         while is_kw(self.peek(), "when") {
             self.pos += 1; // consume WHEN
-            let cond = self.expr(0)?;
+            let cond = self.where_expr()?;
             if !is_kw(self.peek(), "then") {
                 return Err(self.err("expected THEN in a CASE branch"));
             }
             self.pos += 1; // consume THEN
-            let value = self.arith_expr()?;
+            let value = self.value_expr()?;
             branches.push((cond, value));
         }
         if branches.is_empty() {
@@ -1322,7 +1374,7 @@ impl<'a> Parser<'a> {
         }
         let default = if is_kw(self.peek(), "else") {
             self.pos += 1; // consume ELSE
-            Some(Box::new(self.arith_expr()?))
+            Some(Box::new(self.value_expr()?))
         } else {
             None
         };
@@ -1333,16 +1385,10 @@ impl<'a> Parser<'a> {
         Ok(Operand::Case { branches, default })
     }
 
-    /// Parse a full arithmetic expression (additive + multiplicative + unary +
-    /// atom).  This is the primary operand entry point for WHERE, RETURN, SET,
-    /// and function arguments.  Use `operand_atom` for contexts that truly
-    /// require a single atom (e.g., MATCH property map values where arithmetic
-    /// would be syntactically ambiguous with the `}` delimiter).
+    /// A MATCH pattern property value: a full expression, like every other
+    /// value position.
     fn operand(&mut self) -> Result<Operand, String> {
-        // In contexts where `operand` is called for MATCH props, the parser
-        // never sees arithmetic operators (`+`/`/`) because they can't appear
-        // inside `{key: val}` maps.  Delegating to `arith_expr` is safe here.
-        self.arith_expr()
+        self.value_expr()
     }
 
     fn return_clause(&mut self) -> Result<(bool, Vec<RetItem>), String> {
@@ -1431,7 +1477,7 @@ impl<'a> Parser<'a> {
         //   f(...)     → RetVal::FuncCall
         //   n.age + 1  → RetVal::ScalarExpr(BinArith)
         //   42         → RetVal::ScalarExpr(Lit)
-        let op = self.arith_expr()?;
+        let op = self.value_expr()?;
         let value = match op {
             Operand::Var(name) => RetVal::Var(name),
             Operand::Prop { var, field } => RetVal::Prop { var, field },
@@ -1457,7 +1503,7 @@ impl<'a> Parser<'a> {
     }
 
     fn order_item(&mut self, aliases: &[&str]) -> Result<OrderItem, String> {
-        let target = match self.arith_expr()? {
+        let target = match self.value_expr()? {
             Operand::Prop { var, field } => OrderTarget::Prop { var, field },
             Operand::Var(name) if aliases.contains(&name.as_str()) => OrderTarget::Alias(name),
             Operand::Var(name) => OrderTarget::Var(name),
@@ -1588,7 +1634,10 @@ impl<'a> Parser<'a> {
         Ok(CreateNode { var, label, props })
     }
 
-    /// Parse `{key: literal, …}` where all values must be literals (no params, no props).
+    /// Parse the `{key: value, …}` of a plain CREATE or MERGE. A value is a
+    /// literal, or any expression that reads no variable, property or
+    /// `$parameter` (`1 > 0`, `'a' + 'b'`), which is evaluated here so the
+    /// write (and a MERGE's match) sees the value.
     fn literal_props(&mut self) -> Result<Vec<(String, Value)>, String> {
         self.expect(&Tok::LBrace, "expected '{'")?;
         let mut out = Vec::new();
@@ -1598,7 +1647,7 @@ impl<'a> Parser<'a> {
         loop {
             let key = self.ident("expected property key")?;
             self.expect(&Tok::Colon, "expected ':' after property key")?;
-            let val = self.literal_value("property value")?;
+            let val = self.property_value(&key)?;
             out.push((key, val));
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1607,6 +1656,43 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RBrace, "expected '}' to close property map")?;
         Ok(out)
+    }
+
+    /// One value of [`literal_props`](Self::literal_props). A plain literal
+    /// keeps its own parse (and its named errors: a `null` value, a `$param`,
+    /// a variable); anything else is a constant expression.
+    fn property_value(&mut self, key: &str) -> Result<Value, String> {
+        const WHAT: &str = "property value";
+        let start = self.pos;
+        let literal = self.literal_value(WHAT);
+        if let Ok(value) = &literal {
+            if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RBrace)) {
+                return Ok(value.clone());
+            }
+        }
+        let literal_err = literal.err();
+        self.pos = start;
+        let operand = match self.value_expr() {
+            // A bare `null` keeps the literal parse's error.
+            Ok(Operand::Lit(Value::Null)) | Err(_) => {
+                self.pos = start;
+                return Err(literal_err.unwrap_or_else(|| self.err("expected a property value")));
+            }
+            Ok(operand) => operand,
+        };
+        match super::exec::fold_constant(&operand) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(self.err(&format!(
+                "property `{key}` evaluated to null (a CREATE or MERGE property value cannot be null)"
+            ))),
+            Err(super::exec::FoldError::Param) => Err(self.err(&format!(
+                "parameter references are not supported in {WHAT} (v1 limitation: use literals only)"
+            ))),
+            Err(super::exec::FoldError::Variable) => Err(self.err(&format!(
+                "expression RHS not supported in {WHAT} (v1 limitation: use literals only)"
+            ))),
+            Err(super::exec::FoldError::Eval(e)) => Err(format!("property `{key}`: {e}")),
+        }
     }
 
     /// Parse a literal value (int, float, string, boolean or list). Parameters and property
@@ -1894,7 +1980,7 @@ impl<'a> Parser<'a> {
         }
         // Optional WHERE.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -2168,8 +2254,8 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-        // Accept Lit, Param, BinArith (arithmetic expression), and FuncCall on
-        // the RHS. Bare Prop/Var (e.g. `SET n.x = m.y`) remain a named error
+        // Accept Lit, Param, BinArith (arithmetic expression), FuncCall and a
+        // predicate (`n.score > 10`) on the RHS. Bare Prop/Var (e.g. `SET n.x = m.y`) remain a named error
         // because that form requires join semantics not supported in v1; use
         // an arithmetic expression like `m.y + 0` if needed.
         let value = match self.peek() {
@@ -2181,11 +2267,14 @@ impl<'a> Parser<'a> {
                 | Tok::Dash
                 | Tok::Ident(_)
                 | Tok::LBracket
-                | Tok::LBrace,
+                | Tok::LBrace
+                | Tok::LParen
+                | Tok::Not,
             ) => {
-                let op = self.arith_expr()?;
+                let op = self.value_expr()?;
                 match &op {
-                    Operand::Lit(_)
+                    Operand::Pred(_)
+                    | Operand::Lit(_)
                     | Operand::Param(_)
                     | Operand::BinArith { .. }
                     | Operand::FuncCall { .. }
@@ -3023,16 +3112,22 @@ LIMIT 10";
                         field: "city".into()
                     }
                 );
-                assert_eq!(list.len(), 2);
-                assert_eq!(list[0], Operand::Lit(Value::Str("Austin".into())));
-                assert_eq!(list[1], Operand::Param("c".into()));
+                // One list-valued right-hand side (QL-BX): a written list
+                // with a non-constant element stays a list literal.
+                assert_eq!(
+                    list,
+                    Operand::ListLit(vec![
+                        Operand::Lit(Value::Str("Austin".into())),
+                        Operand::Param("c".into()),
+                    ])
+                );
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
         let q2 = parse_src("MATCH (n) WHERE n.city IN $cities RETURN n").unwrap();
         match q2.where_expr {
             Some(Expr::In { list, .. }) => {
-                assert_eq!(list, vec![Operand::Param("cities".into())]);
+                assert_eq!(list, Operand::Param("cities".into()));
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
