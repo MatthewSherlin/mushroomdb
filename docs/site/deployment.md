@@ -227,9 +227,10 @@ service:
 
 **One store per prefix.** The first backup of a store gives it a lineage, the
 `backup.lineage` file in the data directory, and every restore point names it.
-Once HO-09/HO-10 land, a restore from the prefix will start a new lineage.
-Until then, restore into a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for the
-restored store somewhere fresh. The worker refuses the prefix in three cases:
+`mushroomdb restore --from` gives the store it restores a new lineage (see
+[Restoring from the backup](#restoring-from-the-backup)), so back a restored
+store up to a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for it somewhere
+fresh. The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -252,14 +253,64 @@ just written or the one `LATEST` names.
 - **On a best-effort service**, two writers overlapping until the next renewal
   can overwrite each other's objects. A restore point can then fail to
   verify. Run best-effort only where a single writer is otherwise assured.
-- **A store restored from an older backup, which has since written more commits
-  than the prefix's newest restore point,** passes the commit check. Its new
-  restore points are its own and verify. The prefix's older history is not
-  removed, though, so give such a store a new prefix.
+- **A copy of a store made by hand** (its directory copied with `cp`, say,
+  rather than restored) keeps the original's lineage. If it is older than the
+  prefix's newest restore point and has since written more commits than that
+  restore point holds, it passes the commit check. Its new restore points are
+  its own and verify, but the prefix's other history is not removed. Restore
+  with `mushroomdb restore`, which gives the copy a new lineage, or give such a
+  copy a new prefix.
 
-This rewound-store case is tracked as row 138 of the
+This is tracked as row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
-a release blocker that closes when every restore gets a new lineage.
+a release blocker. It stays open until restore on boot, which is not built
+yet, gives the store it restores a new lineage too.
+
+## Restoring from the backup
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+```
+
+`--from` is the `MUSHROOMDB_BACKUP_S3_URL` the store was backed up to
+(`s3://`, `r2://` or `minio://`). Credentials and the endpoint come from the
+same `AWS_*` variables backup uses. The store is written to `--into`, by
+default `./restored`, which must not exist yet or be empty: a restore never
+writes over anything.
+
+Without `--at`, the newest restore point is restored: the one `LATEST` names,
+plus the segments of its generation uploaded after it, up to the last
+contiguous one. A restore of the newest backup loses at most the segment
+cadence, not the manifest interval.
+
+`--at` picks a point in time:
+
+- `--at 75` restores the store as it was right after commit 75. Commits are
+  numbered as `asof --commit` numbers them, from 0, and the restored store
+  holds 76.
+- `--at 2026-10-01T12:00:00Z` restores the last commit at or before that
+  instant (RFC 3339), resolved through the backup's `commit_times.bin`, as a
+  date query resolves it. A backup without that file cannot restore by time,
+  and the command says so.
+
+A point in time is restored from the earliest restore point of the backup's
+lineage that holds it, then cut back to that commit. The result is what
+`asof --commit` shows at that commit, as an ordinary store that takes writes.
+A commit is out of reach when it is below the oldest commit the backup holds
+(the error names that commit), past the newest, or before a truncating snapshot
+or archive retention cut the history it needs.
+
+Before anything is written to `--into`, every file and segment is downloaded
+into a staging directory beside it and checked against its manifest: size,
+CRC-32, generation, offsets, frames and lineage. The copy is then opened and
+must hold the commits the manifest says it does. Only then is it moved into
+`--into`. A restore that fails leaves `--into` as it was and removes the
+staging directory.
+
+**A restored store is a new lineage.** It gets a new `backup.lineage`, so its
+backups can never be confused with the ones it came from. Pointed at the
+prefix it was restored from, the backup worker refuses it: it uploads nothing
+and deletes nothing there. Back it up to a new prefix.
 
 ## Loopback-first posture
 

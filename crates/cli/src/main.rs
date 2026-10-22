@@ -425,6 +425,9 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::RestoreS3 { from, at, into }) => {
+            print_or_fail(cli::run_restore_s3(&from, at.as_deref(), into.as_deref()))
+        }
         Ok(Command::Import {
             db_dir,
             nodes,

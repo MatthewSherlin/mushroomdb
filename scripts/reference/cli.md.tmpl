@@ -143,6 +143,12 @@ Migrate an older store format in place
 
 Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
 
+### `restore`
+
+{{usage restore}}
+
+Restore a continuous S3 backup, the newest restore point or a point in time, into a new or empty directory. Every object is verified before anything is written there, and the restored store starts a new backup lineage. See [Restoring from the backup](deployment.md#restoring-from-the-backup)
+
 ### `export`
 
 {{usage export}}

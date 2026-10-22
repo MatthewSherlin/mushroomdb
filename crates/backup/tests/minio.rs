@@ -23,6 +23,22 @@ struct Bucket {
     store: Arc<dyn ObjectStore>,
     config: BackupConfig,
     prefix: String,
+    endpoint: String,
+}
+
+/// The `AWS_*` lookup the tests' S3 clients are built with.
+fn s3_env(endpoint: &str) -> impl Fn(&str) -> Option<String> {
+    let endpoint = endpoint.to_string();
+    move |k: &str| -> Option<String> {
+        match k {
+            "AWS_ENDPOINT_URL" => Some(endpoint.clone()),
+            "AWS_ACCESS_KEY_ID" => Some(std::env::var(k).unwrap_or_else(|_| "minioadmin".into())),
+            "AWS_SECRET_ACCESS_KEY" => {
+                Some(std::env::var(k).unwrap_or_else(|_| "minioadmin".into()))
+            }
+            _ => std::env::var(k).ok(),
+        }
+    }
 }
 
 fn bucket() -> Option<Bucket> {
@@ -52,21 +68,12 @@ fn bucket_with(lease_conditional: bool) -> Option<Bucket> {
         lease_conditional,
         ..BackupConfig::new(format!("minio://{name}/{prefix}"))
     };
-    let env = |k: &str| -> Option<String> {
-        match k {
-            "AWS_ENDPOINT_URL" => Some(endpoint.clone()),
-            "AWS_ACCESS_KEY_ID" => Some(std::env::var(k).unwrap_or_else(|_| "minioadmin".into())),
-            "AWS_SECRET_ACCESS_KEY" => {
-                Some(std::env::var(k).unwrap_or_else(|_| "minioadmin".into()))
-            }
-            _ => std::env::var(k).ok(),
-        }
-    };
-    let store = build_store_with(&config, env).expect("the S3 client builds");
+    let store = build_store_with(&config, s3_env(&endpoint)).expect("the S3 client builds");
     Some(Bucket {
         store,
         config,
         prefix,
+        endpoint,
     })
 }
 
@@ -162,6 +169,94 @@ async fn s3_round_trip_with_a_multipart_snapshot() {
     let r = GraphDb::open(restored.path()).unwrap();
     assert_eq!(r.node_count(), db.read().node_count());
     assert_eq!(r.node_count(), 210);
+}
+
+/// `restore --from` against the service (HO-09): the latest restore point,
+/// with a snapshot larger than one ranged GET, and a point in time in the
+/// first generation. Each restore is a new lineage, which the worker then
+/// refuses to resume into the prefix with.
+#[tokio::test]
+async fn s3_restore_latest_and_a_point_in_time() {
+    use backup::restore::{restore_from_s3_with, RestoreTarget};
+    let Some(b) = bucket() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let blob = "x".repeat(64 * 1024);
+    let ops: Vec<BatchOp> = (0..160)
+        .map(|i| BatchOp::InsertNode {
+            label: "A".into(),
+            key: format!("n{i}"),
+            props: vec![("blob".into(), Value::Str(format!("{i}{blob}")))],
+        })
+        .collect();
+    db.submit_batch(ops).unwrap();
+    for i in 0..5 {
+        db.write()
+            .insert_node("A", &format!("a{i}"), vec![])
+            .unwrap();
+    }
+    let mut w = BackupWorker::new(
+        b.config.clone(),
+        Arc::clone(&b.store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    w.run_once().await.unwrap();
+    db.write()
+        .snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: true,
+        })
+        .unwrap();
+    for i in 0..10 {
+        db.write()
+            .insert_node("B", &format!("m{i}"), vec![])
+            .unwrap();
+    }
+    w.run_once().await.unwrap();
+    w.flush().await;
+
+    let parent = tempfile::tempdir().unwrap();
+    let latest = parent.path().join("latest");
+    let out = restore_from_s3_with(&b.config.s3_url, None, &latest, s3_env(&b.endpoint))
+        .await
+        .unwrap();
+    assert!(out.bytes > 10 << 20, "{}", out.bytes);
+    assert_eq!(out.commits, db.read().wal_total_commits().unwrap());
+    let r = GraphDb::open(&latest).unwrap();
+    assert_eq!((r.node_count(), r.edge_count()), {
+        let l = db.read();
+        (l.node_count(), l.edge_count())
+    });
+    drop(r);
+
+    let at = parent.path().join("at");
+    let out = restore_from_s3_with(
+        &b.config.s3_url,
+        Some(RestoreTarget::CommitSeq(3)),
+        &at,
+        s3_env(&b.endpoint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.commits, 4);
+    let r = GraphDb::open(&at).unwrap();
+    assert!(r.has_node("a2") && !r.has_node("a3") && !r.has_node("m0"));
+    drop(r);
+
+    let restored = SharedDb::open(&at).unwrap();
+    let mut back = BackupWorker::new(
+        b.config.clone(),
+        Arc::clone(&b.store),
+        Arc::new(restored.clone()),
+        at.clone(),
+    )
+    .unwrap();
+    assert!(
+        back.run_once().await.is_err(),
+        "a restored store is a new lineage"
+    );
 }
 
 /// A refused request's body can carry the access key id; the error the worker

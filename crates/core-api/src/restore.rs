@@ -9,7 +9,7 @@
 //! over [`restore_if_empty`] here, with the CLI's error type; the semantics are
 //! unchanged.
 
-use crate::{GraphDb, GraphError, Result};
+use crate::{GraphDb, GraphError, RealFs, Result};
 use std::path::{Path, PathBuf};
 
 /// What [`restore_if_empty`] did.
@@ -243,4 +243,221 @@ fn stage_and_install(db_dir: &Path, staging: &Path, backup: &Path) -> Result<Res
         files,
         bytes,
     })
+}
+
+// ── Point in time ────────────────────────────────────────────────────────────
+
+/// Cut the closed store in `dir` back to the state right after `commit`, so
+/// that an ordinary open of it shows exactly what [`GraphDb::open_at`] at
+/// `commit` shows, and it holds `commit + 1` commits.
+///
+/// `commit` is the 0-based index `open_at` and `asof --commit` take. The cut
+/// reaches exactly the commits `open_at` reaches, by the same rules, and
+/// refuses the rest with the same [`GraphError::CommitOutOfRange`]:
+///
+/// - **A commit in the live WAL** keeps the snapshot when it is the WAL's
+///   base (a snapshot that replaced its WAL), and the WAL is cut after the
+///   commit's frame. A snapshot that kept its WAL is the state at the WAL's
+///   end, not its start; it is removed and the WAL prefix replays from
+///   nothing, which is possible only while the WAL starts at the store's
+///   first commit (no floor, no archives).
+/// - **A commit in an archive** is rebuilt from nothing: the archives' frames
+///   up to it become the WAL and the snapshot and archives are removed. That
+///   needs the archive chain to start at the store's first commit (the
+///   genesis marker, no floor).
+///
+/// The commit-time sidecar loses the entries after `commit`, so the next
+/// commit is stamped. Nothing else is touched: roles, keys and the other
+/// sidecars are what the store held.
+///
+/// The store must be closed and must not be in the middle of a snapshot: a
+/// non-empty `snapshot.intent` is refused. This is the restore path's tool,
+/// run on a staged copy before it is installed.
+///
+/// # Errors
+///
+/// [`GraphError::CommitOutOfRange`] for a commit `open_at` cannot reach;
+/// [`GraphError::Io`] or [`GraphError::Corrupt`] when a file cannot be read
+/// or written. Every check runs before the first write.
+pub fn cut_at_commit(dir: &Path, commit: u64) -> Result<()> {
+    use core_storage::fs::Fs as _;
+
+    let intent = dir.join("snapshot.intent");
+    if std::fs::metadata(&intent).is_ok_and(|m| m.len() > 0) {
+        return Err(failed(format!(
+            "cut {} at commit {commit}: a snapshot was interrupted half way ({} is not empty); \
+             open the store once to settle it first",
+            dir.display(),
+            intent.display()
+        )));
+    }
+    let fs = RealFs::new(dir)?;
+    let floor = fs.read_horizon_floor()?;
+    let genesis = fs.has_genesis_marker();
+    // Archives at or below a raised floor are orphans the next open removes;
+    // they hold no reachable commit.
+    let archive_ns: Vec<u64> = fs
+        .list_archives()?
+        .into_iter()
+        .filter(|&n| floor == 0 || n > floor)
+        .collect();
+    let mut archives = Vec::new();
+    for &n in &archive_ns {
+        let bytes = fs.read_archive(n)?;
+        let ends = frame_ends(&bytes);
+        archives.push((n, bytes, ends));
+    }
+    let archive_frames: u64 = archives.iter().map(|(_, _, e)| e.len() as u64).sum();
+    let wal = match std::fs::read(dir.join("wal.bin")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    let live_ends = frame_ends(&wal);
+    let total = floor + archive_frames + live_ends.len() as u64;
+    let out_of_range = GraphError::CommitOutOfRange {
+        commit,
+        total,
+        floor,
+    };
+    if commit < floor || commit >= total {
+        return Err(out_of_range);
+    }
+    let local = commit - floor;
+
+    if local < archive_frames {
+        if floor > 0 || !genesis {
+            return Err(out_of_range);
+        }
+        let mut prefix = Vec::new();
+        let mut left = local + 1;
+        for (_, bytes, ends) in &archives {
+            let take = left.min(ends.len() as u64) as usize;
+            if take > 0 {
+                prefix.extend_from_slice(&bytes[..ends[take - 1]]);
+            }
+            left -= take as u64;
+            if left == 0 {
+                break;
+            }
+        }
+        rewrite_commit_times(dir, commit)?;
+        write_file(dir, "wal.bin", &prefix)?;
+        remove_if_present(&dir.join("snapshot.bin"))?;
+        for (n, _, _) in &archives {
+            remove_if_present(&dir.join(format!("wal.{n}.archive")))?;
+        }
+        return Ok(());
+    }
+
+    let keep = (local - archive_frames + 1) as usize;
+    let drop_snapshot = match snapshot_replaced_its_wal(dir)? {
+        None | Some(true) => false,
+        Some(false) if floor > 0 || archive_frames > 0 => return Err(out_of_range),
+        Some(false) => true,
+    };
+    rewrite_commit_times(dir, commit)?;
+    write_file(dir, "wal.bin", &wal[..live_ends[keep - 1]])?;
+    if drop_snapshot {
+        remove_if_present(&dir.join("snapshot.bin"))?;
+    }
+    Ok(())
+}
+
+/// The commit an instant resolves to through a store's `commit_times.bin`
+/// (`bytes`), above the store's WAL floor `wal_floor`: the last commit
+/// recorded at or before `unix_ms`. The same resolution a date query makes.
+///
+/// # Errors
+///
+/// [`GraphError::NoRecordedTime`], [`GraphError::TimeBeforeFloor`] and
+/// [`GraphError::CommitOutOfRange`] as a date query returns them;
+/// [`GraphError::Corrupt`] when `bytes` does not decode.
+pub fn commit_at_instant(bytes: &[u8], wal_floor: u64, unix_ms: i64) -> Result<u64> {
+    core_storage::commit_times::decode(bytes)?.resolve_instant(unix_ms, wal_floor)
+}
+
+/// The byte offset at which each whole, valid frame of `bytes` ends, as far
+/// as the engine's own decoder reads.
+fn frame_ends(bytes: &[u8]) -> Vec<usize> {
+    let (records, valid) = core_storage::wal::decode_all(bytes);
+    let mut ends = Vec::with_capacity(records.len());
+    let mut pos = 0usize;
+    while pos < valid {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+        pos += 8 + len;
+        ends.push(pos);
+    }
+    debug_assert_eq!(ends.len(), records.len());
+    ends
+}
+
+/// Whether `snapshot.bin` replaced its WAL (`Some(true)`: it is the state at
+/// the WAL's start), kept it (`Some(false)`: the state at its end), or is
+/// absent (`None`). The flag `open_at` reads to decide the same thing.
+fn snapshot_replaced_its_wal(dir: &Path) -> Result<Option<bool>> {
+    let path = dir.join("snapshot.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) if b.is_empty() => return Ok(None),
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    let container = bytes.len() >= 6
+        && &bytes[0..4] == b"GDB1"
+        && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([bytes[4], bytes[5]]));
+    if container {
+        drop(bytes);
+        let mapped = core_storage::v8::MappedBase::map(&path)?;
+        let meta = core_storage::v8::encode::decode_meta(mapped.meta_bytes()?)?;
+        return Ok(Some(meta.wal_truncated));
+    }
+    Ok(core_storage::snapshot::decode(&bytes)?.map(|s| s.wal_truncated))
+}
+
+/// Drop the commit-time entries after `commit`. A sidecar that does not
+/// decode is left as it is: the open reports it, as it would have.
+fn rewrite_commit_times(dir: &Path, commit: u64) -> Result<()> {
+    use core_storage::commit_times::{decode, ENTRY_LEN, HEADER_LEN};
+    let path = dir.join("commit_times.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    if decode(&bytes).is_err() {
+        return Ok(());
+    }
+    // Entries are `(commit u64, unix_ms i64)`, ascending by commit.
+    let mut out = bytes[..HEADER_LEN].to_vec();
+    for entry in bytes[HEADER_LEN..].chunks_exact(ENTRY_LEN) {
+        let c = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
+        if c <= commit {
+            out.extend_from_slice(entry);
+        }
+    }
+    if out.len() != bytes.len() {
+        write_file(dir, "commit_times.bin", &out)?;
+    }
+    Ok(())
+}
+
+/// Write `dir/name` whole: a temporary file, fsynced, renamed into place.
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{name}.cut-tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GraphError::Io(e)),
+    }
 }

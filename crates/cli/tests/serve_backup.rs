@@ -1,5 +1,6 @@
 //! `mushroomdb serve` starts continuous backup when `MUSHROOMDB_BACKUP_S3_URL`
-//! is set, and refuses to start when it is set wrong.
+//! is set, and refuses to start when it is set wrong; `mushroomdb restore
+//! --from` reads the backup back.
 //!
 //! The upload test needs a real S3-compatible service and runs only when
 //! `MUSHROOMDB_TEST_S3_ENDPOINT` is set (bucket `MUSHROOMDB_TEST_S3_BUCKET`,
@@ -130,4 +131,52 @@ fn serve_ships_its_wal_to_s3() {
     // The store serve created carries the memory schema: its declarations are
     // WAL frames, so the first restore point has segments.
     assert!(!m.segments.is_empty(), "{m:?}");
+
+    // And `restore --from` reads it back into a store that opens.
+    let into = tmp("restored");
+    let restore = |into: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+            .args(["restore", "--from", url.as_str(), "--into"])
+            .arg(into)
+            .env("AWS_ENDPOINT_URL", &endpoint)
+            .env("AWS_ACCESS_KEY_ID", &key)
+            .env("AWS_SECRET_ACCESS_KEY", &secret)
+            .output()
+            .expect("run mushroomdb restore")
+    };
+    let out = restore(&into);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("new prefix"), "{stdout}");
+    let restored = mushroomdb::GraphDb::open(&into).unwrap();
+    assert!(restored.wal_total_commits().unwrap() >= m.commit_seq);
+    drop(restored);
+    // A second restore into the same, now full, directory is refused.
+    let again = restore(&into);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("not empty"));
+}
+
+#[test]
+fn restore_refuses_an_unusable_url_and_names_the_flag() {
+    let into = tmp("restore-bad");
+    for (args, needle) in [
+        (vec!["restore"], "--from"),
+        (vec!["restore", "--from", "gs://b/p"], "--from"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+            .args(&args)
+            .arg("--into")
+            .arg(&into)
+            .output()
+            .expect("run mushroomdb restore");
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    }
+    assert!(!into.exists());
 }
