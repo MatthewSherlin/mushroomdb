@@ -158,6 +158,7 @@ fn main() -> ExitCode {
             token,
             role_tokens,
             snapshot_every,
+            shutdown_timeout,
             restore_from,
             tls_cert,
             tls_key,
@@ -183,10 +184,18 @@ fn main() -> ExitCode {
                 );
             }
             if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                return fail(
-                    "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
-                     (see SECURITY.md)",
-                );
+                // An admin key in keys.json is authentication too. Read and
+                // write keys are not: they leave no way to administer the server.
+                let admin_key = match mushroomdb::AccessKeys::load(db_dir.join("keys.json")) {
+                    Ok(keys) => keys.has_admin(),
+                    Err(e) => return fail(&e.to_string()),
+                };
+                if !admin_key {
+                    return fail(
+                        "non-loopback --addr requires --token, MUSHROOMDB_TOKEN or an admin key \
+                         in keys.json (see SECURITY.md)",
+                    );
+                }
             }
             // Fail before the store is opened: a bad origin list must not be
             // discovered after a long restore or open.
@@ -255,6 +264,7 @@ fn main() -> ExitCode {
                 token,
                 all_role_tokens,
                 snapshot_every,
+                shutdown_timeout,
                 tls_cert,
                 tls_key,
             ))
@@ -412,6 +422,31 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::KeysAdd {
+            db_dir,
+            name,
+            tier,
+            role,
+        }) => match run_keys_add(&db_dir, &name, &tier, role.as_deref()) {
+            Ok(token) => {
+                println!("{token}");
+                eprintln!(
+                    "key {name:?} added to {} (tier {tier}). The token above is shown once \
+                     and is not stored; only its hash is. A running server loads it on SIGHUP \
+                     (kill -HUP <pid>; not available on Windows, where you restart).",
+                    db_dir.join("keys.json").display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::KeysHash) => match run_keys_hash() {
+            Ok(hash) => {
+                println!("{hash}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Ok(Command::Verify { db_dir }) => match run_verify(&db_dir) {
             Ok(msg) => {
                 println!("{msg}");
@@ -433,12 +468,14 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::RestoreS3 { from, at, into }) => {
+            print_or_fail(cli::run_restore_s3(&from, at.as_deref(), into.as_deref()))
+        }
         Ok(Command::Import {
             db_dir,
-            nodes,
-            relationships,
+            inputs,
             opts,
-        }) => match run_import(&db_dir, nodes.as_deref(), relationships.as_deref(), &opts) {
+        }) => match run_import(&db_dir, &inputs, &opts) {
             Ok(report) => {
                 for w in &report.warnings {
                     eprintln!("warning: {w}");
@@ -603,6 +640,43 @@ fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
     }
 }
 
+/// A new random token: 32 bytes from the operating system's random source (any
+/// platform), in hex.
+fn random_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("no random source: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `keys add`: issue a token, store only its hash, return the token to print.
+fn run_keys_add(
+    db_dir: &std::path::Path,
+    name: &str,
+    tier: &str,
+    role: Option<&str>,
+) -> Result<String, String> {
+    let token = random_token()?;
+    let hash = mushroomdb::hash_token(&token).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(db_dir).map_err(|e| format!("{}: {}", db_dir.display(), e.kind()))?;
+    mushroomdb::add_key(&db_dir.join("keys.json"), name, &hash, tier, role)
+        .map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+/// `keys hash`: the hash of a token read from stdin (one trailing newline dropped).
+fn run_keys_hash() -> Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::io::stdin()
+        .take(4096)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("could not read the token: {}", e.kind()))?;
+    // A trailing newline, or a Windows `\r\n`, is not part of the token.
+    let token = text.strip_suffix('\n').unwrap_or(&text);
+    let token = token.strip_suffix('\r').unwrap_or(token);
+    mushroomdb::hash_token(token).map_err(|e| e.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_serve(
     db_dir: PathBuf,
@@ -611,11 +685,12 @@ fn run_serve(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     snapshot_every: Option<Duration>,
+    shutdown_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         // Same guard as `run_mcp`: checked before `open` creates the
         // directory's files, so it tells a brand-new store from one this
         // invocation is merely reopening (or one `--demo-if-empty` /
@@ -625,6 +700,26 @@ fn run_serve(
         // a snapshot carries it (ledger row 36), and changes what an existing
         // store indexes, so an existing store is never touched here.
         let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
+        // `keys.json` beside the store: extra tokens with tiers, re-read on
+        // SIGHUP. An invalid file stops the start, before the store is opened,
+        // rather than serve with the keys the operator meant to add missing.
+        let keys_path = db_dir.join("keys.json");
+        let access_keys = mushroomdb::AccessKeys::load(&keys_path).map_err(|e| e.to_string())?;
+        // A token configured twice, here and as a key, would be ambiguous.
+        if token
+            .iter()
+            .chain(role_tokens.keys())
+            .any(|t| access_keys.resolve(t).is_some())
+        {
+            return Err(format!(
+                "a token given by --token, MUSHROOMDB_TOKEN or a role token is also a key in {}; \
+                 each token may be configured in one place",
+                keys_path.display()
+            ));
+        }
+        // Always, on Unix: SIGHUP re-reads keys.json, picks up one created after
+        // the start, and with none is a logged no-op. It must never end the process.
+        server::watch_sighup(&access_keys);
         // `GET /ready` answers 503 until the store is open and its schema is in.
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
@@ -656,13 +751,14 @@ fn run_serve(
         }
         // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
         // for the life of the server: dropping the sender stops the worker.
-        let backup = start_backup(&db, &db_dir)?;
+        let (backup, plan) = start_backup(&db, &db_dir, shutdown_timeout)?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut snapshot_task = None;
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
-            let backup_tx = backup.as_ref().map(|(tx, _)| tx.clone());
-            tokio::spawn(async move {
+            let backup_tx = backup.as_ref().map(|(tx, _, _)| tx.clone());
+            snapshot_task = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await; // skip immediate fire
@@ -692,7 +788,7 @@ fn run_serve(
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
                 }
-            });
+            }));
         }
         // A quiescent server still finishes a vector-index build it was handed:
         // one slice a second, and the rule's edges appear when it completes.
@@ -767,6 +863,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await;
                 }
@@ -782,6 +879,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        access_keys,
                     );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -802,6 +900,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await
                 }
@@ -814,6 +913,7 @@ fn run_serve(
                         role_tokens,
                         stop_rx,
                         ready_flag,
+                        Some(access_keys),
                     )
                     .await
                 }
@@ -828,6 +928,7 @@ fn run_serve(
                             role_tokens,
                             stop_rx,
                             ready_flag,
+                            Some(access_keys),
                         )
                         .await
                     }
@@ -841,6 +942,7 @@ fn run_serve(
                             role_tokens,
                             stop_rx,
                             ready_flag,
+                            Some(access_keys),
                         )
                         .await
                     }
@@ -862,45 +964,157 @@ fn run_serve(
                 };
             }
         }
-        tokio::select! {
+        let mut backup = backup;
+        let outcome = tokio::select! {
             result = &mut serve => match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(e.to_string()),
             },
             _ = shutdown_signal() => {
-                // Ask the server to stop, then wait for it. In-flight requests
-                // and live subscribers finish; `serve.abort()` cut them off.
-                tracing::info!("shutdown signal received; draining in-flight requests");
-                let _ = stop_tx.send(());
-                match (&mut serve).await {
-                    Ok(Ok(())) => tracing::info!("drained; stopped"),
-                    Ok(Err(e)) => tracing::error!(error = %e, "server exited with an error"),
-                    Err(e) => tracing::error!(error = %e, "server task failed"),
+                let deadline = std::time::Instant::now() + shutdown_timeout;
+                // The periodic snapshot must not run beside the shutdown one.
+                if let Some(task) = &snapshot_task {
+                    task.abort();
                 }
-                // Same rule as the periodic snapshot: it needs the store's
-                // write lock. Shutting down without one is fine — the WAL holds
-                // every commit, and the next open replays it.
-                match cli::snapshot_shared(&db) {
-                    Ok(()) => {}
-                    Err(GraphError::Busy { .. }) => {
-                        eprintln!(
-                            "shutdown snapshot skipped: another process holds the write lock"
+                // Listen for a second signal before the sequence starts, so
+                // none is swallowed by the handler tokio keeps installed.
+                let second = shutdown_signal();
+                let sequence = graceful_stop(&mut serve, stop_tx, &db, backup.take(), plan, deadline);
+                tokio::select! {
+                    result = sequence => result,
+                    _ = second => {
+                        tracing::warn!(
+                            "second shutdown signal: exiting now; the backup lease, if held, \
+                             expires on its own after its TTL"
                         );
+                        Err("shutdown forced by a second signal".to_string())
                     }
-                    Err(e) => return Err(e.to_string()),
                 }
-                Ok(())
             }
+        };
+        // The server ended by itself: the backup still gets its last flush.
+        if let Some((tx, handle, budget)) = backup.take() {
+            stop_backup(tx, handle, budget).await;
         }
-    })
+        outcome
+    });
+    // A snapshot abandoned past the deadline runs on a blocking thread; do not
+    // wait for it (the WAL already holds every commit).
+    rt.shutdown_background();
+    result
 }
 
-/// The backup worker and the sender that drives it, or `None` when
-/// `MUSHROOMDB_BACKUP_S3_URL` is unset.
+/// Test hook, compiled only with the `test-hooks` feature (enabled for this
+/// package's own tests, never in a release build): delay the shutdown
+/// snapshot by this many milliseconds, to exercise the overrun path.
+#[cfg(feature = "test-hooks")]
+const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS";
+
+/// The graceful shutdown, in three bounded phases inside one `deadline`:
+///
+/// 1. **Drain**: stop accepting and let in-flight requests finish, for at most
+///    `plan.drain` (25 s at the default timeout, scaled down for a shorter one). What is still open then is cut off.
+/// 2. **Snapshot**, on a blocking thread, in what remains once the backup's
+///    reserve is set aside. If it overruns it is skipped: the WAL holds every
+///    commit and the next open replays it.
+/// 3. **Backup**: flush, final manifest, lease release, for at most the
+///    backup's own bound (or what the deadline leaves).
+///
+/// Every phase runs even if an earlier one failed or ran out, so the lease is
+/// always released when the bucket is reachable.
+async fn graceful_stop(
+    serve: &mut tokio::task::JoinHandle<io::Result<()>>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    db: &SharedDb,
+    backup: Option<RunningBackup>,
+    plan: cli::ShutdownPlan,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let reserve = backup.as_ref().map_or(Duration::ZERO, |(_, _, b)| *b);
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
+    let _ = stop_tx.send(());
+    let drain = plan.drain.min(left().saturating_sub(reserve));
+    match tokio::time::timeout(drain, &mut *serve).await {
+        Ok(Ok(Ok(()))) => tracing::info!("drained; stopped"),
+        Ok(Ok(Err(e))) => tracing::error!(error = %e, "server exited with an error"),
+        Ok(Err(e)) => tracing::error!(error = %e, "server task failed"),
+        Err(_) => {
+            tracing::warn!(
+                drain_s = drain.as_secs(),
+                "requests still open after the drain period; closing them"
+            );
+            serve.abort();
+        }
+    }
+
+    // Same rule as the periodic snapshot: it needs the store's write lock.
+    // Shutting down without one is fine: the WAL holds every commit.
+    let mut outcome = Ok(());
+    let snapshot_budget = left().saturating_sub(reserve);
+    if snapshot_budget.is_zero() {
+        tracing::warn!("no time left for the shutdown snapshot; skipped (the WAL is durable)");
+    } else {
+        let db_snap = db.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-hooks")]
+            if let Some(ms) = std::env::var(TEST_SNAPSHOT_DELAY_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            cli::snapshot_shared(&db_snap)
+        });
+        match tokio::time::timeout(snapshot_budget, snapshot).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(GraphError::Busy { .. }))) => {
+                eprintln!("shutdown snapshot skipped: another process holds the write lock");
+            }
+            Ok(Ok(Err(e))) => outcome = Err(e.to_string()),
+            Ok(Err(e)) => outcome = Err(format!("shutdown snapshot task failed: {e}")),
+            Err(_) => tracing::warn!(
+                budget_s = snapshot_budget.as_secs(),
+                "the shutdown snapshot overran its budget; skipped (the WAL is durable)"
+            ),
+        }
+    }
+
+    if let Some((tx, handle, budget)) = backup {
+        stop_backup(tx, handle, budget.min(left())).await;
+    }
+    outcome
+}
+
+/// Send the backup worker `Shutdown` and wait for it, no longer than `wait`.
+/// The worker flushes the last WAL segment and any new snapshot, writes a
+/// final manifest, and deletes its lease. A timeout is logged and ignored: the
+/// local store is already safe, and the lease then expires by itself.
+async fn stop_backup(
+    tx: tokio::sync::watch::Sender<backup::BackupTrigger>,
+    handle: backup::BackupHandle,
+    wait: Duration,
+) {
+    tracing::info!("shutdown: flushing the S3 backup");
+    let _ = tx.send(backup::BackupTrigger::Shutdown);
+    match tokio::time::timeout(wait, handle.join).await {
+        Ok(Ok(())) => tracing::info!("shutdown: backup flushed"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "shutdown: the backup worker failed"),
+        Err(_) => tracing::warn!(
+            wait_s = wait.as_secs(),
+            "shutdown: the S3 flush did not finish in time; the local store is safe"
+        ),
+    }
+}
+
+/// The backup worker, the sender that drives it and the longest its shutdown
+/// may take, or `None` when `MUSHROOMDB_BACKUP_S3_URL` is unset.
 type RunningBackup = (
     tokio::sync::watch::Sender<backup::BackupTrigger>,
     backup::BackupHandle,
+    Duration,
 );
 
 /// Start the backup worker when the environment configures one.
@@ -909,11 +1123,22 @@ type RunningBackup = (
 /// typo must not quietly leave a store without the backup its operator asked
 /// for. The worker itself never stops the server — its failures are retried
 /// and counted on the handle.
-fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<RunningBackup>, String> {
-    let Some(config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
-        return Ok(None);
+///
+/// Also divides `shutdown_timeout` between the shutdown phases. The backup's
+/// flush grace and request deadline are shrunk when its share of a short
+/// timeout is smaller than they are, so the lease release still fits.
+fn start_backup(
+    db: &SharedDb,
+    db_dir: &std::path::Path,
+    shutdown_timeout: Duration,
+) -> Result<(Option<RunningBackup>, cli::ShutdownPlan), String> {
+    let Some(mut config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
+        return Ok((None, cli::shutdown_plan(shutdown_timeout, Duration::ZERO)));
     };
+    let plan = cli::shutdown_plan(shutdown_timeout, config.shutdown_budget());
+    config.fit_shutdown_within(plan.backup);
     let store = backup::build_store(&config).map_err(|e| e.to_string())?;
+    let budget = plan.backup;
     let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
     let handle = backup::BackupWorker::spawn(
         config,
@@ -923,7 +1148,7 @@ fn start_backup(db: &SharedDb, db_dir: &std::path::Path) -> Result<Option<Runnin
         rx,
     )
     .map_err(|e| e.to_string())?;
-    Ok(Some((tx, handle)))
+    Ok((Some((tx, handle, budget)), plan))
 }
 
 async fn shutdown_signal() {

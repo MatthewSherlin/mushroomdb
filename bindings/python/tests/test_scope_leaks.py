@@ -417,9 +417,9 @@ _REFUSED_READS = {
     "fulltext_pairs": lambda h: h.fulltext_pairs(),
     "rules": lambda h: h.rules(),
     "suggest_rules": lambda h: h.suggest_rules(),
-    "recall": lambda h: h.recall("alpha"),
-    "schema_report": lambda h: h.schema_report(),
-    "identity_clusters": lambda h: h.identity_clusters(),
+    "recall": lambda h: h.memory.recall("alpha"),
+    "schema_report": lambda h: h.memory.schema_report(),
+    "identity_clusters": lambda h: h.memory.identity_clusters(),
 }
 
 # The ones whose unscoped answer names every node in the fixture — a row per
@@ -658,16 +658,16 @@ _WRITES_BY_KEY = {
     # A *mismatching* label on purpose, as the `upsert_node` row has: the
     # relabel refusal reads the stored label, and on a scoped handle that read
     # must never be reached.
-    ("upsert_entity", "key"): lambda s, k: s.upsert_entity(k, {"t": 1}, label="__probe_label__"),
-    ("remember", "about"): lambda s, k: s.remember("probe", about=[k], ts=1),
-    ("remember", "entity"): lambda s, k: s.remember(
+    ("upsert_entity", "key"): lambda s, k: s.memory.upsert_entity(k, {"t": 1}, label="__probe_label__"),
+    ("remember", "about"): lambda s, k: s.memory.remember("probe", about=[k], ts=1),
+    ("remember", "entity"): lambda s, k: s.memory.remember(
         "probe", ts=1, entities=[{"key": k, "label": "__probe_label__", "props": {"t": 1}}]
     ),
-    ("forget", "key"): lambda s, k: s.forget(key=k),
-    ("forget", "subject"): lambda s, k: s.forget(
+    ("forget", "key"): lambda s, k: s.memory.forget(key=k),
+    ("forget", "subject"): lambda s, k: s.memory.forget(
         fact={"subject": k, "predicate": "LINKS", "object": "vis_b"}
     ),
-    ("forget", "object"): lambda s, k: s.forget(
+    ("forget", "object"): lambda s, k: s.memory.forget(
         fact={"subject": "vis_a", "predicate": "LINKS", "object": k}
     ),
 }

@@ -15,7 +15,7 @@ use crate::json::{
     params_from_json, parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace,
     stamp_namespace_row,
 };
-use crate::{AppState, AuthIdentity};
+use crate::{AppState, AuthIdentity, ReadOnlyKey};
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -24,10 +24,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mushroomdb::{
-    is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
-    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig,
-    PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value, WccConfig,
-    SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
+    BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
+    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value,
+    WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -103,6 +103,32 @@ pub fn router_with_ready_flag(
         default_advertise_addr(),
         false,
         ready,
+        None,
+    )
+}
+
+/// [`router_with_role_tokens`] plus the `keys.json` set (see [`AccessKeys`]).
+///
+/// An `admin` key is full access, a `write` key may mutate but is refused
+/// `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`, and a `read` key
+/// is the role it names. The env token and `role_tokens` keep working beside
+/// them. `keys` is shared, so a reload of it (see [`crate::watch_sighup`])
+/// reaches every router built from it.
+pub fn router_with_access_keys(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    keys: AccessKeys,
+) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        Some(keys),
     )
 }
 
@@ -123,6 +149,7 @@ pub fn router_with_cors(
         false,
         Arc::new(AtomicBool::new(true)),
         cors,
+        None,
     )
 }
 
@@ -269,6 +296,7 @@ pub async fn serve(
         HashMap::new(),
         None,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -293,6 +321,7 @@ pub async fn serve_with_role_tokens(
         role_tokens,
         None,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -322,6 +351,7 @@ pub async fn serve_with_ui(
         HashMap::new(),
         None,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -344,6 +374,7 @@ pub async fn serve_with_ui_and_role_tokens(
         role_tokens,
         None,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -369,6 +400,7 @@ pub async fn serve_with_embedded_ui(
         role_tokens,
         None,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -402,6 +434,7 @@ pub async fn serve_with_shutdown(
         HashMap::new(),
         Some(shutdown),
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -423,6 +456,7 @@ pub async fn serve_with_role_tokens_and_shutdown(
         role_tokens,
         shutdown,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -437,6 +471,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -447,6 +482,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
         role_tokens,
         Some(shutdown),
         ready_flag,
+        keys,
     )
     .await
 }
@@ -470,6 +506,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
         role_tokens,
         shutdown,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -485,6 +522,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -495,6 +533,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
         role_tokens,
         Some(shutdown),
         ready_flag,
+        keys,
     )
     .await
 }
@@ -517,6 +556,7 @@ pub async fn serve_with_embedded_ui_and_shutdown(
         role_tokens,
         shutdown,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -532,6 +572,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -542,6 +583,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
         role_tokens,
         Some(shutdown),
         ready_flag,
+        keys,
     )
     .await
 }
@@ -563,6 +605,7 @@ async fn serve_inner(
     role_tokens: HashMap<String, String>,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -570,7 +613,7 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app_with_ready(db, token, role_tokens, ui, local, false, ready_flag);
+    let app = build_app_with_ready(db, token, role_tokens, ui, local, false, ready_flag, keys);
     match shutdown {
         None => axum::serve(listener, app).await,
         // Stop accepting, then let every request already in flight finish.
@@ -626,6 +669,7 @@ pub async fn serve_tls(
 /// listener is closed regardless; an unbounded grace period would let one
 /// stuck request hold a restart open forever.
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_tls_with_shutdown(
     db: SharedDb,
     addr: SocketAddr,
@@ -646,6 +690,7 @@ pub async fn serve_tls_with_shutdown(
         role_tokens,
         shutdown,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
     .await
 }
@@ -663,6 +708,7 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> std::io::Result<()> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await
@@ -681,6 +727,7 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
         local,
         true,
         ready_flag,
+        keys,
     );
     let handle = axum_server::Handle::new();
     tokio::spawn({
@@ -721,11 +768,13 @@ fn build_app(
         addr,
         tls_active,
         Arc::new(AtomicBool::new(true)),
+        None,
     )
 }
 
 /// Reads `MUSHROOMDB_CORS_ORIGINS`. An invalid value does not fail here: the CLI
 /// validates before opening the store; other callers get CORS off plus an error log.
+#[allow(clippy::too_many_arguments)]
 fn build_app_with_ready(
     db: SharedDb,
     token: Option<String>,
@@ -734,6 +783,7 @@ fn build_app_with_ready(
     addr: SocketAddr,
     tls_active: bool,
     ready: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
 ) -> Router {
     // The CLI validates the variable before it opens the store; an invalid value
     // reaching here (library use) fails closed: no CORS, and an error logged.
@@ -741,7 +791,17 @@ fn build_app_with_ready(
         tracing::error!("{e}; CORS disabled");
         None
     });
-    build_app_with_cors(db, token, role_tokens, ui, addr, tls_active, ready, cors)
+    build_app_with_cors(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        ready,
+        cors,
+        keys,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,6 +814,7 @@ fn build_app_with_cors(
     tls_active: bool,
     ready: Arc<AtomicBool>,
     cors: Option<tower_http::cors::CorsLayer>,
+    keys: Option<AccessKeys>,
 ) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
@@ -777,6 +838,7 @@ fn build_app_with_cors(
         tls_active,
         started_at: std::time::Instant::now(),
         ready,
+        access_keys: keys,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1039,7 +1101,11 @@ const TOKEN_COOKIE: &str = "mushroomdb_token";
 
 async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     // No auth configured at all: every request is Full, no restriction.
-    if state.token.is_none() && state.role_tokens.is_empty() {
+    let keys_enforce = state
+        .access_keys
+        .as_ref()
+        .is_some_and(AccessKeys::enforcing);
+    if state.token.is_none() && state.role_tokens.is_empty() && !keys_enforce {
         req.extensions_mut().insert(AuthIdentity::Full);
         return next.run(req).await;
     }
@@ -1066,7 +1132,11 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
             .clone()
             .filter(|s| !s.is_empty())
             .zip(presented.as_deref())
-            .is_some_and(|(tok, p)| constant_time_eq(p.as_bytes(), tok.as_bytes()));
+            .is_some_and(|(tok, p)| constant_time_eq(p.as_bytes(), tok.as_bytes()))
+            || presented
+                .as_deref()
+                .zip(state.access_keys.as_ref())
+                .is_some_and(|(p, keys)| keys.resolve(p) == Some(KeyTier::Admin));
         req.extensions_mut().insert(if full {
             AuthIdentity::Full
         } else {
@@ -1093,7 +1163,7 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
 
     // Check role-bound tokens.
     if let Some(tok) = presented.as_deref() {
-        if let Some(role_name) = state.role_tokens.get(tok) {
+        if let Some(role_name) = role_for_token(&state.role_tokens, tok) {
             // Early-deny paths whose handlers use WebSocket upgrade: the WS
             // extraction consumes the request before the handler body runs, so
             // the handler-level identity check is unreachable in those cases.
@@ -1109,9 +1179,81 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
         }
     }
 
+    // Check the keys.json set. `resolve` compares every key in constant time.
+    if let Some(tier) = presented
+        .as_deref()
+        .zip(state.access_keys.as_ref())
+        .and_then(|(tok, keys)| keys.resolve(tok))
+    {
+        let path = req.uri().path();
+        let ws_path = path == "/subscribe" || path == "/watch";
+        match tier {
+            KeyTier::Admin => {
+                let set_cookie = presented_bearer_or_query(&req);
+                req.extensions_mut().insert(AuthIdentity::Full);
+                let mut res = next.run(req).await;
+                if let Some(token) = set_cookie.filter(|_| is_html_response(&res)) {
+                    attach_token_cookie(&mut res, &token, state.tls_active);
+                }
+                return res;
+            }
+            KeyTier::Write => {
+                // The WS extractor runs before the handler body, so these
+                // are refused here as well as in the handlers.
+                if ws_path {
+                    return forbidden(WRITE_TIER_REFUSAL);
+                }
+                req.extensions_mut().insert(AuthIdentity::Write);
+                return next.run(req).await;
+            }
+            KeyTier::Read(role_name) => {
+                if ws_path {
+                    return forbidden("role-bound token: this endpoint is not permitted");
+                }
+                // A role may carry a write scope; a read key never writes.
+                if !read_key_may(req.method(), path) {
+                    return forbidden(READ_TIER_REFUSAL);
+                }
+                req.extensions_mut().insert(AuthIdentity::Role(role_name));
+                req.extensions_mut().insert(ReadOnlyKey);
+                return next.run(req).await;
+            }
+        }
+    }
+
     // Nothing matched → 401.
     unauthorized()
 }
+
+/// The role bound to `presented`, comparing it with every role token in
+/// constant time (a hash-map lookup would stop at the first difference).
+fn role_for_token<'a>(
+    role_tokens: &'a HashMap<String, String>,
+    presented: &str,
+) -> Option<&'a String> {
+    let mut found = None;
+    for (token, role) in role_tokens {
+        if constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+            found = Some(role);
+        }
+    }
+    found
+}
+
+/// Whether a read-tier key may make this request at all. An allowlist, so a
+/// route added later is refused to read keys until someone decides otherwise:
+/// reads (`GET`), and the two `POST` routes that carry a read (`/query`, whose
+/// handler refuses a write statement, and `/find_similar`).
+fn read_key_may(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::GET | Method::HEAD => true,
+        Method::POST => path == "/query" || path == "/find_similar",
+        _ => false,
+    }
+}
+
+/// The 403 detail a read-tier key gets on a write.
+pub(crate) const READ_TIER_REFUSAL: &str = "read-tier key: writes are not permitted";
 
 fn request_token(req: &Request) -> Option<String> {
     presented_bearer_or_query(req).or_else(|| presented_cookie(req))
@@ -1236,6 +1378,14 @@ fn unauthorized() -> Response {
         Json(json!({"error": "unauthorized"})),
     )
         .into_response()
+}
+
+/// The 403 detail a write-tier key gets on an operator route.
+pub(crate) const WRITE_TIER_REFUSAL: &str = "write-tier token: route not allowed";
+
+/// 403 for a write-tier key on a route that is for operators.
+pub(crate) fn refuse_write_tier(identity: &AuthIdentity) -> Option<Response> {
+    matches!(identity, AuthIdentity::Write).then(|| forbidden(WRITE_TIER_REFUSAL))
 }
 
 /// 403 response for role-bound token operations that are denied in v1.
@@ -1411,6 +1561,7 @@ fn format_query_result(rs: ResultSet, format: &str) -> Response {
 async fn query(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
+    read_only_key: Option<Extension<ReadOnlyKey>>,
     Query(qs): Query<BTreeMap<String, String>>,
     Json(body): Json<Js>,
 ) -> Response {
@@ -1479,6 +1630,9 @@ async fn query(
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
+        if is_write && read_only_key.is_some() {
+            return forbidden(READ_TIER_REFUSAL);
+        }
         if as_of.is_some() && is_write {
             return err_response("as_of (time-travel) queries are read-only");
         }
@@ -1732,6 +1886,9 @@ async fn stats(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /stats requires a full-access token");
     }
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
+    }
     let snap = {
         let g = state.db.read();
         g.stats()
@@ -1749,6 +1906,9 @@ async fn metrics(
     // Mirror /stats auth: deny role tokens — counters leak graph size.
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /metrics requires a full-access token");
+    }
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
     }
     let snap = state.db.reader();
     let (nodes_live, nodes_tombstoned, edges) = snap.counts();
@@ -2276,7 +2436,7 @@ async fn find_similar(
     let exact = exact || where_pred.is_some();
     let role_name = match identity {
         AuthIdentity::Role(r) => Some(r),
-        AuthIdentity::Full => None,
+        AuthIdentity::Full | AuthIdentity::Write => None,
         // Unreachable on this route — `Anonymous` is only ever inserted for
         // `GET /health` — but treated as the narrowest identity rather than
         // the widest, so a future open endpoint cannot inherit full access by
@@ -3113,6 +3273,9 @@ async fn backup(
 ) -> Response {
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /backup requires a full-access token");
+    }
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
     }
     let root = backup_root();
     let dest = match body.get("dest").and_then(Js::as_str) {

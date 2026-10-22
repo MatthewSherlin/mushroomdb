@@ -215,6 +215,11 @@ fn tx_role_refusal() -> BoltError {
     )
 }
 
+/// The refusal for a `read` key that runs a statement that writes.
+fn read_key_refusal() -> BoltError {
+    BoltError::Forbidden("read-tier key: writes are not permitted".into())
+}
+
 /// What `RUN` needs from the store.
 #[derive(Clone)]
 pub struct QueryService {
@@ -269,14 +274,20 @@ impl QueryService {
         let params = request.params()?;
         let is_write = is_write_query(&request.query).map_err(BoltError::SyntaxError)?;
         self.wait_for_bookmarks(&request.bookmarks)?;
+        if is_write && matches!(identity, Identity::ReadOnlyRole(_)) {
+            return Err(read_key_refusal());
+        }
         let (result, seq) = if is_write {
             let result = match identity {
-                Identity::Full => self.db.write().query_write(&request.query, &params),
+                Identity::Full | Identity::Write => {
+                    self.db.write().query_write(&request.query, &params)
+                }
                 Identity::Role(role) => {
                     self.db
                         .write()
                         .query_write_authz(role, &request.query, &params)
                 }
+                Identity::ReadOnlyRole(_) => unreachable!("refused above"),
             };
             (result, self.db.reader().version)
         } else {
@@ -284,11 +295,11 @@ impl QueryService {
                 // The read the HTTP route makes for a full token (UNION
                 // included). TX-5 moves HTTP and Bolt to the lock-free reader
                 // together; until its parser matches, Bolt follows HTTP.
-                Identity::Full => {
+                Identity::Full | Identity::Write => {
                     let result = self.db.read().query(&request.query, &params);
                     (result, self.db.reader().version)
                 }
-                Identity::Role(role) => {
+                Identity::Role(role) | Identity::ReadOnlyRole(role) => {
                     let snapshot = self.db.reader();
                     let result = snapshot
                         .mask_for_role(role)
@@ -315,7 +326,7 @@ impl QueryService {
         tx: &mut dyn OpenTransaction,
         request: &RunRequest,
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
-        if matches!(identity, Identity::Role(_)) {
+        if matches!(identity, Identity::Role(_) | Identity::ReadOnlyRole(_)) {
             return Err(tx_role_refusal());
         }
         tx.execute(&request.query, &request.params()?)

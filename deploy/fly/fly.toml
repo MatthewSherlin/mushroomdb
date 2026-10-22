@@ -21,6 +21,11 @@
 app = "mushroomdb"
 primary_region = "iad"
 
+# Seconds between SIGTERM and SIGKILL (default 5, maximum 300). serve drains, snapshots, then flushes the
+# backup and deletes its bucket lease; 60 s covers that at the defaults
+# (docs/site/deployment.md, "Stopping cleanly, and the grace period").
+kill_timeout = 60
+
 [build]
   image = "ghcr.io/matthewsherlin/mushroomdb:latest"
 

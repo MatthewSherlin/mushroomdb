@@ -1,8 +1,8 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
+    AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, DdlStatement, EdgeDelete, Expr,
+    HopRange, LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
     MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
     OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
     UnwindExpr, WithStage, WriteStatement,
@@ -95,12 +95,42 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
     p.write_statement()
 }
 
+/// Parse a schema statement (`CREATE INDEX`, `DROP INDEX`, `SHOW INDEXES`,
+/// `CREATE CONSTRAINT`, `DROP CONSTRAINT`, `SHOW CONSTRAINTS`). The statement
+/// must be the whole input. Callers tell DDL apart with [`is_ddl_tokens`]
+/// first, so a malformed DDL statement gets this parser's error rather than a
+/// read or write parser's.
+pub fn parse_ddl(tokens: &[Tok]) -> Result<DdlStatement, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+    };
+    p.ddl_statement()
+}
+
+/// Whether the tokens begin a schema statement: `CREATE INDEX`,
+/// `CREATE CONSTRAINT`, or anything starting with `DROP` or `SHOW` — no read
+/// or write statement can begin with either word, so a malformed one is
+/// reported as malformed DDL.
+pub fn is_ddl_tokens(tokens: &[Tok]) -> bool {
+    match tokens.first() {
+        Some(Tok::Create) => kw(tokens.get(1), "index") || kw(tokens.get(1), "constraint"),
+        first => kw(first, "drop") || kw(first, "show"),
+    }
+}
+
 /// Return true if the token stream starts with a write keyword, or is a MATCH
 /// statement followed by SET or DELETE.  Used for fast server-side dispatch
 /// without a full parse.
+///
+/// Schema statements that change the schema (`CREATE INDEX|CONSTRAINT`,
+/// `DROP …`) are writes; `SHOW …` is a read.
 pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
+        first if kw(first, "drop") => true,
         Some(Tok::Match) => {
             tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)) || has_remove_clause(tokens)
         }
@@ -179,6 +209,7 @@ struct MergeNode<V = Value> {
     ns: Option<V>,
 }
 
+mod ddl;
 mod unwind_write;
 
 struct Parser<'a> {
@@ -1423,9 +1454,18 @@ impl<'a> Parser<'a> {
                 "min" => Some(AggFunc::Min),
                 "max" => Some(AggFunc::Max),
                 "collect" => Some(AggFunc::Collect),
+                "stdev" => Some(AggFunc::StDev),
+                "stdevp" => Some(AggFunc::StDevP),
+                // `p` is filled in after the first argument is parsed.
+                "percentilecont" => Some(AggFunc::PercentileCont {
+                    p: Operand::Lit(Value::Null),
+                }),
+                "percentiledisc" => Some(AggFunc::PercentileDisc {
+                    p: Operand::Lit(Value::Null),
+                }),
                 _ => None,
             };
-            if let Some(func) = func {
+            if let Some(mut func) = func {
                 self.pos += 1; // consume the function name
                 self.expect(&Tok::LParen, "expected '(' after aggregate function name")?;
                 // `count(DISTINCT t)` — DISTINCT is an ordinary identifier to
@@ -1456,6 +1496,14 @@ impl<'a> Parser<'a> {
                 } else {
                     arg
                 };
+                if let AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } = &mut func {
+                    if !self.eat(&Tok::Comma) {
+                        return Err(
+                            self.err("expected ',' and a percentile `p` after the argument")
+                        );
+                    }
+                    *p = self.value_expr()?;
+                }
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
                     Some(self.binding("expected alias identifier after AS")?)

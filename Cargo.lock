@@ -1423,6 +1423,8 @@ name = "mushroomdb"
 version = "0.9.2"
 dependencies = [
  "bincode",
+ "blake3",
+ "libc",
  "matrixmultiply",
  "mushroomdb-query",
  "mushroomdb-rules",
@@ -1475,8 +1477,10 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "csv",
+ "getrandom 0.3.4",
  "mushroomdb",
  "mushroomdb-backup",
+ "mushroomdb-cli",
  "mushroomdb-extract",
  "mushroomdb-server",
  "parquet",

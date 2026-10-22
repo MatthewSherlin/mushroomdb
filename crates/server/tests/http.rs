@@ -7449,3 +7449,638 @@ async fn http_null_map_param_in_set_removes_the_key() {
     .await;
     assert_eq!(v["rows"], json!([[null, 1]]), "= replaces the properties");
 }
+
+// ---------------------------------------------------------------------------
+// HO-04: access keys (`keys.json`) and the write tier.
+// ---------------------------------------------------------------------------
+
+const ADM_KEY: &str = "adm-key-0123456789abcdef0123456789abcdef";
+const WR_KEY: &str = "wr-key-0123456789abcdef0123456789abcdef";
+const RD_KEY: &str = "rd-key-0123456789abcdef0123456789abcdef";
+const LATE_KEY: &str = "late-key-0123456789abcdef0123456789abcdef";
+
+/// A key file's text: one entry per `(token, tier, role)`, holding hashes only.
+fn keys_text(entries: &[(&str, &str, Option<&str>)]) -> String {
+    let keys: Vec<Json> = entries
+        .iter()
+        .enumerate()
+        .map(|(n, (token, tier, role))| {
+            let mut entry = json!({
+                "name": format!("key{n}"),
+                "hash": mushroomdb::hash_token(token).unwrap(),
+                "tier": tier,
+            });
+            if let Some(role) = role {
+                entry["role"] = json!(role);
+            }
+            entry
+        })
+        .collect();
+    json!({ "keys": keys }).to_string()
+}
+
+fn keys_json() -> String {
+    keys_text(&[
+        (ADM_KEY, "admin", None),
+        (WR_KEY, "write", None),
+        (RD_KEY, "read", Some("viewer")),
+    ])
+}
+
+/// Writes `text` to `path` keeping the file private, as the CLI does.
+fn write_private(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// A store with a `viewer` role, a node, and a router that accepts `keys`
+/// beside the env token `env-tok`.
+fn open_keyed(name: &str, keys: &mushroomdb::AccessKeys) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "viewer".into(),
+                labels: vec!["Person".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_person(&db, "seed");
+    let app = server::router_with_access_keys(
+        db.clone(),
+        Some("env-tok".into()),
+        std::collections::HashMap::new(),
+        keys.clone(),
+    );
+    (app, db)
+}
+
+fn keys_in(name: &str, text: &str) -> (mushroomdb::AccessKeys, PathBuf) {
+    let dir = tmp(&format!("keys-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keys.json");
+    write_private(&path, text);
+    (mushroomdb::AccessKeys::load(&path).unwrap(), path)
+}
+
+async fn status_of(app: &Router, req: Request<Body>) -> StatusCode {
+    send(app.clone(), req).await.0
+}
+
+/// A write-tier token mutates through every mutation route.
+#[tokio::test]
+async fn write_tier_can_mutate() {
+    let (keys, _) = keys_in("mutate", &keys_json());
+    let (app, db) = open_keyed("keys-mutate", &keys);
+
+    let node = json!({"label": "Person", "key": "w1", "props": {"id": "w1"}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/nodes", WR_KEY, node)).await,
+        StatusCode::OK
+    );
+    let edge = json!({"type": "KNOWS", "src": "w1", "dst": "seed"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/edges", WR_KEY, edge)).await,
+        StatusCode::OK
+    );
+    let create = json!({"cypher": "CREATE (n:Person {id: 'w2'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", WR_KEY, create)).await,
+        StatusCode::OK
+    );
+    let ingest = json!({"label": "Person", "rows": [{"id": "w3"}], "options": {}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/ingest", WR_KEY, ingest)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/node/w1", WR_KEY)).await,
+        StatusCode::OK,
+        "a write key reads what it wrote"
+    );
+    assert_eq!(
+        status_of(
+            &app,
+            authed_json_req("DELETE", "/node/w1", WR_KEY, json!({}))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (nodes, _, _) = db.reader().counts();
+    assert!(nodes >= 3, "the writes landed: {nodes}");
+}
+
+/// A write-tier token is refused the operator surfaces; an admin key is not.
+#[tokio::test]
+async fn write_tier_denied_metrics() {
+    let (keys, _) = keys_in("denied", &keys_json());
+    let (app, _db) = open_keyed("keys-denied", &keys);
+
+    for path in ["/metrics", "/stats"] {
+        assert_eq!(
+            status_of(&app, authed_get(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert_eq!(
+            status_of(&app, authed_get(path, ADM_KEY)).await,
+            StatusCode::OK,
+            "an admin key reads {path}"
+        );
+    }
+    let dest = tmp("keys-denied-backup");
+    let backup = json!({"dest": dest.to_str().unwrap()});
+    assert_eq!(
+        status_of(
+            &app,
+            authed_json_req("POST", "/backup", WR_KEY, backup.clone())
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!dest.exists(), "the refused backup wrote nothing");
+    for path in ["/watch", "/subscribe"] {
+        assert_eq!(
+            status_of(&app, authed_ws_upgrade(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path} with an upgrade"
+        );
+        assert_eq!(
+            status_of(&app, authed_get(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path} without one"
+        );
+    }
+}
+
+/// A write-tier token is told liveness and nothing about the graph, as every
+/// token short of full access is.
+#[tokio::test]
+async fn write_tier_health_discloses_no_counts() {
+    let (keys, _) = keys_in("health", &keys_json());
+    let (app, _db) = open_keyed("keys-health", &keys);
+    let (_, body, _) = send(app.clone(), authed_get("/health", WR_KEY)).await;
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+    let (_, body, _) = send(app, authed_get("/health", ADM_KEY)).await;
+    assert!(parse_json(&body)["nodes"].is_number());
+}
+
+/// A read key is the role it names: it reads masked and writes nothing.
+#[tokio::test]
+async fn read_tier_key_reads_and_cannot_mutate() {
+    let (keys, _) = keys_in("read", &keys_json());
+    let (app, db) = open_keyed("keys-read", &keys);
+    let q = json!({"cypher": "MATCH (n:Person) RETURN n.id"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, q)).await,
+        StatusCode::OK
+    );
+    let node = json!({"label": "Person", "key": "r1", "props": {}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/nodes", RD_KEY, node)).await,
+        StatusCode::FORBIDDEN
+    );
+    let create = json!({"cypher": "CREATE (n:Person {id: 'r2'})"});
+    assert_ne!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, create)).await,
+        StatusCode::OK
+    );
+    assert_eq!(db.reader().counts().0, 1, "nothing was written");
+    assert_eq!(
+        status_of(&app, authed_get("/metrics", RD_KEY)).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// The env token, role tokens and keys all work together; anything else is 401.
+/// `/stats` tells them apart: full access answers, the narrower tiers get 403.
+#[tokio::test]
+async fn keys_merge_with_the_env_tokens_and_unknown_tokens_are_401() {
+    let (keys, _) = keys_in("merge", &keys_json());
+    let db = SharedDb::open(&tmp("keys-merge")).unwrap();
+    let mut roles = std::collections::HashMap::new();
+    roles.insert("legacy-role-tok".to_string(), "viewer".to_string());
+    let app = server::router_with_access_keys(db, Some("env-tok".into()), roles, keys);
+    for (token, want) in [
+        ("env-tok", StatusCode::OK),
+        (ADM_KEY, StatusCode::OK),
+        (WR_KEY, StatusCode::FORBIDDEN),
+        ("nope", StatusCode::UNAUTHORIZED),
+        ("wr-ke", StatusCode::UNAUTHORIZED),
+        (&WR_KEY[..WR_KEY.len() - 1], StatusCode::UNAUTHORIZED),
+        (&format!("{WR_KEY}-"), StatusCode::UNAUTHORIZED),
+    ] {
+        assert_eq!(
+            status_of(&app, authed_get("/stats", token)).await,
+            want,
+            "{token}"
+        );
+    }
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", "legacy-role-tok")).await,
+        StatusCode::FORBIDDEN,
+        "a role token still resolves, and is still refused /stats"
+    );
+}
+
+/// Keys alone (no env token, no role tokens) still close the server.
+#[tokio::test]
+async fn a_server_with_only_keys_requires_one_and_removing_them_all_keeps_it_closed() {
+    let (keys, path) = keys_in("only", &keys_json());
+    let db = SharedDb::open(&tmp("keys-only")).unwrap();
+    let app =
+        server::router_with_access_keys(db, None, std::collections::HashMap::new(), keys.clone());
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::OK
+    );
+    write_private(&path, r#"{"keys":[]}"#);
+    keys.reload().unwrap();
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked key is refused"
+    );
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED,
+        "emptying the file must not open the server"
+    );
+}
+
+/// With no env token, no role tokens and no key file, the server is open as before.
+#[tokio::test]
+async fn no_keys_file_leaves_the_server_as_open_as_it_was() {
+    let dir = tmp("keys-absent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = mushroomdb::AccessKeys::load(dir.join("keys.json")).unwrap();
+    let db = SharedDb::open(&tmp("keys-absent-db")).unwrap();
+    let app = server::router_with_access_keys(db, None, std::collections::HashMap::new(), keys);
+    assert_eq!(status_of(&app, get("/stats")).await, StatusCode::OK);
+}
+
+/// SIGHUP re-reads `keys.json`: a new key works and a removed one stops,
+/// without a restart. A bad file on SIGHUP changes nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn keys_json_reload_on_sighup() {
+    let (keys, path) = keys_in("sighup", &keys_json());
+    let (app, _db) = open_keyed("keys-sighup", &keys);
+    // Registers the handler before this returns, so the signal below cannot
+    // arrive first and take the process down.
+    server::watch_sighup(&keys);
+
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let hangup = || unsafe {
+        libc::kill(libc::getpid(), libc::SIGHUP);
+    };
+
+    write_private(
+        &path,
+        &keys_text(&[(LATE_KEY, "admin", None), (WR_KEY, "write", None)]),
+    );
+    hangup();
+    // `/health` shows counts only to a full key.
+    let full = |app: Router| async move {
+        for _ in 0..200 {
+            let (_, body, _) = send(app.clone(), authed_get("/health", LATE_KEY)).await;
+            if parse_json(&body)["nodes"].is_number() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    };
+    assert!(full(app.clone()).await, "the new key works after SIGHUP");
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::UNAUTHORIZED,
+        "a key dropped from the file stops working"
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", "env-tok")).await,
+        StatusCode::OK,
+        "the env token is not a file key"
+    );
+
+    // A file that does not parse changes nothing.
+    write_private(&path, "{ not json");
+    hangup();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::OK,
+        "a bad file leaves the old keys in force"
+    );
+}
+
+/// A store whose `viewer` role *can* write (labels Person, edges KNOWS), and a
+/// router with that role bound twice: as a legacy role token and as a `read` key.
+fn open_writable_role(name: &str, keys: &mushroomdb::AccessKeys) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "viewer".into(),
+                labels: vec!["Person".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: Some(WriteScope {
+                    create_labels: vec!["Person".into()],
+                    update_labels: vec!["Person".into()],
+                    delete_labels: vec!["Person".into()],
+                    create_edge_types: vec!["KNOWS".into()],
+                    delete_edge_types: vec!["KNOWS".into()],
+                }),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_person(&db, "seed");
+    seed_person(&db, "other");
+    let mut role_tokens = std::collections::HashMap::new();
+    role_tokens.insert(
+        "legacy-role-token-0123456789abcdef".to_string(),
+        "viewer".to_string(),
+    );
+    let app = server::router_with_access_keys(db.clone(), None, role_tokens, keys.clone());
+    (app, db)
+}
+
+const READ_TIER_REFUSAL: &str = "read-tier key: writes are not permitted";
+
+/// Every `.route("<path>"` the router registers, read from the source, so a
+/// route added later cannot escape the sweep below.
+fn registered_route_paths() -> std::collections::BTreeSet<String> {
+    let source = include_str!("../src/http.rs");
+    let mut paths = std::collections::BTreeSet::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        let trimmed = rest.trim_start();
+        if let Some(quoted) = trimmed.strip_prefix('"') {
+            if let Some(end) = quoted.find('"') {
+                paths.insert(quoted[..end].to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// A `read` key whose role has a write scope still never writes, on any route.
+/// The control first shows the premise: the same role as a plain role token can.
+#[tokio::test]
+async fn read_tier_key_is_refused_on_every_write_route_even_when_its_role_can_write() {
+    let (keys, _) = keys_in("sweep", &keys_json());
+    let (app, db) = open_writable_role("keys-sweep", &keys);
+    let legacy = "legacy-role-token-0123456789abcdef";
+
+    // Control: the role itself may create a Person.
+    let control = json!({"cypher": "CREATE (n:Person {id: 'control'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", legacy, control)).await,
+        StatusCode::OK,
+        "the role must be able to write for this test to mean anything"
+    );
+    let nodes_before = db.reader().counts();
+    let edges_before = db.reader().counts().2;
+
+    // (method, concrete path, body, the exact error the refusal carries)
+    let write_refusal = READ_TIER_REFUSAL;
+    let role_stats = "role-bound token: /stats requires a full-access token";
+    let role_metrics = "role-bound token: /metrics requires a full-access token";
+    let role_ws = "role-bound token: this endpoint is not permitted";
+    let cases: Vec<(&str, &str, Json, &str)> = vec![
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "CREATE (n:Person {id: 'x1'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MATCH (n:Person {id: 'seed'}) SET n.age = 1"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MATCH (n:Person {id: 'seed'}) DETACH DELETE n"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "CREATE (a:Person {id: 'x6'})-[:KNOWS]->(b:Person {id: 'x7'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MERGE (n:Person {id: 'x2'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/ingest",
+            json!({"label": "Person", "rows": [{"id": "x3"}], "options": {}}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/rules",
+            json!({"name": "r", "kind": "x"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/nodes",
+            json!({"label": "Person", "key": "x4", "props": {}}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/nodes/seed/rename",
+            json!({"new_key": "x5"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/edges",
+            json!({"type": "KNOWS", "src": "seed", "dst": "other"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/edges/upsert",
+            json!({"type": "KNOWS", "src": "seed", "dst": "other"}),
+            write_refusal,
+        ),
+        ("DELETE", "/node/seed", json!({}), write_refusal),
+        (
+            "PUT",
+            "/node/seed/prop/age",
+            json!({"value": 1}),
+            write_refusal,
+        ),
+        ("DELETE", "/node/seed/prop/id", json!({}), write_refusal),
+        (
+            "DELETE",
+            "/edges/KNOWS/seed/other",
+            json!({}),
+            write_refusal,
+        ),
+        ("POST", "/algo/pagerank", json!({}), write_refusal),
+        ("POST", "/algo/wcc", json!({}), write_refusal),
+        ("POST", "/algo/degree", json!({}), write_refusal),
+        (
+            "POST",
+            "/backup",
+            json!({"dest": tmp("keys-sweep-backup").to_str().unwrap()}),
+            write_refusal,
+        ),
+        ("GET", "/stats", json!(null), role_stats),
+        ("GET", "/metrics", json!(null), role_metrics),
+    ];
+    for (method, path, body, want) in &cases {
+        let req = if body.is_null() {
+            authed_get(path, RD_KEY)
+        } else {
+            authed_json_req(method, path, RD_KEY, body.clone())
+        };
+        let (status, bytes, _) = send(app.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} {body} -> {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(parse_json(&bytes)["error"], json!(want), "{method} {path}");
+    }
+    for path in ["/watch", "/subscribe"] {
+        for req in [authed_ws_upgrade(path, RD_KEY), authed_get(path, RD_KEY)] {
+            let (status, bytes, _) = send(app.clone(), req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(parse_json(&bytes)["error"], json!(role_ws), "{path}");
+        }
+    }
+
+    // Nothing was written, and the dest of the refused backup does not exist.
+    assert_eq!(db.reader().counts(), nodes_before);
+    assert_eq!(db.reader().counts().2, edges_before);
+    assert!(!tmp("keys-sweep-backup").exists());
+
+    // The read key still reads.
+    let read = json!({"cypher": "MATCH (n:Person) RETURN n.id"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/node/seed", RD_KEY)).await,
+        StatusCode::OK
+    );
+
+    // Guard: every route the router registers is covered by this test.
+    let covered: std::collections::BTreeSet<String> = [
+        "/health",
+        "/ready",
+        "/query",
+        "/stats",
+        "/metrics",
+        "/ingest",
+        "/rules",
+        "/suggest",
+        "/explain",
+        "/find_similar",
+        "/node/{key}",
+        "/node/{key}/edges",
+        "/node/{key}/neighborhood",
+        "/node/{key}/history",
+        "/history/edge",
+        "/history/was_linked",
+        "/node/{key}/prop/{field}",
+        "/nodes",
+        "/nodes/{key}/rename",
+        "/edges",
+        "/edges/upsert",
+        "/edges/{etype}/{src}/{dst}",
+        "/algo/pagerank",
+        "/algo/wcc",
+        "/algo/degree",
+        "/backup",
+        "/watch",
+        "/subscribe",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        registered_route_paths(),
+        covered,
+        "a route was added or removed: decide what a read key may do on it and extend the sweep"
+    );
+}
+
+/// The read-only GETs a read key may make are not caught by the write refusal.
+#[tokio::test]
+async fn read_tier_key_may_use_the_read_routes() {
+    let (keys, _) = keys_in("reads", &keys_json());
+    let (app, _db) = open_writable_role("keys-reads", &keys);
+    for path in [
+        "/health",
+        "/node/seed",
+        "/node/seed/edges",
+        "/node/seed/neighborhood",
+        "/node/seed/history",
+    ] {
+        let status = status_of(&app, authed_get(path, RD_KEY)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+    let similar = json!({"key": "seed", "k": 1});
+    let status = status_of(
+        &app,
+        authed_json_req("POST", "/find_similar", RD_KEY, similar),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "/find_similar is a read");
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The write tier is not narrowed by this: its role-less writes still work.
+#[tokio::test]
+async fn write_tier_keeps_writing_beside_a_read_key() {
+    let (keys, _) = keys_in("beside", &keys_json());
+    let (app, _db) = open_writable_role("keys-beside", &keys);
+    let create = json!({"cypher": "CREATE (n:Person {id: 'w9'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", WR_KEY, create)).await,
+        StatusCode::OK
+    );
+}

@@ -757,6 +757,81 @@ MERGE (n:Person {id: r.id})
 
 ---
 
+## Schema statements (DDL)
+
+Indexes and unique constraints can be declared, dropped and listed in Cypher.
+Each statement is a whole statement on its own: nothing may come before or
+after it (`CREATE INDEX … RETURN 1` is a parse error). Keywords are
+case-insensitive, and a name may be backtick-quoted (`` CREATE INDEX `by year` … ``).
+
+```cypher
+CREATE INDEX idx_age FOR (n:Person) ON (n.age)
+CREATE INDEX FOR (n:Person) ON (n.score)
+CREATE INDEX idx_age IF NOT EXISTS FOR (n:Person) ON (n.age)
+DROP INDEX idx_age
+DROP INDEX idx_age IF EXISTS
+SHOW INDEXES
+
+CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE
+CREATE CONSTRAINT uniq_email IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE
+DROP CONSTRAINT uniq_email
+DROP CONSTRAINT uniq_email IF EXISTS
+SHOW CONSTRAINTS
+```
+
+`CREATE INDEX` creates a **range index** on one property of one label, the
+index `GraphDb::enable_range_index` declares; with no name it is called
+`idx_<Label>_<property>`. `CREATE CONSTRAINT` declares a unique constraint, as
+`GraphDb::create_constraint` does, together with the equality index it is
+checked against. Equality and full-text indexes are declared through the API,
+the schema file or the CLI, not in Cypher.
+
+Creating a name that exists, or dropping one that does not, is an error that
+names it. `IF NOT EXISTS` makes a `CREATE` do nothing when the name exists;
+an unnamed `CREATE INDEX` also does nothing when the label and property
+already have a range index, while a named one over a pair indexed under
+another name is an error naming that index. For `CREATE CONSTRAINT`, an
+existing constraint on the same label and property also counts. `IF EXISTS`
+makes a `DROP` of a missing name do nothing.
+A constraint over data that already breaks it is refused, as
+`create_constraint` refuses it. A statement that changes the schema answers
+with no columns and no rows.
+
+`SHOW INDEXES` lists every index, sorted by name, with the columns `name`,
+`type` (`range`, `equality` or `fulltext`), `label`, `property` and `state`
+(always `online`: an index is built in full by the statement that declares
+it). An equality index is listed as `eq_<Label>_<property>` and a full-text
+index as `ft_<Label>_<property>`; `DROP INDEX` drops either by that name.
+Those two prefixes are reserved: a range index cannot be named `eq_…` or
+`ft_…`, through Cypher or `enable_range_index`. Two pairs can still join to
+one listed name (`(A_b, c)` and `(A, b_c)` are both `eq_A_b_c`); `DROP INDEX`
+then refuses, listing both, and `disable_index(label, field)` or
+`disable_fulltext(label, field)` drops the one meant. The
+equality index a constraint is checked against is listed too, and
+`DROP INDEX` refuses it, naming the constraint, until the constraint is
+dropped. `SHOW CONSTRAINTS` lists `name`, `type` (`unique`), `label` and
+`property`, sorted by name.
+
+The first range index or constraint on a store moves it to the V11 snapshot
+format, which 0.9.x cannot read, whether it is declared in Cypher or through the
+API.
+
+**Where they run.** A statement that changes the schema is a write: it runs
+through `GraphDb::query_write`, HTTP `/query` and the MCP `query` tool with a
+full token, Bolt auto-commit and `mushroomdb query`. It is refused inside a
+transaction (`BEGIN … COMMIT`, `Transaction::execute`), on a read-only
+(`open_at`) handle, in a time-travel (`as_of`) query, in a masked or namespaced
+read, and for a role-bound token (HTTP 403, Bolt `Security.Forbidden`).
+`SHOW INDEXES` and `SHOW CONSTRAINTS` are reads and run wherever a read does.
+For a role-bound token, a masked read (`mask`, `scoped`) or a namespaced read
+they are narrowed: a row is listed only when the caller can see at least one
+node of its label, so a scoped caller learns nothing of the schema outside its
+scope. A full-access read lists everything.
+
+The words these statements use (`INDEX`, `CONSTRAINT`, `DROP`, `SHOW`,
+`UNIQUE`, `REQUIRE`, …) are not reserved: they still name properties, labels
+and variables (`MATCH (show:Index) RETURN show.index`).
+
 ## OPTIONAL MATCH
 
 `OPTIONAL MATCH` applies left-outer-join semantics.  Rows that satisfy the
@@ -919,6 +994,19 @@ cannot read; see [Format stability](https://github.com/MatthewSherlin/mushroomdb
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
 `collect` accept `DISTINCT`.
+
+Four statistical aggregates read a numeric property or alias: `stDev(x)` (sample
+standard deviation) and `stDevP(x)` (population standard deviation), and
+`percentileCont(x, p)` and `percentileDisc(x, p)`. Names are case-insensitive.
+Nulls are skipped; ints and floats mix; any other value is a type error naming the
+function. `stDev` and `stDevP` are `0.0` with fewer than two non-null values
+(including none), and a percentile of no values is null. `p` is a number from 0 to 1, a literal or a
+parameter, the same for every row; anything else is an error, even over no rows.
+`percentileDisc` is the nearest-rank value (the input value, with its own type);
+`percentileCont` interpolates linearly between the two nearest ranks and is always
+a float. A percentile holds every value of its group in memory until the group is
+done; `stDev` and `stDevP` keep constant state. All four work with grouping keys,
+`DISTINCT` and aggregate `WITH`.
 
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (read or write RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
@@ -1123,10 +1211,14 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
+| `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
+| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; see [Schema statements](#schema-statements-ddl) |
+| `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
+| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Named-error
@@ -1163,6 +1255,12 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Integer division by zero | `execute: division by zero` |
 | Writing to a view-maintained property | `property is managed by view "…" and cannot be written directly` |
 | Any write on an `open_at` (as-of) instance | `as-of instances are read-only` |
+| A schema statement with another clause (`CREATE INDEX … RETURN 1`) | `parse: … a schema statement is the whole statement; unexpected tokens` |
+| `CREATE` / `DROP INDEX` or `CONSTRAINT` inside a transaction | `a schema statement (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) cannot run inside a transaction; run it on its own, outside BEGIN … COMMIT` |
+| `CREATE` / `DROP INDEX` or `CONSTRAINT` by a role-bound token | `role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) are not permitted` |
+| A range index named `eq_…` or `ft_…` | `index names beginning 'eq_' or 'ft_' are reserved: SHOW INDEXES lists equality and full-text indexes under them; …` |
+| `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
+| A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
 
 ### Absent
 
@@ -1176,7 +1274,7 @@ unexpected-token parse error or other unspecified result.
 | Regular-expression match `=~` |
 | `EXISTS { … }` subquery predicate |
 | `CALL` procedure invocations |
-| Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
+| Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
 
 ---
 

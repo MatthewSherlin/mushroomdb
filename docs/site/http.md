@@ -13,8 +13,8 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
-listener is accepting. Non-loopback `--addr` requires `--token` or
-`MUSHROOMDB_TOKEN` (see `SECURITY.md`).
+listener is accepting. Non-loopback `--addr` requires `--token`,
+`MUSHROOMDB_TOKEN` or an `admin` key in `keys.json` (see `SECURITY.md`).
 
 ## Authentication
 
@@ -102,6 +102,79 @@ any role carries a write scope, v3 when any role carries a `visible_where`
 predicate, v4 when any role is bound to one or more namespaces). A version this
 binary does not recognise poisons the roles state rather than loading it —
 denying beats over-granting.
+
+## Access keys and the write tier
+
+`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token can write wherever its role's write
+scope reaches. To hand an application a token that can write but cannot read operator data, or a
+token that can only read, issue access keys. They live in `keys.json` in the store directory, beside
+`roles.json`, and the file holds **hashes, never tokens**.
+
+```text
+mushroomdb keys add <db-dir> app --tier write
+mushroomdb keys add <db-dir> tenant --tier read --role tenant_a
+```
+
+Each command generates a random 32-byte token, prints it once on standard output, and appends only
+its blake3 hash to `keys.json`, creating the file with mode 0600. The token cannot be shown again.
+A running server loads it on SIGHUP (`kill -HUP <pid>`), including the first key added to a server that started without a `keys.json`; once that key is loaded the server requires a key. Windows has no SIGHUP: restart the server there.
+
+```json
+{
+  "keys": [
+    { "name": "ops",    "hash": "<64 hex characters>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex characters>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex characters>", "tier": "read", "role": "tenant_a" }
+  ]
+}
+```
+
+To bring a token you already have, hash it: `printf %s "$TOKEN" | mushroomdb keys hash` prints the
+`hash` to put in the file. A token must be at least 32 bytes; a shorter one is refused by `keys hash`
+and never matches. A file with a plaintext `"token"` field is refused, and the message says how to
+convert it.
+
+| Tier | What it is |
+|---|---|
+| `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
+
+Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
+`MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` rather than replacing them. Each token belongs in
+one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
+token is also a key. A server with no env token and no role tokens but at least one key requires
+a key. An `admin` key also satisfies the rule that a non-loopback `--addr` needs a token; a
+`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes.
+
+The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
+malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the
+whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must be owned by the user running the server and closed to group and others: a file
+with any group or world bit set is refused with a message naming the path and its mode (`chmod 600`
+fixes it), and a file owned by another account is refused naming both uids. The check is made on the
+opened file, so the file checked is the file read. **Windows performs no such check**: there the
+file is as private as its directory's access list makes it, so lock that down yourself. Error messages
+never contain a token.
+
+**Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
+The new set replaces the old one in a single step, so a request sees one set or the other, never a
+mix. If the new file does not parse or is not private, the old keys stay in force and the error is
+logged. Removing every key locks the server rather than opening it: once a key has been loaded,
+authentication stays required. A server started with no `keys.json` handles SIGHUP too: with no file it is a logged no-op, and a file created later is picked up. On a platform without SIGHUP (Windows), restart to reload.
+
+**What a reload does not reach.** HTTP resolves the key on every request, so a revoked key is
+refused on its next request. A WebSocket (`/watch`, `/subscribe`) opened with an admin key, and a
+Bolt connection, keep the access they were granted until they close: a Bolt connection
+authenticates once, at `HELLO`, and a stream does not look again. Close them yourself, or restart,
+when you revoke an admin key.
+
+**Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
+tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
+`read` key reads under its role and is refused every statement that writes (and every statement in an
+explicit transaction) with `Neo.ClientError.Security.Forbidden`.
+
+`keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
+keys back, so reissue or copy the file deliberately.
 
 ## Write scopes for role-bound tokens
 
@@ -1204,7 +1277,7 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
-the WebSocket URL when the client cannot set headers. A role-bound token gets 403.
+the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
 
 ### `GET /subscribe`
 

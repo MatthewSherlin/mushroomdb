@@ -4683,7 +4683,7 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 
 A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `COMMIT` and an auto-commit `PULL` return one; a transaction that wrote nothing returns the commit its snapshot read. Pass it in a later `BEGIN` or `RUN` to read at least that commit.
 
-A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those.
+A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those. A `write` or `admin` key from `keys.json` can; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
 
@@ -5461,6 +5461,81 @@ MERGE (n:Person {id: r.id})
 
 ---
 
+## Schema statements (DDL)
+
+Indexes and unique constraints can be declared, dropped and listed in Cypher.
+Each statement is a whole statement on its own: nothing may come before or
+after it (`CREATE INDEX … RETURN 1` is a parse error). Keywords are
+case-insensitive, and a name may be backtick-quoted (`` CREATE INDEX `by year` … ``).
+
+```cypher
+CREATE INDEX idx_age FOR (n:Person) ON (n.age)
+CREATE INDEX FOR (n:Person) ON (n.score)
+CREATE INDEX idx_age IF NOT EXISTS FOR (n:Person) ON (n.age)
+DROP INDEX idx_age
+DROP INDEX idx_age IF EXISTS
+SHOW INDEXES
+
+CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE
+CREATE CONSTRAINT uniq_email IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE
+DROP CONSTRAINT uniq_email
+DROP CONSTRAINT uniq_email IF EXISTS
+SHOW CONSTRAINTS
+```
+
+`CREATE INDEX` creates a **range index** on one property of one label, the
+index `GraphDb::enable_range_index` declares; with no name it is called
+`idx_<Label>_<property>`. `CREATE CONSTRAINT` declares a unique constraint, as
+`GraphDb::create_constraint` does, together with the equality index it is
+checked against. Equality and full-text indexes are declared through the API,
+the schema file or the CLI, not in Cypher.
+
+Creating a name that exists, or dropping one that does not, is an error that
+names it. `IF NOT EXISTS` makes a `CREATE` do nothing when the name exists;
+an unnamed `CREATE INDEX` also does nothing when the label and property
+already have a range index, while a named one over a pair indexed under
+another name is an error naming that index. For `CREATE CONSTRAINT`, an
+existing constraint on the same label and property also counts. `IF EXISTS`
+makes a `DROP` of a missing name do nothing.
+A constraint over data that already breaks it is refused, as
+`create_constraint` refuses it. A statement that changes the schema answers
+with no columns and no rows.
+
+`SHOW INDEXES` lists every index, sorted by name, with the columns `name`,
+`type` (`range`, `equality` or `fulltext`), `label`, `property` and `state`
+(always `online`: an index is built in full by the statement that declares
+it). An equality index is listed as `eq_<Label>_<property>` and a full-text
+index as `ft_<Label>_<property>`; `DROP INDEX` drops either by that name.
+Those two prefixes are reserved: a range index cannot be named `eq_…` or
+`ft_…`, through Cypher or `enable_range_index`. Two pairs can still join to
+one listed name (`(A_b, c)` and `(A, b_c)` are both `eq_A_b_c`); `DROP INDEX`
+then refuses, listing both, and `disable_index(label, field)` or
+`disable_fulltext(label, field)` drops the one meant. The
+equality index a constraint is checked against is listed too, and
+`DROP INDEX` refuses it, naming the constraint, until the constraint is
+dropped. `SHOW CONSTRAINTS` lists `name`, `type` (`unique`), `label` and
+`property`, sorted by name.
+
+The first range index or constraint on a store moves it to the V11 snapshot
+format, which 0.9.x cannot read, whether it is declared in Cypher or through the
+API.
+
+**Where they run.** A statement that changes the schema is a write: it runs
+through `GraphDb::query_write`, HTTP `/query` and the MCP `query` tool with a
+full token, Bolt auto-commit and `mushroomdb query`. It is refused inside a
+transaction (`BEGIN … COMMIT`, `Transaction::execute`), on a read-only
+(`open_at`) handle, in a time-travel (`as_of`) query, in a masked or namespaced
+read, and for a role-bound token (HTTP 403, Bolt `Security.Forbidden`).
+`SHOW INDEXES` and `SHOW CONSTRAINTS` are reads and run wherever a read does.
+For a role-bound token, a masked read (`mask`, `scoped`) or a namespaced read
+they are narrowed: a row is listed only when the caller can see at least one
+node of its label, so a scoped caller learns nothing of the schema outside its
+scope. A full-access read lists everything.
+
+The words these statements use (`INDEX`, `CONSTRAINT`, `DROP`, `SHOW`,
+`UNIQUE`, `REQUIRE`, …) are not reserved: they still name properties, labels
+and variables (`MATCH (show:Index) RETURN show.index`).
+
 ## OPTIONAL MATCH
 
 `OPTIONAL MATCH` applies left-outer-join semantics.  Rows that satisfy the
@@ -5623,6 +5698,19 @@ cannot read; see [Format stability](https://github.com/MatthewSherlin/mushroomdb
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
 `collect` accept `DISTINCT`.
+
+Four statistical aggregates read a numeric property or alias: `stDev(x)` (sample
+standard deviation) and `stDevP(x)` (population standard deviation), and
+`percentileCont(x, p)` and `percentileDisc(x, p)`. Names are case-insensitive.
+Nulls are skipped; ints and floats mix; any other value is a type error naming the
+function. `stDev` and `stDevP` are `0.0` with fewer than two non-null values
+(including none), and a percentile of no values is null. `p` is a number from 0 to 1, a literal or a
+parameter, the same for every row; anything else is an error, even over no rows.
+`percentileDisc` is the nearest-rank value (the input value, with its own type);
+`percentileCont` interpolates linearly between the two nearest ranks and is always
+a float. A percentile holds every value of its group in memory until the group is
+done; `stDev` and `stDevP` keep constant state. All four work with grouping keys,
+`DISTINCT` and aggregate `WITH`.
 
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (read or write RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
@@ -5827,10 +5915,14 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
+| `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
+| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_`; see [Schema statements](#schema-statements-ddl) |
+| `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
+| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Named-error
@@ -5867,6 +5959,12 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Integer division by zero | `execute: division by zero` |
 | Writing to a view-maintained property | `property is managed by view "…" and cannot be written directly` |
 | Any write on an `open_at` (as-of) instance | `as-of instances are read-only` |
+| A schema statement with another clause (`CREATE INDEX … RETURN 1`) | `parse: … a schema statement is the whole statement; unexpected tokens` |
+| `CREATE` / `DROP INDEX` or `CONSTRAINT` inside a transaction | `a schema statement (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) cannot run inside a transaction; run it on its own, outside BEGIN … COMMIT` |
+| `CREATE` / `DROP INDEX` or `CONSTRAINT` by a role-bound token | `role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) are not permitted` |
+| A range index named `eq_…` or `ft_…` | `index names beginning 'eq_' or 'ft_' are reserved: SHOW INDEXES lists equality and full-text indexes under them; …` |
+| `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
+| A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
 
 ### Absent
 
@@ -5880,7 +5978,7 @@ unexpected-token parse error or other unspecified result.
 | Regular-expression match `=~` |
 | `EXISTS { … }` subquery predicate |
 | `CALL` procedure invocations |
-| Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
+| Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
 
 ---
 
@@ -5946,8 +6044,8 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
-listener is accepting. Non-loopback `--addr` requires `--token` or
-`MUSHROOMDB_TOKEN` (see `SECURITY.md`).
+listener is accepting. Non-loopback `--addr` requires `--token`,
+`MUSHROOMDB_TOKEN` or an `admin` key in `keys.json` (see `SECURITY.md`).
 
 ## Authentication
 
@@ -6035,6 +6133,79 @@ any role carries a write scope, v3 when any role carries a `visible_where`
 predicate, v4 when any role is bound to one or more namespaces). A version this
 binary does not recognise poisons the roles state rather than loading it —
 denying beats over-granting.
+
+## Access keys and the write tier
+
+`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token can write wherever its role's write
+scope reaches. To hand an application a token that can write but cannot read operator data, or a
+token that can only read, issue access keys. They live in `keys.json` in the store directory, beside
+`roles.json`, and the file holds **hashes, never tokens**.
+
+```text
+mushroomdb keys add <db-dir> app --tier write
+mushroomdb keys add <db-dir> tenant --tier read --role tenant_a
+```
+
+Each command generates a random 32-byte token, prints it once on standard output, and appends only
+its blake3 hash to `keys.json`, creating the file with mode 0600. The token cannot be shown again.
+A running server loads it on SIGHUP (`kill -HUP <pid>`), including the first key added to a server that started without a `keys.json`; once that key is loaded the server requires a key. Windows has no SIGHUP: restart the server there.
+
+```json
+{
+  "keys": [
+    { "name": "ops",    "hash": "<64 hex characters>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex characters>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex characters>", "tier": "read", "role": "tenant_a" }
+  ]
+}
+```
+
+To bring a token you already have, hash it: `printf %s "$TOKEN" | mushroomdb keys hash` prints the
+`hash` to put in the file. A token must be at least 32 bytes; a shorter one is refused by `keys hash`
+and never matches. A file with a plaintext `"token"` field is refused, and the message says how to
+convert it.
+
+| Tier | What it is |
+|---|---|
+| `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
+
+Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
+`MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` rather than replacing them. Each token belongs in
+one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
+token is also a key. A server with no env token and no role tokens but at least one key requires
+a key. An `admin` key also satisfies the rule that a non-loopback `--addr` needs a token; a
+`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes.
+
+The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
+malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the
+whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must be owned by the user running the server and closed to group and others: a file
+with any group or world bit set is refused with a message naming the path and its mode (`chmod 600`
+fixes it), and a file owned by another account is refused naming both uids. The check is made on the
+opened file, so the file checked is the file read. **Windows performs no such check**: there the
+file is as private as its directory's access list makes it, so lock that down yourself. Error messages
+never contain a token.
+
+**Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
+The new set replaces the old one in a single step, so a request sees one set or the other, never a
+mix. If the new file does not parse or is not private, the old keys stay in force and the error is
+logged. Removing every key locks the server rather than opening it: once a key has been loaded,
+authentication stays required. A server started with no `keys.json` handles SIGHUP too: with no file it is a logged no-op, and a file created later is picked up. On a platform without SIGHUP (Windows), restart to reload.
+
+**What a reload does not reach.** HTTP resolves the key on every request, so a revoked key is
+refused on its next request. A WebSocket (`/watch`, `/subscribe`) opened with an admin key, and a
+Bolt connection, keep the access they were granted until they close: a Bolt connection
+authenticates once, at `HELLO`, and a stream does not look again. Close them yourself, or restart,
+when you revoke an admin key.
+
+**Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
+tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
+`read` key reads under its role and is refused every statement that writes (and every statement in an
+explicit transaction) with `Neo.ClientError.Security.Forbidden`.
+
+`keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
+keys back, so reissue or copy the file deliberately.
 
 ## Write scopes for role-bound tokens
 
@@ -7137,7 +7308,7 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
-the WebSocket URL when the client cannot set headers. A role-bound token gets 403.
+the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
 
 ### `GET /subscribe`
 
@@ -7788,13 +7959,13 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 ### `serve`
 
 ```text
-mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
 
 ### `mcp`
 
@@ -7934,6 +8105,19 @@ mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
 
 Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole
 
+### `keys`
+
+```text
+mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                   issues an access key: prints a new random token once and stores only its
+                   blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                   needs --role, and reads that role's view without ever writing
+mushroomdb keys hash
+                   reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
+```
+
+`keys add` works on every platform (the token comes from the operating system's random source). It writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. The mode and owner check on `keys.json` applies on Unix only; Windows has none. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+
 ### `verify`
 
 ```text
@@ -7960,23 +8144,46 @@ mushroomdb backup <db-dir> <dest>   process-local consistent copy of the databas
 
 Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
 
+### `restore`
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                   restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                   which must be new or empty; every object is checked against its manifest first
+                   --at N restores the store as it was right after commit N (as asof --commit counts);
+                   --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                   backup's commit times; an instant past the newest recorded time is refused
+                   when later commits have none
+                   the restored store starts a new backup lineage: back it up to a new prefix
+                   r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+```
+
+Restore a continuous S3 backup, the newest restore point or a point in time, into a new or empty directory. Every object is verified before anything is written there, and the restored store starts a new backup lineage. See [Restoring from the backup](deployment.md#restoring-from-the-backup)
+
 ### `export`
 
 ```text
-mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                    --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                    csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                    cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
                                     graphml writes one file: <dest>/graph.graphml if <dest> is an
                                     existing directory, otherwise <dest> is the file path itself
                                     (nodes + edges only; rules have no GraphML analogue)
 ```
 
-Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools
+Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools. `--format jsonl --single-file` writes one `graph.jsonl` of typed `node`, `edge` and `rule` lines. JSONL, CSV and Cypher stream, so memory does not grow with the properties of the store. CSV (`nodes.csv`, `relationships.csv`) and JSONL load back with `import` and give the same store, rules included; Cypher (`graph.cypher`, one `MERGE` per line) is read by this engine's own `query`, and says in its output what it could not write, such as a NaN or infinite float, or a property whose name or map key holds a line break (one line cannot carry it; the JSONL export does). The formats are described in [Durability](durability.md#export-cli)
 
 ### `import`
 
 ```text
 mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                  [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                   [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
-                                 bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                 `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                 `-` reads one of them from standard input
                                  nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
                                  other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
                                  one label per node: Person;Employee is refused; relationship properties are not supported
@@ -7984,7 +8191,7 @@ mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--deli
                                  an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
 ```
 
-Bulk-load a nodes CSV and a relationships CSV. A node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
+Bulk-load CSV or JSONL files. `--jsonl` reads the single file `export --format jsonl --single-file` writes (an edge must come after its nodes, or it is an error at its line). `--nodes-jsonl`, `--edges-jsonl` and `--rules-jsonl` read the files `export --format jsonl` writes (and `--rules-jsonl` the one the CSV export writes), from a path or `-` for standard input, line by line in the same batches; a node line is `{"key": …, "label": …, <properties>}`, its key is not also stored as a property, derived edges are left to their rules, and the rules are created last so each backfills once. A CSV key column named `:KEY` is a key that is not also stored as the property `id`; `date`, `localdatetime`, `datetime`, `duration` and `binary` column types and `json` carry the newer types and nested values (a store that stores one of the newer types moves to the V11 format, which 0.9.x does not open). A CSV node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
 
 ## Hook bodies
 
@@ -8031,7 +8238,7 @@ Print the usage this page is generated from, and exit.
 The notes `--help` prints under its usage:
 
 ```text
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
@@ -9386,7 +9593,9 @@ Refused on a `scoped()` handle with `ValueError`.
 
 ## Memory
 
-### `remember`
+The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's store and scope. Each access returns a new accessor; one you keep holds the store open, as a `scoped()` handle does, and the store is released when the handle and every accessor are dropped.
+
+### `memory.remember`
 
 ```python
 def remember(
@@ -9443,14 +9652,14 @@ declares full-text on `Note.text` and on each new entity label's
 `name` itself, so `recall` works after the first call.
 
 ```python
-r = db.remember("Matthew is driving 0.7", about=["matthew"],
-                entities=[{"key": "v0.7", "label": "Release"}],
-                facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+r = db.memory.remember("Matthew is driving 0.7", about=["matthew"],
+                       entities=[{"key": "v0.7", "label": "Release"}],
+                       facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
 r["note"]         # "note:…"
 r["provisional"]  # ["matthew"]
 ```
 
-### `recall`
+### `memory.recall`
 
 ```python
 def recall(self, topic: str) -> dict[str, Any]
@@ -9484,7 +9693,7 @@ prompt. This binding exposes no helper for it.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `upsert_entity`
+### `memory.upsert_entity`
 
 ```python
 def upsert_entity(
@@ -9531,10 +9740,10 @@ whitespace, and a create under such a `label`. An `IngestError`'s
 `ingest error: ` prefix.
 
 ```python
-db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
 ```
 
-### `forget`
+### `memory.forget`
 
 ```python
 def forget(
@@ -9571,7 +9780,7 @@ the same whole sentence — which rule owns the edge and the fields it
 reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
 is written in any of the three.
 
-### `schema_report`
+### `memory.schema_report`
 
 ```python
 def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]
@@ -9598,7 +9807,7 @@ content, unsanitized, as `recall`'s rows are.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `identity_clusters`
+### `memory.identity_clusters`
 
 ```python
 def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]
@@ -9622,6 +9831,19 @@ derives them is applied with `mushroomdb schema apply <db>
 Raises `ValueError` for a `floor` that is not a finite number.
 
 Refused on a `scoped()` handle with `ValueError`.
+
+### Deprecated aliases
+
+The old top-level names still work on `GraphDb`. Each takes the same arguments, returns the same result and emits a `DeprecationWarning` that names the caller's line. New code should use `db.memory`.
+
+| Old name | Use instead |
+|---|---|
+| `remember` | `memory.remember` |
+| `recall` | `memory.recall` |
+| `upsert_entity` | `memory.upsert_entity` |
+| `schema_report` | `memory.schema_report` |
+| `forget` | `memory.forget` |
+| `identity_clusters` | `memory.identity_clusters` |
 
 ## Errors
 
@@ -11006,7 +11228,7 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
+mushroomdb export <db-dir> <dest> [--format jsonl|csv|cypher|parquet|graphml] [--single-file]
 ```
 
 Default format: `jsonl`.
@@ -11014,6 +11236,75 @@ Default format: `jsonl`.
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
 to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
 deterministic, and byte-identical between two runs on the same store.
+
+A node line is `{"key": …, "label": …, <properties>}`; a property whose name is
+`key`, `label` or `$props` is written inside a `"$props"` object instead, so no
+property is ever overwritten. The five newer value types are written in their
+tagged JSON forms (`{"$date": "2024-01-15"}`, see the [HTTP API](http.md)), and a
+float is always written with a fraction or exponent, so it reads back as a float.
+An edge line is `{"edge_type", "src", "dst", "derived", "rule"}`.
+
+`--format jsonl --single-file` writes the same records as one file,
+`<dest>/graph.jsonl`, each line an object whose `"type"` (written first) is
+`node`, `edge` or `rule`: every node, then every edge, then every rule
+(`{"type":"rule","rule":{…}}`). A property named `type` goes in the node's
+`$props` object.
+
+JSONL, CSV and Cypher exports stream: the store is read one node (and one
+source node's edges) at a time and written as it goes, so an export holds the
+sorted list of node ids (four bytes a node) and no property maps. Exporting a
+1,000,000-node, 1,000,000-edge store peaks at the memory of opening it; Parquet
+and GraphML build their whole file in memory.
+
+**CSV format** (`--format csv`): writes `nodes.csv` and `relationships.csv`, the
+files `mushroomdb import --nodes --relationships` reads, plus `rules.jsonl` when
+the store has rules. `nodes.csv` has `:ID` (the key), `:LABEL`, then one column
+per property, sorted by name, each named with its type: `age:int`,
+`score:float`, `active:boolean`, `name:string`, `born:date`,
+`seen:datetime`, `ttl:duration`, `blob:binary`. A property that is a list or a
+map, an empty string, or of different types on different nodes is a
+`name:json` column, whose cells are the JSON text of the value. The key column
+is `:KEY` instead of `:ID` when some node has no `id` property equal to its key:
+`:ID` stores the key as the property `id` as well, and `:KEY` does not, so an
+import gives back exactly the properties the store had.
+`relationships.csv` has `:START_ID`, `:END_ID`, `:TYPE` and holds manual edges
+only (edges carry no properties). A label containing `;` is refused, because the
+importer reads it as a multi-label.
+
+**Cypher format** (`--format cypher`): writes `graph.cypher`, one statement per
+line with no terminator, nodes first and then manual edges:
+
+```text
+MERGE (n:`Person` {id: 'alice'}) ON CREATE SET n.`age` = 30, n.`tags` = ['a', 'b']
+MERGE (a:`Person` {id: 'alice'})-[:`KNOWS`]->(b:`Person` {id: 'bob'})
+```
+
+Run each line with `mushroomdb query` (or `query_write`); running the file twice
+changes nothing, because every statement is a `MERGE`. Cypher stores a node's
+key as its `id` property, so a node that had no `id` gains one, and the export
+prints how many; the file reproduces the store exactly when every node's `id`
+equals its key (what `import` and `ingest` write). Things with no Cypher form
+are counted in the export's output rather than silently dropped: properties of the date, time,
+duration and binary types (the Cypher export writes no form for them), NaN, infinities and `-9223372036854775808` (the lexer has no literal),
+a property name or map key with a line break (a statement is one line), a node
+whose `id` differs from its key, and rules.
+
+**Loading an export back.** `mushroomdb import --jsonl graph.jsonl` reads the
+single-file form (a file or `-`); an edge must come after the nodes it joins,
+and one that does not is an error at its line (a node still waiting in the open
+batch counts, and is committed first). Rules are created last. The three-file
+form: `mushroomdb import --nodes-jsonl nodes.jsonl
+--edges-jsonl edges.jsonl --rules-jsonl rules.jsonl --db <dir>` (or `--nodes
+nodes.csv --relationships relationships.csv --rules-jsonl rules.jsonl`) rebuilds
+the store: the same nodes with the same properties, the same manual edges and the
+same rules, whose derived edges are made when the rules are created at the end
+(`derived: true` lines are skipped, and counted). A JSONL path of `-` reads
+standard input, and the file streams line by line in batches of 50,000
+(`--batch-size`), one WAL frame each, the same path the CSV import uses. The
+store you export must be the whole of what you want back: indexes, constraints
+and views are not part of an export. An import carrying one of the newer value
+types moves the store to the V11 format, as any write of one does; 0.9.x does
+not open a V11 store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
 and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
@@ -11038,8 +11329,9 @@ under `score`, another a string), the key declares `attr.type="string"` for
 every node rather than risk a value that doesn't fit a narrower type.
 
 **Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
-JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
-finite floats round-trip correctly.
+JSON `null` (JSONL/Parquet), an empty cell (CSV) or an empty `<data>` element
+(GraphML), and the export prints how many it left out. Normal finite floats
+round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
 the rule name (present for derived edges, null/omitted for manual edges).
@@ -12703,8 +12995,14 @@ aborted outright, which severed in-flight responses and subscriptions
 mid-stream. Nothing was ever lost — the WAL holds every commit and the next
 open replays it — but a rolling restart cut off work it did not need to.
 
-A TLS server gets 30 seconds of grace before the listener closes regardless, so
-one stuck request cannot hold a restart open indefinitely.
+The drain is bounded (25 s at the default timeout; a stuck request or an open
+subscriber is cut off then, over plain HTTP and TLS alike), then comes the shutdown snapshot, then, with
+continuous backup on, a final flush to the bucket that deletes the bucket lease
+so a successor starts at once. The whole sequence finishes within
+`--shutdown-timeout-secs` (default 55), and a second SIGTERM or SIGINT exits
+immediately. Give the platform's stop timeout room for all of it (60 s at the
+defaults); see
+[Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
 
 **The log is quiet when the server is healthy.** A line per request is what
 makes a server log unreadable, so the level follows what happened:
@@ -13003,9 +13301,11 @@ holder can stop renewing because it died, or because it is shutting down in a
 rolling deploy. Either way the waiting instance takes over within one TTL plus
 one check, at most 40 s at the default.
 
-Deleting the lease on a clean shutdown, so that a successor can start at once,
-arrives with graceful shutdown (HO-11). Until then, a stopped holder's lease
-expires after its TTL.
+A clean shutdown (SIGTERM or SIGINT) deletes the lease, so a successor holds it
+within a few seconds instead of waiting out the TTL (see
+[Stopping cleanly](#stopping-cleanly-and-the-grace-period)). A holder that is
+killed, or that cannot reach the bucket in time, leaves the lease to expire
+after its TTL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -13042,9 +13342,10 @@ service:
 
 **One store per prefix.** The first backup of a store gives it a lineage, the
 `backup.lineage` file in the data directory, and every restore point names it.
-Once HO-09/HO-10 land, a restore from the prefix will start a new lineage.
-Until then, restore into a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for the
-restored store somewhere fresh. The worker refuses the prefix in three cases:
+`mushroomdb restore --from` gives the store it restores a new lineage (see
+[Restoring from the backup](#restoring-from-the-backup)), so back a restored
+store up to a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for it somewhere
+fresh. The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -13067,14 +13368,184 @@ just written or the one `LATEST` names.
 - **On a best-effort service**, two writers overlapping until the next renewal
   can overwrite each other's objects. A restore point can then fail to
   verify. Run best-effort only where a single writer is otherwise assured.
-- **A store restored from an older backup, which has since written more commits
-  than the prefix's newest restore point,** passes the commit check. Its new
-  restore points are its own and verify. The prefix's older history is not
-  removed, though, so give such a store a new prefix.
+- **A copy of a store made by hand** (its directory copied with `cp`, say,
+  rather than restored) keeps the original's lineage. If it is older than the
+  prefix's newest restore point and has since written more commits than that
+  restore point holds, it passes the commit check. Its new restore points are
+  its own and verify, but the prefix's other history is not removed. Restore
+  with `mushroomdb restore`, which gives the copy a new lineage, or give such a
+  copy a new prefix.
 
-This rewound-store case is tracked as row 138 of the
+This is tracked as row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
-a release blocker that closes when every restore gets a new lineage.
+a release blocker. It stays open until restore on boot, which is not built
+yet, gives the store it restores a new lineage too.
+
+## Restoring from the backup
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+```
+
+`--from` is the `MUSHROOMDB_BACKUP_S3_URL` the store was backed up to
+(`s3://`, `r2://` or `minio://`). Credentials and the endpoint come from the
+same `AWS_*` variables backup uses. The store is written to `--into`, by
+default `./restored`, which must not exist yet or be an empty directory (not a
+mount point: restore into a directory inside one). A restore never writes over
+anything.
+
+Without `--at`, the newest restore point is restored: the one `LATEST` names,
+plus the segments of its generation uploaded after it, up to the last
+contiguous one. A restore of the newest backup loses at most the segment
+cadence, not the manifest interval.
+
+`--at` picks a point in time:
+
+- `--at 75` restores the store as it was right after commit 75. Commits are
+  numbered as `asof --commit` numbers them, from 0, and the restored store
+  holds 76.
+- `--at 2026-10-01T12:00:00Z` restores the last commit at or before that
+  instant (RFC 3339), resolved through the backup's `commit_times.bin`, as a
+  date query resolves it. A backup without that file cannot restore by time,
+  and the command says so.
+- The times come from the newest restore point's `commit_times.bin`. Segments
+  uploaded after that restore point hold commits with no recorded time. An
+  instant at or after the newest recorded time could fall after some of them,
+  so it is refused with an error naming the last commit with a time, its index
+  and when it was: restore an earlier instant, by commit index
+  (`--at <commit index>`) instead, or without `--at` for the newest. An instant before
+  the newest recorded time resolves as above.
+
+A point in time is restored from the earliest restore point of the backup's
+lineage that holds it, then cut back to that commit. The result is what
+`asof --commit` shows at that commit, as an ordinary store that takes writes.
+A commit is out of reach when it is below the oldest commit the backup holds
+(the error names that commit), past the newest, or before a truncating snapshot
+or archive retention cut the history it needs.
+
+Before anything is written to `--into`, every file and segment is downloaded
+into a staging directory beside it, a hidden `.<name>.restore-…` directory in
+the same parent, and checked against its manifest: size, CRC-32, generation,
+offsets, frames and lineage. Segments uploaded after the newest restore point
+are named by no manifest. They are checked by their own frame checksums, size
+and offsets, and the restore takes them up to the first one that is missing,
+damaged or after a gap, and says so if it stops early. `commit_times.bin` is
+trimmed to the commits restored, so the store stamps its own next commit. The
+copy is then opened and must hold the commits the manifest says it does.
+
+Every file is fsynced, and the staging directory then becomes `--into` in one
+directory rename. So `--into` is always either as it was, absent or empty, or
+the whole restored store, and never part of one, even after a crash.
+
+- An existing empty `--into` is replaced by the staging directory, on every
+  platform, so its permissions and ownership are not kept: the restored
+  directory has the ones the restore created it with. On Unix the replacement
+  is the rename itself. Elsewhere the empty directory is removed first; if the
+  rename then fails, it is created again where possible, and the error says
+  whether it was.
+- Once the rename has happened the restore has succeeded. If syncing the
+  parent directory afterwards fails, the command still succeeds and prints a
+  warning: the store is in place, but its directory entry may not survive a
+  power loss until the system syncs it.
+- A restore that fails removes the staging directory. One killed outright
+  leaves it behind, beside its lock file
+  (`.<name>.restore-<pid>-<tag>.lock`), and it can hold a whole copy of the
+  store. The next restore into the same `--into` removes such leftovers whose
+  lock no running restore holds, and lists what it removed. Nothing else in
+  the directory is touched.
+
+If segments uploaded after the newest restore point exist but cannot be used
+(the first one missing or damaged, or a later one after a gap), the restore of
+the newest point still succeeds with what it can verify and warns, naming how
+many segments and bytes of WAL were not restored and why.
+
+`roles.json` and `keys.json` are restored as the chosen restore point holds
+them. They are not cut back to a point in time: roles and keys are current
+state, not history, as they are for `asof`.
+
+**A restored store is a new lineage.** It gets a new `backup.lineage`, so its
+backups can never be confused with the ones it came from. Pointed at the
+prefix it was restored from, the backup worker refuses it: it uploads nothing
+and deletes nothing there. Back it up to a new prefix.
+
+## Stopping cleanly, and the grace period
+
+On SIGTERM or SIGINT `serve` stops in three phases, all inside one deadline,
+`--shutdown-timeout-secs` (default 55):
+
+| Phase | What happens | Bound at the defaults |
+| --- | --- | --- |
+| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. Whatever is still open at the bound is cut off. | 25 s |
+| 2. Snapshot | Write the shutdown snapshot. If it has not finished by its bound it is skipped: the WAL holds every commit and the next open replays it. | 8 s (what is left) |
+| 3. Backup | Tell the backup worker to stop. It uploads the last WAL segment and the new snapshot, writes a final restore point, and deletes the bucket lease (only if it still names this instance). | 22 s |
+
+The arithmetic: the backup phase is reserved first. It is
+`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` (10 s) plus one request deadline,
+`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` (10 s), plus 2 s, which is 22 s. The drain
+takes at most 25 s, or less if the deadline leaves less after that reserve. The
+snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
+time to the next one.
+
+**The phases scale with `--shutdown-timeout-secs`.** With at least 55 s (more
+goes to the snapshot) the split above holds. With less, all three phases shrink
+in proportion, but the backup keeps a floor of 2 s and the drain gives way
+first, because a stuck client is what stretches it. The backup's own flush grace
+and request deadline are shrunk to fit its share, so the lease release still
+has a request deadline of its own. At `--shutdown-timeout-secs 25`, for
+example, the drain gets about 11 s, the snapshot about 3 s and the backup about
+10 s. The whole sequence never exceeds the timeout.
+
+Every phase runs even when an earlier one ran out, so the lease is released
+whenever the bucket is reachable. If the bucket is unreachable the log says so,
+the process exits, and the lease expires by itself after its TTL. No
+acknowledged write is lost in any of these cases, because the WAL holds every
+commit.
+
+| Variable or flag | Default | Meaning |
+| --- | --- | --- |
+| `--shutdown-timeout-secs` | `55` | The whole shutdown must finish within this many seconds |
+| `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take before the upload in flight is abandoned |
+| `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request, including the lease release |
+
+**A second SIGTERM or SIGINT exits at once.** An operator who presses Ctrl-C
+twice on a slow shutdown gets an immediate exit. The log says that the backup
+lease, if held, expires on its own after its TTL (at most 40 s until a
+successor holds it).
+
+**Set the platform's stop timeout above `--shutdown-timeout-secs`.** A platform
+that sends SIGKILL earlier cuts the sequence short. Nothing is lost, but the
+lease is left behind and the next start waits for it. The Fly, Compose and Railway templates use 60 s.
+If you raise `--shutdown-timeout-secs`, raise the platform's value by the same
+amount.
+
+| Platform | Setting | Default | Template |
+| --- | --- | --- | --- |
+| Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
+| Docker Compose | `stop_grace_period` | 10 s | `60s` |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
+| Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
+| Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |
+
+Sources, read 2026-10-22:
+[Fly.io configuration](https://docs.fly.io/reference/configuration),
+[Render deploys](https://render.com/docs/deploys) and
+[blueprint spec](https://render.com/docs/blueprint-spec),
+[Railway config as code](https://docs.railway.com/config-as-code/reference).
+Railway's default and maximum are not documented there, so they are
+unverified. Compose and Kubernetes defaults are the tools' standard ones.
+
+**On Render with a disk the window is a fixed 30 s**, shorter than the 55 s
+default, so the Render template sets `--shutdown-timeout-secs 25`. Raising the
+platform value is not possible there; if you drop the disk, you may set
+`maxShutdownDelaySeconds` and a longer `--shutdown-timeout-secs`.
+
+**Backup health never gates `/ready`.** `/ready` answers 503 only until the
+store is open. A rolling deploy starts the new instance while the old one still
+holds the lease, so the new one is backup-unhealthy until the old one stops. If
+`/ready` followed backup health, the platform would never route traffic to the
+new instance and never stop the old one. Watch backup health in the log (it
+warns while the lease is foreign), not through `/ready`.
 
 ## Loopback-first posture
 

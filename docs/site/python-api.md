@@ -1319,7 +1319,9 @@ Refused on a `scoped()` handle with `ValueError`.
 
 ## Memory
 
-### `remember`
+The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's store and scope. Each access returns a new accessor; one you keep holds the store open, as a `scoped()` handle does, and the store is released when the handle and every accessor are dropped.
+
+### `memory.remember`
 
 ```python
 def remember(
@@ -1376,14 +1378,14 @@ declares full-text on `Note.text` and on each new entity label's
 `name` itself, so `recall` works after the first call.
 
 ```python
-r = db.remember("Matthew is driving 0.7", about=["matthew"],
-                entities=[{"key": "v0.7", "label": "Release"}],
-                facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+r = db.memory.remember("Matthew is driving 0.7", about=["matthew"],
+                       entities=[{"key": "v0.7", "label": "Release"}],
+                       facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
 r["note"]         # "note:…"
 r["provisional"]  # ["matthew"]
 ```
 
-### `recall`
+### `memory.recall`
 
 ```python
 def recall(self, topic: str) -> dict[str, Any]
@@ -1417,7 +1419,7 @@ prompt. This binding exposes no helper for it.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `upsert_entity`
+### `memory.upsert_entity`
 
 ```python
 def upsert_entity(
@@ -1464,10 +1466,10 @@ whitespace, and a create under such a `label`. An `IngestError`'s
 `ingest error: ` prefix.
 
 ```python
-db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
 ```
 
-### `forget`
+### `memory.forget`
 
 ```python
 def forget(
@@ -1504,7 +1506,7 @@ the same whole sentence — which rule owns the edge and the fields it
 reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
 is written in any of the three.
 
-### `schema_report`
+### `memory.schema_report`
 
 ```python
 def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]
@@ -1531,7 +1533,7 @@ content, unsanitized, as `recall`'s rows are.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `identity_clusters`
+### `memory.identity_clusters`
 
 ```python
 def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]
@@ -1555,6 +1557,19 @@ derives them is applied with `mushroomdb schema apply <db>
 Raises `ValueError` for a `floor` that is not a finite number.
 
 Refused on a `scoped()` handle with `ValueError`.
+
+### Deprecated aliases
+
+The old top-level names still work on `GraphDb`. Each takes the same arguments, returns the same result and emits a `DeprecationWarning` that names the caller's line. New code should use `db.memory`.
+
+| Old name | Use instead |
+|---|---|
+| `remember` | `memory.remember` |
+| `recall` | `memory.recall` |
+| `upsert_entity` | `memory.upsert_entity` |
+| `schema_report` | `memory.schema_report` |
+| `forget` | `memory.forget` |
+| `identity_clusters` | `memory.identity_clusters` |
 
 ## Errors
 

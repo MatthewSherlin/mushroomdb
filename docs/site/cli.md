@@ -68,13 +68,13 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 ### `serve`
 
 ```text
-mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not
 
 ### `mcp`
 
@@ -214,6 +214,19 @@ mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
 
 Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole
 
+### `keys`
+
+```text
+mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                   issues an access key: prints a new random token once and stores only its
+                   blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                   needs --role, and reads that role's view without ever writing
+mushroomdb keys hash
+                   reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
+```
+
+`keys add` works on every platform (the token comes from the operating system's random source). It writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. The mode and owner check on `keys.json` applies on Unix only; Windows has none. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+
 ### `verify`
 
 ```text
@@ -240,23 +253,46 @@ mushroomdb backup <db-dir> <dest>   process-local consistent copy of the databas
 
 Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
 
+### `restore`
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                   restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                   which must be new or empty; every object is checked against its manifest first
+                   --at N restores the store as it was right after commit N (as asof --commit counts);
+                   --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                   backup's commit times; an instant past the newest recorded time is refused
+                   when later commits have none
+                   the restored store starts a new backup lineage: back it up to a new prefix
+                   r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+```
+
+Restore a continuous S3 backup, the newest restore point or a point in time, into a new or empty directory. Every object is verified before anything is written there, and the restored store starts a new backup lineage. See [Restoring from the backup](deployment.md#restoring-from-the-backup)
+
 ### `export`
 
 ```text
-mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                    --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                    csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                    cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
                                     graphml writes one file: <dest>/graph.graphml if <dest> is an
                                     existing directory, otherwise <dest> is the file path itself
                                     (nodes + edges only; rules have no GraphML analogue)
 ```
 
-Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools
+Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools. `--format jsonl --single-file` writes one `graph.jsonl` of typed `node`, `edge` and `rule` lines. JSONL, CSV and Cypher stream, so memory does not grow with the properties of the store. CSV (`nodes.csv`, `relationships.csv`) and JSONL load back with `import` and give the same store, rules included; Cypher (`graph.cypher`, one `MERGE` per line) is read by this engine's own `query`, and says in its output what it could not write, such as a NaN or infinite float, or a property whose name or map key holds a line break (one line cannot carry it; the JSONL export does). The formats are described in [Durability](durability.md#export-cli)
 
 ### `import`
 
 ```text
 mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                  [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                   [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
-                                 bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                 `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                 `-` reads one of them from standard input
                                  nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
                                  other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
                                  one label per node: Person;Employee is refused; relationship properties are not supported
@@ -264,7 +300,7 @@ mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--deli
                                  an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
 ```
 
-Bulk-load a nodes CSV and a relationships CSV. A node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
+Bulk-load CSV or JSONL files. `--jsonl` reads the single file `export --format jsonl --single-file` writes (an edge must come after its nodes, or it is an error at its line). `--nodes-jsonl`, `--edges-jsonl` and `--rules-jsonl` read the files `export --format jsonl` writes (and `--rules-jsonl` the one the CSV export writes), from a path or `-` for standard input, line by line in the same batches; a node line is `{"key": …, "label": …, <properties>}`, its key is not also stored as a property, derived edges are left to their rules, and the rules are created last so each backfills once. A CSV key column named `:KEY` is a key that is not also stored as the property `id`; `date`, `localdatetime`, `datetime`, `duration` and `binary` column types and `json` carry the newer types and nested values (a store that stores one of the newer types moves to the V11 format, which 0.9.x does not open). A CSV node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
 
 ## Hook bodies
 
@@ -311,7 +347,7 @@ Print the usage this page is generated from, and exit.
 The notes `--help` prints under its usage:
 
 ```text
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).

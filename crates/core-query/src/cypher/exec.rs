@@ -738,7 +738,9 @@ fn execute_inner(
                             gk.clone(),
                             (
                                 display_vals,
-                                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                                aggs.iter()
+                                    .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                                    .collect::<Result<Vec<_>, _>>()?,
                             ),
                         );
                     }
@@ -756,7 +758,9 @@ fn execute_inner(
                         empty_key,
                         (
                             vec![],
-                            aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                            aggs.iter()
+                                .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                                .collect::<Result<Vec<_>, _>>()?,
                         ),
                     );
                 }
@@ -954,7 +958,7 @@ fn execute_inner(
                     arg,
                     op_edges: OpEdges::new(&[], &vars),
                 };
-                let mut acc = AggAcc::for_arg(func, arg);
+                let mut acc = AggAcc::for_arg(func, arg, params)?;
                 for row in &rows {
                     // agg_stream with empty ops hits the terminal branch (accumulate).
                     agg_stream(&ctx, &[], row, &mut acc)?;
@@ -3891,6 +3895,22 @@ enum AggAcc {
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// `stDev` / `stDevP`: Welford's running mean and sum of squared
+    /// deviations, so the deviation is stable and memory is O(1).
+    StDev {
+        population: bool,
+        n: u64,
+        mean: f64,
+        m2: f64,
+    },
+    /// `percentileCont` / `percentileDisc`: every numeric input, with the
+    /// `p` the query asked for (already validated to lie in `[0,1]`).
+    Percentile {
+        name: &'static str,
+        continuous: bool,
+        p: f64,
+        values: Vec<(f64, Value)>,
+    },
     /// `DISTINCT` wrapper: forwards to `inner` the first time a value is
     /// seen in this group and drops every repeat.
     Distinct {
@@ -3902,18 +3922,45 @@ enum AggAcc {
 impl AggAcc {
     /// The accumulator an aggregate needs given the argument it was written
     /// with — a `DISTINCT` argument adds the seen-set around the plain one.
-    fn for_arg(func: &AggFunc, arg: &AggArg) -> Self {
-        match arg {
+    fn for_arg(func: &AggFunc, arg: &AggArg, params: &Params) -> Result<Self, String> {
+        let plain = AggAcc::new(func, params)?;
+        Ok(match arg {
             AggArg::Distinct(_) => AggAcc::Distinct {
                 seen: HashSet::new(),
-                inner: Box::new(AggAcc::new(func)),
+                inner: Box::new(plain),
             },
-            _ => AggAcc::new(func),
-        }
+            _ => plain,
+        })
     }
 
-    fn new(func: &AggFunc) -> Self {
-        match func {
+    /// Fails when a percentile's `p` is not a number in `[0,1]`, so a bad `p`
+    /// is an error on an empty match as well.
+    fn new(func: &AggFunc, params: &Params) -> Result<Self, String> {
+        Ok(match func {
+            AggFunc::StDev => AggAcc::StDev {
+                population: false,
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            AggFunc::StDevP => AggAcc::StDev {
+                population: true,
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            AggFunc::PercentileCont { p } => AggAcc::Percentile {
+                name: "percentileCont",
+                continuous: true,
+                p: percentile_arg("percentileCont", p, params)?,
+                values: Vec::new(),
+            },
+            AggFunc::PercentileDisc { p } => AggAcc::Percentile {
+                name: "percentileDisc",
+                continuous: false,
+                p: percentile_arg("percentileDisc", p, params)?,
+                values: Vec::new(),
+            },
             AggFunc::Count => AggAcc::Count(0),
             AggFunc::Sum => AggAcc::Sum {
                 val: 0.0,
@@ -3923,7 +3970,7 @@ impl AggAcc {
             AggFunc::Min => AggAcc::Min(None),
             AggFunc::Max => AggAcc::Max(None),
             AggFunc::Collect => AggAcc::Collect(Vec::new()),
-        }
+        })
     }
 
     fn finish(self) -> Option<Value> {
@@ -3951,8 +3998,109 @@ impl AggAcc {
             AggAcc::Max(v) => v,
             // Empty collect() yields an empty list (never null), matching openCypher.
             AggAcc::Collect(items) => Some(Value::List(items)),
+            AggAcc::StDev {
+                population, n, m2, ..
+            } => {
+                // Fewer than two values (none, for stDevP) have no spread: 0.0,
+                // as openCypher has it, never null.
+                let divisor = if population { n } else { n.saturating_sub(1) };
+                if divisor == 0 {
+                    Some(Value::Float(0.0))
+                } else {
+                    Some(Value::Float((m2 / divisor as f64).sqrt()))
+                }
+            }
+            AggAcc::Percentile {
+                continuous,
+                p,
+                mut values,
+                ..
+            } => {
+                if values.is_empty() {
+                    return None;
+                }
+                values.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let last = values.len() - 1;
+                if continuous {
+                    let rank = p * last as f64;
+                    let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+                    let frac = rank - lo as f64;
+                    let (a, b) = (values[lo].0, values[hi.min(last)].0);
+                    Some(Value::Float(a + (b - a) * frac))
+                } else {
+                    // Nearest rank: the ⌈p·N⌉-th smallest, the smallest for p = 0.
+                    let rank = nearest_rank(p, values.len());
+                    let (_, value) = values.swap_remove(rank - 1);
+                    Some(value)
+                }
+            }
             AggAcc::Distinct { inner, .. } => inner.finish(),
         }
+    }
+}
+
+/// The 1-based nearest rank `⌈p·n⌉`, clamped to `[1, n]`. `p·n` is snapped to
+/// the nearest integer when it is within float error of one, so `0.07 * 100`
+/// (7.000000000000001) is rank 7, not 8.
+fn nearest_rank(p: f64, n: usize) -> usize {
+    let exact = p * n as f64;
+    let nearest = exact.round();
+    let snapped = if (exact - nearest).abs() <= 1e-9 * nearest.max(1.0) {
+        nearest
+    } else {
+        exact.ceil()
+    };
+    (snapped as usize).clamp(1, n)
+}
+
+/// The `p` of a percentile aggregate: a number in `[0,1]`, given as a
+/// literal or a parameter (so it is the same for every row).
+fn percentile_arg(name: &str, p: &Operand, params: &Params) -> Result<f64, String> {
+    let value = match p {
+        Operand::Lit(v) => v.clone(),
+        Operand::Param(n) => params
+            .0
+            .get(n)
+            .cloned()
+            .ok_or_else(|| format!("{name}(): missing parameter ${n} for p"))?,
+        _ => return Err(format!("{name}(): p must be a literal or a parameter")),
+    };
+    let p = numeric_val(&value).ok_or_else(|| format!("{name}(): p must be a number in [0,1]"))?;
+    if !(0.0..=1.0).contains(&p) {
+        return Err(format!("{name}(): p must be in [0,1], got {p}"));
+    }
+    Ok(p)
+}
+
+/// The numeric input of a statistical aggregate on one row: `None` for null,
+/// an error for a value that is not a number (these aggregates do not
+/// silently skip what they cannot read).
+fn stat_input(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    arg: &AggArg,
+    name: &str,
+) -> Result<Option<(f64, Value)>, String> {
+    let value = match arg {
+        AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
+        AggArg::Var(v) => match vars
+            .slot(v)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref())
+        {
+            Some(Cell::Scalar(x)) => Some(x.clone()),
+            None => None,
+            Some(_) => return Err(format!("{name}(): expected a number, got a graph element")),
+        },
+        _ => return Ok(None),
+    };
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match numeric_val(&v) {
+            Some(x) => Ok(Some((x, v))),
+            None => Err(format!("{name}(): expected a number, got {v:?}")),
+        },
     }
 }
 
@@ -4007,7 +4155,7 @@ fn execute_aggregate(
         op_edges: OpEdges::new(producers, &vars),
     };
     let initial_row: Row = vec![None; vars.names.len()];
-    let mut acc = AggAcc::for_arg(func, arg);
+    let mut acc = AggAcc::for_arg(func, arg, params)?;
     agg_stream(&ctx, producers, &initial_row, &mut acc)?;
 
     let value = acc.finish();
@@ -4208,6 +4356,30 @@ fn update_acc(
             if let Some(val) = resolve_prop(view, vars, row, var, field)? {
                 if let AggAcc::Collect(items) = acc {
                     items.push(val);
+                }
+            }
+        }
+        (AggFunc::StDev | AggFunc::StDevP, _) => {
+            if let AggAcc::StDev {
+                population,
+                n,
+                mean,
+                m2,
+            } = acc
+            {
+                let name = if *population { "stDevP" } else { "stDev" };
+                if let Some((x, _)) = stat_input(view, vars, row, arg, name)? {
+                    *n += 1;
+                    let delta = x - *mean;
+                    *mean += delta / *n as f64;
+                    *m2 += delta * (x - *mean);
+                }
+            }
+        }
+        (AggFunc::PercentileCont { .. } | AggFunc::PercentileDisc { .. }, _) => {
+            if let AggAcc::Percentile { name, values, .. } = acc {
+                if let Some(entry) = stat_input(view, vars, row, arg, name)? {
+                    values.push(entry);
                 }
             }
         }
@@ -4702,7 +4874,9 @@ fn execute_group_aggregate(
             empty_key,
             (
                 vec![],
-                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                aggs.iter()
+                    .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
         );
     }
@@ -4764,8 +4938,8 @@ fn group_stream(
                 let init: Vec<AggAcc> = ctx
                     .aggs
                     .iter()
-                    .map(|(f, a, _)| AggAcc::for_arg(f, a))
-                    .collect();
+                    .map(|(f, a, _)| AggAcc::for_arg(f, a, ctx.params))
+                    .collect::<Result<_, _>>()?;
                 groups.insert(gk.clone(), (display_vals, init));
             }
             let (_, accs) = groups.get_mut(&gk).unwrap();
@@ -5504,6 +5678,10 @@ fn column_name(item: &RetItem) -> String {
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
                 AggFunc::Collect => "COLLECT",
+                AggFunc::StDev => "stDev",
+                AggFunc::StDevP => "stDevP",
+                AggFunc::PercentileCont { .. } => "percentileCont",
+                AggFunc::PercentileDisc { .. } => "percentileDisc",
             };
             format!("{f}({})", agg_arg_label(arg))
         }
@@ -5718,6 +5896,10 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
     let n = usize::try_from(n).unwrap_or(usize::MAX);
     rows.truncate(n);
 }
+
+#[cfg(test)]
+#[path = "tests/ql_04.rs"]
+mod ql_04;
 
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]

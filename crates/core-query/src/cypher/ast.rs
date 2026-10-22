@@ -107,6 +107,22 @@ pub enum AggFunc {
     /// `collect(x)` — gather each row's value of `x` into a list, skipping
     /// nulls. Per group when grouping keys are present.
     Collect,
+    /// `stDev(x)` — sample standard deviation (n - 1) of the non-null
+    /// numeric values; `0.0` with fewer than two values.
+    StDev,
+    /// `stDevP(x)` — population standard deviation (n) of the non-null
+    /// numeric values; `0.0` with none.
+    StDevP,
+    /// `percentileCont(x, p)` — the `p`th percentile (`p` in `[0,1]`) with
+    /// linear interpolation between the two nearest ranks; always a float.
+    PercentileCont {
+        p: Operand,
+    },
+    /// `percentileDisc(x, p)` — the nearest-rank `p`th percentile
+    /// (`p` in `[0,1]`); an input value, with its own type.
+    PercentileDisc {
+        p: Operand,
+    },
 }
 
 /// Argument to an aggregate function.
@@ -446,6 +462,49 @@ pub enum WriteStatement {
     /// `UNWIND … [MATCH|WITH …]* <write clause>+ [RETURN …]`: the write clauses
     /// run once per row the read part produces.
     UnwindWrite(Box<UnwindWriteStmt>),
+}
+
+// ─── Schema (DDL) statement AST ──────────────────────────────────────────────
+
+/// A schema statement: an index or a unique constraint declared, withdrawn or
+/// listed. Produced by `parse_ddl`; executed by `GraphDb::query_write` (and,
+/// for the two `Show…` forms, by every read entry point). A DDL statement is
+/// the whole statement — no clause may precede or follow it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DdlStatement {
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.field)` — a
+    /// range index. With no name it is `idx_<Label>_<field>`.
+    CreateIndex {
+        name: Option<String>,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX name [IF EXISTS]`.
+    DropIndex { name: String, if_exists: bool },
+    /// `SHOW INDEXES` (or `SHOW INDEX`).
+    ShowIndexes,
+    /// `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:Label) REQUIRE n.field IS UNIQUE`.
+    CreateConstraint {
+        name: String,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP CONSTRAINT name [IF EXISTS]`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SHOW CONSTRAINTS` (or `SHOW CONSTRAINT`).
+    ShowConstraints,
+}
+
+impl DdlStatement {
+    /// Whether the statement only lists the schema (`SHOW …`) and so is a read.
+    pub fn is_show(&self) -> bool {
+        matches!(
+            self,
+            DdlStatement::ShowIndexes | DdlStatement::ShowConstraints
+        )
+    }
 }
 
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`

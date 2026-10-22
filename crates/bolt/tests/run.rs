@@ -1124,3 +1124,69 @@ fn trait_objects_are_send() {
     assert_send::<Box<dyn ResultCursor>>();
     assert_send::<Box<dyn OpenTransaction>>();
 }
+
+// -------------------------------------------------- schema statements (TY-9)
+
+#[test]
+fn an_auto_commit_ddl_statement_runs_for_a_full_token_and_show_lists_it() {
+    let (db, _dir) = open_db("ddl-full");
+    let mut conn = connected(&db, FULL);
+    for q in [
+        "CREATE INDEX i FOR (n:P) ON (n.a)",
+        "CREATE CONSTRAINT c FOR (n:P) REQUIRE n.b IS UNIQUE",
+    ] {
+        let out = conn.handle(run(q));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{q}: {out:?}"
+        );
+        let out = conn.handle(pull(-1));
+        let (rows, end) = rows_and_end(&out);
+        assert!(
+            rows.is_empty() && matches!(end, ServerMessage::Success(_)),
+            "{out:?}"
+        );
+    }
+    assert_eq!(db.read().range_indexes().len(), 1);
+    assert_eq!(db.read().constraints().len(), 1);
+    conn.handle(run("SHOW CONSTRAINTS"));
+    let out = conn.handle(pull(-1));
+    let (rows, _) = rows_and_end(&out);
+    assert_eq!(rows, vec![&vec![s("c"), s("unique"), s("P"), s("b")]]);
+}
+
+#[test]
+fn a_role_token_cannot_run_ddl_but_can_show_the_schema() {
+    let (db, _dir) = db_with_role("ddl-role");
+    db.write()
+        .query_write("CREATE INDEX i FOR (n:Public) ON (n.n)", &BTreeMap::new())
+        .unwrap();
+    // The role cannot see `Secret`, so its index is not listed to it.
+    db.write()
+        .query_write("CREATE INDEX s FOR (n:Secret) ON (n.n)", &BTreeMap::new())
+        .unwrap();
+    let mut conn = connected(&db, ROLE);
+    let out = conn.handle(run("DROP INDEX i"));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
+    assert_eq!(db.read().range_indexes().len(), 2);
+    conn.handle(ClientMessage::Reset);
+    conn.handle(run("SHOW INDEXES"));
+    let out = conn.handle(pull(-1));
+    let (rows, _) = rows_and_end(&out);
+    assert_eq!(
+        rows,
+        vec![&vec![s("i"), s("range"), s("Public"), s("n"), s("online")]]
+    );
+}
+
+#[test]
+fn ddl_is_refused_inside_an_explicit_transaction() {
+    let (db, _dir) = open_db("ddl-tx");
+    let mut conn = in_tx(&db, FULL);
+    let out = conn.handle(run("CREATE INDEX i FOR (n:P) ON (n.a)"));
+    assert!(
+        matches!(out.last(), Some(ServerMessage::Failure(_))),
+        "{out:?}"
+    );
+    assert!(db.read().range_indexes().is_empty());
+}

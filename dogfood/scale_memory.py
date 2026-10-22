@@ -493,7 +493,7 @@ def phase_remember(
     for text, kind, about_keys in texts:
         t0 = time.perf_counter()
         try:
-            db.remember(text, about=about_keys or None, kind=kind)
+            db.memory.remember(text, about=about_keys or None, kind=kind)
             samples.append(time.perf_counter() - t0)
         except Exception as exc:
             n_errors += 1
@@ -596,7 +596,7 @@ def phase_recall(
                 continue
             t0 = time.perf_counter()
             try:
-                result = db.recall(q)
+                result = db.memory.recall(q)
                 samples.append(time.perf_counter() - t0)
                 n_hits += len(result.get("hits", []))
             except Exception as exc:

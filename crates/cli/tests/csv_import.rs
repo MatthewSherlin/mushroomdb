@@ -159,10 +159,10 @@ fn csv_import_bad_header_is_an_error_with_file_and_line() {
 #[test]
 fn csv_import_unknown_type_suffix_warns_and_stores_a_string() {
     let dir = tmp("unknowntype");
-    let n = write(&dir, "n.csv", ":ID,:LABEL,born:date\na,P,1815-12-10\n");
+    let n = write(&dir, "n.csv", ":ID,:LABEL,born:uuid\na,P,1815-12-10\n");
     let report = run_import(&dir.join("db"), Some(&n), None, &opts()).unwrap();
     assert_eq!(report.warnings.len(), 1);
-    assert!(report.warnings[0].contains("n.csv:1:") && report.warnings[0].contains("born:date"));
+    assert!(report.warnings[0].contains("n.csv:1:") && report.warnings[0].contains("born:uuid"));
     let db = GraphDb::open(&dir.join("db")).unwrap();
     assert_eq!(
         db.node_ref("a").unwrap().props()["born"],

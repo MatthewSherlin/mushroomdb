@@ -264,6 +264,10 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// `--shutdown-timeout-secs`: the whole graceful shutdown (drain,
+        /// snapshot, backup flush, lease release) must finish within this.
+        /// Default [`DEFAULT_SHUTDOWN_TIMEOUT_SECS`].
+        shutdown_timeout: Duration,
         /// Seed an empty `db_dir` from the newest backup under this directory
         /// before opening it. See [`restore_if_empty`]. `None` = off (default).
         restore_from: Option<PathBuf>,
@@ -373,6 +377,15 @@ pub enum Command {
     Migrate {
         db_dir: PathBuf,
     },
+    /// Issue an access key: print a new random token once, store only its hash.
+    KeysAdd {
+        db_dir: PathBuf,
+        name: String,
+        tier: String,
+        role: Option<String>,
+    },
+    /// Print the `keys.json` hash of the token read from standard input.
+    KeysHash,
     /// Validate CRC32 integrity of every section in the V8 snapshot.
     Verify {
         db_dir: PathBuf,
@@ -382,17 +395,27 @@ pub enum Command {
         db_dir: PathBuf,
         dest: PathBuf,
     },
+    /// Restore a store from a continuous backup in S3-compatible storage
+    /// (`restore --from s3://bucket/prefix`). See [`run_restore_s3`].
+    RestoreS3 {
+        /// `s3://bucket/prefix`, `r2://…` or `minio://…`.
+        from: String,
+        /// `--at`: a commit number or an RFC 3339 timestamp; `None` restores
+        /// the newest restore point.
+        at: Option<String>,
+        /// `--into`; `None` is [`DEFAULT_RESTORE_INTO`].
+        into: Option<PathBuf>,
+    },
     /// Export all nodes, edges, and rules to a destination directory.
     Export {
         db_dir: PathBuf,
         dest: PathBuf,
         format: ExportFormat,
     },
-    /// Bulk-load a nodes CSV and a relationships CSV.
+    /// Bulk-load CSV and JSONL files.
     Import {
         db_dir: PathBuf,
-        nodes: Option<PathBuf>,
-        relationships: Option<PathBuf>,
+        inputs: import::ImportInputs,
         opts: import::ImportOptions,
     },
     /// Build (or incrementally sync) a graph of a git repository.
@@ -502,6 +525,12 @@ Usage:
                      folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
                      so node_history, edge_history, was_linked and asof keep reaching it;
                      --truncate discards it instead, --keep-wal leaves wal.bin whole
+  mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                     issues an access key: prints a new random token once and stores only its
+                     blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                     needs --role, and reads that role's view without ever writing
+  mushroomdb keys hash
+                     reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
   mushroomdb build-index <db-dir> [--rule <name>]
                      drives a rule's vector index to completion a slice at a time, for an
                      operator who wants the build finished before traffic arrives; a rule
@@ -517,17 +546,33 @@ Usage:
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+  mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                     restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                     which must be new or empty; every object is checked against its manifest first
+                     --at N restores the store as it was right after commit N (as asof --commit counts);
+                     --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                     backup's commit times; an instant past the newest recorded time is refused
+                     when later commits have none
+                     the restored store starts a new backup lineage: back it up to a new prefix
+                     r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+  mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                      --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                      csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                      cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
                                       graphml writes one file: <dest>/graph.graphml if <dest> is an
                                       existing directory, otherwise <dest> is the file path itself
                                       (nodes + edges only; rules have no GraphML analogue)
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
   mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                    [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                     [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
-                                   bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                   `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                   `-` reads one of them from standard input
                                    nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
                                    other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
                                    one label per node: Person;Employee is refused; relationship properties are not supported
@@ -572,7 +617,7 @@ Usage:
   mushroomdb --version
   mushroomdb --help
 
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
@@ -888,7 +933,9 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
+        "keys" => parse_keys(&args[1..]),
         "backup" => parse_backup(&args[1..]),
+        "restore" => parse_restore(&args[1..]),
         "export" => parse_export(&args[1..]),
         "import" => parse_import(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
@@ -931,6 +978,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
@@ -998,6 +1046,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--shutdown-timeout-secs" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --shutdown-timeout-secs".to_string())?;
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--shutdown-timeout-secs=") {
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 1;
         } else if a == "--restore-from" {
             let val = args
                 .get(i + 1)
@@ -1054,6 +1112,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        shutdown_timeout,
         restore_from,
         tls_cert,
         tls_key,
@@ -1071,6 +1130,75 @@ fn parse_role_token(val: &str) -> Result<(String, String), String> {
         return Err("--role-token: ROLE must not be empty".to_string());
     }
     Ok((tok.to_string(), role.to_string()))
+}
+
+/// Default for `serve --shutdown-timeout-secs`: drain up to 25 s, snapshot in
+/// what is left of the budget (8 s with the default backup bounds), then flush
+/// the backup and release the lease within 22 s.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 55;
+/// The drain phase's share at the default timeout, and its cap at any timeout.
+pub const SHUTDOWN_DRAIN_SECS: u64 = 25;
+/// The snapshot phase's nominal share, used to scale the phases down when the
+/// timeout is shorter than drain + snapshot + backup.
+const SHUTDOWN_SNAPSHOT_NOMINAL: Duration = Duration::from_secs(8);
+/// A backup flush keeps at least this much of any timeout, so the lease
+/// release is still attempted under a tight one.
+const SHUTDOWN_BACKUP_FLOOR: Duration = Duration::from_secs(2);
+
+/// How a shutdown's time is divided: the three phases, in order, and the
+/// most each may take. They sum to at most the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// Longest the drain of in-flight requests may take.
+    pub drain: Duration,
+    /// Snapshot's share; unused drain time also goes to it at run time.
+    pub snapshot: Duration,
+    /// Backup flush and lease release. Zero without backup.
+    pub backup: Duration,
+}
+
+/// Divide `total` between the phases. `backup_bound` is the backup's own
+/// shutdown bound (`BackupConfig::shutdown_budget`), zero without backup.
+///
+/// With room (`total` at least drain cap + 8 s + `backup_bound`) the drain gets
+/// its cap, the backup its bound, and the snapshot the rest. With less, all
+/// three scale down in proportion, except that the backup keeps a floor
+/// ([`SHUTDOWN_BACKUP_FLOOR`], never more than its bound) and the drain gives
+/// way first: it is the phase a stuck client can stretch.
+pub fn shutdown_plan(total: Duration, backup_bound: Duration) -> ShutdownPlan {
+    let cap = Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    let nominal = cap + SHUTDOWN_SNAPSHOT_NOMINAL + backup_bound;
+    if total >= nominal {
+        return ShutdownPlan {
+            drain: cap,
+            snapshot: total - cap - backup_bound,
+            backup: backup_bound,
+        };
+    }
+    let scaled = |d: Duration| d.mul_f64(total.as_secs_f64() / nominal.as_secs_f64());
+    let backup = if backup_bound.is_zero() {
+        Duration::ZERO
+    } else {
+        scaled(backup_bound)
+            .max(SHUTDOWN_BACKUP_FLOOR.min(backup_bound))
+            .min(total)
+    };
+    let drain = scaled(cap).min(total - backup);
+    ShutdownPlan {
+        drain,
+        snapshot: total - backup - drain,
+        backup,
+    }
+}
+
+fn parse_shutdown_timeout(val: &str) -> Result<Duration, String> {
+    let secs: u64 = val
+        .parse()
+        .map_err(|_| format!("invalid --shutdown-timeout-secs: {val}"))?;
+    if secs == 0 {
+        return Err("--shutdown-timeout-secs must be a positive number of seconds".into());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
@@ -1999,6 +2127,34 @@ fn parse_backup(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Backup { db_dir, dest })
 }
 
+/// `restore --from <url> [--at <commit | timestamp>] [--into <dir>]`.
+fn parse_restore(args: &[&str]) -> Result<Command, String> {
+    let (mut from, mut at, mut into) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = flag_value(args, &mut i, "--from")? {
+            from = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--at")? {
+            // Checked here so a typo fails before anything is downloaded.
+            backup::RestoreTarget::parse(v)?;
+            at = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--into")? {
+            into = Some(PathBuf::from(v));
+        } else if args[i].starts_with('-') {
+            return Err(format!("unexpected flag: {}", args[i]));
+        } else {
+            return Err(format!(
+                "unexpected argument: {} (restore takes --from, --at and --into)",
+                args[i]
+            ));
+        }
+    }
+    let from = from
+        .filter(|f| !f.trim().is_empty())
+        .ok_or_else(|| "restore requires --from s3://bucket/prefix".to_string())?;
+    Ok(Command::RestoreS3 { from, at, into })
+}
+
 /// Take the value of `--flag value` or `--flag=value` at `args[*i]`.
 fn flag_value<'a>(args: &[&'a str], i: &mut usize, flag: &str) -> Result<Option<&'a str>, String> {
     let a = args[*i];
@@ -2033,8 +2189,7 @@ fn single_char(flag: &str, val: &str) -> Result<char, String> {
 
 fn parse_import(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = PathBuf::from("mushroomdb-data");
-    let mut nodes = None;
-    let mut relationships = None;
+    let mut inputs = import::ImportInputs::default();
     let mut opts = import::ImportOptions::default();
     let mut i = 0;
     while i < args.len() {
@@ -2043,9 +2198,17 @@ fn parse_import(args: &[&str]) -> Result<Command, String> {
             opts.ignore_errors = true;
             i += 1;
         } else if let Some(v) = flag_value(args, &mut i, "--nodes")? {
-            nodes = Some(PathBuf::from(v));
+            inputs.nodes_csv = Some(PathBuf::from(v));
         } else if let Some(v) = flag_value(args, &mut i, "--relationships")? {
-            relationships = Some(PathBuf::from(v));
+            inputs.rels_csv = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--nodes-jsonl")? {
+            inputs.nodes_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--edges-jsonl")? {
+            inputs.edges_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--jsonl")? {
+            inputs.stream_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--rules-jsonl")? {
+            inputs.rules_jsonl = Some(PathBuf::from(v));
         } else if let Some(v) = flag_value(args, &mut i, "--db")? {
             db_dir = PathBuf::from(v);
         } else if let Some(v) = flag_value(args, &mut i, "--delimiter")? {
@@ -2068,13 +2231,15 @@ fn parse_import(args: &[&str]) -> Result<Command, String> {
             return Err(format!("unexpected argument: {a}"));
         }
     }
-    if nodes.is_none() && relationships.is_none() {
-        return Err("import needs --nodes <file>, --relationships <file>, or both".to_string());
+    if inputs == import::ImportInputs::default() {
+        return Err(
+            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl, --rules-jsonl or --jsonl"
+                .to_string(),
+        );
     }
     Ok(Command::Import {
         db_dir,
-        nodes,
-        relationships,
+        inputs,
         opts,
     })
 }
@@ -2083,21 +2248,25 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut dest = None;
     let mut format = ExportFormat::Jsonl;
+    let mut single_file = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--format" {
+        if a == "--single-file" {
+            single_file = true;
+            i += 1;
+        } else if a == "--format" {
             let val = args
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --format".to_string())?;
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--format=") {
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 1;
         } else if a.starts_with('-') {
@@ -2114,6 +2283,12 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
     }
     let db_dir = db_dir.ok_or_else(|| "export requires <db-dir>".to_string())?;
     let dest = dest.ok_or_else(|| "export requires <dest>".to_string())?;
+    if single_file {
+        if format != ExportFormat::Jsonl {
+            return Err("--single-file goes with --format jsonl".to_string());
+        }
+        format = ExportFormat::JsonlSingle;
+    }
     Ok(Command::Export {
         db_dir,
         dest,
@@ -2125,6 +2300,73 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
 pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> {
     let db = GraphDb::open(db_dir)?;
     Ok(db.backup_to(dest)?)
+}
+
+/// Where `restore` writes when `--into` is not given.
+pub const DEFAULT_RESTORE_INTO: &str = "restored";
+
+/// `mushroomdb restore --from s3://…`: download, verify and install a restore
+/// point into `into` (default [`DEFAULT_RESTORE_INTO`]) with
+/// [`backup::restore_from_s3`], and say what was restored.
+pub fn run_restore_s3(
+    from: &str,
+    at: Option<&str>,
+    into: Option<&Path>,
+) -> Result<String, CliError> {
+    let target = at
+        .map(backup::RestoreTarget::parse)
+        .transpose()
+        .map_err(CliError)?;
+    let into = into.map_or_else(|| PathBuf::from(DEFAULT_RESTORE_INTO), Path::to_path_buf);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let out = rt
+        .block_on(backup::restore_from_s3(from, target, &into))
+        .map_err(|e| CliError(format!("restore from {from} failed: {e}")))?;
+    Ok(format_restore_s3(from, target, &out))
+}
+
+/// Format a [`backup::RestoreS3Outcome`] for display.
+pub fn format_restore_s3(
+    from: &str,
+    at: Option<backup::RestoreTarget>,
+    out: &backup::RestoreS3Outcome,
+) -> String {
+    let mut s = String::new();
+    let point = at.map_or_else(|| "the newest restore point".to_string(), |t| t.to_string());
+    writeln!(s, "restored {from} at {point} into {}", out.into.display()).unwrap();
+    writeln!(s, "  manifest: {}", out.manifest).unwrap();
+    writeln!(s, "  commits: {}", out.commits).unwrap();
+    writeln!(s, "  files: {}", out.files.join(", ")).unwrap();
+    writeln!(s, "  segments: {}", out.segments).unwrap();
+    writeln!(s, "  bytes: {}", out.bytes).unwrap();
+    for path in &out.swept {
+        writeln!(
+            s,
+            "  removed a killed restore's leftover: {}",
+            path.display()
+        )
+        .unwrap();
+    }
+    if let Some(note) = &out.install_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    if let Some(note) = &out.tail_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    writeln!(
+        s,
+        "  lineage: {} (new; restored from {})",
+        out.lineage, out.source_lineage
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "back this store up to a new prefix: the one it came from belongs to the source"
+    )
+    .unwrap();
+    s
 }
 
 /// [`mushroomdb::restore::restore_if_empty`], in the CLI's error type.
@@ -2151,58 +2393,141 @@ pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
     out
 }
 
-/// Bulk-load CSV files into `db_dir`; the text `mushroomdb import` prints.
+/// Bulk-load CSV and JSONL files into `db_dir`; `mushroomdb import`.
 pub fn run_import(
     db_dir: &Path,
-    nodes: Option<&Path>,
-    relationships: Option<&Path>,
+    inputs: &import::ImportInputs,
     opts: &import::ImportOptions,
 ) -> Result<import::ImportReport, CliError> {
-    import::run_import(db_dir, nodes, relationships, opts)
+    import::run_import_inputs(db_dir, inputs, opts, &mut |_| {})
+}
+
+/// The warning line for NaN and infinite floats, which JSON and CSV cannot
+/// carry; empty when there are none.
+fn non_finite_note(stats: &export::ExportStats) -> String {
+    match stats.non_finite_floats {
+        0 => String::new(),
+        n => format!(
+            "warning: {n} NaN or infinite float values cannot be written in this format and were left out\n"
+        ),
+    }
+}
+
+fn export_summary(
+    dest: &Path,
+    format: &ExportFormat,
+    stats: &export::ExportStats,
+    rule_count: usize,
+    extra: &str,
+) -> String {
+    let manual = stats.edges - stats.derived_edges;
+    let mut out = format!(
+        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+        dest.display(),
+        format.name(),
+        stats.nodes,
+        manual,
+        rule_count
+    );
+    if stats.derived_edges > 0 {
+        let _ = writeln!(
+            out,
+            "{} derived edges are not written; they belong to their rules",
+            stats.derived_edges
+        );
+    }
+    out.push_str(extra);
+    out
 }
 
 /// Export all data from `db_dir` to `dest` in `format`.
+///
+/// JSONL, CSV and Cypher stream: the store is read node by node and the files
+/// are written as it goes. Parquet and GraphML build their whole file in
+/// memory, so they read the store whole.
 pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
-    let nodes = db.all_nodes_for_export();
-    let edges = db.all_edges_for_export();
     let mut rules = db.rules();
     rules.sort_by(|a, b| a.name.cmp(&b.name));
-    let node_count = nodes.len();
-    let edge_count = edges.len();
     let rule_count = rules.len();
     match format {
         ExportFormat::Jsonl => {
-            export::write_jsonl(&nodes, &edges, &rules, dest)?;
+            let stats = export::write_jsonl(&db, &rules, dest)?;
+            // JSONL has always counted every edge, derived included.
             Ok(format!(
-                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n{}",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
-                rule_count
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
             ))
         }
+        ExportFormat::JsonlSingle => {
+            let stats = export::write_jsonl_single(&db, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}, single file): {} nodes, {} edges, {} rules\n{}",
+                dest.display(),
+                format.name(),
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
+            ))
+        }
+        ExportFormat::Csv => {
+            let stats = export::write_csv(&db, &rules, dest)?;
+            let note = non_finite_note(&stats);
+            Ok(export_summary(dest, format, &stats, rule_count, &note))
+        }
+        ExportFormat::Cypher => {
+            let (stats, loss) = export::write_cypher(&db, dest)?;
+            let mut extra = String::new();
+            if rule_count > 0 {
+                extra.push_str(&format!(
+                    "{rule_count} rules are not written: Cypher has no statement for one\n"
+                ));
+            }
+            if loss.ids_added > 0 {
+                extra.push_str(&format!(
+                    "warning: {} nodes had no id property and gain one, equal to their key, when the file is run\n",
+                    loss.ids_added
+                ));
+            }
+            if loss.typed_properties + loss.unwritable_numbers + loss.differing_ids > 0 {
+                extra.push_str(&format!(
+                    "warning: not written to the Cypher file: {} properties of the date, time, duration or binary types, \
+                     {} NaN, infinite or -2^63 numbers or names with a line break, {} nodes whose id property is not their key\n",
+                    loss.typed_properties, loss.unwritable_numbers, loss.differing_ids
+                ));
+            }
+            Ok(export_summary(dest, format, &stats, 0, &extra))
+        }
         ExportFormat::Parquet => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             export::write_parquet(&nodes, &edges, &rules, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
                 rule_count
             ))
         }
         // GraphML has no rule analogue: only nodes and edges are written.
         ExportFormat::Graphml => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             let file_path = export::write_graphml(&nodes, &edges, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges\n",
                 file_path.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
             ))
         }
     }
@@ -2724,6 +3049,61 @@ fn parse_positional(
         return Err(format!("unexpected extra argument: {}", rest[max]));
     }
     Ok((db_dir, rest))
+}
+
+fn parse_keys(args: &[&str]) -> Result<Command, String> {
+    match args.first().copied() {
+        Some("hash") if args.len() == 1 => Ok(Command::KeysHash),
+        Some("hash") => Err("keys hash takes no arguments; it reads the token from stdin".into()),
+        Some("add") => {
+            let mut positional: Vec<&str> = Vec::new();
+            let mut tier: Option<String> = None;
+            let mut role: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--tier" | "--role" => {
+                        let flag = args[i];
+                        i += 1;
+                        let value = args
+                            .get(i)
+                            .ok_or_else(|| format!("{flag} requires a value"))?;
+                        let slot = if flag == "--tier" {
+                            &mut tier
+                        } else {
+                            &mut role
+                        };
+                        if slot.replace((*value).to_string()).is_some() {
+                            return Err(format!("{flag} given twice"));
+                        }
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unexpected flag: {flag}"))
+                    }
+                    other => positional.push(other),
+                }
+                i += 1;
+            }
+            let [db_dir, name] = positional.as_slice() else {
+                return Err("keys add requires <db-dir> <name>".into());
+            };
+            let tier = tier.ok_or("keys add requires --tier admin|write|read")?;
+            match (tier.as_str(), role.is_some()) {
+                ("admin" | "write", false) => {}
+                ("admin" | "write", true) => return Err("--role goes only with --tier read".into()),
+                ("read", true) => {}
+                ("read", false) => return Err("--tier read requires --role <name>".into()),
+                _ => return Err("--tier must be admin, write or read".into()),
+            }
+            Ok(Command::KeysAdd {
+                db_dir: PathBuf::from(*db_dir),
+                name: (*name).to_string(),
+                tier,
+                role,
+            })
+        }
+        _ => Err("keys requires a subcommand: add or hash".into()),
+    }
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -3334,6 +3714,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3363,6 +3744,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3395,6 +3777,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
@@ -3790,6 +4173,65 @@ mod tests {
     }
 
     #[test]
+    fn the_shutdown_plan_uses_the_nominal_split_with_room_and_scales_without() {
+        let s = Duration::from_secs;
+        // Default timeout, default backup bound: 25 + 8 + 22.
+        let p = shutdown_plan(s(55), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(8), s(22)));
+        // More room goes to the snapshot.
+        let p = shutdown_plan(s(100), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(53), s(22)));
+        // Less room: every phase shrinks, and the sum never exceeds the timeout.
+        for total in [1, 2, 5, 10, 25, 40, 54] {
+            for bound in [0, 1, 3, 22, 60] {
+                let p = shutdown_plan(s(total), s(bound));
+                assert!(
+                    p.drain + p.snapshot + p.backup <= s(total),
+                    "{total}/{bound}: {p:?}"
+                );
+                assert!(p.drain <= s(SHUTDOWN_DRAIN_SECS));
+                if bound == 0 {
+                    assert_eq!(p.backup, Duration::ZERO);
+                } else {
+                    assert!(p.backup <= s(bound).min(s(total)));
+                    assert!(p.backup >= s(2).min(s(bound)).min(s(total)), "{p:?}");
+                }
+            }
+        }
+        // 25 s with backup: the backup keeps a real share.
+        let p = shutdown_plan(s(25), s(22));
+        assert!(p.backup >= s(9) && p.drain >= s(10), "{p:?}");
+    }
+
+    #[test]
+    fn serve_shutdown_timeout_parses_seconds_and_defaults_to_55() {
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(55)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", "90"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(90)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs=7"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(7)),
+            other => panic!("{other:?}"),
+        }
+        for bad in ["0", "nope"] {
+            let err =
+                parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", bad]).unwrap_err();
+            assert!(err.contains("shutdown-timeout-secs"), "{err}");
+        }
+        assert!(parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs"]).is_err());
+    }
+
+    #[test]
     fn serve_snapshot_every_parses_seconds() {
         match parse_args(&["serve", "/tmp/db", "--snapshot-every", "30"]).unwrap() {
             Command::Serve { snapshot_every, .. } => {
@@ -3957,6 +4399,41 @@ mod tests {
             "synced sha",
         ] {
             assert!(!text.contains(stale), "usage still says {stale:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keys_subcommands() {
+        match parse_args(&["keys", "add", "/d", "app", "--tier", "write"]).unwrap() {
+            Command::KeysAdd {
+                name, tier, role, ..
+            } => assert_eq!((name.as_str(), tier.as_str(), role), ("app", "write", None)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["keys", "add", "/d", "t", "--role", "r", "--tier", "read"]).unwrap() {
+            Command::KeysAdd { tier, role, .. } => {
+                assert_eq!((tier.as_str(), role.as_deref()), ("read", Some("r")))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&["keys", "hash"]),
+            Ok(Command::KeysHash)
+        ));
+        for bad in [
+            vec!["keys"],
+            vec!["keys", "hash", "x"],
+            vec!["keys", "add", "/d", "app"],
+            vec!["keys", "add", "/d", "--tier", "write"],
+            vec!["keys", "add", "/d", "app", "--tier", "read"],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--role", "r"],
+            vec!["keys", "add", "/d", "app", "--tier", "root"],
+            vec![
+                "keys", "add", "/d", "app", "--tier", "write", "--tier", "read",
+            ],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--bogus"],
+        ] {
+            assert!(parse_args(&bad).is_err(), "{bad:?}");
         }
     }
 
@@ -4601,6 +5078,72 @@ mod tests {
             }
             other => panic!("backup parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_restore_takes_from_at_and_into() {
+        assert_eq!(
+            parse_args(&["restore", "--from", "s3://b/p"]),
+            Ok(Command::RestoreS3 {
+                from: "s3://b/p".into(),
+                at: None,
+                into: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&[
+                "restore",
+                "--from=minio://b/p",
+                "--at",
+                "75",
+                "--into",
+                "/tmp/r",
+            ]),
+            Ok(Command::RestoreS3 {
+                from: "minio://b/p".into(),
+                at: Some("75".into()),
+                into: Some(PathBuf::from("/tmp/r")),
+            })
+        );
+        match parse_args(&["restore", "--from", "s3://b", "--at=2026-10-01T12:00:00Z"]) {
+            Ok(Command::RestoreS3 { at, .. }) => {
+                assert_eq!(at.as_deref(), Some("2026-10-01T12:00:00Z"))
+            }
+            other => panic!("restore parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_refuses_what_it_cannot_use() {
+        for (args, needle) in [
+            (vec!["restore"], "--from"),
+            (vec!["restore", "--into", "x"], "--from"),
+            (
+                vec!["restore", "--from", "s3://b", "--at", "yesterday"],
+                "RFC 3339",
+            ),
+            (vec!["restore", "--from", "s3://b", "--at"], "missing value"),
+            (
+                vec!["restore", "--from", "s3://b", "extra"],
+                "unexpected argument",
+            ),
+            (
+                vec!["restore", "--from", "s3://b", "--force"],
+                "unexpected flag",
+            ),
+        ] {
+            let e = parse_args(&args).unwrap_err();
+            assert!(e.contains(needle), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn restore_with_a_bad_url_fails_before_touching_anything() {
+        let parent = tmp("restore-bad-url");
+        let into = parent.join("restored");
+        let e = run_restore_s3("gs://b/p", None, Some(&into)).unwrap_err();
+        assert!(e.0.contains("--from"), "{e}");
+        assert!(!into.exists());
     }
 
     #[test]

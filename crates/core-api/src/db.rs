@@ -38,8 +38,13 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod ddl;
 mod row_eval;
 mod unwind_write;
+
+pub(crate) use ddl::{
+    ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
+};
 
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
@@ -415,7 +420,7 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
 /// multiplicity opt-in — and writes no
 /// node, edge or property. These are the records a truncating snapshot
 /// re-emits into its baseline WAL.
-fn is_declaration(rec: &WalRecord) -> bool {
+pub(crate) fn is_declaration(rec: &WalRecord) -> bool {
     matches!(
         rec,
         WalRecord::EnableFulltext { .. }
@@ -426,7 +431,7 @@ fn is_declaration(rec: &WalRecord) -> bool {
             | WalRecord::DropConstraint { .. }
             | WalRecord::EnableRangeIndex { .. }
             | WalRecord::DisableRangeIndex { .. }
-    ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
+    ) || rec.is_multiplicity_decl()
 }
 
 /// Database-wide counters plus per-rule budget/fire stats.
@@ -562,12 +567,12 @@ impl SlowQuerySink {
     }
 }
 
-/// Whether `rec` declares or drops an equality index, inside a batch or not.
-fn declares_an_index(rec: &WalRecord) -> bool {
+/// Whether `rec` declares or withdraws an index or a constraint, inside a
+/// batch or not (see [`is_declaration`]).
+fn declares_schema(rec: &WalRecord) -> bool {
     match rec {
-        WalRecord::EnableIndex { .. } | WalRecord::DisableIndex { .. } => true,
-        WalRecord::Batch(inner) => inner.iter().any(declares_an_index),
-        _ => false,
+        WalRecord::Batch(inner) => inner.iter().any(declares_schema),
+        rec => is_declaration(rec),
     }
 }
 
@@ -1956,6 +1961,10 @@ pub struct GraphDb<F: Fs> {
     /// it opened and nothing replayed over it since has spoiled it, so the
     /// open did not build it.
     fulltext_loaded: bool,
+    /// `true` when a declaration was applied since the last fold built its
+    /// `SchemaListing`, so the next fold builds it again instead of sharing
+    /// the previous fold's.
+    schema_stale: bool,
     /// Set by the insert arms of `apply` when they index a node that is
     /// already indexed under that field. `add_tokens` appends, so that node's
     /// postings are now doubled: the WAL being replayed holds writes the
@@ -2883,6 +2892,7 @@ impl<F: Fs> GraphDb<F> {
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
             fulltext_loaded: false,
+            schema_stale: true,
             fulltext_reindexed_a_node: false,
             base_wal_truncated: false,
             fulltext_reindexed_at_open: 0,
@@ -2963,6 +2973,7 @@ impl<F: Fs> GraphDb<F> {
         self.view_store = ViewStore::new();
         self.fulltext = Arc::new(FulltextIndex::new());
         self.prop_index = Arc::new(PropertyIndex::new());
+        self.schema_stale = true;
         // Cleared like every other declaration: a reload replays the store's own
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
@@ -4481,6 +4492,17 @@ impl<F: Fs> GraphDb<F> {
         self.fold_with(derived);
     }
 
+    /// The listing the next fold carries: the previous fold's when no
+    /// declaration was applied since, else built afresh.
+    fn fold_schema(&mut self) -> Arc<SchemaListing> {
+        let listing = match &self.fold_overlay {
+            Some(previous) if !self.schema_stale => Arc::clone(&previous.schema),
+            _ => Arc::new(self.schema_listing()),
+        };
+        self.schema_stale = false;
+        listing
+    }
+
     fn fold_with(&mut self, derived: crate::reader::DerivedEdges) {
         // The fold holds every edge property as it stands, so nothing written
         // so far (replay, a refresh, a commit's own writes) is owed to a delta.
@@ -4510,6 +4532,7 @@ impl<F: Fs> GraphDb<F> {
             roles: self.roles.clone().map(std::sync::Arc::new),
             prop_index: std::sync::Arc::clone(&self.prop_index),
             derived,
+            schema: self.fold_schema(),
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
@@ -4760,7 +4783,9 @@ impl<F: Fs> GraphDb<F> {
         //
         // A declaration writes no node and no edge, and its arm reads no rule
         // index, so it does not start the scan.
-        if !is_declaration(rec) {
+        if is_declaration(rec) {
+            self.schema_stale = true;
+        } else {
             self.populate_indexes_before_write();
         }
         // A V11-only record makes the store V11 however it arrives: a live
@@ -7182,10 +7207,11 @@ impl<F: Fs> GraphDb<F> {
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
-            // A commit that declares or drops an equality index folds too: a
-            // snapshot answers indexed lookups from the fold's index, and the
-            // fold's pairs must be the store's (see `ReaderSnapshot::query_index`).
-            let fold = view_values.is_none() || declares_an_index(&rec);
+            // A commit that declares or drops an index or a constraint folds
+            // too: a snapshot answers indexed lookups from the fold's index,
+            // and `SHOW` from the fold's listing, so both must be the store's
+            // (see `ReaderSnapshot::query_index`).
+            let fold = view_values.is_none() || declares_schema(&rec);
             // Every edge whose properties this commit wrote — a rule's weights
             // above all, which no record carries — as the commit left it.
             let edge_props = if self.edge_props.has_touched() {
@@ -9304,6 +9330,7 @@ impl<F: Fs> GraphDb<F> {
         match core_storage::fulltext::FulltextIndex::from_blob(bytes) {
             Some((index, node_count)) if node_count as usize == self.ids.len() => {
                 self.fulltext = Arc::new(index);
+                self.schema_stale = true;
                 self.fulltext_loaded = true;
             }
             _ => eprintln!(
@@ -9566,7 +9593,9 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
     /// - [`GraphError::QueryError`]: a range index named `name` already
-    ///   exists; `(label, field)` already has a range index; or a view owns
+    ///   exists; `name` begins with `eq_` or `ft_` (reserved for the names
+    ///   `SHOW INDEXES` lists equality and full-text indexes under);
+    ///   `(label, field)` already has a range index; or a view owns
     ///   `(label, field)`.
     ///
     /// # Format
@@ -9576,6 +9605,9 @@ impl<F: Fs> GraphDb<F> {
     pub fn enable_range_index(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
+        }
+        if let Some(err) = ddl::reserved_index_name(name) {
+            return Err(err);
         }
         if self.prop_index.range_index(name).is_some() {
             return Err(GraphError::QueryError {
@@ -11215,6 +11247,22 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // A role's write scope names labels and edge types; the schema is
+        // outside every scope, so a role never changes it. `SHOW` is a read.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(ddl::schema_change_for_a_role());
+            }
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            return Ok(self.schema_listing().show_visible(
+                &stmt,
+                &self.view(),
+                &authz.mask.visible,
+            ));
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -11701,6 +11749,7 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         for (label, field) in owned {
             Arc::make_mut(&mut self.prop_index).disable(&label, &field);
+            self.schema_stale = true;
             // Once per pair per open: the only signal that a query on it now
             // scans, where the declaration said it would not.
             eprintln!(
@@ -11769,6 +11818,12 @@ impl<F: Fs> GraphDb<F> {
         })?;
         if is_write_tokens(&tokens) {
             return Err(GraphError::MaskedReadOnly);
+        }
+        // `SHOW …` lists only the labels the mask lets the caller see.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return Ok(self
+                .schema_listing()
+                .show_visible(&stmt, &self.view(), &mask.visible));
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -12350,6 +12405,130 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.dst.cmp(&b.dst))
         });
         edges
+    }
+
+    /// [`all_nodes_for_export`](Self::all_nodes_for_export), one node at a time.
+    ///
+    /// Calls `each` with every live node in key order, and stops at its first
+    /// `Err`. Only the sorted list of node ids (four bytes a node) is held; a
+    /// node's property map is built when it is handed over and dropped when
+    /// `each` returns, so an export's memory does not grow with the properties
+    /// of the store.
+    pub fn for_each_node_for_export<E>(
+        &self,
+        mut each: impl FnMut(NodeInfo) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let pv = self.props_view();
+        let fields = pv.field_names();
+        let mut ids: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX && self.syms.resolve(sym).is_some())
+            })
+            .collect();
+        ids.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+        for id in ids {
+            let (Some(key), Some(&sym)) = (self.ids.key_of(id), self.labels.get(id as usize))
+            else {
+                continue;
+            };
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            let mut props = BTreeMap::new();
+            for field in &fields {
+                if let Some(vr) = pv.get(id, field) {
+                    props.insert(field.clone(), vr.into_value());
+                }
+            }
+            each(NodeInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                props,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// [`all_edges_for_export`](Self::all_edges_for_export), one edge at a
+    /// time, in the same `(edge_type, src, dst)` order.
+    ///
+    /// Held at once: the sorted node ids, the edge types, and the derived-edge
+    /// provenance as borrowed rule names (twelve bytes and a pointer per derived
+    /// edge, none for a store with no rules). One source node's out-edges at a
+    /// time are materialised.
+    pub fn for_each_edge_for_export<E>(
+        &self,
+        mut each: impl FnMut(ExportEdge) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let mut prov: HashMap<(u32, u32, u32), &str> = HashMap::new();
+        for (rule_name, triples) in self.engine.provenance() {
+            for &triple in triples {
+                prov.insert(triple, rule_name.as_str());
+            }
+        }
+        let weight_props: HashMap<&str, Option<&str>> = self
+            .engine
+            .rules()
+            .map(|r| (r.name.as_str(), r.weight_prop.as_deref()))
+            .collect();
+        let tv = self.topo_view();
+        let ep = self.edge_props_view();
+
+        let mut etypes: Vec<(&str, u32)> = tv
+            .etypes()
+            .filter_map(|sym| self.syms.resolve(sym).map(|name| (name, sym)))
+            .collect();
+        etypes.sort();
+        let mut srcs: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX)
+            })
+            .collect();
+        srcs.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+
+        for (edge_type, etype_sym) in etypes {
+            for &id in &srcs {
+                let Some(src) = self.ids.key_of(id) else {
+                    continue;
+                };
+                let mut out: Vec<(&str, u32)> = tv
+                    .neighbors(etype_sym, Direction::Out, id)
+                    .as_ref()
+                    .iter()
+                    .filter_map(|&nbr| self.ids.key_of(nbr).map(|k| (k, nbr)))
+                    .collect();
+                out.sort();
+                for (dst, nbr) in out {
+                    let rule = prov.get(&(etype_sym, id, nbr)).copied();
+                    let weight = rule
+                        .and_then(|rn| weight_props.get(rn).copied().flatten())
+                        .and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                            Some(Value::Float(f)) => Some(f),
+                            Some(Value::Int(i)) => Some(i as f64),
+                            _ => None,
+                        });
+                    each(ExportEdge {
+                        edge_type: edge_type.to_string(),
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                        derived: rule.is_some(),
+                        rule: rule.map(str::to_string),
+                        weight,
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What each edge type *is*, without building one record per edge.
@@ -13201,6 +13380,14 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `SHOW INDEXES` / `SHOW CONSTRAINTS` are reads; a statement that
+        // changes the schema is a write, and this entry point does not write.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(schema_change_on_a_read());
+            }
+            return Ok(self.schema_listing().show(&stmt));
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -13263,6 +13450,9 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return self.exec_ddl(stmt);
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;

@@ -21,11 +21,11 @@ def db(tmp_path):
 
 
 def test_recall_says_no_index_before_anything_is_remembered(db):
-    assert db.recall("Matthew") == {"indexed": False, "terms": 0, "hits": []}
+    assert db.memory.recall("Matthew") == {"indexed": False, "terms": 0, "hits": []}
 
 
 def test_remember_then_recall_returns_the_note_as_a_row(db):
-    report = db.remember("Matthew prefers concise summaries", about=["matthew"], ts=TS)
+    report = db.memory.remember("Matthew prefers concise summaries", about=["matthew"], ts=TS)
 
     assert report["note"].startswith("note:")
     assert report["provisional"] == ["matthew"], "an unknown subject is stubbed, not refused"
@@ -35,7 +35,7 @@ def test_remember_then_recall_returns_the_note_as_a_row(db):
     assert db.node_info("matthew")["label"] == "Entity"
     assert db.neighbors(report["note"], "ABOUT", "out") == ["matthew"]
 
-    rows = db.recall("Matthew")
+    rows = db.memory.recall("Matthew")
     assert rows["indexed"] is True
     assert rows["terms"] == 1
     note = next(h for h in rows["hits"] if h["key"] == report["note"])
@@ -43,15 +43,15 @@ def test_remember_then_recall_returns_the_note_as_a_row(db):
     assert note["covered"] == 1
     assert note["summary"] == "Matthew prefers concise summaries"
 
-    assert db.recall("zebra")["hits"] == []
+    assert db.memory.recall("zebra")["hits"] == []
 
     # The same text at the same ts is the same note, not a second one.
-    again = db.remember("Matthew prefers concise summaries", about=["matthew"], ts=TS)
+    again = db.memory.remember("Matthew prefers concise summaries", about=["matthew"], ts=TS)
     assert again["note"] == report["note"]
 
 
 def test_remember_writes_entities_and_facts_in_the_same_call(db):
-    report = db.remember(
+    report = db.memory.remember(
         "Matthew is driving the 0.7 release",
         about=["matthew", "matthew"],
         ts=TS,
@@ -68,7 +68,7 @@ def test_remember_writes_entities_and_facts_in_the_same_call(db):
 
 def test_entities_and_facts_take_any_sequence_as_the_stub_says(db):
     """The stub types both `Sequence`, as it does `about`; a tuple is one."""
-    report = db.remember(
+    report = db.memory.remember(
         "Matthew is driving the 0.7 release",
         about=("matthew",),
         ts=TS,
@@ -82,24 +82,24 @@ def test_entities_and_facts_take_any_sequence_as_the_stub_says(db):
     # A str is a sequence of str to Python, and never a list of dicts here.
     nodes = db.stats()["nodes_live"]
     with pytest.raises(TypeError, match="entities"):
-        db.remember("x", ts=TS + 1, entities="v0.7")
+        db.memory.remember("x", ts=TS + 1, entities="v0.7")
     with pytest.raises(TypeError, match="facts"):
-        db.remember("x", ts=TS + 1, facts="matthew")
+        db.memory.remember("x", ts=TS + 1, facts="matthew")
     with pytest.raises(TypeError, match="entities"):
-        db.remember("x", ts=TS + 1, entities={"key": "k", "label": "L"})
+        db.memory.remember("x", ts=TS + 1, entities={"key": "k", "label": "L"})
     assert db.stats()["nodes_live"] == nodes
 
 
 def test_a_bad_kind_and_bad_shapes_are_refused_before_anything_is_written(db):
     with pytest.raises(IngestError) as err:
-        db.remember("a rumour", kind="rumour")
+        db.memory.remember("a rumour", kind="rumour")
     assert "kind must be one of" in err.value.detail
     with pytest.raises(TypeError):
-        db.remember("x", entities=["not-a-dict"])
+        db.memory.remember("x", entities=["not-a-dict"])
     with pytest.raises(ValueError, match="label"):
-        db.remember("x", entities=[{"key": "k"}])
+        db.memory.remember("x", entities=[{"key": "k"}])
     with pytest.raises(ValueError, match="object"):
-        db.remember("x", facts=[{"subject": "a", "predicate": "P"}])
+        db.memory.remember("x", facts=[{"subject": "a", "predicate": "P"}])
     assert db.stats()["nodes_live"] == 0
 
 
@@ -107,7 +107,7 @@ def test_a_bad_kind_and_bad_shapes_are_refused_before_anything_is_written(db):
 def test_an_empty_key_is_refused_and_nothing_is_written(db, key):
     """Defect 76: a key with nothing in it used to be stubbed like any other
     unknown key, leaving an `Entity` keyed by the empty string."""
-    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    db.memory.remember("Ada wrote the first one", about=["ada"], ts=TS)
     before = (db.stats(), db.wal_total_commits())
     calls = {
         "remember: about[1]": dict(about=["ada", key]),
@@ -123,12 +123,12 @@ def test_an_empty_key_is_refused_and_nothing_is_written(db, key):
     }
     for argument, kwargs in calls.items():
         with pytest.raises(IngestError) as err:
-            db.remember("a note that must not land", ts=TS + 1, **kwargs)
+            db.memory.remember("a note that must not land", ts=TS + 1, **kwargs)
         assert err.value.detail == (
             f"{argument} must not be empty or only whitespace, got {json.dumps(key)}"
         )
     with pytest.raises(IngestError) as err:
-        db.upsert_entity(key, {"name": "Nobody"}, label="Person")
+        db.memory.upsert_entity(key, {"name": "Nobody"}, label="Person")
     assert err.value.detail == (
         f"key must not be empty or only whitespace, got {json.dumps(key)}"
     )
@@ -142,12 +142,12 @@ def test_an_empty_key_is_refused_and_nothing_is_written(db, key):
 def test_an_empty_predicate_or_label_is_refused_and_nothing_is_written(db, blank):
     """Defect 77: a fact's predicate became an edge type and an entity's label
     a node label and a full-text declaration, whatever was in them."""
-    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    db.memory.remember("Ada wrote the first one", about=["ada"], ts=TS)
     before = (db.stats(), db.wal_total_commits(), db.fulltext_pairs())
     good = {"key": "v0.7", "label": "Release"}
 
     with pytest.raises(IngestError) as err:
-        db.remember(
+        db.memory.remember(
             "a fact with no predicate",
             ts=TS + 1,
             entities=[good],
@@ -157,14 +157,14 @@ def test_an_empty_predicate_or_label_is_refused_and_nothing_is_written(db, blank
         f"remember: facts[0].predicate must not be empty or only whitespace, got {json.dumps(blank)}"
     )
     with pytest.raises(IngestError) as err:
-        db.remember(
+        db.memory.remember(
             "an entity with no label", ts=TS + 1, entities=[good, {"key": "widget", "label": blank}]
         )
     assert err.value.detail == (
         f"remember: entities[1].label must not be empty or only whitespace, got {json.dumps(blank)}"
     )
     with pytest.raises(IngestError) as err:
-        db.upsert_entity("gizmo", {"name": "Gizmo"}, label=blank)
+        db.memory.upsert_entity("gizmo", {"name": "Gizmo"}, label=blank)
     assert err.value.detail == (
         f"label must not be empty or only whitespace, got {json.dumps(blank)}"
     )
@@ -180,7 +180,7 @@ def test_a_store_that_already_holds_an_empty_type_edge_and_label_still_answers(t
     reopens and answers with them there, and `forget` removes both."""
     path = str(tmp_path / "db")
     db = GraphDb.open(path)
-    db.remember("Ada wrote the first one", about=["ada", "bob"], ts=TS)
+    db.memory.remember("Ada wrote the first one", about=["ada", "bob"], ts=TS)
     db.insert_edge("", "ada", "bob")
     db.insert_node("", "widget", {"name": "Widget"})
     db.close()
@@ -189,12 +189,12 @@ def test_a_store_that_already_holds_an_empty_type_edge_and_label_still_answers(t
     try:
         assert db.node_info("widget")["label"] == ""
         assert db.stats()["nodes_live"] == 4 and db.stats()["edges"] == 3
-        assert db.recall("Ada")["hits"][0]["label"] == "Note"
-        assert db.schema_report()["brief"]["nodes"] == 4
+        assert db.memory.recall("Ada")["hits"][0]["label"] == "Note"
+        assert db.memory.schema_report()["brief"]["nodes"] == 4
 
-        gone = db.forget(fact={"subject": "ada", "predicate": "", "object": "bob"})
+        gone = db.memory.forget(fact={"subject": "ada", "predicate": "", "object": "bob"})
         assert gone["mode"] == "fact" and gone["changed"] is True
-        assert db.forget(key="widget")["changed"] is True
+        assert db.memory.forget(key="widget")["changed"] is True
         assert db.stats()["nodes_live"] == 3 and db.stats()["edges"] == 2
     finally:
         db.close()
@@ -206,21 +206,21 @@ def test_a_store_that_already_holds_an_empty_key_node_still_answers(tmp_path):
     there, and `forget` removes it."""
     path = str(tmp_path / "db")
     db = GraphDb.open(path)
-    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    db.memory.remember("Ada wrote the first one", about=["ada"], ts=TS)
     db.upsert_node("Entity", "", {"name": "", "provisional": True})
-    db.insert_edge("ABOUT", db.recall("Ada")["hits"][0]["key"], "")
+    db.insert_edge("ABOUT", db.memory.recall("Ada")["hits"][0]["key"], "")
     db.close()
 
     db = GraphDb.open(path)
     try:
         assert db.node_info("")["label"] == "Entity"
         assert db.stats()["nodes_live"] == 3
-        assert db.recall("Ada")["hits"][0]["label"] == "Note"
-        assert db.schema_report()["provisional"] >= 1
+        assert db.memory.recall("Ada")["hits"][0]["label"] == "Note"
+        assert db.memory.schema_report()["provisional"] >= 1
         with pytest.raises(IngestError):
-            db.remember("more of the same", about=[""], ts=TS + 1)
+            db.memory.remember("more of the same", about=[""], ts=TS + 1)
 
-        gone = db.forget(key="")
+        gone = db.memory.forget(key="")
         assert gone["mode"] == "node" and gone["changed"] is True
         assert db.node_info("") is None
         assert db.stats()["nodes_live"] == 2
@@ -230,10 +230,10 @@ def test_a_store_that_already_holds_an_empty_key_node_still_answers(tmp_path):
 
 def test_upsert_entity_maintains_aliases_and_clears_a_provisional_mark(db):
     with pytest.raises(IngestError) as err:
-        db.upsert_entity("ada", {"name": "Ada Lovelace"})
+        db.memory.upsert_entity("ada", {"name": "Ada Lovelace"})
     assert err.value.detail == "label required when creating a new entity"
 
-    made = db.upsert_entity(
+    made = db.memory.upsert_entity(
         "ada", {"name": "Ada Lovelace", "id": "ignored"}, label="Person", aliases=["Countess"]
     )
     assert made == {
@@ -251,44 +251,44 @@ def test_upsert_entity_maintains_aliases_and_clears_a_provisional_mark(db):
     assert props["aliases"] == ["ada", "ada lovelace", "lovelace"]
     assert props["alias_keys"] == ["Countess"], "declared aliases, as written"
 
-    again = db.upsert_entity("ada", {"role": "analyst"})
+    again = db.memory.upsert_entity("ada", {"role": "analyst"})
     assert again["created"] is False and again["updated_fields"] == 1
     assert again["label"] == "Person"
 
     # `aliases` is recomputed from the current name, not accumulated; a
     # declared alias accumulates.
-    db.upsert_entity("ada", {"name": "Ada King"}, aliases=["AAL"])
+    db.memory.upsert_entity("ada", {"name": "Ada King"}, aliases=["AAL"])
     props = db.node_info("ada")["props"]
     assert props["aliases"] == ["ada", "ada king", "king"], "the old name's words are gone"
     assert props["alias_keys"] == ["AAL", "Countess"]
 
     with pytest.raises(IngestError) as err:
-        db.upsert_entity("ada", {"role": "x"}, label="Org")
+        db.memory.upsert_entity("ada", {"role": "x"}, label="Org")
     assert "cannot relabel" in err.value.detail
     assert db.node_info("ada")["props"]["role"] == "analyst", "refused before anything was written"
 
     with pytest.raises(IngestError) as err:
-        db.upsert_entity("ada", {"aliases": ["x"]})
+        db.memory.upsert_entity("ada", {"aliases": ["x"]})
     assert "aliases" in err.value.detail
 
     # A stub stops being provisional the moment anything describes it.
-    db.remember("Matt reviewed it", about=["matt"], ts=TS)
+    db.memory.remember("Matt reviewed it", about=["matt"], ts=TS)
     assert db.node_info("matt")["props"]["provisional"] is True
-    db.upsert_entity("matt", {"name": "Matt"})
+    db.memory.upsert_entity("matt", {"name": "Matt"})
     assert "provisional" not in db.node_info("matt")["props"]
 
 
 def test_upsert_entity_namespace_argument_and_props_must_agree(db):
-    db.upsert_entity("doc-1", {"name": "Doc"}, label="Concept", namespace="team-a")
+    db.memory.upsert_entity("doc-1", {"name": "Doc"}, label="Concept", namespace="team-a")
     assert db.node_info("doc-1")["props"]["ns"] == "team-a"
     with pytest.raises(ValueError, match="one or the other"):
-        db.upsert_entity("doc-2", {"ns": "team-b"}, label="Concept", namespace="team-a")
+        db.memory.upsert_entity("doc-2", {"ns": "team-b"}, label="Concept", namespace="team-a")
     assert db.node_info("doc-2") is None
 
 
 def test_schema_report_counts_what_remember_stubbed(db):
-    db.remember("Matthew reviewed it", about=["matthew"], ts=TS)
-    report = db.schema_report()
+    db.memory.remember("Matthew reviewed it", about=["matthew"], ts=TS)
+    report = db.memory.schema_report()
     assert set(report) == {
         "brief",
         "rules",
@@ -305,19 +305,19 @@ def test_schema_report_counts_what_remember_stubbed(db):
 
 
 def test_forget_reports_what_is_left_behind(db):
-    note = db.remember("Ada likes Rust", about=["ada"], ts=TS)["note"]
+    note = db.memory.remember("Ada likes Rust", about=["ada"], ts=TS)["note"]
 
     with pytest.raises(ValueError, match="exactly one"):
-        db.forget()
+        db.memory.forget()
     with pytest.raises(ValueError, match="exactly one"):
-        db.forget(prop="name")
+        db.memory.forget(prop="name")
     with pytest.raises(KeyNotFound):
-        db.forget(key="nobody")
+        db.memory.forget(key="nobody")
 
-    absent = db.forget(key="ada", prop="no_such_prop")
+    absent = db.memory.forget(key="ada", prop="no_such_prop")
     assert absent["mode"] == "prop" and absent["changed"] is False
 
-    gone = db.forget(key="ada")
+    gone = db.memory.forget(key="ada")
     assert gone["mode"] == "node"
     assert gone["target"] == "ada (Entity)"
     assert gone["changed"] is True
@@ -342,19 +342,19 @@ def test_forget_refuses_a_rule_derived_fact_and_names_the_rule(db):
     db.insert_node("Person", "a", {"team": "red"})
     db.insert_node("Person", "b", {"team": "red"})
     with pytest.raises(RuleOwned) as err:
-        db.forget(fact={"subject": "a", "predicate": "SAME_TEAM", "object": "b"})
+        db.memory.forget(fact={"subject": "a", "predicate": "SAME_TEAM", "object": "b"})
     assert "is derived by rule same_team" in err.value.detail
     assert "(team)" in err.value.detail
     assert db.neighbors("a", "SAME_TEAM", "out") == ["b"], "nothing was written"
 
     db.insert_edge("KNOWS", "a", "b")
-    done = db.forget(fact={"subject": "a", "predicate": "KNOWS", "object": "b"})
+    done = db.memory.forget(fact={"subject": "a", "predicate": "KNOWS", "object": "b"})
     assert done["mode"] == "fact" and done["changed"] is True
     assert done["target"] == "KNOWS a → b"
 
 
 def test_identity_clusters_resolves_same_as_links(db):
-    assert db.identity_clusters() == {"clusters": [], "linked": 0, "claims": 0, "floor": 0.6}
+    assert db.memory.identity_clusters() == {"clusters": [], "linked": 0, "claims": 0, "floor": 0.6}
 
     # One rule of the identity preset, made by hand: the preset itself is a
     # CLI step (`schema apply --memory-identity`).
@@ -370,10 +370,10 @@ def test_identity_clusters_resolves_same_as_links(db):
     )
     # Two keys, one full name. Each carries four aliases — its key, "john
     # smith", "john", "smith" — and they share three of five: 3/5 = 0.6.
-    db.upsert_entity("john-smith-nyc", {"name": "John Smith"}, label="Person")
-    db.upsert_entity("john-smith-sf", {"name": "John Smith"}, label="Person")
+    db.memory.upsert_entity("john-smith-nyc", {"name": "John Smith"}, label="Person")
+    db.memory.upsert_entity("john-smith-sf", {"name": "John Smith"}, label="Person")
 
-    report = db.identity_clusters()
+    report = db.memory.identity_clusters()
     assert report["claims"] == 1, "both directions of the link are one claim"
     assert report["linked"] == 2
     assert len(report["clusters"]) == 1
@@ -382,7 +382,7 @@ def test_identity_clusters_resolves_same_as_links(db):
     assert cluster["members"] == ["john-smith-nyc", "john-smith-sf"]
     assert cluster["weakest"] == pytest.approx(0.6)
 
-    assert db.identity_clusters(floor=0.9)["clusters"] == []
+    assert db.memory.identity_clusters(floor=0.9)["clusters"] == []
 
 
 def test_a_rule_derived_refusal_is_the_bare_sentence(db):
@@ -406,7 +406,7 @@ def test_a_rule_derived_refusal_is_the_bare_sentence(db):
     db.insert_node("Person", "b", {"team": "red"})
 
     with pytest.raises(RuleOwned) as err:
-        db.forget(fact={"subject": "a", "predicate": "SAME_TEAM", "object": "b"})
+        db.memory.forget(fact={"subject": "a", "predicate": "SAME_TEAM", "object": "b"})
     assert str(err.value) == err.value.detail
     assert str(err.value).startswith("refused: SAME_TEAM a → b is derived by rule same_team.")
     assert "rule-owned" not in str(err.value)
@@ -418,9 +418,9 @@ def test_a_rule_derived_refusal_is_the_bare_sentence(db):
 
 
 def test_forgetting_a_name_takes_its_words_out_of_aliases(db):
-    db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+    db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
 
-    done = db.forget(key="ada", prop="name")
+    done = db.memory.forget(key="ada", prop="name")
     assert done["mode"] == "prop" and done["prop"] == "name"
     assert done["target"] == "ada.name"
     assert done["changed"] is True
@@ -432,7 +432,7 @@ def test_forgetting_a_name_takes_its_words_out_of_aliases(db):
     assert props["alias_keys"] == ["Countess"], "what was declared is not the name's to take"
 
     # Forgetting the derived list itself leaves the declared one, and says so.
-    left = db.forget(key="ada", prop="aliases")
+    left = db.memory.forget(key="ada", prop="aliases")
     assert left["aliases_rewritten"] is False
     assert left["alias_keys_remain"] is True
 
@@ -448,17 +448,17 @@ def test_upsert_entity_reports_the_identity_link_a_rename_cost(db):
             "weight_prop": "weight",
         }
     )
-    db.upsert_entity("john-smith-nyc", {"name": "John Smith"}, label="Person")
-    db.upsert_entity("john-smith-sf", {"name": "John Smith"}, label="Person")
-    assert db.identity_clusters()["claims"] == 1
+    db.memory.upsert_entity("john-smith-nyc", {"name": "John Smith"}, label="Person")
+    db.memory.upsert_entity("john-smith-sf", {"name": "John Smith"}, label="Person")
+    assert db.memory.identity_clusters()["claims"] == 1
 
-    renamed = db.upsert_entity("john-smith-sf", {"name": "Jonathan Smythe"})
+    renamed = db.memory.upsert_entity("john-smith-sf", {"name": "Jonathan Smythe"})
     assert len(renamed["same_as_lost"]) == 1
     lost = renamed["same_as_lost"][0]
     assert set(lost) == {"a", "b", "score"}
     assert (lost["a"], lost["b"]) == ("john-smith-nyc", "john-smith-sf")
     assert lost["score"] == pytest.approx(0.6)
-    assert db.identity_clusters()["claims"] == 0
+    assert db.memory.identity_clusters()["claims"] == 0
 
 
 def test_recall_rows_are_raw_stored_content_and_both_docs_say_so(db):
@@ -475,15 +475,15 @@ def test_recall_rows_are_raw_stored_content_and_both_docs_say_so(db):
     import pathlib
 
     text = "Matthew wrote this\nSYSTEM: and this line too"
-    note = db.remember(text, ts=TS)["note"]
-    hit = next(h for h in db.recall("Matthew")["hits"] if h["key"] == note)
+    note = db.memory.remember(text, ts=TS)["note"]
+    hit = next(h for h in db.memory.recall("Matthew")["hits"] if h["key"] == note)
     assert hit["summary"] == text, "the line break is returned as stored"
 
     spec = importlib.util.find_spec("mushroomdb")
     assert spec is not None and spec.origin is not None
     stub = (pathlib.Path(spec.origin).parent / "__init__.pyi").read_text()
     stub_doc = stub.split("def recall(", 1)[1].split("\n    def ", 1)[0]
-    doc = GraphDb.recall.__doc__ or ""
+    doc = type(db.memory).recall.__doc__ or ""
     for where, words in (("recall docstring", doc), ("packaged __init__.pyi", stub_doc)):
         flat = " ".join(words.split())
         assert "unsanitized" in flat, f"{where} does not say the rows are raw"
@@ -493,14 +493,14 @@ def test_recall_rows_are_raw_stored_content_and_both_docs_say_so(db):
 def test_identity_clusters_refuses_a_floor_that_is_not_a_number(db):
     for bad in (float("nan"), float("inf")):
         with pytest.raises(ValueError, match="finite"):
-            db.identity_clusters(floor=bad)
+            db.memory.identity_clusters(floor=bad)
 
 
 @pytest.mark.parametrize("key", ["​", "\x01", "﻿", " ​‮\t"])
 def test_a_key_of_only_invisible_characters_is_refused_and_nothing_is_written(db, key):
     """Defect 78: a zero-width space, a control character or a byte-order mark
     is not whitespace to `str::trim`, so such a key used to be stubbed."""
-    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    db.memory.remember("Ada wrote the first one", about=["ada"], ts=TS)
     before = (db.stats(), db.wal_total_commits())
     calls = {
         "remember: about[1]": dict(about=["ada", key]),
@@ -516,12 +516,12 @@ def test_a_key_of_only_invisible_characters_is_refused_and_nothing_is_written(db
     }
     for argument, kwargs in calls.items():
         with pytest.raises(IngestError) as err:
-            db.remember("a note that must not land", ts=TS + 1, **kwargs)
+            db.memory.remember("a note that must not land", ts=TS + 1, **kwargs)
         assert err.value.detail.startswith(
             f"{argument} must not be only invisible characters, got "
         )
     with pytest.raises(IngestError) as err:
-        db.upsert_entity(key, {"name": "Nobody"}, label="Person")
+        db.memory.upsert_entity(key, {"name": "Nobody"}, label="Person")
     assert err.value.detail.startswith("key must not be only invisible characters, got ")
 
     assert (db.stats(), db.wal_total_commits()) == before, "a refusal writes nothing"

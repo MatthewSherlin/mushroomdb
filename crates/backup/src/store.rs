@@ -4,6 +4,7 @@ use crate::BackupError;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, Checksum, S3ConditionalPut};
 use object_store::ObjectStore;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Default WAL-segment cadence (`MUSHROOMDB_BACKUP_WAL_INTERVAL_MS`).
 pub const DEFAULT_WAL_INTERVAL_MS: u64 = 1000;
@@ -13,6 +14,9 @@ pub const DEFAULT_MANIFEST_INTERVAL_S: u64 = 60;
 pub const DEFAULT_RETAIN_N: usize = 7;
 /// Default bucket-lease TTL in seconds (`MUSHROOMDB_BACKUP_LEASE_TTL`).
 pub const DEFAULT_LEASE_TTL_S: u64 = 30;
+/// Slack added to [`BackupConfig::shutdown_budget`] for task scheduling.
+pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(2);
+
 /// Default deadline on each object-store operation (`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`).
 pub const DEFAULT_OP_TIMEOUT_MS: u64 = 10_000;
 /// Default bound on the shutdown flush (`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS`).
@@ -152,6 +156,37 @@ impl BackupConfig {
             op_timeout_ms: DEFAULT_OP_TIMEOUT_MS,
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
         }
+    }
+
+    /// The longest a shutdown can keep the process alive on account of the
+    /// backup: the flush's grace, then the lease release (one request, one
+    /// `op_timeout_ms`), plus [`SHUTDOWN_MARGIN`] for scheduling. The serve
+    /// loop waits this long for the worker, so a platform's stop timeout
+    /// must exceed it by whatever the HTTP drain and the shutdown snapshot
+    /// take (see the deployment guide).
+    pub fn shutdown_budget(&self) -> Duration {
+        Duration::from_millis(self.shutdown_grace_ms.saturating_add(self.op_timeout_ms))
+            + SHUTDOWN_MARGIN
+    }
+
+    /// Shrink the flush grace and the request deadline until they, plus a
+    /// margin of at most [`SHUTDOWN_MARGIN`], fit in `within`, keeping their
+    /// ratio. Does nothing when [`shutdown_budget`](Self::shutdown_budget)
+    /// already fits. For a serve whose whole shutdown window is shorter than
+    /// the configured bounds: the lease release still gets a request deadline
+    /// of its own.
+    pub fn fit_shutdown_within(&mut self, within: Duration) {
+        let budget = self.shutdown_budget();
+        if budget <= within {
+            return;
+        }
+        let margin = SHUTDOWN_MARGIN.min(within / 5);
+        let room = within.saturating_sub(margin).as_secs_f64();
+        let used = (self.shutdown_grace_ms.saturating_add(self.op_timeout_ms)) as f64 / 1000.0;
+        let ratio = (room / used).min(1.0);
+        let scale = |ms: u64| ((ms as f64 * ratio) as u64).max(100);
+        self.shutdown_grace_ms = scale(self.shutdown_grace_ms);
+        self.op_timeout_ms = scale(self.op_timeout_ms);
     }
 
     /// The bucket and prefix `s3_url` names.
@@ -353,6 +388,37 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lease_conditional
+        );
+    }
+
+    #[test]
+    fn the_shutdown_budget_covers_the_flush_and_the_lease_release() {
+        let mut c = BackupConfig::new("s3://b/p");
+        assert_eq!(c.shutdown_budget(), Duration::from_secs(22));
+        c.shutdown_grace_ms = 3_000;
+        c.op_timeout_ms = 1_000;
+        assert_eq!(c.shutdown_budget(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_tight_shutdown_window_shrinks_the_bounds_to_fit() {
+        let mut c = BackupConfig::new("s3://b/p");
+        c.fit_shutdown_within(Duration::from_secs(30));
+        assert_eq!(c.shutdown_budget(), Duration::from_secs(22), "already fits");
+        c.fit_shutdown_within(Duration::from_secs(10));
+        let worst = |c: &BackupConfig, within: Duration| {
+            Duration::from_millis(c.shutdown_grace_ms + c.op_timeout_ms)
+                + SHUTDOWN_MARGIN.min(within / 5)
+        };
+        assert!(
+            worst(&c, Duration::from_secs(10)) <= Duration::from_secs(10),
+            "{c:?}"
+        );
+        assert!(c.op_timeout_ms >= 100 && c.shutdown_grace_ms >= 100);
+        c.fit_shutdown_within(Duration::from_millis(300));
+        assert!(
+            worst(&c, Duration::from_millis(300)) <= Duration::from_millis(300),
+            "{c:?}"
         );
     }
 

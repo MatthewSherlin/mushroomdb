@@ -203,9 +203,11 @@ holder can stop renewing because it died, or because it is shutting down in a
 rolling deploy. Either way the waiting instance takes over within one TTL plus
 one check, at most 40 s at the default.
 
-Deleting the lease on a clean shutdown, so that a successor can start at once,
-arrives with graceful shutdown (HO-11). Until then, a stopped holder's lease
-expires after its TTL.
+A clean shutdown (SIGTERM or SIGINT) deletes the lease, so a successor holds it
+within a few seconds instead of waiting out the TTL (see
+[Stopping cleanly](#stopping-cleanly-and-the-grace-period)). A holder that is
+killed, or that cannot reach the bucket in time, leaves the lease to expire
+after its TTL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -242,9 +244,10 @@ service:
 
 **One store per prefix.** The first backup of a store gives it a lineage, the
 `backup.lineage` file in the data directory, and every restore point names it.
-Once HO-09/HO-10 land, a restore from the prefix will start a new lineage.
-Until then, restore into a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for the
-restored store somewhere fresh. The worker refuses the prefix in three cases:
+`mushroomdb restore --from` gives the store it restores a new lineage (see
+[Restoring from the backup](#restoring-from-the-backup)), so back a restored
+store up to a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for it somewhere
+fresh. The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -267,14 +270,184 @@ just written or the one `LATEST` names.
 - **On a best-effort service**, two writers overlapping until the next renewal
   can overwrite each other's objects. A restore point can then fail to
   verify. Run best-effort only where a single writer is otherwise assured.
-- **A store restored from an older backup, which has since written more commits
-  than the prefix's newest restore point,** passes the commit check. Its new
-  restore points are its own and verify. The prefix's older history is not
-  removed, though, so give such a store a new prefix.
+- **A copy of a store made by hand** (its directory copied with `cp`, say,
+  rather than restored) keeps the original's lineage. If it is older than the
+  prefix's newest restore point and has since written more commits than that
+  restore point holds, it passes the commit check. Its new restore points are
+  its own and verify, but the prefix's other history is not removed. Restore
+  with `mushroomdb restore`, which gives the copy a new lineage, or give such a
+  copy a new prefix.
 
-This rewound-store case is tracked as row 138 of the
+This is tracked as row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
-a release blocker that closes when every restore gets a new lineage.
+a release blocker. It stays open until restore on boot, which is not built
+yet, gives the store it restores a new lineage too.
+
+## Restoring from the backup
+
+```text
+mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+```
+
+`--from` is the `MUSHROOMDB_BACKUP_S3_URL` the store was backed up to
+(`s3://`, `r2://` or `minio://`). Credentials and the endpoint come from the
+same `AWS_*` variables backup uses. The store is written to `--into`, by
+default `./restored`, which must not exist yet or be an empty directory (not a
+mount point: restore into a directory inside one). A restore never writes over
+anything.
+
+Without `--at`, the newest restore point is restored: the one `LATEST` names,
+plus the segments of its generation uploaded after it, up to the last
+contiguous one. A restore of the newest backup loses at most the segment
+cadence, not the manifest interval.
+
+`--at` picks a point in time:
+
+- `--at 75` restores the store as it was right after commit 75. Commits are
+  numbered as `asof --commit` numbers them, from 0, and the restored store
+  holds 76.
+- `--at 2026-10-01T12:00:00Z` restores the last commit at or before that
+  instant (RFC 3339), resolved through the backup's `commit_times.bin`, as a
+  date query resolves it. A backup without that file cannot restore by time,
+  and the command says so.
+- The times come from the newest restore point's `commit_times.bin`. Segments
+  uploaded after that restore point hold commits with no recorded time. An
+  instant at or after the newest recorded time could fall after some of them,
+  so it is refused with an error naming the last commit with a time, its index
+  and when it was: restore an earlier instant, by commit index
+  (`--at <commit index>`) instead, or without `--at` for the newest. An instant before
+  the newest recorded time resolves as above.
+
+A point in time is restored from the earliest restore point of the backup's
+lineage that holds it, then cut back to that commit. The result is what
+`asof --commit` shows at that commit, as an ordinary store that takes writes.
+A commit is out of reach when it is below the oldest commit the backup holds
+(the error names that commit), past the newest, or before a truncating snapshot
+or archive retention cut the history it needs.
+
+Before anything is written to `--into`, every file and segment is downloaded
+into a staging directory beside it, a hidden `.<name>.restore-…` directory in
+the same parent, and checked against its manifest: size, CRC-32, generation,
+offsets, frames and lineage. Segments uploaded after the newest restore point
+are named by no manifest. They are checked by their own frame checksums, size
+and offsets, and the restore takes them up to the first one that is missing,
+damaged or after a gap, and says so if it stops early. `commit_times.bin` is
+trimmed to the commits restored, so the store stamps its own next commit. The
+copy is then opened and must hold the commits the manifest says it does.
+
+Every file is fsynced, and the staging directory then becomes `--into` in one
+directory rename. So `--into` is always either as it was, absent or empty, or
+the whole restored store, and never part of one, even after a crash.
+
+- An existing empty `--into` is replaced by the staging directory, on every
+  platform, so its permissions and ownership are not kept: the restored
+  directory has the ones the restore created it with. On Unix the replacement
+  is the rename itself. Elsewhere the empty directory is removed first; if the
+  rename then fails, it is created again where possible, and the error says
+  whether it was.
+- Once the rename has happened the restore has succeeded. If syncing the
+  parent directory afterwards fails, the command still succeeds and prints a
+  warning: the store is in place, but its directory entry may not survive a
+  power loss until the system syncs it.
+- A restore that fails removes the staging directory. One killed outright
+  leaves it behind, beside its lock file
+  (`.<name>.restore-<pid>-<tag>.lock`), and it can hold a whole copy of the
+  store. The next restore into the same `--into` removes such leftovers whose
+  lock no running restore holds, and lists what it removed. Nothing else in
+  the directory is touched.
+
+If segments uploaded after the newest restore point exist but cannot be used
+(the first one missing or damaged, or a later one after a gap), the restore of
+the newest point still succeeds with what it can verify and warns, naming how
+many segments and bytes of WAL were not restored and why.
+
+`roles.json` and `keys.json` are restored as the chosen restore point holds
+them. They are not cut back to a point in time: roles and keys are current
+state, not history, as they are for `asof`.
+
+**A restored store is a new lineage.** It gets a new `backup.lineage`, so its
+backups can never be confused with the ones it came from. Pointed at the
+prefix it was restored from, the backup worker refuses it: it uploads nothing
+and deletes nothing there. Back it up to a new prefix.
+
+## Stopping cleanly, and the grace period
+
+On SIGTERM or SIGINT `serve` stops in three phases, all inside one deadline,
+`--shutdown-timeout-secs` (default 55):
+
+| Phase | What happens | Bound at the defaults |
+| --- | --- | --- |
+| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. Whatever is still open at the bound is cut off. | 25 s |
+| 2. Snapshot | Write the shutdown snapshot. If it has not finished by its bound it is skipped: the WAL holds every commit and the next open replays it. | 8 s (what is left) |
+| 3. Backup | Tell the backup worker to stop. It uploads the last WAL segment and the new snapshot, writes a final restore point, and deletes the bucket lease (only if it still names this instance). | 22 s |
+
+The arithmetic: the backup phase is reserved first. It is
+`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` (10 s) plus one request deadline,
+`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` (10 s), plus 2 s, which is 22 s. The drain
+takes at most 25 s, or less if the deadline leaves less after that reserve. The
+snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
+time to the next one.
+
+**The phases scale with `--shutdown-timeout-secs`.** With at least 55 s (more
+goes to the snapshot) the split above holds. With less, all three phases shrink
+in proportion, but the backup keeps a floor of 2 s and the drain gives way
+first, because a stuck client is what stretches it. The backup's own flush grace
+and request deadline are shrunk to fit its share, so the lease release still
+has a request deadline of its own. At `--shutdown-timeout-secs 25`, for
+example, the drain gets about 11 s, the snapshot about 3 s and the backup about
+10 s. The whole sequence never exceeds the timeout.
+
+Every phase runs even when an earlier one ran out, so the lease is released
+whenever the bucket is reachable. If the bucket is unreachable the log says so,
+the process exits, and the lease expires by itself after its TTL. No
+acknowledged write is lost in any of these cases, because the WAL holds every
+commit.
+
+| Variable or flag | Default | Meaning |
+| --- | --- | --- |
+| `--shutdown-timeout-secs` | `55` | The whole shutdown must finish within this many seconds |
+| `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take before the upload in flight is abandoned |
+| `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request, including the lease release |
+
+**A second SIGTERM or SIGINT exits at once.** An operator who presses Ctrl-C
+twice on a slow shutdown gets an immediate exit. The log says that the backup
+lease, if held, expires on its own after its TTL (at most 40 s until a
+successor holds it).
+
+**Set the platform's stop timeout above `--shutdown-timeout-secs`.** A platform
+that sends SIGKILL earlier cuts the sequence short. Nothing is lost, but the
+lease is left behind and the next start waits for it. The Fly, Compose and Railway templates use 60 s.
+If you raise `--shutdown-timeout-secs`, raise the platform's value by the same
+amount.
+
+| Platform | Setting | Default | Template |
+| --- | --- | --- | --- |
+| Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
+| Docker Compose | `stop_grace_period` | 10 s | `60s` |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
+| Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
+| Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |
+
+Sources, read 2026-10-22:
+[Fly.io configuration](https://docs.fly.io/reference/configuration),
+[Render deploys](https://render.com/docs/deploys) and
+[blueprint spec](https://render.com/docs/blueprint-spec),
+[Railway config as code](https://docs.railway.com/config-as-code/reference).
+Railway's default and maximum are not documented there, so they are
+unverified. Compose and Kubernetes defaults are the tools' standard ones.
+
+**On Render with a disk the window is a fixed 30 s**, shorter than the 55 s
+default, so the Render template sets `--shutdown-timeout-secs 25`. Raising the
+platform value is not possible there; if you drop the disk, you may set
+`maxShutdownDelaySeconds` and a longer `--shutdown-timeout-secs`.
+
+**Backup health never gates `/ready`.** `/ready` answers 503 only until the
+store is open. A rolling deploy starts the new instance while the old one still
+holds the lease, so the new one is backup-unhealthy until the old one stops. If
+`/ready` followed backup health, the platform would never route traffic to the
+new instance and never stop the old one. Watch backup health in the log (it
+warns while the lease is foreign), not through `/ready`.
 
 ## Loopback-first posture
 

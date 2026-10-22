@@ -29,6 +29,9 @@ services:
     # Local development: explicit command, no --demo-if-empty. For a throwaway
     # demo store, append "--demo-if-empty" here. Production never does.
     restart: unless-stopped
+    # Time between SIGTERM and SIGKILL. serve drains, snapshots, then flushes
+    # the backup and deletes its bucket lease; 60 s covers that at the defaults.
+    stop_grace_period: 60s
     command: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
     depends_on:
       minio:
