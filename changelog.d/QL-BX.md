@@ -1,7 +1,6 @@
 #### BREAKING
 
 - **A WHERE predicate that evaluates to null now filters the row, including under NOT.** `WHERE`, `CASE WHEN` and a list comprehension's `WHERE` evaluate three-valued, as openCypher does: `WHERE NOT n.x = 1` no longer returns the nodes that have no `x`, and `WHERE NOT (a AND null)` drops a row whose `a` is true. Before, a comparison with a null side read as false and `NOT` turned it into true, so these queries returned extra rows (defect ledger row 133, present in 0.9.x). A write statement's `WHERE` writes only the rows a read keeps. Queries without a `NOT` over a null return what they did.
-- **The operands of `AND`, `OR`, `XOR` and `NOT` must be booleans or null.** Anything else is a named error, `type error: AND expects boolean operands, got an integer (…)`, as openCypher specifies: `WHERE n.age AND n.active`, `RETURN 1 AND true` and `NOT 'a'` used to read the number or string as true or false. A whole `WHERE` that is a bare value (`WHERE n.flag`) still reads a non-boolean as true unless it is empty or zero.
 - **Expressions nest at most 64 levels deep.** Parentheses, function arguments, list and map elements and `CASE` branches count together; deeper input is the named parse error `expression nesting too deep`. Function-call and `RETURN` parenthesis nesting had no limit before (very deep input could overflow the stack); `WHERE` parentheses and literals were already capped at 64 each.
 
 ### Fixed

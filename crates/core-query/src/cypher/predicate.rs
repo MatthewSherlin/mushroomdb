@@ -14,8 +14,7 @@ use core_storage::Value;
 const MAX_DEPTH: u32 = 256;
 
 /// Evaluate `expr` three-valued. `resolve` gives an operand's value (`None` is
-/// null); `error` builds the error for a predicate nested past the limit and
-/// for a non-boolean operand of `AND`, `OR`, `XOR` or `NOT`.
+/// null); `error` builds the error for a predicate nested past the limit.
 pub fn eval_predicate<E>(
     expr: &Expr,
     resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
@@ -24,10 +23,11 @@ pub fn eval_predicate<E>(
     eval(expr, resolve, error, 0)
 }
 
-/// How a value reads as a whole predicate (the root of a WHERE, a CASE WHEN
-/// or a comprehension filter, `WHERE n.flag`): a boolean is itself, null is
-/// null, and any other value is true unless it is empty or zero. An operand of
-/// `AND`, `OR`, `XOR` or `NOT` is not read this way; it must be a boolean.
+/// How a value reads as a predicate, at the root of a WHERE (`WHERE n.flag`)
+/// and as an operand of `AND`, `OR`, `XOR` or `NOT` alike: a boolean is
+/// itself, null is null, and any other value is true unless it is empty or
+/// zero. (openCypher makes a non-boolean operand a type error; that strict
+/// form is planned for a later release.)
 pub fn truthy(value: &Value) -> Option<bool> {
     Some(match value {
         Value::Null => return None,
@@ -46,24 +46,6 @@ pub fn truthy(value: &Value) -> Option<bool> {
     })
 }
 
-/// The name of a value's type, for a type error.
-fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Int(_) => "an integer",
-        Value::Float(_) => "a float",
-        Value::Str(_) => "a string",
-        Value::List(_) => "a list",
-        Value::Map(_) => "a map",
-        Value::Binary(_) => "binary",
-        Value::Date(_) => "a date",
-        Value::LocalDateTime(_) => "a local datetime",
-        Value::DateTime { .. } => "a datetime",
-        Value::Duration { .. } => "a duration",
-    }
-}
-
 fn eval<E>(
     expr: &Expr,
     resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
@@ -73,12 +55,12 @@ fn eval<E>(
     if depth > MAX_DEPTH {
         return Err(error("expression nesting too deep".to_string()));
     }
+    let sub = |e: &Expr, resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>| {
+        eval(e, resolve, error, depth + 1)
+    };
     Ok(match expr {
         Expr::And(l, r) => {
-            let (l, r) = (
-                bool_operand(l, "AND", resolve, error, depth)?,
-                bool_operand(r, "AND", resolve, error, depth)?,
-            );
+            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
             match (l, r) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -86,10 +68,7 @@ fn eval<E>(
             }
         }
         Expr::Or(l, r) => {
-            let (l, r) = (
-                bool_operand(l, "OR", resolve, error, depth)?,
-                bool_operand(r, "OR", resolve, error, depth)?,
-            );
+            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
             match (l, r) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -97,16 +76,13 @@ fn eval<E>(
             }
         }
         Expr::Xor(l, r) => {
-            let (l, r) = (
-                bool_operand(l, "XOR", resolve, error, depth)?,
-                bool_operand(r, "XOR", resolve, error, depth)?,
-            );
+            let (l, r) = (sub(l, resolve)?, sub(r, resolve)?);
             match (l, r) {
                 (Some(a), Some(b)) => Some(a != b),
                 _ => None,
             }
         }
-        Expr::Not(inner) => bool_operand(inner, "NOT", resolve, error, depth)?.map(|b| !b),
+        Expr::Not(inner) => sub(inner, resolve)?.map(|b| !b),
         Expr::Cmp { lhs, op, rhs } => {
             let (l, r) = (resolve(lhs)?, resolve(rhs)?);
             match (l, r) {
@@ -122,36 +98,6 @@ fn eval<E>(
             in_list(needle.as_ref(), list, resolve)?
         }
     })
-}
-
-/// An operand of `AND`, `OR`, `XOR` or `NOT`: a predicate, or a value that
-/// must be a boolean or null (openCypher raises a type error for anything
-/// else).
-#[inline]
-fn bool_operand<E>(
-    expr: &Expr,
-    op: &str,
-    resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
-    error: &dyn Fn(String) -> E,
-    depth: u32,
-) -> Result<Option<bool>, E> {
-    match expr {
-        Expr::Truthy(o) => match resolve(o)? {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::Bool(b)) => Ok(Some(b)),
-            Some(other) => Err(error(not_a_boolean(op, &other))),
-        },
-        other => eval(other, resolve, error, depth + 1),
-    }
-}
-
-/// The type error for a non-boolean operand of `op`.
-#[cold]
-fn not_a_boolean(op: &str, value: &Value) -> String {
-    format!(
-        "type error: {op} expects boolean operands, got {} ({value:?})",
-        type_name(value)
-    )
 }
 
 /// `needle IN list`: true when an element equals the needle (a list element

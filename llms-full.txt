@@ -5585,11 +5585,11 @@ compares as null under `<`, `<=`, `>` and `>=`, so `1 < 'a'`, `false < true` and
 `[1] < [2]` are all null (booleans and lists do not order). Values of different
 types are unequal (`1 = 'a'` is false).
 
-The operands of `NOT`, `AND`, `OR` and `XOR` must be booleans or null: any other
-value is the named error `type error: AND expects boolean operands, got an integer (…)`
-(`RETURN 1 AND true`, `WHERE n.age AND n.active`, `NOT 'a'`). A whole `WHERE`,
-`CASE WHEN` or comprehension filter that is a bare value, not a predicate
-(`WHERE n.flag`), reads a non-boolean as true unless it is empty or zero.
+A non-boolean operand of `NOT`, `AND`, `OR` or `XOR`, or a whole `WHERE` that is a
+bare value (`WHERE n.flag`), reads as true unless it is empty or zero (a non-empty
+string or list, a non-zero number), and null stays null: `RETURN 1 AND true` is
+true, `NOT 0` is true. **Planned:** strict boolean operands, where a non-boolean
+operand is a type error as openCypher specifies, are planned for a later release.
 
 `x IN list` takes one list on the right, an additive expression: `IN [a, b]`,
 `IN $list`, `IN n.tags`, `IN [1, 2] + [3]`. Each element is compared whole, so

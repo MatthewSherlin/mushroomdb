@@ -479,32 +479,25 @@ fn in_does_not_flatten_list_valued_elements() {
 }
 
 #[test]
-fn and_or_not_xor_refuse_a_non_boolean_operand() {
-    for (expr, op) in [
-        ("1 AND true", "AND"),
-        ("true OR 'a'", "OR"),
-        ("NOT 5", "NOT"),
-        ("[1] XOR false", "XOR"),
-    ] {
-        let err = super::tests::eval_err(expr);
-        assert!(
-            err.contains("type error") && err.contains(op),
-            "`{expr}`: {err}"
-        );
-    }
-    // Null stays null, and a boolean is fine.
+fn and_or_not_xor_coerce_a_non_boolean_operand_as_before() {
+    // 0.10 keeps base's reading of a non-boolean operand (a strict type error
+    // is planned for a later release); null stays three-valued.
+    assert_eq!(eval("1 AND true"), b(true));
+    assert_eq!(eval("0 OR false"), b(false));
+    assert_eq!(eval("NOT 5"), b(false));
+    assert_eq!(eval("NOT ''"), b(true));
+    assert_eq!(eval("[1] XOR false"), b(true));
     assert_eq!(eval("NOT n.missing"), None);
-    assert_eq!(eval("null AND true"), None);
-    assert_eq!(eval("true AND NOT false"), b(true));
-    // In a WHERE too.
+    assert_eq!(eval("null AND 1"), None);
+    assert_eq!(eval("null AND 0"), b(false));
     let fx = people();
-    let err = run(
-        &fx.view(),
-        "MATCH (n:P) WHERE n.age AND true RETURN n.key AS k",
-        &BTreeMap::new(),
-    )
-    .expect_err("a number is not a boolean");
-    assert!(err.contains("type error"), "{err}");
+    assert_eq!(
+        keys(
+            &fx,
+            "MATCH (n:P) WHERE n.age AND n.score > 10 RETURN n.key AS k ORDER BY k"
+        ),
+        vec!["a"]
+    );
 }
 
 #[test]
@@ -712,8 +705,7 @@ fn leaf() -> impl Strategy<Value = P> {
                 },
             )
         }),
-        // A bare operand is an operand of NOT / AND / OR, so it is a
-        // boolean (or null): anything else is a type error.
+        operand().prop_map(|(t, o)| P::Leaf(t, Expr::Truthy(o))),
         bool_operand().prop_map(|(t, o)| P::Leaf(t, Expr::Truthy(o))),
         Just(P::Leaf(
             "n.s STARTS WITH 'a'".to_string(),
