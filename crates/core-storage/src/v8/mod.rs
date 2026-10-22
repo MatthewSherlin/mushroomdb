@@ -3,7 +3,8 @@
 //! Wire layout (all integers LE):
 //! ```text
 //! [0..4]   MAGIC "GDB1"
-//! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
+//! [4..6]   VERSION = 8, 9, 10 or 11 (u16 LE) — same container; V9 adds section 12,
+//!          V11 adds section 18 and the typed-value columns
 //! [6..8]   section_count (u16 LE) — 14 since 0.7.2; one more with a WAL mark, one more with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
@@ -25,6 +26,8 @@
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained as undecoded bytes at open)
 //!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
+//!  13–17 = optional sections (FULLTEXT, WAL_MARK, EDGES_SWEPT, PROV_RECONCILED, DERIVED_BITS)
+//!  18 = DECLARATIONS (magic + bincode SnapshotDeclarations; V11 only)
 
 pub mod encode;
 pub mod layout;
@@ -131,6 +134,56 @@ pub const RECONCILED_MAGIC: &[u8; 4] = b"MREC";
 pub const SECTION_DERIVED_BITS: u8 = 17;
 /// The first four bytes of [`SECTION_DERIVED_BITS`].
 pub const DERIVED_BITS_MAGIC: &[u8; 4] = b"MDRV";
+/// The store's V11-era declarations: [`DECLARATIONS_MAGIC`], then a bincode
+/// [`SnapshotDeclarations`]. Written by every V11 snapshot and by no other, so
+/// a store that never opted in to V11 writes the bytes 0.9.x writes. The open
+/// restores the unique constraints and the multiplicity opt-in from it before
+/// the WAL replays, so a snapshot whose WAL was archived away before its
+/// baseline was written still carries them. Small, and CRC-checked on every
+/// read; a damaged one refuses the open rather than drop a constraint.
+pub const SECTION_DECLARATIONS: u8 = 18;
+/// The first four bytes of [`SECTION_DECLARATIONS`].
+pub const DECLARATIONS_MAGIC: &[u8; 4] = b"MDCL";
+
+/// The payload of [`SECTION_DECLARATIONS`], after its magic.
+///
+/// New fields go at the end, with `#[serde(default)]`: the section is bincode,
+/// and a reader of an older payload must still find every field it knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotDeclarations {
+    /// The store records insert-count multiplicity. V11 carries this fact
+    /// here because V11 is above V10, so the V10 stamp can no longer say it.
+    pub multiplicity: bool,
+    /// The declared unique constraints, in declaration order.
+    pub constraints: Vec<crate::types::UniqueConstraint>,
+}
+
+impl SnapshotDeclarations {
+    /// The section payload: the magic, then the bincode body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = DECLARATIONS_MAGIC.to_vec();
+        bincode::serialize_into(&mut out, self).map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: declarations serialize: {e}"),
+        })?;
+        Ok(out)
+    }
+
+    /// Read a section payload written by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    /// [`GraphError::Corrupt`] for a payload without the magic or whose body
+    /// does not decode.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(DECLARATIONS_MAGIC.as_slice())
+            .ok_or_else(|| GraphError::Corrupt {
+                detail: "v8: declarations section: bad magic".into(),
+            })?;
+        bincode::deserialize(body).map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: declarations section: {e}"),
+        })
+    }
+}
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -302,6 +355,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_EDGES_SWEPT
             | SECTION_PROV_RECONCILED
             | SECTION_DERIVED_BITS
+            | SECTION_DECLARATIONS
     )
 }
 
@@ -472,6 +526,7 @@ impl MappedBase {
             SECTION_EDGES_SWEPT => "edges_swept",
             SECTION_PROV_RECONCILED => "prov_reconciled",
             SECTION_DERIVED_BITS => "derived_bits",
+            SECTION_DECLARATIONS => "declarations",
             _ => "unknown",
         };
         self.dir
@@ -940,6 +995,29 @@ impl MappedBase {
                 .is_ok_and(|bytes| bytes == RECONCILED_MAGIC)
     }
 
+    /// The V11 declarations this snapshot carries (section 18), or `None`
+    /// for a snapshot without the section — every one before V11.
+    ///
+    /// The section is checked against its directory CRC on every call: it is
+    /// a few bytes, read once per open, and a constraint silently dropped
+    /// from a damaged one would let duplicates in.
+    ///
+    /// # Errors
+    /// [`GraphError::Corrupt`] for a section that fails its CRC or does not
+    /// decode.
+    pub fn declarations(&self) -> Result<Option<SnapshotDeclarations>> {
+        let Some(entry) = self.dir.iter().find(|e| e.id == SECTION_DECLARATIONS) else {
+            return Ok(None);
+        };
+        let bytes = self.section_bytes(SECTION_DECLARATIONS)?;
+        if crc32fast::hash(bytes) != entry.crc32 {
+            return Err(GraphError::Corrupt {
+                detail: "v8: declarations section: CRC mismatch".into(),
+            });
+        }
+        SnapshotDeclarations::decode(bytes).map(Some)
+    }
+
     /// The WAL mark this snapshot carries (section 14), if it carries one
     /// that reads back. `None` for a snapshot with no such section and for
     /// one whose mark is damaged: either way the open replays the whole WAL,
@@ -1110,6 +1188,9 @@ mod tests {
             fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
             prov_reconciled: false,
+            v11: false,
+            constraints: Vec::new(),
+            multiplicity: false,
         }
     }
 

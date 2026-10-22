@@ -5518,10 +5518,10 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
-| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
-| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
-| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
-| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
+| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
+| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
+| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. Storing a result moves the store to the V11 format |
 | `time(…)`, `localtime(…)` | | | error: `not supported in mushroomdb 0.10: time types` |
 
 ### Temporal values
@@ -5548,9 +5548,9 @@ key in a map) are not supported and give null. A map constructor takes
 integers; a `datetime` map is read as UTC. Years outside about ±5.88 million for
 `Date`, and ±292 thousand for date-times, give null.
 
-Until the V11 format ships, a temporal value cannot be stored: `SET n.d =
-date("2024-01-01")` is refused with a `not supported in mushroomdb 0.10 yet`
-error naming the type.
+A temporal value can be stored: `SET n.d = date("2024-01-01")` writes a `Date`.
+The first such write moves the store to the V11 snapshot format, which 0.9.x
+cannot read; see [Format stability](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md).
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
@@ -7964,10 +7964,12 @@ A value the store can hold: int, float, str, bool, bytes, date, datetime, Durati
 blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
 is a local date-time; an aware one is a date-time that keeps its UTC offset
 (within +-18:00, whole seconds). A value that cannot be held exactly, such as an
-offset with a fractional second, raises `ValueError` rather than being rounded.
-Reading one back gives the same Python type; a stored date outside Python's
-years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
-write that carries one is refused until the format that holds them lands.
+offset with a fractional second or a `pandas.Timestamp` with a nonzero
+`nanosecond`, raises `ValueError` rather than being rounded. Reading one back
+gives the same Python type; a stored date outside Python's years 1 to 9999
+raises `ValueError`. The first write of a `bytes`, `date`, `datetime` or
+`Duration` value moves the store to the V11 snapshot format, which 0.9.x cannot
+read.
 
 ### `Params`
 

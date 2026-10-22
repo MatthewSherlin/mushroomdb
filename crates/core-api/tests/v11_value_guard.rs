@@ -1,18 +1,19 @@
-//! Until the V11 format lands, no Date / LocalDateTime / DateTime / Duration /
-//! Binary value may reach the WAL (0.10 TY-1).
+//! Every write path stores the five 0.10 value types — Date / LocalDateTime /
+//! DateTime / Duration / Binary — and moves the store to the V11 snapshot
+//! format before the first one reaches the WAL (0.10 TY-1, TY-12, contract C9).
 //!
-//! A 0.9.x reader cannot decode a frame carrying one and stops replaying there,
-//! silently losing every later commit, while the store carries no stamp telling
-//! it to refuse. So every write path refuses such a value before anything is
-//! appended, and these tests prove it path by path: the write fails with the
-//! refusal, `wal.bin` is byte-for-byte unchanged, and the store reads the same
-//! live as after a reopen.
+//! A 0.9.x reader cannot decode a frame carrying one and would truncate the
+//! WAL there, so the order is the guard: the V11 snapshot is written first,
+//! and a 0.9.x reader stops at `snapshot: unsupported version 11` with the WAL
+//! untouched. These tests prove it path by path: the write succeeds, the
+//! snapshot on disk is V11 and the WAL that was there is still its prefix, and
+//! the store reads the same live as after a reopen.
 //!
-//! Reads are not refused: a query can still take a typed parameter and return
-//! it.
+//! A role predicate is the one place a 0.10 value is still refused:
+//! `roles.json` is not covered by the snapshot's version stamp.
 
 use mushroomdb::schema::Schema;
-use mushroomdb::{GraphError, IngestOptions, PropPredicate, RealFs, RoleDef, Value};
+use mushroomdb::{IngestOptions, PropPredicate, RealFs, RoleDef, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -67,208 +68,190 @@ fn expected_refusal(type_name: &str) -> String {
     )
 }
 
-fn assert_refused(result: Result<impl std::fmt::Debug, GraphError>, type_name: &str) {
-    match result {
-        Err(GraphError::QueryError { detail }) => assert_eq!(detail, expected_refusal(type_name)),
-        other => panic!("expected the V11 refusal for {type_name}, got {other:?}"),
-    }
-}
-
 /// A store with one node, so SET paths have a target.
 fn seeded(name: &str) -> (PathBuf, GraphDb) {
     let dir = tmp(name);
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))])
         .unwrap();
+    assert!(!db.is_v11());
     (dir, db)
 }
 
-/// After a refused write: nothing appended, the store unchanged, and a
-/// reopened store answers exactly as the never-closed one does.
-fn assert_nothing_written(dir: &Path, db: GraphDb, wal_before: &[u8]) {
-    assert_eq!(
-        wal_bytes(dir),
-        wal_before,
-        "a refused write appended to the WAL"
+/// After a successful write: the store is V11, the WAL that was there before
+/// it is still its prefix (the upgrade keeps it), and a reopened store
+/// answers `key.field` exactly as the never-closed one does.
+fn assert_upgraded_and_stored(
+    dir: &Path,
+    db: GraphDb,
+    wal_before: &[u8],
+    key: &str,
+    field: &str,
+    value: &Value,
+) {
+    assert!(db.is_v11(), "{key}.{field}: the handle is V11");
+    assert_eq!(mushroomdb::snapshot_version_at(dir).unwrap(), Some(11));
+    let wal = wal_bytes(dir);
+    assert!(
+        wal.starts_with(wal_before) && wal.len() > wal_before.len(),
+        "the upgrade keeps the WAL and the write is appended to it"
     );
-    let live = db.node_info("alice").expect("alice survives");
-    assert_eq!(live.props.get("age"), Some(&Value::Int(30)));
-    assert!(db.node_info("bob").is_none());
+    assert_eq!(db.get_prop(key, field).as_ref(), Some(value), "live");
+    let live = db.node_info(key);
+    let live_alice = db.node_info("alice");
     let live_count = db.node_count();
     drop(db);
     let reopened = GraphDb::open(dir).unwrap();
-    assert_eq!(reopened.node_info("alice"), Some(live));
+    assert!(reopened.is_v11());
+    assert_eq!(reopened.node_info(key), live, "reopened");
+    assert_eq!(reopened.node_info("alice"), live_alice);
     assert_eq!(reopened.node_count(), live_count);
 }
 
 #[test]
-fn insert_node_refuses_every_v11_type() {
-    for (type_name, value) in v11_values() {
+fn insert_node_stores_every_v11_type() {
+    for (_, value) in v11_values() {
         let (dir, mut db) = seeded("insert-node");
         let before = wal_bytes(&dir);
-        assert_refused(
-            db.insert_node("Person", "bob", vec![("born".into(), value)]),
-            type_name,
-        );
-        assert_nothing_written(&dir, db, &before);
+        db.insert_node("Person", "bob", vec![("born".into(), value.clone())])
+            .unwrap();
+        assert_upgraded_and_stored(&dir, db, &before, "bob", "born", &value);
     }
 }
 
 #[test]
-fn set_prop_refuses_every_v11_type() {
-    for (type_name, value) in v11_values() {
+fn set_prop_stores_every_v11_type() {
+    for (_, value) in v11_values() {
         let (dir, mut db) = seeded("set-prop");
         let before = wal_bytes(&dir);
-        assert_refused(db.set_prop("alice", "born", value), type_name);
-        assert_nothing_written(&dir, db, &before);
+        db.set_prop("alice", "born", value.clone()).unwrap();
+        assert_upgraded_and_stored(&dir, db, &before, "alice", "born", &value);
     }
 }
 
 #[test]
-fn set_props_refuses_a_v11_value() {
+fn set_props_stores_a_v11_value() {
     let (dir, mut db) = seeded("set-props");
     let before = wal_bytes(&dir);
-    assert_refused(
-        db.set_props(
-            "alice",
-            vec![
-                ("name".into(), Value::Str("Alice".into())),
-                ("born".into(), Value::Date(1)),
-            ],
-        ),
-        "Date",
+    db.set_props(
+        "alice",
+        vec![
+            ("name".into(), Value::Str("Alice".into())),
+            ("born".into(), Value::Date(1)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_prop("alice", "name"),
+        Some(Value::Str("Alice".into()))
     );
-    assert_nothing_written(&dir, db, &before);
+    assert_upgraded_and_stored(&dir, db, &before, "alice", "born", &Value::Date(1));
 }
 
 #[test]
-fn write_batch_refuses_the_whole_batch() {
+fn write_batch_stores_the_whole_batch() {
     let (dir, mut db) = seeded("write-batch");
     let before = wal_bytes(&dir);
-    // The V11 value is the last op: the plain ops before it must not land.
-    let result = db.write_batch(|b: &mut mushroomdb::BatchBuilder<'_, RealFs>| {
+    // The V11 value is the last op: the plain ops before it land with it.
+    db.write_batch(|b: &mut mushroomdb::BatchBuilder<'_, RealFs>| {
         b.insert_node("Person", "bob", vec![("age".into(), Value::Int(1))]);
         b.insert_edge("KNOWS", "alice", "bob");
         b.set_prop("alice", "blob", Value::Binary(vec![1]));
-    });
-    assert_refused(result, "Binary");
-    assert_nothing_written(&dir, db, &before);
+    })
+    .unwrap();
+    assert_eq!(db.edge_count(), 1);
+    assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(1)));
+    assert_upgraded_and_stored(&dir, db, &before, "alice", "blob", &Value::Binary(vec![1]));
 }
 
 #[test]
-fn ingest_json_refuses_a_tagged_value() {
+fn ingest_json_stores_a_tagged_value() {
     let (dir, mut db) = seeded("ingest-json");
     let before = wal_bytes(&dir);
     let json = r#"[{"id": "bob", "born": {"$date": "2024-01-15"}}, {"id": "carol"}]"#;
-    assert_refused(
-        db.ingest_json("Person", json, &IngestOptions::default()),
-        "Date",
-    );
-    assert_nothing_written(&dir, db, &before);
+    db.ingest_json("Person", json, &IngestOptions::default())
+        .unwrap();
+    assert!(db.node_info("carol").is_some());
+    assert_upgraded_and_stored(&dir, db, &before, "bob", "born", &Value::Date(19_737));
 }
 
 #[test]
-fn ingest_rows_refuse_a_v11_value() {
+fn ingest_rows_store_a_v11_value() {
     let (dir, mut db) = seeded("ingest-rows");
     let before = wal_bytes(&dir);
+    let span = Value::Duration {
+        months: 1,
+        days: 0,
+        nanos: 0,
+    };
     let row = BTreeMap::from([
         ("id".to_string(), Value::Str("bob".into())),
-        (
-            "span".to_string(),
-            Value::Duration {
-                months: 1,
-                days: 0,
-                nanos: 0,
-            },
-        ),
+        ("span".to_string(), span.clone()),
     ]);
-    assert_refused(
-        db.ingest("Person", vec![row], &IngestOptions::default()),
-        "Duration",
-    );
-    assert_nothing_written(&dir, db, &before);
+    db.ingest("Person", vec![row], &IngestOptions::default())
+        .unwrap();
+    assert_upgraded_and_stored(&dir, db, &before, "bob", "span", &span);
 }
 
 #[test]
-fn cypher_set_with_a_v11_parameter_is_refused() {
+fn cypher_set_with_a_v11_parameter_stores_it() {
     let (dir, mut db) = seeded("cypher-set");
     let before = wal_bytes(&dir);
     let params = BTreeMap::from([("d".to_string(), Value::LocalDateTime(5))]);
-    assert_refused(
-        db.query_write("MATCH (n:Person) WHERE n.age = 30 SET n.seen = $d", &params),
-        "LocalDateTime",
-    );
-    assert_nothing_written(&dir, db, &before);
+    db.query_write("MATCH (n:Person) WHERE n.age = 30 SET n.seen = $d", &params)
+        .unwrap();
+    assert_upgraded_and_stored(&dir, db, &before, "alice", "seen", &Value::LocalDateTime(5));
 }
 
 #[test]
-fn cypher_merge_with_a_v11_parameter_is_refused() {
+fn cypher_merge_with_a_v11_parameter_stores_it() {
     let (dir, mut db) = seeded("cypher-merge");
     let before = wal_bytes(&dir);
-    let params = BTreeMap::from([(
-        "t".to_string(),
-        Value::DateTime {
-            micros_utc: 0,
-            offset_seconds: 0,
-        },
-    )]);
-    assert_refused(
-        db.query_write(
-            "MERGE (n:Person {id: 'bob'}) ON CREATE SET n.at = $t",
-            &params,
-        ),
-        "DateTime",
-    );
-    assert_nothing_written(&dir, db, &before);
+    let at = Value::DateTime {
+        micros_utc: 0,
+        offset_seconds: 0,
+    };
+    let params = BTreeMap::from([("t".to_string(), at.clone())]);
+    db.query_write(
+        "MERGE (n:Person {id: 'bob'}) ON CREATE SET n.at = $t",
+        &params,
+    )
+    .unwrap();
+    assert_upgraded_and_stored(&dir, db, &before, "bob", "at", &at);
 }
 
+/// The upgrade runs before anything is interned: the label and field a V11
+/// write introduces replay to the ids the live handle gave them.
 #[test]
-fn a_refused_write_leaves_no_interned_name_behind() {
-    // The refused insert names a label and a field nothing else uses. If either
-    // were interned without its `Intern` record reaching the WAL, the next
-    // successful write would log ids that replay does not reproduce.
-    let (dir, mut db) = seeded("intern-rollback");
-    assert!(db
-        .insert_node("Fresh", "bob", vec![("fresh_field".into(), Value::Date(0))])
-        .is_err());
-    assert!(db.set_prop("alice", "other_fresh", Value::Date(0)).is_err());
+fn the_upgrade_leaves_interned_names_consistent() {
+    let (dir, mut db) = seeded("intern");
+    db.insert_node("Fresh", "bob", vec![("fresh_field".into(), Value::Date(0))])
+        .unwrap();
+    db.set_prop("alice", "other_fresh", Value::Date(0)).unwrap();
     db.insert_node(
         "Later",
         "carol",
         vec![("fresh_field".into(), Value::Int(7))],
     )
     .unwrap();
-    db.set_prop("alice", "other_fresh", Value::Int(8)).unwrap();
-    let live_carol = db.node_info("carol").unwrap();
-    let live_alice = db.node_info("alice").unwrap();
+    let live: Vec<_> = ["alice", "bob", "carol"]
+        .iter()
+        .map(|k| db.node_info(k))
+        .collect();
     drop(db);
     let reopened = GraphDb::open(&dir).unwrap();
-    assert_eq!(reopened.node_info("carol"), Some(live_carol));
-    assert_eq!(reopened.node_info("alice"), Some(live_alice));
-    assert_eq!(
-        reopened.node_info("carol").unwrap().label,
-        "Later",
-        "carol's label must replay as written"
-    );
+    let back: Vec<_> = ["alice", "bob", "carol"]
+        .iter()
+        .map(|k| reopened.node_info(k))
+        .collect();
+    assert_eq!(back, live);
+    assert_eq!(reopened.node_info("bob").unwrap().label, "Fresh");
+    assert_eq!(reopened.node_info("carol").unwrap().label, "Later");
 }
 
 #[test]
-fn a_refused_write_does_not_poison_the_handle() {
-    let (dir, mut db) = seeded("not-poisoned");
-    assert!(db.set_prop("alice", "x", Value::Binary(vec![])).is_err());
-    db.set_prop("alice", "x", Value::Str("ok".into())).unwrap();
-    db.snapshot().unwrap();
-    drop(db);
-    let reopened = GraphDb::open(&dir).unwrap();
-    assert_eq!(
-        reopened.node_info("alice").unwrap().props.get("x"),
-        Some(&Value::Str("ok".into()))
-    );
-}
-
-#[test]
-fn a_query_can_still_take_and_return_a_v11_parameter() {
-    let (_dir, db) = seeded("read-path");
+fn a_query_can_take_and_return_a_v11_parameter_without_upgrading() {
+    let (dir, db) = seeded("read-path");
     for (_, value) in v11_values() {
         let params = BTreeMap::from([("d".to_string(), value.clone())]);
         let rs = db
@@ -283,6 +266,8 @@ fn a_query_can_still_take_and_return_a_v11_parameter() {
         .query("MATCH (n:Person) WHERE n.age = $d RETURN n.age", &params)
         .unwrap();
     assert_eq!(rs.len(), 0);
+    assert!(!db.is_v11());
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), None);
 }
 
 fn role_with(pred: PropPredicate) -> RoleDef {

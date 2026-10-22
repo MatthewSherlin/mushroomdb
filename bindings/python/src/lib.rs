@@ -204,17 +204,15 @@ impl GraphDb {
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
-    /// Declare a unique constraint on a handle with the V11 format unlocked.
+    /// Declare a unique constraint.
     ///
     /// Test-only: built with the `test-hooks` feature and never in a wheel.
-    /// Python has no constraint API until the V11 format lands (0.10 TY-12),
-    /// so this is how a test reaches the errors a declaration raises.
+    /// Python has no constraint API of its own yet, so this is how a test
+    /// reaches the errors a declaration raises. Like any declaration, it moves
+    /// the store to the V11 snapshot format.
     #[cfg(feature = "test-hooks")]
     fn _declare_constraint_for_test(&self, name: &str, label: &str, field: &str) -> PyResult<()> {
-        self.with_mut(|db| {
-            db.unlock_v11_format_for_test();
-            db.create_constraint(name, label, field)
-        })
+        self.with_mut(|db| db.create_constraint(name, label, field))
     }
 
     /// Insert `key` if absent, otherwise update it in place.
@@ -3441,6 +3439,17 @@ fn datetime_to_py<'py>(
 /// cannot hold exactly instead of rounding it.
 fn datetime_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     let field = |name: &str| obj.getattr(name)?.extract::<i64>();
+    // A `pandas.Timestamp` is a `datetime` that also carries nanoseconds the
+    // `datetime` fields leave out. The engine holds microseconds, so a nonzero
+    // remainder is refused rather than rounded away.
+    if let Ok(nanos) = obj.getattr("nanosecond") {
+        if nanos.extract::<i64>().unwrap_or(0) != 0 {
+            return Err(PyValueError::new_err(
+                "datetime has a nonzero nanosecond part, which a DateTime or LocalDateTime \
+                 cannot hold exactly: it holds microseconds",
+            ));
+        }
+    }
     let days = days_from_civil(field("year")?, field("month")? as u8, field("day")? as u8);
     let local_micros = days
         .checked_mul(MICROS_PER_DAY)
@@ -3923,33 +3932,10 @@ engine_errors! {
     ValueTooLarge, "value_too_large", "A value is larger than the store accepts. Carries `.field`, `.size` and `.limit`, in bytes. Nothing was written.";
 }
 
-/// Test hook: convert `value` to the engine's `Value` and straight back.
-///
-/// Exercises the same two conversions a write and a read use, without the
-/// engine's V11 write refusal in between. Not part of the supported API.
-#[pyfunction]
-fn _value_roundtrip<'py>(
-    py: Python<'py>,
-    value: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    value_to_py(py, &py_to_value(value)?)
-}
-
-/// Test hook: the ISO 8601 or base64 text the engine prints for `value`, with
-/// its wire tag, or `None` for a type that has none.
-#[pyfunction]
-fn _value_tagged_text(value: &Bound<'_, PyAny>) -> PyResult<Option<(String, String)>> {
-    core_storage::tagged_text(&py_to_value(value)?)
-        .map(|tagged| tagged.map(|(tag, text)| (tag.to_string(), text)))
-        .map_err(PyValueError::new_err)
-}
-
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
     m.add_class::<Duration>()?;
-    m.add_function(wrap_pyfunction!(_value_roundtrip, m)?)?;
-    m.add_function(wrap_pyfunction!(_value_tagged_text, m)?)?;
     register_errors(m)?;
     Ok(())
 }

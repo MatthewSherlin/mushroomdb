@@ -8,11 +8,10 @@
 //! `keep_wal`), batched or not, and as of a past commit.
 //!
 //! `EnableRangeIndex` / `DisableRangeIndex` are format-V11 WAL records, which a
-//! 0.9.x reader cannot decode. Until the V11 format lands (TY-12) the write
-//! path refuses them like a V11 value, so a default build cannot declare a
-//! range index at all — the first test below holds that. Everything else runs
-//! on a handle the `test-hooks` hook unlocks, which is the path TY-12 opens
-//! for real: `cargo test -p mushroomdb --features test-hooks --test range_index`.
+//! 0.9.x reader cannot decode, so the first declaration moves the store to
+//! the V11 snapshot format before its record is appended (TY-12) — the first
+//! test below holds that. The rest read the postings through a `test-hooks`
+//! accessor: `cargo test -p mushroomdb --features test-hooks --test range_index`.
 
 use mushroomdb::{GraphError, RealFs, Value};
 use std::path::{Path, PathBuf};
@@ -40,34 +39,29 @@ fn val(i: i64) -> Vec<(String, Value)> {
     vec![("val".into(), Value::Int(i))]
 }
 
-const RANGE_REFUSAL: &str = "not supported in mushroomdb 0.10 yet: range indexes cannot be \
-                             declared until the V11 format lands";
-
 #[test]
-fn enable_range_index_is_refused_until_the_v11_format_lands() {
-    let dir = tmp("locked");
+fn enable_range_index_moves_the_store_to_v11_before_its_record() {
+    let dir = tmp("upgrade");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("Score", "s1", val(1)).unwrap();
+    // An unknown name is refused before anything is written.
     let before = wal_bytes(&dir);
-    match db.enable_range_index("idx", "Score", "val") {
-        Err(GraphError::QueryError { detail }) => assert_eq!(detail, RANGE_REFUSAL),
-        other => panic!("expected the V11 record refusal, got {other:?}"),
-    }
-    assert_eq!(
-        wal_bytes(&dir),
-        before,
-        "a refused declaration was appended"
-    );
-    assert!(db.range_indexes().is_empty());
-    assert!(!db.is_index_enabled("Score", "val"));
     match db.disable_range_index("idx") {
         Err(GraphError::QueryError { detail }) => assert_eq!(detail, "no range index named 'idx'"),
         other => panic!("expected an unknown-name refusal, got {other:?}"),
     }
+    assert_eq!(wal_bytes(&dir), before);
+    assert!(!db.is_v11());
+    db.enable_range_index("idx", "Score", "val").unwrap();
+    assert!(db.is_v11());
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    let after = wal_bytes(&dir);
+    assert!(after.starts_with(&before) && after.len() > before.len());
+    assert!(db.is_index_enabled("Score", "val"));
     drop(db);
     let reopened = GraphDb::open(&dir).unwrap();
-    assert!(reopened.range_indexes().is_empty());
-    assert!(!reopened.is_index_enabled("Score", "val"));
+    assert_eq!(reopened.range_indexes().len(), 1);
+    assert!(reopened.is_index_enabled("Score", "val"));
 }
 
 /// Ledger row 125: an equality index answered `= 2` with the `Int` 2 only,
@@ -247,16 +241,13 @@ mod unlocked {
 
     fn open_temp(name: &str) -> (PathBuf, GraphDb) {
         let dir = tmp(name);
-        let mut db = GraphDb::open(&dir).unwrap();
-        db.unlock_v11_format_for_test();
+        let db = GraphDb::open(&dir).unwrap();
         (dir, db)
     }
 
     fn reopen(dir: &Path, db: GraphDb) -> GraphDb {
         drop(db);
-        let mut db = GraphDb::open(dir).unwrap();
-        db.unlock_v11_format_for_test();
-        db
+        GraphDb::open(dir).unwrap()
     }
 
     fn int(i: i64) -> Value {

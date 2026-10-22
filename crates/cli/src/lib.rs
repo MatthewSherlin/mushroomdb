@@ -1551,10 +1551,13 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         },
     )?;
     db.snapshot()?;
+    // The version the snapshot was written at: a WAL-only store whose WAL
+    // holds a 0.10 record is written at V11, not at the default.
+    let to_ver = mushroomdb::snapshot_version_at(db_dir)?.unwrap_or(current);
 
     let msg = match from_ver {
-        Some(ver) => format!("migrated V{ver} -> V{current}\n"),
-        None => format!("migrated WAL-only -> V{current}\n"),
+        Some(ver) => format!("migrated V{ver} -> V{to_ver}\n"),
+        None => format!("migrated WAL-only -> V{to_ver}\n"),
     };
     Ok(msg)
 }
