@@ -67,7 +67,7 @@ A background Tokio task (`BackupWorker`) runs alongside the serve loop and does 
    `watch::Sender<BackupTrigger>` each time `snapshot_automatically()`, an explicit snapshot or the
    graceful-shutdown snapshot completes (after the atomic rename). It uploads the new
    `snapshot.bin`, any new `wal.N.archive` (immutable; never re-uploaded) and the small side files
-   (`commit_times.bin`, `roles.json`, `keys.json`, `wal.genesis`, `wal.floor`). A truncating
+   (`commit_times.bin`, `roles.json`, `wal.genesis`, `wal.floor`; never `keys.json`, which holds key hashes and stays out of every backup). A truncating
    snapshot replaces `wal.bin`; the worker starts a new `generation` (a counter stored in the
    manifest) so segment offsets restart at 0 without colliding.
 3. **Writes manifests.** After each snapshot upload, and every `MUSHROOMDB_BACKUP_MANIFEST_INTERVAL_S`
@@ -259,20 +259,21 @@ pub(crate) enum AuthIdentity {
 }
 ```
 
-`keys.json` sidecar (like `roles.json`, placed alongside the store):
+`keys.json` sidecar (like `roles.json`, placed alongside the store). It holds blake3 **hashes** of the tokens, never the tokens:
 ```json
 {
   "keys": [
-    { "token": "tok-abc", "tier": "admin" },
-    { "token": "tok-xyz", "tier": "write" },
-    { "token": "tok-def", "tier": "read", "role": "tenant_a" }
+    { "name": "ops",    "hash": "<64 hex: blake3 of the token>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex>", "tier": "read", "role": "tenant_a" }
   ]
 }
 ```
+`mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role R]` issues a random 32-byte token, prints it once, and writes only the hash (file mode 0600); `mushroomdb keys hash` hashes a token you already have. Tokens are at least 32 bytes. A `"token"` field is refused. On Unix the file must be owned by the server's user and closed to group and others.
 
-- `admin` = current `Full` behavior.
+- `admin` = current `Full` behavior. An admin key also satisfies the rule that a non-loopback `--addr` needs a token.
 - `write` = new `Write` variant: all mutation routes (`/ingest`, `/nodes`, `/edges`, `/rules`, `/node/{key}/prop/*`, etc.); denied `/backup`, `/stats`, `/metrics`, `/watch`, `/subscribe`.
-- `read` with optional `role` = current `Role(name)` behavior.
+- `read` requires a `role` and never writes, even when the role has a write scope (`Role(name)` masking, plus a read-only marker).
 
 `MUSHROOMDB_TOKEN` (env var) remains the admin token. `MUSHROOMDB_ROLE_TOKENS` remains for backward compat. `keys.json` is an additive source merged at startup; SIGHUP reloads it without restart.
 
@@ -482,7 +483,7 @@ The smoke test uses the same docker-compose MinIO image as the template, so temp
 
 **Time travel / as-of:** Archives are the WAL segments that `asof` queries replay into. Backing them up is exactly what enables remote PITR. Restoring with `--at <commit-seq>` downloads archives only up to that seq and uses the existing `open_at` path — no format change. One constraint: an `--at` target earlier than the oldest archive in the backup is not restorable (the manifest records the oldest retained commit; the CLI errors loudly if the target is before it).
 
-**Scoped visibility:** `roles.json` is in every backup manifest. A restore includes it, so role-based visibility works identically after restore. The new `keys.json` sidecar is also included in backups (added to the file list in `BackupWorker`).
+**Scoped visibility:** `roles.json` is in every backup manifest. A restore includes it, so role-based visibility works identically after restore. The new `keys.json` sidecar is **not** included in backups: it holds key hashes, and `GraphDb::backup_to` and `BackupWorker` both leave it out (a test pins this). A restore does not bring keys back; reissue them or copy the file deliberately.
 
 **Snapshots + WAL replay:** The backup is built on the snapshot as the base. The `snapshot.intent` crash-window file (row 92) must NOT be included in backups — its presence in a restored store would indicate an interrupted snapshot that didn't happen on the restored machine, which would corrupt the open logic. `BackupWorker` explicitly skips `snapshot.intent`. A backup captured mid-snapshot is safe because: `snapshot_automatically()` is atomic from the Fs layer's perspective (rename-based); the trigger channel fires only after the atomic rename completes, so the backup worker never sees a partial snapshot.
 
