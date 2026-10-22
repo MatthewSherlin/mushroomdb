@@ -242,7 +242,7 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export <db-dir> <dest> [--format jsonl|csv|cypher|parquet|graphml]
+mushroomdb export <db-dir> <dest> [--format jsonl|csv|cypher|parquet|graphml] [--single-file]
 ```
 
 Default format: `jsonl`.
@@ -257,6 +257,18 @@ property is ever overwritten. The five newer value types are written in their
 tagged JSON forms (`{"$date": "2024-01-15"}`, see the [HTTP API](http.md)), and a
 float is always written with a fraction or exponent, so it reads back as a float.
 An edge line is `{"edge_type", "src", "dst", "derived", "rule"}`.
+
+`--format jsonl --single-file` writes the same records as one file,
+`<dest>/graph.jsonl`, each line an object whose `"type"` (written first) is
+`node`, `edge` or `rule`: every node, then every edge, then every rule
+(`{"type":"rule","rule":{…}}`). A property named `type` goes in the node's
+`$props` object.
+
+JSONL, CSV and Cypher exports stream: the store is read one node (and one
+source node's edges) at a time and written as it goes, so an export holds the
+sorted list of node ids (four bytes a node) and no property maps. Exporting a
+1,000,000-node, 1,000,000-edge store peaks at the memory of opening it; Parquet
+and GraphML build their whole file in memory.
 
 **CSV format** (`--format csv`): writes `nodes.csv` and `relationships.csv`, the
 files `mushroomdb import --nodes --relationships` reads, plus `rules.jsonl` when
@@ -283,15 +295,20 @@ MERGE (a:`Person` {id: 'alice'})-[:`KNOWS`]->(b:`Person` {id: 'bob'})
 
 Run each line with `mushroomdb query` (or `query_write`); running the file twice
 changes nothing, because every statement is a `MERGE`. Cypher stores a node's
-key as its `id` property, so a node that had no `id` gains one; the file
-reproduces the store exactly when every node's `id` equals its key (what
-`import` and `ingest` write). Four things have no Cypher form and are counted in
-the export's output rather than silently dropped: properties of the date, time,
+key as its `id` property, so a node that had no `id` gains one, and the export
+prints how many; the file reproduces the store exactly when every node's `id`
+equals its key (what `import` and `ingest` write). Things with no Cypher form
+are counted in the export's output rather than silently dropped: properties of the date, time,
 duration and binary types (no statement can store one until the V11 format
 ships), NaN, infinities and `-9223372036854775808` (the lexer has no literal),
-a node whose `id` differs from its key, and rules.
+a property name or map key with a line break (a statement is one line), a node
+whose `id` differs from its key, and rules.
 
-**Loading an export back.** `mushroomdb import --nodes-jsonl nodes.jsonl
+**Loading an export back.** `mushroomdb import --jsonl graph.jsonl` reads the
+single-file form (a file or `-`); an edge must come after the nodes it joins,
+and one that does not is an error at its line (a node still waiting in the open
+batch counts, and is committed first). Rules are created last. The three-file
+form: `mushroomdb import --nodes-jsonl nodes.jsonl
 --edges-jsonl edges.jsonl --rules-jsonl rules.jsonl --db <dir>` (or `--nodes
 nodes.csv --relationships relationships.csv --rules-jsonl rules.jsonl`) rebuilds
 the store: the same nodes with the same properties, the same manual edges and the

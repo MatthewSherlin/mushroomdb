@@ -133,6 +133,7 @@ fn build(dir: &Path, shape: Shape) -> Db {
                         p.push(("label".into(), Value::Int(7)));
                         p.push(("$props".into(), Value::Bool(false)));
                         p.push(("a:b".into(), Value::Str("colon".into())));
+                        p.push(("type".into(), Value::Str("node".into())));
                     }
                     6 => p.push(("small".into(), Value::Int(i64::MIN))),
                     7 => p.push(("empty_list".into(), Value::List(vec![]))),
@@ -350,6 +351,131 @@ fn round_trip_csv_reproduces_the_store_with_and_without_rules() {
     }
 }
 
+fn stream_inputs(dir: &Path) -> ImportInputs {
+    ImportInputs {
+        stream_jsonl: Some(dir.join("graph.jsonl")),
+        ..ImportInputs::default()
+    }
+}
+
+/// The brief's single stream: one file, `{"type":"node","key":…}` and
+/// `{"type":"edge",…}` lines, that imports back into the same store, with and
+/// without rules (which travel as `{"type":"rule"}` lines).
+#[test]
+fn round_trip_single_file_jsonl_reproduces_the_store_with_and_without_rules() {
+    for (name, shape) in shapes() {
+        let dir = tmp(&format!("single-{name}"));
+        drop(build(&dir.join("src"), shape));
+        let out1 = dir.join("out1");
+        let summary = export(&dir.join("src"), &out1, ExportFormat::JsonlSingle);
+        assert!(summary.contains("16 nodes"), "{summary}");
+        assert_eq!(
+            read_dir_bytes(&out1).keys().collect::<Vec<_>>(),
+            ["graph.jsonl"]
+        );
+
+        let text = std::fs::read_to_string(out1.join("graph.jsonl")).unwrap();
+        let types: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["type"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            types.iter().filter(|t| *t == "node").count(),
+            16,
+            "{name}: one record per node"
+        );
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .starts_with("{\"type\":\"node\","),
+            "{text}"
+        );
+        let first_edge = types.iter().position(|t| t == "edge").unwrap();
+        assert!(
+            types[..first_edge].iter().all(|t| t == "node"),
+            "nodes come first"
+        );
+        assert_eq!(
+            types.iter().filter(|t| *t == "rule").count(),
+            if shape.rules { 2 } else { 0 }
+        );
+
+        import(&dir.join("dst"), &stream_inputs(&out1), 5);
+        assert_same(&state(&dir.join("src")), &state(&dir.join("dst")), name);
+        let out2 = dir.join("out2");
+        export(&dir.join("dst"), &out2, ExportFormat::JsonlSingle);
+        assert_eq!(
+            read_dir_bytes(&out1),
+            read_dir_bytes(&out2),
+            "{name}: re-export"
+        );
+    }
+}
+
+#[test]
+fn round_trip_single_file_jsonl_edges_after_their_nodes_only() {
+    let dir = tmp("single-order");
+    let run = |name: &str, text: &str, ignore: bool| {
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, text).unwrap();
+        run_import_inputs(
+            &dir.join(format!("db-{name}")),
+            &ImportInputs {
+                stream_jsonl: Some(path),
+                ..ImportInputs::default()
+            },
+            &ImportOptions {
+                ignore_errors: ignore,
+                // Nodes wait in the open batch when the edge arrives.
+                batch_size: 100,
+                ..ImportOptions::default()
+            },
+            &mut |_| {},
+        )
+    };
+    let node = |k: &str| format!("{{\"type\":\"node\",\"key\":\"{k}\",\"label\":\"T\"}}\n");
+    let edge = "{\"type\":\"edge\",\"edge_type\":\"K\",\"src\":\"a\",\"dst\":\"b\"}\n";
+
+    // Nodes still in the open batch are committed before the edge needs them.
+    let ok = run("ok", &format!("{}{}{edge}", node("a"), node("b")), false).unwrap();
+    assert_eq!((ok.nodes_inserted, ok.edges_inserted), (2, 1));
+
+    // An edge ahead of its nodes is an error naming its line.
+    let e = run("early", &format!("{edge}{}{}", node("a"), node("b")), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("early.jsonl:1: src `a` is not a node earlier in the stream"),
+        "{e}"
+    );
+
+    // Under --ignore-errors it is skipped, and counted.
+    let r = run("early2", &format!("{edge}{}{}", node("a"), node("b")), true).unwrap();
+    assert_eq!(
+        (r.nodes_inserted, r.edges_inserted, r.rows_skipped),
+        (2, 0, 1)
+    );
+
+    let e = run("kind", "{\"type\":\"vertex\"}\n", false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("kind.jsonl:1: unknown line type `vertex`"),
+        "{e}"
+    );
+    let e = run("notype", "{\"key\":\"a\"}\n", false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("notype.jsonl:1: the line has no string `type`"),
+        "{e}"
+    );
+}
+
 /// A node's count of manual edges is the same through every route, and a store
 /// is also the same across formats: CSV in, JSONL out equals JSONL straight out.
 #[test]
@@ -439,7 +565,11 @@ fn round_trip_cypher_adds_only_the_id_property_a_node_lacked() {
     let dir = tmp("cypher-noid");
     drop(build(&dir.join("src"), shape));
     let out = dir.join("out");
-    export(&dir.join("src"), &out, ExportFormat::Cypher);
+    let summary = export(&dir.join("src"), &out, ExportFormat::Cypher);
+    assert!(
+        summary.contains("16 nodes had no id property and gain one"),
+        "the one place a Cypher round trip is not an identity is reported: {summary}"
+    );
     run_statements(&dir.join("dst"), &cypher_statements(&out));
 
     let mut expected = state(&dir.join("src"));
@@ -468,6 +598,7 @@ fn round_trip_cypher_says_what_it_could_not_write() {
         "{summary}"
     );
     assert!(summary.contains("rules are not written"), "{summary}");
+    assert!(!summary.contains("had no id property"), "{summary}");
     assert!(
         summary.contains("derived edges are not written"),
         "{summary}"

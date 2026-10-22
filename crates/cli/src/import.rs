@@ -938,6 +938,9 @@ pub struct ImportInputs {
     pub nodes_jsonl: Option<PathBuf>,
     pub edges_jsonl: Option<PathBuf>,
     pub rules_jsonl: Option<PathBuf>,
+    /// One stream of `{"type": "node" | "edge" | "rule", …}` lines, which
+    /// `export --format jsonl --single-file` writes.
+    pub stream_jsonl: Option<PathBuf>,
 }
 
 impl ImportInputs {
@@ -947,6 +950,7 @@ impl ImportInputs {
             && self.nodes_jsonl.is_none()
             && self.edges_jsonl.is_none()
             && self.rules_jsonl.is_none()
+            && self.stream_jsonl.is_none()
     }
 
     fn csv_paths(&self) -> impl Iterator<Item = &PathBuf> {
@@ -958,6 +962,7 @@ impl ImportInputs {
             .iter()
             .chain(self.edges_jsonl.iter())
             .chain(self.rules_jsonl.iter())
+            .chain(self.stream_jsonl.iter())
     }
 }
 
@@ -1024,9 +1029,19 @@ pub const JSONL_PROPS_FIELD: &str = "$props";
 fn parse_node_line(text: &str) -> Result<NodeRecord, String> {
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    parse_node_value(json, false)
+}
+
+/// [`parse_node_line`] for a line already parsed. In a stream (`typed`) the
+/// `"type"` field is the line's discriminator, not a property (a property of
+/// that name is in `$props`).
+fn parse_node_value(json: serde_json::Value, typed: bool) -> Result<NodeRecord, String> {
     let serde_json::Value::Object(mut obj) = json else {
         return Err("a node line must be a JSON object".to_string());
     };
+    if typed {
+        obj.remove("type");
+    }
     let mut text_field = |name: &str| match obj.remove(name) {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s),
         Some(_) => Err(format!("`{name}` must be a non-empty string")),
@@ -1059,6 +1074,10 @@ fn parse_node_line(text: &str) -> Result<NodeRecord, String> {
 fn parse_edge_line(text: &str) -> Result<(String, String, String, bool), String> {
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    parse_edge_value(&json)
+}
+
+fn parse_edge_value(json: &serde_json::Value) -> Result<(String, String, String, bool), String> {
     let serde_json::Value::Object(obj) = json else {
         return Err("an edge line must be a JSON object".to_string());
     };
@@ -1175,6 +1194,99 @@ fn import_rules_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(),
     })
 }
 
+/// Import a single stream of typed lines (`export --format jsonl
+/// --single-file`): `{"type":"node",…}`, `{"type":"edge",…}` and
+/// `{"type":"rule","rule":{…}}`.
+///
+/// Lines are taken in order and nodes and edges are committed in batches as
+/// they arrive. An edge must come after both its nodes: one whose node is not
+/// in the store or earlier in the stream is an error at its line (a node still
+/// waiting in the open batch counts, and is committed first). Rules are created
+/// last, so each backfills once over everything.
+fn import_stream_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
+    let file = path.display().to_string();
+    let mut records: Vec<NodeRecord> = Vec::new();
+    let mut batch_keys: HashSet<String> = HashSet::new();
+    let mut edges: Vec<(String, String, String, u64)> = Vec::new();
+    let mut rules: Vec<(u64, mushroomdb::RuleDef)> = Vec::new();
+    for_each_line(path, |line, text| {
+        let json: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => return run.bad_row(&file, line, &format!("not JSON: {e}")),
+        };
+        let kind = json.get("type").and_then(serde_json::Value::as_str);
+        match kind {
+            Some("node") => {
+                let mut record = match parse_node_value(json, true) {
+                    Ok(r) => r,
+                    Err(reason) => return run.bad_row(&file, line, &reason),
+                };
+                record.line = line;
+                if db.has_node(&record.key) || !batch_keys.insert(record.key.clone()) {
+                    let reason = format!("duplicate key `{}`", record.key);
+                    return run.bad_row(&file, line, &reason);
+                }
+                records.push(record);
+                if records.len() >= run.opts.batch_size {
+                    flush_node_records(db, &mut records, &file, run)?;
+                    batch_keys.clear();
+                }
+            }
+            Some("edge") => {
+                let (edge_type, src, dst, derived) = match parse_edge_value(&json) {
+                    Ok(parsed) => parsed,
+                    Err(reason) => return run.bad_row(&file, line, &reason),
+                };
+                if derived {
+                    run.report.derived_edges_skipped += 1;
+                    return Ok(());
+                }
+                if [&src, &dst].iter().any(|k| batch_keys.contains(*k)) {
+                    flush_node_records(db, &mut records, &file, run)?;
+                    batch_keys.clear();
+                }
+                let missing = [("src", &src), ("dst", &dst)]
+                    .into_iter()
+                    .find(|(_, key)| !db.has_node(key));
+                if let Some((field, key)) = missing {
+                    let reason = format!(
+                        "{field} `{key}` is not a node earlier in the stream or in the store \
+                         (an edge must come after its nodes)"
+                    );
+                    return run.bad_row(&file, line, &reason);
+                }
+                edges.push((edge_type, src, dst, line));
+                if edges.len() >= run.opts.batch_size {
+                    flush_edges(db, &mut edges, &file, run)?;
+                }
+            }
+            Some("rule") => match json.get("rule").cloned().map(serde_json::from_value) {
+                Some(Ok(def)) => rules.push((line, def)),
+                Some(Err(e)) => return run.bad_row(&file, line, &format!("not a rule: {e}")),
+                None => return run.bad_row(&file, line, "the line has no `rule`"),
+            },
+            Some(other) => {
+                let reason = format!("unknown line type `{other}` (node, edge or rule)");
+                return run.bad_row(&file, line, &reason);
+            }
+            None => return run.bad_row(&file, line, "the line has no string `type`"),
+        }
+        Ok(())
+    })?;
+    flush_node_records(db, &mut records, &file, run)?;
+    flush_edges(db, &mut edges, &file, run)?;
+    for (line, def) in rules {
+        match db.create_rule(def) {
+            Ok(()) => {
+                run.report.rules_created += 1;
+                run.committed();
+            }
+            Err(e) => run.bad_row(&file, line, &e.to_string())?,
+        }
+    }
+    Ok(())
+}
+
 /// Import `nodes_csv` and then `rels_csv` into the store at `db_dir`
 /// (created if absent). At least one file is required.
 pub fn run_import(
@@ -1228,7 +1340,7 @@ pub fn run_import_inputs(
 fn check_inputs(inputs: &ImportInputs, opts: &ImportOptions) -> Result<(), CliError> {
     if inputs.is_empty() {
         return Err(CliError(
-            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl or --rules-jsonl"
+            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl, --rules-jsonl or --jsonl"
                 .into(),
         ));
     }
@@ -1291,6 +1403,9 @@ pub fn import_inputs_into(
     }
     if let Some(path) = &inputs.edges_jsonl {
         import_edges_jsonl(db, path, &mut run)?;
+    }
+    if let Some(path) = &inputs.stream_jsonl {
+        import_stream_jsonl(db, path, &mut run)?;
     }
     if let Some(path) = &inputs.rules_jsonl {
         import_rules_jsonl(db, path, &mut run)?;

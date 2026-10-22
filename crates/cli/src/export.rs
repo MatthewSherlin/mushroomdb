@@ -43,6 +43,8 @@ use parquet::file::properties::WriterProperties;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportFormat {
     Jsonl,
+    /// `--format jsonl --single-file`: one `graph.jsonl` of typed lines.
+    JsonlSingle,
     Csv,
     Cypher,
     Parquet,
@@ -64,6 +66,7 @@ impl ExportFormat {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Jsonl => "jsonl",
+            Self::JsonlSingle => "jsonl",
             Self::Csv => "csv",
             Self::Cypher => "cypher",
             Self::Parquet => "parquet",
@@ -106,69 +109,229 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
+/// Where an export reads the store from: node by node and edge by edge, so an
+/// export holds one record at a time (see
+/// [`mushroomdb::GraphDb::for_each_node_for_export`]). Nodes arrive sorted by
+/// key and edges by `(edge_type, src, dst)`.
+pub trait ExportSource {
+    fn for_each_node(
+        &self,
+        each: &mut dyn FnMut(NodeInfo) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError>;
+    fn for_each_edge(
+        &self,
+        each: &mut dyn FnMut(ExportEdge) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError>;
+    /// The label of the node `key`.
+    fn label_of(&self, key: &str) -> Option<String>;
+}
+
+impl ExportSource for mushroomdb::GraphDb<mushroomdb::RealFs> {
+    fn for_each_node(
+        &self,
+        each: &mut dyn FnMut(NodeInfo) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        self.for_each_node_for_export(each)
+    }
+    fn for_each_edge(
+        &self,
+        each: &mut dyn FnMut(ExportEdge) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        self.for_each_edge_for_export(each)
+    }
+    fn label_of(&self, key: &str) -> Option<String> {
+        self.node_ref(key).map(|n| n.label().to_string())
+    }
+}
+
+/// Sorted slices as a source, for callers that already hold them.
+pub struct Slices<'a> {
+    pub nodes: &'a [NodeInfo],
+    pub edges: &'a [ExportEdge],
+}
+
+impl ExportSource for Slices<'_> {
+    fn for_each_node(
+        &self,
+        each: &mut dyn FnMut(NodeInfo) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        self.nodes.iter().try_for_each(|n| each(n.clone()))
+    }
+    fn for_each_edge(
+        &self,
+        each: &mut dyn FnMut(ExportEdge) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        self.edges.iter().try_for_each(|e| each(e.clone()))
+    }
+    fn label_of(&self, key: &str) -> Option<String> {
+        self.nodes
+            .iter()
+            .find(|n| n.key == key)
+            .map(|n| n.label.clone())
+    }
+}
+
+/// What a streamed export wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportStats {
+    pub nodes: usize,
+    /// Every edge of the store, derived ones included.
+    pub edges: usize,
+    pub derived_edges: usize,
+    /// NaN and infinite floats, which neither JSON nor CSV can write; JSON
+    /// writes `null` for one and CSV leaves the cell empty.
+    pub non_finite_floats: usize,
+}
+
+fn count_non_finite(v: &Value) -> usize {
+    match v {
+        Value::Float(f) => usize::from(!f.is_finite()),
+        Value::List(xs) => xs.iter().map(count_non_finite).sum(),
+        Value::Map(m) => m.values().map(count_non_finite).sum(),
+        _ => 0,
+    }
+}
+
+fn json_line(w: &mut impl std::io::Write, v: &serde_json::Value) -> Result<(), crate::CliError> {
+    serde_json::to_writer(&mut *w, v)
+        .map_err(|e| crate::CliError(format!("json encode error: {e}")))?;
+    w.write_all(b"\n")?;
+    Ok(())
+}
+
+/// A node as the JSON object a JSONL line holds: `key`, `label` and the
+/// properties. A property whose name is one of the line's own fields (`key`,
+/// `label`, `$props`, and `type` when `typed` is set) goes in a `$props`
+/// object, so that no property is overwritten and the importer gives every one
+/// back.
+fn node_json(node: &NodeInfo, typed: bool) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("key".into(), serde_json::Value::String(node.key.clone()));
+    obj.insert(
+        "label".into(),
+        serde_json::Value::String(node.label.clone()),
+    );
+    let mut reserved = serde_json::Map::new();
+    for (k, v) in &node.props {
+        let own = matches!(k.as_str(), "key" | "label") || k == crate::import::JSONL_PROPS_FIELD;
+        if own || (typed && k == "type") {
+            reserved.insert(k.clone(), value_to_json(v));
+        } else {
+            obj.insert(k.clone(), value_to_json(v));
+        }
+    }
+    if !reserved.is_empty() {
+        obj.insert(
+            crate::import::JSONL_PROPS_FIELD.into(),
+            serde_json::Value::Object(reserved),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn edge_json(edge: &ExportEdge) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("edge_type".into(), edge.edge_type.clone().into());
+    obj.insert("src".into(), edge.src.clone().into());
+    obj.insert("dst".into(), edge.dst.clone().into());
+    obj.insert("derived".into(), edge.derived.into());
+    obj.insert(
+        "rule".into(),
+        edge.rule
+            .clone()
+            .map_or(serde_json::Value::Null, Into::into),
+    );
+    serde_json::Value::Object(obj)
+}
+
+/// A JSONL line whose object is `value` with `"type": kind` put first, where
+/// `serde_json` would sort it among the other fields.
+fn typed_json_line(
+    w: &mut impl std::io::Write,
+    kind: &str,
+    value: &serde_json::Value,
+) -> Result<(), crate::CliError> {
+    let text = serde_json::to_string(value)
+        .map_err(|e| crate::CliError(format!("json encode error: {e}")))?;
+    let rest = text.strip_prefix('{').unwrap_or(&text);
+    let comma = if rest == "}" { "" } else { "," };
+    writeln!(w, "{{\"type\":\"{kind}\"{comma}{rest}")?;
+    Ok(())
+}
+
+fn create_file(path: PathBuf) -> Result<std::io::BufWriter<std::fs::File>, crate::CliError> {
+    Ok(std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(path)?,
+    ))
+}
+
 /// Write JSONL files to `dest`: nodes.jsonl, edges.jsonl, rules.jsonl.
 ///
-/// `nodes` must be sorted by key, `edges` by (edge_type, src, dst), `rules` by name.
-/// Deterministic: same sorted input → byte-identical output.
+/// Records are written as the source hands them over, in its order (nodes by
+/// key, edges by `(edge_type, src, dst)`, `rules` by name, the caller's job).
+/// Deterministic: same store state, byte-identical output.
 pub fn write_jsonl(
-    nodes: &[NodeInfo],
-    edges: &[ExportEdge],
+    source: &dyn ExportSource,
     rules: &[RuleDef],
     dest: &Path,
-) -> Result<(), crate::CliError> {
+) -> Result<ExportStats, crate::CliError> {
     std::fs::create_dir_all(dest)?;
+    let mut stats = ExportStats::default();
+    let mut f = create_file(dest.join("nodes.jsonl"))?;
+    source.for_each_node(&mut |node| {
+        stats.non_finite_floats += node.props.values().map(count_non_finite).sum::<usize>();
+        stats.nodes += 1;
+        json_line(&mut f, &node_json(&node, false))
+    })?;
+    f.flush()?;
+    let mut f = create_file(dest.join("edges.jsonl"))?;
+    source.for_each_edge(&mut |edge| {
+        stats.edges += 1;
+        stats.derived_edges += usize::from(edge.derived);
+        json_line(&mut f, &edge_json(&edge))
+    })?;
+    f.flush()?;
+    write_rules_jsonl(rules, dest)?;
+    Ok(stats)
+}
 
-    // ── nodes.jsonl ────────────────────────────────────────────────────────
-    {
-        let mut f = std::fs::File::create(dest.join("nodes.jsonl"))?;
-        for node in nodes {
-            let mut obj = serde_json::Map::new();
-            obj.insert("key".into(), serde_json::Value::String(node.key.clone()));
-            obj.insert(
-                "label".into(),
-                serde_json::Value::String(node.label.clone()),
-            );
-            // A property named like one of the line's own fields goes in a
-            // `$props` object, so that no property is overwritten and the
-            // importer can give every one back.
-            let mut reserved = serde_json::Map::new();
-            for (k, v) in &node.props {
-                if matches!(k.as_str(), "key" | "label") || k == crate::import::JSONL_PROPS_FIELD {
-                    reserved.insert(k.clone(), value_to_json(v));
-                } else {
-                    obj.insert(k.clone(), value_to_json(v));
-                }
-            }
-            if !reserved.is_empty() {
-                obj.insert(
-                    crate::import::JSONL_PROPS_FIELD.into(),
-                    serde_json::Value::Object(reserved),
-                );
-            }
-            let line = serde_json::to_string(&serde_json::Value::Object(obj))
-                .map_err(|e| crate::CliError(format!("json encode error: {e}")))?;
-            writeln!(f, "{line}")?;
-        }
+/// Write one file, `<dest>/graph.jsonl`: every node, then every edge, then
+/// every rule, each line an object whose `"type"` is `node`, `edge` or `rule`.
+///
+/// ```text
+/// {"type":"node","key":"alice","label":"Person","age":30}
+/// {"type":"edge","edge_type":"KNOWS","src":"alice","dst":"bob","derived":false,"rule":null}
+/// {"type":"rule","rule":{"name":"same_city",...}}
+/// ```
+///
+/// A property named `type` is written in the node's `$props` object. `mushroomdb
+/// import --jsonl` reads it, a file or standard input, in this order: an edge
+/// must come after the nodes it joins.
+pub fn write_jsonl_single(
+    source: &dyn ExportSource,
+    rules: &[RuleDef],
+    dest: &Path,
+) -> Result<ExportStats, crate::CliError> {
+    std::fs::create_dir_all(dest)?;
+    let mut stats = ExportStats::default();
+    let mut f = create_file(dest.join("graph.jsonl"))?;
+    source.for_each_node(&mut |node| {
+        stats.non_finite_floats += node.props.values().map(count_non_finite).sum::<usize>();
+        stats.nodes += 1;
+        typed_json_line(&mut f, "node", &node_json(&node, true))
+    })?;
+    source.for_each_edge(&mut |edge| {
+        stats.edges += 1;
+        stats.derived_edges += usize::from(edge.derived);
+        typed_json_line(&mut f, "edge", &edge_json(&edge))
+    })?;
+    for rule in rules {
+        let line = serde_json::json!({ "rule": rule });
+        typed_json_line(&mut f, "rule", &line)?;
     }
-
-    // ── edges.jsonl ────────────────────────────────────────────────────────
-    {
-        let mut f = std::fs::File::create(dest.join("edges.jsonl"))?;
-        for edge in edges {
-            let obj = serde_json::json!({
-                "edge_type": edge.edge_type,
-                "src": edge.src,
-                "dst": edge.dst,
-                "derived": edge.derived,
-                "rule": edge.rule,
-            });
-            let line = serde_json::to_string(&obj)
-                .map_err(|e| crate::CliError(format!("json encode error: {e}")))?;
-            writeln!(f, "{line}")?;
-        }
-    }
-
-    write_rules_jsonl(rules, dest)
+    f.flush()?;
+    Ok(stats)
 }
 
 /// Write `rules.jsonl` to `dest`, one rule per line, which `mushroomdb import
@@ -271,6 +434,9 @@ fn csv_error(e: csv::Error) -> crate::CliError {
 /// Write `nodes.csv` and `relationships.csv` to `dest`, plus `rules.jsonl`
 /// when there are rules.
 ///
+/// Two passes over the nodes, neither holding more than one: the first finds
+/// each property's kind (a column holds one), the second writes the rows.
+///
 /// Manual edges only: a derived edge belongs to its rule and is made again
 /// when the rule is created, so importing `rules.jsonl` last restores it.
 /// Edges carry no properties, so `relationships.csv` has none.
@@ -280,46 +446,47 @@ fn csv_error(e: csv::Error) -> crate::CliError {
 /// key, and `:KEY` (the key only) otherwise, so that an import gives back
 /// exactly the properties the store had.
 pub fn write_csv(
-    nodes: &[NodeInfo],
-    edges: &[ExportEdge],
+    source: &dyn ExportSource,
     rules: &[RuleDef],
     dest: &Path,
-) -> Result<(), crate::CliError> {
+) -> Result<ExportStats, crate::CliError> {
     std::fs::create_dir_all(dest)?;
-    if let Some(n) = nodes.iter().find(|n| n.label.contains(';')) {
-        return Err(crate::CliError(format!(
-            "label `{}` of node `{}` cannot be written to CSV: the importer reads `;` as a multi-label",
-            n.label, n.key
-        )));
-    }
-    let id_is_key = !nodes.is_empty()
-        && nodes
-            .iter()
-            .all(|n| matches!(n.props.get("id"), Some(Value::Str(s)) if *s == n.key));
+    let mut stats = ExportStats::default();
 
-    // One kind per property; a second kind turns the column into JSON.
-    let mut kinds: BTreeMap<&str, CsvKind> = BTreeMap::new();
-    for node in nodes {
+    // Pass 1: the shape of the columns.
+    let mut id_is_key = true;
+    let mut kinds: BTreeMap<String, CsvKind> = BTreeMap::new();
+    source.for_each_node(&mut |node| {
+        if node.label.contains(';') {
+            return Err(crate::CliError(format!(
+                "label `{}` of node `{}` cannot be written to CSV: the importer reads `;` as a multi-label",
+                node.label, node.key
+            )));
+        }
+        stats.nodes += 1;
+        id_is_key &= matches!(node.props.get("id"), Some(Value::Str(s)) if *s == node.key);
         for (name, value) in &node.props {
-            if id_is_key && name == "id" {
-                continue;
-            }
             if name.is_empty() {
                 return Err(crate::CliError(format!(
                     "node `{}` has a property with an empty name, which a CSV header cannot carry",
                     node.key
                 )));
             }
+            stats.non_finite_floats += count_non_finite(value);
             let kind = CsvKind::of(value);
-            kinds
-                .entry(name)
-                .and_modify(|k| {
-                    if *k != kind {
-                        *k = CsvKind::Json;
-                    }
-                })
-                .or_insert(kind);
+            match kinds.get_mut(name.as_str()) {
+                Some(k) if *k != kind => *k = CsvKind::Json,
+                Some(_) => {}
+                None => {
+                    kinds.insert(name.clone(), kind);
+                }
+            }
         }
+        Ok(())
+    })?;
+    let id_is_key = id_is_key && stats.nodes > 0;
+    if id_is_key {
+        kinds.remove("id");
     }
 
     // ── nodes.csv ──────────────────────────────────────────────────────────
@@ -332,34 +499,39 @@ pub fn write_csv(
     // in it would otherwise be read as `name:type`.
     header.extend(kinds.iter().map(|(n, k)| format!("{n}:{}", k.suffix())));
     w.write_record(&header).map_err(csv_error)?;
-    for node in nodes {
+    source.for_each_node(&mut |node| {
         let mut row = vec![node.key.clone(), node.label.clone()];
         for (name, kind) in &kinds {
             row.push(
                 node.props
-                    .get(*name)
+                    .get(name.as_str())
                     .map(|v| csv_cell(v, *kind))
                     .unwrap_or_default(),
             );
         }
-        w.write_record(&row).map_err(csv_error)?;
-    }
+        w.write_record(&row).map_err(csv_error)
+    })?;
     w.flush()?;
 
     // ── relationships.csv ──────────────────────────────────────────────────
     let mut w = csv::Writer::from_path(dest.join("relationships.csv")).map_err(csv_error)?;
     w.write_record([":START_ID", ":END_ID", ":TYPE"])
         .map_err(csv_error)?;
-    for edge in edges.iter().filter(|e| !e.derived) {
+    source.for_each_edge(&mut |edge| {
+        stats.edges += 1;
+        stats.derived_edges += usize::from(edge.derived);
+        if edge.derived {
+            return Ok(());
+        }
         w.write_record([&edge.src, &edge.dst, &edge.edge_type])
-            .map_err(csv_error)?;
-    }
+            .map_err(csv_error)
+    })?;
     w.flush()?;
 
     if !rules.is_empty() {
         write_rules_jsonl(rules, dest)?;
     }
-    Ok(())
+    Ok(stats)
 }
 
 // ── Cypher ───────────────────────────────────────────────────────────────
@@ -372,11 +544,15 @@ pub struct CypherLoss {
     /// no Cypher statement can store yet.
     pub typed_properties: usize,
     /// Properties holding a NaN or an infinity, or the integer `-2^63`, which
-    /// have no Cypher literal.
+    /// have no Cypher literal, or whose name (or a map key in it) has a line
+    /// break, which one-statement-per-line cannot carry.
     pub unwritable_numbers: usize,
     /// Nodes whose `id` property is not their key. A Cypher `MERGE` stores the
     /// key as `id`, so a different `id` cannot be written.
     pub differing_ids: usize,
+    /// Nodes that had no `id` property and gain one, equal to their key, when
+    /// the file is run: the one place a Cypher round trip is not an identity.
+    pub ids_added: usize,
 }
 
 impl CypherLoss {
@@ -436,6 +612,10 @@ fn cypher_literal(v: &Value) -> Result<String, CypherSkip> {
         Value::Map(m) => {
             let mut items = Vec::with_capacity(m.len());
             for (k, v) in m {
+                // A name is written between backticks on one line.
+                if k.contains(['\n', '\r']) {
+                    return Err(CypherSkip::Number);
+                }
                 items.push(format!("{}: {}", cypher_ident(k), cypher_literal(v)?));
             }
             format!("{{{}}}", items.join(", "))
@@ -459,34 +639,39 @@ enum CypherSkip {
 /// manual edges.
 ///
 /// ```text
-/// MERGE (n:`Person` {id: 'alice'}) ON CREATE SET n.age = 30, n.tags = ['a', 'b']
+/// MERGE (n:`Person` {id: 'alice'}) ON CREATE SET n.`age` = 30, n.`tags` = ['a', 'b']
 /// MERGE (a:`Person` {id: 'alice'})-[:`KNOWS`]->(b:`Person` {id: 'bob'})
 /// ```
 ///
 /// `MERGE` rather than `CREATE`, so that running the file twice is harmless.
 /// Cypher stores the key of a node as its `id` property, so a node whose
-/// properties had no `id` gains one: the file reproduces the store exactly when
-/// every node's `id` equals its key (what `mushroomdb import` and `ingest`
-/// produce). Rules are not written: Cypher has no statement for one.
+/// properties had no `id` gains one ([`CypherLoss::ids_added`] counts them): the
+/// file reproduces the store exactly when every node's `id` equals its key (what
+/// `mushroomdb import` and `ingest` produce). Rules are not written: Cypher has
+/// no statement for one.
 pub fn write_cypher(
-    nodes: &[NodeInfo],
-    edges: &[ExportEdge],
+    source: &dyn ExportSource,
     dest: &Path,
-) -> Result<CypherLoss, crate::CliError> {
+) -> Result<(ExportStats, CypherLoss), crate::CliError> {
     std::fs::create_dir_all(dest)?;
-    let mut out = std::io::BufWriter::new(std::fs::File::create(dest.join("graph.cypher"))?);
+    let mut out = create_file(dest.join("graph.cypher"))?;
     let mut loss = CypherLoss::default();
-    let mut label_of: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::with_capacity(nodes.len());
-    for node in nodes {
-        label_of.insert(&node.key, &node.label);
+    let mut stats = ExportStats::default();
+    source.for_each_node(&mut |node| {
+        stats.nodes += 1;
         let mut sets = Vec::new();
+        let mut has_id = false;
         for (name, value) in &node.props {
             if name == "id" {
                 // The statement stores the key under `id` by itself.
+                has_id = true;
                 if !matches!(value, Value::Str(s) if *s == node.key) {
                     loss.differing_ids += 1;
                 }
+                continue;
+            }
+            if name.contains(['\n', '\r']) {
+                loss.unwritable_numbers += 1;
                 continue;
             }
             match cypher_literal(value) {
@@ -495,6 +680,7 @@ pub fn write_cypher(
                 Err(CypherSkip::Number) => loss.unwritable_numbers += 1,
             }
         }
+        loss.ids_added += usize::from(!has_id);
         write!(
             out,
             "MERGE (n:{} {{id: {}}})",
@@ -505,41 +691,32 @@ pub fn write_cypher(
             write!(out, " ON CREATE SET {}", sets.join(", "))?;
         }
         writeln!(out)?;
-    }
-    for edge in edges.iter().filter(|e| !e.derived) {
-        let (Some(src_label), Some(dst_label)) = (
-            label_of.get(edge.src.as_str()),
-            label_of.get(edge.dst.as_str()),
-        ) else {
-            continue;
+        Ok(())
+    })?;
+    source.for_each_edge(&mut |edge| {
+        stats.edges += 1;
+        stats.derived_edges += usize::from(edge.derived);
+        if edge.derived {
+            return Ok(());
+        }
+        let (Some(src_label), Some(dst_label)) =
+            (source.label_of(&edge.src), source.label_of(&edge.dst))
+        else {
+            return Ok(());
         };
         writeln!(
             out,
             "MERGE (a:{} {{id: {}}})-[:{}]->(b:{} {{id: {}}})",
-            cypher_ident(src_label),
+            cypher_ident(&src_label),
             cypher_string(&edge.src),
             cypher_ident(&edge.edge_type),
-            cypher_ident(dst_label),
+            cypher_ident(&dst_label),
             cypher_string(&edge.dst)
         )?;
-    }
+        Ok(())
+    })?;
     out.flush()?;
-    Ok(loss)
-}
-
-/// How many float values in `nodes` are NaN or infinite, which neither JSON nor
-/// CSV can write. They are left out (JSON writes `null`); the export says how
-/// many.
-pub fn count_non_finite(nodes: &[NodeInfo]) -> usize {
-    fn count(v: &Value) -> usize {
-        match v {
-            Value::Float(f) => usize::from(!f.is_finite()),
-            Value::List(xs) => xs.iter().map(count).sum(),
-            Value::Map(m) => m.values().map(count).sum(),
-            _ => 0,
-        }
-    }
-    nodes.iter().flat_map(|n| n.props.values()).map(count).sum()
+    Ok((stats, loss))
 }
 
 /// Write parquet files to `dest`: nodes.parquet, edges.parquet, rules.parquet.
@@ -1073,7 +1250,11 @@ mod round_trip_unit_tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         };
-        write_csv(std::slice::from_ref(&node), &[], &[], &dir).unwrap();
+        let source = super::Slices {
+            nodes: std::slice::from_ref(&node),
+            edges: &[],
+        };
+        write_csv(&source, &[], &dir).unwrap();
 
         let mut reader = csv::Reader::from_path(dir.join("nodes.csv")).unwrap();
         let header = reader.headers().unwrap().clone();
