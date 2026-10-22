@@ -181,6 +181,12 @@ fn keys_hash_reads_a_token_from_stdin_and_refuses_a_short_one() {
         String::from_utf8(out.stdout).unwrap().trim(),
         mushroomdb::hash_token(&token).unwrap()
     );
+    // A Windows pipe ends the line with CR LF.
+    let out = run(&format!("{token}\r\n"));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        mushroomdb::hash_token(&token).unwrap()
+    );
     let out = run("too-short");
     assert_eq!(out.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("too-short"));
@@ -284,25 +290,51 @@ fn a_token_that_is_both_the_env_token_and_a_key_stops_serve() {
     assert!(!stderr.contains(&token), "a token was echoed");
 }
 
+/// Sends SIGHUP to the server.
 #[cfg(unix)]
-#[test]
-fn a_store_without_keys_json_still_dies_on_sighup_as_before() {
-    let dir = tmp("nokeys");
-    let mut server = start(&dir);
+fn hangup(server: &Server) {
     let signalled = Command::new("kill")
         .arg("-HUP")
         .arg(server.child.id().to_string())
         .status()
         .unwrap();
     assert!(signalled.success());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if server.child.try_wait().unwrap().is_some() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("no SIGHUP handler may be installed without a keys.json");
+}
+
+/// SIGHUP to a server that started with no keys.json is a no-op: it keeps
+/// serving, and answers requests afterwards.
+#[cfg(unix)]
+#[test]
+fn sighup_to_a_server_without_keys_json_leaves_it_serving() {
+    let dir = tmp("nokeys");
+    let mut server = start(&dir);
+    hangup(&server);
+    hangup(&server);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "SIGHUP ended a server that has no keys.json"
+    );
+    assert_eq!(status(&server.addr, "/health", "anything"), 200);
+    // No key was added, so the server is as open as it was.
+    assert_eq!(status(&server.addr, "/stats", "anything"), 200);
+}
+
+/// The first key is issued while the server runs; SIGHUP loads it, and from
+/// then on the server requires a key.
+#[cfg(unix)]
+#[test]
+fn sighup_loads_a_first_key_added_after_the_server_started() {
+    let dir = tmp("firstkey");
+    let server = start(&dir);
+    assert_eq!(status(&server.addr, "/stats", "anything"), 200);
+    let admin = keys_add(&dir, "ops", "admin", None);
+    hangup(&server);
+    assert!(
+        wait_for(&server.addr, "/stats", &admin, 200),
+        "the first key never started working"
+    );
+    assert_eq!(status(&server.addr, "/stats", "anything"), 401);
 }
 
 #[test]
@@ -368,7 +400,8 @@ fn serves_on_wildcard(dir: &Path) -> (bool, String) {
     (listening, message)
 }
 
-const NON_LOOPBACK_MESSAGE: &str = "non-loopback --addr requires --token or MUSHROOMDB_TOKEN";
+const NON_LOOPBACK_MESSAGE: &str =
+    "non-loopback --addr requires --token, MUSHROOMDB_TOKEN or an admin key in keys.json";
 
 #[test]
 fn an_admin_key_alone_lets_serve_bind_a_non_loopback_address() {

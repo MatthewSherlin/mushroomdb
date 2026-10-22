@@ -49,3 +49,6 @@ arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
 # `mushroomdb import`: RFC 4180 parsing of the bulk-import CSV files.
 csv = "1"
+# `keys add`: the token comes from the operating system's random source on every
+# platform. Already in the lock (rand and others use it).
+getrandom = "0.3"

@@ -259,20 +259,21 @@ pub(crate) enum AuthIdentity {
 }
 ```
 
-`keys.json` sidecar (like `roles.json`, placed alongside the store):
+`keys.json` sidecar (like `roles.json`, placed alongside the store). It holds blake3 **hashes** of the tokens, never the tokens:
 ```json
 {
   "keys": [
-    { "token": "tok-abc", "tier": "admin" },
-    { "token": "tok-xyz", "tier": "write" },
-    { "token": "tok-def", "tier": "read", "role": "tenant_a" }
+    { "name": "ops",    "hash": "<64 hex: blake3 of the token>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex>", "tier": "read", "role": "tenant_a" }
   ]
 }
 ```
+`mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role R]` issues a random 32-byte token, prints it once, and writes only the hash (file mode 0600); `mushroomdb keys hash` hashes a token you already have. Tokens are at least 32 bytes. A `"token"` field is refused. On Unix the file must be owned by the server's user and closed to group and others.
 
-- `admin` = current `Full` behavior.
+- `admin` = current `Full` behavior. An admin key also satisfies the rule that a non-loopback `--addr` needs a token.
 - `write` = new `Write` variant: all mutation routes (`/ingest`, `/nodes`, `/edges`, `/rules`, `/node/{key}/prop/*`, etc.); denied `/backup`, `/stats`, `/metrics`, `/watch`, `/subscribe`.
-- `read` with optional `role` = current `Role(name)` behavior.
+- `read` requires a `role` and never writes, even when the role has a write scope (`Role(name)` masking, plus a read-only marker).
 
 `MUSHROOMDB_TOKEN` (env var) remains the admin token. `MUSHROOMDB_ROLE_TOKENS` remains for backward compat. `keys.json` is an additive source merged at startup; SIGHUP reloads it without restart.
 

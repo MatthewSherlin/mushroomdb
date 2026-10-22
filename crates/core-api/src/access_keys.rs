@@ -27,8 +27,9 @@
 //! on any other tier, a malformed or repeated hash, a repeated name, a
 //! plaintext `token` field, or an unknown field refuses the whole file. A
 //! half-applied key file is an access decision nobody made. On Unix the file
-//! must not be accessible by group or others, as `ssh` requires of a private
-//! key. No error ever carries a token.
+//! must be owned by the user running the server and closed to group and
+//! others (the file that was opened is the file checked). Windows has no such
+//! check. No error ever carries a token.
 //!
 //! A reload swaps the whole table at once; a request resolves against exactly
 //! one table. A reload that fails keeps the table in force.
@@ -348,21 +349,10 @@ impl AccessKeys {
     }
 }
 
-/// Refuses a key file that group or others can read or write.
-#[cfg(unix)]
-fn check_private(path: &Path) -> Result<(), AccessKeysError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)
-        .map_err(|e| {
-            refuse(format!(
-                "{} could not be read: {}",
-                path.display(),
-                e.kind()
-            ))
-        })?
-        .permissions()
-        .mode()
-        & 0o777;
+/// Whether a key file with this `mode` and owner may be trusted by a process
+/// running as `euid`: owned by that user and closed to group and others.
+fn private_enough(path: &Path, mode: u32, owner: u32, euid: u32) -> Result<(), AccessKeysError> {
+    let mode = mode & 0o777;
     if mode & 0o077 != 0 {
         return Err(refuse(format!(
             "{} is accessible by group or others (mode {mode:04o}); \
@@ -371,34 +361,46 @@ fn check_private(path: &Path) -> Result<(), AccessKeysError> {
             path.display()
         )));
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_private(_path: &Path) -> Result<(), AccessKeysError> {
-    Ok(())
-}
-
-fn read_text(path: &Path) -> Result<Option<String>, AccessKeysError> {
-    match std::fs::metadata(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(refuse(format!(
-                "{} could not be read: {}",
-                path.display(),
-                e.kind()
-            )))
-        }
+    if owner != euid {
+        return Err(refuse(format!(
+            "{} is owned by uid {owner}, not by the user running the server (uid {euid}); \
+             another account could rewrite the keys, run: chown {euid} {}",
+            path.display(),
+            path.display()
+        )));
     }
-    check_private(path)?;
-    std::fs::read_to_string(path).map(Some).map_err(|e| {
+    Ok(())
+}
+
+/// Opens `path` and reads it, checking the mode and owner of the *opened* file
+/// (not of the path), so the file checked is the file read. `None` when the
+/// file does not exist. Windows has no mode check: the file's access is
+/// whatever its directory grants.
+fn read_text(path: &Path) -> Result<Option<String>, AccessKeysError> {
+    use std::io::Read;
+    let failed = |e: std::io::Error| {
         refuse(format!(
             "{} could not be read: {}",
             path.display(),
             e.kind()
         ))
-    })
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(failed(e)),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = file.metadata().map_err(failed)?;
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        private_enough(path, meta.permissions().mode(), meta.uid(), euid)?;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(failed)?;
+    Ok(Some(text))
 }
 
 fn read_table(path: &Path) -> Result<KeyTable, AccessKeysError> {
@@ -757,6 +759,33 @@ mod tests {
             set_mode(&path, mode);
             assert!(AccessKeys::load(&path).is_ok(), "{mode:04o}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_owned_by_another_user_is_refused() {
+        let path = Path::new("/store/keys.json");
+        // A private file, owned by someone else.
+        let err = private_enough(path, 0o100600, 1001, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/store/keys.json"), "{err}");
+        assert!(
+            err.contains("uid 1001") && err.contains("uid 1000"),
+            "{err}"
+        );
+        // Owned by us and private: fine, whatever the file-type bits say.
+        assert!(private_enough(path, 0o100600, 1000, 1000).is_ok());
+        assert!(private_enough(path, 0o100400, 1000, 1000).is_ok());
+        // Loose beats owner in the message, and either way it is refused.
+        let err = private_enough(path, 0o100644, 1001, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0644"), "{err}");
+        // A file this process just created is accepted by the real check.
+        let dir = TempDir::new("owner");
+        let own = dir.write_keys(&sample());
+        assert!(AccessKeys::load(&own).is_ok());
     }
 
     #[cfg(unix)]

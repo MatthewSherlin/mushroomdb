@@ -183,8 +183,8 @@ fn main() -> ExitCode {
                 };
                 if !admin_key {
                     return fail(
-                        "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
-                         (see SECURITY.md)",
+                        "non-loopback --addr requires --token, MUSHROOMDB_TOKEN or an admin key \
+                         in keys.json (see SECURITY.md)",
                     );
                 }
             }
@@ -422,7 +422,8 @@ fn main() -> ExitCode {
                 println!("{token}");
                 eprintln!(
                     "key {name:?} added to {} (tier {tier}). The token above is shown once \
-                     and is not stored; only its hash is. SIGHUP a running server to load it.",
+                     and is not stored; only its hash is. A running server loads it on SIGHUP \
+                     (kill -HUP <pid>; not available on Windows, where you restart).",
                     db_dir.join("keys.json").display()
                 );
                 ExitCode::SUCCESS
@@ -624,13 +625,11 @@ fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
     }
 }
 
-/// A new random token: 32 bytes from the operating system, in hex.
+/// A new random token: 32 bytes from the operating system's random source (any
+/// platform), in hex.
 fn random_token() -> Result<String, String> {
-    use std::io::Read;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| format!("no random source (/dev/urandom): {}", e.kind()))?;
+    getrandom::fill(&mut bytes).map_err(|e| format!("no random source: {e}"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -657,7 +656,9 @@ fn run_keys_hash() -> Result<String, String> {
         .take(4096)
         .read_to_string(&mut text)
         .map_err(|e| format!("could not read the token: {}", e.kind()))?;
+    // A trailing newline, or a Windows `\r\n`, is not part of the token.
     let token = text.strip_suffix('\n').unwrap_or(&text);
+    let token = token.strip_suffix('\r').unwrap_or(token);
     mushroomdb::hash_token(token).map_err(|e| e.to_string())
 }
 
@@ -683,7 +684,6 @@ fn run_serve(
         // a snapshot carries it (ledger row 36), and changes what an existing
         // store indexes, so an existing store is never touched here.
         let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
-        // `GET /ready` answers 503 until the store is open and its schema is in.
         // `keys.json` beside the store: extra tokens with tiers, re-read on
         // SIGHUP. An invalid file stops the start, before the store is opened,
         // rather than serve with the keys the operator meant to add missing.
@@ -701,10 +701,10 @@ fn run_serve(
                 keys_path.display()
             ));
         }
-        // A store with no keys.json behaves exactly as before, SIGHUP included.
-        if keys_path.exists() {
-            server::watch_sighup(&access_keys);
-        }
+        // Always, on Unix: SIGHUP re-reads keys.json, picks up one created after
+        // the start, and with none is a logged no-op. It must never end the process.
+        server::watch_sighup(&access_keys);
+        // `GET /ready` answers 503 until the store is open and its schema is in.
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         // A shared open takes no lock, so an unwritable data directory would

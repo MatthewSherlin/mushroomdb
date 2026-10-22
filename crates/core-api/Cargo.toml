@@ -45,6 +45,11 @@ unicode-normalization = { workspace = true }
 # mushroomdb-extract, so it adds no new crate to the lock.
 blake3 = "1"
 
+[target.'cfg(unix)'.dependencies]
+# The effective uid, to check who owns keys.json. Already a dependency of
+# mushroomdb-storage and mushroomdb-server.
+libc = { version = "0.2", default-features = false }
+
 [dev-dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.9.2" }
 # `test-hooks` exposes `core_rules::hnsw_insert_count`, which

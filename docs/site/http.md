@@ -117,7 +117,7 @@ mushroomdb keys add <db-dir> tenant --tier read --role tenant_a
 
 Each command generates a random 32-byte token, prints it once on standard output, and appends only
 its blake3 hash to `keys.json`, creating the file with mode 0600. The token cannot be shown again.
-A running server picks the new key up on SIGHUP.
+A running server loads it on SIGHUP (`kill -HUP <pid>`), including the first key added to a server that started without a `keys.json`; once that key is loaded the server requires a key. Windows has no SIGHUP: restart the server there.
 
 ```json
 {
@@ -145,22 +145,22 @@ Keys are read the same three ways as the other tokens (header, `?token=`, cookie
 one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
 token is also a key. A server with no env token and no role tokens but at least one key requires
 a key. An `admin` key also satisfies the rule that a non-loopback `--addr` needs a token; a
-`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes, and `serve` installs no SIGHUP handler.
+`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes.
 
 The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
 malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the
-whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must not be
-accessible by group or others, as `ssh` requires of a private key: a file with any group or world bit
-set is refused with a message naming the path and its mode (`chmod 600` fixes it). Error messages
+whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must be owned by the user running the server and closed to group and others: a file
+with any group or world bit set is refused with a message naming the path and its mode (`chmod 600`
+fixes it), and a file owned by another account is refused naming both uids. The check is made on the
+opened file, so the file checked is the file read. **Windows performs no such check**: there the
+file is as private as its directory's access list makes it, so lock that down yourself. Error messages
 never contain a token.
 
 **Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
 The new set replaces the old one in a single step, so a request sees one set or the other, never a
 mix. If the new file does not parse or is not private, the old keys stay in force and the error is
 logged. Removing every key locks the server rather than opening it: once a key has been loaded,
-authentication stays required. A server started with no `keys.json` does not watch for SIGHUP, so
-create the file and restart it once to start using keys. On a platform without SIGHUP, restart to
-reload.
+authentication stays required. A server started with no `keys.json` handles SIGHUP too: with no file it is a logged no-op, and a file created later is picked up. On a platform without SIGHUP (Windows), restart to reload.
 
 **What a reload does not reach.** HTTP resolves the key on every request, so a revoked key is
 refused on its next request. A WebSocket (`/watch`, `/subscribe`) opened with an admin key, and a

@@ -225,7 +225,7 @@ mushroomdb keys hash
                    reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
 ```
 
-`keys add` writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
+`keys add` works on every platform (the token comes from the operating system's random source). It writes a 32-byte random token to standard output, as 64 hex characters, and a note to standard error. The token is not stored and cannot be shown again; only its hash goes in `keys.json`. It refuses a repeated name and leaves the file as it was. The mode and owner check on `keys.json` applies on Unix only; Windows has none. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier) for what each tier may do and how a running server reloads the file.
 
 ### `verify`
 
