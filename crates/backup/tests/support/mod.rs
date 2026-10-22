@@ -33,6 +33,12 @@ pub struct Faulty {
     pub hang_data_puts: AtomicBool,
     /// Conditional PUTs are performed as plain overwrites.
     pub ignore_preconditions: AtomicBool,
+    /// `If-Match` PUTs are performed as plain overwrites; `If-None-Match`
+    /// is honored.
+    pub ignore_if_match: AtomicBool,
+    /// A PUT of `LEASE` is applied, then reported as failed: the answer was
+    /// lost on the way back.
+    pub lose_lease_acks: AtomicBool,
     /// PUTs, multipart uploads and DELETEs of objects other than `LEASE`
     /// that reached the store.
     pub data_writes: AtomicU64,
@@ -46,6 +52,8 @@ impl Faulty {
             lease_down: AtomicBool::new(false),
             hang_data_puts: AtomicBool::new(false),
             ignore_preconditions: AtomicBool::new(false),
+            ignore_if_match: AtomicBool::new(false),
+            lose_lease_acks: AtomicBool::new(false),
             data_writes: AtomicU64::new(0),
         })
     }
@@ -115,7 +123,10 @@ impl ObjectStore for Faulty {
         Box::pin(async move {
             self.refuse_at(location)?;
             self.data_write(location).await;
-            let opts = if self.ignore_preconditions.load(Ordering::SeqCst) {
+            let ignore = self.ignore_preconditions.load(Ordering::SeqCst)
+                || (matches!(opts.mode, PutMode::Update(_))
+                    && self.ignore_if_match.load(Ordering::SeqCst));
+            let opts = if ignore {
                 PutOptions {
                     mode: PutMode::Overwrite,
                     ..opts
@@ -123,7 +134,14 @@ impl ObjectStore for Faulty {
             } else {
                 opts
             };
-            self.inner.put_opts(location, payload, opts).await
+            let r = self.inner.put_opts(location, payload, opts).await;
+            if r.is_ok() && is_lease(location) && self.lose_lease_acks.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "Faulty",
+                    source: "the answer was lost".into(),
+                });
+            }
+            r
         })
     }
 

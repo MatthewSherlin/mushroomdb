@@ -12834,40 +12834,81 @@ on the backup prefix before it uploads anything. The lease is one object,
 { "instance_id": "…", "acquired_at": "…", "renewed_at": "…", "ttl_s": 30 }
 ```
 
-The holder renews it every third of a TTL and deletes it on shutdown. A second
-instance pointed at the same prefix finds a lease renewed less than `ttl_s` ago
-and uploads nothing. Its backup health turns false, naming the holder, while it
-keeps serving from its local disk. It checks again every third of a TTL. When the
-holder stops renewing, the second instance takes over within one TTL: the holder
-may have died, or it may be shutting down in a rolling deploy.
+The holder renews it every third of a TTL. A second instance pointed at the
+same prefix finds a lease renewed less than `ttl_s` ago and uploads nothing.
+Its backup health turns false, naming the holder, while it keeps serving from
+its local disk. It does not give up: it checks again every third of a TTL. A
+holder can stop renewing because it died, or because it is shutting down in a
+rolling deploy. Either way the waiting instance takes over within one TTL plus
+one check, at most 40 s at the default.
+
+Deleting the lease on a clean shutdown, so that a successor can start at once,
+arrives with graceful shutdown (HO-11). Until then, a stopped holder's lease
+expires after its TTL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MUSHROOMDB_BACKUP_LEASE_TTL` | `30` | Seconds a lease stays its holder's after a renewal; at least 1 |
-| `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL` | `on` | `off` for a service that rejects conditional PUT headers |
+| `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL` | `on` | `off` for a service that rejects conditional PUT headers; the lease is then best-effort |
 
 **The lease is advisory, not a distributed lock.** It catches the common mistake
-of giving two machines the same bucket. It does not make two writers safe:
+of giving two machines the same bucket. What it guarantees depends on the
+service:
 
-- **Real exclusion needs conditional PUT.** On AWS S3, Cloudflare R2 and MinIO the
-  lease is taken and renewed with `If-None-Match` / `If-Match`. Two instances
-  that start together get exactly one lease, and a holder whose lease was taken
-  over learns so at its next renewal. When a service ignores those headers, a
-  probe detects it as the lease is taken. Under `..._LEASE_CONDITIONAL=off` the
-  lease is best-effort, and the log says so. In that case two instances that
-  start together can both upload until the next renewal.
-- **A holder stops itself in time.** A holder that cannot renew stops writing two
-  thirds of a TTL after its last renewal. Its in-flight uploads are cancelled at
-  that point. Nobody may take the lease over until a full TTL has passed, so a
-  holder cut off from the bucket writes nothing after a takeover, even after
-  the network comes back. This tolerates clock skew between machines of up to a
-  third of a TTL (10 s at the default).
-- **What it cannot stop.** If the service has already received an upload, the
-  upload completes there even after the client gives up on it. A process
-  frozen in the middle of a request still sends it when it resumes. Every
-  backup object is immutable, so the worst outcome is an orphaned object or a
-  `LATEST` that points at an older restore point. A restore point that does
-  not verify is never one of the outcomes.
+- **Conditional services (AWS S3, Cloudflare R2, MinIO).** The lease is taken and
+  renewed with `If-None-Match` / `If-Match`. Two instances that start together
+  get exactly one lease. A holder whose lease was taken over learns so at its
+  next renewal. Each time the lease is taken, a probe checks that the service
+  really refuses both headers. A service that accepts either one is refused:
+  backup does not start, and health and the log say why and name the switch.
+  Exclusion is never lost silently.
+- **Best-effort (`MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off`).** Each step reads
+  the lease, then writes it. Two instances that start together can both upload
+  until the next renewal, and the log warns of this when the lease is taken.
+- **A holder stops itself in time.** A holder that cannot renew stops writing
+  two thirds of a TTL after its last successful renewal. Its in-flight uploads
+  are cancelled at that point. Nobody may take the lease over until a full TTL
+  has passed. So a holder cut off from the bucket writes nothing after a
+  takeover, even once the network comes back. Clock skew between machines of up
+  to a third of a TTL (10 s at the default) is absorbed.
+- **A lost answer is not a lost lease.** A renewal can time out on the client and
+  still land on the service. The holder then recognises the lease as its own.
+  It never waits behind itself or reports itself as the foreign holder.
+- **The bucket refuses a stale writer too.** On a conditional service every
+  immutable object is written with `If-None-Match: *`, and `LATEST` and the
+  manifests with `If-Match`. An instance that lost the prefix cannot overwrite
+  an object, and its `LATEST` is refused once a successor has written its own.
+
+**One store per prefix.** The first backup of a store gives it a lineage, the
+`backup.lineage` file in the data directory, and every restore point names it.
+A store restored from the prefix keeps the lineage, and continues the backup
+where it left off. The worker refuses the prefix in three cases:
+
+- the prefix's newest restore point is another store's;
+- this store has never been backed up but the prefix has restore points;
+- this store holds fewer commits than that restore point. It was restored
+  from an older backup.
+
+On refusal it uploads nothing and deletes nothing, reports unhealthy with the
+reason, and releases the lease. Use a new prefix for such a store. Retention
+deletes only this lineage's objects. It never deletes the restore point it has
+just written or the one `LATEST` names.
+
+**What can go wrong, exactly:**
+
+- **On a conditional service**, a stale holder's request can still complete:
+  one the service had already received, or one sent by a process frozen
+  mid-request that then resumes. Such a write is refused if it would overwrite
+  an object or move `LATEST`. Otherwise it adds an object no current restore
+  point names. The worst outcome is an orphaned object. Every restore point
+  that `LATEST` and the kept manifests name still verifies.
+- **On a best-effort service**, two writers overlapping until the next renewal
+  can overwrite each other's objects. A restore point can then fail to
+  verify. Run best-effort only where a single writer is otherwise assured.
+- **A store restored from an older backup that has since written more commits
+  than the prefix's newest restore point** passes the commit check. Its new
+  restore points are its own and verify. The prefix's older history is not
+  removed, though, so give such a store a new prefix.
 
 ## Loopback-first posture
 

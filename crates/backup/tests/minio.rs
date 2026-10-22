@@ -17,6 +17,8 @@ use object_store::{ObjectStore, PutPayload};
 use std::path::Path;
 use std::sync::Arc;
 
+static NEXT_PREFIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Bucket {
     store: Arc<dyn ObjectStore>,
     config: BackupConfig,
@@ -36,12 +38,15 @@ fn bucket_with(lease_conditional: bool) -> Option<Bucket> {
     let name =
         std::env::var("MUSHROOMDB_TEST_S3_BUCKET").unwrap_or_else(|_| "mushroomdb-test".into());
     let prefix = format!(
-        "ho07-{}-{}",
+        "ho07-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        // Tests run in parallel and the clock can read the same on two
+        // threads: a counter keeps every prefix distinct.
+        NEXT_PREFIX.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     );
     let config = BackupConfig {
         lease_conditional,
@@ -322,4 +327,71 @@ async fn s3_worker_holds_renews_and_releases_the_lease() {
     let restored = tempfile::tempdir().unwrap();
     restore_latest(&b, restored.path()).await;
     assert_eq!(GraphDb::open(restored.path()).unwrap().node_count(), 5);
+}
+
+/// The bucket-side fence on a real S3 service: once another writer has
+/// moved `LATEST`, a stale writer's `LATEST` is refused (If-Match), and an
+/// immutable object it would overwrite with other bytes is refused too
+/// (If-None-Match).
+#[tokio::test]
+async fn s3_refuses_a_stale_writer() {
+    let Some(b) = bucket() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    for i in 0..2 {
+        db.write()
+            .insert_node("A", &format!("a{i}"), vec![])
+            .unwrap();
+    }
+    let config = BackupConfig {
+        manifest_interval_s: 0,
+        ..b.config.clone()
+    };
+    let mut stale = BackupWorker::new(
+        config,
+        Arc::clone(&b.store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    stale.run_once().await.unwrap();
+
+    // An object where the next segment will go, with other bytes.
+    let m = {
+        let key = String::from_utf8(get(&b.store, &latest_key(&b.prefix)).await).unwrap();
+        Manifest::from_json(&get(&b.store, &key).await).unwrap()
+    };
+    let (g, _, end) = parse_segment_key(&b.prefix, &m.segments.last().unwrap().key).unwrap();
+    db.write().insert_node("A", "b0", vec![]).unwrap();
+    let len = std::fs::metadata(dir.path().join("wal.bin")).unwrap().len();
+    let next = backup::manifest::segment_key(&b.prefix, g, end, len);
+    b.store
+        .put(
+            &ObjectPath::from(next.as_str()),
+            PutPayload::from_static(b"not ours"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale.run_once().await,
+        Err(backup::BackupError::Conflict(_))
+    ));
+    assert_eq!(get(&b.store, &next).await, b"not ours");
+
+    // A successor moves LATEST; the stale writer's LATEST is refused.
+    b.store
+        .delete(&ObjectPath::from(next.as_str()))
+        .await
+        .unwrap();
+    let latest = ObjectPath::from(latest_key(&b.prefix));
+    let successor = format!("{}/manifest/successor.json", b.prefix);
+    b.store
+        .put(&latest, PutPayload::from(successor.clone().into_bytes()))
+        .await
+        .unwrap();
+    match stale.run_once().await {
+        Err(backup::BackupError::Conflict(m)) => assert!(m.contains("LATEST"), "{m}"),
+        other => panic!("expected the bucket to refuse LATEST, got {other:?}"),
+    }
+    assert_eq!(get(&b.store, latest.as_ref()).await, successor.as_bytes());
 }

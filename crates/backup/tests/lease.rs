@@ -244,46 +244,80 @@ async fn writes_stop_a_third_of_a_ttl_before_the_lease_can_expire() {
     assert!(lease.may_write(), "a renewal lifts the fence");
 }
 
-/// A service that accepts a conditional PUT but ignores its precondition is
-/// detected at acquire and reported as best-effort.
+/// A service that accepts a conditional PUT but ignores its precondition
+/// cannot exclude anyone: the acquire fails closed, names the switch, and
+/// leaves no lease behind.
 #[tokio::test]
-async fn a_store_that_ignores_preconditions_is_reported_best_effort() {
+async fn a_store_that_ignores_preconditions_fails_closed() {
     let faulty = Faulty::new(mem());
     faulty.ignore_preconditions.store(true, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = faulty;
-    let lease = BucketLease::acquire(Arc::clone(&store), PREFIX, 30)
-        .await
-        .unwrap();
-    assert_eq!(lease.exclusion(), Exclusion::BestEffort);
-    // Best effort still notices a takeover at the next renewal.
-    write_foreign(&store, "successor", 0, 30).await;
-    assert!(matches!(lease.renew().await, Err(LeaseError::Lost { .. })));
+    match BucketLease::acquire(Arc::clone(&store), PREFIX, 30).await {
+        Err(e @ LeaseError::PreconditionsIgnored { .. }) => {
+            assert!(e.to_string().contains("If-None-Match"), "{e}");
+            assert!(
+                e.to_string()
+                    .contains("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off"),
+                "{e}"
+            );
+        }
+        other => panic!("expected PreconditionsIgnored, got {other:?}"),
+    }
+    assert!(read_lease(&store).await.is_none(), "no lease left behind");
+}
+
+/// A service that honors If-None-Match but ignores If-Match would let two
+/// contenders both take over a stale lease and overwrite each other's
+/// renewals unnoticed. The probe catches it.
+#[tokio::test]
+async fn a_store_that_ignores_only_if_match_fails_closed() {
+    let faulty = Faulty::new(mem());
+    faulty.ignore_if_match.store(true, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = faulty;
+    match BucketLease::acquire(Arc::clone(&store), PREFIX, 30).await {
+        Err(LeaseError::PreconditionsIgnored { header }) => assert_eq!(header, "If-Match"),
+        other => panic!("expected PreconditionsIgnored, got {other:?}"),
+    }
 }
 
 /// A store with create-if-absent but no compare-and-swap (the local file
-/// system) renews best-effort, and still notices a takeover.
+/// system): the probe finds the client cannot send If-Match, so the lease is
+/// best-effort from the start, and renewal still notices a takeover.
 #[tokio::test]
-async fn a_store_without_conditional_update_renews_best_effort() {
+async fn a_store_without_conditional_update_is_best_effort() {
     let bucket = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(bucket.path()).unwrap());
     let lease = BucketLease::acquire(Arc::clone(&store), PREFIX, 30)
         .await
         .unwrap();
-    assert_eq!(
-        lease.exclusion(),
-        Exclusion::Conditional,
-        "create-if-absent"
-    );
+    assert_eq!(lease.exclusion(), Exclusion::BestEffort);
     lease.renew().await.unwrap();
-    assert_eq!(
-        lease.exclusion(),
-        Exclusion::BestEffort,
-        "no compare-and-swap"
-    );
     lease.renew().await.unwrap();
     write_foreign(&store, "successor", 0, 30).await;
     assert!(matches!(lease.renew().await, Err(LeaseError::Lost { .. })));
+}
+
+/// A renewal that landed on the service but whose answer was lost leaves
+/// the lease with a version the holder never saw. The next renewal finds
+/// its own id there and carries on: the lease is not lost.
+#[tokio::test]
+async fn a_renewal_whose_answer_was_lost_is_not_a_lost_lease() {
+    let faulty = Faulty::new(mem());
+    let store: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
+    let lease = BucketLease::acquire(Arc::clone(&store), PREFIX, 30)
+        .await
+        .unwrap();
+    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
+    assert!(lease.renew().await.is_err(), "the answer is lost");
+    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
+    lease.renew().await.expect("the lease is still ours");
+    assert!(!lease.is_lost());
+    assert!(lease.may_write());
+    assert_eq!(
+        read_lease(&store).await.unwrap().instance_id,
+        lease.instance_id()
+    );
 }
 
 // ── The worker ───────────────────────────────────────────────────────────────
@@ -632,5 +666,52 @@ async fn a_holder_that_cannot_renew_turns_unhealthy_then_resumes() {
     })
     .await;
     assert_eq!(read_lease(&inner).await.unwrap().instance_id, holder);
+    stop(tx, h).await;
+}
+
+/// Lease writes whose answers are lost — acquire and renewals both — never
+/// make the worker wait behind itself: health never reports its own id as a
+/// foreign holder, and it uploads once answers come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_lease_answers_never_lock_the_worker_out_behind_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let inner = mem();
+    let faulty = Faulty::new(Arc::clone(&inner));
+    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
+    let via: Arc<dyn ObjectStore> = Arc::clone(&faulty) as Arc<dyn ObjectStore>;
+    let (tx, h) = spawn(&via, &db, dir.path());
+    let mut reasons = Vec::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reasons.push(reason(&h));
+    }
+    let id = read_lease(&inner)
+        .await
+        .expect("the acquire landed")
+        .instance_id;
+    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
+    wait_until("the first upload", Duration::from_secs(8), || {
+        has_latest(&inner)
+    })
+    .await;
+    // Renewals with lost answers, while it holds the lease.
+    faulty.lose_lease_acks.store(true, Ordering::SeqCst);
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reasons.push(reason(&h));
+    }
+    faulty.lose_lease_acks.store(false, Ordering::SeqCst);
+    wait_until("health", Duration::from_secs(5), || {
+        let ok = h.healthy.load(Ordering::Acquire);
+        async move { ok }
+    })
+    .await;
+    for r in &reasons {
+        assert!(!r.contains("held by another instance"), "{r}");
+        assert!(!r.contains(&id), "named itself: {r}");
+    }
+    assert_eq!(read_lease(&inner).await.unwrap().instance_id, id);
     stop(tx, h).await;
 }

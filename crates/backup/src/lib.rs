@@ -53,6 +53,11 @@ pub enum BackupError {
     /// The bucket lease does not allow this write: it is lost, or it could
     /// not be renewed in time and the holder has fenced itself.
     Lease(String),
+    /// The prefix belongs to another store lineage, or this store was
+    /// rewound; the worker refuses it.
+    Lineage(String),
+    /// The bucket refused a conditional write: another writer is active.
+    Conflict(String),
 }
 
 impl std::fmt::Display for BackupError {
@@ -67,6 +72,7 @@ impl std::fmt::Display for BackupError {
             BackupError::Manifest(m) => write!(f, "manifest: {m}"),
             BackupError::Inconsistent(m) => write!(f, "{m}"),
             BackupError::Lease(m) => write!(f, "bucket lease: {m}"),
+            BackupError::Lineage(m) | BackupError::Conflict(m) => write!(f, "{m}"),
         }
     }
 }

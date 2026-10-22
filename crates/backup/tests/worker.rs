@@ -178,6 +178,7 @@ fn segment_excludes_partial_frame() {
 fn manifest_round_trip() {
     let m = Manifest {
         version: MANIFEST_VERSION,
+        lineage: "0123abcd".into(),
         created_at: "2026-10-19T12:00:00Z".into(),
         commit_seq: 4712,
         oldest_commit_seq: 12,
@@ -187,18 +188,21 @@ fn manifest_round_trip() {
             size: 18_432_000,
             crc32: "cbf43926".into(),
             frames: 0,
+            lineage: "0123abcd".into(),
         }],
         wal_generation: 12,
         segments: vec![SegmentEntry {
             key: "pfx/wal/12/00000000000000000000-00000000000000065536".into(),
             crc32: "00000000".into(),
             frames: 17,
+            lineage: "0123abcd".into(),
         }],
     };
     let json = m.to_json();
     let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
     for field in [
         "version",
+        "lineage",
         "created_at",
         "commit_seq",
         "oldest_commit_seq",
