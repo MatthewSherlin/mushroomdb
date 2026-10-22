@@ -1,6 +1,6 @@
 [package]
 name = "mushroomdb-python"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Python bindings for mushroomdb"
@@ -19,7 +19,7 @@ crate-type = ["cdylib"]
 # this crate's own library is `mushroomdb` (it is what Python imports), and a
 # crate cannot depend on another under its own name. Everywhere else the
 # engine is `mushroomdb`.
-core-api = { package = "mushroomdb", path = "../../crates/core-api", version = "0.9.2" }
-core-storage = { package = "mushroomdb-storage", path = "../../crates/core-storage", version = "0.9.2" }
+core-api = { package = "mushroomdb", path = "../../crates/core-api", version = "0.9.3" }
+core-storage = { package = "mushroomdb-storage", path = "../../crates/core-storage", version = "0.9.3" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
 serde_json = "1"

@@ -3880,9 +3880,11 @@ fn pull_rows(
             if let Some((field, cmp_op_ref, lit)) = fused_filter {
                 // Fused scan+filter: column resolved once, comparison done
                 // inline — no recursive call into pull_rows for the Filter arm.
+                // The column reads overlay and snapshot base, as
+                // `resolve_prop` does (ledger row 139).
                 #[cfg(test)]
                 FUSED_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let col = ctx.view.props.column(field);
+                let col = ctx.view.props.view_column(field);
                 let rest_after_filter = &rest[1..];
                 for (i, &sym) in ctx.view.labels.iter().enumerate() {
                     if result.len() >= ctx.bound {
@@ -3900,11 +3902,9 @@ fn pull_rows(
                     if !ctx.view.visible(id) {
                         continue;
                     }
-                    if let Some(v) = col.get(id) {
-                        if eval_cmp(cmp_op_ref, v, lit) {
-                            row[slot] = Some(Cell::Node(id));
-                            pull_rows(ctx, rest_after_filter, row, result)?;
-                        }
+                    if col.test(id, |v| eval_cmp(cmp_op_ref, v, lit)) {
+                        row[slot] = Some(Cell::Node(id));
+                        pull_rows(ctx, rest_after_filter, row, result)?;
                     }
                 }
             } else {

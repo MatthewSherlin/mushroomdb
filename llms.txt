@@ -271,7 +271,7 @@ Claude Desktop config (Claude Code and Cursor should use the plugin or
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.9.2", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.9.3", "mcp", "/path/to/your/db"]
     }
   }
 }
