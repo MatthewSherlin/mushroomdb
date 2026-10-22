@@ -35,8 +35,10 @@
 //! crash, leaves the target exactly as it was — absent, or an empty
 //! directory — never a part of a store. A failed restore removes the staging
 //! directory; one killed outright can leave it behind, as a hidden
-//! `.<name>.restore-…` directory beside the target, safe to delete. A target
-//! that holds anything is refused before anything is downloaded.
+//! `.<name>.restore-…` directory and lock file beside the target, and the
+//! next restore into the same target removes such leftovers no running
+//! restore holds. A target that holds anything is refused before anything is
+//! downloaded.
 
 use crate::disk;
 use crate::lease::new_instance_id;
@@ -119,9 +121,18 @@ pub struct RestoreS3Outcome {
     /// later one exists but could not be used (missing, short, not whole
     /// frames, or after a gap). The restore holds the commits up to there.
     pub tail_note: Option<String>,
+    /// The store is in place, but something after the final rename failed
+    /// (syncing the parent directory): its directory entry may not be
+    /// durable yet.
+    pub install_note: Option<String>,
+    /// Staging directories (and their lock files) that earlier, killed
+    /// restores into the same target left beside it, removed at the start.
+    pub swept: Vec<PathBuf>,
 }
 
-/// Why a restore failed. The target is untouched in every case.
+/// Why a restore failed. The target is in every case as it was before the
+/// restore — absent, or an empty directory. (Once the store is in place
+/// nothing is reported as a failure; see [`RestoreS3Outcome::install_note`].)
 #[derive(Debug)]
 pub enum RestoreS3Error {
     /// The `--from` URL or the `AWS_*` environment cannot be used.
@@ -144,7 +155,13 @@ pub enum RestoreS3Error {
     BeforeOldestArchive { target: u64, oldest: u64 },
     /// `--at` names a commit past the newest one in the backup, which holds
     /// commits `0..commits`.
-    AfterLatest { target: u64, commits: u64 },
+    AfterLatest {
+        target: u64,
+        commits: u64,
+        /// Why the backup holds no more: segments after the newest manifest
+        /// that exist but could not be used.
+        not_restorable: Option<String>,
+    },
     /// `--at` is a timestamp, and the backup holds no `commit_times.bin` (or
     /// one that records no commit) to resolve it with.
     CommitTimesAbsent,
@@ -154,6 +171,8 @@ pub enum RestoreS3Error {
     CommitTimesEnd {
         /// The newest commit with a recorded time.
         recorded_through: u64,
+        /// That commit's recorded time, in Unix milliseconds.
+        recorded_through_ms: i64,
         /// The commits the backup holds (`0..commits`).
         commits: u64,
     },
@@ -184,13 +203,23 @@ impl std::fmt::Display for RestoreS3Error {
                 "commit {target} is before the oldest commit the backup holds ({oldest}); \
                  restore commit {oldest} or later"
             ),
-            RestoreS3Error::AfterLatest { target, commits } => match commits.checked_sub(1) {
-                Some(newest) => write!(
-                    f,
-                    "commit {target} is past the newest commit in the backup ({newest})"
-                ),
-                None => write!(f, "commit {target}: the backup holds no commits"),
-            },
+            RestoreS3Error::AfterLatest {
+                target,
+                commits,
+                not_restorable,
+            } => {
+                match commits.checked_sub(1) {
+                    Some(newest) => write!(
+                        f,
+                        "commit {target} is past the newest commit in the backup ({newest})"
+                    )?,
+                    None => write!(f, "commit {target}: the backup holds no commits")?,
+                }
+                match not_restorable {
+                    Some(why) => write!(f, "; {why}"),
+                    None => Ok(()),
+                }
+            }
             RestoreS3Error::CommitTimesAbsent => write!(
                 f,
                 "the backup records no commit times (no commit_times.bin), so a timestamp \
@@ -198,15 +227,18 @@ impl std::fmt::Display for RestoreS3Error {
             ),
             RestoreS3Error::CommitTimesEnd {
                 recorded_through,
+                recorded_through_ms,
                 commits,
             } => write!(
                 f,
-                "the backup records commit times only up to commit {recorded_through}, and \
-                 commits {} to {} have none, so a timestamp at or after that commit's time \
-                 cannot be placed among them; restore by commit number (--at N), or without \
-                 --at for the newest",
+                "the backup records commit times only up to commit {recorded_through}, at {at}, \
+                 and commits {} to {} have none, so an instant at or after {at} cannot be \
+                 placed among them. Restore an instant before it, or by commit index \
+                 (--at <commit index>, for example --at {recorded_through}), or without --at \
+                 for the newest",
                 recorded_through + 1,
-                commits.saturating_sub(1)
+                commits.saturating_sub(1),
+                at = ms_rfc3339(*recorded_through_ms),
             ),
             RestoreS3Error::Unreachable(m) => write!(f, "{m}"),
         }
@@ -285,6 +317,7 @@ pub async fn restore_from_store(
     into: &Path,
 ) -> Result<RestoreS3Outcome, RestoreS3Error> {
     check_into(into)?;
+    let swept = sweep_stale_staging(into);
     let bucket = Bucket { store, prefix };
     let Some(latest_target) = bucket.get_text(&latest_key(prefix)).await? else {
         return Err(RestoreS3Error::NoBackup {
@@ -305,6 +338,7 @@ pub async fn restore_from_store(
         (Vec::new(), None)
     };
     let available = latest.commit_seq + tail.iter().map(|s| s.frames).sum::<u64>();
+    let latest_commit_seq = latest.commit_seq;
 
     let target = match at {
         None => None,
@@ -319,6 +353,7 @@ pub async fn restore_from_store(
             return Err(RestoreS3Error::AfterLatest {
                 target: n,
                 commits: available,
+                not_restorable: tail_note,
             })
         }
         Some(n) if n >= latest.commit_seq => (latest_target, latest, tail, n + 1),
@@ -330,10 +365,16 @@ pub async fn restore_from_store(
                     oldest: m.oldest_commit_seq,
                 });
             }
+            // A restore point older than the newest was asked for: what
+            // follows the newest does not concern it.
             (key, m, Vec::new(), n + 1)
         }
     };
-    let tail_note = if tail.is_empty() { None } else { tail_note };
+    let tail_note = if manifest.commit_seq < latest_commit_seq {
+        None
+    } else {
+        tail_note
+    };
     if let Some(note) = &tail_note {
         tracing::warn!(note = %note, "the segments after the newest manifest stop early");
     }
@@ -349,6 +390,8 @@ pub async fn restore_from_store(
         segments: 0,
         bytes: 0,
         tail_note,
+        install_note: None,
+        swept,
     };
     bucket
         .download(&manifest, &tail, staging.path(), &mut out)
@@ -409,7 +452,7 @@ pub async fn restore_from_store(
     }
     let dir = staging.path().to_path_buf();
     let target_dir = into.to_path_buf();
-    blocking(move || install(&dir, &target_dir)).await?;
+    out.install_note = blocking(move || install(&dir, &target_dir)).await?;
     staging.installed();
     Ok(out)
 }
@@ -530,28 +573,52 @@ impl Bucket<'_> {
             .collect();
         later.sort();
         let mut tail = Vec::new();
-        for (start, stop, key) in later {
-            if start != end {
-                return Ok((
-                    tail,
-                    Some(format!("{key} starts at {start}, after a gap from {end}")),
-                ));
-            }
-            let Some(bytes) = self.get(&key).await? else {
-                return Ok((tail, Some(format!("{key} was listed but is gone"))));
+        for (i, (start, stop, key)) in later.iter().enumerate() {
+            let why = if *start != end {
+                Some(format!(
+                    "the segment that should start at byte {end} is missing \
+                     ({key} starts at {start})"
+                ))
+            } else {
+                match self.get(key).await? {
+                    None => Some(format!("{key} was listed but is gone")),
+                    Some(bytes) => {
+                        let (whole, frames) = complete_frames(&bytes);
+                        if bytes.len() as u64 != stop - start || whole != bytes.len() {
+                            Some(format!(
+                                "{key} is damaged: not {} bytes of whole, valid frames",
+                                stop - start
+                            ))
+                        } else {
+                            end = *stop;
+                            tail.push(TailSegment {
+                                key: key.clone(),
+                                bytes,
+                                frames,
+                            });
+                            None
+                        }
+                    }
+                }
             };
-            let (whole, frames) = complete_frames(&bytes);
-            if bytes.len() as u64 != stop - start || whole != bytes.len() {
+            if let Some(why) = why {
+                let unrestored = &later[i..];
+                let bytes = unrestored.last().map_or(end, |l| l.1) - end;
+                // A gap is at least one more segment, missing from the list.
+                let (at_least, count) = if *start != end {
+                    ("at least ", unrestored.len() + 1)
+                } else {
+                    ("", unrestored.len())
+                };
                 return Ok((
                     tail,
                     Some(format!(
-                        "{key} is not {} bytes of whole frames",
-                        stop - start
+                        "{at_least}{count} segment(s) uploaded after the newest manifest, \
+                         {bytes} bytes of WAL from byte {end} on, were not restored, so the \
+                         commits they hold are not in the restored store: {why}"
                     )),
                 ));
             }
-            end = stop;
-            tail.push(TailSegment { key, bytes, frames });
         }
         Ok((tail, None))
     }
@@ -589,9 +656,7 @@ impl Bucket<'_> {
                     } => RestoreS3Error::Unreachable(format!(
                         "{} is before the oldest recorded commit time ({}, commit {floor_commit})",
                         rfc3339(t),
-                        OffsetDateTime::from_unix_timestamp_nanos(floor_ms as i128 * 1_000_000)
-                            .map(rfc3339)
-                            .unwrap_or_else(|_| format!("{floor_ms} ms"))
+                        ms_rfc3339(floor_ms)
                     )),
                     mushroomdb::GraphError::CommitOutOfRange { commit, floor, .. } => {
                         RestoreS3Error::BeforeOldestArchive {
@@ -609,6 +674,7 @@ impl Bucket<'_> {
         if at.commit == at.newest_recorded && at.newest_recorded + 1 < available {
             return Err(RestoreS3Error::CommitTimesEnd {
                 recorded_through: at.newest_recorded,
+                recorded_through_ms: at.newest_recorded_ms,
                 commits: available,
             });
         }
@@ -784,37 +850,114 @@ fn check_into(into: &Path) -> Result<(), RestoreS3Error> {
     }
 }
 
-/// The staging directory beside the target. Dropped without
-/// [`installed`](Self::installed), it is removed, and so are the directories
-/// above it that the restore created.
+/// The parent directory a target sits in; `.` for a bare relative name.
+fn parent_of(into: &Path) -> PathBuf {
+    match into.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// The target's file name, as the staging names use it.
+fn name_of(into: &Path) -> String {
+    into.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "restored".into())
+}
+
+/// The staging stem (`.<name>.restore-<pid>-<8 hex>`) an entry of the parent
+/// directory belongs to, for a restore into `name`: the staging directory
+/// itself, or its lock file (the same name plus `.lock`). Exact: nothing
+/// else in the parent ever matches.
+fn staging_stem(entry: &str, name: &str) -> Option<String> {
+    let rest = entry.strip_prefix(&format!(".{name}.restore-"))?;
+    let stem = rest.strip_suffix(".lock").unwrap_or(rest);
+    let (pid, tag) = stem.split_once('-')?;
+    let ok = !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && tag.len() == 8
+        && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    ok.then(|| format!(".{name}.restore-{stem}"))
+}
+
+/// Remove the staging directories, and their lock files, that earlier
+/// restores into `into` left beside it when they were killed: those whose
+/// lock file no process holds. A restore still running holds its lock, and
+/// its staging directory is left alone. Returns what was removed.
+fn sweep_stale_staging(into: &Path) -> Vec<PathBuf> {
+    let parent = parent_of(into);
+    let name = name_of(into);
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return Vec::new();
+    };
+    let mut stems = std::collections::BTreeSet::new();
+    for e in entries.flatten() {
+        if let Some(stem) = staging_stem(&e.file_name().to_string_lossy(), &name) {
+            stems.insert(stem);
+        }
+    }
+    let mut removed = Vec::new();
+    for stem in stems {
+        let dir = parent.join(&stem);
+        let lock = parent.join(format!("{stem}.lock"));
+        let held = match std::fs::OpenOptions::new().write(true).open(&lock) {
+            Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            Err(_) => false,
+        };
+        if held {
+            continue;
+        }
+        if dir.is_dir() && std::fs::remove_dir_all(&dir).is_ok() {
+            tracing::info!(path = %dir.display(), "removed a stale restore staging directory");
+            removed.push(dir);
+        }
+        if std::fs::remove_file(&lock).is_ok() {
+            removed.push(lock);
+        }
+    }
+    removed
+}
+
+/// The staging directory beside the target, `.<name>.restore-<pid>-<tag>`,
+/// with a lock file of the same name plus `.lock` that this restore holds
+/// locked for as long as it runs, so a later restore can tell a killed
+/// restore's leftovers from a running one's. Dropped without
+/// [`installed`](Self::installed), the directory and its lock file are
+/// removed, and so are the directories above it that the restore created.
 struct Staging {
     path: PathBuf,
+    lock_path: PathBuf,
+    _lock: std::fs::File,
     /// Ancestors of the target this restore created, deepest first.
     created: Vec<PathBuf>,
 }
 
 impl Staging {
     fn beside(into: &Path) -> Result<Self, RestoreS3Error> {
-        let parent = match into.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
+        let parent = parent_of(into);
         let created: Vec<PathBuf> = parent
             .ancestors()
             .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
             .map(Path::to_path_buf)
             .collect();
         std::fs::create_dir_all(&parent)?;
-        let name = into
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "restored".into());
-        let path = parent.join(format!(
-            ".{name}.restore-{}-{}",
+        let stem = format!(
+            ".{}.restore-{}-{}",
+            name_of(into),
             std::process::id(),
             &new_instance_id()[..8]
-        ));
-        let staging = Self { path, created };
+        );
+        let path = parent.join(&stem);
+        let lock_path = parent.join(format!("{stem}.lock"));
+        // The lock first: a sweep never sees this directory unlocked.
+        let lock = std::fs::File::create(&lock_path)?;
+        lock.lock()?;
+        let staging = Self {
+            path,
+            lock_path,
+            _lock: lock,
+            created,
+        };
         std::fs::create_dir(&staging.path)?;
         Ok(staging)
     }
@@ -833,6 +976,7 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.lock_path);
         for dir in &self.created {
             // Only an empty one: anything another process put there stays.
             let _ = std::fs::remove_dir(dir);
@@ -850,7 +994,7 @@ impl Drop for Staging {
 /// Unix in the same step; elsewhere it is removed first, so a crash in
 /// between leaves it absent, never partial). A mount point cannot be
 /// replaced: the rename fails and the target is left as it was.
-fn install(staging: &Path, into: &Path) -> Result<(), RestoreS3Error> {
+fn install(staging: &Path, into: &Path) -> Result<Option<String>, RestoreS3Error> {
     // The read-only verification open may have left its lock file.
     match std::fs::remove_file(staging.join("LOCK")) {
         Ok(()) => {}
@@ -868,24 +1012,50 @@ fn install(staging: &Path, into: &Path) -> Result<(), RestoreS3Error> {
         ))));
     }
     #[cfg(not(unix))]
-    if into.exists() {
+    let replaced_empty = if into.exists() {
         std::fs::remove_dir(into)?;
-    }
-    std::fs::rename(staging, into).map_err(|e| {
-        RestoreS3Error::Io(std::io::Error::new(
+        true
+    } else {
+        false
+    };
+    if let Err(e) = std::fs::rename(staging, into) {
+        #[allow(unused_mut)]
+        let mut recreated = String::new();
+        #[cfg(not(unix))]
+        if replaced_empty {
+            recreated = match std::fs::create_dir(into) {
+                Ok(()) => "; the empty directory it replaced was created again".into(),
+                Err(_) => "; the empty directory it was to replace was removed and could \
+                           not be created again"
+                    .into(),
+            };
+        }
+        return Err(RestoreS3Error::Io(std::io::Error::new(
             e.kind(),
             format!(
                 "moving the restored store into {} (it must be a new or empty directory, \
-                 not a mount point; restore into a directory inside one): {e}",
+                 not a mount point; restore into a directory inside one): {e}{recreated}",
                 into.display()
             ),
-        ))
-    })?;
-    #[cfg(unix)]
-    if let Some(parent) = into.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::File::open(parent)?.sync_all()?;
+        )));
     }
-    Ok(())
+    // From here the store is in place: nothing below is a failure of the
+    // restore, only a doubt about how durable its directory entry is.
+    #[cfg(unix)]
+    {
+        let parent = parent_of(into);
+        if let Err(e) = std::fs::File::open(&parent).and_then(|d| d.sync_all()) {
+            let note = format!(
+                "the restored store is in place in {}, but syncing its parent directory {} \
+                 failed ({e}): its directory entry may not survive a power loss",
+                into.display(),
+                parent.display()
+            );
+            tracing::warn!(note = %note, "restore installed");
+            return Ok(Some(note));
+        }
+    }
+    Ok(None)
 }
 
 /// Targets whose next install fails just before the rename (tests only).
@@ -919,6 +1089,12 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| RestoreS3Error::Io(std::io::Error::other(e.to_string())))?
+}
+
+fn ms_rfc3339(ms: i64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000)
+        .map(rfc3339)
+        .unwrap_or_else(|_| format!("{ms} ms"))
 }
 
 fn rfc3339(t: OffsetDateTime) -> String {

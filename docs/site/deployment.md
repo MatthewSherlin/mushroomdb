@@ -296,8 +296,9 @@ cadence, not the manifest interval.
 - The times come from the newest restore point's `commit_times.bin`. Segments
   uploaded after that restore point hold commits with no recorded time. An
   instant at or after the newest recorded time could fall after some of them,
-  so it is refused with an error naming the last commit with a time: restore
-  by commit number instead, or without `--at` for the newest. An instant before
+  so it is refused with an error naming the last commit with a time, its index
+  and when it was: restore an earlier instant, by commit index
+  (`--at <commit index>`) instead, or without `--at` for the newest. An instant before
   the newest recorded time resolves as above.
 
 A point in time is restored from the earliest restore point of the backup's
@@ -319,9 +320,29 @@ copy is then opened and must hold the commits the manifest says it does.
 
 Every file is fsynced, and the staging directory then becomes `--into` in one
 directory rename. So `--into` is always either as it was, absent or empty, or
-the whole restored store, and never part of one, even after a crash. A restore
-that fails removes the staging directory. One killed outright can leave it
-behind; it is safe to delete.
+the whole restored store, and never part of one, even after a crash.
+
+- An existing empty `--into` is replaced by the staging directory, on every
+  platform, so its permissions and ownership are not kept: the restored
+  directory has the ones the restore created it with. On Unix the replacement
+  is the rename itself. Elsewhere the empty directory is removed first; if the
+  rename then fails, it is created again where possible, and the error says
+  whether it was.
+- Once the rename has happened the restore has succeeded. If syncing the
+  parent directory afterwards fails, the command still succeeds and prints a
+  warning: the store is in place, but its directory entry may not survive a
+  power loss until the system syncs it.
+- A restore that fails removes the staging directory. One killed outright
+  leaves it behind, beside its lock file
+  (`.<name>.restore-<pid>-<tag>.lock`), and it can hold a whole copy of the
+  store. The next restore into the same `--into` removes such leftovers whose
+  lock no running restore holds, and lists what it removed. Nothing else in
+  the directory is touched.
+
+If segments uploaded after the newest restore point exist but cannot be used
+(the first one missing or damaged, or a later one after a gap), the restore of
+the newest point still succeeds with what it can verify and warns, naming how
+many segments and bytes of WAL were not restored and why.
 
 `roles.json` and `keys.json` are restored as the chosen restore point holds
 them. They are not cut back to a point in time: roles and keys are current

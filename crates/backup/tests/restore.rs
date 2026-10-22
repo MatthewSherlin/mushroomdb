@@ -674,7 +674,8 @@ async fn segments_after_the_newest_manifest_are_restored_too() {
                 e,
                 RestoreS3Error::AfterLatest {
                     target: 12,
-                    commits: 12
+                    commits: 12,
+                    not_restorable: None,
                 }
             ),
             "{backend}: {e}"
@@ -920,11 +921,16 @@ async fn a_timestamp_past_the_recorded_times_is_refused_when_later_commits_have_
             match &e {
                 RestoreS3Error::CommitTimesEnd {
                     recorded_through,
+                    recorded_through_ms,
                     commits,
-                } => assert_eq!((*recorded_through, *commits), (1, 4), "{backend} {at}"),
+                } => {
+                    assert_eq!((*recorded_through, *commits), (1, 4), "{backend} {at}");
+                    assert_eq!(*recorded_through_ms, ms("2026-02-01T00:00:00Z"));
+                }
                 other => panic!("{backend} {at}: expected CommitTimesEnd, got {other}"),
             }
-            assert!(e.to_string().contains("--at N"), "{e}");
+            assert!(e.to_string().contains("--at <commit index>"), "{e}");
+            assert!(e.to_string().contains("2026-02-01T00:00:00Z"), "{e}");
             assert!(!target.exists());
         }
         // Before the newest recorded time the answer is certain.
@@ -1010,4 +1016,178 @@ async fn a_failed_install_leaves_the_target_absent_or_empty() {
             "{backend}"
         );
     }
+}
+
+// ── Fix round 2 ──────────────────────────────────────────────────────────────
+
+/// A backup whose newest manifest is at commit 3, followed by two segments
+/// of two commits each. Returns the bucket's two tail segment keys.
+async fn manifest_then_two_tail_segments(b: &Bucket) -> (SharedDb, tempfile::TempDir, [String; 2]) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let mut w = worker_with(
+        &b.store,
+        &db,
+        dir.path(),
+        BackupConfig {
+            manifest_interval_s: 3600,
+            ..config()
+        },
+    );
+    insert(&db, "a", 3);
+    w.run_once().await.unwrap();
+    insert(&db, "b", 2);
+    w.run_once().await.unwrap();
+    insert(&db, "c", 2);
+    w.run_once().await.unwrap();
+    let m = latest(&b.store).await;
+    assert_eq!(m.commit_seq, 3);
+    let mut tail: Vec<String> = bucket_contents(&b.store)
+        .await
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            backup::manifest::parse_segment_key(PREFIX, k).is_some()
+                && !m.segments.iter().any(|s| &s.key == k)
+        })
+        .collect();
+    tail.sort();
+    assert_eq!(tail.len(), 2, "{tail:?}");
+    (db, dir, [tail[0].clone(), tail[1].clone()])
+}
+
+/// When the first segment after the newest manifest is missing or damaged,
+/// none of the later commits can be restored. The restore of the newest
+/// point still succeeds with what the manifest holds, and says how many
+/// segments and bytes it did not restore and why; `--at` into the lost range
+/// says so too. A restore of an older point, asked for, says nothing.
+#[tokio::test]
+async fn commits_after_the_manifest_that_cannot_be_restored_are_reported() {
+    for (backend, b) in buckets() {
+        let (_db, _dir, [first, _second]) = manifest_then_two_tail_segments(&b).await;
+        let good = get(&b.store, &first).await.unwrap();
+        for (case, damage) in [
+            ("missing", None),
+            ("damaged", Some(good[..good.len() - 1].to_vec())),
+        ] {
+            match &damage {
+                None => b
+                    .store
+                    .delete(&ObjectPath::from(first.as_str()))
+                    .await
+                    .unwrap(),
+                Some(bytes) => put(&b.store, &first, bytes.clone()).await,
+            }
+            let into = tempfile::tempdir().unwrap();
+            let out =
+                restore_from_store(Arc::clone(&b.store), PREFIX, None, &into.path().join("r"))
+                    .await
+                    .unwrap();
+            assert_eq!(out.commits, 3, "{backend} {case}");
+            let note = out
+                .tail_note
+                .unwrap_or_else(|| panic!("{backend} {case}: no warning"));
+            assert!(note.contains("2 segment(s)"), "{backend} {case}: {note}");
+            assert!(note.contains("not restored"), "{backend} {case}: {note}");
+            assert!(note.contains(case), "{backend} {case}: {note}");
+
+            let e = restore_from_store(
+                Arc::clone(&b.store),
+                PREFIX,
+                Some(RestoreTarget::CommitSeq(5)),
+                &into.path().join("at"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    RestoreS3Error::AfterLatest {
+                        not_restorable: Some(_),
+                        ..
+                    }
+                ),
+                "{backend} {case}: {e}"
+            );
+            assert!(
+                e.to_string().contains("not restored"),
+                "{backend} {case}: {e}"
+            );
+
+            let older = restore_from_store(
+                Arc::clone(&b.store),
+                PREFIX,
+                Some(RestoreTarget::CommitSeq(1)),
+                &into.path().join("older"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(older.tail_note, None, "{backend} {case}");
+            put(&b.store, &first, good.clone()).await;
+        }
+        let into = tempfile::tempdir().unwrap();
+        let whole = restore_from_store(Arc::clone(&b.store), PREFIX, None, &into.path().join("r"))
+            .await
+            .unwrap();
+        assert_eq!((whole.commits, whole.tail_note), (7, None), "{backend}");
+    }
+}
+
+/// A restore removes the staging directories and lock files killed restores
+/// into the same target left beside it — and nothing else: not a running
+/// restore's (its lock is held), not another target's, not a look-alike.
+#[tokio::test]
+async fn a_restore_sweeps_what_killed_restores_into_its_target_left() {
+    let b = in_memory();
+    let (_db, _dir) = two_generations(&b.store).await;
+    let parent = tempfile::tempdir().unwrap();
+    let p = parent.path();
+    let stale = p.join(".restored.restore-4242-0a1b2c3d");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("snapshot.bin"), b"half a store").unwrap();
+    std::fs::write(p.join(".restored.restore-4242-0a1b2c3d.lock"), b"").unwrap();
+    let orphan_lock = p.join(".restored.restore-17-ffffffff.lock");
+    std::fs::write(&orphan_lock, b"").unwrap();
+    // A restore still running: its lock file is held.
+    let running = p.join(".restored.restore-99-12345678");
+    std::fs::create_dir(&running).unwrap();
+    let held = std::fs::File::create(p.join(".restored.restore-99-12345678.lock")).unwrap();
+    held.lock().unwrap();
+    // Not this tool's, or not this target's.
+    for keep in [
+        ".restored.restore-x",
+        ".restored.restore-1-ABCDEF01",
+        ".restored.restore-1-abc",
+        ".other.restore-1-abcdef01",
+        "restored.restore-1-abcdef01",
+    ] {
+        std::fs::create_dir(p.join(keep)).unwrap();
+    }
+
+    let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &p.join("restored"))
+        .await
+        .unwrap();
+    let mut swept = out.swept.clone();
+    swept.sort();
+    let mut want = vec![
+        stale.clone(),
+        p.join(".restored.restore-4242-0a1b2c3d.lock"),
+        orphan_lock,
+    ];
+    want.sort();
+    assert_eq!(swept, want);
+    assert_eq!(
+        dir_entries(p),
+        [
+            ".other.restore-1-abcdef01",
+            ".restored.restore-1-ABCDEF01",
+            ".restored.restore-1-abc",
+            ".restored.restore-99-12345678",
+            ".restored.restore-99-12345678.lock",
+            ".restored.restore-x",
+            "restored",
+            "restored.restore-1-abcdef01",
+        ]
+    );
+    drop(held);
 }

@@ -2212,12 +2212,19 @@ pub fn format_restore_s3(
     writeln!(s, "  files: {}", out.files.join(", ")).unwrap();
     writeln!(s, "  segments: {}", out.segments).unwrap();
     writeln!(s, "  bytes: {}", out.bytes).unwrap();
-    if let Some(note) = &out.tail_note {
+    for path in &out.swept {
         writeln!(
             s,
-            "  warning: the segments after the newest manifest stop early: {note}"
+            "  removed a killed restore's leftover: {}",
+            path.display()
         )
         .unwrap();
+    }
+    if let Some(note) = &out.install_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    if let Some(note) = &out.tail_note {
+        writeln!(s, "  warning: {note}").unwrap();
     }
     writeln!(
         s,

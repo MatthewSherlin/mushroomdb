@@ -374,6 +374,8 @@ pub struct InstantAt {
     /// limit it was read with). A store holding commits past it has no time
     /// for them, so an instant that resolves to it may belong to one of them.
     pub newest_recorded: u64,
+    /// The recorded time of `newest_recorded`, in Unix milliseconds.
+    pub newest_recorded_ms: i64,
 }
 
 /// The commit an instant resolves to through a store's `commit_times.bin`
@@ -396,9 +398,11 @@ pub fn commit_at_instant(
     core_storage::commit_times::decode(bytes)?;
     let times = core_storage::commit_times::decode(&commit_times_below(bytes, commits))?;
     let commit = times.resolve_instant(unix_ms, wal_floor)?;
+    let newest_recorded = times.newest_commit().unwrap_or(commit);
     Ok(InstantAt {
         commit,
-        newest_recorded: times.newest_commit().unwrap_or(commit),
+        newest_recorded,
+        newest_recorded_ms: times.time_of(newest_recorded).unwrap_or(unix_ms),
     })
 }
 

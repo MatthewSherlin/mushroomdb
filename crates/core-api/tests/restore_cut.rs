@@ -278,7 +278,8 @@ fn an_instant_resolves_through_the_commit_times_sidecar() {
         at(1_500, 3).unwrap(),
         InstantAt {
             commit: 0,
-            newest_recorded: 2
+            newest_recorded: 2,
+            newest_recorded_ms: 2_000,
         }
     );
     assert_eq!(at(2_000, 3).unwrap().commit, 2);
@@ -287,7 +288,8 @@ fn an_instant_resolves_through_the_commit_times_sidecar() {
         at(2_000, 2).unwrap(),
         InstantAt {
             commit: 1,
-            newest_recorded: 1
+            newest_recorded: 1,
+            newest_recorded_ms: 2_000,
         }
     );
     assert!(matches!(
