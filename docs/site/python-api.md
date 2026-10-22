@@ -1317,7 +1317,7 @@ Refused on a `scoped()` handle with `ValueError`.
 
 ## Memory
 
-The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's store and scope, and dropping the handle releases the store.
+The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's store and scope. Each access returns a new accessor; one you keep holds the store open, as a `scoped()` handle does, and the store is released when the handle and every accessor are dropped.
 
 ### `memory.remember`
 

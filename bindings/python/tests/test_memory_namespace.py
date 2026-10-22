@@ -10,7 +10,7 @@ import warnings
 
 import pytest
 
-from mushroomdb import GraphDb, IngestError
+from mushroomdb import GraphDb, IngestError, MushroomBusy
 
 TS = 1_759_000_000
 
@@ -163,3 +163,17 @@ def test_the_accessor_follows_the_handle_it_came_from(db):
     db.close()
     with pytest.raises(Exception):
         memory.recall("Alice")
+
+
+def test_a_kept_accessor_holds_the_store_open_until_it_is_dropped(tmp_path):
+    path = str(tmp_path / "g")
+    db = GraphDb.open(path)
+    acc = db.memory
+    assert db.memory is not acc, "each access is a new accessor"
+    del db
+    gc.collect()
+    with pytest.raises(MushroomBusy):
+        GraphDb.open(path)
+    del acc
+    gc.collect()
+    GraphDb.open(path).close()

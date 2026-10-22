@@ -308,8 +308,10 @@ class MemoryAccessor:
     A plain `GraphDb` is a general-purpose graph store and imposes none of
     these behaviours on ordinary nodes; this namespace is the memory API only.
     It shares the handle's store and scope, so on a `scoped()` handle it is
-    scoped the same way. Dropping the handle releases the store: the accessor
-    holds no reference back to the `GraphDb` object.
+    scoped the same way. Each `db.memory` access returns a new, cheap accessor
+    (`db.memory is db.memory` is `False`). An accessor you keep holds the store
+    open, as a `scoped()` handle does; the store is released when the handle
+    and every accessor are dropped.
     """
 
     def remember(

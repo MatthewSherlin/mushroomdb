@@ -363,7 +363,8 @@ def parse_stub(source: str) -> dict:
 MEMORY_INTRO = (
     "The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph "
     "store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's "
-    "store and scope, and dropping the handle releases the store."
+    "store and scope. Each access returns a new accessor; one you keep holds the store open, as a "
+    "`scoped()` handle does, and the store is released when the handle and every accessor are dropped."
 )
 DEPRECATED_INTRO = (
     "### Deprecated aliases\n\n"

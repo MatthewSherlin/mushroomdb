@@ -4,7 +4,8 @@
 //! ones that write and read notes, entities and identities the way the memory
 //! tools do. The accessor holds the store's shared state and the handle's scope
 //! directly, not a reference to the `GraphDb` object it came from, so it forms
-//! no reference cycle: dropping the handle releases the store.
+//! no reference cycle: the store is released once the handle and every accessor
+//! are dropped.
 
 use super::*;
 
