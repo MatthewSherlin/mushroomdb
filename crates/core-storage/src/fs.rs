@@ -128,6 +128,14 @@ pub trait Fs {
         Ok(None)
     }
 
+    /// [`wal_len`](Fs::wal_len) and [`wal_ident`](Fs::wal_ident) together:
+    /// what a write scope checks before every append. `RealFs` reads both
+    /// from one look at the file, so a commit pays one `stat` for them, not
+    /// two.
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        Ok((self.wal_len()?, self.wal_ident()?))
+    }
+
     /// Read `file` from byte offset `from` to the end.
     ///
     /// Returns an empty `Vec` when `from` is at or past the end of the file.
@@ -250,7 +258,30 @@ pub trait Fs {
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Keep this store's genesis marker under [`GENESIS_MARKER_V11`] from now
+    /// on, renaming a [`GENESIS_MARKER`] that is already there.
+    ///
+    /// Called by a V11 store before any snapshot it takes (0.10 TY-12). A
+    /// 0.9.x `open_at` replays archive-resident commits from empty state on
+    /// the strength of `wal.genesis` alone, without reading `snapshot.bin`,
+    /// and its WAL decoder drops every frame from the first one it cannot
+    /// read — so beside archives that hold V11 records it would answer with
+    /// the wrong history. Without the marker it refuses those commits as out
+    /// of range, and every other commit goes through the snapshot, which it
+    /// refuses by version. This binary reads either name.
+    ///
+    /// Default: no-op (no older reader opens an in-memory store).
+    fn use_v11_genesis_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
+
+/// The genesis-chain marker every store writes until it is V11.
+pub const GENESIS_MARKER: &str = "wal.genesis";
+/// The genesis-chain marker of a V11 store, a name 0.9.x does not read; see
+/// [`Fs::use_v11_genesis_marker`].
+pub const GENESIS_MARKER_V11: &str = "wal.genesis.v11";
 
 pub trait FsIntrospect {
     fn total_appended(&self) -> usize;
@@ -378,6 +409,9 @@ pub struct RealFs {
     /// in-process write guard, so that a peer holding the lock cannot stall
     /// this process's readers.
     lock: std::sync::Mutex<LockState>,
+    /// The genesis marker is written as [`GENESIS_MARKER_V11`]: set by
+    /// [`Fs::use_v11_genesis_marker`].
+    v11_genesis: bool,
 }
 
 impl RealFs {
@@ -386,6 +420,7 @@ impl RealFs {
         Ok(Self {
             dir: dir.to_path_buf(),
             lock: std::sync::Mutex::new(LockState::default()),
+            v11_genesis: false,
         })
     }
 
@@ -514,6 +549,14 @@ impl Fs for RealFs {
         }
     }
 
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        match std::fs::metadata(self.path(FileId::Wal)) {
+            Ok(m) => Ok((m.len(), file_ident(&m))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
+            Err(e) => Err(e),
+        }
+    }
+
     fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut f = match File::open(self.path(file)) {
@@ -616,11 +659,16 @@ impl Fs for RealFs {
     }
 
     fn has_genesis_marker(&self) -> bool {
-        self.dir.join("wal.genesis").exists()
+        self.dir.join(GENESIS_MARKER).exists() || self.dir.join(GENESIS_MARKER_V11).exists()
     }
 
     fn write_genesis_marker(&mut self) -> std::io::Result<()> {
-        let path = self.dir.join("wal.genesis");
+        let name = if self.v11_genesis {
+            GENESIS_MARKER_V11
+        } else {
+            GENESIS_MARKER
+        };
+        let path = self.dir.join(name);
         {
             let mut f = File::create(&path)?;
             f.write_all(b"")?;
@@ -630,7 +678,24 @@ impl Fs for RealFs {
     }
 
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
-        match std::fs::remove_file(self.dir.join("wal.genesis")) {
+        let mut removed = false;
+        for name in [GENESIS_MARKER, GENESIS_MARKER_V11] {
+            match std::fs::remove_file(self.dir.join(name)) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if removed {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    fn use_v11_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.v11_genesis = true;
+        let old = self.dir.join(GENESIS_MARKER);
+        match std::fs::rename(&old, self.dir.join(GENESIS_MARKER_V11)) {
             Ok(()) => sync_dir(&self.dir),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -771,5 +836,28 @@ mod tests {
         fs.write_atomic(FileId::Snapshot, b"snap1").unwrap();
         fs.write_atomic(FileId::Snapshot, b"snap2").unwrap();
         assert_eq!(fs.read(FileId::Snapshot).unwrap(), b"snap2");
+    }
+
+    /// The one-look pair a write scope reads is exactly the two separate
+    /// looks: missing, grown, and replaced by a rename.
+    #[test]
+    fn wal_len_and_ident_answer_as_the_two_separate_looks() {
+        let d = std::env::temp_dir().join(format!("graphdb-fs-walident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut fs = RealFs::new(&d).unwrap();
+        let separate = |fs: &RealFs| (fs.wal_len().unwrap(), fs.wal_ident().unwrap());
+        assert_eq!(fs.wal_len_and_ident().unwrap(), (0, None));
+        assert_eq!(fs.wal_len_and_ident().unwrap(), separate(&fs));
+        fs.append(FileId::Wal, b"abc").unwrap();
+        let grown = fs.wal_len_and_ident().unwrap();
+        assert_eq!(grown, separate(&fs));
+        assert_eq!(grown.0, 3);
+        fs.write_atomic(FileId::Wal, b"abcdef").unwrap();
+        let replaced = fs.wal_len_and_ident().unwrap();
+        assert_eq!(replaced, separate(&fs));
+        assert_eq!(replaced.0, 6);
+        #[cfg(unix)]
+        assert_ne!(replaced.1, grown.1, "a rename gives the WAL a new identity");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -11,11 +11,21 @@
 //! manifest names is ever overwritten, so every manifest still in the bucket
 //! verifies — not only the newest. Each entry also says which file of the
 //! store it restores to (`name`), since the key no longer does.
+//!
+//! # Lineage
+//!
+//! Every manifest, and every entry in it, carries the `lineage` of the store
+//! it was taken from: a random id the worker gives a store the first time it
+//! backs it up (the `backup.lineage` file, which travels with every restore
+//! point). A prefix belongs to one lineage. A manifest whose entries name
+//! more than one lineage does not parse ([`Manifest::from_json`]): a restore
+//! point is never assembled from two stores' objects.
 
 use serde::{Deserialize, Serialize};
 
-/// The only manifest version this release writes or reads.
-pub const MANIFEST_VERSION: u32 = 1;
+/// The only manifest version this release writes or reads. Version 2 added
+/// `lineage`; version 1 was never released.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// One consistent restore point: the snapshot, the archives and side files
 /// that go with it, and the ordered WAL segments of one generation.
@@ -27,6 +37,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub struct Manifest {
     /// [`MANIFEST_VERSION`].
     pub version: u32,
+    /// The lineage of the store this restore point was taken from.
+    pub lineage: String,
     /// When the manifest was written, RFC 3339 in UTC.
     pub created_at: String,
     /// Global frame index one past the last frame this restore point holds —
@@ -63,6 +75,8 @@ pub struct FileEntry {
     /// file.
     #[serde(default)]
     pub frames: u64,
+    /// The lineage of the store the object was uploaded from.
+    pub lineage: String,
 }
 
 /// One WAL segment named by a manifest. Its byte range is in its key.
@@ -74,6 +88,8 @@ pub struct SegmentEntry {
     /// WAL frames in the segment.
     #[serde(default)]
     pub frames: u64,
+    /// The lineage of the store the segment was uploaded from.
+    pub lineage: String,
 }
 
 impl Manifest {
@@ -81,7 +97,9 @@ impl Manifest {
         serde_json::to_vec_pretty(self).expect("a manifest always serialises")
     }
 
-    /// Parse a manifest, refusing any version this release does not know.
+    /// Parse a manifest, refusing any version this release does not know and
+    /// any manifest that is not of one lineage throughout
+    /// ([`verify_lineage`](Self::verify_lineage)).
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
         let m: Manifest =
             serde_json::from_slice(bytes).map_err(|e| format!("manifest is not valid: {e}"))?;
@@ -91,7 +109,30 @@ impl Manifest {
                 m.version
             ));
         }
+        m.verify_lineage()?;
         Ok(m)
+    }
+
+    /// Check that the manifest names a lineage and that every file and
+    /// segment in it was uploaded from that lineage.
+    pub fn verify_lineage(&self) -> Result<(), String> {
+        if self.lineage.is_empty() {
+            return Err("manifest names no lineage".into());
+        }
+        let foreign = self
+            .files
+            .iter()
+            .map(|f| (&f.key, &f.lineage))
+            .chain(self.segments.iter().map(|s| (&s.key, &s.lineage)))
+            .find(|(_, l)| **l != self.lineage);
+        match foreign {
+            Some((key, l)) => Err(format!(
+                "manifest of lineage {} names {key}, uploaded from lineage {l}: \
+                 a restore point mixing two stores is refused",
+                self.lineage
+            )),
+            None => Ok(()),
+        }
     }
 }
 
@@ -217,7 +258,8 @@ mod tests {
     #[test]
     fn an_unknown_version_is_refused() {
         let mut m = Manifest {
-            version: 2,
+            version: MANIFEST_VERSION + 1,
+            lineage: "l".into(),
             created_at: "2026-10-20T00:00:00Z".into(),
             commit_seq: 0,
             oldest_commit_seq: 0,
@@ -228,6 +270,43 @@ mod tests {
         assert!(Manifest::from_json(&m.to_json()).is_err());
         m.version = MANIFEST_VERSION;
         assert!(Manifest::from_json(&m.to_json()).is_ok());
+    }
+
+    #[test]
+    fn a_restore_point_mixing_two_lineages_does_not_parse() {
+        let entry = |lineage: &str| FileEntry {
+            name: "wal.3.archive".into(),
+            key: "p/archives/0-wal.3.archive".into(),
+            size: 1,
+            crc32: "00000000".into(),
+            frames: 1,
+            lineage: lineage.into(),
+        };
+        let mut m = Manifest {
+            version: MANIFEST_VERSION,
+            lineage: "b".into(),
+            created_at: "2026-10-22T00:00:00Z".into(),
+            commit_seq: 1,
+            oldest_commit_seq: 0,
+            files: vec![entry("b")],
+            wal_generation: 0,
+            segments: vec![],
+        };
+        assert!(Manifest::from_json(&m.to_json()).is_ok());
+        m.files.push(entry("a"));
+        let e = Manifest::from_json(&m.to_json()).unwrap_err();
+        assert!(e.contains("lineage a"), "{e}");
+        m.files.pop();
+        m.segments.push(SegmentEntry {
+            key: "p/wal/0/x".into(),
+            crc32: "00000000".into(),
+            frames: 0,
+            lineage: "a".into(),
+        });
+        assert!(Manifest::from_json(&m.to_json()).is_err());
+        m.segments.clear();
+        m.lineage.clear();
+        assert!(Manifest::from_json(&m.to_json()).is_err());
     }
 
     #[test]

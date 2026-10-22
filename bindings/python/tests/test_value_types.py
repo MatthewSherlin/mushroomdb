@@ -1,26 +1,57 @@
 """The five format-V11 value types in Python: Date, LocalDateTime, DateTime,
 Duration and Binary.
 
-Until TY-12 lets the engine store them, a write carrying one is refused. So the
-conversions are tested through `_value_roundtrip` (Python object -> engine
-`Value` -> Python object, the two halves a write and a read use) and the
-refusal is tested through a real write. TY-12 re-tests both end to end.
+Every conversion is tested end to end: the value is written to a store
+(`insert_node`) and read back (`node_info`), which is the Python object ->
+engine `Value` -> WAL -> engine `Value` -> Python object path a real caller
+takes. The first such write moves the store to the V11 snapshot format.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 
 import pytest
 
 import mushroomdb
-from mushroomdb import Duration, GraphDb, _value_roundtrip, _value_tagged_text
+from mushroomdb import Duration, GraphDb
 
 UTC = dt.timezone.utc
 
 
 def tz(hours: int = 0, minutes: int = 0, seconds: int = 0) -> dt.timezone:
     return dt.timezone(dt.timedelta(hours=hours, minutes=minutes, seconds=seconds))
+
+
+_DB: GraphDb | None = None
+_KEYS = itertools.count()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _store(tmp_path_factory):
+    global _DB
+    _DB = GraphDb.open(str(tmp_path_factory.mktemp("value-types") / "db"))
+    yield _DB
+    _DB.close()
+    _DB = None
+
+
+def roundtrip(value):
+    """Store `value` on a fresh node and read it back from the store."""
+    assert _DB is not None
+    key = f"n{next(_KEYS)}"
+    _DB.insert_node("V", key, {"v": value})
+    return _DB.node_info(key)["props"]["v"]
+
+
+def snapshot_version(path) -> int | None:
+    snap = path / "snapshot.bin"
+    if not snap.exists():
+        return None
+    head = snap.read_bytes()[:6]
+    assert head[:4] == b"GDB1"
+    return int.from_bytes(head[4:6], "little")
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +71,7 @@ def tz(hours: int = 0, minutes: int = 0, seconds: int = 0) -> dt.timezone:
     ],
 )
 def test_date_roundtrip(value):
-    out = _value_roundtrip(value)
+    out = roundtrip(value)
     assert out == value
     assert type(out) is dt.date
 
@@ -56,7 +87,7 @@ def test_date_roundtrip(value):
     ],
 )
 def test_naive_datetime_is_a_local_datetime(value):
-    out = _value_roundtrip(value)
+    out = roundtrip(value)
     assert out == value
     assert out.tzinfo is None
 
@@ -77,7 +108,7 @@ def test_naive_datetime_is_a_local_datetime(value):
     ],
 )
 def test_aware_datetime_keeps_its_offset(value):
-    out = _value_roundtrip(value)
+    out = roundtrip(value)
     assert out == value
     assert out.utcoffset() == value.utcoffset()
     assert (out.year, out.month, out.day, out.hour, out.minute) == (
@@ -93,12 +124,12 @@ def test_same_instant_different_offset_both_keep_their_offset():
     a = dt.datetime(2024, 1, 15, 12, tzinfo=UTC)
     b = dt.datetime(2024, 1, 15, 7, tzinfo=tz(-5))
     assert a == b
-    assert _value_roundtrip(a).utcoffset() != _value_roundtrip(b).utcoffset()
+    assert roundtrip(a).utcoffset() != roundtrip(b).utcoffset()
 
 
 def test_datetime_is_not_mistaken_for_a_date():
-    assert isinstance(_value_roundtrip(dt.datetime(2024, 1, 15)), dt.datetime)
-    assert type(_value_roundtrip(dt.date(2024, 1, 15))) is dt.date
+    assert isinstance(roundtrip(dt.datetime(2024, 1, 15)), dt.datetime)
+    assert type(roundtrip(dt.date(2024, 1, 15))) is dt.date
 
 
 def test_tzinfo_whose_utcoffset_is_none_is_naive():
@@ -109,7 +140,7 @@ def test_tzinfo_whose_utcoffset_is_none_is_naive():
         def dst(self, when):
             return None
 
-    out = _value_roundtrip(dt.datetime(2024, 1, 15, 1, 2, 3, tzinfo=Unknown()))
+    out = roundtrip(dt.datetime(2024, 1, 15, 1, 2, 3, tzinfo=Unknown()))
     assert out == dt.datetime(2024, 1, 15, 1, 2, 3)
     assert out.tzinfo is None
 
@@ -137,12 +168,12 @@ def test_duration_type():
     ],
 )
 def test_duration_roundtrip(dur):
-    assert _value_roundtrip(dur) == dur
+    assert roundtrip(dur) == dur
 
 
 def test_a_month_is_not_thirty_days():
     assert Duration(months=1) != Duration(days=30)
-    assert _value_roundtrip(Duration(months=1)) == Duration(months=1, days=0, nanos=0)
+    assert roundtrip(Duration(months=1)) == Duration(months=1, days=0, nanos=0)
 
 
 @pytest.mark.parametrize("field", ["months", "days"])
@@ -158,18 +189,18 @@ def test_duration_i32_fields_refuse_overflow(field):
     [b"", b"\x00\xff\xde\xad", bytes(range(256)), b"a" * 100_000],
 )
 def test_binary_roundtrip(value):
-    out = _value_roundtrip(value)
+    out = roundtrip(value)
     assert out == value
     assert type(out) is bytes
 
 
 def test_bytearray_and_memoryview_become_binary():
     raw = b"\x01\x02\x03\x04"
-    assert _value_roundtrip(bytearray(raw)) == raw
-    assert _value_roundtrip(memoryview(raw)) == raw
+    assert roundtrip(bytearray(raw)) == raw
+    assert roundtrip(memoryview(raw)) == raw
     # A strided view is copied in logical order.
-    assert _value_roundtrip(memoryview(raw)[::2]) == b"\x01\x03"
-    assert type(_value_roundtrip(bytearray(raw))) is bytes
+    assert roundtrip(memoryview(raw)[::2]) == b"\x01\x03"
+    assert type(roundtrip(bytearray(raw))) is bytes
 
 
 def test_new_types_nest_in_lists_and_maps():
@@ -178,36 +209,43 @@ def test_new_types_nest_in_lists_and_maps():
         "blob": b"\x00",
         "span": Duration(1, 0, 0),
     }
-    assert _value_roundtrip(value) == value
+    assert roundtrip(value) == value
 
 
 def test_existing_types_are_unchanged():
     for value in (1, 1.5, "x", True, [1, "a"], {"k": 2}):
-        assert _value_roundtrip(value) == value
+        assert roundtrip(value) == value
     # bool is still a bool, not an int.
-    assert _value_roundtrip(True) is True
+    assert roundtrip(True) is True
 
 
 # ---------------------------------------------------------------------------
-# Agreement with the wire text (what the server's JSON tags carry)
+# Agreement with the wire text: a value written from its ISO 8601 text by
+# Cypher reads back in Python as the object that text names
 # ---------------------------------------------------------------------------
 
 
-def test_tagged_text_matches_the_server_json_forms():
-    assert _value_tagged_text(dt.date(2024, 1, 15)) == ("$date", "2024-01-15")
-    assert _value_tagged_text(dt.datetime(2024, 1, 15, 12, 34, 56, 789012)) == (
-        "$ldt",
-        "2024-01-15T12:34:56.789012",
-    )
-    assert _value_tagged_text(
-        dt.datetime(2024, 1, 15, 12, 34, 56, 789012, tzinfo=tz(5, 30))
-    ) == ("$dt", "2024-01-15T12:34:56.789012+05:30")
-    assert _value_tagged_text(Duration(months=14, days=3, nanos=14_706_789_000_000)) == (
-        "$dur",
-        "P1Y2M3DT4H5M6.789S",
-    )
-    assert _value_tagged_text(b"\xde\xad\xbe\xef") == ("$binary", "3q2+7w==")
-    assert _value_tagged_text("text") is None
+@pytest.mark.parametrize(
+    "cypher, expected",
+    [
+        ("date('2024-01-15')", dt.date(2024, 1, 15)),
+        ("localdatetime('2024-01-15T12:34:56.789012')", dt.datetime(2024, 1, 15, 12, 34, 56, 789012)),
+        (
+            "datetime('2024-01-15T12:34:56.789012+05:30')",
+            dt.datetime(2024, 1, 15, 12, 34, 56, 789012, tzinfo=tz(5, 30)),
+        ),
+        ("duration('P1Y2M3DT4H5M6.789S')", Duration(months=14, days=3, nanos=14_706_789_000_000)),
+    ],
+)
+def test_iso_text_written_by_cypher_reads_back_as_the_python_object(cypher, expected):
+    assert _DB is not None
+    key = f"n{next(_KEYS)}"
+    _DB.insert_node("V", key, {})
+    _DB.query_write(f"MATCH (n:V) WHERE n.id = '{key}' SET n.v = {cypher}")
+    out = _DB.node_info(key)["props"]["v"]
+    assert out == expected
+    if isinstance(expected, dt.datetime):
+        assert out.utcoffset() == expected.utcoffset()
 
 
 # ---------------------------------------------------------------------------
@@ -218,44 +256,81 @@ def test_tagged_text_matches_the_server_json_forms():
 def test_offset_with_a_fractional_second_is_refused():
     odd = dt.timezone(dt.timedelta(hours=1, microseconds=1))
     with pytest.raises(ValueError, match="fractional second"):
-        _value_roundtrip(dt.datetime(2024, 1, 15, tzinfo=odd))
+        roundtrip(dt.datetime(2024, 1, 15, tzinfo=odd))
 
 
 @pytest.mark.parametrize("seconds", [18 * 3600 + 1, -(18 * 3600 + 1), 23 * 3600])
 def test_offset_beyond_eighteen_hours_is_refused(seconds):
     wide = dt.timezone(dt.timedelta(seconds=seconds))
     with pytest.raises(ValueError, match="18:00"):
-        _value_roundtrip(dt.datetime(2024, 1, 15, tzinfo=wide))
+        roundtrip(dt.datetime(2024, 1, 15, tzinfo=wide))
 
 
 def test_timedelta_is_refused_and_points_at_duration():
     with pytest.raises(TypeError, match="mushroomdb.Duration"):
-        _value_roundtrip(dt.timedelta(days=1))
+        roundtrip(dt.timedelta(days=1))
 
 
 def test_time_of_day_is_still_not_a_value():
     with pytest.raises(TypeError, match="cannot convert"):
-        _value_roundtrip(dt.time(12, 0))
+        roundtrip(dt.time(12, 0))
+
+
+def test_nonzero_nanoseconds_are_refused_not_rounded():
+    # A `pandas.Timestamp` is a `datetime` with a `nanosecond` the datetime
+    # fields leave out; this subclass stands in for it without the dependency.
+    class Stamp(dt.datetime):
+        nanosecond = 0
+
+    class FineStamp(dt.datetime):
+        nanosecond = 1
+
+    assert roundtrip(Stamp(2024, 1, 15, 1, 2, 3, 4)) == dt.datetime(2024, 1, 15, 1, 2, 3, 4)
+    with pytest.raises(ValueError, match="nanosecond"):
+        roundtrip(FineStamp(2024, 1, 15, 1, 2, 3, 4))
+    with pytest.raises(ValueError, match="nanosecond"):
+        roundtrip(FineStamp(2024, 1, 15, tzinfo=UTC))
 
 
 # ---------------------------------------------------------------------------
-# Writes, until TY-12
+# Writes move the store to the V11 format, and survive a reopen
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "value, type_name",
+    "value",
     [
-        (dt.date(2024, 1, 15), "Date"),
-        (dt.datetime(2024, 1, 15, 1, 2, 3), "LocalDateTime"),
-        (dt.datetime(2024, 1, 15, 1, 2, 3, tzinfo=UTC), "DateTime"),
-        (Duration(months=1), "Duration"),
-        (b"\x00\x01", "Binary"),
+        dt.date(2024, 1, 15),
+        dt.datetime(2024, 1, 15, 1, 2, 3),
+        dt.datetime(2024, 1, 15, 1, 2, 3, tzinfo=tz(-5)),
+        Duration(months=1),
+        b"\x00\x01",
     ],
 )
-def test_writing_a_new_type_is_refused_until_the_engine_stores_it(tmp_path, value, type_name):
-    db = GraphDb.open(str(tmp_path / "db"))
-    with pytest.raises(mushroomdb.MushroomError, match=f"{type_name} values cannot be stored"):
-        db.insert_node("Event", "e1", {"on": value})
-    assert db.node_info("e1") is None
+def test_writing_a_new_type_moves_the_store_to_v11_and_survives_a_reopen(tmp_path, value):
+    path = tmp_path / "db"
+    db = GraphDb.open(str(path))
+    db.insert_node("Event", "e0", {"n": 1})
+    assert snapshot_version(path) is None
+    db.insert_node("Event", "e1", {"on": value})
+    assert snapshot_version(path) == 11
+    assert db.node_info("e1")["props"]["on"] == value
+    db.close()
+    reopened = GraphDb.open(str(path))
+    out = reopened.node_info("e1")["props"]["on"]
+    assert out == value
+    assert type(out) is type(value)
+    rows = reopened.query("MATCH (n:Event) WHERE n.id = 'e1' RETURN n.on AS on")
+    assert rows == [{"on": value}]
+    reopened.snapshot()
+    assert snapshot_version(path) == 11
+    reopened.close()
+
+
+def test_a_store_without_new_types_stays_v9(tmp_path):
+    path = tmp_path / "db"
+    db = GraphDb.open(str(path))
+    db.insert_node("Event", "e1", {"n": 1, "s": "x"})
+    db.snapshot()
+    assert snapshot_version(path) == 9
     db.close()

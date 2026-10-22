@@ -1,16 +1,20 @@
-use crate::pack::{
-    push_f64s, push_i64s, push_str, push_u32, push_u32s, read_exact, read_f64s, read_i64s,
-    read_str, read_u32, read_u32s,
-};
+use crate::cow::{CowMap, CowVec, HashIndex};
+use crate::pack::{push_str, push_u32, read_exact, read_str, read_u32, read_u32s};
 use crate::types::Result as StoreResult;
 use crate::types::{GraphError, Value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
+// Every structure here is copy-on-write in pieces (`crate::cow`): the write
+// path shares the column store with the reader's fold, and the first commit
+// after a fold copies only the chunks it writes, not the store (ledger row
+// 126).
 
 /// Presence bitmap: bit i is set iff node i has a value. Unset bits are nulls.
 #[derive(Debug, Default, Clone)]
 struct Bitmap {
-    bits: Vec<u64>,
+    bits: CowVec<u64>,
 }
 
 impl Bitmap {
@@ -27,12 +31,15 @@ impl Bitmap {
         let word = i / 64;
         let bit = i % 64;
         if word >= self.bits.len() {
-            self.bits.resize(word + 1, 0);
+            self.bits.grow_to(word + 1, 0);
         }
         let mask = 1u64 << bit;
-        let newly = self.bits[word] & mask == 0;
-        self.bits[word] |= mask;
-        newly
+        let w = self.bits[word];
+        if w & mask != 0 {
+            return false;
+        }
+        self.bits.set(word, w | mask);
+        true
     }
 
     /// Clear bit `i`. Returns true if it was previously set.
@@ -40,13 +47,15 @@ impl Bitmap {
         let i = i as usize;
         let word = i / 64;
         let bit = i % 64;
-        let Some(w) = self.bits.get_mut(word) else {
+        let Some(&w) = self.bits.get(word) else {
             return false;
         };
         let mask = 1u64 << bit;
-        let was = *w & mask != 0;
-        *w &= !mask;
-        was
+        if w & mask == 0 {
+            return false;
+        }
+        self.bits.set(word, w & !mask);
+        true
     }
 
     fn for_each(&self, mut f: impl FnMut(u32)) {
@@ -66,7 +75,7 @@ impl Bitmap {
 
     fn pack(&self, out: &mut Vec<u8>) {
         push_u32(out, self.bits.len() as u32);
-        for w in &self.bits {
+        for w in self.bits.iter() {
             out.extend_from_slice(&w.to_le_bytes());
         }
     }
@@ -78,30 +87,40 @@ impl Bitmap {
         for chunk in bytes.chunks_exact(8) {
             bits.push(u64::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(8) yields 8-byte slices
         }
-        Ok(Self { bits })
+        Ok(Self {
+            bits: CowVec::from_vec(bits),
+        })
     }
 }
 
 /// Append-only intern of `Value::Str`. Homogeneous string columns store ids here.
+///
+/// Strings are found through a [`HashIndex`], which holds hashes and not the
+/// strings, so a clone copies no string and a new string copies one shard.
 #[derive(Debug, Default, Clone)]
 struct StrIntern {
-    to_id: HashMap<String, u32>,
-    values: Vec<Value>,
+    index: HashIndex,
+    values: CowVec<Value>,
 }
 
 impl StrIntern {
+    fn find(&self, s: &str, h: u64) -> Option<u32> {
+        self.index
+            .get_hashed(s, h, |id| match self.values.get(id as usize) {
+                Some(Value::Str(x)) => Some(x.as_str()),
+                _ => None,
+            })
+    }
+
     fn intern(&mut self, s: String) -> u32 {
-        use std::collections::hash_map::Entry;
-        match self.to_id.entry(s) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let id = self.values.len() as u32;
-                let cloned = e.key().clone();
-                e.insert(id);
-                self.values.push(Value::Str(cloned));
-                id
-            }
+        let h = self.index.hash(&s);
+        if let Some(id) = self.find(&s, h) {
+            return id;
         }
+        let id = self.values.len() as u32;
+        self.index.insert_hashed(&s, h, id);
+        self.values.push(Value::Str(s));
+        id
     }
 
     fn get(&self, id: u32) -> &Value {
@@ -110,7 +129,7 @@ impl StrIntern {
 
     fn pack(&self, out: &mut Vec<u8>) {
         push_u32(out, self.values.len() as u32);
-        for v in &self.values {
+        for v in self.values.iter() {
             let Value::Str(s) = v else {
                 unreachable!("StrIntern values are always Value::Str");
             };
@@ -121,122 +140,179 @@ impl StrIntern {
     fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
         let n = read_u32(src, pos)? as usize;
         let mut intern = Self::default();
-        intern.values.reserve(n);
-        intern.to_id.reserve(n);
         for i in 0..n {
             let s = read_str(src, pos)?;
-            intern.to_id.insert(s.clone(), i as u32);
+            // A string an image lists twice keeps its first id, as `intern`
+            // would have given it.
+            let h = intern.index.hash(&s);
+            if intern.find(&s, h).is_none() {
+                intern.index.insert_hashed(&s, h, i as u32);
+            }
             intern.values.push(Value::Str(s));
         }
         Ok(intern)
     }
 }
 
-fn grow<T: Clone>(data: &mut Vec<T>, adapter: &mut Vec<Value>, node: u32, fill: T, dummy: Value) {
-    let n = node as usize + 1;
-    if data.len() < n {
-        data.resize(n, fill);
-        adapter.resize(n, dummy);
+/// The scalar types a fixed-width column holds, and their pack tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fixed {
+    Int,
+    Float,
+    Bool,
+    /// `Value::Date` as days since 1970-01-01.
+    Date,
+    /// `Value::LocalDateTime` as microseconds since the epoch, no offset.
+    Ldt,
+    /// `Value::DateTime` as `(micros_utc, offset_seconds)`.
+    Dt,
+    /// `Value::Duration` as `(months, days, nanos)`.
+    Dur,
+}
+
+impl Fixed {
+    fn of(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::Int(_) => Fixed::Int,
+            Value::Float(_) => Fixed::Float,
+            Value::Bool(_) => Fixed::Bool,
+            Value::Date(_) => Fixed::Date,
+            Value::LocalDateTime(_) => Fixed::Ldt,
+            Value::DateTime { .. } => Fixed::Dt,
+            Value::Duration { .. } => Fixed::Dur,
+            _ => return None,
+        })
+    }
+
+    /// What an unset slot holds: never read, since `present` is clear.
+    fn filler(self) -> Value {
+        match self {
+            Fixed::Int => Value::Int(0),
+            Fixed::Float => Value::Float(0.0),
+            Fixed::Bool => Value::Bool(false),
+            Fixed::Date => Value::Date(0),
+            Fixed::Ldt => Value::LocalDateTime(0),
+            Fixed::Dt => Value::DateTime {
+                micros_utc: 0,
+                offset_seconds: 0,
+            },
+            Fixed::Dur => Value::Duration {
+                months: 0,
+                days: 0,
+                nanos: 0,
+            },
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Fixed::Int => 0,
+            Fixed::Float => 1,
+            Fixed::Bool => 2,
+            Fixed::Date => 5,
+            Fixed::Ldt => 6,
+            Fixed::Dt => 7,
+            Fixed::Dur => 8,
+        }
+    }
+
+    /// Bytes per packed slot.
+    fn width(self) -> usize {
+        match self {
+            Fixed::Bool => 1,
+            Fixed::Date => 4,
+            Fixed::Int | Fixed::Float | Fixed::Ldt => 8,
+            Fixed::Dt => 12,
+            Fixed::Dur => 16,
+        }
+    }
+
+    /// Append the raw little-endian form of `v`, a value of this type.
+    fn push_raw(self, v: &Value, out: &mut Vec<u8>) {
+        match (self, v) {
+            (Fixed::Int, Value::Int(i)) | (Fixed::Ldt, Value::LocalDateTime(i)) => {
+                out.extend_from_slice(&i.to_le_bytes())
+            }
+            (Fixed::Float, Value::Float(f)) => out.extend_from_slice(&f.to_le_bytes()),
+            (Fixed::Bool, Value::Bool(b)) => out.push(u8::from(*b)),
+            (Fixed::Date, Value::Date(d)) => out.extend_from_slice(&d.to_le_bytes()),
+            (
+                Fixed::Dt,
+                Value::DateTime {
+                    micros_utc,
+                    offset_seconds,
+                },
+            ) => {
+                out.extend_from_slice(&micros_utc.to_le_bytes());
+                out.extend_from_slice(&offset_seconds.to_le_bytes());
+            }
+            (
+                Fixed::Dur,
+                Value::Duration {
+                    months,
+                    days,
+                    nanos,
+                },
+            ) => {
+                out.extend_from_slice(&months.to_le_bytes());
+                out.extend_from_slice(&days.to_le_bytes());
+                out.extend_from_slice(&nanos.to_le_bytes());
+            }
+            _ => unreachable!("a fixed column holds only its own type"),
+        }
+    }
+
+    /// The value one packed slot of this type holds.
+    fn read_raw(self, b: &[u8]) -> Value {
+        match self {
+            Fixed::Int => Value::Int(le_i64(b)),
+            Fixed::Float => Value::Float(f64::from_le_bytes(b[..8].try_into().unwrap())),
+            Fixed::Bool => Value::Bool(b[0] != 0),
+            Fixed::Date => Value::Date(le_i32(b)),
+            Fixed::Ldt => Value::LocalDateTime(le_i64(b)),
+            Fixed::Dt => Value::DateTime {
+                micros_utc: le_i64(&b[..8]),
+                offset_seconds: le_i32(&b[8..]),
+            },
+            Fixed::Dur => Value::Duration {
+                months: le_i32(&b[..4]),
+                days: le_i32(&b[4..8]),
+                nanos: le_i64(&b[8..]),
+            },
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 enum Column {
-    Int {
-        data: Vec<i64>,
+    /// A homogeneous fixed-width scalar column. Each slot holds its `Value`
+    /// (the type's filler when unset), so `get` hands out a `&Value` with no
+    /// conversion, and a write touches one chunk. The packed form is the raw
+    /// scalars, derived from the values when the column is packed.
+    Fixed {
+        kind: Fixed,
+        values: CowVec<Value>,
         present: Bitmap,
-        adapter: Vec<Value>,
-        live: usize,
-    },
-    Float {
-        data: Vec<f64>,
-        present: Bitmap,
-        adapter: Vec<Value>,
-        live: usize,
-    },
-    Bool {
-        data: Vec<bool>,
-        present: Bitmap,
-        adapter: Vec<Value>,
         live: usize,
     },
     Str {
-        ids: Vec<u32>,
+        ids: CowVec<u32>,
         present: Bitmap,
-        live: usize,
-    },
-    /// `Value::Date` as days since 1970-01-01.
-    Date {
-        data: Vec<i32>,
-        present: Bitmap,
-        adapter: Vec<Value>,
-        live: usize,
-    },
-    /// `Value::LocalDateTime` as microseconds since the epoch, no offset.
-    Ldt {
-        data: Vec<i64>,
-        present: Bitmap,
-        adapter: Vec<Value>,
-        live: usize,
-    },
-    /// `Value::DateTime` as `(micros_utc, offset_seconds)`.
-    Dt {
-        data: Vec<(i64, i32)>,
-        present: Bitmap,
-        adapter: Vec<Value>,
-        live: usize,
-    },
-    /// `Value::Duration` as `(months, days, nanos)`.
-    Dur {
-        data: Vec<(i32, i32, i64)>,
-        present: Bitmap,
-        adapter: Vec<Value>,
         live: usize,
     },
     /// `Value::Binary`. Each slot holds a `Value::Binary` inline (an empty one
     /// for an unset slot), so `get` can hand out a `&Value` with no adapter.
     Binary {
-        data: Vec<Value>,
+        data: CowVec<Value>,
         present: Bitmap,
         live: usize,
     },
     /// Slow path: mixed-type fields and `Value::List`. Never demoted back to homogeneous.
-    Mixed(HashMap<u32, Value>),
+    Mixed(CowMap<u32, Value>),
 }
 
 fn empty_binary() -> Value {
     Value::Binary(Vec::new())
-}
-
-/// Store `value` at `node` in a fixed-width typed column.
-fn set_fixed<T: Clone>(
-    (data, present, adapter, live): (&mut Vec<T>, &mut Bitmap, &mut Vec<Value>, &mut usize),
-    node: u32,
-    fill: T,
-    raw: T,
-    value: Value,
-    dummy: Value,
-) {
-    grow(data, adapter, node, fill, dummy);
-    data[node as usize] = raw;
-    adapter[node as usize] = value;
-    if present.set(node) {
-        *live += 1;
-    }
-}
-
-/// Append `n` little-endian fixed-width records, count first.
-fn push_records<T>(
-    out: &mut Vec<u8>,
-    items: &[T],
-    width: usize,
-    mut write: impl FnMut(&T, &mut Vec<u8>),
-) {
-    push_u32(out, items.len() as u32);
-    out.reserve(items.len().saturating_mul(width));
-    for item in items {
-        write(item, out);
-    }
 }
 
 /// Read a count-prefixed run of `width`-byte records. The byte length is
@@ -265,83 +341,41 @@ fn le_i64(b: &[u8]) -> i64 {
 impl Column {
     fn from_first(node: u32, value: Value, intern: &mut StrIntern) -> Self {
         let mut col = match &value {
-            Value::Int(_) => Column::Int {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
-            Value::Float(_) => Column::Float {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
-            Value::Bool(_) => Column::Bool {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
             Value::Str(_) => Column::Str {
-                ids: Vec::new(),
+                ids: CowVec::new(),
                 present: Bitmap::default(),
-                live: 0,
-            },
-            Value::List(_) => Column::Mixed(HashMap::new()),
-            // Map spills to the Mixed path, like List. Never promotes a typed column.
-            Value::Map(_) => Column::Mixed(HashMap::new()),
-            Value::Date(_) => Column::Date {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
-            Value::LocalDateTime(_) => Column::Ldt {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
-            Value::DateTime { .. } => Column::Dt {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
-                live: 0,
-            },
-            Value::Duration { .. } => Column::Dur {
-                data: Vec::new(),
-                present: Bitmap::default(),
-                adapter: Vec::new(),
                 live: 0,
             },
             Value::Binary(_) => Column::Binary {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
                 live: 0,
             },
-            // Never reached: every write path refuses a null value before it
-            // gets here (see `Value::contains_null`). Mixed is the safe home.
-            Value::Null => Column::Mixed(HashMap::new()),
+            other => match Fixed::of(other) {
+                Some(kind) => Column::Fixed {
+                    kind,
+                    values: CowVec::new(),
+                    present: Bitmap::default(),
+                    live: 0,
+                },
+                // List and Map spill to the Mixed path and never promote a
+                // typed column. Null is never reached: every write path
+                // refuses a null value before it gets here (see
+                // `Value::contains_null`); Mixed is the safe home.
+                None => Column::Mixed(CowMap::new()),
+            },
         };
         col.set(node, value, intern);
         col
     }
 
     fn accepts(&self, value: &Value) -> bool {
-        matches!(
-            (self, value),
-            (Column::Int { .. }, Value::Int(_))
-                | (Column::Float { .. }, Value::Float(_))
-                | (Column::Bool { .. }, Value::Bool(_))
-                | (Column::Str { .. }, Value::Str(_))
-                | (Column::Date { .. }, Value::Date(_))
-                | (Column::Ldt { .. }, Value::LocalDateTime(_))
-                | (Column::Dt { .. }, Value::DateTime { .. })
-                | (Column::Dur { .. }, Value::Duration { .. })
-                | (Column::Binary { .. }, Value::Binary(_))
-                | (Column::Mixed(_), _)
-        )
+        match self {
+            Column::Fixed { kind, .. } => Fixed::of(value) == Some(*kind),
+            Column::Str { .. } => matches!(value, Value::Str(_)),
+            Column::Binary { .. } => matches!(value, Value::Binary(_)),
+            Column::Mixed(_) => true,
+        }
     }
 
     fn set(&mut self, node: u32, value: Value, intern: &mut StrIntern) {
@@ -351,151 +385,35 @@ impl Column {
             *self = Column::Mixed(map);
             return;
         }
+        let i = node as usize;
         match (self, value) {
             (
-                Column::Int {
-                    data,
+                Column::Fixed {
+                    kind,
+                    values,
                     present,
-                    adapter,
                     live,
                 },
-                Value::Int(v),
+                v,
             ) => {
-                grow(data, adapter, node, 0, Value::Int(0));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Int(v);
-                if present.set(node) {
-                    *live += 1;
+                if values.len() <= i {
+                    values.grow_to(i + 1, kind.filler());
                 }
-            }
-            (
-                Column::Float {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::Float(v),
-            ) => {
-                grow(data, adapter, node, 0.0, Value::Float(0.0));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Float(v);
-                if present.set(node) {
-                    *live += 1;
-                }
-            }
-            (
-                Column::Bool {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::Bool(v),
-            ) => {
-                grow(data, adapter, node, false, Value::Bool(false));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Bool(v);
+                values.set(i, v);
                 if present.set(node) {
                     *live += 1;
                 }
             }
             (Column::Str { ids, present, live }, Value::Str(s)) => {
                 let id = intern.intern(s);
-                let n = node as usize + 1;
-                if ids.len() < n {
-                    ids.resize(n, 0);
+                if ids.len() <= i {
+                    ids.grow_to(i + 1, 0);
                 }
-                ids[node as usize] = id;
+                ids.set(i, id);
                 if present.set(node) {
                     *live += 1;
                 }
             }
-            (
-                Column::Date {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::Date(v),
-            ) => set_fixed(
-                (data, present, adapter, live),
-                node,
-                0,
-                v,
-                Value::Date(v),
-                Value::Date(0),
-            ),
-            (
-                Column::Ldt {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::LocalDateTime(v),
-            ) => set_fixed(
-                (data, present, adapter, live),
-                node,
-                0,
-                v,
-                Value::LocalDateTime(v),
-                Value::LocalDateTime(0),
-            ),
-            (
-                Column::Dt {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::DateTime {
-                    micros_utc,
-                    offset_seconds,
-                },
-            ) => set_fixed(
-                (data, present, adapter, live),
-                node,
-                (0, 0),
-                (micros_utc, offset_seconds),
-                Value::DateTime {
-                    micros_utc,
-                    offset_seconds,
-                },
-                Value::DateTime {
-                    micros_utc: 0,
-                    offset_seconds: 0,
-                },
-            ),
-            (
-                Column::Dur {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                },
-                Value::Duration {
-                    months,
-                    days,
-                    nanos,
-                },
-            ) => set_fixed(
-                (data, present, adapter, live),
-                node,
-                (0, 0, 0),
-                (months, days, nanos),
-                Value::Duration {
-                    months,
-                    days,
-                    nanos,
-                },
-                Value::Duration {
-                    months: 0,
-                    days: 0,
-                    nanos: 0,
-                },
-            ),
             (
                 Column::Binary {
                     data,
@@ -504,11 +422,10 @@ impl Column {
                 },
                 v @ Value::Binary(_),
             ) => {
-                let n = node as usize + 1;
-                if data.len() < n {
-                    data.resize(n, empty_binary());
+                if data.len() <= i {
+                    data.grow_to(i + 1, empty_binary());
                 }
-                data[node as usize] = v;
+                data.set(i, v);
                 if present.set(node) {
                     *live += 1;
                 }
@@ -522,29 +439,16 @@ impl Column {
 
     fn get<'a>(&'a self, node: u32, intern: &'a StrIntern) -> Option<&'a Value> {
         match self {
-            Column::Int {
-                present, adapter, ..
+            Column::Fixed {
+                values, present, ..
             }
-            | Column::Float {
-                present, adapter, ..
-            }
-            | Column::Bool {
-                present, adapter, ..
-            }
-            | Column::Date {
-                present, adapter, ..
-            }
-            | Column::Ldt {
-                present, adapter, ..
-            }
-            | Column::Dt {
-                present, adapter, ..
-            }
-            | Column::Dur {
-                present, adapter, ..
+            | Column::Binary {
+                data: values,
+                present,
+                ..
             } => {
                 if present.contains(node) {
-                    Some(&adapter[node as usize])
+                    values.get(node as usize)
                 } else {
                     None
                 }
@@ -556,21 +460,14 @@ impl Column {
                     None
                 }
             }
-            Column::Binary { data, present, .. } => {
-                if present.contains(node) {
-                    Some(&data[node as usize])
-                } else {
-                    None
-                }
-            }
             Column::Mixed(map) => map.get(&node),
         }
     }
 
     fn remove(&mut self, node: u32, intern: &StrIntern) -> Option<Value> {
         match self {
-            Column::Int {
-                data,
+            Column::Fixed {
+                values,
                 present,
                 live,
                 ..
@@ -579,31 +476,7 @@ impl Column {
                     return None;
                 }
                 *live -= 1;
-                Some(Value::Int(data[node as usize]))
-            }
-            Column::Float {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                Some(Value::Float(data[node as usize]))
-            }
-            Column::Bool {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                Some(Value::Bool(data[node as usize]))
+                Some(values[node as usize].clone())
             }
             Column::Str { ids, present, live } => {
                 if !present.clear(node) {
@@ -611,63 +484,6 @@ impl Column {
                 }
                 *live -= 1;
                 Some(intern.get(ids[node as usize]).clone())
-            }
-            Column::Date {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                Some(Value::Date(data[node as usize]))
-            }
-            Column::Ldt {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                Some(Value::LocalDateTime(data[node as usize]))
-            }
-            Column::Dt {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                let (micros_utc, offset_seconds) = data[node as usize];
-                Some(Value::DateTime {
-                    micros_utc,
-                    offset_seconds,
-                })
-            }
-            Column::Dur {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                if !present.clear(node) {
-                    return None;
-                }
-                *live -= 1;
-                let (months, days, nanos) = data[node as usize];
-                Some(Value::Duration {
-                    months,
-                    days,
-                    nanos,
-                })
             }
             Column::Binary {
                 data,
@@ -678,7 +494,7 @@ impl Column {
                     return None;
                 }
                 *live -= 1;
-                Some(std::mem::replace(&mut data[node as usize], empty_binary()))
+                Some(data.replace(node as usize, empty_binary()))
             }
             Column::Mixed(map) => map.remove(&node),
         }
@@ -687,97 +503,56 @@ impl Column {
     fn is_empty(&self) -> bool {
         match self {
             Column::Mixed(map) => map.is_empty(),
-            Column::Int { live, .. }
-            | Column::Float { live, .. }
-            | Column::Bool { live, .. }
-            | Column::Str { live, .. }
-            | Column::Date { live, .. }
-            | Column::Ldt { live, .. }
-            | Column::Dt { live, .. }
-            | Column::Dur { live, .. }
-            | Column::Binary { live, .. } => *live == 0,
+            Column::Fixed { live, .. } | Column::Str { live, .. } | Column::Binary { live, .. } => {
+                *live == 0
+            }
         }
     }
 
-    fn take_map(&mut self, intern: &StrIntern) -> HashMap<u32, Value> {
-        match std::mem::replace(self, Column::Mixed(HashMap::new())) {
+    fn take_map(&mut self, intern: &StrIntern) -> CowMap<u32, Value> {
+        match std::mem::replace(self, Column::Mixed(CowMap::new())) {
             Column::Mixed(map) => map,
-            other => other.to_map(intern),
+            other => {
+                let mut entries: Vec<(u32, Value)> = other.to_map(intern).into_iter().collect();
+                entries.sort_unstable_by_key(|(node, _)| *node);
+                CowMap::from_sorted(entries)
+            }
         }
     }
 
     fn pack(&self, intern: &StrIntern, out: &mut Vec<u8>) -> StoreResult<()> {
-        debug_assert!(
-            !matches!(
-                self,
-                Column::Date { .. }
-                    | Column::Ldt { .. }
-                    | Column::Dt { .. }
-                    | Column::Dur { .. }
-                    | Column::Binary { .. }
-            ) || cfg!(test),
-            "pack tags 5-9 require the V11 snapshot format (TY-12)"
-        );
         match self {
-            Column::Int { data, present, .. } => {
-                out.push(0);
-                push_i64s(out, data);
-                present.pack(out);
-            }
-            Column::Float { data, present, .. } => {
-                out.push(1);
-                push_f64s(out, data);
-                present.pack(out);
-            }
-            Column::Bool { data, present, .. } => {
-                out.push(2);
-                push_u32(out, data.len() as u32);
-                out.reserve(data.len());
-                for b in data {
-                    out.push(u8::from(*b));
+            // Tags 5-9 reach disk only in a V11 snapshot: the snapshot encoder
+            // (`v8::encode::decode_all_columns`) refuses them for any other
+            // version, and a store that writes one of these values is moved to
+            // V11 at the WAL choke point before the value is appended.
+            Column::Fixed {
+                kind,
+                values,
+                present,
+                ..
+            } => {
+                out.push(kind.tag());
+                push_u32(out, values.len() as u32);
+                out.reserve(values.len().saturating_mul(kind.width()));
+                for v in values.iter() {
+                    kind.push_raw(v, out);
                 }
                 present.pack(out);
             }
             Column::Str { ids, present, .. } => {
                 out.push(3);
-                push_u32s(out, ids);
-                present.pack(out);
-            }
-            // Tags 5-9 exist only in a V11 snapshot (TY-12 owns the version
-            // bump). Until then no store can hold one of these columns: the
-            // WAL choke point refuses every new-type value, so a V9/V10
-            // image written by this code never reaches these arms.
-            Column::Date { data, present, .. } => {
-                out.push(5);
-                push_records(out, data, 4, |v, o| o.extend_from_slice(&v.to_le_bytes()));
-                present.pack(out);
-            }
-            Column::Ldt { data, present, .. } => {
-                out.push(6);
-                push_i64s(out, data);
-                present.pack(out);
-            }
-            Column::Dt { data, present, .. } => {
-                out.push(7);
-                push_records(out, data, 12, |(m, off), o| {
-                    o.extend_from_slice(&m.to_le_bytes());
-                    o.extend_from_slice(&off.to_le_bytes());
-                });
-                present.pack(out);
-            }
-            Column::Dur { data, present, .. } => {
-                out.push(8);
-                push_records(out, data, 16, |(mo, d, n), o| {
-                    o.extend_from_slice(&mo.to_le_bytes());
-                    o.extend_from_slice(&d.to_le_bytes());
-                    o.extend_from_slice(&n.to_le_bytes());
-                });
+                push_u32(out, ids.len() as u32);
+                out.reserve(ids.len().saturating_mul(4));
+                for id in ids.iter() {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
                 present.pack(out);
             }
             Column::Binary { data, present, .. } => {
                 out.push(9);
                 push_u32(out, data.len() as u32);
-                for v in data {
+                for v in data.iter() {
                     let Value::Binary(bytes) = v else {
                         unreachable!("Binary column slots are always Value::Binary");
                     };
@@ -791,7 +566,8 @@ impl Column {
                     return Err(null_in_column());
                 }
                 out.push(4);
-                let blob = bincode::serialize(map).map_err(|e| GraphError::Corrupt {
+                let map: HashMap<u32, Value> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+                let blob = bincode::serialize(&map).map_err(|e| GraphError::Corrupt {
                     detail: format!("mixed column failed to encode: {e}"),
                 })?;
                 push_u32(out, blob.len() as u32);
@@ -805,50 +581,39 @@ impl Column {
     fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
         // Infallible: `read_exact(src, pos, 1)` returns a 1-byte slice; `first()` cannot return None.
         let tag = *read_exact(src, pos, 1)?.first().unwrap();
+        let fixed = match tag {
+            0 => Some(Fixed::Int),
+            1 => Some(Fixed::Float),
+            2 => Some(Fixed::Bool),
+            5 => Some(Fixed::Date),
+            6 => Some(Fixed::Ldt),
+            7 => Some(Fixed::Dt),
+            8 => Some(Fixed::Dur),
+            _ => None,
+        };
+        if let Some(kind) = fixed {
+            let values: CowVec<Value> = read_records(src, pos, kind.width())?
+                .map(|b| kind.read_raw(b))
+                .collect();
+            let present = Bitmap::unpack(src, pos)?;
+            let live = present.live_count();
+            return Ok(Column::Fixed {
+                kind,
+                values,
+                present,
+                live,
+            });
+        }
         match tag {
-            0 => {
-                let data = read_i64s(src, pos)?;
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data.iter().copied().map(Value::Int).collect();
-                Ok(Column::Int {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
-            1 => {
-                let data = read_f64s(src, pos)?;
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data.iter().copied().map(Value::Float).collect();
-                Ok(Column::Float {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
-            2 => {
-                let n = read_u32(src, pos)? as usize;
-                let bytes = read_exact(src, pos, n)?;
-                let data: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data.iter().copied().map(Value::Bool).collect();
-                Ok(Column::Bool {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
             3 => {
                 let ids = read_u32s(src, pos)?;
                 let present = Bitmap::unpack(src, pos)?;
                 let live = present.live_count();
-                Ok(Column::Str { ids, present, live })
+                Ok(Column::Str {
+                    ids: CowVec::from_vec(ids),
+                    present,
+                    live,
+                })
             }
             4 => {
                 let n = read_u32(src, pos)? as usize;
@@ -857,72 +622,9 @@ impl Column {
                     bincode::deserialize(blob).map_err(|e| GraphError::Corrupt {
                         detail: format!("snapshot: mixed column: {e}"),
                     })?;
-                Ok(Column::Mixed(map))
-            }
-            5 => {
-                let data: Vec<i32> = read_records(src, pos, 4)?.map(le_i32).collect();
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data.iter().copied().map(Value::Date).collect();
-                Ok(Column::Date {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
-            6 => {
-                let data = read_i64s(src, pos)?;
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data.iter().copied().map(Value::LocalDateTime).collect();
-                Ok(Column::Ldt {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
-            7 => {
-                let data: Vec<(i64, i32)> = read_records(src, pos, 12)?
-                    .map(|c| (le_i64(&c[..8]), le_i32(&c[8..])))
-                    .collect();
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data
-                    .iter()
-                    .map(|&(micros_utc, offset_seconds)| Value::DateTime {
-                        micros_utc,
-                        offset_seconds,
-                    })
-                    .collect();
-                Ok(Column::Dt {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
-            }
-            8 => {
-                let data: Vec<(i32, i32, i64)> = read_records(src, pos, 16)?
-                    .map(|c| (le_i32(&c[..4]), le_i32(&c[4..8]), le_i64(&c[8..])))
-                    .collect();
-                let present = Bitmap::unpack(src, pos)?;
-                let live = present.live_count();
-                let adapter = data
-                    .iter()
-                    .map(|&(months, days, nanos)| Value::Duration {
-                        months,
-                        days,
-                        nanos,
-                    })
-                    .collect();
-                Ok(Column::Dur {
-                    data,
-                    present,
-                    adapter,
-                    live,
-                })
+                let mut entries: Vec<(u32, Value)> = map.into_iter().collect();
+                entries.sort_unstable_by_key(|(node, _)| *node);
+                Ok(Column::Mixed(CowMap::from_sorted(entries)))
             }
             9 => {
                 let n = read_u32(src, pos)? as usize;
@@ -936,7 +638,7 @@ impl Column {
                 let present = Bitmap::unpack(src, pos)?;
                 let live = present.live_count();
                 Ok(Column::Binary {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     live,
                 })
@@ -949,40 +651,21 @@ impl Column {
 
     fn to_map(&self, intern: &StrIntern) -> HashMap<u32, Value> {
         match self {
-            Column::Mixed(map) => map.clone(),
-            Column::Int {
-                data,
+            Column::Mixed(map) => map.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            Column::Fixed {
+                values,
                 present,
                 live,
                 ..
-            } => {
-                let mut map = HashMap::with_capacity(*live);
-                present.for_each(|i| {
-                    map.insert(i, Value::Int(data[i as usize]));
-                });
-                map
             }
-            Column::Float {
-                data,
+            | Column::Binary {
+                data: values,
                 present,
                 live,
-                ..
             } => {
                 let mut map = HashMap::with_capacity(*live);
                 present.for_each(|i| {
-                    map.insert(i, Value::Float(data[i as usize]));
-                });
-                map
-            }
-            Column::Bool {
-                data,
-                present,
-                live,
-                ..
-            } => {
-                let mut map = HashMap::with_capacity(*live);
-                present.for_each(|i| {
-                    map.insert(i, Value::Bool(data[i as usize]));
+                    map.insert(i, values[i as usize].clone());
                 });
                 map
             }
@@ -990,47 +673,6 @@ impl Column {
                 let mut map = HashMap::with_capacity(*live);
                 present.for_each(|i| {
                     map.insert(i, intern.get(ids[i as usize]).clone());
-                });
-                map
-            }
-            Column::Date {
-                present,
-                adapter,
-                live,
-                ..
-            }
-            | Column::Ldt {
-                present,
-                adapter,
-                live,
-                ..
-            }
-            | Column::Dt {
-                present,
-                adapter,
-                live,
-                ..
-            }
-            | Column::Dur {
-                present,
-                adapter,
-                live,
-                ..
-            } => {
-                let mut map = HashMap::with_capacity(*live);
-                present.for_each(|i| {
-                    map.insert(i, adapter[i as usize].clone());
-                });
-                map
-            }
-            Column::Binary {
-                data,
-                present,
-                live,
-            } => {
-                let mut map = HashMap::with_capacity(*live);
-                present.for_each(|i| {
-                    map.insert(i, data[i as usize].clone());
                 });
                 map
             }
@@ -1063,12 +705,14 @@ impl<'a> ColumnHandle<'a> {
 /// On-disk (V6) shape is still `HashMap<String, HashMap<u32, Value>>`.
 #[derive(Debug, Default, Clone)]
 pub struct ColumnStore {
-    cols: HashMap<String, Column>,
+    /// Each column behind its own `Arc`, so a clone copies the field list and
+    /// a write copies the one column's chunk lists, never the others.
+    cols: HashMap<String, Arc<Column>>,
     intern: StrIntern,
     /// Deleted prop keys for nodes whose value lives only in the V8 mmap'd base.
     /// Consulted by `ColumnsView::get` before falling through to the base section.
     /// Cleared at V8 snapshot merge (all data folds into the new base snapshot).
-    pub(crate) prop_tombstones: HashMap<u32, BTreeSet<String>>,
+    pub(crate) prop_tombstones: CowMap<u32, BTreeSet<String>>,
 }
 
 impl ColumnStore {
@@ -1079,9 +723,12 @@ impl ColumnStore {
     pub fn set(&mut self, node: u32, field: &str, value: Value) {
         let ColumnStore { cols, intern, .. } = self;
         if let Some(col) = cols.get_mut(field) {
-            col.set(node, value, intern);
+            Arc::make_mut(col).set(node, value, intern);
         } else {
-            cols.insert(field.to_string(), Column::from_first(node, value, intern));
+            cols.insert(
+                field.to_string(),
+                Arc::new(Column::from_first(node, value, intern)),
+            );
         }
     }
 
@@ -1096,7 +743,7 @@ impl ColumnStore {
     /// Returns a handle that always returns `None` when the field is absent.
     pub fn column(&self, field: &str) -> ColumnHandle<'_> {
         ColumnHandle {
-            col: self.cols.get(field),
+            col: self.cols.get(field).map(|col| &**col),
             intern: &self.intern,
         }
     }
@@ -1109,8 +756,11 @@ impl ColumnStore {
     /// Prunes the column's inner map entry when it becomes empty.
     pub fn remove(&mut self, node: u32, field: &str) -> Option<Value> {
         let ColumnStore { cols, intern, .. } = self;
-        let old = cols.get_mut(field)?.remove(node, intern)?;
-        if cols.get(field).is_some_and(Column::is_empty) {
+        let col = cols.get_mut(field)?;
+        // Absent: nothing to remove, and nothing to copy.
+        col.get(node, intern)?;
+        let old = Arc::make_mut(col).remove(node, intern)?;
+        if col.is_empty() {
             cols.remove(field);
         }
         Some(old)
@@ -1123,7 +773,10 @@ impl ColumnStore {
     pub fn remove_all(&mut self, node: u32) {
         let ColumnStore { cols, intern, .. } = self;
         cols.retain(|_, col| {
-            col.remove(node, intern);
+            // Only a column holding the node is written, and so copied.
+            if col.get(node, intern).is_some() {
+                Arc::make_mut(col).remove(node, intern);
+            }
             !col.is_empty()
         });
     }
@@ -1144,8 +797,7 @@ impl ColumnStore {
     /// resurrected by base fallback reads.  Consumed (cleared) at snapshot merge.
     pub fn record_prop_tombstone(&mut self, node: u32, field: &str) {
         self.prop_tombstones
-            .entry(node)
-            .or_default()
+            .get_or_insert_with(node, BTreeSet::new)
             .insert(field.to_string());
     }
 
@@ -1169,7 +821,7 @@ impl ColumnStore {
 
     #[cfg(test)]
     fn is_mixed(&self, field: &str) -> bool {
-        matches!(self.cols.get(field), Some(Column::Mixed(_)))
+        matches!(self.cols.get(field).map(|c| &**c), Some(Column::Mixed(_)))
     }
 
     /// V7 packed columns: intern table, then sorted field name + typed payload.
@@ -1196,17 +848,43 @@ impl ColumnStore {
         for _ in 0..n {
             let name = read_str(src, &mut pos)?;
             let col = Column::unpack(src, &mut pos)?;
-            cols.insert(name, col);
+            cols.insert(name, Arc::new(col));
         }
         Ok((
             Self {
                 cols,
                 intern,
-                prop_tombstones: HashMap::new(),
+                prop_tombstones: CowMap::new(),
             },
             pos,
         ))
     }
+}
+
+/// Read one packed column holding a pack tag 5-9 type — `Date`,
+/// `LocalDateTime`, `DateTime`, `Duration` or `Binary` — starting at its tag
+/// byte, as the node-to-value map those values make.
+///
+/// The snapshot encoder writes these columns into the COLUMNS section in the
+/// `Mixed` shape, so the archived layout of the section does not move.
+///
+/// # Errors
+/// [`GraphError::Corrupt`] for a truncated column, or for a tag that is not
+/// one of 5-9.
+pub(crate) fn unpack_typed_column_map(
+    src: &[u8],
+    pos: &mut usize,
+) -> StoreResult<HashMap<u32, Value>> {
+    let tag = src.get(*pos).copied();
+    if !matches!(tag, Some(5..=9)) {
+        return Err(GraphError::Corrupt {
+            detail: format!("columns: expected a typed-value column tag 5-9, found {tag:?}"),
+        });
+    }
+    let col = Column::unpack(src, pos)?;
+    // No `Str` column comes through here, so nothing resolves against the
+    // intern table.
+    Ok(col.to_map(&StrIntern::default()))
 }
 
 /// The refusal a column encoder gives a null value (query-only, never stored).
@@ -1219,7 +897,7 @@ fn null_in_column() -> GraphError {
 impl Serialize for ColumnStore {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::{Error, SerializeStruct};
-        let holds_null = self.cols.values().any(|c| match c {
+        let holds_null = self.cols.values().any(|c| match &**c {
             Column::Mixed(map) => map.values().any(Value::contains_null),
             _ => false,
         });
@@ -1492,9 +1170,21 @@ mod tests {
         let mut col = Column::from_first(0, Value::Date(100), &mut intern);
         col.set(1, Value::Date(200), &mut intern);
         col.set(2, Value::Date(-300), &mut intern);
-        assert!(matches!(col, Column::Date { .. }));
+        assert!(matches!(
+            col,
+            Column::Fixed {
+                kind: Fixed::Date,
+                ..
+            }
+        ));
         let back = pack_round_trip(&col, &intern);
-        assert!(matches!(back, Column::Date { .. }));
+        assert!(matches!(
+            back,
+            Column::Fixed {
+                kind: Fixed::Date,
+                ..
+            }
+        ));
         assert_eq!(back.get(0, &intern), Some(&Value::Date(100)));
         assert_eq!(back.get(1, &intern), Some(&Value::Date(200)));
         assert_eq!(back.get(2, &intern), Some(&Value::Date(-300)));
@@ -1685,5 +1375,64 @@ mod tests {
         assert_eq!(back.get(3, "tags"), Some(&Value::List(vec![Value::Int(1)])));
         assert!(back.is_mixed("mix"));
         assert!(back.is_mixed("tags"));
+    }
+
+    /// Ledger row 126: the reader's fold holds a clone of the column store and
+    /// the writer goes on writing its own. Every kind of write to the writer's
+    /// copy — across chunk boundaries, typed and mixed columns, a promotion to
+    /// mixed, removals, a node's whole row, tombstones, new interned strings —
+    /// leaves the clone exactly as it was, with real hashes and with every
+    /// string's hash the same.
+    #[test]
+    fn a_clone_keeps_its_contents_while_the_original_is_written() {
+        for forced in [None, Some(7_u64)] {
+            crate::cow::FORCED_HASH.with(|f| f.set(forced));
+            let n = 3_000u32;
+            let mut live = ColumnStore::new();
+            for i in 0..n {
+                live.set(i, "name", Value::Str(format!("n{i}")));
+                live.set(i, "age", Value::Int(i64::from(i)));
+                if i % 3 == 0 {
+                    live.set(i, "tags", Value::List(vec![Value::Int(i64::from(i))]));
+                }
+            }
+            let frozen = live.clone();
+            for i in (0..n).step_by(7) {
+                live.set(i, "name", Value::Str(format!("renamed {i}")));
+                live.set(i, "age", Value::Int(-1));
+            }
+            live.set(5, "age", Value::Str("promoted".into()));
+            live.remove(14, "name");
+            live.remove_all(21);
+            live.set(n + 500, "name", Value::Str("n1".into()));
+            live.record_prop_tombstone(3, "gone");
+            for i in 0..n {
+                assert_eq!(frozen.get(i, "name"), Some(&Value::Str(format!("n{i}"))));
+                assert_eq!(frozen.get(i, "age"), Some(&Value::Int(i64::from(i))));
+                let tags = (i % 3 == 0).then(|| Value::List(vec![Value::Int(i64::from(i))]));
+                assert_eq!(frozen.get(i, "tags"), tags.as_ref());
+            }
+            assert_eq!(frozen.get(n + 500, "name"), None);
+            assert!(!frozen.is_mixed("age") && live.is_mixed("age"));
+            assert!(!frozen.is_tombstoned(3, "gone") && live.is_tombstoned(3, "gone"));
+            assert_eq!(live.get(7, "name"), Some(&Value::Str("renamed 7".into())));
+            assert_eq!(live.get(14, "name"), None);
+            assert_eq!(live.get(21, "age"), None);
+            assert!(std::ptr::eq(
+                live.get(n + 500, "name").unwrap(),
+                live.get(1, "name").unwrap()
+            ));
+            let (back, _) = ColumnStore::unpack(&{
+                let mut b = Vec::new();
+                live.pack(&mut b).unwrap();
+                b
+            })
+            .unwrap();
+            for i in 0..n {
+                assert_eq!(back.get(i, "name"), live.get(i, "name"));
+                assert_eq!(back.get(i, "tags"), live.get(i, "tags"));
+            }
+            crate::cow::FORCED_HASH.with(|f| f.set(None));
+        }
     }
 }

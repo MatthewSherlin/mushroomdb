@@ -583,6 +583,8 @@ mod tests {
             fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
             prov_reconciled: false,
+            v11: false,
+            declarations: Default::default(),
         }
     }
 

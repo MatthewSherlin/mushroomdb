@@ -191,8 +191,8 @@ pub enum WalRecord {
     // duplicates written before the constraint was declared, and replay must
     // never fail on them. The check runs at write time only.
     //
-    // Format-V11 records: a 0.9.x reader cannot decode them, so they reach the
-    // WAL only once the V11 format is in place (0.10 TY-12).
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (0.10 TY-12, contract C9).
     /// Declare a unique constraint on `(label, field)`. Replay also enables the
     /// backing equality index for the pair if it is not already enabled.
     /// Discriminant 24.
@@ -213,8 +213,8 @@ pub enum WalRecord {
     // `(label, field)` that answers range and prefix lookups as well as exact
     // ones; it shares its postings with an `EnableIndex` on the same pair.
     //
-    // Format-V11 records: a 0.9.x reader cannot decode them, so they reach the
-    // WAL only once the V11 format is in place (0.10 TY-12).
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (0.10 TY-12, contract C9).
     /// Declare the range index `name` on `(label, field)`. Discriminant 26.
     EnableRangeIndex {
         name: String,
