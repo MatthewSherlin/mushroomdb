@@ -38,8 +38,13 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod ddl;
 mod row_eval;
 mod unwind_write;
+
+pub(crate) use ddl::{
+    ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
+};
 
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
@@ -562,12 +567,12 @@ impl SlowQuerySink {
     }
 }
 
-/// Whether `rec` declares or drops an equality index, inside a batch or not.
-fn declares_an_index(rec: &WalRecord) -> bool {
+/// Whether `rec` declares or withdraws an index or a constraint, inside a
+/// batch or not (see [`is_declaration`]).
+fn declares_schema(rec: &WalRecord) -> bool {
     match rec {
-        WalRecord::EnableIndex { .. } | WalRecord::DisableIndex { .. } => true,
-        WalRecord::Batch(inner) => inner.iter().any(declares_an_index),
-        _ => false,
+        WalRecord::Batch(inner) => inner.iter().any(declares_schema),
+        rec => is_declaration(rec),
     }
 }
 
@@ -4497,6 +4502,7 @@ impl<F: Fs> GraphDb<F> {
             roles: self.roles.clone().map(std::sync::Arc::new),
             prop_index: std::sync::Arc::clone(&self.prop_index),
             derived,
+            schema: Arc::new(self.schema_listing()),
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
@@ -7169,10 +7175,11 @@ impl<F: Fs> GraphDb<F> {
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
-            // A commit that declares or drops an equality index folds too: a
-            // snapshot answers indexed lookups from the fold's index, and the
-            // fold's pairs must be the store's (see `ReaderSnapshot::query_index`).
-            let fold = view_values.is_none() || declares_an_index(&rec);
+            // A commit that declares or drops an index or a constraint folds
+            // too: a snapshot answers indexed lookups from the fold's index,
+            // and `SHOW` from the fold's listing, so both must be the store's
+            // (see `ReaderSnapshot::query_index`).
+            let fold = view_values.is_none() || declares_schema(&rec);
             // Every edge whose properties this commit wrote — a rule's weights
             // above all, which no record carries — as the commit left it.
             let edge_props = if self.edge_props.has_touched() {
@@ -11202,6 +11209,14 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // A role's write scope names labels and edge types; the schema is
+        // outside every scope, so a role never changes it. `SHOW` is a read.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(ddl::schema_change_for_a_role());
+            }
+            return Ok(self.schema_listing().show(&stmt));
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -11756,6 +11771,10 @@ impl<F: Fs> GraphDb<F> {
         })?;
         if is_write_tokens(&tokens) {
             return Err(GraphError::MaskedReadOnly);
+        }
+        // `SHOW …`: the schema is not node data, so the mask does not narrow it.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return Ok(self.schema_listing().show(&stmt));
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -13188,6 +13207,14 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `SHOW INDEXES` / `SHOW CONSTRAINTS` are reads; a statement that
+        // changes the schema is a write, and this entry point does not write.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(schema_change_on_a_read());
+            }
+            return Ok(self.schema_listing().show(&stmt));
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -13250,6 +13277,9 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return self.exec_ddl(stmt);
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
