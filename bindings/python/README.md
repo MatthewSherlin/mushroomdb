@@ -263,10 +263,14 @@ computed over nodes the scope hides.
 ## Memory
 
 The MCP memory tools, as data. Each calls the function the tool calls and
-returns its report as a dict rather than a rendered digest.
+returns its report as a dict rather than a rendered digest. They live under
+`db.memory`; the old top-level names (`db.remember(...)` and the rest) still
+work and emit a `DeprecationWarning` naming your line. A plain handle is a
+general-purpose graph store and imposes none of these behaviours on ordinary
+nodes.
 
 ```python
-r = db.remember(
+r = db.memory.remember(
     "Matthew is driving the 0.7 release",
     about=["matthew", "v0.7"],                           # matthew is unknown → a provisional stub
     entities=[{"key": "v0.7", "label": "Release", "props": {"name": "v0.7"}}],
@@ -274,11 +278,11 @@ r = db.remember(
 )
 r["note"], r["provisional"]           # "note:…", ["matthew"]
 
-db.recall("who is driving the release")["hits"]          # ranked rows, not text
-db.upsert_entity("matthew", {"name": "Matthew Sherlin"}, label=None, aliases=["Matt"])
-db.schema_report()["provisional"]                        # 0 — it has been described
-db.forget(key="v0.7")["notes"]                           # ["note:…"] — the note about it, still there
-db.identity_clusters()["clusters"]                       # which keys are one entity
+db.memory.recall("who is driving the release")["hits"]  # ranked rows, not text
+db.memory.upsert_entity("matthew", {"name": "Matthew Sherlin"}, label=None, aliases=["Matt"])
+db.memory.schema_report()["provisional"]  # 0 — it has been described
+db.memory.forget(key="v0.7")["notes"]  # ["note:…"] — the note about it, still there
+db.memory.identity_clusters()["clusters"]  # which keys are one entity
 ```
 
 - `upsert_entity` is not `upsert_node`: it keeps `aliases` (derived from the

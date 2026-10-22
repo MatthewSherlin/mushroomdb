@@ -334,9 +334,19 @@ class ReviewFindings(unittest.TestCase):
 class RealTree(unittest.TestCase):
     def test_every_method_in_the_real_stub_has_a_group(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
-        names = [m[0] for m in stub["methods"]]
+        names = [m[0] for m in stub["methods"]] + [m[0] for m in stub["memory_methods"]]
         grouped = [n for members in gen.GROUPS.values() for n in members]
         self.assertEqual(sorted(names), sorted(grouped))
+
+    def test_the_memory_methods_come_from_the_accessor_and_the_aliases_are_a_table(self):
+        stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
+        memory = [m[0] for m in stub["memory_methods"]]
+        self.assertEqual(sorted(memory), sorted(gen.GROUPS["Memory"]))
+        self.assertEqual(sorted(m[0] for m in stub["deprecated"]), sorted(memory))
+        page = gen.generate("python-api", None)
+        self.assertIn("### `memory.remember`", page)
+        self.assertIn("| `remember` | `memory.remember` |", page)
+        self.assertNotIn("### `remember`", page)
 
     def test_the_committed_python_page_is_current(self):
         self.assertEqual(gen.main(["--check", "python-api"]), 0)
