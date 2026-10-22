@@ -788,3 +788,226 @@ async fn a_commit_whose_history_is_not_whole_is_unreachable() {
         dump(&GraphDb::open_at(dir.path(), last).unwrap())
     );
 }
+
+// ── Fix round 1 ──────────────────────────────────────────────────────────────
+
+fn ms(s: &str) -> i64 {
+    (rfc(s).unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+fn rfc(s: &str) -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+}
+
+/// The worker reads `commit_times.bin` after shipping the WAL, so a manifest
+/// can carry the time of a commit it does not hold — here a commit that was
+/// never fsynced, so never shipped, as when the source dies right after the
+/// manifest. A restore of the newest point trims the times to its commits:
+/// the restored store's next commit gets its own time, and a date resolves
+/// to this store's commits.
+#[tokio::test]
+async fn a_restore_of_the_newest_point_trims_the_times_to_its_commits() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&b.store, &db, dir.path());
+        db.write()
+            .record_commits_at(Some(ms("2026-01-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "a", 2);
+        w.run_once().await.unwrap();
+        db.write()
+            .record_commits_at(Some(ms("2026-02-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "c", 1);
+        // Stamped and in the file, never fsynced: its time ships, it does not.
+        db.write()
+            .set_fsync_policy(mushroomdb::FsyncPolicy::Relaxed);
+        db.write()
+            .record_commits_at(Some(ms("2026-03-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "d", 1);
+        w.run_once().await.unwrap();
+        let m = latest(&b.store).await;
+        assert_eq!(m.commit_seq, 3, "{backend}");
+        let times = m
+            .files
+            .iter()
+            .find(|f| f.name == "commit_times.bin")
+            .unwrap();
+        let shipped = get(&b.store, &times.key).await.unwrap();
+        assert!(
+            mushroomdb::restore::commit_at_instant(&shipped, 0, i64::MAX, u64::MAX)
+                .unwrap()
+                .newest_recorded
+                >= 3,
+            "{backend}: the manifest's times run past its commits"
+        );
+
+        let into = tempfile::tempdir().unwrap();
+        let target = into.path().join("restored");
+        let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &target)
+            .await
+            .unwrap();
+        assert_eq!(out.commits, 3, "{backend}");
+        let mut r = GraphDb::open(&target).unwrap();
+        assert_eq!(
+            r.commit_time_ms(3),
+            None,
+            "{backend}: no time past its commits"
+        );
+        r.record_commits_at(Some(ms("2026-04-01T00:00:00Z")))
+            .unwrap();
+        r.insert_node("A", "z", vec![]).unwrap();
+        assert_eq!(
+            r.commit_time_ms(3),
+            Some(ms("2026-04-01T00:00:00Z")),
+            "{backend}: the next commit gets its own time"
+        );
+        assert_eq!(
+            r.resolve_date("2026-03-15T00:00:00Z").unwrap(),
+            2,
+            "{backend}: a date between resolves to this store's commit, not the source's"
+        );
+    }
+}
+
+/// Segments shipped after the newest manifest hold commits whose times the
+/// backup does not have. An instant at or after the newest recorded time
+/// could fall after some of them, so it is refused, naming the limit; an
+/// instant before it resolves as a date query would.
+#[tokio::test]
+async fn a_timestamp_past_the_recorded_times_is_refused_when_later_commits_have_none() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker_with(
+            &b.store,
+            &db,
+            dir.path(),
+            BackupConfig {
+                manifest_interval_s: 3600,
+                ..config()
+            },
+        );
+        db.write()
+            .record_commits_at(Some(ms("2026-01-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "a", 1);
+        db.write()
+            .record_commits_at(Some(ms("2026-02-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "b", 1);
+        w.run_once().await.unwrap();
+        db.write()
+            .record_commits_at(Some(ms("2026-03-01T00:00:00Z")))
+            .unwrap();
+        insert(&db, "c", 2);
+        w.run_once().await.unwrap();
+        assert_eq!(latest(&b.store).await.commit_seq, 2, "{backend}: tail only");
+
+        let into = tempfile::tempdir().unwrap();
+        for at in ["2026-02-15T00:00:00Z", "2026-03-15T00:00:00Z"] {
+            let target = into.path().join("refused");
+            let e = restore_from_store(
+                Arc::clone(&b.store),
+                PREFIX,
+                Some(RestoreTarget::Timestamp(rfc(at))),
+                &target,
+            )
+            .await
+            .unwrap_err();
+            match &e {
+                RestoreS3Error::CommitTimesEnd {
+                    recorded_through,
+                    commits,
+                } => assert_eq!((*recorded_through, *commits), (1, 4), "{backend} {at}"),
+                other => panic!("{backend} {at}: expected CommitTimesEnd, got {other}"),
+            }
+            assert!(e.to_string().contains("--at N"), "{e}");
+            assert!(!target.exists());
+        }
+        // Before the newest recorded time the answer is certain.
+        let target = into.path().join("jan");
+        let out = restore_from_store(
+            Arc::clone(&b.store),
+            PREFIX,
+            Some(RestoreTarget::Timestamp(rfc("2026-01-15T00:00:00Z"))),
+            &target,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.commits, 1, "{backend}");
+        // And the tail's commits are reachable by number.
+        let out = restore_from_store(
+            Arc::clone(&b.store),
+            PREFIX,
+            Some(RestoreTarget::CommitSeq(3)),
+            &into.path().join("by-number"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.commits, 4, "{backend}");
+    }
+}
+
+/// The install is one directory rename of a staged, fsynced store. A failure
+/// at that last step — everything downloaded, verified, cut and staged —
+/// leaves a missing target missing and an empty one empty: never a store
+/// that opens, never a part of one, and no staging directory.
+#[tokio::test]
+async fn a_failed_install_leaves_the_target_absent_or_empty() {
+    for (backend, b) in buckets() {
+        let (_db, _dir) = two_generations(&b.store).await;
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("deep").join("restored");
+        backup::restore::fail_next_install_into(&missing);
+        let e = restore_from_store(Arc::clone(&b.store), PREFIX, None, &missing)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("injected"), "{backend}: {e}");
+        assert!(!missing.exists(), "{backend}");
+        assert!(dir_entries(parent.path()).is_empty(), "{backend}");
+
+        let empty = tempfile::tempdir().unwrap();
+        backup::restore::fail_next_install_into(empty.path());
+        assert!(restore_from_store(
+            Arc::clone(&b.store),
+            PREFIX,
+            Some(RestoreTarget::CommitSeq(75)),
+            empty.path()
+        )
+        .await
+        .is_err());
+        assert!(dir_entries(empty.path()).is_empty(), "{backend}");
+        assert!(!mushroomdb::restore::holds_a_store(empty.path()));
+
+        // The same restores then succeed, whole, with nothing left beside.
+        restore_from_store(Arc::clone(&b.store), PREFIX, None, &missing)
+            .await
+            .unwrap();
+        assert!(mushroomdb::restore::holds_a_store(&missing), "{backend}");
+        assert_eq!(
+            dir_entries(missing.parent().unwrap()),
+            ["restored"],
+            "{backend}"
+        );
+        assert!(!missing.join("LOCK").exists(), "{backend}");
+        restore_from_store(
+            Arc::clone(&b.store),
+            PREFIX,
+            Some(RestoreTarget::CommitSeq(75)),
+            empty.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            GraphDb::open(empty.path())
+                .unwrap()
+                .wal_total_commits()
+                .unwrap(),
+            76,
+            "{backend}"
+        );
+    }
+}

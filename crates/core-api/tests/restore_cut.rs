@@ -6,7 +6,7 @@
 //! commit count are compared with `open_at` on the uncut store. A commit
 //! `open_at` refuses, the cut refuses too.
 
-use mushroomdb::restore::{commit_at_instant, cut_at_commit};
+use mushroomdb::restore::{commit_at_instant, cut_at_commit, trim_commit_times, InstantAt};
 use mushroomdb::{GraphDb, GraphError, Predicate, RealFs, RuleDef, SnapshotOptions, Value};
 use std::path::Path;
 
@@ -273,14 +273,73 @@ fn an_instant_resolves_through_the_commit_times_sidecar() {
         db.insert_node("T", "c", vec![]).unwrap();
     }
     let bytes = std::fs::read(dir.path().join("commit_times.bin")).unwrap();
-    assert_eq!(commit_at_instant(&bytes, 0, 1_500).unwrap(), 0);
-    assert_eq!(commit_at_instant(&bytes, 0, 2_000).unwrap(), 2);
+    let at = |ms, commits| commit_at_instant(&bytes, 0, ms, commits);
+    assert_eq!(
+        at(1_500, 3).unwrap(),
+        InstantAt {
+            commit: 0,
+            newest_recorded: 2
+        }
+    );
+    assert_eq!(at(2_000, 3).unwrap().commit, 2);
+    // Entries past the commits a store holds are not answers.
+    assert_eq!(
+        at(2_000, 2).unwrap(),
+        InstantAt {
+            commit: 1,
+            newest_recorded: 1
+        }
+    );
     assert!(matches!(
-        commit_at_instant(&bytes, 0, 999),
+        at(999, 3),
         Err(GraphError::TimeBeforeFloor { .. })
     ));
     assert!(matches!(
-        commit_at_instant(&bytes, 1, 1_500),
+        commit_at_instant(&bytes, 1, 1_500, 3),
         Err(GraphError::CommitOutOfRange { .. })
     ));
+}
+
+/// A sidecar ahead of the WAL beside it — read after it, as a backup reads
+/// it — is trimmed to the commits the WAL holds, so the next commit gets its
+/// own time and dates resolve to this store's commits.
+#[test]
+fn trimming_the_commit_times_lets_the_next_commit_stamp_its_own() {
+    let dir = TmpDir::new();
+    {
+        let mut db = GraphDb::open(dir.path()).unwrap();
+        db.record_commits_at(Some(1_000)).unwrap();
+        db.insert_node("T", "a", vec![]).unwrap();
+        db.insert_node("T", "b", vec![]).unwrap();
+    }
+    let sidecar = std::fs::read(dir.path().join("commit_times.bin")).unwrap();
+    {
+        let mut db = GraphDb::open(dir.path()).unwrap();
+        db.record_commits_at(Some(5_000)).unwrap();
+        db.insert_node("T", "c", vec![]).unwrap();
+    }
+    // A copy whose WAL holds 2 commits beside a sidecar recording 3.
+    let copy = TmpDir::new();
+    {
+        let mut db = GraphDb::open(copy.path()).unwrap();
+        db.record_commits_at(Some(1_000)).unwrap();
+        db.insert_node("T", "a", vec![]).unwrap();
+        db.insert_node("T", "b", vec![]).unwrap();
+    }
+    let mut ahead = sidecar.clone();
+    ahead.extend_from_slice(
+        &std::fs::read(dir.path().join("commit_times.bin")).unwrap()[sidecar.len()..],
+    );
+    std::fs::write(copy.path().join("commit_times.bin"), &ahead).unwrap();
+    trim_commit_times(copy.path(), 2).unwrap();
+    let mut db = GraphDb::open(copy.path()).unwrap();
+    assert_eq!(db.commit_time_ms(2), None);
+    db.record_commits_at(Some(9_000)).unwrap();
+    db.insert_node("T", "z", vec![]).unwrap();
+    assert_eq!(
+        db.commit_time_ms(2),
+        Some(9_000),
+        "the next commit has its own time"
+    );
+    assert_eq!(db.resolve_instant(5_000).unwrap(), 1);
 }

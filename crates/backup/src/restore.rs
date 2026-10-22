@@ -5,29 +5,38 @@
 //! 1. `{prefix}/LATEST` names the newest manifest. A point in time
 //!    (`--at`) uses the earliest manifest of the same lineage that holds the
 //!    target commit instead; a timestamp is first resolved to a commit
-//!    through the newest manifest's `commit_times.bin`.
+//!    through the newest manifest's `commit_times.bin`, over the commits the
+//!    restore can see. When the instant is at or after the newest recorded
+//!    time and commits with no recorded time follow, it is refused
+//!    ([`RestoreS3Error::CommitTimesEnd`]) rather than placed before them.
 //! 2. Every file the manifest names is downloaded and its size and CRC-32
 //!    checked; its segments are checked the same way, must be of the
 //!    manifest's generation and contiguous from offset 0, and are
-//!    concatenated into `wal.bin`. A restore of the newest manifest also
-//!    takes the segments of its generation shipped after it, up to the last
-//!    contiguous one, each checked frame by frame, so a restore loses at
-//!    most the segment cadence. The manifest, its entries and the store's
-//!    `backup.lineage` file must all name one lineage.
+//!    concatenated into `wal.bin`. The manifest, its entries and the store's
+//!    `backup.lineage` file must all name one lineage. A restore of the
+//!    newest point also takes the segments of its generation shipped after
+//!    the manifest, up to the last contiguous one. No manifest names those,
+//!    so they are checked by their own frame checksums, size and offsets,
+//!    not against an entry; a restore loses at most the segment cadence.
 //! 3. With `--at`, the copy is cut back to the state right after the target
 //!    commit ([`mushroomdb::restore::cut_at_commit`]): what `open_at` shows
-//!    there, as an ordinary store.
+//!    there, as an ordinary store. Either way `commit_times.bin` is trimmed
+//!    to the commits restored, so the store stamps its own next commit.
 //! 4. The copy gets a **new backup lineage**. A restored store is a new
 //!    history: its next backup can never resume into the prefix it came from
 //!    or delete anything there (defect-ledger row 138). Back it up to a new
 //!    prefix.
 //! 5. The copy is opened, read-only, and must hold the commits the restore
-//!    point says it does. Only then is it moved into place.
+//!    point says it does. Only then is it moved into place, with one
+//!    directory rename.
 //!
-//! Everything up to the last step happens in a staging directory beside the
-//! target. A restore that fails at any point leaves the target exactly as it
-//! was — absent, or an empty directory — and removes the staging directory.
-//! A target that holds anything is refused before anything is downloaded.
+//! Everything up to that rename happens in a staging directory beside the
+//! target, every file fsynced. A restore that fails at any point, or a
+//! crash, leaves the target exactly as it was — absent, or an empty
+//! directory — never a part of a store. A failed restore removes the staging
+//! directory; one killed outright can leave it behind, as a hidden
+//! `.<name>.restore-…` directory beside the target, safe to delete. A target
+//! that holds anything is refused before anything is downloaded.
 
 use crate::disk;
 use crate::lease::new_instance_id;
@@ -35,6 +44,7 @@ use crate::manifest::{crc32_hex, latest_key, object_key, parse_segment_key, Mani
 use crate::segment::complete_frames;
 use crate::store::{build_store_with, BackupConfig};
 use crate::{redact, BackupError};
+use mushroomdb::restore::cut_at_commit;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use std::path::{Path, PathBuf};
@@ -105,6 +115,10 @@ pub struct RestoreS3Outcome {
     pub segments: usize,
     /// Bytes downloaded.
     pub bytes: u64,
+    /// Why the segments after the newest manifest stop where they do, when a
+    /// later one exists but could not be used (missing, short, not whole
+    /// frames, or after a gap). The restore holds the commits up to there.
+    pub tail_note: Option<String>,
 }
 
 /// Why a restore failed. The target is untouched in every case.
@@ -134,6 +148,15 @@ pub enum RestoreS3Error {
     /// `--at` is a timestamp, and the backup holds no `commit_times.bin` (or
     /// one that records no commit) to resolve it with.
     CommitTimesAbsent,
+    /// `--at` is a timestamp at or after the newest commit time the backup
+    /// records, and the backup holds commits after that one with no recorded
+    /// time: which of them the instant falls after cannot be told.
+    CommitTimesEnd {
+        /// The newest commit with a recorded time.
+        recorded_through: u64,
+        /// The commits the backup holds (`0..commits`).
+        commits: u64,
+    },
     /// The target cannot be rebuilt from what the backup holds.
     Unreachable(String),
 }
@@ -141,7 +164,9 @@ pub enum RestoreS3Error {
 impl std::fmt::Display for RestoreS3Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RestoreS3Error::Config(m) => write!(f, "{m}"),
+            // A client builder's error can quote configuration; nothing
+            // credential-shaped reaches the terminal.
+            RestoreS3Error::Config(m) => write!(f, "{}", redact(m)),
             RestoreS3Error::Store(e) => write!(f, "object store: {}", redact(&e.to_string())),
             RestoreS3Error::Io(e) => write!(f, "{e}"),
             RestoreS3Error::NoBackup { from } => {
@@ -170,6 +195,18 @@ impl std::fmt::Display for RestoreS3Error {
                 f,
                 "the backup records no commit times (no commit_times.bin), so a timestamp \
                  cannot be resolved; restore by commit number instead"
+            ),
+            RestoreS3Error::CommitTimesEnd {
+                recorded_through,
+                commits,
+            } => write!(
+                f,
+                "the backup records commit times only up to commit {recorded_through}, and \
+                 commits {} to {} have none, so a timestamp at or after that commit's time \
+                 cannot be placed among them; restore by commit number (--at N), or without \
+                 --at for the newest",
+                recorded_through + 1,
+                commits.saturating_sub(1)
             ),
             RestoreS3Error::Unreachable(m) => write!(f, "{m}"),
         }
@@ -259,13 +296,22 @@ pub async fn restore_from_store(
         });
     };
     let latest = bucket.manifest(&latest_target).await?;
-    let tail = bucket.tail_segments(&latest).await?;
+    // The segments after the newest manifest matter unless the target is a
+    // commit the manifest already holds; only then are they skipped.
+    let needs_tail = !matches!(at, Some(RestoreTarget::CommitSeq(n)) if n < latest.commit_seq);
+    let (tail, tail_note) = if needs_tail {
+        bucket.tail_segments(&latest).await?
+    } else {
+        (Vec::new(), None)
+    };
     let available = latest.commit_seq + tail.iter().map(|s| s.frames).sum::<u64>();
 
     let target = match at {
         None => None,
         Some(RestoreTarget::CommitSeq(n)) => Some(n),
-        Some(RestoreTarget::Timestamp(t)) => Some(bucket.resolve_time(&latest, t).await?),
+        Some(RestoreTarget::Timestamp(t)) => {
+            Some(bucket.resolve_time(&latest, t, available).await?)
+        }
     };
     let (key, manifest, tail, expect) = match target {
         None => (latest_target, latest, tail, available),
@@ -287,6 +333,10 @@ pub async fn restore_from_store(
             (key, m, Vec::new(), n + 1)
         }
     };
+    let tail_note = if tail.is_empty() { None } else { tail_note };
+    if let Some(note) = &tail_note {
+        tracing::warn!(note = %note, "the segments after the newest manifest stop early");
+    }
 
     let staging = Staging::beside(into)?;
     let mut out = RestoreS3Outcome {
@@ -298,6 +348,7 @@ pub async fn restore_from_store(
         files: Vec::new(),
         segments: 0,
         bytes: 0,
+        tail_note,
     };
     bucket
         .download(&manifest, &tail, staging.path(), &mut out)
@@ -309,7 +360,7 @@ pub async fn restore_from_store(
     let manifest_key = out.manifest.clone();
     blocking(move || -> Result<(), RestoreS3Error> {
         if let Some(n) = cut {
-            mushroomdb::restore::cut_at_commit(&dir, n).map_err(|e| match e {
+            cut_at_commit(&dir, n).map_err(|e| match e {
                 mushroomdb::GraphError::CommitOutOfRange { floor, .. } if n < floor => {
                     RestoreS3Error::BeforeOldestArchive {
                         target: n,
@@ -327,6 +378,11 @@ pub async fn restore_from_store(
                 other => RestoreS3Error::Io(std::io::Error::other(other.to_string())),
             })?;
         }
+        // The side files were read after the WAL they describe, so the
+        // commit times can run past the commits restored; the restored store
+        // must stamp its own next commit.
+        mushroomdb::restore::trim_commit_times(&dir, expect)
+            .map_err(|e| RestoreS3Error::Io(std::io::Error::other(e.to_string())))?;
         disk::create_lineage(&dir, &lineage)?;
         let opened = mushroomdb::GraphDb::open_with_options(
             &dir,
@@ -353,8 +409,7 @@ pub async fn restore_from_store(
     }
     let dir = staging.path().to_path_buf();
     let target_dir = into.to_path_buf();
-    let names = out.files.clone();
-    blocking(move || install(&dir, &target_dir, &names)).await?;
+    blocking(move || install(&dir, &target_dir)).await?;
     staging.installed();
     Ok(out)
 }
@@ -443,7 +498,10 @@ impl Bucket<'_> {
 
     /// The segments of `latest`'s generation after its last one, up to the
     /// last contiguous one whose bytes are whole, valid WAL frames.
-    async fn tail_segments(&self, latest: &Manifest) -> Result<Vec<TailSegment>, RestoreS3Error> {
+    async fn tail_segments(
+        &self,
+        latest: &Manifest,
+    ) -> Result<(Vec<TailSegment>, Option<String>), RestoreS3Error> {
         let mut end = match latest.segments.last() {
             Some(s) => {
                 parse_segment_key(self.prefix, &s.key)
@@ -474,19 +532,28 @@ impl Bucket<'_> {
         let mut tail = Vec::new();
         for (start, stop, key) in later {
             if start != end {
-                break;
+                return Ok((
+                    tail,
+                    Some(format!("{key} starts at {start}, after a gap from {end}")),
+                ));
             }
             let Some(bytes) = self.get(&key).await? else {
-                break;
+                return Ok((tail, Some(format!("{key} was listed but is gone"))));
             };
             let (whole, frames) = complete_frames(&bytes);
             if bytes.len() as u64 != stop - start || whole != bytes.len() {
-                break;
+                return Ok((
+                    tail,
+                    Some(format!(
+                        "{key} is not {} bytes of whole frames",
+                        stop - start
+                    )),
+                ));
             }
             end = stop;
             tail.push(TailSegment { key, bytes, frames });
         }
-        Ok(tail)
+        Ok((tail, None))
     }
 
     /// The commit `t` resolves to through `latest`'s `commit_times.bin`.
@@ -494,6 +561,7 @@ impl Bucket<'_> {
         &self,
         latest: &Manifest,
         t: OffsetDateTime,
+        available: u64,
     ) -> Result<u64, RestoreS3Error> {
         let entry = latest
             .files
@@ -511,28 +579,40 @@ impl Bucket<'_> {
             )));
         }
         let ms = (t.unix_timestamp_nanos().div_euclid(1_000_000)) as i64;
-        mushroomdb::restore::commit_at_instant(&bytes, latest.oldest_commit_seq, ms).map_err(|e| {
-            match e {
-                mushroomdb::GraphError::NoRecordedTime => RestoreS3Error::CommitTimesAbsent,
-                mushroomdb::GraphError::TimeBeforeFloor {
-                    floor_ms,
-                    floor_commit,
-                } => RestoreS3Error::Unreachable(format!(
-                    "{} is before the oldest recorded commit time ({}, commit {floor_commit})",
-                    rfc3339(t),
-                    OffsetDateTime::from_unix_timestamp_nanos(floor_ms as i128 * 1_000_000)
-                        .map(rfc3339)
-                        .unwrap_or_else(|_| format!("{floor_ms} ms"))
-                )),
-                mushroomdb::GraphError::CommitOutOfRange { commit, floor, .. } => {
-                    RestoreS3Error::BeforeOldestArchive {
-                        target: commit,
-                        oldest: floor,
+        let at =
+            mushroomdb::restore::commit_at_instant(&bytes, latest.oldest_commit_seq, ms, available)
+                .map_err(|e| match e {
+                    mushroomdb::GraphError::NoRecordedTime => RestoreS3Error::CommitTimesAbsent,
+                    mushroomdb::GraphError::TimeBeforeFloor {
+                        floor_ms,
+                        floor_commit,
+                    } => RestoreS3Error::Unreachable(format!(
+                        "{} is before the oldest recorded commit time ({}, commit {floor_commit})",
+                        rfc3339(t),
+                        OffsetDateTime::from_unix_timestamp_nanos(floor_ms as i128 * 1_000_000)
+                            .map(rfc3339)
+                            .unwrap_or_else(|_| format!("{floor_ms} ms"))
+                    )),
+                    mushroomdb::GraphError::CommitOutOfRange { commit, floor, .. } => {
+                        RestoreS3Error::BeforeOldestArchive {
+                            target: commit,
+                            oldest: floor,
+                        }
                     }
-                }
-                other => RestoreS3Error::Verify(format!("commit_times.bin: {other}")),
-            }
-        })
+                    other => RestoreS3Error::Verify(format!("commit_times.bin: {other}")),
+                })?;
+        // The instant is at or after the newest recorded time. If commits
+        // follow that one with no time of their own — shipped after the
+        // manifest, or stamped after its side files were read — the instant
+        // may fall after some of them: a date query on the source would see
+        // them. Refused rather than answered with an earlier commit.
+        if at.commit == at.newest_recorded && at.newest_recorded + 1 < available {
+            return Err(RestoreS3Error::CommitTimesEnd {
+                recorded_through: at.newest_recorded,
+                commits: available,
+            });
+        }
+        Ok(at.commit)
     }
 
     /// Download and verify every object of `m` (and `tail`) into `dir`.
@@ -743,8 +823,8 @@ impl Staging {
         &self.path
     }
 
-    /// The restore is in place: the staging directory goes, the directories
-    /// above the target stay.
+    /// The restore is in place: the staging directory became the target, and
+    /// the directories above it stay.
     fn installed(mut self) {
         self.created.clear();
     }
@@ -760,33 +840,77 @@ impl Drop for Staging {
     }
 }
 
-/// Move the restored files from `staging` into `into`. A missing target is
-/// created; an empty one is filled in place (it may be a mount point). A
-/// failed move undoes the moves made, so the target is left as it was.
-fn install(staging: &Path, into: &Path, names: &[String]) -> Result<(), RestoreS3Error> {
-    // The target may have been filled since the start; it is checked again.
-    check_into(into)?;
-    let created = !into.exists();
-    std::fs::create_dir_all(into)?;
-    let mut moved: Vec<&String> = Vec::new();
-    for name in names {
-        if let Err(e) = std::fs::rename(staging.join(name), into.join(name)) {
-            for done in &moved {
-                let _ = std::fs::rename(into.join(done), staging.join(done));
-            }
-            if created {
-                let _ = std::fs::remove_dir(into);
-            }
-            return Err(RestoreS3Error::Io(std::io::Error::new(
-                e.kind(),
-                format!("installing {name} into {}: {e}", into.display()),
-            )));
-        }
-        moved.push(name);
+/// Put the staged store in place with one directory rename, so the target
+/// is either what it was (absent or empty) or the whole restored store, and
+/// never a part of one — a crash included.
+///
+/// Every file in `staging` was fsynced as it was written; the staging
+/// directory is fsynced before the rename and its parent after it. A target
+/// that exists must be an empty directory, which the rename replaces (on
+/// Unix in the same step; elsewhere it is removed first, so a crash in
+/// between leaves it absent, never partial). A mount point cannot be
+/// replaced: the rename fails and the target is left as it was.
+fn install(staging: &Path, into: &Path) -> Result<(), RestoreS3Error> {
+    // The read-only verification open may have left its lock file.
+    match std::fs::remove_file(staging.join("LOCK")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     #[cfg(unix)]
-    std::fs::File::open(into)?.sync_all()?;
+    std::fs::File::open(staging)?.sync_all()?;
+    // The target may have been filled since the start; it is checked again.
+    check_into(into)?;
+    if take_install_fault(into) {
+        return Err(RestoreS3Error::Io(std::io::Error::other(format!(
+            "installing into {}: injected failure",
+            into.display()
+        ))));
+    }
+    #[cfg(not(unix))]
+    if into.exists() {
+        std::fs::remove_dir(into)?;
+    }
+    std::fs::rename(staging, into).map_err(|e| {
+        RestoreS3Error::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "moving the restored store into {} (it must be a new or empty directory, \
+                 not a mount point; restore into a directory inside one): {e}",
+                into.display()
+            ),
+        ))
+    })?;
+    #[cfg(unix)]
+    if let Some(parent) = into.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
+}
+
+/// Targets whose next install fails just before the rename (tests only).
+static INSTALL_FAULTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Make the next restore into `into` fail at the last step, with the whole
+/// store staged and fsynced and nothing yet moved. For tests of what a failed
+/// install leaves behind.
+#[doc(hidden)]
+pub fn fail_next_install_into(into: &Path) {
+    INSTALL_FAULTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(into.to_path_buf());
+}
+
+fn take_install_fault(into: &Path) -> bool {
+    let mut faults = INSTALL_FAULTS.lock().unwrap_or_else(|p| p.into_inner());
+    match faults.iter().position(|p| p == into) {
+        Some(i) => {
+            faults.remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 async fn blocking<T: Send + 'static>(

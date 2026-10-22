@@ -247,7 +247,9 @@ mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into
                    restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
                    which must be new or empty; every object is checked against its manifest first
                    --at N restores the store as it was right after commit N (as asof --commit counts);
-                   --at 2026-10-01T12:00:00Z the last commit at or before that instant
+                   --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                   backup's commit times; an instant past the newest recorded time is refused
+                   when later commits have none
                    the restored store starts a new backup lineage: back it up to a new prefix
                    r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
 ```

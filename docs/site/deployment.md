@@ -275,8 +275,9 @@ mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into
 `--from` is the `MUSHROOMDB_BACKUP_S3_URL` the store was backed up to
 (`s3://`, `r2://` or `minio://`). Credentials and the endpoint come from the
 same `AWS_*` variables backup uses. The store is written to `--into`, by
-default `./restored`, which must not exist yet or be empty: a restore never
-writes over anything.
+default `./restored`, which must not exist yet or be an empty directory (not a
+mount point: restore into a directory inside one). A restore never writes over
+anything.
 
 Without `--at`, the newest restore point is restored: the one `LATEST` names,
 plus the segments of its generation uploaded after it, up to the last
@@ -292,6 +293,12 @@ cadence, not the manifest interval.
   instant (RFC 3339), resolved through the backup's `commit_times.bin`, as a
   date query resolves it. A backup without that file cannot restore by time,
   and the command says so.
+- The times come from the newest restore point's `commit_times.bin`. Segments
+  uploaded after that restore point hold commits with no recorded time. An
+  instant at or after the newest recorded time could fall after some of them,
+  so it is refused with an error naming the last commit with a time: restore
+  by commit number instead, or without `--at` for the newest. An instant before
+  the newest recorded time resolves as above.
 
 A point in time is restored from the earliest restore point of the backup's
 lineage that holds it, then cut back to that commit. The result is what
@@ -301,11 +308,24 @@ A commit is out of reach when it is below the oldest commit the backup holds
 or archive retention cut the history it needs.
 
 Before anything is written to `--into`, every file and segment is downloaded
-into a staging directory beside it and checked against its manifest: size,
-CRC-32, generation, offsets, frames and lineage. The copy is then opened and
-must hold the commits the manifest says it does. Only then is it moved into
-`--into`. A restore that fails leaves `--into` as it was and removes the
-staging directory.
+into a staging directory beside it, a hidden `.<name>.restore-…` directory in
+the same parent, and checked against its manifest: size, CRC-32, generation,
+offsets, frames and lineage. Segments uploaded after the newest restore point
+are named by no manifest. They are checked by their own frame checksums, size
+and offsets, and the restore takes them up to the first one that is missing,
+damaged or after a gap, and says so if it stops early. `commit_times.bin` is
+trimmed to the commits restored, so the store stamps its own next commit. The
+copy is then opened and must hold the commits the manifest says it does.
+
+Every file is fsynced, and the staging directory then becomes `--into` in one
+directory rename. So `--into` is always either as it was, absent or empty, or
+the whole restored store, and never part of one, even after a crash. A restore
+that fails removes the staging directory. One killed outright can leave it
+behind; it is safe to delete.
+
+`roles.json` and `keys.json` are restored as the chosen restore point holds
+them. They are not cut back to a point in time: roles and keys are current
+state, not history, as they are for `asof`.
 
 **A restored store is a new lineage.** It gets a new `backup.lineage`, so its
 backups can never be confused with the ones it came from. Pointed at the

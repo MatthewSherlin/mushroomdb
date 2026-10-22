@@ -341,7 +341,7 @@ pub fn cut_at_commit(dir: &Path, commit: u64) -> Result<()> {
                 break;
             }
         }
-        rewrite_commit_times(dir, commit)?;
+        trim_commit_times(dir, commit + 1)?;
         write_file(dir, "wal.bin", &prefix)?;
         remove_if_present(&dir.join("snapshot.bin"))?;
         for (n, _, _) in &archives {
@@ -356,7 +356,7 @@ pub fn cut_at_commit(dir: &Path, commit: u64) -> Result<()> {
         Some(false) if floor > 0 || archive_frames > 0 => return Err(out_of_range),
         Some(false) => true,
     };
-    rewrite_commit_times(dir, commit)?;
+    trim_commit_times(dir, commit + 1)?;
     write_file(dir, "wal.bin", &wal[..live_ends[keep - 1]])?;
     if drop_snapshot {
         remove_if_present(&dir.join("snapshot.bin"))?;
@@ -364,17 +364,81 @@ pub fn cut_at_commit(dir: &Path, commit: u64) -> Result<()> {
     Ok(())
 }
 
+/// What an instant resolves to through a `commit_times.bin`
+/// ([`commit_at_instant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstantAt {
+    /// The last commit recorded at or before the instant.
+    pub commit: u64,
+    /// The newest commit the sidecar records a time for (below the commit
+    /// limit it was read with). A store holding commits past it has no time
+    /// for them, so an instant that resolves to it may belong to one of them.
+    pub newest_recorded: u64,
+}
+
 /// The commit an instant resolves to through a store's `commit_times.bin`
-/// (`bytes`), above the store's WAL floor `wal_floor`: the last commit
-/// recorded at or before `unix_ms`. The same resolution a date query makes.
+/// (`bytes`), above the store's WAL floor `wal_floor`, over the store's first
+/// `commits` commits: the last of them recorded at or before `unix_ms`. The
+/// same resolution a date query makes. Entries for commits at or past
+/// `commits` are ignored: a sidecar copied beside a WAL can be ahead of it.
 ///
 /// # Errors
 ///
 /// [`GraphError::NoRecordedTime`], [`GraphError::TimeBeforeFloor`] and
 /// [`GraphError::CommitOutOfRange`] as a date query returns them;
 /// [`GraphError::Corrupt`] when `bytes` does not decode.
-pub fn commit_at_instant(bytes: &[u8], wal_floor: u64, unix_ms: i64) -> Result<u64> {
-    core_storage::commit_times::decode(bytes)?.resolve_instant(unix_ms, wal_floor)
+pub fn commit_at_instant(
+    bytes: &[u8],
+    wal_floor: u64,
+    unix_ms: i64,
+    commits: u64,
+) -> Result<InstantAt> {
+    core_storage::commit_times::decode(bytes)?;
+    let times = core_storage::commit_times::decode(&commit_times_below(bytes, commits))?;
+    let commit = times.resolve_instant(unix_ms, wal_floor)?;
+    Ok(InstantAt {
+        commit,
+        newest_recorded: times.newest_commit().unwrap_or(commit),
+    })
+}
+
+/// Drop the entries of `dir/commit_times.bin` for commits at or past
+/// `commits`, so that a store holding `commits` commits stamps its next one.
+///
+/// A sidecar is read after the WAL it describes, so it can name commits the
+/// WAL beside it does not hold; [`GraphDb`] ignores a time for a commit at or
+/// below the newest one recorded, so without this the store's next commits
+/// would get no time of their own, and dates would resolve to the source's.
+/// A missing sidecar, or one that does not decode, is left as it is.
+pub fn trim_commit_times(dir: &Path, commits: u64) -> Result<()> {
+    let path = dir.join("commit_times.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    if core_storage::commit_times::decode(&bytes).is_err() {
+        return Ok(());
+    }
+    let out = commit_times_below(&bytes, commits);
+    if out.len() != bytes.len() {
+        write_file(dir, "commit_times.bin", &out)?;
+    }
+    Ok(())
+}
+
+/// A decodable sidecar's bytes with only the entries for commits below
+/// `commits`. Entries are `(commit u64, unix_ms i64)`, ascending by commit.
+fn commit_times_below(bytes: &[u8], commits: u64) -> Vec<u8> {
+    use core_storage::commit_times::{ENTRY_LEN, HEADER_LEN};
+    let mut out = bytes[..HEADER_LEN].to_vec();
+    for entry in bytes[HEADER_LEN..].chunks_exact(ENTRY_LEN) {
+        let c = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
+        if c < commits {
+            out.extend_from_slice(entry);
+        }
+    }
+    out
 }
 
 /// The byte offset at which each whole, valid frame of `bytes` ends, as far
@@ -413,33 +477,6 @@ fn snapshot_replaced_its_wal(dir: &Path) -> Result<Option<bool>> {
         return Ok(Some(meta.wal_truncated));
     }
     Ok(core_storage::snapshot::decode(&bytes)?.map(|s| s.wal_truncated))
-}
-
-/// Drop the commit-time entries after `commit`. A sidecar that does not
-/// decode is left as it is: the open reports it, as it would have.
-fn rewrite_commit_times(dir: &Path, commit: u64) -> Result<()> {
-    use core_storage::commit_times::{decode, ENTRY_LEN, HEADER_LEN};
-    let path = dir.join("commit_times.bin");
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(GraphError::Io(e)),
-    };
-    if decode(&bytes).is_err() {
-        return Ok(());
-    }
-    // Entries are `(commit u64, unix_ms i64)`, ascending by commit.
-    let mut out = bytes[..HEADER_LEN].to_vec();
-    for entry in bytes[HEADER_LEN..].chunks_exact(ENTRY_LEN) {
-        let c = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
-        if c <= commit {
-            out.extend_from_slice(entry);
-        }
-    }
-    if out.len() != bytes.len() {
-        write_file(dir, "commit_times.bin", &out)?;
-    }
-    Ok(())
 }
 
 /// Write `dir/name` whole: a temporary file, fsynced, renamed into place.
