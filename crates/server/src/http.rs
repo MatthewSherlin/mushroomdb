@@ -26,8 +26,8 @@ use axum::{Json, Router};
 use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
     BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
-    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value,
-    WccConfig, SUGGEST_DEFAULT_SEED,
+    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SchemaError, SchemaErrorKind,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -844,6 +844,18 @@ fn build_app_with_cors(
         .route("/health", get(health))
         .route("/ready", get(ready_handler))
         .route("/query", post(query))
+        .route("/schema/indexes", get(schema_indexes_list))
+        .route("/schema/indexes", post(schema_index_create))
+        .route(
+            "/schema/indexes/{name}",
+            axum::routing::delete(schema_index_drop),
+        )
+        .route("/schema/constraints", get(schema_constraints_list))
+        .route("/schema/constraints", post(schema_constraint_create))
+        .route(
+            "/schema/constraints/{name}",
+            axum::routing::delete(schema_constraint_drop),
+        )
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/ingest", post(ingest))
@@ -1819,6 +1831,276 @@ async fn query(
     };
 
     format_query_result(rs, format)
+}
+
+// ── /schema/indexes and /schema/constraints (TY-11) ─────────────────────────
+//
+// Each route runs what the matching Cypher DDL statement runs
+// (`GraphDb::schema_*`, `SHOW …`), so HTTP, Cypher and the CLI cannot
+// disagree: a row has the fields and values `SHOW` gives it, a role-bound
+// caller sees what its `SHOW` shows, and a write is refused to the callers a
+// DDL write is refused to.
+
+/// The rows of `SHOW INDEXES` / `SHOW CONSTRAINTS` as objects, narrowed to
+/// what `identity` can see exactly as the same statement through `/query` is.
+fn schema_listing_response(state: &AppState, identity: &AuthIdentity, statement: &str) -> Response {
+    let params = BTreeMap::new();
+    let rs = match identity {
+        AuthIdentity::Role(role_name) => {
+            let snap = state.db.reader();
+            let role_mask = match snap.mask_for_role(role_name) {
+                Ok(m) => m,
+                Err(e) => return role_mask_err(e),
+            };
+            snap.query_masked(statement, &params, &role_mask)
+        }
+        AuthIdentity::Full | AuthIdentity::Write => state.db.reader().query(statement, &params),
+        AuthIdentity::Anonymous => return forbidden("this endpoint requires a token"),
+    };
+    let rs = match rs {
+        Ok(rs) => rs,
+        Err(e) => return graph_err(e),
+    };
+    let columns: Vec<&String> = rs.columns().iter().collect();
+    let rows: Vec<Js> = (0..rs.len())
+        .map(|i| {
+            let obj: serde_json::Map<String, Js> = columns
+                .iter()
+                .zip(rs.row(i))
+                .map(|(col, cell)| {
+                    let v = cell.as_ref().map_or(Js::Null, crate::json::value_to_json);
+                    ((*col).clone(), v)
+                })
+                .collect();
+            Js::Object(obj)
+        })
+        .collect();
+    json_ok(Js::Array(rows))
+}
+
+async fn schema_indexes_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW INDEXES")
+}
+
+async fn schema_constraints_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW CONSTRAINTS")
+}
+
+/// 403 for a role-bound token on a schema write, as a DDL statement gives it.
+const SCHEMA_ROLE_REFUSAL: &str =
+    "role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP \
+     CONSTRAINT) are not permitted";
+
+/// The refusal a schema write gets for `identity`, if any. A read-tier key never
+/// reaches here (the auth middleware refuses it first), but carries a role.
+fn refuse_schema_write(identity: &AuthIdentity) -> Option<Response> {
+    match identity {
+        AuthIdentity::Role(_) => Some(forbidden(SCHEMA_ROLE_REFUSAL)),
+        AuthIdentity::Anonymous => Some(forbidden("this endpoint requires a token")),
+        AuthIdentity::Full | AuthIdentity::Write => None,
+    }
+}
+
+/// A schema write's error as HTTP, by the kind the engine decided from the
+/// state it found: a name nothing answers to is 404, a collision with what
+/// exists (a taken name or pair, an index a constraint backs, existing
+/// duplicates, a view-owned property) is 409, and a malformed request is 400.
+fn schema_err(e: SchemaError) -> Response {
+    let status = match e.kind {
+        SchemaErrorKind::NotFound => StatusCode::NOT_FOUND,
+        SchemaErrorKind::Conflict => StatusCode::CONFLICT,
+        SchemaErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        SchemaErrorKind::Other => return graph_err(e.error),
+    };
+    let detail = match e.error {
+        GraphError::QueryError { detail } | GraphError::RuleInvalid { detail } => detail,
+        other => other.to_string(),
+    };
+    (status, Json(json!({ "error": detail }))).into_response()
+}
+
+/// The refusal for a schema body that is not an object, or carries a field
+/// outside `allowed`, naming it.
+fn schema_body_check(body: &Js, allowed: &[&str]) -> std::result::Result<(), String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "the body must be a JSON object".to_string())?;
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(unknown) => Err(format!(
+            "unknown field '{unknown}'; this route takes: {}",
+            allowed.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A required, non-empty string field of a schema request body.
+fn schema_text<'a>(body: &'a Js, field: &str) -> std::result::Result<&'a str, String> {
+    match body.get(field).and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(format!(
+            "{field} is required and must be a non-empty string"
+        )),
+    }
+}
+
+/// An optional `name`: absent or null is `None`; otherwise it must be an
+/// identifier, so every surface (HTTP path, Cypher `DROP INDEX name`) can
+/// address it.
+fn schema_name(body: &Js) -> std::result::Result<Option<&str>, String> {
+    match body.get("name") {
+        None | Some(Js::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some(s) if is_schema_identifier(s) => Ok(Some(s)),
+            _ => Err(
+                "name must be a string of letters, digits and underscores, not starting with a digit"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn is_schema_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+async fn schema_index_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "kind"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    let name = match schema_name(&body) {
+        Ok(n) => n.map(str::to_string),
+        Err(e) => return err_response(e),
+    };
+    let kind =
+        match body.get("kind") {
+            None | Some(Js::Null) => "range",
+            Some(v) => match v.as_str() {
+                Some(k @ ("range" | "equality")) => k,
+                _ => return err_response(
+                    "kind must be \"range\" or \"equality\"; full-text indexes are not created \
+                     over this route",
+                ),
+            },
+        };
+    let kind = kind.to_string();
+    let db = state.db.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        let mut g = db.write();
+        match kind.as_str() {
+            "equality" => g.schema_create_equality_index(name.as_deref(), &label, &property),
+            _ => g.schema_create_range_index(name.as_deref(), &label, &property),
+        }
+        .map(|listed| (listed, kind, label, property))
+    })
+    .await;
+    match created {
+        Ok(Ok((listed, kind, label, property))) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": listed, "type": kind, "label": label,
+                "property": property, "state": "online"
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_index_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_index(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "type"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    // A constraint needs a name (Cypher DDL requires one), so there is none to invent.
+    let name = match schema_name(&body) {
+        Ok(Some(n)) => n.to_string(),
+        Ok(None) => return err_response("name is required for a constraint"),
+        Err(e) => return err_response(e),
+    };
+    match body.get("type") {
+        None | Some(Js::Null) => {}
+        Some(v) if v.as_str() == Some("unique") => {}
+        Some(_) => return err_response("type must be \"unique\", the only constraint type"),
+    }
+    let db = state.db.clone();
+    let reply = json!({
+        "name": name, "type": "unique", "label": label, "property": property
+    });
+    match tokio::task::spawn_blocking(move || {
+        db.write()
+            .schema_create_constraint(&name, &label, &property)
+    })
+    .await
+    {
+        Ok(Ok(())) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_constraint(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
 }
 
 /// An unmasked, live (non-`as_of`) read query, on the lock-free reader. An

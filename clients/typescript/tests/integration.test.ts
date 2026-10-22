@@ -1752,3 +1752,27 @@ describe.skipIf(NO_SERVER)("special character key round trip", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// schema indexes / constraints — server-based behavior
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("schema indexes and constraints", () => {
+  it("declares, lists and drops a range index and a unique constraint", async () => {
+    const label = `TsSchema${Date.now()}`;
+    const created = await client.createIndex(label, "age");
+    expect(created.name).toBe(`idx_${label}_age`);
+    expect((await client.indexes()).some((i) => i.name === created.name && i.type === "range")).toBe(true);
+    await client.dropIndex(created.name);
+    expect((await client.indexes()).some((i) => i.name === created.name)).toBe(false);
+
+    await client.createConstraint(`uc_${label}`, label, "email");
+    expect((await client.constraints()).some((c) => c.name === `uc_${label}`)).toBe(true);
+    await client.dropConstraint(`uc_${label}`);
+    await client.dropIndex(`eq_${label}_email`);
+  });
+
+  it("dropIndex throws MushroomError (404) for an unknown name", async () => {
+    await expect(client.dropIndex("ts_no_such_index")).rejects.toBeInstanceOf(MushroomError);
+  });
+});

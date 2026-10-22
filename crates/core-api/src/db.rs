@@ -39,6 +39,7 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 const NS_DEFAULT_IDX: u32 = 0;
 
 mod ddl;
+pub use ddl::{SchemaError, SchemaErrorKind};
 mod row_eval;
 mod unwind_write;
 

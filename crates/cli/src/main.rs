@@ -4,8 +4,8 @@ use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
     parse_args, read_stats, resolve_statement, run_algo, run_asof, run_backup, run_build_index,
     run_demo, run_export, run_import, run_migrate, run_query, run_schema_apply,
-    run_schema_apply_memory_defaults, run_schema_apply_memory_identity, run_snapshot, run_suggest,
-    run_verify, usage, Command, ServeUi,
+    run_schema_apply_memory_defaults, run_schema_apply_memory_identity, run_schema_list,
+    run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
 use mushroomdb::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -408,6 +408,13 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Ok(Command::SchemaList { db_dir, what }) => match run_schema_list(&db_dir, what) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
         Ok(Command::SchemaApply {
             db_dir,
             schema_file,
