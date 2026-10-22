@@ -1229,11 +1229,20 @@ async fn restore_on_boot(
             lease
         }
         Err(e) => {
+            // Some failures leave a store in place (one that may have served
+            // writes, or one whose install is not yet durable): say "holds
+            // no store" only when that is true on disk.
+            let left = if mushroomdb::restore::holds_a_store(db_dir) {
+                format!(
+                    "{} still holds a store; do not empty it without reading the error above",
+                    db_dir.display()
+                )
+            } else {
+                format!("{} holds no store", db_dir.display())
+            };
             return Err(format!(
-                "restore-on-boot from {url} failed: {e}. Nothing is served, and {} holds no \
-                 store",
-                db_dir.display()
-            ))
+                "restore-on-boot from {url} failed: {e}. Nothing is served, and {left}"
+            ));
         }
     };
     if continues {
