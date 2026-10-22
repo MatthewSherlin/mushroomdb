@@ -585,9 +585,8 @@ impl Builder {
     /// `old` — and the fold is unchanged, `old` (and a queued state `state`
     /// supersedes) is dropped here instead. Should a reader hold it after
     /// all, dropping here releases only this reference; the reader keeps the
-    /// state. No capture is
-    /// updating its counts, and its fold and deltas live on in `state`, so
-    /// that drop is a few reference counts. Queued until the next tick, it
+    /// state. Its fold and deltas live on in `state`, so that drop is usually
+    /// a few reference counts. Queued until the next tick, it
     /// would hold the built layer the next build moves, and a reader building
     /// first would copy that layer instead.
     fn submit(&self, state: Arc<PublishedState>, old: Option<Arc<PublishedState>>, eager: bool) {
