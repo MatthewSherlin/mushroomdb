@@ -11,7 +11,7 @@
 //! whether the executor actually answered from the index through
 //! [`core_query::cypher::exec::range_index_scans`], a per-thread count.
 
-use core_query::cypher::exec::{range_index_scans, set_pull_probe_slots};
+use core_query::cypher::exec::{range_index_scans, range_top_k_stops, set_pull_probe_slots};
 use core_query::cypher::{lex, parse, plan};
 use mushroomdb::{NodeMask, RealFs, ResultSet, Value};
 use std::collections::BTreeMap;
@@ -347,6 +347,129 @@ fn order_by_limit_is_a_top_k_from_the_index_with_nulls_where_a_sort_puts_them() 
     assert!(plan_of(other).contains("order: None"), "{}", plan_of(other));
     let (rs, _) = qp(&db, other, &[]);
     assert_eq!(keys(&rs, "n"), ["c", "d"]);
+}
+
+/// `cypher` on `db` against the same query with its `WHERE` turned into
+/// `(…) OR false` (or `WHERE true` added), which no fold reads: the scan.
+/// Returns the shared answer as Debug text.
+fn assert_as_scan(db: &GraphDb, cypher: &str, params: &[(&str, Value)]) -> String {
+    let scan = match cypher.find(" WHERE ") {
+        Some(at) => {
+            let ret = cypher.find(" RETURN ").expect("a RETURN");
+            format!(
+                "{} WHERE ({}) OR false{}",
+                &cypher[..at],
+                &cypher[at + " WHERE ".len()..ret],
+                &cypher[ret..]
+            )
+        }
+        None => cypher.replacen(" RETURN ", " WHERE true RETURN ", 1),
+    };
+    let got = format!("{:?}", db.query_with_params(cypher, params));
+    let want = format!("{:?}", db.query_with_params(&scan, params));
+    assert_eq!(got, want, "{cypher} {params:?}");
+    got
+}
+
+/// Ties that straddle the `LIMIT` and the `SKIP` boundary come out in the
+/// scan's order — node id, as a stable sort leaves them — whatever order the
+/// index holds them in: an `Int` key before an equal `Float` key, buckets read
+/// backwards for `DESC`, and two `Int`s that are one `f64` above 2^53.
+#[test]
+fn ties_at_the_limit_and_skip_boundary_come_out_in_the_scans_order() {
+    let big = 1i64 << 53;
+    // Keys in id order; values deliberately out of that order.
+    let mut db = item_db(
+        "ties",
+        &[
+            ("a", Value::Float(10.0)),
+            ("b", Value::Int(big + 1)),
+            ("c", Value::Int(5)),
+            ("d", Value::Int(10)),
+            ("e", Value::Int(big)),
+            ("f", Value::Float(10.0)),
+            ("g", Value::Int(20)),
+            ("h", Value::Int(10)),
+            ("i", Value::Float(big as f64)),
+        ],
+    );
+    db.insert_node("Item", "m", vec![]).unwrap();
+    let cases: [(&str, &[&str]); 13] = [
+        // 5, then the four 10s (a d f h, by id), 20, the 2^53 run (b e i), null.
+        ("LIMIT 2", &["c", "a"]),
+        ("LIMIT 3", &["c", "a", "d"]),
+        ("SKIP 2 LIMIT 2", &["d", "f"]),
+        ("SKIP 4 LIMIT 1", &["h"]),
+        ("SKIP 6 LIMIT 2", &["b", "e"]),
+        ("SKIP 7 LIMIT 3", &["e", "i", "m"]),
+        // Descending: null, the 2^53 run, 20, the 10s, 5.
+        ("DESC LIMIT 2", &["m", "b"]),
+        ("DESC SKIP 1 LIMIT 2", &["b", "e"]),
+        ("DESC SKIP 3 LIMIT 1", &["i"]),
+        ("DESC SKIP 4 LIMIT 3", &["g", "a", "d"]),
+        ("DESC SKIP 6 LIMIT 2", &["d", "f"]),
+        ("DESC SKIP 7 LIMIT 2", &["f", "h"]),
+        ("DESC SKIP 9 LIMIT 5", &["c"]),
+    ];
+    for (tail, want) in cases {
+        let cypher = format!("MATCH (n:Item) RETURN n.key AS k, n.val AS v ORDER BY n.val {tail}");
+        assert!(plan_of(&cypher).contains("order: Some"), "{cypher}");
+        assert_as_scan(&db, &cypher, &[]);
+        assert_eq!(keys(&q(&db, &cypher), "k"), want, "{cypher}");
+    }
+    // With a range on the field the cut falls inside the 10s as well.
+    let ranged: [(&str, &[&str]); 4] = [
+        ("LIMIT 2", &["a", "d"]),
+        ("SKIP 1 LIMIT 2", &["d", "f"]),
+        ("DESC LIMIT 3", &["g", "a", "d"]),
+        ("DESC SKIP 2 LIMIT 2", &["d", "f"]),
+    ];
+    for (tail, want) in ranged {
+        let cypher = format!(
+            "MATCH (n:Item) WHERE n.val >= 10 AND n.val <= 20 RETURN n.key AS k ORDER BY n.val {tail}"
+        );
+        assert!(plan_of(&cypher).contains("order: Some"), "{cypher}");
+        assert_as_scan(&db, &cypher, &[]);
+        assert_eq!(keys(&q(&db, &cypher), "k"), want, "{cypher}");
+    }
+}
+
+/// `LIMIT $k` and `SKIP $s` on the index plan answer as the scan does:
+/// valid, missing, negative and non-integer alike.
+#[test]
+fn limit_and_skip_parameters_on_the_index_plan_answer_as_the_scan() {
+    let db = item_db(
+        "params",
+        &[
+            ("a", Value::Int(3)),
+            ("b", Value::Int(1)),
+            ("c", Value::Float(1.0)),
+            ("d", Value::Int(2)),
+        ],
+    );
+    let plain = "MATCH (n:Item) RETURN n.key AS k ORDER BY n.val SKIP $s LIMIT $k";
+    let ranged =
+        "MATCH (n:Item) WHERE n.val > 0 RETURN n.key AS k ORDER BY n.val DESC SKIP $s LIMIT $k";
+    for query in [plain, ranged] {
+        assert!(plan_of(query).contains("order: Some"), "{query}");
+        let ok = assert_as_scan(&db, query, &[("s", Value::Int(1)), ("k", Value::Int(2))]);
+        assert!(ok.starts_with("Ok("), "{ok}");
+        for params in [
+            vec![("s", Value::Int(1))],
+            vec![("k", Value::Int(2))],
+            vec![("s", Value::Int(0)), ("k", Value::Int(-1))],
+            vec![("s", Value::Int(-1)), ("k", Value::Int(2))],
+            vec![("s", Value::Int(0)), ("k", Value::Str("2".into()))],
+        ] {
+            let got = assert_as_scan(&db, query, &params);
+            assert!(got.starts_with("Err("), "{query} {params:?}: {got}");
+        }
+    }
+    let params = [("s", Value::Int(1)), ("k", Value::Int(2))];
+    let rs = db.query_with_params(plain, &params).unwrap();
+    assert_eq!(keys(&rs, "k"), ["c", "d"]);
+    let rs = db.query_with_params(ranged, &params).unwrap();
+    assert_eq!(keys(&rs, "k"), ["d", "b"]);
 }
 
 // ── Visibility ───────────────────────────────────────────────────────────────
@@ -718,6 +841,7 @@ fn run(db: &GraphDb, cypher: &str, params: &[(String, Value)]) -> String {
 fn index_plans_return_exactly_what_the_scan_returns() {
     let mut used = 0;
     let mut queries = 0;
+    let stops_before = range_top_k_stops();
     for seed in 1..=12u64 {
         let graph_seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         let mut indexed = GraphDb::open(&tmp(&format!("diff-ix-{seed}"))).unwrap();
@@ -764,5 +888,11 @@ fn index_plans_return_exactly_what_the_scan_returns() {
     assert!(
         used * 3 > queries,
         "{used} of {queries} queries read the index"
+    );
+    // And the top-k cut, which stops reading the index part-way, ran often.
+    let stops = range_top_k_stops() - stops_before;
+    assert!(
+        stops >= 50,
+        "only {stops} ORDER BY … LIMIT queries stopped early"
     );
 }

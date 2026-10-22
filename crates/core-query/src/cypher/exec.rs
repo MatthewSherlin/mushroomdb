@@ -61,6 +61,17 @@ fn count_range_index_scan() {
 }
 
 thread_local! {
+    static RANGE_TOP_K_STOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an `ORDER BY … LIMIT` over a range index
+/// stopped reading the index before its end. Per thread, for tests.
+#[doc(hidden)]
+pub fn range_top_k_stops() -> u64 {
+    RANGE_TOP_K_STOPS.with(|c| c.get())
+}
+
+thread_local! {
     static PULL_PROBE_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(4096) };
 }
 
@@ -2037,6 +2048,7 @@ fn top_k(
                 _ => true,
             };
             if !in_run {
+                RANGE_TOP_K_STOPS.with(|c| c.set(c.get() + 1));
                 break;
             }
         }
