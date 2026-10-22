@@ -138,6 +138,8 @@ use core_storage::RealFs;
 use core_storage::Result;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
@@ -284,6 +286,15 @@ impl Drop for DrainHandle {
     }
 }
 
+/// How long a published version no reader has asked for waits for the
+/// background builder: it builds the latest such version once per delay.
+const LAZY_BUILD_DELAY: Duration = Duration::from_millis(2);
+
+/// How long the background builder keeps ticking with nothing to build
+/// before it sleeps until a publish wakes it. Longer than a slow commit, so a
+/// writer committing back to back does not wake it once per commit.
+const BUILDER_IDLE_SPELL: Duration = Duration::from_millis(100);
+
 // ── Published snapshot ────────────────────────────────────────────────────────
 
 /// The reader snapshot of the last state a writer released.
@@ -311,6 +322,10 @@ pub(crate) struct Published {
     /// Set while a write guard holds the RwLock, from its acquisition until
     /// it has published; see [`Self::current`].
     writing: AtomicBool,
+    /// Set by every capture; cleared by the next publish, which hands its
+    /// version to the builder at once only if it was set — a reader read
+    /// since the last publish, so one is likely to read this version too.
+    demand: AtomicBool,
     builder: Arc<Builder>,
 }
 
@@ -401,7 +416,18 @@ impl Published {
             slot: Mutex::new(state),
             probe,
             writing: AtomicBool::new(false),
+            demand: AtomicBool::new(false),
             builder,
+        }
+    }
+
+    /// Note that a reader captured, so the next publish is handed to the
+    /// builder at once. Writes the flag only when it is clear, so readers
+    /// capturing back to back do not keep taking its cache line from each
+    /// other.
+    fn note_reader(&self) {
+        if !self.demand.load(Ordering::Relaxed) {
+            self.demand.store(true, Ordering::Relaxed);
         }
     }
 
@@ -438,6 +464,14 @@ impl Published {
     /// before the build finishes shares those cells: `get_or_init` has it wait
     /// for the build in flight or do it itself, never twice.
     ///
+    /// The builder is woken for this version only when a reader has captured
+    /// since the last publish (see [`Self::note_reader`]). Otherwise the
+    /// version waits for the builder's own schedule ([`LAZY_BUILD_DELAY`]):
+    /// back-to-back commits nobody reads then cost no wake-up and no build
+    /// each, and the builder builds the latest of them once per delay. The
+    /// slot itself is always updated here, so what a capture is served —
+    /// read-your-write, and never a torn state — does not depend on it.
+    ///
     /// The new snapshot replaces the old one before the build, so the old
     /// version's cells are no longer held here and the build extends them in
     /// place instead of copying them.
@@ -465,7 +499,11 @@ impl Published {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replace(Arc::clone(&state));
-        self.builder.submit(state, old);
+        let eager = self.demand.load(Ordering::Relaxed);
+        if eager {
+            self.demand.store(false, Ordering::Relaxed);
+        }
+        self.builder.submit(state, old, eager);
     }
 
     fn get(&self) -> Option<ReaderSnapshot> {
@@ -480,6 +518,13 @@ impl Published {
 /// one not yet started, so builds never queue. A superseded version is built,
 /// if anyone reads it, by its first reader, as before.
 ///
+/// A publish a reader is likely to read wakes it at once. Any other waits
+/// for the thread's next tick: after each build it checks for a new version
+/// every [`LAZY_BUILD_DELAY`], and only after [`BUILDER_IDLE_SPELL`] with
+/// nothing to build does it sleep until a publish wakes it. So a writer
+/// committing back to back with no reader wakes it about once, not once per
+/// commit.
+///
 /// It also drops the states a publish replaced. Dropping a snapshot releases
 /// one reference on each of its `Arc`s — the fold, every delta of the tail —
 /// whose counts readers' captures are updating at the same moment, so the
@@ -490,12 +535,23 @@ pub(crate) struct Builder {
     pending: Mutex<BuilderQueue>,
     wake: std::sync::Condvar,
     shutdown: std::sync::atomic::AtomicBool,
+    /// Publishes that woke the builder thread.
+    #[cfg(test)]
+    wakes: AtomicU64,
+    /// Publishes handed to the builder at once because a reader had read
+    /// since the publish before.
+    #[cfg(test)]
+    eager: AtomicU64,
 }
 
 #[derive(Default)]
 struct BuilderQueue {
     next: Option<Arc<PublishedState>>,
     retired: Vec<Arc<PublishedState>>,
+    /// Build now, without waiting out the delay.
+    urgent: bool,
+    /// The thread is asleep with no timeout: a publish must wake it.
+    sleeping: bool,
 }
 
 impl Builder {
@@ -504,42 +560,116 @@ impl Builder {
             pending: Mutex::new(BuilderQueue::default()),
             wake: std::sync::Condvar::new(),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            wakes: AtomicU64::new(0),
+            #[cfg(test)]
+            eager: AtomicU64::new(0),
         })
     }
 
     /// Queue `state` for its build, and `old`, the state it replaced, for
-    /// dropping.
-    fn submit(&self, state: Arc<PublishedState>, old: Option<Arc<PublishedState>>) {
+    /// dropping. `eager`: build it at once rather than on the thread's own
+    /// schedule.
+    ///
+    /// When no reader asked for `old` and the fold is unchanged, `old` (and a
+    /// queued state `state` supersedes) is dropped here instead. No capture is
+    /// updating its counts, and its fold and deltas live on in `state`, so
+    /// that drop is a few reference counts. Queued until the next tick, it
+    /// would hold the built layer the next build moves, and a reader building
+    /// first would copy that layer instead.
+    fn submit(&self, state: Arc<PublishedState>, old: Option<Arc<PublishedState>>, eager: bool) {
+        // Dropped here only when it shares `state`'s fold: a state of an
+        // older fold may hold the last reference to that fold.
+        let unread_same_fold = |s: &Option<Arc<PublishedState>>| {
+            !eager
+                && s.as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(&s.snap.frozen, &state.snap.frozen))
+        };
+        let old_here = unread_same_fold(&old);
         let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(superseded) = queue.next.replace(state) {
-            queue.retired.push(superseded);
+        let superseded = queue.next.take();
+        let superseded_here = old_here && unread_same_fold(&superseded);
+        queue.next = Some(state);
+        let mut here = (None, None);
+        if superseded_here {
+            here.0 = superseded;
+        } else {
+            queue.retired.extend(superseded);
         }
-        queue.retired.extend(old);
+        if old_here {
+            here.1 = old;
+        } else {
+            queue.retired.extend(old);
+        }
+        // A sleeping thread would never see this publish; one waiting out
+        // its delay will, and one already told to hurry needs no second
+        // wake.
+        let wake = (eager || queue.sleeping) && !queue.urgent;
+        if wake {
+            queue.urgent = true;
+            queue.sleeping = false;
+        }
         drop(queue);
-        self.wake.notify_one();
+        #[cfg(test)]
+        {
+            self.wakes.fetch_add(u64::from(wake), Ordering::Relaxed);
+            self.eager.fetch_add(u64::from(eager), Ordering::Relaxed);
+        }
+        if wake {
+            self.wake.notify_one();
+        }
+        drop(here);
     }
 
     fn run(self: Arc<Self>) {
-        use std::sync::atomic::Ordering;
+        let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let (next, retired) = {
-                let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    if queue.next.is_some() || !queue.retired.is_empty() {
-                        break (queue.next.take(), std::mem::take(&mut queue.retired));
-                    }
-                    if self.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
+            // Wait for a reason to build: a wake-up, or a tick of the delay
+            // finding something to build. Tick on while publishes may still
+            // come; sleep only after a whole idle spell found none.
+            let built_at = Instant::now();
+            let mut tick_end = built_at + LAZY_BUILD_DELAY;
+            loop {
+                if self.shutdown.load(Ordering::Acquire) {
+                    // No reader is left to want a build; drop what is queued
+                    // off the lock.
+                    let queued = (queue.next.take(), std::mem::take(&mut queue.retired));
+                    drop(queue);
+                    drop(queued);
+                    return;
+                }
+                if queue.urgent {
+                    break;
+                }
+                let work = queue.next.is_some() || !queue.retired.is_empty();
+                let now = Instant::now();
+                if now < tick_end {
+                    queue = self
+                        .wake
+                        .wait_timeout(queue, tick_end - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                } else if work {
+                    break;
+                } else if now < built_at + BUILDER_IDLE_SPELL {
+                    tick_end = now + LAZY_BUILD_DELAY;
+                } else {
+                    queue.sleeping = true;
                     queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
                 }
-            };
+            }
+            queue.urgent = false;
+            queue.sleeping = false;
+            let next = queue.next.take();
+            let retired = std::mem::take(&mut queue.retired);
+            drop(queue);
             drop(retired);
             if let Some(state) = next {
                 if state.snap.prepare() {
                     state.snap.mark_built_in_background();
                 }
             }
+            queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -1052,6 +1182,7 @@ impl SharedDb {
     /// not hold read guards a writer has to wait for.
     pub fn reader(&self) -> ReaderSnapshot {
         use std::sync::TryLockError;
+        self.published.note_reader();
         if let Some(snap) = self.published.current() {
             return snap;
         }
@@ -1669,6 +1800,103 @@ mod tests {
         // Refreshed and republished: the next capture is lock-free again.
         assert_eq!(value_of(&db.reader(), "b"), Some(Value::Int(7)));
         assert_eq!(locked_captures(&db), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn builder_counts(db: &SharedDb) -> (u64, u64) {
+        let b = &db.published.builder;
+        (
+            b.wakes.load(Ordering::Relaxed),
+            b.eager.load(Ordering::Relaxed),
+        )
+    }
+
+    /// TX-5c: a commit no reader is waiting for neither wakes the background
+    /// builder nor hands it the new version at once. The builder still builds
+    /// the latest version on its own schedule, and a commit after a read
+    /// hands its version over at once, as before.
+    #[test]
+    fn a_commit_with_no_reader_since_the_last_publish_does_not_wake_the_builder() {
+        let dir = tmp("lazy");
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("N", "a", vec![]).unwrap();
+        // Let the builder finish and fall asleep: the first commit wakes it.
+        std::thread::sleep(BUILDER_IDLE_SPELL * 2);
+        let (wakes0, eager0) = builder_counts(&db);
+        let commits = 200;
+        for i in 0..commits {
+            db.write().set_prop("a", "v", Value::Int(i)).unwrap();
+        }
+        let (wakes1, eager1) = builder_counts(&db);
+        assert_eq!(
+            eager1 - eager0,
+            0,
+            "a commit no reader asked for was handed over at once"
+        );
+        assert!(
+            wakes1 - wakes0 < commits as u64 / 4,
+            "{} of {commits} commits with no reader woke the builder",
+            wakes1 - wakes0
+        );
+        // Still built in the background: the live version, captured under a
+        // read guard (which keeps writers out, so it stays the latest).
+        {
+            let g = db.read();
+            let snap = g.reader();
+            assert!(!snap.deltas.is_empty());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !snap.built_in_background() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the builder never built the version no reader asked for"
+                );
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        // A read, then a commit: that commit's version is handed over at once.
+        assert_eq!(value_of(&db.reader(), "a"), Some(Value::Int(commits - 1)));
+        db.write().set_prop("a", "v", Value::Int(-1)).unwrap();
+        let (_, eager2) = builder_counts(&db);
+        assert_eq!(
+            eager2 - eager1,
+            1,
+            "a commit after a read was not handed over at once"
+        );
+        assert_eq!(value_of(&db.reader(), "a"), Some(Value::Int(-1)));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TX-5c: a version replaced before any reader asked for it is dropped as
+    /// it is replaced, not kept until the builder's next tick. Kept, it holds
+    /// the built layer the next build would move, so the first reader after a
+    /// quiet spell — after a bulk load, say — copied a bulk-sized layer while
+    /// every other reader waited on it.
+    #[test]
+    fn a_version_replaced_before_anyone_read_it_is_not_kept_alive() {
+        let dir = tmp("retire");
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("N", "a", vec![]).unwrap();
+        db.write().set_prop("a", "v", Value::Int(1)).unwrap();
+        let replaced = std::sync::Arc::downgrade(&db.published.state().unwrap());
+        {
+            let g = db.read();
+            let snap = g.reader();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !snap.built_in_background() {
+                assert!(std::time::Instant::now() < deadline, "never built");
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        // Let the builder let go of the version it built.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        db.write().set_prop("a", "v", Value::Int(2)).unwrap();
+        assert!(
+            replaced.upgrade().is_none(),
+            "the replaced version is still held after the commit that replaced it"
+        );
+        assert_eq!(value_of(&db.reader(), "a"), Some(Value::Int(2)));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
