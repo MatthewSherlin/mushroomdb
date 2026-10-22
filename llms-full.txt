@@ -13080,9 +13080,10 @@ anything, and renews it while it runs. If another instance holds a fresh
 lease, it may still be writing: serve exits 1, naming the holder, and writes
 nothing to the data directory. Stop that instance, or wait for its lease to
 expire, and start again. When backup continues under the same prefix, the
-backup worker holds the lease the restore took, and never takes it a second
-time. Otherwise the lease is released once the restore is done, or as soon as
-it fails.
+lease stays renewed while the restored store is opened, however long that
+takes. The backup worker then holds it and renews it at once, and never takes
+it a second time. Otherwise the lease is released once the restore is done.
+It is released as soon as anything fails before the worker holds it.
 
 **The restored store continues the prefix as a new lineage.** Like any restore
 it gets a new `backup.lineage`, and it also gets a `backup.parent` file naming
@@ -13102,12 +13103,27 @@ point. A mount point cannot be replaced by a rename, and its parent may not be
 writable, so this restore stages inside the data directory, in a hidden
 `.<name>.restore-…` directory. It verifies everything there first, as
 `restore --from` does. It then writes `.mushroomdb-restore-install`, naming
-the staged files, moves them into the data directory (`snapshot.bin` and
-`wal.bin` last), syncs it, and removes the marker. A failure partway removes
-what it moved. A crash leaves the marker behind. The next start with the
-variable set removes exactly the files the marker names and restores again.
-Without the variable, serve refuses a directory holding the marker rather
-than open a part of a store.
+the staged files with their sizes and modification times. It moves them into
+the data directory (`snapshot.bin` and `wal.bin` last), syncs it, removes the
+marker and syncs it again. The store is served only once that last sync has
+succeeded. If it fails, serve exits 1: the next start serves the store, or
+restores it again if a power loss brought the marker back. A failure partway
+removes what it moved.
+
+A crash leaves the marker behind. While it is there, nothing opens the
+directory: `serve`, `mcp`, `query`, every other command, the library and the
+Python binding all refuse it, naming the marker. The next start with the
+variable set takes the lease first, then removes exactly the files the
+marker names, and restores again. It never removes a store that has changed
+since the install, which would mean it may have served writes. If a file the
+marker names has another size or time, or a `snapshot.bin` or `wal.bin` it
+does not name has appeared, serve exits 1, names the marker and removes
+nothing. Delete the marker to keep that store, or empty the directory to
+restore again.
+
+Leftovers of killed restores inside the data directory are swept at the next
+start once their lock is free and they are stale, also on a start that skips
+the restore. Any the sweep has to leave are named on stderr.
 
 **A large restore delays readiness.** The port is bound only once the store
 is restored and open, so the platform's health check sees a process still

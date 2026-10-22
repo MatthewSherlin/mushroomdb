@@ -1086,6 +1086,28 @@ fn sweep_stale_staging(root: &Path, name: &str) -> Vec<PathBuf> {
     removed
 }
 
+/// Sweep what killed restores on boot left inside the data directory `dir`
+/// ([`sweep_stale_staging`] with the in-place staging root).
+pub(crate) fn sweep_in_place(dir: &Path) -> Vec<PathBuf> {
+    sweep_stale_staging(dir, &name_of(dir))
+}
+
+/// Staging directories and lock files of restores into `dir` still inside
+/// it: ones a sweep had to leave (too young, or no advisory locks).
+pub(crate) fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+    let name = name_of(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| staging_stem(&e.file_name().to_string_lossy(), &name).is_some())
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
 /// The staging directory, `.<name>.restore-<pid>-<tag>` in the mode's
 /// staging root, with a lock file of the same name plus `.lock` that this
 /// restore holds locked for as long as it runs, so a later restore can tell
@@ -1231,18 +1253,24 @@ fn install(staging: &Path, into: &Path) -> Result<Option<String>, RestoreS3Error
 }
 
 /// The file in a data directory that says a restore on boot is moving a
-/// store into it, naming the files it moves, one per line.
-pub const INSTALL_MARKER: &str = ".mushroomdb-restore-install";
+/// store into it: one line per file it moves, `<name>\t<size>\t<mtime ns>`,
+/// as the file was staged. [`mushroomdb::GraphDb::open`] refuses a directory
+/// holding it.
+pub use mushroomdb::restore::INSTALL_MARKER;
 
 /// Move the staged store into the data directory `dir`, in place.
 ///
-/// The marker naming every staged file is written and fsynced first; the
-/// files are renamed in (`snapshot.bin` and `wal.bin`, which make the
-/// directory a store, last), the directory fsynced, and the marker removed.
-/// A failure before the marker is gone moves nothing in, or removes what it
-/// moved, so the directory is as it was. A crash leaves the marker, and the
-/// next restore on boot removes the files it names
-/// ([`undo_interrupted_install`]).
+/// The marker naming every staged file (with its size and modification
+/// time) is written and fsynced first; the files are renamed in
+/// (`snapshot.bin` and `wal.bin`, which make the directory a store, last),
+/// the directory fsynced, the marker removed and the directory fsynced
+/// again. The install has succeeded only once that last fsync has: until
+/// then a power loss can bring the marker back, and the next boot would undo
+/// the install, so a failed last fsync fails the restore and the server does
+/// not start. A failure before the marker's removal removes what it moved,
+/// makes that durable, and only then removes the marker, so the directory is
+/// as it was. A crash leaves the marker, and the next restore on boot
+/// removes the files it names ([`undo_interrupted_install`]).
 fn install_in_place(staging: &Path, dir: &Path) -> Result<Option<String>, RestoreS3Error> {
     remove_if_present(&staging.join("LOCK"))?;
     #[cfg(unix)]
@@ -1257,11 +1285,16 @@ fn install_in_place(staging: &Path, dir: &Path) -> Result<Option<String>, Restor
     if take_fault(dir, Fault::BeforeRename) {
         return Err(injected(dir));
     }
+    let mut lines = Vec::new();
+    for name in &names {
+        let (size, mtime) = disk::ident_of(&std::fs::metadata(staging.join(name))?);
+        lines.push(format!("{name}\t{size}\t{mtime}"));
+    }
     let marker = dir.join(INSTALL_MARKER);
     {
         use std::io::Write as _;
         let mut f = std::fs::File::create(&marker)?;
-        f.write_all(names.join("\n").as_bytes())?;
+        f.write_all(lines.join("\n").as_bytes())?;
         f.sync_all()?;
     }
     let mut moved: Vec<&str> = Vec::new();
@@ -1280,28 +1313,43 @@ fn install_in_place(staging: &Path, dir: &Path) -> Result<Option<String>, Restor
             moved.push(name);
         }
         sync_dir(dir, dir)?;
-        std::fs::remove_file(&marker)?;
         Ok(())
     })();
     if let Err(e) = result {
         for name in &moved {
             let _ = std::fs::remove_file(dir.join(name));
         }
-        let _ = std::fs::remove_file(&marker);
-        let _ = sync_dir(dir, dir);
+        // The marker goes only once the removals are durable: otherwise a
+        // power loss could keep a part of a store and lose the marker.
+        if sync_dir(dir, dir).is_ok() {
+            let _ = std::fs::remove_file(&marker);
+            let _ = sync_dir(dir, dir);
+        }
         return Err(e);
     }
-    // The store is in place. If the marker's removal is not durable, it may
-    // come back after a power loss, and the next boot restores again.
-    Ok(sync_dir(dir, dir).err().map(|e| {
-        let note = format!(
-            "the restored store is in place in {}, but syncing it failed ({e}): after a \
-             power loss the next boot may restore it again",
-            dir.display()
-        );
-        tracing::warn!(note = %note, "restore installed");
-        note
-    }))
+    if !take_fault(dir, Fault::KeepMarker) {
+        std::fs::remove_file(&marker)?;
+    }
+    if let Err(e) = sync_marker_removal(dir) {
+        return Err(RestoreS3Error::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "the restored store is in {}, but syncing the directory after removing the \
+                 install marker failed ({e}); not served, since a power loss could bring the \
+                 marker back. Start again: the next boot serves the store, or restores it \
+                 again if the marker came back",
+                dir.display()
+            ),
+        )));
+    }
+    Ok(None)
+}
+
+fn sync_marker_removal(dir: &Path) -> std::io::Result<()> {
+    if take_fault(dir, Fault::MarkerRemovalSync) {
+        return Err(std::io::Error::other("injected fsync failure"));
+    }
+    sync_dir(dir, dir)
 }
 
 /// Whether `dir` holds a restore on boot that stopped while it moved its
@@ -1315,6 +1363,14 @@ pub fn install_interrupted(dir: &Path) -> bool {
 /// remove the files its [`INSTALL_MARKER`] names, then the marker. Returns
 /// the files removed; nothing when there is no marker. Only plain file names
 /// directly in `dir` are touched.
+///
+/// # Errors
+///
+/// Nothing is removed when a file the marker names is no longer the file the
+/// restore staged (another size or modification time) or a store file it
+/// does not name has appeared: the store has changed since the install, so
+/// it may have served writes, and deleting it could lose them. The error says
+/// so and how to go on.
 pub fn undo_interrupted_install(dir: &Path) -> std::io::Result<Vec<String>> {
     let marker = dir.join(INSTALL_MARKER);
     let listed = match std::fs::read_to_string(&marker) {
@@ -1322,14 +1378,52 @@ pub fn undo_interrupted_install(dir: &Path) -> std::io::Result<Vec<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let mut entries: Vec<(&str, Option<disk::Ident>)> = Vec::new();
+    for line in listed.lines() {
+        let mut fields = line.split('\t').map(str::trim);
+        let Some(name) = fields.next().filter(|n| is_plain_name(n)) else {
+            continue;
+        };
+        let size = fields.next().and_then(|v| v.parse::<u64>().ok());
+        let mtime = fields.next().and_then(|v| v.parse::<u64>().ok());
+        entries.push((name, size.zip(mtime)));
+    }
+    let changed = |why: String| {
+        std::io::Error::other(format!(
+            "{} holds the install marker of a restore on boot ({}), but {why} since that \
+             install: the store may have served writes, so nothing was removed. If the store \
+             is the one you want, delete {}; to restore again, empty the directory",
+            dir.display(),
+            marker.display(),
+            marker.display()
+        ))
+    };
+    for (name, ident) in &entries {
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(name)) else {
+            continue;
+        };
+        if let Some(staged) = ident {
+            // An empty file is what an empty data directory may hold before
+            // the install (an empty `wal.bin`): it holds no writes.
+            if meta.is_file() && meta.len() > 0 && disk::ident_of(&meta) != *staged {
+                return Err(changed(format!("{name} has changed")));
+            }
+        }
+    }
+    for written in ["snapshot.bin", "wal.bin"] {
+        if !entries.iter().any(|(n, _)| *n == written) && dir.join(written).exists() {
+            return Err(changed(format!("{written} has appeared")));
+        }
+    }
     let mut removed = Vec::new();
-    for name in listed.lines().map(str::trim).filter(|n| is_plain_name(n)) {
+    for (name, _) in &entries {
         let path = dir.join(name);
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             std::fs::remove_file(&path)?;
             removed.push(name.to_string());
         }
     }
+    sync_dir(dir, dir)?;
     std::fs::remove_file(&marker)?;
     sync_dir(dir, dir)?;
     Ok(removed)
@@ -1375,6 +1469,11 @@ pub enum Fault {
     DirSync,
     /// Locking the staging lock file.
     Lock,
+    /// An in-place install: the fsync after the marker's removal.
+    MarkerRemovalSync,
+    /// An in-place install: the marker is not removed, yet the install
+    /// reports success, as after a power loss that undid the removal.
+    KeepMarker,
 }
 
 /// Faults to inject, by target (tests only).

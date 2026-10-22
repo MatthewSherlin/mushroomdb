@@ -715,8 +715,8 @@ fn every_store_creating_call_site_applies_a_schema() {
          function to ALLOWLIST with its reason."
     );
     // Guards that the scan sees what it guards: a census that found nothing
-    // would pass vacuously.
-    for expected in ["run_mcp", "run_serve", "run_demo", "run_ingest_git"] {
+    // would pass vacuously. (serve opens its store in `open_for_serve`.)
+    for expected in ["run_mcp", "open_for_serve", "run_demo", "run_ingest_git"] {
         assert!(
             sites
                 .iter()

@@ -43,6 +43,31 @@ const RESTORE_FILES: [&str; 8] = [
     "snapshot.intent",
 ];
 
+/// The file a restore on boot (`MUSHROOMDB_RESTORE_FROM_S3`) writes into a
+/// data directory while it moves a restored store into it, naming the files
+/// it moves. While it is there the directory holds a part of a store, and
+/// [`GraphDb::open`](crate::GraphDb::open) refuses it
+/// ([`refuse_half_installed`]).
+pub const INSTALL_MARKER: &str = ".mushroomdb-restore-install";
+
+/// Refuse to open `dir` while it holds [`INSTALL_MARKER`]: a restore on boot
+/// stopped while it moved its files in, and what is there is a part of a
+/// store. The error names the marker and the two ways out.
+pub fn refuse_half_installed(dir: &Path) -> Result<()> {
+    let marker = dir.join(INSTALL_MARKER);
+    if !marker.exists() {
+        return Ok(());
+    }
+    Err(GraphError::Io(std::io::Error::other(format!(
+        "{} holds a restore on boot that stopped while it moved its files in ({} is \
+         there): what the directory holds is a part of a store, and it is not opened. \
+         Start `mushroomdb serve` on it with MUSHROOMDB_RESTORE_FROM_S3 set to the backup it \
+         came from to restore it again, or empty the directory",
+        dir.display(),
+        marker.display()
+    ))))
+}
+
 /// Is there a store in `dir` already?
 ///
 /// A store is "present" when `dir` holds `snapshot.bin` or a non-empty

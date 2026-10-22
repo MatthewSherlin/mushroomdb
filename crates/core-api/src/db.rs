@@ -2596,6 +2596,7 @@ impl GraphDb<RealFs> {
     }
 
     fn open_dir(dir: &std::path::Path, opts: OpenOptions, hold_lock: bool) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
@@ -2666,6 +2667,7 @@ impl GraphDb<RealFs> {
     /// - [`GraphError::CommitOutOfRange`] if `commit >= wal_commit_count` (including
     ///   when the WAL is empty after a snapshot).
     pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         Self::open_at_with(RealFs::new(dir)?, commit)
     }
 

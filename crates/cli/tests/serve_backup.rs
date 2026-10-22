@@ -1217,3 +1217,124 @@ fn a_half_installed_restore_is_not_served() {
     assert!(stderr.contains("MUSHROOMDB_RESTORE_FROM_S3"), "{stderr}");
     assert!(!stdout.contains("listening on"));
 }
+
+/// M2: not only serve: the query command (and so every command over
+/// `GraphDb::open`) refuses a half-installed directory, naming the marker.
+#[test]
+fn a_half_installed_restore_is_refused_by_query_too() {
+    let dir = tmp("boot-half-query");
+    {
+        let mut db = mushroomdb::GraphDb::open(&dir).unwrap();
+        db.insert_node("A", "a", vec![]).unwrap();
+    }
+    std::fs::write(dir.join(backup::restore::INSTALL_MARKER), "snapshot.bin").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&dir)
+        .arg("MATCH (n) RETURN count(n)")
+        .output()
+        .expect("run mushroomdb query");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(backup::restore::INSTALL_MARKER), "{stderr}");
+}
+
+/// I1: the lease a restore on boot takes is renewed without a gap through a
+/// slow open (one that takes longer than a whole TTL here) into the backup
+/// worker, through the real serve path: it is never taken again, no renewal
+/// fails or lapses, and the first write ships as soon as the server is up.
+#[test]
+fn restore_on_boot_holds_the_lease_through_a_slow_open() {
+    let Some(s3) = S3Env::from_env() else { return };
+    let src = tmp("boot-slow-src");
+    let prefix = src.file_name().unwrap().to_string_lossy().to_string();
+    let url = s3.url(&prefix);
+    let store = s3.store(&prefix);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut first = s3.serve(&src, &prefix);
+    let addr = listening_addr(&mut first);
+    create_node(&addr, "a");
+    terminate(&mut first);
+    let parent_latest = rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LATEST"),
+        Duration::from_secs(5),
+    ));
+
+    let lease_key = format!("{prefix}/LEASE");
+    let read_lease = || -> Option<serde_json::Value> {
+        rt.block_on(async {
+            match store.get(&ObjectPath::from(lease_key.as_str())).await {
+                Ok(r) => Some(serde_json::from_slice(&r.bytes().await.unwrap()).unwrap()),
+                Err(_) => None,
+            }
+        })
+    };
+    let dir = tmp("boot-slow-dir");
+    // TTL 3 s: renewals every 1 s, the write fence at 2 s. The open takes 5 s.
+    let mut child = boot_serve(
+        Some(&s3),
+        &dir,
+        &[
+            ("MUSHROOMDB_RESTORE_FROM_S3", url.as_str()),
+            ("MUSHROOMDB_BACKUP_S3_URL", url.as_str()),
+            ("MUSHROOMDB_BACKUP_LEASE_TTL", "3"),
+            ("MUSHROOMDB_TEST_OPEN_DELAY_MS", "5000"),
+        ],
+    );
+    let err = stderr_of(&mut child);
+    // Watch the lease while the open is held up: it never goes stale.
+    let started = std::time::Instant::now();
+    let mut seen: Vec<(String, String, String)> = Vec::new();
+    while started.elapsed() < Duration::from_secs(6) {
+        if let Some(v) = read_lease() {
+            let rec = (
+                v["instance_id"].as_str().unwrap().to_string(),
+                v["acquired_at"].as_str().unwrap().to_string(),
+                v["renewed_at"].as_str().unwrap().to_string(),
+            );
+            if seen.last() != Some(&rec) {
+                seen.push(rec);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!seen.is_empty(), "the boot never took the lease");
+    let addr = listening_addr(&mut child);
+    create_node(&addr, "after");
+    let shipped = std::time::Instant::now();
+    loop {
+        let latest = rt.block_on(wait_for_object(
+            store.as_ref(),
+            &format!("{prefix}/LATEST"),
+            Duration::from_secs(5),
+        ));
+        if latest != parent_latest {
+            break;
+        }
+        assert!(
+            shipped.elapsed() < Duration::from_secs(10),
+            "the first write did not ship: the lease's write fence was hit"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = read_lease().expect("still held");
+    terminate(&mut child);
+    let stderr = err.join().unwrap();
+
+    let (id, acquired) = (&seen[0].0, &seen[0].1);
+    for (i, a, _) in &seen {
+        assert_eq!((i, a), (id, acquired), "taken again: {seen:?}");
+    }
+    assert_eq!(after["instance_id"].as_str().unwrap(), id);
+    assert_eq!(after["acquired_at"].as_str().unwrap(), acquired);
+    // Renewed at least every second or so across the 6 s window.
+    assert!(seen.len() >= 4, "not renewed through the open: {seen:?}");
+    for bad in [
+        "renewal failed",
+        "lost the backup bucket lease",
+        "uploads are stopped",
+    ] {
+        assert!(!stderr.contains(bad), "{bad}: {stderr}");
+    }
+}

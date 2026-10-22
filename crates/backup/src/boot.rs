@@ -4,13 +4,16 @@
 //!
 //! In order:
 //!
-//! 1. A restore on boot that a crash stopped while it moved its files in is
-//!    undone ([`crate::restore::undo_interrupted_install`]).
-//! 2. A data directory that holds a store is never restored over:
-//!    [`BootRestore::Skipped`], and nothing else happens.
-//! 3. The prefix's bucket lease is taken. A fresh lease of another instance
+//! 1. A data directory that holds a store, and no install marker, is never
+//!    restored over: [`BootRestore::Skipped`]. Only what killed restores into
+//!    it left is swept.
+//! 2. The prefix's bucket lease is taken. A fresh lease of another instance
 //!    means that instance may still be writing: nothing is restored and
 //!    nothing is written to the data directory ([`BootError::ForeignLease`]).
+//! 3. Under the lease, a restore on boot that a crash stopped while it moved
+//!    its files in is undone ([`crate::restore::undo_interrupted_install`]),
+//!    unless the store has changed since that install (it may have served):
+//!    then nothing is removed and the boot fails.
 //! 4. The newest restore point is restored in place
 //!    ([`crate::restore::restore_in_place`]) while the lease is renewed. The
 //!    store gets a new lineage and records the restore point it came from,
@@ -26,7 +29,8 @@
 
 use crate::lease::{new_instance_id, BucketLease, LeaseError, LeaseWatch};
 use crate::restore::{
-    restore_in_place, undo_interrupted_install, RestoreS3Error, RestoreS3Outcome,
+    install_interrupted, restore_in_place, staging_leftovers, sweep_in_place,
+    undo_interrupted_install, RestoreS3Error, RestoreS3Outcome,
 };
 use crate::store::BackupConfig;
 use object_store::ObjectStore;
@@ -40,13 +44,32 @@ use tokio::task::JoinHandle;
 pub struct BootLease {
     lease: Arc<BucketLease>,
     renewer: JoinHandle<()>,
+    op_timeout: Duration,
 }
 
 impl BootLease {
     fn hold(lease: BucketLease, op_timeout: Duration) -> Self {
         let lease = Arc::new(lease);
         let renewer = tokio::spawn(renew(Arc::clone(&lease), op_timeout));
-        Self { lease, renewer }
+        Self {
+            lease,
+            renewer,
+            op_timeout,
+        }
+    }
+
+    /// The request deadline the lease was taken with; [`release`](Self::release)
+    /// waits no longer than this for the bucket.
+    pub fn op_timeout(&self) -> Duration {
+        self.op_timeout
+    }
+
+    /// Stop renewing and hand the lease on at once, without waiting: for a
+    /// caller about to [`adopt`](crate::BackupWorker::adopt_lease) it, which
+    /// renews it at once, so the lease is never left unrenewed in between.
+    pub fn detach(self) -> Arc<BucketLease> {
+        self.renewer.abort();
+        self.lease
     }
 
     /// The instance id the lease names.
@@ -62,8 +85,10 @@ impl BootLease {
         self.lease
     }
 
-    /// Stop renewing and delete the lease.
-    pub async fn release(self, op_timeout: Duration) {
+    /// Stop renewing and delete the lease, waiting at most
+    /// [`op_timeout`](Self::op_timeout) for the bucket.
+    pub async fn release(self) {
+        let op_timeout = self.op_timeout;
         let lease = self.into_lease().await;
         let Ok(lease) = Arc::try_unwrap(lease) else {
             return;
@@ -110,6 +135,9 @@ pub enum BootRestore {
         /// Files an interrupted earlier restore on boot had moved in, removed
         /// before this one.
         undone: Vec<String>,
+        /// Leftovers of killed restores the sweep had to leave in the data
+        /// directory (in use, too young, or no advisory locks there).
+        leftovers: Vec<std::path::PathBuf>,
     },
 }
 
@@ -159,21 +187,19 @@ pub async fn restore_on_boot(
         .map_err(|e| BootError::Restore(RestoreS3Error::Config(e.to_string())))?
         .prefix;
     let dir = data_dir.to_path_buf();
-    let undone = tokio::task::spawn_blocking(move || {
-        let undone = undo_interrupted_install(&dir)?;
-        Ok::<_, std::io::Error>((undone, mushroomdb::restore::holds_a_store(&dir)))
+    let (interrupted, holds) = blocking(move || {
+        Ok((
+            install_interrupted(&dir),
+            mushroomdb::restore::holds_a_store(&dir),
+        ))
     })
-    .await
-    .map_err(|e| BootError::Io(std::io::Error::other(e.to_string())))?
-    .map_err(BootError::Io)?;
-    let (undone, holds) = undone;
-    if !undone.is_empty() {
-        tracing::warn!(
-            files = undone.len(),
-            "removed the files of a restore on boot that a crash interrupted"
-        );
-    }
-    if holds {
+    .await?;
+    if holds && !interrupted {
+        // Never restored over; only what killed restores left is cleaned.
+        let dir = data_dir.to_path_buf();
+        for path in blocking(move || Ok(sweep_in_place(&dir))).await? {
+            tracing::info!(path = %path.display(), "removed a killed restore's leftover");
+        }
         return Ok(BootRestore::Skipped);
     }
 
@@ -207,17 +233,63 @@ pub async fn restore_on_boot(
         }
     };
 
+    // Under the lease: a crash's half-done install is undone only by the
+    // instance that will restore again.
+    let undone = if interrupted {
+        let dir = data_dir.to_path_buf();
+        match blocking(move || undo_interrupted_install(&dir).map_err(BootError::Io)).await {
+            Ok(undone) => {
+                tracing::warn!(
+                    files = undone.len(),
+                    "removed the files of a restore on boot that a crash interrupted"
+                );
+                undone
+            }
+            Err(e) => {
+                lease.release().await;
+                return Err(e);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     match restore_in_place(store, &prefix, data_dir).await {
-        Ok(outcome) => Ok(BootRestore::Restored {
-            outcome: Box::new(outcome),
-            lease,
-            undone,
-        }),
-        Err(RestoreS3Error::NoBackup { .. }) => Ok(BootRestore::NoBackup { lease }),
+        Ok(outcome) => {
+            let dir = data_dir.to_path_buf();
+            let leftovers = blocking(move || Ok(staging_leftovers(&dir))).await?;
+            for path in &leftovers {
+                tracing::warn!(
+                    path = %path.display(),
+                    "a killed restore's leftover stays in the data directory"
+                );
+            }
+            Ok(BootRestore::Restored {
+                outcome: Box::new(outcome),
+                lease,
+                undone,
+                leftovers,
+            })
+        }
+        Err(RestoreS3Error::NoBackup { .. }) => {
+            let dir = data_dir.to_path_buf();
+            for path in blocking(move || Ok(sweep_in_place(&dir))).await? {
+                tracing::info!(path = %path.display(), "removed a killed restore's leftover");
+            }
+            Ok(BootRestore::NoBackup { lease })
+        }
         Err(e) => {
             // Nothing will back this server up: let a successor in at once.
-            lease.release(op_timeout).await;
+            lease.release().await;
             Err(BootError::Restore(e))
         }
     }
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, BootError> + Send + 'static,
+) -> Result<T, BootError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| BootError::Io(std::io::Error::other(e.to_string())))?
 }

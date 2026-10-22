@@ -293,7 +293,7 @@ async fn a_prefix_that_moved_on_since_the_boot_restore_is_refused() {
             .await
             .unwrap(),
     );
-    lease.release(Duration::from_secs(5)).await;
+    lease.release().await;
     // The source keeps writing to the prefix after the restore.
     insert(&db, "late", 3);
     w.run_once().await.unwrap();
@@ -472,7 +472,7 @@ async fn an_empty_prefix_is_no_backup_and_keeps_the_lease() {
                 read_lease(&store).await.unwrap().instance_id,
                 lease.instance_id()
             );
-            lease.release(Duration::from_secs(5)).await;
+            lease.release().await;
         }
         other => panic!("expected no backup, got {other:?}"),
     }
@@ -558,7 +558,7 @@ async fn leftovers_of_dead_restores_and_lost_found_count_as_empty() {
             .await
             .unwrap(),
     );
-    lease.release(Duration::from_secs(5)).await;
+    lease.release().await;
     let mut swept = out.swept.clone();
     swept.sort();
     assert_eq!(swept, [stale, stale_lock]);
@@ -601,7 +601,7 @@ async fn an_interrupted_install_is_undone_at_the_next_boot() {
         } => {
             undone.sort();
             assert_eq!(undone, ["snapshot.bin", "wal.floor"]);
-            lease.release(Duration::from_secs(5)).await;
+            lease.release().await;
         }
         other => panic!("expected a restore, got {other:?}"),
     }
@@ -631,6 +631,142 @@ async fn a_failure_halfway_through_the_install_moves_nothing_in() {
             .await
             .unwrap(),
     );
-    lease.release(Duration::from_secs(5)).await;
+    lease.release().await;
     assert_eq!(dump_of(d), dump_of(src.path()));
+}
+
+// ── Fix round 1 ──────────────────────────────────────────────────────────────
+
+/// M1: the install has succeeded only once the marker's removal is durable.
+/// A failed fsync there fails the boot (nothing is served) and gives the
+/// lease back; the store is in place without the marker, so the next boot
+/// serves it.
+#[tokio::test]
+async fn a_failed_sync_after_the_marker_removal_fails_the_boot() {
+    let store = mem();
+    let src = source(&store).await;
+    let (_root, dir) = data_dir();
+    inject_fault(&dir, Fault::MarkerRemovalSync);
+    let e = restore_on_boot(&config(), Arc::clone(&store), &dir)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("install marker"), "{e}");
+    assert!(read_lease(&store).await.is_none(), "released");
+    assert!(!install_interrupted(&dir));
+    let r = restore_on_boot(&config(), Arc::clone(&store), &dir)
+        .await
+        .unwrap();
+    assert!(matches!(r, BootRestore::Skipped), "{r:?}");
+    assert_eq!(dump_of(&dir), dump_of(src.path()));
+}
+
+/// M1: a marker that came back (its removal lost to a power loss) over a
+/// store that has served writes since is not undone: the boot refuses,
+/// naming the marker, and deletes nothing. Over a store that has not
+/// changed, the next boot undoes and restores again.
+#[tokio::test]
+async fn a_marker_back_over_a_store_that_served_is_refused_not_undone() {
+    let store = mem();
+    let src = source(&store).await;
+
+    // Unchanged since the install: undone and restored again.
+    let (_r1, quiet) = data_dir();
+    inject_fault(&quiet, Fault::KeepMarker);
+    let (_, lease) = restored(
+        restore_on_boot(&config(), Arc::clone(&store), &quiet)
+            .await
+            .unwrap(),
+    );
+    lease.release().await;
+    assert!(install_interrupted(&quiet));
+    let (_, lease) = restored(
+        restore_on_boot(&config(), Arc::clone(&store), &quiet)
+            .await
+            .unwrap(),
+    );
+    lease.release().await;
+    assert!(!install_interrupted(&quiet));
+    assert_eq!(dump_of(&quiet), dump_of(src.path()));
+
+    // Served writes since: refused, nothing removed.
+    let (_r2, served) = data_dir();
+    inject_fault(&served, Fault::KeepMarker);
+    let (_, lease) = restored(
+        restore_on_boot(&config(), Arc::clone(&store), &served)
+            .await
+            .unwrap(),
+    );
+    lease.release().await;
+    std::fs::rename(served.join(INSTALL_MARKER), served.join("marker.keep")).unwrap();
+    {
+        let db = SharedDb::open(&served).unwrap();
+        insert(&db, "acked", 3);
+    }
+    std::fs::rename(served.join("marker.keep"), served.join(INSTALL_MARKER)).unwrap();
+    let before = dir_entries(&served);
+    let e = restore_on_boot(&config(), Arc::clone(&store), &served)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("may have served"), "{e}");
+    assert!(e.to_string().contains(INSTALL_MARKER), "{e}");
+    assert_eq!(dir_entries(&served), before, "nothing removed");
+    assert!(read_lease(&store).await.is_none(), "released");
+    std::fs::remove_file(served.join(INSTALL_MARKER)).unwrap();
+    assert!(GraphDb::open(&served).unwrap().has_node("acked0"));
+}
+
+/// M4: under another instance's live lease, an interrupted install is left
+/// exactly as it is: the undo runs only under this boot's own lease.
+#[tokio::test]
+async fn a_live_foreign_lease_leaves_an_interrupted_install_alone() {
+    let store = mem();
+    let _src = source(&store).await;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let record = LeaseRecord {
+        instance_id: "the-other-one".into(),
+        acquired_at: now.clone(),
+        renewed_at: now,
+        ttl_s: 600,
+    };
+    put(
+        &store,
+        &lease_key(PREFIX),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("snapshot.bin"), b"part of a store").unwrap();
+    std::fs::write(dir.path().join(INSTALL_MARKER), "snapshot.bin").unwrap();
+    let before = dir_entries(dir.path());
+    let e = restore_on_boot(&config(), Arc::clone(&store), dir.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, BootError::ForeignLease { .. }), "{e}");
+    assert_eq!(dir_entries(dir.path()), before);
+}
+
+/// M3: a boot that skips the restore (the directory holds a store) still
+/// sweeps what killed restores into it left, once they are stale.
+#[tokio::test]
+async fn a_skipped_boot_sweeps_stale_leftovers() {
+    let store = mem();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    {
+        let mut db = GraphDb::open(d).unwrap();
+        db.insert_node("Local", "mine", vec![]).unwrap();
+    }
+    let name = d.file_name().unwrap().to_string_lossy().into_owned();
+    let stale = d.join(format!(".{name}.restore-4242-0a1b2c3d"));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("snapshot.bin"), b"a whole old copy").unwrap();
+    age(&stale, STALE_STAGING_AFTER * 2);
+    let r = restore_on_boot(&config(), Arc::clone(&store), d)
+        .await
+        .unwrap();
+    assert!(matches!(r, BootRestore::Skipped), "{r:?}");
+    assert!(!stale.exists());
+    assert!(GraphDb::open(d).unwrap().has_node("mine"));
 }

@@ -612,12 +612,12 @@ impl BackupWorker {
     }
 
     /// Hold `lease`, taken for this prefix by someone else in this process (a
-    /// restore on boot), instead of taking one: the worker renews it from
-    /// now on, and its instance id becomes the lease's. Call before
+    /// restore on boot), instead of taking one: the worker renews it at once
+    /// and from then on, and its instance id becomes the lease's. Call before
     /// [`start`](Self::start), inside a Tokio runtime.
     pub fn adopt_lease(&mut self, lease: Arc<BucketLease>) {
         self.instance_id = lease.instance_id().to_string();
-        self.hold(lease);
+        self.hold(lease, Duration::ZERO);
     }
 
     /// Test hook: allow `n` more requests that change the bucket (PUTs and
@@ -720,7 +720,8 @@ impl BackupWorker {
         );
         let wait = match tokio::time::timeout(limit, acquire).await {
             Ok(Ok(lease)) => {
-                self.hold(Arc::new(lease));
+                let first = lease.renew_interval();
+                self.hold(Arc::new(lease), first);
                 None
             }
             Ok(Err(LeaseError::ForeignActive { instance_id })) => {
@@ -761,7 +762,8 @@ impl BackupWorker {
 
     /// Hold `lease`: start renewing it, and forget a previous tenure's view
     /// of the bucket.
-    fn hold(&mut self, lease: Arc<BucketLease>) {
+    /// The first renewal comes after `first`; then every third of a TTL.
+    fn hold(&mut self, lease: Arc<BucketLease>, first: Duration) {
         if self.tenures > 0 {
             self.reset_tenure();
         }
@@ -781,6 +783,7 @@ impl BackupWorker {
         }
         self.renewer = Some(tokio::spawn(renew_loop(
             Arc::clone(&lease),
+            first,
             self.op_timeout(),
             self.health.clone(),
             Arc::clone(&self.error_count),
@@ -1966,12 +1969,13 @@ async fn fence<T>(
 /// when the lease is found lost; health says why the worker is kept out.
 async fn renew_loop(
     lease: Arc<BucketLease>,
+    first: Duration,
     op_timeout: Duration,
     health: Health,
     errors: Arc<AtomicU64>,
 ) {
     let every = lease.renew_interval().max(Duration::from_millis(1));
-    let mut wait = every;
+    let mut wait = first;
     loop {
         tokio::time::sleep(wait).await;
         let why = match tokio::time::timeout(op_timeout, lease.renew()).await {
