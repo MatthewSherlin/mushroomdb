@@ -15,12 +15,20 @@ use std::path::PathBuf;
 
 type GraphDb = mushroomdb::GraphDb<RealFs>;
 
+/// A fresh directory per call. The clock alone is not enough: on macOS it
+/// ticks in microseconds, so two tests running in parallel could get the same
+/// name and share a store; the counter keeps every name in the process unique.
 fn tmp(name: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let d = std::env::temp_dir().join(format!("graphdb-ddl-{name}-{}-{nanos}", std::process::id()));
+    let d = std::env::temp_dir().join(format!(
+        "graphdb-ddl-{name}-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
