@@ -16,6 +16,7 @@
 
 use super::*;
 use core_query::cypher::{parse_ddl, DdlStatement, Tok};
+use core_query::VisibleSet;
 
 /// `SHOW INDEXES` columns.
 const INDEX_COLUMNS: [&str; 5] = ["name", "type", "label", "property", "state"];
@@ -36,6 +37,25 @@ fn equality_index_name(label: &str, field: &str) -> String {
 /// As [`equality_index_name`], for a full-text index.
 fn fulltext_index_name(label: &str, field: &str) -> String {
     format!("ft_{label}_{field}")
+}
+
+/// The name prefixes of [`equality_index_name`] and [`fulltext_index_name`].
+/// A range index may not take a name beginning with either, so a listed name
+/// never belongs to a range index and to another index at once.
+const RESERVED_INDEX_PREFIXES: [&str; 2] = ["eq_", "ft_"];
+
+/// The refusal for a range index named with a reserved prefix, if `name` is.
+pub(crate) fn reserved_index_name(name: &str) -> Option<GraphError> {
+    RESERVED_INDEX_PREFIXES
+        .iter()
+        .any(|p| name.starts_with(p))
+        .then(|| GraphError::QueryError {
+            detail: format!(
+                "index names beginning 'eq_' or 'ft_' are reserved: SHOW INDEXES lists \
+                 equality and full-text indexes under them; choose another name for range \
+                 index '{name}'"
+            ),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,11 +133,50 @@ impl SchemaListing {
     /// The answer to `SHOW INDEXES` or `SHOW CONSTRAINTS`; an empty result for
     /// any other statement.
     pub(crate) fn show(&self, stmt: &DdlStatement) -> ResultSet {
+        self.show_where(stmt, |_| true)
+    }
+
+    /// [`show`](Self::show) for a scoped read: only the rows whose label a
+    /// node the caller can see carries. `view` is the unmasked state the
+    /// caller's `visible` ids index into. A label none of those nodes carries
+    /// is not listed, so a role, a key mask or a namespace learns nothing of
+    /// the schema outside it.
+    pub(crate) fn show_visible(
+        &self,
+        stmt: &DdlStatement,
+        view: &GraphView<'_>,
+        visible: &VisibleSet,
+    ) -> ResultSet {
+        let mut wanted: HashMap<u32, &str> = self
+            .indexes
+            .iter()
+            .map(|e| e.label.as_str())
+            .chain(self.constraints.iter().map(|c| c.label.as_str()))
+            .filter_map(|label| view.sym(label).map(|sym| (sym, label)))
+            .collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        // Stops as soon as every listed label is found, so a wide mask over a
+        // store whose indexed labels are common costs a few probes.
+        for id in visible.iter() {
+            if wanted.is_empty() {
+                break;
+            }
+            if view.try_key_of(id).is_none() {
+                continue;
+            }
+            if let Some(label) = view.label_sym(id).and_then(|sym| wanted.remove(&sym)) {
+                seen.insert(label);
+            }
+        }
+        self.show_where(stmt, |label| seen.contains(label))
+    }
+
+    fn show_where(&self, stmt: &DdlStatement, keep: impl Fn(&str) -> bool) -> ResultSet {
         let text = |s: &str| Some(Value::Str(s.to_string()));
         match stmt {
             DdlStatement::ShowIndexes => {
                 let mut rs = ResultSet::new(INDEX_COLUMNS.iter().map(|c| c.to_string()).collect());
-                for e in &self.indexes {
+                for e in self.indexes.iter().filter(|e| keep(&e.label)) {
                     rs.push_row(vec![
                         text(&e.name),
                         text(e.kind.as_str()),
@@ -133,7 +192,7 @@ impl SchemaListing {
             DdlStatement::ShowConstraints => {
                 let mut rs =
                     ResultSet::new(CONSTRAINT_COLUMNS.iter().map(|c| c.to_string()).collect());
-                for c in &self.constraints {
+                for c in self.constraints.iter().filter(|c| keep(&c.label)) {
                     rs.push_row(vec![
                         text(&c.name),
                         text("unique"),
@@ -147,13 +206,11 @@ impl SchemaListing {
         }
     }
 
-    /// The range index named `name` if there is one, else the equality or
-    /// full-text index listed under it.
-    fn index_named(&self, name: &str) -> Option<&IndexEntry> {
-        self.indexes
-            .iter()
-            .find(|e| e.name == name && e.kind == IndexKind::Range)
-            .or_else(|| self.indexes.iter().find(|e| e.name == name))
+    /// Every index listed under `name`. More than one only for equality or
+    /// full-text indexes whose label and property join to the same text
+    /// (`(A_b, c)` and `(A, b_c)` are both `eq_A_b_c`).
+    fn indexes_named(&self, name: &str) -> Vec<&IndexEntry> {
+        self.indexes.iter().filter(|e| e.name == name).collect()
     }
 }
 
@@ -220,26 +277,45 @@ impl<F: Fs> GraphDb<F> {
                 field,
                 if_not_exists,
             } => {
+                // Unnamed, an existing range index on the pair is the index
+                // asked for. Named, only one of that name is: a pair indexed
+                // under another name leaves the requested name missing, which
+                // `enable_range_index` reports.
+                let anonymous = name.is_none();
                 let name = name.unwrap_or_else(|| auto_index_name(&label, &field));
                 let exists = self.prop_index.range_index(&name).is_some()
-                    || self.prop_index.range_index_on(&label, &field).is_some();
+                    || (anonymous && self.prop_index.range_index_on(&label, &field).is_some());
                 if !(if_not_exists && exists) {
                     self.enable_range_index(&name, &label, &field)?;
                 }
             }
             DdlStatement::DropIndex { name, if_exists } => {
                 let listing = self.schema_listing();
-                match listing.index_named(&name) {
-                    Some(e) => match e.kind {
+                match listing.indexes_named(&name).as_slice() {
+                    [e] => match e.kind {
                         IndexKind::Range => self.disable_range_index(&name)?,
                         IndexKind::Equality => self.disable_index(&e.label, &e.field)?,
                         IndexKind::Fulltext => self.disable_fulltext(&e.label, &e.field)?,
                     },
-                    None if if_exists => {}
-                    None => {
+                    [] if if_exists => {}
+                    [] => {
                         return Err(GraphError::QueryError {
                             detail: format!("no index named '{name}'"),
                         })
+                    }
+                    several => {
+                        let candidates: Vec<String> = several
+                            .iter()
+                            .map(|e| format!("{} ({}, {})", e.kind.as_str(), e.label, e.field))
+                            .collect();
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "'{name}' names more than one index: {}; drop the one you mean \
+                                 with disable_index(label, field) or disable_fulltext(label, \
+                                 field)",
+                                candidates.join(", ")
+                            ),
+                        });
                     }
                 }
             }

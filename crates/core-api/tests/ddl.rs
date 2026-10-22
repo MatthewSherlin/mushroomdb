@@ -259,6 +259,9 @@ fn create_index_twice_is_an_error_naming_it_unless_if_not_exists() {
     ddl(&mut db, "CREATE INDEX IF NOT EXISTS FOR (n:P) ON (n.a)");
     let err = ddl_err(&mut db, "CREATE INDEX FOR (n:P) ON (n.a)");
     assert!(err.contains("'i'"), "{err}");
+    // A name asked for that would not exist after the no-op is an error.
+    let err = ddl_err(&mut db, "CREATE INDEX j IF NOT EXISTS FOR (n:P) ON (n.a)");
+    assert!(err.contains("'i'"), "{err}");
     assert_eq!(
         db.range_indexes(),
         vec![("i".into(), "P".into(), "a".into())]
@@ -404,6 +407,7 @@ fn ddl_is_refused_inside_a_transaction_and_show_answers_there() {
     db.write()
         .query_write("CREATE INDEX i FOR (n:P) ON (n.a)", &p())
         .unwrap();
+    let seq = db.read().commit_seq();
     let mut tx = db.begin_transaction();
     for q in [
         "CREATE INDEX j FOR (n:P) ON (n.b)",
@@ -419,7 +423,9 @@ fn ddl_is_refused_inside_a_transaction_and_show_answers_there() {
     let rs = tx.execute("SHOW CONSTRAINTS", &p()).unwrap();
     assert!(rs.is_empty());
     tx.commit().unwrap();
+    assert_eq!(db.read().commit_seq(), seq, "nothing was logged");
     assert_eq!(db.read().range_indexes().len(), 1);
+    assert!(db.read().constraints().is_empty());
 }
 
 #[test]
@@ -471,6 +477,8 @@ fn role_store() -> GraphDb {
         }],
     })
     .unwrap();
+    db.insert_node("P", "p1", vec![("ns".into(), Value::Str("a".into()))])
+        .unwrap();
     db
 }
 
@@ -607,4 +615,123 @@ fn the_first_ddl_declaration_moves_the_store_to_v11() {
             "{q}"
         );
     }
+}
+
+// ── Fix round 1: names cannot collide ───────────────────────────────────────
+
+#[test]
+fn a_range_index_cannot_take_a_name_reserved_for_listed_indexes() {
+    let mut db = open_temp();
+    // Before the equality index exists, and after it: both refused.
+    for q in [
+        "CREATE INDEX eq_X_y FOR (n:X) ON (n.y)",
+        "CREATE INDEX ft_X_y FOR (n:X) ON (n.z)",
+    ] {
+        let err = ddl_err(&mut db, q);
+        assert!(err.contains("reserved"), "{q}: {err}");
+    }
+    let err = db
+        .enable_range_index("eq_a", "X", "y")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("reserved"), "{err}");
+    db.enable_index("X", "y").unwrap();
+    db.enable_fulltext("X", "y").unwrap();
+    for q in [
+        "CREATE INDEX eq_X_y FOR (n:X) ON (n.y)",
+        "CREATE INDEX ft_X_y IF NOT EXISTS FOR (n:X) ON (n.y)",
+    ] {
+        let err = ddl_err(&mut db, q);
+        assert!(err.contains("reserved"), "{q}: {err}");
+    }
+    assert!(db.range_indexes().is_empty());
+    // So each listed name is one index, and DROP INDEX takes the right one.
+    ddl(&mut db, "DROP INDEX eq_X_y");
+    assert!(!db.is_index_enabled("X", "y"));
+    assert!(db.is_fulltext_enabled("X", "y"));
+}
+
+#[test]
+fn drop_index_refuses_a_listed_name_two_indexes_share() {
+    let mut db = open_temp();
+    db.enable_index("A_b", "c").unwrap();
+    db.enable_index("A", "b_c").unwrap();
+    let names: Vec<String> = show_indexes(&db)
+        .into_iter()
+        .map(|r| r["name"].clone())
+        .collect();
+    assert_eq!(names, ["eq_A_b_c", "eq_A_b_c"]);
+    let err = ddl_err(&mut db, "DROP INDEX eq_A_b_c");
+    for part in ["(A, b_c)", "(A_b, c)", "disable_index"] {
+        assert!(err.contains(part), "{part}: {err}");
+    }
+    let err = ddl_err(&mut db, "DROP INDEX eq_A_b_c IF EXISTS");
+    assert!(err.contains("disable_index"), "{err}");
+    assert!(db.is_index_enabled("A_b", "c"));
+    assert!(db.is_index_enabled("A", "b_c"));
+    // The API drops either by its pair.
+    db.disable_index("A", "b_c").unwrap();
+    ddl(&mut db, "DROP INDEX eq_A_b_c");
+    assert!(show_indexes(&db).is_empty());
+}
+
+// ── Fix round 1: SHOW lists only what the caller can see ────────────────────
+
+/// Role `writer` sees label `P` only. `P` and `Q` each have a node, a range
+/// index, an equality index and a constraint; `P` lives in namespace `a`,
+/// `Q` in `b`.
+fn two_label_store() -> GraphDb {
+    let mut db = role_store();
+    db.insert_node("Q", "q1", vec![("ns".into(), Value::Str("b".into()))])
+        .unwrap();
+    for l in ["P", "Q"] {
+        ddl(&mut db, &format!("CREATE INDEX FOR (n:{l}) ON (n.a)"));
+        ddl(
+            &mut db,
+            &format!("CREATE CONSTRAINT c_{l} FOR (n:{l}) REQUIRE n.b IS UNIQUE"),
+        );
+    }
+    db
+}
+
+fn labels_of(rs: &ResultSet) -> Vec<String> {
+    let mut v: Vec<String> = rows(rs).into_iter().map(|r| r["label"].clone()).collect();
+    v.dedup();
+    v
+}
+
+#[test]
+fn show_is_narrowed_to_the_labels_a_scoped_read_can_see() {
+    let mut db = two_label_store();
+    assert_eq!(
+        labels_of(&db.query("SHOW INDEXES", &p()).unwrap()),
+        ["P", "Q", "P", "Q"]
+    );
+    let role = db.mask_for_role("writer").unwrap();
+    let ns_a = db.mask_for_namespace("a");
+    let ns_b = db.mask_for_namespace("b");
+    for (mask, want) in [(&role, "P"), (&ns_a, "P"), (&ns_b, "Q")] {
+        for q in ["SHOW INDEXES", "SHOW CONSTRAINTS"] {
+            let live = db.query_masked(q, &p(), mask).unwrap();
+            let snap = db.reader().query_masked(q, &p(), mask).unwrap();
+            assert_eq!(rows(&live), rows(&snap), "{q}");
+            assert!(!live.is_empty(), "{q}");
+            assert!(
+                labels_of(&live).iter().all(|l| l == want),
+                "{q}: {:?}",
+                rows(&live)
+            );
+        }
+    }
+    // A role's own SHOW through the write entry point is narrowed the same way.
+    let rs = db
+        .query_write_authz("writer", "SHOW CONSTRAINTS", &p())
+        .unwrap();
+    assert_eq!(rows(&rs), vec![row("c_P", "unique", "P", "b")]);
+    // A mask that sees nothing sees no schema.
+    let none = mushroomdb::NodeMask::from_ids(std::iter::empty());
+    assert!(db
+        .query_masked("SHOW INDEXES", &p(), &none)
+        .unwrap()
+        .is_empty());
 }

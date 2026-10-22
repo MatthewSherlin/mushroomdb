@@ -787,9 +787,12 @@ checked against. Equality and full-text indexes are declared through the API,
 the schema file or the CLI, not in Cypher.
 
 Creating a name that exists, or dropping one that does not, is an error that
-names it. `IF NOT EXISTS` makes a `CREATE` do nothing when the name exists, or
-when the label and property already have a range index (or a constraint, for
-`CREATE CONSTRAINT`); `IF EXISTS` makes a `DROP` of a missing name do nothing.
+names it. `IF NOT EXISTS` makes a `CREATE` do nothing when the name exists;
+an unnamed `CREATE INDEX` also does nothing when the label and property
+already have a range index, while a named one over a pair indexed under
+another name is an error naming that index. For `CREATE CONSTRAINT`, an
+existing constraint on the same label and property also counts. `IF EXISTS`
+makes a `DROP` of a missing name do nothing.
 A constraint over data that already breaks it is refused, as
 `create_constraint` refuses it. A statement that changes the schema answers
 with no columns and no rows.
@@ -798,7 +801,12 @@ with no columns and no rows.
 `type` (`range`, `equality` or `fulltext`), `label`, `property` and `state`
 (always `online`: an index is built in full by the statement that declares
 it). An equality index is listed as `eq_<Label>_<property>` and a full-text
-index as `ft_<Label>_<property>`; `DROP INDEX` drops either by that name. The
+index as `ft_<Label>_<property>`; `DROP INDEX` drops either by that name.
+Those two prefixes are reserved: a range index cannot be named `eq_…` or
+`ft_…`, through Cypher or `enable_range_index`. Two pairs can still join to
+one listed name (`(A_b, c)` and `(A, b_c)` are both `eq_A_b_c`); `DROP INDEX`
+then refuses, listing both, and `disable_index(label, field)` or
+`disable_fulltext(label, field)` drops the one meant. The
 equality index a constraint is checked against is listed too, and
 `DROP INDEX` refuses it, naming the constraint, until the constraint is
 dropped. `SHOW CONSTRAINTS` lists `name`, `type` (`unique`), `label` and
@@ -814,8 +822,11 @@ full token, Bolt auto-commit and `mushroomdb query`. It is refused inside a
 transaction (`BEGIN … COMMIT`, `Transaction::execute`), on a read-only
 (`open_at`) handle, in a time-travel (`as_of`) query, in a masked or namespaced
 read, and for a role-bound token (HTTP 403, Bolt `Security.Forbidden`).
-`SHOW INDEXES` and `SHOW CONSTRAINTS` are reads and run wherever a read does;
-the schema is not node data, so a role's mask does not narrow them.
+`SHOW INDEXES` and `SHOW CONSTRAINTS` are reads and run wherever a read does.
+For a role-bound token, a masked read (`mask`, `scoped`) or a namespaced read
+they are narrowed: a row is listed only when the caller can see at least one
+node of its label, so a scoped caller learns nothing of the schema outside its
+scope. A full-access read lists everything.
 
 The words these statements use (`INDEX`, `CONSTRAINT`, `DROP`, `SHOW`,
 `UNIQUE`, `REQUIRE`, …) are not reserved: they still name properties, labels
@@ -1193,7 +1204,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
 | `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; see [Schema statements](#schema-statements-ddl) |
 | `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
-| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state` |
+| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Named-error
@@ -1233,6 +1244,8 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | A schema statement with another clause (`CREATE INDEX … RETURN 1`) | `parse: … a schema statement is the whole statement; unexpected tokens` |
 | `CREATE` / `DROP INDEX` or `CONSTRAINT` inside a transaction | `a schema statement (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) cannot run inside a transaction; run it on its own, outside BEGIN … COMMIT` |
 | `CREATE` / `DROP INDEX` or `CONSTRAINT` by a role-bound token | `role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP CONSTRAINT) are not permitted` |
+| A range index named `eq_…` or `ft_…` | `index names beginning 'eq_' or 'ft_' are reserved: SHOW INDEXES lists equality and full-text indexes under them; …` |
+| `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
 | A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
 
 ### Absent

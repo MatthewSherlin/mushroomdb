@@ -54,6 +54,19 @@ fn open(name: &str) -> (Router, SharedDb) {
     (app, db)
 }
 
+/// A `P` node in namespace `a` and a `Q` node in namespace `b`, with a range
+/// index on `Q.a`: what a caller scoped to `P` (or to `a`) must not see.
+fn seed_two_labels(db: &SharedDb) {
+    use mushroomdb::Value;
+    let mut g = db.write();
+    g.insert_node("P", "p1", vec![("ns".into(), Value::Str("a".into()))])
+        .unwrap();
+    g.insert_node("Q", "q1", vec![("ns".into(), Value::Str("b".into()))])
+        .unwrap();
+    g.query_write("CREATE INDEX q FOR (n:Q) ON (n.a)", &Default::default())
+        .unwrap();
+}
+
 async fn post(app: &Router, uri: &str, token: &str, body: Json) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
         .method("POST")
@@ -151,6 +164,7 @@ async fn a_full_token_runs_ddl_through_query_and_show_lists_it() {
 #[tokio::test]
 async fn a_role_token_cannot_change_the_schema_but_can_show_it() {
     let (app, db) = open("role");
+    seed_two_labels(&db);
     db.write()
         .query_write("CREATE INDEX i FOR (n:P) ON (n.a)", &Default::default())
         .unwrap();
@@ -168,8 +182,9 @@ async fn a_role_token_cannot_change_the_schema_but_can_show_it() {
             String::from_utf8_lossy(&body)
         );
     }
-    assert_eq!(db.read().range_indexes().len(), 1);
+    assert_eq!(db.read().range_indexes().len(), 2);
     assert!(db.read().constraints().is_empty());
+    // Narrowed to `P`, the one label the role sees: `Q`'s index is not listed.
     let (status, body) = post(
         &app,
         "/query?format=json",
@@ -223,17 +238,58 @@ fn mcp_call(db: &SharedDb, arguments: Json) -> Json {
 #[test]
 fn the_mcp_query_tool_runs_ddl_and_a_role_cannot() {
     let (_, db) = open("mcp");
+    seed_two_labels(&db);
     let reply = mcp_call(&db, json!({"cypher": "CREATE INDEX i FOR (n:P) ON (n.a)"}));
     assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
-    assert_eq!(db.read().range_indexes().len(), 1);
+    assert_eq!(db.read().range_indexes().len(), 2);
 
     let reply = mcp_call(&db, json!({"cypher": "DROP INDEX i", "role": "writer"}));
     assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert_eq!(db.read().range_indexes().len(), 1);
+    assert_eq!(db.read().range_indexes().len(), 2);
 
     let reply = mcp_call(&db, json!({"cypher": "SHOW INDEXES", "role": "writer"}));
     assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     let rs: Json = serde_json::from_str(text).unwrap();
     assert_eq!(rs["rows"], json!([["i", "range", "P", "a", "online"]]));
+}
+
+#[tokio::test]
+async fn a_namespaced_or_masked_show_lists_only_what_it_can_see() {
+    let (app, db) = open("narrow");
+    seed_two_labels(&db);
+    db.write()
+        .query_write("CREATE INDEX i FOR (n:P) ON (n.a)", &Default::default())
+        .unwrap();
+    let show = |extra: Json| {
+        let mut body = json!({"cypher": "SHOW INDEXES"});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    let p_row = json!([["i", "range", "P", "a", "online"]]);
+    let q_row = json!([["q", "range", "Q", "a", "online"]]);
+    for (token, extra, want) in [
+        (
+            "full",
+            json!({}),
+            json!([
+                ["i", "range", "P", "a", "online"],
+                ["q", "range", "Q", "a", "online"]
+            ]),
+        ),
+        ("full", json!({"namespace": "a"}), p_row.clone()),
+        ("full", json!({"namespace": "b"}), q_row.clone()),
+        ("full", json!({"mask": ["q1"]}), q_row.clone()),
+        ("rtok", json!({"namespace": "b"}), json!([])),
+    ] {
+        let (status, body) = post(&app, "/query?format=json", token, show(extra.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{token} {extra}");
+        assert_eq!(json(&body)["rows"], want, "{token} {extra}");
+    }
+    let reply = mcp_call(&db, json!({"cypher": "SHOW INDEXES", "namespace": "b"}));
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    let rs: Json = serde_json::from_str(text).unwrap();
+    assert_eq!(rs["rows"], q_row);
 }

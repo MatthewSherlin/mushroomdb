@@ -1161,10 +1161,14 @@ fn a_role_token_cannot_run_ddl_but_can_show_the_schema() {
     db.write()
         .query_write("CREATE INDEX i FOR (n:Public) ON (n.n)", &BTreeMap::new())
         .unwrap();
+    // The role cannot see `Secret`, so its index is not listed to it.
+    db.write()
+        .query_write("CREATE INDEX s FOR (n:Secret) ON (n.n)", &BTreeMap::new())
+        .unwrap();
     let mut conn = connected(&db, ROLE);
     let out = conn.handle(run("DROP INDEX i"));
     assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
-    assert_eq!(db.read().range_indexes().len(), 1);
+    assert_eq!(db.read().range_indexes().len(), 2);
     conn.handle(ClientMessage::Reset);
     conn.handle(run("SHOW INDEXES"));
     let out = conn.handle(pull(-1));

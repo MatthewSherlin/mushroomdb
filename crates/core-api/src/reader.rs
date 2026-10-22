@@ -1077,7 +1077,8 @@ impl ReaderSnapshot {
             });
         }
         if let Some(stmt) = ddl_statement(&tokens)? {
-            return Ok(self.frozen.schema.show(&stmt));
+            let view = self.view(None)?;
+            return Ok(self.frozen.schema.show_visible(&stmt, &view, &mask.visible));
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -1550,7 +1551,9 @@ fn touched_nodes(
         a.is_some() || b.is_some()
     };
     match rec {
-        WalRecord::EnableIndex { .. } | WalRecord::DisableIndex { .. } => return false,
+        // A declaration folds (see `declares_schema`), so a tail holding one
+        // is a safeguard case: no layered index is built over it.
+        rec if crate::db::is_declaration(rec) => return false,
         WalRecord::InsertNode { key, .. }
         | WalRecord::InsertNodeId { key, .. }
         | WalRecord::SetProp { key, .. }
