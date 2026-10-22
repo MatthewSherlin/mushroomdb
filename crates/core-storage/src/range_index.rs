@@ -498,6 +498,52 @@ impl UnifiedIndex {
         }
     }
 
+    /// The nodes [`lookup_range`](Self::lookup_range) returns for the same
+    /// bounds, in the order a scan's `ORDER BY field` sorts them — ascending,
+    /// or descending when `descending` — read lazily from the end that order
+    /// starts at, so a caller that needs the first few stops after them.
+    ///
+    /// With both bounds `None`, every indexed node, class by class in sort
+    /// order: numbers (`Int` and `Float` together, by `f64` total order),
+    /// strings, `Bool`s, `Date`s, `LocalDateTime`s, `DateTime`s, binaries.
+    /// The nodes of one key come in id order whichever the direction, and
+    /// `DateTime`s at one instant are one key (the order does not sort them by
+    /// offset), so a caller cutting the order should cut between keys.
+    pub fn lookup_ordered(
+        &self,
+        label: &str,
+        field: &str,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+        descending: bool,
+    ) -> impl Iterator<Item = u32> + '_ {
+        let Some(postings) = self.postings(label, field) else {
+            return empty();
+        };
+        let mut classes = match (lo.map(|b| order_class(b.0)), hi.map(|b| order_class(b.0))) {
+            (None, None) => SORT_CLASSES.to_vec(),
+            (Some(None), _) | (_, Some(None)) => return empty(),
+            (Some(Some(a)), Some(Some(b))) if a != b => return empty(),
+            (Some(Some(c)), _) | (None, Some(Some(c))) => vec![SortClass::Ordered(c)],
+        };
+        if descending {
+            classes.reverse();
+        }
+        let lo = lo.map(|(v, incl)| (v.clone(), incl));
+        let hi = hi.map(|(v, incl)| (v.clone(), incl));
+        let offsets = self.offsets.get(&pair(label, field));
+        Box::new(classes.into_iter().flat_map(move |class| {
+            ordered_class(
+                postings,
+                offsets,
+                class,
+                lo.as_ref(),
+                hi.as_ref(),
+                descending,
+            )
+        }))
+    }
+
     /// The nodes of `label` whose `field` is a string starting with `prefix`,
     /// in key order. Only `Str` keys can match.
     pub fn lookup_prefix(
@@ -777,6 +823,264 @@ fn key_range<'a>(
     )
 }
 
+/// A class [`UnifiedIndex::lookup_ordered`] walks: one a range orders
+/// within, or `Bool`, which sorts (between strings and dates) but has no range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortClass {
+    Ordered(OrderClass),
+    Bool,
+}
+
+/// The indexed classes in the order a scan's `ORDER BY` sorts them.
+const SORT_CLASSES: [SortClass; 7] = [
+    SortClass::Ordered(OrderClass::Numeric),
+    SortClass::Ordered(OrderClass::Str),
+    SortClass::Bool,
+    SortClass::Ordered(OrderClass::Date),
+    SortClass::Ordered(OrderClass::LocalDateTime),
+    SortClass::Ordered(OrderClass::DateTime),
+    SortClass::Ordered(OrderClass::Binary),
+];
+
+type Bucket<'a> = (&'a ValueKey, &'a IdSet);
+type BucketIter<'a> = Box<dyn Iterator<Item = Bucket<'a>> + 'a>;
+
+/// The smallest key of the variant after `k`'s, `None` after the last.
+fn variant_after(k: &ValueKey) -> Option<ValueKey> {
+    Some(match k {
+        ValueKey::Int(_) => ValueKey::FloatBits(0),
+        ValueKey::FloatBits(_) => ValueKey::Str(String::new()),
+        ValueKey::Str(_) => ValueKey::Bool(false),
+        ValueKey::Bool(_) => ValueKey::DateDays(i32::MIN),
+        ValueKey::DateDays(_) => ValueKey::LocalDateTimeMicros(i64::MIN),
+        ValueKey::LocalDateTimeMicros(_) => ValueKey::DateTimeMicrosUtc(i64::MIN),
+        ValueKey::DateTimeMicrosUtc(_) => ValueKey::BinaryBytes(Vec::new()),
+        ValueKey::BinaryBytes(_) => return None,
+    })
+}
+
+/// The buckets of `variant`'s keys between `start` and `end` (`None`: the
+/// variant's own end), in key order or its reverse.
+fn variant_run<'a>(
+    postings: &'a Postings,
+    variant: &ValueKey,
+    start: Option<Bound<ValueKey>>,
+    end: Option<Bound<ValueKey>>,
+    descending: bool,
+) -> BucketIter<'a> {
+    let start = start.unwrap_or_else(|| Bound::Included(variant_min(variant)));
+    let end = end.unwrap_or_else(|| match variant_after(variant) {
+        Some(next) => Bound::Excluded(next),
+        None => Bound::Unbounded,
+    });
+    let inverted = match (&start, &end) {
+        (Bound::Included(a), Bound::Included(b)) => a > b,
+        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
+            a >= b
+        }
+        _ => false,
+    };
+    if inverted {
+        return Box::new(std::iter::empty());
+    }
+    let variant = variant.clone();
+    let same = move |(k, _): &Bucket<'_>| same_variant(k, &variant);
+    if descending {
+        Box::new(postings.range_rev((start, end)).filter(same))
+    } else {
+        Box::new(postings.range((start, end)).filter(same))
+    }
+}
+
+/// A bound as a key bound, for a class whose key order is the scan's.
+fn key_bound(b: Option<&(Value, bool)>) -> Option<Bound<ValueKey>> {
+    b.map(|(v, incl)| {
+        let k = ValueKey::from_value(v).expect("an ordered class has keys");
+        if *incl {
+            Bound::Included(k)
+        } else {
+            Bound::Excluded(k)
+        }
+    })
+}
+
+/// One class of [`UnifiedIndex::lookup_ordered`].
+fn ordered_class<'a>(
+    postings: &'a Postings,
+    offsets: Option<&'a CowMap<u32, i32>>,
+    class: SortClass,
+    lo: Option<&(Value, bool)>,
+    hi: Option<&(Value, bool)>,
+    descending: bool,
+) -> IdIter<'a> {
+    match class {
+        SortClass::Bool => {
+            let mut keys = vec![ValueKey::Bool(false), ValueKey::Bool(true)];
+            if descending {
+                keys.reverse();
+            }
+            Box::new(
+                keys.into_iter()
+                    .filter_map(move |k| postings.get(&k))
+                    .flat_map(|ids| ids.iter()),
+            )
+        }
+        SortClass::Ordered(OrderClass::Numeric) => numeric_ordered(postings, lo, hi, descending),
+        SortClass::Ordered(OrderClass::DateTime) => {
+            datetime_ordered(postings, offsets, lo, hi, descending)
+        }
+        SortClass::Ordered(other) => {
+            let variant = match other {
+                OrderClass::Str => ValueKey::Str(String::new()),
+                OrderClass::Date => ValueKey::DateDays(0),
+                OrderClass::LocalDateTime => ValueKey::LocalDateTimeMicros(0),
+                _ => ValueKey::BinaryBytes(Vec::new()),
+            };
+            let buckets = variant_run(postings, &variant, key_bound(lo), key_bound(hi), descending);
+            Box::new(buckets.flat_map(|(_, ids)| ids.iter()))
+        }
+    }
+}
+
+/// The `DateTime` class in instant order: a key run between the bounds'
+/// instants, each node checked against the exact `(instant, offset)` bounds
+/// as [`datetime_range`] checks it.
+fn datetime_ordered<'a>(
+    postings: &'a Postings,
+    offsets: Option<&'a CowMap<u32, i32>>,
+    lo: Option<&(Value, bool)>,
+    hi: Option<&(Value, bool)>,
+    descending: bool,
+) -> IdIter<'a> {
+    let pair_of = |b: Option<&(Value, bool)>| match b {
+        Some((
+            Value::DateTime {
+                micros_utc,
+                offset_seconds,
+            },
+            incl,
+        )) => Some(((*micros_utc, *offset_seconds), *incl)),
+        _ => None,
+    };
+    let (lo, hi) = (pair_of(lo), pair_of(hi));
+    let start = lo.map(|((us, _), _)| Bound::Included(ValueKey::DateTimeMicrosUtc(us)));
+    let end = hi.map(|((us, _), _)| Bound::Included(ValueKey::DateTimeMicrosUtc(us)));
+    let variant = ValueKey::DateTimeMicrosUtc(0);
+    let buckets = variant_run(postings, &variant, start, end, descending);
+    Box::new(buckets.flat_map(move |(key, ids)| {
+        let ValueKey::DateTimeMicrosUtc(us) = *key else {
+            unreachable!("a DateTime key run")
+        };
+        ids.iter().filter(move |id| {
+            let offset = offsets.and_then(|o| o.get(id)).copied().unwrap_or(0);
+            let stored = (us, offset);
+            lo.is_none_or(|(b, incl)| admits(stored.cmp(&b), true, incl))
+                && hi.is_none_or(|(b, incl)| admits(stored.cmp(&b), false, incl))
+        })
+    }))
+}
+
+/// The numeric class in sort order: the `Int` keys and the two runs of
+/// `Float` keys (raw bits order a clear sign bit's floats by value, and a set
+/// one's in reverse), each read in the direction that walks its values in
+/// order, merged by value, every bucket checked against the bounds as
+/// [`numeric_range`] checks it.
+fn numeric_ordered<'a>(
+    postings: &'a Postings,
+    lo: Option<&(Value, bool)>,
+    hi: Option<&(Value, bool)>,
+    descending: bool,
+) -> IdIter<'a> {
+    const SIGN: u64 = 1 << 63;
+    let lo = lo.map(|(v, incl)| (as_number(v), *incl));
+    let hi = hi.map(|(v, incl)| (as_number(v), *incl));
+    let within = move |x: f64| {
+        lo.is_none_or(|(b, incl)| admits(x.total_cmp(&b), true, incl))
+            && hi.is_none_or(|(b, incl)| admits(x.total_cmp(&b), false, incl))
+    };
+    type Run<'a> = Box<dyn Iterator<Item = (f64, &'a IdSet)> + 'a>;
+    let mut runs: Vec<Run<'a>> = Vec::new();
+    let int_lo = match lo {
+        None => Some(i64::MIN),
+        Some((b, _)) if b.is_nan() => b.is_sign_negative().then_some(i64::MIN),
+        Some((b, _)) => Some(b.next_down().floor() as i64),
+    };
+    let int_hi = match hi {
+        None => Some(i64::MAX),
+        Some((b, _)) if b.is_nan() => b.is_sign_positive().then_some(i64::MAX),
+        Some((b, _)) => Some(b.next_up().ceil() as i64),
+    };
+    if let (Some(a), Some(b)) = (int_lo, int_hi) {
+        if a <= b {
+            let range = (
+                Bound::Included(ValueKey::Int(a)),
+                Bound::Included(ValueKey::Int(b)),
+            );
+            let keys: BucketIter<'a> = if descending {
+                Box::new(postings.range_rev(range))
+            } else {
+                Box::new(postings.range(range))
+            };
+            runs.push(Box::new(keys.filter_map(|(k, ids)| match k {
+                ValueKey::Int(j) => Some((*j as f64, ids)),
+                _ => None,
+            })));
+        }
+    }
+    let t_lo = lo.map_or(0, |(b, _)| total_order(b.to_bits()));
+    let t_hi = hi.map_or(u64::MAX, |(b, _)| total_order(b.to_bits()));
+    if t_lo <= t_hi {
+        // (raw bits from, to, whether raw order is value order).
+        let mut float_runs: Vec<(u64, u64, bool)> = Vec::new();
+        if t_hi >= SIGN {
+            float_runs.push((t_lo.max(SIGN) ^ SIGN, t_hi ^ SIGN, true));
+        }
+        if t_lo < SIGN {
+            float_runs.push((!t_hi.min(SIGN - 1), !t_lo, false));
+        }
+        for (a, b, raw_is_value_order) in float_runs {
+            let range = (
+                Bound::Included(ValueKey::FloatBits(a)),
+                Bound::Included(ValueKey::FloatBits(b)),
+            );
+            let keys: BucketIter<'a> = if descending == raw_is_value_order {
+                Box::new(postings.range_rev(range))
+            } else {
+                Box::new(postings.range(range))
+            };
+            runs.push(Box::new(keys.filter_map(|(k, ids)| match k {
+                ValueKey::FloatBits(bits) => Some((f64::from_bits(*bits), ids)),
+                _ => None,
+            })));
+        }
+    }
+    let mut runs: Vec<_> = runs
+        .into_iter()
+        .map(|r| r.filter(move |(x, _)| within(*x)).peekable())
+        .collect();
+    let merged = std::iter::from_fn(move || {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, run) in runs.iter_mut().enumerate() {
+            if let Some(&(x, _)) = run.peek() {
+                let better = best.is_none_or(|(_, b)| {
+                    let ord = x.total_cmp(&b);
+                    if descending {
+                        ord.is_gt()
+                    } else {
+                        ord.is_lt()
+                    }
+                });
+                if better {
+                    best = Some((i, x));
+                }
+            }
+        }
+        let (i, _) = best?;
+        runs[i].next().map(|(_, ids)| ids)
+    });
+    Box::new(merged.flat_map(|ids| ids.iter()))
+}
+
 /// The smallest key of `k`'s variant.
 fn variant_min(k: &ValueKey) -> ValueKey {
     match k {
@@ -925,6 +1229,118 @@ fn datetime_range<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value's place in `ORDER BY`, as far as `lookup_ordered` sorts:
+    /// class, then value (a `DateTime` by instant only).
+    fn sort_place(v: &Value) -> (u8, f64, Vec<u8>) {
+        match v {
+            Value::Int(i) => (0, *i as f64, vec![]),
+            Value::Float(f) => (0, *f, vec![]),
+            Value::Str(s) => (1, 0.0, s.as_bytes().to_vec()),
+            Value::Bool(b) => (2, f64::from(u8::from(*b)), vec![]),
+            Value::Date(d) => (3, f64::from(*d), vec![]),
+            Value::LocalDateTime(us) => (4, *us as f64, vec![]),
+            Value::DateTime { micros_utc, .. } => (5, *micros_utc as f64, vec![]),
+            Value::Binary(b) => (6, 0.0, b.clone()),
+            other => unreachable!("not indexed: {other:?}"),
+        }
+    }
+
+    fn place_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+        let (ca, xa, ba) = sort_place(a);
+        let (cb, xb, bb) = sort_place(b);
+        ca.cmp(&cb).then(xa.total_cmp(&xb)).then(ba.cmp(&bb))
+    }
+
+    #[test]
+    fn lookup_ordered_is_lookup_range_in_sort_order_both_ways() {
+        let pool = [
+            Value::Int(-3),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(1 << 53),
+            Value::Int((1 << 53) + 1),
+            Value::Float(-2.5),
+            Value::Float(-0.0),
+            Value::Float(0.0),
+            Value::Float(2.0),
+            Value::Float(9007199254740992.0),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(f64::NAN),
+            Value::Float(-f64::NAN),
+            Value::Str(String::new()),
+            Value::Str("a".into()),
+            Value::Str("é".into()),
+            Value::Str("e\u{301}".into()),
+            Value::Str("日本".into()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Date(-1),
+            Value::Date(4),
+            Value::LocalDateTime(7),
+            Value::DateTime {
+                micros_utc: 5,
+                offset_seconds: 3600,
+            },
+            Value::DateTime {
+                micros_utc: 5,
+                offset_seconds: 0,
+            },
+            Value::DateTime {
+                micros_utc: 9,
+                offset_seconds: -60,
+            },
+            Value::Binary(vec![]),
+            Value::Binary(vec![1, 2]),
+            Value::List(vec![Value::Int(1)]),
+        ];
+        let mut state = 0x5eed_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mut ix = UnifiedIndex::new();
+        ix.enable_range("r", "N", "v");
+        let mut values = BTreeMap::new();
+        for id in 0..400u32 {
+            let v = pool[next(pool.len())].clone();
+            ix.set("N", "v", id, &v);
+            values.insert(id, v);
+        }
+        let check = |ix: &UnifiedIndex, lo: Option<(&Value, bool)>, hi: Option<(&Value, bool)>| {
+            let mut want: Vec<u32> = ix.lookup_range("N", "v", lo, hi).collect();
+            want.sort_unstable();
+            for descending in [false, true] {
+                let got: Vec<u32> = ix.lookup_ordered("N", "v", lo, hi, descending).collect();
+                let mut set = got.clone();
+                set.sort_unstable();
+                assert_eq!(set, want, "{lo:?} {hi:?} desc={descending}");
+                for w in got.windows(2) {
+                    let ord = place_cmp(&values[&w[0]], &values[&w[1]]);
+                    let ok = if descending { ord.is_ge() } else { ord.is_le() };
+                    assert!(
+                        ok,
+                        "{lo:?} {hi:?} desc={descending}: {:?} then {:?}",
+                        values[&w[0]], values[&w[1]]
+                    );
+                }
+            }
+        };
+        check(&ix, None, None);
+        for _ in 0..600 {
+            let a = &pool[next(pool.len())];
+            let b = &pool[next(pool.len())];
+            let (ai, bi) = (next(2) == 0, next(2) == 0);
+            match next(3) {
+                0 => check(&ix, Some((a, ai)), None),
+                1 => check(&ix, None, Some((b, bi))),
+                _ => check(&ix, Some((a, ai)), Some((b, bi))),
+            }
+        }
+    }
 
     #[test]
     fn indexed_ids_are_the_nodes_whose_value_has_an_index_key() {

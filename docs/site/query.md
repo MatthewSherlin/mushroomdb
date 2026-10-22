@@ -827,8 +827,13 @@ from the index instead of a scan of the label:
 
 `x` is a literal or a `$parameter`. So is `ORDER BY n.prop [DESC] … LIMIT k`
 (with or without `SKIP`) over `MATCH (n:Label)`, with no `WHERE` or with a
-`WHERE` made only of the range above on the same property: the index yields the
-first rows of the sort and the rest are never read.
+`WHERE` made only of the range above on the same property: the index is read
+in sort order from the end the sort starts at, and reading stops once the first
+`SKIP + LIMIT` rows (and any rows tied with the last of them) are known. Two
+cases read more: a descending sort with no `WHERE` also walks the label's nodes
+once to find those without the property (they sort first), as does an
+ascending one whose first rows reach past the numbers, strings and booleans;
+and a descending `STARTS WITH` reads all of the prefix's matches.
 
 The answer is the scan's, row for row and in the same order: integers and
 floats compare as numbers (`n.prop > 5.5` finds the integer 10), a string bound

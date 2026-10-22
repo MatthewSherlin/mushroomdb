@@ -189,6 +189,7 @@ fn bench_range_and_top_k_at_100k() {
         "MATCH (n:Item) RETURN n ORDER BY n.score LIMIT 10",
         "MATCH (n:Item) RETURN n ORDER BY n.score DESC LIMIT 10",
         "MATCH (n:Item) WHERE n.score > 50000 RETURN n ORDER BY n.score LIMIT 10",
+        "MATCH (n:Item) WHERE n.score > 50000 RETURN n ORDER BY n.score DESC LIMIT 10",
         "MATCH (n:Item) WHERE n.score > 100 RETURN n LIMIT 10",
     ] {
         let (with, rows_with) = median_us(&indexed, cypher, 7);
@@ -500,14 +501,29 @@ impl Rng {
     }
 }
 
-const STRS: [&str; 8] = ["", "a", "al", "alice", "alicia", "b", "ba", "bob"];
+const STRS: [&str; 12] = [
+    "", "a", "al", "alice", "alicia", "b", "ba", "bob", "é", "e\u{301}", "日", "日本",
+];
 
 /// A value the indexed field may hold, or `None` for no property.
 fn random_value(rng: &mut Rng) -> Option<Value> {
     Some(match rng.below(14) {
         0 | 1 => Value::Int(rng.below(9) as i64 - 4),
         2 => Value::Int(rng.below(3) as i64 + (1 << 53)),
-        3 => Value::Float(*rng.pick(&[-2.5, -0.0, 0.0, 1.0, 2.0, 2.5, f64::INFINITY, f64::NAN])),
+        3 => Value::Float(*rng.pick(&[
+            -2.5,
+            -0.0,
+            0.0,
+            1.0,
+            2.0,
+            2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            9007199254740992.0,
+            9007199254740993.0_f64.next_up(),
+            9007199254740992.0_f64.next_down(),
+        ])),
         4 | 5 => Value::Str(rng.pick(&STRS).to_string()),
         6 => Value::Bool(rng.below(2) == 1),
         7 => Value::Date(rng.below(5) as i32 - 2),
@@ -671,6 +687,27 @@ fn random_graph(rng: &mut Rng, db: &mut GraphDb, index: bool) {
     }
 }
 
+/// REMOVE WHEN QL-FS (branch `v0.10/ql-fs-fused-scan`) lands: ledger row 139.
+///
+/// The released pull path fuses a lone `WHERE n.f <op> <literal>` into its
+/// label walk when a `LIMIT` follows with no `ORDER BY`; the fused walk reads
+/// only the column overlay and misses values in a snapshot's base. Without an
+/// index TY-10's plan falls back to that walk, so for exactly that shape the
+/// no-index store is not an oracle until QL-FS fixes it. (The index plan does
+/// not share the defect: it is compared against the unfused scan for every
+/// shape.) Every other shape is compared without an index too.
+fn row_139_shape(cypher: &str) -> bool {
+    let (Some(at), Some(ret)) = (cypher.find(" WHERE "), cypher.find(" RETURN ")) else {
+        return false;
+    };
+    let pred = &cypher[at + " WHERE ".len()..ret];
+    let lone_literal_cmp = pred.starts_with("n.val ")
+        && !pred.contains(" AND ")
+        && !pred.contains('$')
+        && !pred.contains("STARTS WITH");
+    lone_literal_cmp && cypher.contains(" LIMIT ") && !cypher.contains(" ORDER BY ")
+}
+
 fn run(db: &GraphDb, cypher: &str, params: &[(String, Value)]) -> String {
     let map: BTreeMap<String, Value> = params.iter().cloned().collect();
     // Debug text compares NaN with NaN, which `==` on values does not.
@@ -702,13 +739,8 @@ fn index_plans_return_exactly_what_the_scan_returns() {
                 got, want,
                 "seed {seed}: {index_q} {params:?}\n  vs {scan_q}"
             );
-            // Without the index the plan falls back to the label scan. Not
-            // compared for `LIMIT` without `ORDER BY`: that shape takes the
-            // fused scan-and-filter path, which reads only the column overlay
-            // and misses values in a snapshot's base — a defect of the
-            // released scan, reported with TY-10, that the index plan does not
-            // share.
-            let fused_shape = index_q.contains("LIMIT") && !index_q.contains("ORDER BY");
+            // Without the index the plan falls back to the label scan.
+            let fused_shape = row_139_shape(&index_q);
             if !fused_shape {
                 let unindexed = run(&plain, &index_q, &params);
                 assert_eq!(

@@ -1878,74 +1878,20 @@ impl<'a> RangeScan<'a> {
     }
 }
 
-/// The classes a range index orders, in the order `ORDER BY` sorts them
-/// (`value_ops::cmp_values`). Lists, `Duration`s and maps sort between some
-/// of them but have no index key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexClass {
-    Numeric,
-    Str,
-    Bool,
-    Date,
-    LocalDateTime,
-    DateTime,
-    Binary,
-}
-
-const INDEX_CLASSES: [IndexClass; 7] = [
-    IndexClass::Numeric,
-    IndexClass::Str,
-    IndexClass::Bool,
-    IndexClass::Date,
-    IndexClass::LocalDateTime,
-    IndexClass::DateTime,
-    IndexClass::Binary,
-];
-
-/// The class a range bound orders within; `None` for a value no range over
-/// the index can take (`Bool`, list, map, `Duration`), which the scan answers.
-fn bound_class(v: &Value) -> Option<IndexClass> {
-    match v {
-        Value::Int(_) | Value::Float(_) => Some(IndexClass::Numeric),
-        Value::Str(_) => Some(IndexClass::Str),
-        Value::Date(_) => Some(IndexClass::Date),
-        Value::LocalDateTime(_) => Some(IndexClass::LocalDateTime),
-        Value::DateTime { .. } => Some(IndexClass::DateTime),
-        Value::Binary(_) => Some(IndexClass::Binary),
-        _ => None,
-    }
-}
-
-/// Every indexed node of one class, in ascending sort order.
-fn class_ids<'a>(
-    index: &'a UnifiedIndex,
-    label: &str,
-    field: &str,
-    class: IndexClass,
-) -> Box<dyn Iterator<Item = u32> + 'a> {
-    // The least value of each ordered class, as an inclusive lower bound.
-    // `f64::from_bits(u64::MAX)` is the negative NaN `total_cmp` puts first.
-    let least = match class {
-        IndexClass::Numeric => Value::Float(f64::from_bits(u64::MAX)),
-        IndexClass::Str => Value::Str(String::new()),
-        IndexClass::Date => Value::Date(i32::MIN),
-        IndexClass::LocalDateTime => Value::LocalDateTime(i64::MIN),
-        IndexClass::DateTime => Value::DateTime {
-            micros_utc: i64::MIN,
-            offset_seconds: i32::MIN,
-        },
-        IndexClass::Binary => Value::Binary(Vec::new()),
-        IndexClass::Bool => {
-            let ids = [false, true].into_iter().flat_map(move |b| {
-                index
-                    .lookup_eq(label, field, &ValueKey::Bool(b))
-                    .into_iter()
-                    .flat_map(|set| set.iter())
-            });
-            return Box::new(ids.collect::<Vec<u32>>().into_iter());
-        }
-    };
-    Box::new(index.lookup_range(label, field, Some((&least, true)), None))
+/// Whether a range bound is of a class the index orders (numbers, strings,
+/// the temporal types except `Duration`, binary). Any other bound — `Bool`,
+/// list, map, `Duration` — the scan answers.
+fn orderable_bound(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Binary(_)
+    )
 }
 
 /// Whether two values of one class sort as one run for a top-k cut: equal as
@@ -1973,9 +1919,8 @@ fn range_scan_ids(
     scan: &RangeScan<'_>,
     params: &Params,
 ) -> Result<Option<Vec<u32>>, String> {
-    let fallback = || None;
     let Some(index) = view.range_index(scan.label, scan.field) else {
-        return Ok(fallback());
+        return Ok(None);
     };
     let Some(sym) = view.sym(scan.label) else {
         return Ok(Some(Vec::new()));
@@ -1985,49 +1930,65 @@ fn range_scan_ids(
             return Ok(Some(None));
         };
         Ok(resolve_operand(view, vars, row, &b.value, params)?
-            .filter(|v| bound_class(v).is_some())
+            .filter(orderable_bound)
             .map(|v| Some((v, b.inclusive))))
     };
     // `None`: a bound the index cannot take (null, Bool, Duration, …).
     let (Some(lo), Some(hi)) = (bound(scan.lo)?, bound(scan.hi)?) else {
-        return Ok(fallback());
+        return Ok(None);
     };
     let prefix = match scan.prefix {
         None => None,
         Some(op) => match resolve_operand(view, vars, row, op, params)? {
             Some(Value::Str(s)) => Some(s),
-            _ => return Ok(fallback()),
+            _ => return Ok(None),
         },
     };
     let keeps = |id: u32| view.visible(id) && view.label_sym(id) == Some(sym);
     let bounded = lo.is_some() || hi.is_some() || prefix.is_some();
-    let source = || -> Box<dyn Iterator<Item = u32> + '_> {
-        match &prefix {
-            Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
-            None => Box::new(index.lookup_range(
-                scan.label,
-                scan.field,
-                lo.as_ref().map(|(v, incl)| (v, *incl)),
-                hi.as_ref().map(|(v, incl)| (v, *incl)),
-            )),
-        }
-    };
+    let lo = lo.as_ref().map(|(v, incl)| (v, *incl));
+    let hi = hi.as_ref().map(|(v, incl)| (v, *incl));
     let keep = scan
         .order
         .and_then(|o| skip_limit_bound(o.skip.as_ref(), Some(&o.limit), params));
     let mut ids: Vec<u32> = match (scan.order, keep) {
         (Some(order), Some(keep)) => {
-            let mut ids = if bounded {
-                top_k(view, scan.field, source(), order.descending, keep, &keeps)
-            } else {
-                ordered_top_k(view, index, scan, order.descending, keep, &keeps)
+            let desc = order.descending;
+            let walk: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) if desc => {
+                    // A prefix's matches are one run of keys, read forwards.
+                    let mut all: Vec<u32> =
+                        index.lookup_prefix(scan.label, scan.field, p).collect();
+                    all.reverse();
+                    Box::new(all.into_iter())
+                }
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_ordered(scan.label, scan.field, lo, hi, desc)),
             };
+            let (mut ids, cut) = top_k(view, scan.field, walk, keep, &keeps);
+            // With a range, a node with no index entry fails it. Without
+            // one, such nodes (no property, or a list, map or `Duration`)
+            // sort among the rows: descending, nulls come first; ascending,
+            // after numbers, strings and Bools — so only a cut past those
+            // can need them.
+            let settled_before_unindexed = !desc
+                && matches!(
+                    cut,
+                    Some(Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_))
+                );
+            if !bounded && !settled_before_unindexed {
+                ids.extend(unindexed_ids(view, index, scan));
+            }
             ids.sort_unstable();
             ids
         }
-        _ if !bounded => return Ok(fallback()),
+        _ if !bounded => return Ok(None),
         _ => {
-            let mut ids: Vec<u32> = source().filter(|&id| keeps(id)).collect();
+            let source: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_range(scan.label, scan.field, lo, hi)),
+            };
+            let mut ids: Vec<u32> = source.filter(|&id| keeps(id)).collect();
             ids.sort_unstable();
             ids
         }
@@ -2049,28 +2010,21 @@ fn range_or_scan_ids(
         .unwrap_or_else(|| scan_ids(view, Some(scan.label))))
 }
 
-/// The first `keep` of `ids` — given in ascending sort order of `field` —
-/// that pass `keeps`, in the requested direction, plus every later one in
-/// the same run as the last of them: the rows a stable sort could put at
-/// position `keep` or before.
+/// The first `keep` of `ids` — given in the order `ORDER BY field` sorts
+/// them — that pass `keeps`, plus every later one in the same run as the
+/// last of them: every row a stable sort could put at position `keep` or
+/// before. Stops reading `ids` there. Also returns the value the cut fell on
+/// (`None` when fewer than `keep` came).
 fn top_k(
     view: &GraphView,
     field: &str,
     ids: impl Iterator<Item = u32>,
-    descending: bool,
     keep: usize,
     keeps: &dyn Fn(u32) -> bool,
-) -> Vec<u32> {
-    let ids: Box<dyn Iterator<Item = u32>> = if descending {
-        let mut all: Vec<u32> = ids.collect();
-        all.reverse();
-        Box::new(all.into_iter())
-    } else {
-        Box::new(ids)
-    };
+) -> (Vec<u32>, Option<Value>) {
     let mut out = Vec::new();
     if keep == 0 {
-        return out;
+        return (out, None);
     }
     let value = |id: u32| view.prop(id, field).map(|v| v.into_value());
     let mut cut: Option<Option<Value>> = None;
@@ -2091,43 +2045,19 @@ fn top_k(
             cut = Some(value(id));
         }
     }
-    out
+    (out, cut.flatten())
 }
 
-/// The candidates of `ORDER BY field … LIMIT` with no range: every node of
-/// the label with no index entry — no property (null, which sorts last
-/// ascending and first descending), or a list, map or `Duration` — and the
-/// top `keep` of the indexed nodes, class by class in sort order.
-fn ordered_top_k(
-    view: &GraphView,
-    index: &UnifiedIndex,
-    scan: &RangeScan<'_>,
-    descending: bool,
-    keep: usize,
-    keeps: &dyn Fn(u32) -> bool,
-) -> Vec<u32> {
-    // Both lists ascend: one merge walk finds the label's nodes with no entry.
+/// The visible nodes of the label with no index entry — no property, or a
+/// list, map or `Duration` — by one merge walk of two ascending id lists.
+fn unindexed_ids(view: &GraphView, index: &UnifiedIndex, scan: &RangeScan<'_>) -> Vec<u32> {
     let mut indexed = index.indexed_ids(scan.label, scan.field).peekable();
-    let mut out: Vec<u32> = Vec::new();
+    let mut out = Vec::new();
     for id in view.nodes_with_label(scan.label) {
         while indexed.next_if(|&e| e < id).is_some() {}
         if indexed.next_if_eq(&id).is_none() && view.visible(id) {
             out.push(id);
         }
-    }
-    let mut classes: Vec<IndexClass> = INDEX_CLASSES.to_vec();
-    if descending {
-        classes.reverse();
-    }
-    let mut remaining = keep;
-    for class in classes {
-        if remaining == 0 {
-            break;
-        }
-        let ids = class_ids(index, scan.label, scan.field, class);
-        let got = top_k(view, scan.field, ids, descending, remaining, keeps);
-        remaining = remaining.saturating_sub(got.len());
-        out.extend(got);
     }
     out
 }
@@ -2245,7 +2175,7 @@ fn scan_range(
         .slot(var)
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
     for row in rows {
         for &id in &ids {
             if out.len() >= cap {
