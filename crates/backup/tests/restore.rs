@@ -1191,3 +1191,326 @@ async fn a_restore_sweeps_what_killed_restores_into_its_target_left() {
     );
     drop(held);
 }
+
+// ── TY-12 × HO-09: a V11 store restores as V11 ───────────────────────────────
+
+/// The snapshot versions a 0.9.x reader accepts (V5–V10); it refuses every
+/// other one with `snapshot: unsupported version {N}` (see
+/// `crates/core-api/tests/snapshot_v11.rs`).
+const V0_9_ACCEPTS: [u16; 6] = [5, 6, 7, 8, 9, 10];
+
+fn event(db: &SharedDb, key: &str, on: i64) {
+    db.write()
+        .insert_node(
+            "Event",
+            key,
+            vec![("on".into(), mushroomdb::Value::Int(on))],
+        )
+        .unwrap();
+}
+
+fn events(db: &SharedDb, from: i64, n: i64) {
+    for i in from..from + n {
+        event(db, &format!("e{i}"), i);
+    }
+}
+
+fn commits_of(db: &SharedDb) -> u64 {
+    db.read().wal_total_commits().unwrap()
+}
+
+/// Declare a constraint and a range index on `Event.on`: the store's first
+/// V11-only records, so the store moves to V11 at the first. Returns the
+/// commit index of the constraint, the first commit at which it is V11.
+fn make_v11(db: &SharedDb) -> u64 {
+    let first = commits_of(db);
+    {
+        let mut g = db.write();
+        assert!(!g.is_v11(), "not V11 before its first V11-only record");
+        g.create_constraint("uniq_on", "Event", "on").unwrap();
+        g.enable_range_index("by_on", "Event", "on").unwrap();
+        assert!(g.is_v11());
+    }
+    assert_eq!(commits_of(db), first + 2, "one commit per declaration");
+    first
+}
+
+/// The store's whole retained history as WAL bytes: its archives in order,
+/// then its live WAL.
+fn history_bytes(dir: &Path) -> Vec<u8> {
+    let mut archives: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            let name = p.file_name()?.to_str()?.to_string();
+            let n = name
+                .strip_prefix("wal.")?
+                .strip_suffix(".archive")?
+                .parse()
+                .ok()?;
+            Some((n, p))
+        })
+        .collect();
+    archives.sort();
+    let mut bytes = Vec::new();
+    for (_, p) in archives {
+        bytes.extend(std::fs::read(p).unwrap());
+    }
+    bytes.extend(std::fs::read(dir.join("wal.bin")).unwrap_or_default());
+    bytes
+}
+
+/// A store restored at `commit` from a V11 source (source directory `src`,
+/// V11 from commit `v11_from`) is the source at that commit, byte for byte,
+/// and is V11 exactly when the source was V11 there: once V11, every later
+/// commit is V11 (C9). `snapshot_dropped`: the cut is one of the two that
+/// remove the snapshot (the commit is in an archive, or in a WAL the snapshot
+/// kept).
+fn assert_cut_matches_source(
+    what: &str,
+    src: &Path,
+    target: &Path,
+    commit: u64,
+    v11_from: u64,
+    snapshot_dropped: bool,
+) {
+    let want_v11 = commit >= v11_from;
+    assert_eq!(
+        !target.join("snapshot.bin").exists(),
+        snapshot_dropped,
+        "{what}: {:?}",
+        dir_entries(target)
+    );
+    // Byte-exact: the WAL is a prefix of the history it was cut from (the
+    // source's live WAL beside a kept snapshot; its archives and WAL rebuilt
+    // from nothing otherwise) holding exactly `commit + 1` commits.
+    let wal = std::fs::read(target.join("wal.bin")).unwrap();
+    let from = if snapshot_dropped {
+        history_bytes(src)
+    } else {
+        assert_eq!(
+            std::fs::read(target.join("snapshot.bin")).unwrap(),
+            std::fs::read(src.join("snapshot.bin")).unwrap(),
+            "{what}: the kept snapshot is the source's"
+        );
+        std::fs::read(src.join("wal.bin")).unwrap()
+    };
+    assert!(
+        from.starts_with(&wal),
+        "{what}: the WAL is a prefix of the source's"
+    );
+    let restored = GraphDb::open(target).unwrap();
+    assert_eq!(restored.wal_total_commits().unwrap(), commit + 1, "{what}");
+    assert_eq!(
+        dump(&restored),
+        dump(&GraphDb::open_at(src, commit).unwrap()),
+        "{what}: the graph at commit {commit}"
+    );
+    assert_eq!(
+        restored.is_v11(),
+        want_v11,
+        "{what}: V11 iff the source was"
+    );
+    assert_eq!(
+        restored.constraints().len(),
+        usize::from(want_v11),
+        "{what}"
+    );
+    assert_eq!(
+        restored.range_indexes().len(),
+        usize::from(commit > v11_from),
+        "{what}"
+    );
+    drop(restored);
+
+    // It stays what it is: a write and a snapshot stamp V11 iff it was V11.
+    let mut db = GraphDb::open(target).unwrap();
+    if want_v11 {
+        assert!(
+            db.insert_node(
+                "Event",
+                "dup",
+                vec![("on".into(), mushroomdb::Value::Int(0))]
+            )
+            .is_err(),
+            "{what}: the constraint is enforced"
+        );
+    }
+    db.insert_node("Event", "after-restore", vec![]).unwrap();
+    db.snapshot().unwrap();
+    let version = mushroomdb::snapshot_version_at(target).unwrap().unwrap();
+    assert_eq!(version == 11, want_v11, "{what}: stamped V{version}");
+}
+
+/// A store made V11 by a constraint and a range index backs up through the
+/// worker and restores through `restore_from_store` as V11: stamped V11, its
+/// constraint and range index present and the constraint enforced, the V11
+/// genesis marker in place of the one 0.9.x reads, and a version 0.9.x
+/// refuses.
+#[tokio::test]
+async fn a_v11_store_restores_as_v11() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&b.store, &db, dir.path());
+        events(&db, 0, 5);
+        db.write().snapshot_with(ARCHIVING).unwrap();
+        make_v11(&db);
+        events(&db, 5, 5);
+        db.write().snapshot_with(ARCHIVING).unwrap();
+        events(&db, 10, 5);
+        w.run_once().await.unwrap();
+        w.flush().await;
+        assert_eq!(
+            mushroomdb::snapshot_version_at(dir.path()).unwrap(),
+            Some(11)
+        );
+
+        let into = tempfile::tempdir().unwrap();
+        let target = into.path().join("restored");
+        let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &target)
+            .await
+            .unwrap_or_else(|e| panic!("{backend}: {e}"));
+        assert_eq!(out.commits, commits_of(&db), "{backend}");
+        let version = mushroomdb::snapshot_version_at(&target).unwrap();
+        assert_eq!(version, Some(11), "{backend}");
+        assert!(
+            !V0_9_ACCEPTS.contains(&version.unwrap()),
+            "{backend}: a 0.9.x reader refuses it by version"
+        );
+        assert!(target.join("wal.genesis.v11").exists(), "{backend}");
+        assert!(!target.join("wal.genesis").exists(), "{backend}");
+        assert_eq!(
+            std::fs::read(target.join("snapshot.bin")).unwrap(),
+            std::fs::read(dir.path().join("snapshot.bin")).unwrap(),
+            "{backend}: the snapshot byte for byte"
+        );
+
+        let mut back = GraphDb::open(&target).unwrap();
+        assert!(back.is_v11(), "{backend}");
+        assert_eq!(dump(&back), dump(&db.read()), "{backend}");
+        assert_eq!(back.constraints().len(), 1, "{backend}");
+        assert_eq!(
+            back.range_indexes(),
+            vec![("by_on".into(), "Event".into(), "on".into())],
+            "{backend}"
+        );
+        assert!(
+            back.insert_node(
+                "Event",
+                "dup",
+                vec![("on".into(), mushroomdb::Value::Int(3))]
+            )
+            .is_err(),
+            "{backend}: the constraint is enforced"
+        );
+        back.insert_node(
+            "Event",
+            "new",
+            vec![("on".into(), mushroomdb::Value::Int(99))],
+        )
+        .unwrap();
+        back.snapshot().unwrap();
+        assert_eq!(
+            mushroomdb::snapshot_version_at(&target).unwrap(),
+            Some(11),
+            "{backend}: it stays V11"
+        );
+    }
+}
+
+/// `cut_at_commit` through a restore, on a V11 store whose snapshot kept its
+/// WAL (the upgrade's own snapshot; no archives): the cut drops the snapshot
+/// and replays the WAL prefix. Before the first V11 record the restored store
+/// is not V11; at it and after, it is.
+#[tokio::test]
+async fn a_cut_in_the_wal_a_v11_snapshot_kept_restores_v11_iff_the_source_was() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&b.store, &db, dir.path());
+        events(&db, 0, 10);
+        let v11_from = make_v11(&db);
+        events(&db, 10, 10);
+        w.run_once().await.unwrap();
+        w.flush().await;
+        assert_eq!(
+            mushroomdb::snapshot_version_at(dir.path()).unwrap(),
+            Some(11),
+            "the upgrade wrote a V11 snapshot"
+        );
+        let last = commits_of(&db) - 1;
+        for commit in [0, v11_from - 1, v11_from, v11_from + 1, v11_from + 5, last] {
+            let what = format!("{backend}, commit {commit}");
+            let into = tempfile::tempdir().unwrap();
+            let target = into.path().join("restored");
+            let out = restore_from_store(
+                Arc::clone(&b.store),
+                PREFIX,
+                Some(RestoreTarget::CommitSeq(commit)),
+                &target,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(out.commits, commit + 1, "{what}");
+            assert_cut_matches_source(&what, dir.path(), &target, commit, v11_from, true);
+        }
+    }
+}
+
+/// `cut_at_commit` through a restore, on a V11 store with archives on both
+/// sides of the move to V11: a commit in an archive drops the V11 snapshot and
+/// rebuilds from nothing; a commit in the live WAL keeps it. The restored
+/// store is the source at that commit, and V11 iff the source was.
+#[tokio::test]
+async fn a_cut_in_an_archive_of_a_v11_store_restores_v11_iff_the_source_was() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&b.store, &db, dir.path());
+        events(&db, 0, 10);
+        db.write().snapshot_with(ARCHIVING).unwrap();
+        events(&db, 10, 5);
+        let v11_from = make_v11(&db);
+        events(&db, 15, 5);
+        db.write().snapshot_with(ARCHIVING).unwrap();
+        let live_from = commits_of(&db);
+        events(&db, 20, 5);
+        w.run_once().await.unwrap();
+        w.flush().await;
+        assert_eq!(
+            mushroomdb::snapshot_version_at(dir.path()).unwrap(),
+            Some(11)
+        );
+        let last = commits_of(&db) - 1;
+        for commit in [
+            3,            // the first archive, long before V11
+            v11_from - 2, // the second archive, before V11
+            v11_from,     // the second archive, the first V11 commit
+            v11_from + 4, // the second archive, after
+            live_from,    // the live WAL beside the V11 snapshot
+            last,
+        ] {
+            let what = format!("{backend}, commit {commit}");
+            let into = tempfile::tempdir().unwrap();
+            let target = into.path().join("restored");
+            let out = restore_from_store(
+                Arc::clone(&b.store),
+                PREFIX,
+                Some(RestoreTarget::CommitSeq(commit)),
+                &target,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(out.commits, commit + 1, "{what}");
+            assert_cut_matches_source(
+                &what,
+                dir.path(),
+                &target,
+                commit,
+                v11_from,
+                commit < live_from,
+            );
+        }
+    }
+}
