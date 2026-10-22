@@ -875,6 +875,8 @@ export class MushroomError extends Error {
     public readonly detail: string,
     /** HTTP status of the response that caused the error, when there was one. */
     public readonly status?: number,
+    /** The server's machine-readable `code` for the error, when it sent one (`conflict`, `busy`). */
+    public readonly code?: string,
   ) {
     super(detail);
     this.name = "MushroomError";
@@ -888,8 +890,8 @@ export class MushroomError extends Error {
  * retry for you.
  */
 export class TransactionConflictError extends MushroomError {
-  constructor(detail: string, status?: number) {
-    super(detail, status);
+  constructor(detail: string, status?: number, code?: string) {
+    super(detail, status, code);
     this.name = "TransactionConflictError";
   }
 }

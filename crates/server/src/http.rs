@@ -37,6 +37,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
+// The `/tx/*` routes and the open-transaction store. Declared here, not in
+// `lib.rs`, so the module reaches this file's private helpers (`graph_err`,
+// `forbidden`, ...) instead of widening each of them to `pub(crate)`.
+#[path = "tx.rs"]
+mod tx;
+pub use tx::TxLimits;
+pub(crate) use tx::TxStore;
+
 /// Build the HTTP router over `db`. The graph read endpoints (`/query`,
 /// `/node/{key}`, its `/edges` and `/neighborhood`), `/health`, `/metrics` and
 /// `/algo/*` run on a lock-free [`ReaderSnapshot`], whose capture never waits
@@ -150,6 +158,31 @@ pub fn router_with_cors(
         Arc::new(AtomicBool::new(true)),
         cors,
         None,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`router_with_access_keys`] with the open-transaction limits given instead
+/// of read from `MUSHROOMDB_TX_MAX` and `MUSHROOMDB_TX_TIMEOUT_SECS`. For an
+/// embedder that serves several routers, and for tests that need a short idle
+/// timeout.
+pub fn router_with_tx_limits(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    keys: Option<AccessKeys>,
+    limits: TxLimits,
+) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        keys,
+        TxStore::new(limits),
     )
 }
 
@@ -613,7 +646,18 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app_with_ready(db, token, role_tokens, ui, local, false, ready_flag, keys);
+    let txs = TxStore::new(TxLimits::from_env());
+    let app = build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        local,
+        false,
+        ready_flag,
+        keys,
+        txs.clone(),
+    );
     match shutdown {
         None => axum::serve(listener, app).await,
         // Stop accepting, then let every request already in flight finish.
@@ -623,6 +667,9 @@ async fn serve_inner(
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.await;
+                    // The start of the drain: open transactions roll back and
+                    // a new `begin` is refused.
+                    txs.close();
                 })
                 .await
         }
@@ -719,7 +766,8 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
     if ready.send(local).is_err() {
         eprintln!("serve_tls: readiness receiver dropped before bind notify");
     }
-    let app = build_app_with_ready(
+    let txs = TxStore::new(TxLimits::from_env());
+    let app = build_app_with_ready_and_txs(
         db,
         token,
         role_tokens,
@@ -728,12 +776,14 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
         true,
         ready_flag,
         keys,
+        txs.clone(),
     );
     let handle = axum_server::Handle::new();
     tokio::spawn({
         let handle = handle.clone();
         async move {
             let _ = shutdown.await;
+            txs.close();
             handle.graceful_shutdown(Some(TLS_GRACE));
         }
     });
@@ -785,6 +835,33 @@ fn build_app_with_ready(
     ready: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
 ) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        ready,
+        keys,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`build_app_with_ready`] over a transaction store the caller holds, so the
+/// serve loop can close it when the shutdown signal arrives.
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_ready_and_txs(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    txs: TxStore,
+) -> Router {
     // The CLI validates the variable before it opens the store; an invalid value
     // reaching here (library use) fails closed: no CORS, and an error logged.
     let cors = crate::cors::cors_layer_from_env().unwrap_or_else(|e| {
@@ -801,6 +878,7 @@ fn build_app_with_ready(
         ready,
         cors,
         keys,
+        txs,
     )
 }
 
@@ -815,6 +893,7 @@ fn build_app_with_cors(
     ready: Arc<AtomicBool>,
     cors: Option<tower_http::cors::CorsLayer>,
     keys: Option<AccessKeys>,
+    txs: TxStore,
 ) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
@@ -839,6 +918,7 @@ fn build_app_with_cors(
         started_at: std::time::Instant::now(),
         ready,
         access_keys: keys,
+        txs,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -893,6 +973,7 @@ fn build_app_with_cors(
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
         .route("/backup", post(backup))
+        .merge(tx::routes())
         .with_state(state.clone());
 
     // The two WebSocket routes are built separately and merged unlayered: a
@@ -1254,12 +1335,14 @@ fn role_for_token<'a>(
 
 /// Whether a read-tier key may make this request at all. An allowlist, so a
 /// route added later is refused to read keys until someone decides otherwise:
-/// reads (`GET`), and the two `POST` routes that carry a read (`/query`, whose
-/// handler refuses a write statement, and `/find_similar`).
+/// reads (`GET`), the two `POST` routes that carry a read (`/query`, whose
+/// handler refuses a write statement, and `/find_similar`), and the `/tx/*`
+/// routes: a read key may hold a transaction, whose handler refuses a write.
 fn read_key_may(method: &Method, path: &str) -> bool {
     match *method {
         Method::GET | Method::HEAD => true,
-        Method::POST => path == "/query" || path == "/find_similar",
+        Method::POST => path == "/query" || path == "/find_similar" || path.starts_with("/tx/"),
+        Method::DELETE => path.starts_with("/tx/"),
         _ => false,
     }
 }

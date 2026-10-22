@@ -375,7 +375,9 @@ export class MushroomClient {
     if (!resp.ok) {
       const detail: string =
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail, resp.status);
+      const code: string | undefined =
+        typeof body?.code === "string" ? body.code : undefined;
+      throw new MushroomError(detail, resp.status, code);
     }
     return body as T;
   }
@@ -1012,8 +1014,12 @@ export class MushroomClient {
       return await this.fetchJson<T>(path, init);
     } catch (err) {
       if (err instanceof MushroomError) {
-        if (err.status === 409) {
-          throw new TransactionConflictError(err.detail, err.status);
+        // `busy` is a request that raced another on the same transaction:
+        // nothing is wrong with the transaction, so it is not a conflict and
+        // the handle stays open. Any other 409 (`conflict`, or no code from an
+        // older server) is a commit conflict.
+        if (err.status === 409 && err.code !== "busy") {
+          throw new TransactionConflictError(err.detail, err.status, err.code);
         }
         if (expiredOnMissing && (err.status === 404 || err.status === 410)) {
           throw new TransactionExpiredError(err.detail, err.status);

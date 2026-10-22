@@ -69,8 +69,8 @@ Each method calls one route. The route's page has the request and the response i
 | `client.setNodeProp(` | Set or overwrite one property on a node | [`PUT /node/{key}/prop/{field}`](http.md#put-nodekeypropfield) |
 | `client.removeNodeProp(` | Delete one property from a node | [`DELETE /node/{key}/prop/{field}`](http.md#delete-nodekeypropfield) |
 | `client.backup(` | Copy the store to a directory and verify it | [`POST /backup`](http.md#post-backup) |
-| `client.beginTransaction(` | Open a transaction and return its handle | `POST /tx/begin` |
-| `client.transaction(` | Run a callback in a transaction; commit when it resolves, roll back when it throws | `POST /tx/begin`, `POST /tx/{tx_id}/commit`, `POST /tx/{tx_id}/rollback` |
+| `client.beginTransaction(` | Open a transaction and return its handle | [`POST /tx/begin`](http.md#post-txbegin) |
+| `client.transaction(` | Run a callback in a transaction; commit when it resolves, roll back when it throws | [`POST /tx/begin`](http.md#post-txbegin), [`POST /tx/{tx_id}/commit`](http.md#post-txidcommit), [`POST /tx/{tx_id}/rollback`](http.md#post-txidrollback) |
 | `client.watch(` | Stream the raw mutation log over WebSocket | [`GET /watch`](http.md#get-watch) |
 
 ## Transactions
@@ -99,7 +99,7 @@ try {
 }
 ```
 
-`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. Both extend `MushroomError`. The client does not retry. If a rollback fails after the callback threw, the callback's error is still the one rethrown, with the rollback failure on its `rollbackError` property. If `commit()` fails at the network level its outcome is unknown and the handle refuses further use; a failed `rollback()` can be retried.
+`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`; a request that raced another on the same transaction (the server answers 409 with `code: "busy"`) throws a plain `MushroomError` with `code === "busy"` and leaves the handle open, so it can be retried; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. Both extend `MushroomError`. The client does not retry. If a rollback fails after the callback threw, the callback's error is still the one rethrown, with the rollback failure on its `rollbackError` property. If `commit()` fails at the network level its outcome is unknown and the handle refuses further use; a failed `rollback()` can be retried.
 
 ## What it does not wrap
 

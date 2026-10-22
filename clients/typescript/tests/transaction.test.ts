@@ -216,6 +216,43 @@ describe("beginTransaction", () => {
     expect(tx.isFinished).toBe(true);
   });
 
+  it("a busy 409 is retryable: not a conflict, and the handle stays open", async () => {
+    let commits = 0;
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) {
+        commits += 1;
+        return commits === 1
+          ? { status: 409, body: { error: "transaction busy", code: "busy" } }
+          : { status: 200, body: { bookmark: 5 } };
+      }
+      return { status: 409, body: { error: "transaction busy", code: "busy" } };
+    };
+    const tx = await client.beginTransaction();
+    const runErr = await tx.execute("RETURN 1").catch((e: unknown) => e);
+    expect(runErr).toBeInstanceOf(MushroomError);
+    expect(runErr).not.toBeInstanceOf(TransactionConflictError);
+    expect((runErr as MushroomError).code).toBe("busy");
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MushroomError);
+    expect(err).not.toBeInstanceOf(TransactionConflictError);
+    expect(tx.isFinished).toBe(false);
+    // The same handle commits once the server is free.
+    await expect(tx.commit()).resolves.toBe(5);
+  });
+
+  it("a 409 with code conflict is a TransactionConflictError", async () => {
+    handler = (req) =>
+      req.path === "/tx/begin"
+        ? { status: 200, body: { tx_id: "abc123", expires_at: 1 } }
+        : { status: 409, body: { error: "CAS conflict", code: "conflict" } };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TransactionConflictError);
+    expect((err as TransactionConflictError).code).toBe("conflict");
+    expect(tx.isFinished).toBe(true);
+  });
+
   it("maps 404 on commit to TransactionExpiredError", async () => {
     handler = (req) =>
       req.path === "/tx/begin"
