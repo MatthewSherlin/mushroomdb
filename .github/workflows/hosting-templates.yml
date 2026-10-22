@@ -22,6 +22,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request cancels the run it supersedes. Pushes
+# to main and release/** each run to the end.
+concurrency:
+  group: hosting-templates-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -70,25 +76,20 @@ jobs:
       AWS_REGION: us-east-1
       MUSHROOMDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
       MUSHROOMDB_TEST_S3_BUCKET: mushroomdb-test
+      # Chainguard's free images publish only `latest`, so an old digest can
+      # stop resolving; the job then fails at `docker run`. The fix is this one
+      # line: `docker buildx imagetools inspect cgr.dev/chainguard/minio:latest`
+      # gives the current index digest.
       MINIO_IMAGE: cgr.dev/chainguard/minio@sha256:d88920d6a50bd0b088223b688be3b76c63e6205dbe494437f67ba1240ea12880
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Toolchain version comes from rust-toolchain.toml — keep the two in sync.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
-      # A test file that reads MUSHROOMDB_TEST_S3_ENDPOINT outside the targets
-      # run below would skip here unseen. Add its target below, then here.
-      - name: every S3-gated test file is run by this job
-        run: |
-          set -euo pipefail
-          bad=0
-          while IFS= read -r f; do
-            case "$f" in
-              crates/backup/*|crates/cli/tests/serve_backup.rs) echo "covered: $f" ;;
-              *) echo "::error file=$f::reads MUSHROOMDB_TEST_S3_ENDPOINT but the s3-backup job does not run it"; bad=1 ;;
-            esac
-          done < <(grep -rl --include='*.rs' MUSHROOMDB_TEST_S3_ENDPOINT crates)
-          exit "$bad"
+      # Lists the S3-gated tests from source, and fails if a file outside
+      # scripts/s3-gated-tests.py's GATED_FILES reads the variable.
+      - name: the S3-gated tests, from source
+        run: python3 scripts/s3-gated-tests.py
       - name: start MinIO and create the bucket
         run: |
           set -euo pipefail
@@ -115,24 +116,16 @@ jobs:
           set -euo pipefail
           cargo test -p mushroomdb-backup -- --show-output 2>&1 | tee "$RUNNER_TEMP/s3-tests.log"
           cargo test -p mushroomdb-cli --test serve_backup -- --show-output 2>&1 | tee -a "$RUNNER_TEMP/s3-tests.log"
-      - name: no S3 test skipped
-        run: |
-          set -euo pipefail
-          if grep -n 'skipping the S3 test' "$RUNNER_TEMP/s3-tests.log"; then
-            echo "::error::an S3-gated test skipped although MinIO was up"
-            exit 1
-          fi
-          # And they ran at all: minio.rs's eight s3_ tests (at the time of
-          # writing) and serve's restore on boot passed.
-          ran="$(grep -cE '^test s3_[a-z0-9_]+ \.\.\. ok$' "$RUNNER_TEMP/s3-tests.log" || true)"
-          echo "s3_ tests passed: $ran"
-          test "$ran" -ge 8
-          grep -qE '^test restore_on_boot_empty_dir \.\.\. ok$' "$RUNNER_TEMP/s3-tests.log"
+      # Every S3-gated test found in source must have passed, and the log
+      # must hold no skip line. The expected set is read from source, not set
+      # by hand: see scripts/s3-gated-tests.py for how a new test is counted.
+      - name: every S3-gated test ran, none skipped
+        run: python3 scripts/s3-gated-tests.py --check-log "$RUNNER_TEMP/s3-tests.log"
       - if: failure()
         run: docker logs minio 2>&1 | tail -n 100 || true
 
   # fly.toml: `flyctl config validate --strict` checks the file locally
-  # (unknown keys and sections included). flyctl refuses to start without some
+  # (unknown keys and sections included), and any warning fails the job. flyctl refuses to start without some
   # token but makes no API call for this command, so a dummy one is given.
   fly-lint:
     needs: [changes]
@@ -155,8 +148,15 @@ jobs:
       - name: flyctl config validate
         env:
           FLY_API_TOKEN: not-a-real-token
+        # A warning fails too: flyctl warns where it will silently change a
+        # value (a check's grace_period over 60 s is lowered to 60 s).
         run: |
-          "$RUNNER_TEMP/flyctl" config validate --strict -c deploy/fly/fly.toml
+          set -euo pipefail
+          "$RUNNER_TEMP/flyctl" config validate --strict -c deploy/fly/fly.toml 2>&1 | tee "$RUNNER_TEMP/fly-validate.log"
+          if grep -qi 'warn' "$RUNNER_TEMP/fly-validate.log"; then
+            echo "::error file=deploy/fly/fly.toml::flyctl config validate warned; fix the template"
+            exit 1
+          fi
 
   # The K8s manifest. `kubectl apply --dry-run=client` still needs an API
   # server (for its OpenAPI schema and resource discovery), so a pinned

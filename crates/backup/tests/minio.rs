@@ -6,6 +6,11 @@
 //! must exist. Credentials come from `AWS_ACCESS_KEY_ID` /
 //! `AWS_SECRET_ACCESS_KEY`, defaulting to MinIO's `minioadmin`. Each run writes
 //! under a fresh prefix.
+//!
+//! CI (the `s3-backup` job) runs these against MinIO and fails unless every
+//! S3 test it finds in this file passed. A new test is counted when it starts
+//! with `let Some(b) = bucket() else { return };` (or `bucket_with`): see
+//! `scripts/s3-gated-tests.py`.
 
 use backup::lease::{lease_key, LeaseRecord};
 use backup::manifest::{crc32_hex, latest_key, parse_segment_key};

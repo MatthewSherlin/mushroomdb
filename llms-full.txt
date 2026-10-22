@@ -13019,15 +13019,19 @@ runs on every push and pull request into `main` and `release/**`.
 | Job | Runs | What it checks |
 | --- | --- | --- |
 | `s3-backup` | Always | Every S3-gated test against a MinIO started in the job, then `scripts/minio-smoke-test.sh` |
-| `fly-lint` | When `deploy/**`, the `Dockerfile` or the workflow change | `flyctl config validate --strict` on `deploy/fly/fly.toml` |
+| `fly-lint` | When `deploy/**`, the `Dockerfile` or the workflow change | `flyctl config validate --strict` on `deploy/fly/fly.toml`; a warning fails it too |
 | `k8s-lint` | Same | `kubeconform -strict` on `deploy/k8s/statefulset.yaml`, and `docker compose config` on the Compose file |
 | `docker-build` | On pushes that change the image's inputs | `docker build --no-cache`, with `--features tls` as the Dockerfile builds it. On pull requests, the `docker` job in `ci.yml` builds and runs the same Dockerfile |
 
 The S3-gated tests read `MUSHROOMDB_TEST_S3_ENDPOINT`. Without it each one
 prints `skipping the S3 test` and passes, which is why the main workflow,
 which starts no S3 service, never really ran them. `s3-backup` fails if any
-test prints that line. It also fails if a test file that reads the variable
-is outside the targets it runs, or if fewer of the tests pass than it expects.
+test prints that line. `scripts/s3-gated-tests.py` finds the S3-gated tests
+in the source: those that call their file's gate helper (`bucket()` in
+`crates/backup/tests/minio.rs`, `S3Env::from_env()` in
+`crates/cli/tests/serve_backup.rs`) or read the variable themselves. The job
+fails unless every one of them passed, and fails if any other file reads the
+variable.
 
 The smoke script runs the built binary end to end:
 
@@ -13343,8 +13347,11 @@ WAL segments since. To measure it, time `mushroomdb restore --from <url>
 --into /tmp/probe` from the same region. Then give the platform's start
 window that time plus the store's open time, with a margin:
 
-- **Fly.io:** `grace_period` of the `/ready` check in `fly.toml` (120 s in the
-  template).
+- **Fly.io:** `grace_period` of the `/ready` check in `fly.toml` is 60 s in
+  the template, which is the most Fly accepts: flyctl lowers a longer value to
+  60 s. A restore and open that take longer leave the check failing and the
+  machine marked unhealthy until `/ready` answers. What Fly does with such a
+  machine is confirmed at the release gate's Fly deploy.
 - **Railway:** `healthcheckTimeout` in `railway.json` (120 s in the template).
 - **Kubernetes:** a `startupProbe` on `/ready` whose `failureThreshold` times
   `periodSeconds` covers the restore.

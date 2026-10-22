@@ -5,6 +5,11 @@
 //! The upload test needs a real S3-compatible service and runs only when
 //! `MUSHROOMDB_TEST_S3_ENDPOINT` is set (bucket `MUSHROOMDB_TEST_S3_BUCKET`,
 //! default `mushroomdb-test`, must exist; credentials default to MinIO's).
+//!
+//! CI (the `s3-backup` job) runs these against MinIO and fails unless every
+//! S3 test it finds in this file passed. A new S3 test is counted when it
+//! starts with `let Some(s3) = S3Env::from_env() else { return };`: see
+//! `scripts/s3-gated-tests.py`.
 use backup::object_store::path::Path as ObjectPath;
 use backup::object_store::ObjectStore as _;
 use std::io::{BufRead, BufReader};

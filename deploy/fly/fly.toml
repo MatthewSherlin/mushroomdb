@@ -63,7 +63,11 @@ kill_timeout = 60
   [[services.http_checks]]
     interval = "10s"
     timeout = "5s"
-    grace_period = "120s"   # allow WAL replay (and a restore on boot) before the first check counts
+    # Fly's maximum: flyctl lowers anything longer to 60 s. A WAL replay or a
+    # restore on boot that takes longer leaves the check failing, and the
+    # machine unhealthy, until /ready answers (docs/site/deployment.md,
+    # "Restoring on boot").
+    grace_period = "60s"
     method = "get"
     path = "/ready"
 

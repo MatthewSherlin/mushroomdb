@@ -162,6 +162,18 @@ fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
     }
 }
 
+/// flyctl lowers a check's `grace_period` over 60 s to 60 s, so the template
+/// states the value Fly really uses.
+#[test]
+fn the_fly_template_keeps_its_check_grace_period_within_flys_limit() {
+    let text = template("fly/fly.toml");
+    let periods: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("grace_period = "))
+        .collect();
+    assert_eq!(periods, ["\"60s\""], "fly.toml grace_period lines");
+}
+
 /// A Render service with a persistent disk gets a fixed 30 s shutdown delay;
 /// `maxShutdownDelaySeconds` is refused with a disk, so it must not be set,
 /// and `serve` is told to finish inside the window instead.
