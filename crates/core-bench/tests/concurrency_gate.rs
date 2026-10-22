@@ -140,33 +140,21 @@ fn concurrency_gate() {
     // The writer, paused and running readers alternating; against v0.9.2 on
     // this machine when a baseline build is given, interleaved.
     let baseline = std::env::var("MUSHROOMDB_GATE_V092").ok();
-    let first = measure_writer_set(baseline.as_deref());
-    let (alone, under, reads) = (first.alone, first.under, first.reads);
+    let writer = measure_writer_set(baseline.as_deref());
+    let (alone, under, reads) = (writer.alone, writer.under, writer.reads);
     let ratio = under / alone;
     println!(
         "writer: plain commit p50 {alone:.4} ms paused, {under:.4} ms under {} readers (>= {reads:.0} reads/s): {ratio:.2}x (bound {WRITER_UNDER_READERS_MAX}x, reads/s floor {READS_PER_SEC_FLOOR})",
         writer_check_readers()
     );
-    // The paused bound takes the best of up to PAUSED_ATTEMPTS sets (see
-    // PAUSED_ATTEMPTS); the running bound takes the first set only.
-    let vs_v092 = first.vs_v092.map(|(alone_x, under_x)| {
-        let mut best = alone_x;
-        let mut attempts = 1;
-        while best > ALONE_MAX_VS_V092 && attempts < PAUSED_ATTEMPTS {
-            let again = measure_writer_set(baseline.as_deref());
-            let (x, _) = again.vs_v092.expect("the baseline is still set");
-            best = best.min(x);
-            attempts += 1;
-        }
-        println!(
-            "v0.9.2: paused best of {attempts}: {best:.2}x (bound {ALONE_MAX_VS_V092}x, until TX-5c); running {under_x:.2}x (bound {UNDER_MAX_VS_V092}x)"
-        );
-        (best, under_x)
-    });
-    if vs_v092.is_none() {
-        println!(
+    let vs_v092 = writer.vs_v092;
+    match vs_v092 {
+        Some((alone_x, under_x)) => println!(
+            "v0.9.2: paused {alone_x:.2}x (bound {ALONE_MAX_VS_V092}x); running {under_x:.2}x (bound {UNDER_MAX_VS_V092}x)"
+        ),
+        None => println!(
             "v0.9.2: no baseline (MUSHROOMDB_GATE_V092 unset); the v0.9.2 bounds were not checked"
-        );
+        ),
     }
 
     assert!(
@@ -185,7 +173,7 @@ fn concurrency_gate() {
     if let Some((alone_x, under_x)) = vs_v092 {
         assert!(
             alone_x <= ALONE_MAX_VS_V092,
-            "a plain commit with no readers costs {alone_x:.2}x v0.9.2's on this machine at best of {PAUSED_ATTEMPTS}; bound {ALONE_MAX_VS_V092}x (the 1.05x bar plus noise; TX-5c targets 1.05x)"
+            "a plain commit with no readers costs {alone_x:.2}x v0.9.2's on this machine; bound {ALONE_MAX_VS_V092}x (the 1.05x bar plus noise)"
         );
         assert!(
             under_x <= UNDER_MAX_VS_V092,

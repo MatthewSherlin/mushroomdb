@@ -41,6 +41,11 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// blocked behind the writer). With no readers the commit is 1.01× v0.9.2,
 /// and the 0.10 bar for a write path is 1.05×.
 ///
+/// With readers paused the tree sat at 1.10–1.12× v0.9.2 until TX-5c
+/// (2026-10-22): a commit no reader has asked for no longer wakes the
+/// background builder, and a write scope reads the WAL's length and
+/// identity with one `stat`. One measurement now holds the bound.
+///
 /// Three bounds hold that, all on medians of plain fsync-off commits:
 ///
 /// - **Against v0.9.2, on the same machine** (CI builds the v0.9.2 tag with
@@ -51,19 +56,9 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// - **Against this build with its readers paused**, which needs no
 ///   baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
 pub const ALONE_MAX_VS_V092: f64 = 1.15;
-/// Sets of [`V092_ROUNDS`] pairs the paused bound may take the best of.
-///
-/// Interim, by the coordinator's ruling of 2026-10-22: the tree sits at
-/// 1.10–1.12× v0.9.2 with readers paused, from TX-5's per-commit publish and
-/// background builder (the TX-7 base measured the same), so one set at
-/// 1.15× fails about one run in three. Until **TX-5c** removes that cost
-/// (target ≤ 1.05× v0.9.2), the paused check passes if any of up to 3 sets
-/// does; the bound itself stays at 1.15×. TX-5c should set this back to 1.
-pub const PAUSED_ATTEMPTS: usize = 3;
 /// See [`ALONE_MAX_VS_V092`]: the owner accepted up to 1.21×; 1.25× is that
 /// with a 0.04 noise margin. This tree measured 1.01–1.09× v0.9.2 here
-/// (TX-7 fix round 1), with readers paused 1.10–1.12× — the same as the TX-7
-/// base it was built on, so inside the alone margin, not under the bar.
+/// (TX-7 fix round 1).
 pub const UNDER_MAX_VS_V092: f64 = 1.25;
 /// Interleaved v0.9.2 / this-build pairs behind the v0.9.2 bounds. The
 /// alone bound is the 1.05× bar plus a 0.10 noise margin: on the machine

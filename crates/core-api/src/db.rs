@@ -3604,10 +3604,23 @@ impl<F: Fs> GraphDb<F> {
             return Ok(0);
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
-        let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
+        // Before an append the WAL's identity is always checked, so both come
+        // from one look at the file; otherwise only when the WAL grew.
+        let (wal_len, appending_ident) = if before_append {
+            let (len, ident) = self.fs.wal_len_and_ident().map_err(GraphError::Io)?;
+            (len, Some(ident))
+        } else {
+            (self.fs.wal_len().map_err(GraphError::Io)?, None)
+        };
         let wal_replaced = || -> Result<bool> {
-            Ok((before_append || wal_len > self.wal_consumed)
-                && self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident)
+            let ident = match appending_ident {
+                Some(ident) => ident,
+                None if wal_len > self.wal_consumed => {
+                    self.fs.wal_ident().map_err(GraphError::Io)?
+                }
+                None => return Ok(false),
+            };
+            Ok(ident != self.wal_ident)
         };
         if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
             // The WAL no longer continues our state: rebuild from disk. State
