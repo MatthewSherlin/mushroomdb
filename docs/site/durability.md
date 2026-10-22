@@ -299,8 +299,7 @@ key as its `id` property, so a node that had no `id` gains one, and the export
 prints how many; the file reproduces the store exactly when every node's `id`
 equals its key (what `import` and `ingest` write). Things with no Cypher form
 are counted in the export's output rather than silently dropped: properties of the date, time,
-duration and binary types (no statement can store one until the V11 format
-ships), NaN, infinities and `-9223372036854775808` (the lexer has no literal),
+duration and binary types (the Cypher export writes no form for them), NaN, infinities and `-9223372036854775808` (the lexer has no literal),
 a property name or map key with a line break (a statement is one line), a node
 whose `id` differs from its key, and rules.
 
@@ -317,9 +316,9 @@ same rules, whose derived edges are made when the rules are created at the end
 standard input, and the file streams line by line in batches of 50,000
 (`--batch-size`), one WAL frame each, the same path the CSV import uses. The
 store you export must be the whole of what you want back: indexes, constraints
-and views are not part of an export. Until the V11 format ships a store cannot
-hold the newer value types, and an import carrying one is refused by the engine
-with nothing written.
+and views are not part of an export. An import carrying one of the newer value
+types moves the store to the V11 format, as any write of one does; 0.9.x does
+not open a V11 store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
 and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs

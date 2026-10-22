@@ -749,11 +749,10 @@ fn round_trip_jsonl_edges_skip_derived_and_refuse_dangling() {
     assert!(e.contains("d.jsonl:1: dst `zz` is not a node"), "{e}");
 }
 
-/// A store holds none of the five new types until the V11 format lands, so an
-/// import that carries one is refused whole, by the engine's own message, with
-/// nothing written.
+/// An import that carries one of the five new types moves the store to V11
+/// (TY-12) and stores the value as it was written.
 #[test]
-fn round_trip_importing_a_typed_value_is_refused_until_v11() {
+fn round_trip_importing_a_typed_value_moves_the_store_to_v11() {
     let dir = tmp("typed");
     let nodes = dir.join("n.jsonl");
     std::fs::write(
@@ -761,7 +760,7 @@ fn round_trip_importing_a_typed_value_is_refused_until_v11() {
         "{\"key\":\"a\",\"label\":\"T\",\"born\":{\"$date\":\"2024-01-15\"}}\n",
     )
     .unwrap();
-    let e = run_import_inputs(
+    let report = run_import_inputs(
         &dir.join("db"),
         &ImportInputs {
             nodes_jsonl: Some(nodes),
@@ -770,10 +769,15 @@ fn round_trip_importing_a_typed_value_is_refused_until_v11() {
         &ImportOptions::default(),
         &mut |_| {},
     )
-    .unwrap_err()
-    .to_string();
-    assert!(e.contains("V11"), "{e}");
-    assert_eq!(GraphDb::open(&dir.join("db")).unwrap().node_count(), 0);
+    .unwrap();
+    assert_eq!(report.nodes_inserted, 1);
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert!(db.is_v11());
+    assert_eq!(db.get_prop("a", "born"), Some(Value::Date(19_737)));
+    assert_eq!(
+        mushroomdb::snapshot_version_at(&dir.join("db")).unwrap(),
+        Some(11)
+    );
 }
 
 #[test]
@@ -904,11 +908,18 @@ fn jsonl_import_throughput_above_50k_per_second() {
 #[test]
 fn round_trip_ignore_errors_retries_a_rejected_node_batch_row_by_row() {
     let dir = tmp("retry");
+    // The store's unique constraint rejects `b`, whose `n` is `held`'s.
+    {
+        let mut db = GraphDb::open(&dir.join("db")).unwrap();
+        db.create_constraint("uniq_n", "T", "n").unwrap();
+        db.insert_node("T", "held", vec![("n".into(), Value::Int(7))])
+            .unwrap();
+    }
     let nodes = dir.join("n.jsonl");
     std::fs::write(
         &nodes,
         "{\"key\":\"a\",\"label\":\"T\"}\n\
-         {\"key\":\"b\",\"label\":\"T\",\"d\":{\"$date\":\"2024-01-15\"}}\n\
+         {\"key\":\"b\",\"label\":\"T\",\"n\":7}\n\
          {\"key\":\"c\",\"label\":\"T\"}\n",
     )
     .unwrap();

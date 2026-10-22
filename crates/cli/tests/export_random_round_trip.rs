@@ -167,10 +167,16 @@ fn build(dir: &Path, seed: u64, limits: Limits) -> Db {
     })
     .unwrap();
 
-    // The new value types are refused by the engine, whole, with nothing written.
-    if rng.chance(2) {
-        for typed in [
+    // The new value types, stored once the store is V11 (TY-12), round-trip
+    // through the file formats too; the Cypher export skips them by design.
+    if !limits.cypher && rng.chance(2) {
+        let typed = [
             Value::Date(19_737),
+            Value::LocalDateTime(1_705_322_096_789_012),
+            Value::DateTime {
+                micros_utc: 1_705_322_096_789_012,
+                offset_seconds: -18_000,
+            },
             Value::List(vec![Value::Int(1), Value::Date(0)]),
             Value::Binary(vec![1, 2]),
             Value::Duration {
@@ -178,13 +184,18 @@ fn build(dir: &Path, seed: u64, limits: Limits) -> Db {
                 days: 2,
                 nanos: 3,
             },
-        ] {
-            let r = db.write_batch(|b| {
-                b.insert_node("Typed", "typed-node", vec![("v".into(), typed.clone())]);
-            });
-            assert!(r.is_err(), "seed {seed}: {typed:?} must be refused");
-            assert!(!db.has_node("typed-node"), "seed {seed}: nothing written");
-        }
+        ];
+        db.write_batch(|b| {
+            for (i, v) in typed.iter().enumerate() {
+                b.insert_node(
+                    "Typed",
+                    &format!("typed-{i}"),
+                    vec![("v".into(), v.clone())],
+                );
+            }
+        })
+        .unwrap_or_else(|e| panic!("seed {seed}: typed values are stored: {e}"));
+        assert!(db.is_v11(), "seed {seed}: the store moved to V11");
     }
     db
 }
