@@ -7962,6 +7962,9 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
+                   MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix restores the newest backup there into an
+                   empty <db-dir> before the port is bound, as a new lineage that keeps backing up beside
+                   it; a prefix with no backup starts an empty store, any other failure exits 1
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
 ```
 
@@ -13281,7 +13284,60 @@ kubectl apply -f deploy/k8s/statefulset.yaml
 - **One replica.** mushroomdb is single-writer; the manifest ships no autoscaler.
 - **Volume ownership.** `fsGroup: 65532` gives the non-root image a writable volume. A storage class that ignores `fsGroup` shows as a permission-denied crash loop on `/data`.
 - **Placeholder token.** `serve` refuses the literal `<set-me>` as a token and exits with status 1.
+- **Backup.** `MUSHROOMDB_BACKUP_S3_URL` and `MUSHROOMDB_RESTORE_FROM_S3` are in the ConfigMap, commented out. The `AWS_*` credentials belong in a Secret of your own.
 - **Not yet verified on a live cluster.**
+
+## How CI checks the templates and the backup
+
+The `hosting-templates` workflow (`.github/workflows/hosting-templates.yml`)
+runs on every push and pull request into `main` and `release/**`.
+
+| Job | Runs | What it checks |
+| --- | --- | --- |
+| `s3-backup` | Always | Every S3-gated test against a MinIO started in the job, then `scripts/minio-smoke-test.sh` |
+| `fly-lint` | When `deploy/**`, the `Dockerfile` or the workflow change | `flyctl config validate --strict` on `deploy/fly/fly.toml`; a warning fails it too |
+| `k8s-lint` | Same | `kubeconform -strict` on `deploy/k8s/statefulset.yaml`, and `docker compose config` on the Compose file |
+| `docker-build` | On pushes that change the image's inputs | `docker build --no-cache`, with `--features tls` as the Dockerfile builds it. On pull requests, the `docker` job in `ci.yml` builds and runs the same Dockerfile |
+
+The S3-gated tests read `MUSHROOMDB_TEST_S3_ENDPOINT`. Without it each one
+prints `skipping the S3 test` and passes, which is why the main workflow,
+which starts no S3 service, never really ran them. `s3-backup` fails if any
+test prints that line. `scripts/s3-gated-tests.py` finds the S3-gated tests
+in the source: those that call their file's gate helper (`bucket()` in
+`crates/backup/tests/minio.rs`, `S3Env::from_env()` in
+`crates/cli/tests/serve_backup.rs`) or read the variable themselves. The job
+fails unless every one of them passed, and fails if any other file reads the
+variable.
+
+The smoke script runs the built binary end to end:
+
+1. `serve` with backup on takes 10 writes over HTTP.
+2. `<prefix>/LATEST` appears in the bucket.
+3. `mushroomdb restore --from` returns all 10 nodes.
+4. `serve` stops cleanly on SIGTERM.
+5. A `serve` with `MUSHROOMDB_RESTORE_FROM_S3`, started on an empty directory, serves the same 10 nodes.
+
+To run it locally against any S3-compatible service:
+
+```text
+MUSHROOMDB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 bash scripts/minio-smoke-test.sh
+```
+
+The bucket (`MUSHROOMDB_TEST_S3_BUCKET`, default `mushroomdb-test`) must
+exist. The credentials come from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, and default to MinIO's. Without the endpoint the
+script skips, except when `CI` is set: there, a skip is a failure.
+
+Two of the checks work around tool limits:
+
+- `kubectl apply --dry-run=client` still asks an API server for its schema,
+  so the manifest is checked with kubeconform instead. It needs no cluster and
+  validates against the Kubernetes 1.31 schemas at a pinned commit.
+- `flyctl config validate` will not start without a token. It makes no API
+  call for this command, so the job gives it a dummy one.
+
+Every tool is pinned: flyctl and kubeconform by version and SHA-256, the
+actions by commit, and the MinIO image by digest.
 
 ## One writer per backup bucket (the lease)
 
@@ -13345,7 +13401,9 @@ service:
 `mushroomdb restore --from` gives the store it restores a new lineage (see
 [Restoring from the backup](#restoring-from-the-backup)), so back a restored
 store up to a new prefix: point `MUSHROOMDB_BACKUP_S3_URL` for it somewhere
-fresh. The worker refuses the prefix in three cases:
+fresh. A store restored on boot is the one exception: it continues the prefix
+it came from as a new lineage (see [Restoring on boot](#restoring-on-boot)).
+The worker refuses the prefix in three cases:
 
 - the prefix's newest restore point is another store's;
 - this store has never been backed up but the prefix has restore points;
@@ -13355,7 +13413,8 @@ fresh. The worker refuses the prefix in three cases:
 On refusal it uploads nothing and deletes nothing, reports unhealthy with the
 reason, and releases the lease. Use a new prefix for such a store. Retention
 deletes only this lineage's objects. It never deletes the restore point it has
-just written or the one `LATEST` names.
+just written, the one `LATEST` names, or an object another lineage's restore
+point names.
 
 **What can go wrong, exactly:**
 
@@ -13376,10 +13435,10 @@ just written or the one `LATEST` names.
   with `mushroomdb restore`, which gives the copy a new lineage, or give such a
   copy a new prefix.
 
-This is tracked as row 138 of the
+This was row 138 of the
 [defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
-a release blocker. It stays open until restore on boot, which is not built
-yet, gives the store it restores a new lineage too.
+closed once both restore paths, `restore --from` and restore on boot, gave the
+store they restore a new lineage. The hand-made copy above is what remains.
 
 ## Restoring from the backup
 
@@ -13467,6 +13526,118 @@ state, not history, as they are for `asof`.
 backups can never be confused with the ones it came from. Pointed at the
 prefix it was restored from, the backup worker refuses it: it uploads nothing
 and deletes nothing there. Back it up to a new prefix.
+
+## Restoring on boot
+
+```text
+MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix
+```
+
+Set on `serve`, this restores the newest restore point of the prefix into the
+data directory when it holds no store, before the store is opened and before
+the port is bound. A replaced machine or a new volume comes back with its data
+without anyone running `mushroomdb restore`. Credentials and the endpoint come
+from the `AWS_*` variables, and the lease settings
+(`MUSHROOMDB_BACKUP_LEASE_TTL`, `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL`,
+`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`) from the same variables backup reads.
+Usually it names the same prefix as `MUSHROOMDB_BACKUP_S3_URL`.
+
+What happens at each start:
+
+| The data directory | The prefix | What serve does |
+| --- | --- | --- |
+| Holds a store | (not contacted) | Logs that it skips the restore, and serves the store |
+| Holds no store | Has a backup | Restores the newest restore point, then serves it |
+| Holds no store | Holds no backup at all | Warns, and starts an empty store: a template's first deploy |
+| Holds no store | Has a backup that cannot be restored | Exits 1 and serves nothing |
+
+"Cannot be restored" covers a manifest or object that is missing, damaged or
+partial, a refused credential, and a network failure that outlasts the
+client's retries. The data directory is then left without a store, so the
+next start tries again rather than serving an empty one. `restore-on-boot:`
+lines on stderr say what happened, how many commits were restored from which
+manifest, and how long it took.
+
+An empty data directory may hold `lost+found` (a new ext4 volume has one), a
+`LOCK` file, an empty `wal.bin`, and what killed restores into it left. Any
+other file makes the restore refuse, naming it: move such files away. The
+variable cannot be combined with `--restore-from` or `--demo-if-empty`, which
+also fill an empty directory; serve refuses the combination at start.
+
+**The lease comes first.** The restore takes the prefix's bucket lease (see
+[the lease](#one-writer-per-backup-bucket-the-lease)) before it reads
+anything, and renews it while it runs. If another instance holds a fresh
+lease, it may still be writing: serve exits 1, naming the holder, and writes
+nothing to the data directory. Stop that instance, or wait for its lease to
+expire, and start again. When backup continues under the same prefix, the
+lease stays renewed while the restored store is opened, however long that
+takes. The backup worker then holds it and renews it at once, and never takes
+it a second time. Otherwise the lease is released once the restore is done.
+It is released as soon as anything fails before the worker holds it.
+
+**The restored store continues the prefix as a new lineage.** Like any restore
+it gets a new `backup.lineage`, and it also gets a `backup.parent` file naming
+the lineage and restore point it came from. The backup worker uses the record
+to continue the prefix the store came from. It does so only while `LATEST`
+still names that same restore point. If another instance has written to the
+prefix since, the prefix is refused, as any other store's would be. The new
+lineage's segments, snapshots and manifests go under generation numbers of
+their own, and `LATEST` moves to its first restore point once the store
+commits anything new. The parent's restore points stay exactly as they were:
+nothing of the parent lineage is overwritten, or deleted by retention. From
+then on `restore --from` follows `LATEST` and restores the new lineage. The
+parent's objects stay in the prefix, byte for byte, for a restore by hand.
+
+**In place, all or nothing.** The data directory is usually a volume's mount
+point. A mount point cannot be replaced by a rename, and its parent may not be
+writable, so this restore stages inside the data directory, in a hidden
+`.<name>.restore-…` directory. It verifies everything there first, as
+`restore --from` does. It then writes `.mushroomdb-restore-install`, naming
+the staged files with their sizes and modification times. It moves them into
+the data directory (`snapshot.bin` and `wal.bin` last), syncs it, removes the
+marker and syncs it again. The store is served only once that last sync has
+succeeded. If it fails, serve exits 1: the next start serves the store, or
+restores it again if a power loss brought the marker back. A failure partway
+removes what it moved.
+
+A crash leaves the marker behind. While it is there, nothing opens the
+directory: `serve`, `mcp`, `query`, every other command, the library and the
+Python binding all refuse it, naming the marker. The next start with the
+variable set takes the lease first, then removes exactly the files the
+marker names, and restores again. It never removes a store that has changed
+since the install, which would mean it may have served writes. If a file the
+marker names has another size or time, or a `snapshot.bin` or `wal.bin` it
+does not name has appeared, serve exits 1, names the marker and removes
+nothing. Delete the marker to keep that store, or empty the directory to
+restore again.
+
+Leftovers of killed restores inside the data directory are swept at the next
+start once their lock is free and they are stale, also on a start that skips
+the restore. Any the sweep has to leave are named on stderr.
+
+**A large restore delays readiness.** The port is bound only once the store
+is restored and open, so the platform's health check sees a process still
+starting, never an empty store. The restore takes about as long as
+downloading the backup: the newest snapshot, the archives it names, and the
+WAL segments since. To measure it, time `mushroomdb restore --from <url>
+--into /tmp/probe` from the same region. Then give the platform's start
+window that time plus the store's open time, with a margin:
+
+- **Fly.io:** `grace_period` of the `/ready` check in `fly.toml` is 60 s in
+  the template, which is the most Fly accepts: flyctl lowers a longer value to
+  60 s. A restore and open that take longer leave the check failing and the
+  machine marked unhealthy until `/ready` answers. What Fly does with such a
+  machine is confirmed at the release gate's Fly deploy.
+- **Railway:** `healthcheckTimeout` in `railway.json` (120 s in the template).
+- **Kubernetes:** a `startupProbe` on `/ready` whose `failureThreshold` times
+  `periodSeconds` covers the restore.
+- **Docker Compose:** the healthcheck's `start_period`, if you add one.
+- **Render:** the deploy waits for `/ready`. A restore longer than Render's
+  wait fails the deploy, so measure it first.
+
+A start window that runs out kills a restore partway. That loses nothing:
+the data directory holds no store, and the next start restores again from the
+beginning.
 
 ## Stopping cleanly, and the grace period
 

@@ -202,6 +202,24 @@ fn main() -> ExitCode {
             if let Err(e) = server::cors_layer_from_env() {
                 return fail(&e);
             }
+            // Restore on boot, checked before anything fills the directory.
+            let restore_from_s3 = match restore_from_s3_url() {
+                Ok(url) => url,
+                Err(e) => return fail(&e),
+            };
+            if restore_from_s3.is_some() {
+                for (set, flag) in [
+                    (restore_from.is_some(), "--restore-from"),
+                    (demo_if_empty, "--demo-if-empty"),
+                ] {
+                    if set {
+                        return fail(&format!(
+                            "MUSHROOMDB_RESTORE_FROM_S3 and {flag} both fill an empty data \
+                             directory; use one of them"
+                        ));
+                    }
+                }
+            }
             // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
             // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
             // collision (flags are inserted last; HashMap retains last writer).
@@ -267,6 +285,7 @@ fn main() -> ExitCode {
                 shutdown_timeout,
                 tls_cert,
                 tls_key,
+                restore_from_s3,
             ))
         }
         Ok(Command::Mcp {
@@ -688,21 +707,14 @@ fn run_serve(
     shutdown_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    restore_from_s3: Option<String>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = rt.block_on(async {
-        // Same guard as `run_mcp`: checked before `open` creates the
-        // directory's files, so it tells a brand-new store from one this
-        // invocation is merely reopening (or one `--demo-if-empty` /
-        // `--restore-from` already populated above, in which case this is
-        // already `true` and nothing here re-declares anything). Declaring
-        // full-text on a populated store builds the index at each open until
-        // a snapshot carries it (ledger row 36), and changes what an existing
-        // store indexes, so an existing store is never touched here.
-        let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
         // `keys.json` beside the store: extra tokens with tiers, re-read on
-        // SIGHUP. An invalid file stops the start, before the store is opened,
-        // rather than serve with the keys the operator meant to add missing.
+        // SIGHUP. An invalid file stops the start, before a boot restore takes
+        // the bucket lease and before the store is opened, rather than serve
+        // with the keys the operator meant to add missing.
         let keys_path = db_dir.join("keys.json");
         let access_keys = mushroomdb::AccessKeys::load(&keys_path).map_err(|e| e.to_string())?;
         // A token configured twice, here and as a key, would be ambiguous.
@@ -720,38 +732,34 @@ fn run_serve(
         // Always, on Unix: SIGHUP re-reads keys.json, picks up one created after
         // the start, and with none is a logged no-op. It must never end the process.
         server::watch_sighup(&access_keys);
+        // Restore on boot comes first: before the store is opened and before
+        // the port is bound, so a platform's health check sees a process
+        // still starting, never an empty store.
+        let boot_lease = match &restore_from_s3 {
+            Some(url) => restore_on_boot(url, &db_dir).await?,
+            None => {
+                if backup::restore::install_interrupted(&db_dir) {
+                    return Err(format!(
+                        "{} holds a restore on boot that stopped while it moved its files in \
+                         ({} is there): a part of a store, which serve will not open. Set \
+                         MUSHROOMDB_RESTORE_FROM_S3 to the backup it came from and start again: \
+                         the boot removes what was moved in and restores again",
+                        db_dir.display(),
+                        backup::restore::INSTALL_MARKER
+                    ));
+                }
+                None
+            }
+        };
         // `GET /ready` answers 503 until the store is open and its schema is in.
         let ready_flag = Arc::new(AtomicBool::new(false));
-        let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
-        // A shared open takes no lock, so an unwritable data directory would
-        // otherwise surface at the first write, long after the platform called
-        // the deploy healthy. Try the write lock once: only a permission
-        // refusal is fatal. A peer holding the lock (`Busy`) is not this
-        // check's business, and serving reads alongside it stays as it was.
-        match db.write_with_wait(Duration::ZERO) {
-            // A read-only mount is a deliberate setup that 0.9.2 served reads
-            // from, so an existing store on one still starts; its writes fail
-            // with the cause. A new store has nothing to serve without a write.
-            Err(GraphError::Unwritable {
-                detail,
-                read_only_filesystem: true,
-                ..
-            }) if !is_new_store => {
-                eprintln!("serve: read-only store, writes will fail: {detail}");
-            }
-            Err(e @ GraphError::Unwritable { .. }) => return Err(e.to_string()),
-            _ => {}
+        let mut boot_lease = boot_lease;
+        let opened = open_for_serve(&db_dir, shutdown_timeout, &mut boot_lease).await;
+        // A lease the worker did not take: give it back at once.
+        if let Some(lease) = boot_lease.take() {
+            lease.release().await;
         }
-        if is_new_store {
-            // The first store most HTTP callers open. Declare the memory
-            // schema before the first write so `recall` can answer on it.
-            db.write()
-                .apply_schema(&mushroomdb::memory_schema::memory_defaults())
-                .map_err(|e| e.to_string())?;
-        }
-        // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
-        // for the life of the server: dropping the sender stops the worker.
-        let (backup, plan) = start_backup(&db, &db_dir, shutdown_timeout)?;
+        let (db, backup, plan) = opened?;
         ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut snapshot_task = None;
@@ -1005,6 +1013,70 @@ fn run_serve(
     result
 }
 
+/// Open the store for `serve`, declare the memory schema on a new one, and
+/// start continuous backup. `boot_lease` is handed to the backup worker,
+/// which renews it at once; it is left in place when this fails earlier, for
+/// the caller to release.
+async fn open_for_serve(
+    db_dir: &std::path::Path,
+    shutdown_timeout: Duration,
+    boot_lease: &mut Option<backup::BootLease>,
+) -> Result<(SharedDb, Option<RunningBackup>, cli::ShutdownPlan), String> {
+    // Test hook: an open that takes this long (a large restored store).
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var(TEST_OPEN_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    // Same guard as `run_mcp`: checked before `open` creates the
+    // directory's files, so it tells a brand-new store from one this
+    // invocation is merely reopening (or one `--demo-if-empty` /
+    // `--restore-from` already populated above, in which case this is
+    // already `true` and nothing here re-declares anything). Declaring
+    // full-text on a populated store builds the index at each open until
+    // a snapshot carries it (ledger row 36), and changes what an existing
+    // store indexes, so an existing store is never touched here.
+    let is_new_store = !mushroomdb::restore::holds_a_store(db_dir);
+    let db = SharedDb::open(db_dir).map_err(|e| e.to_string())?;
+    // A shared open takes no lock, so an unwritable data directory would
+    // otherwise surface at the first write, long after the platform called
+    // the deploy healthy. Try the write lock once: only a permission
+    // refusal is fatal. A peer holding the lock (`Busy`) is not this
+    // check's business, and serving reads alongside it stays as it was.
+    match db.write_with_wait(Duration::ZERO) {
+        // A read-only mount is a deliberate setup that 0.9.2 served reads
+        // from, so an existing store on one still starts; its writes fail
+        // with the cause. A new store has nothing to serve without a write.
+        Err(GraphError::Unwritable {
+            detail,
+            read_only_filesystem: true,
+            ..
+        }) if !is_new_store => {
+            eprintln!("serve: read-only store, writes will fail: {detail}");
+        }
+        Err(e @ GraphError::Unwritable { .. }) => return Err(e.to_string()),
+        _ => {}
+    }
+    if is_new_store {
+        // The first store most HTTP callers open. Declare the memory
+        // schema before the first write so `recall` can answer on it.
+        db.write()
+            .apply_schema(&mushroomdb::memory_schema::memory_defaults())
+            .map_err(|e| e.to_string())?;
+    }
+    // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
+    // for the life of the server: dropping the sender stops the worker.
+    let (backup, plan) = start_backup(&db, db_dir, shutdown_timeout, boot_lease)?;
+    Ok((db, backup, plan))
+}
+
+/// Test hook (the `test-hooks` feature): delay the open in `serve` by this
+/// many milliseconds.
+#[cfg(feature = "test-hooks")]
+const TEST_OPEN_DELAY_ENV: &str = "MUSHROOMDB_TEST_OPEN_DELAY_MS";
+
 /// Test hook, compiled only with the `test-hooks` feature (enabled for this
 /// package's own tests, never in a release build): delay the shutdown
 /// snapshot by this many milliseconds, to exercise the overrun path.
@@ -1127,10 +1199,15 @@ type RunningBackup = (
 /// Also divides `shutdown_timeout` between the shutdown phases. The backup's
 /// flush grace and request deadline are shrunk when its share of a short
 /// timeout is smaller than they are, so the lease release still fits.
+///
+/// `boot_lease` is the bucket lease a restore on boot took on this backup's
+/// prefix: the worker holds it from the start instead of taking one. It is
+/// taken out of the option only once nothing else here can fail.
 fn start_backup(
     db: &SharedDb,
     db_dir: &std::path::Path,
     shutdown_timeout: Duration,
+    boot_lease: &mut Option<backup::BootLease>,
 ) -> Result<(Option<RunningBackup>, cli::ShutdownPlan), String> {
     let Some(mut config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
         return Ok((None, cli::shutdown_plan(shutdown_timeout, Duration::ZERO)));
@@ -1140,15 +1217,148 @@ fn start_backup(
     let store = backup::build_store(&config).map_err(|e| e.to_string())?;
     let budget = plan.backup;
     let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
-    let handle = backup::BackupWorker::spawn(
+    let mut worker = backup::BackupWorker::new(
         config,
         store,
         std::sync::Arc::new(db.clone()),
         db_dir.to_path_buf(),
-        rx,
     )
     .map_err(|e| e.to_string())?;
+    // Taken only here, with nothing left that can fail: the boot's renewer
+    // stops and the worker's renews at once.
+    if let Some(lease) = boot_lease.take() {
+        worker.adopt_lease(lease.detach());
+    }
+    let handle = worker.start(rx);
     Ok((Some((tx, handle, budget)), plan))
+}
+
+/// `MUSHROOMDB_RESTORE_FROM_S3`, checked: `None` when unset or empty.
+fn restore_from_s3_url() -> Result<Option<String>, String> {
+    let Some(url) = std::env::var("MUSHROOMDB_RESTORE_FROM_S3")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    restore_config(&url)?;
+    Ok(Some(url))
+}
+
+/// The configuration a restore on boot from `url` runs with: the bucket
+/// lease settings (`MUSHROOMDB_BACKUP_LEASE_TTL`, `…_LEASE_CONDITIONAL`,
+/// `…_OP_TIMEOUT_MS`) as backup reads them, for the prefix `url` names.
+fn restore_config(url: &str) -> Result<backup::BackupConfig, String> {
+    backup::BackupConfig::from_lookup(|k| match k {
+        "MUSHROOMDB_BACKUP_S3_URL" => Some(url.to_string()),
+        _ => std::env::var(k).ok(),
+    })
+    .map_err(|e| {
+        e.to_string()
+            .replace("MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3")
+    })?
+    .ok_or_else(|| "MUSHROOMDB_RESTORE_FROM_S3 is empty".to_string())
+}
+
+/// Restore on boot from `url` into `db_dir` when it holds no store
+/// ([`backup::restore_on_boot`]), saying what happened on stderr. Returns the
+/// bucket lease to hand to the backup worker when backup continues under
+/// the same prefix; otherwise the lease is released here.
+///
+/// A prefix with no backup is a warning: a first deploy starts an empty
+/// store. Any other failure is an error, and the server does not start.
+async fn restore_on_boot(
+    url: &str,
+    db_dir: &std::path::Path,
+) -> Result<Option<backup::BootLease>, String> {
+    let config = restore_config(url)?;
+    let continues = match backup::BackupConfig::from_env() {
+        Ok(Some(b)) => b.location().ok() == config.location().ok(),
+        _ => false,
+    };
+    let store =
+        backup::build_store(&config).map_err(|e| format!("restore-on-boot from {url}: {e}"))?;
+    let started = std::time::Instant::now();
+    let lease = match backup::restore_on_boot(&config, store, db_dir).await {
+        Ok(backup::BootRestore::Skipped) => {
+            eprintln!(
+                "restore-on-boot: {} already holds a store; not restoring",
+                db_dir.display()
+            );
+            return Ok(None);
+        }
+        Ok(backup::BootRestore::NoBackup { lease }) => {
+            eprintln!("restore-on-boot: warning: {url} holds no backup; starting an empty store");
+            lease
+        }
+        Ok(backup::BootRestore::Restored {
+            outcome,
+            lease,
+            undone,
+            leftovers,
+        }) => {
+            for path in &leftovers {
+                eprintln!(
+                    "restore-on-boot: warning: a killed restore's leftover stays in the data \
+                     directory (in use, too young, or no advisory locks here): {}; remove it once \
+                     no restore runs",
+                    path.display()
+                );
+            }
+            if !undone.is_empty() {
+                eprintln!(
+                    "restore-on-boot: removed what an interrupted restore had moved in: {}",
+                    undone.join(", ")
+                );
+            }
+            for path in &outcome.swept {
+                eprintln!(
+                    "restore-on-boot: removed a killed restore's leftover: {}",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "restore-on-boot: restored {url} into {}: {} commits from {}, {} bytes in {:.1} s",
+                db_dir.display(),
+                outcome.commits,
+                outcome.manifest,
+                outcome.bytes,
+                started.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "restore-on-boot: lineage {} (new; restored from {})",
+                outcome.lineage, outcome.source_lineage
+            );
+            for note in outcome.tail_note.iter().chain(&outcome.install_note) {
+                eprintln!("restore-on-boot: warning: {note}");
+            }
+            lease
+        }
+        Err(e) => {
+            // Some failures leave a store in place (one that may have served
+            // writes, or one whose install is not yet durable): say "holds
+            // no store" only when that is true on disk.
+            let left = if mushroomdb::restore::holds_a_store(db_dir) {
+                format!(
+                    "{} still holds a store; do not empty it without reading the error above",
+                    db_dir.display()
+                )
+            } else {
+                format!("{} holds no store", db_dir.display())
+            };
+            return Err(format!(
+                "restore-on-boot from {url} failed: {e}. Nothing is served, and {left}"
+            ));
+        }
+    };
+    if continues {
+        // Still renewed: the worker takes it over once the store is open.
+        Ok(Some(lease))
+    } else {
+        lease.release().await;
+        Ok(None)
+    }
 }
 
 async fn shutdown_signal() {

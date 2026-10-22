@@ -10,7 +10,9 @@
 //! (defect-ledger row 138).
 
 use backup::manifest::{crc32_hex, latest_key, manifest_key, object_key, side_key};
-use backup::restore::{restore_from_store, RestoreS3Error, RestoreTarget};
+use backup::restore::{
+    inject_fault, restore_from_store, Fault, RestoreS3Error, RestoreTarget, STALE_STAGING_AFTER,
+};
 use backup::{BackupConfig, BackupError, BackupWorker, FileEntry, Manifest};
 use mushroomdb::{GraphDb, RealFs, SharedDb, SnapshotOptions};
 use object_store::local::LocalFileSystem;
@@ -1148,6 +1150,14 @@ async fn a_restore_sweeps_what_killed_restores_into_its_target_left() {
     std::fs::write(p.join(".restored.restore-4242-0a1b2c3d.lock"), b"").unwrap();
     let orphan_lock = p.join(".restored.restore-17-ffffffff.lock");
     std::fs::write(&orphan_lock, b"").unwrap();
+    // Killed a while ago: older than the margin a starting restore gets.
+    for old in [
+        stale.clone(),
+        p.join(".restored.restore-4242-0a1b2c3d.lock"),
+        orphan_lock.clone(),
+    ] {
+        age(&old, STALE_STAGING_AFTER * 2);
+    }
     // A restore still running: its lock file is held.
     let running = p.join(".restored.restore-99-12345678");
     std::fs::create_dir(&running).unwrap();
@@ -1513,4 +1523,176 @@ async fn a_cut_in_an_archive_of_a_v11_store_restores_v11_iff_the_source_was() {
             );
         }
     }
+}
+
+// ── HO-10: carried from the HO-09 re-review (N6-N9) ─────────────────────────
+
+/// Set a file's (or directory's) modification time `by` in the past.
+fn age(path: &Path, by: std::time::Duration) {
+    let t = std::time::SystemTime::now() - by;
+    std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+}
+
+/// N6: a restore creates its lock file, then locks it, then creates its
+/// directory. A sweep in that window finds the lock file unlocked; while it
+/// is young it is not a killed restore's, and neither is a young directory
+/// whose lock file is gone. Both are left alone; the same, aged, are swept.
+#[tokio::test]
+async fn a_young_unlocked_staging_entry_is_not_swept() {
+    let b = in_memory();
+    let (_db, _dir) = two_generations(&b.store).await;
+    let parent = tempfile::tempdir().unwrap();
+    let p = parent.path();
+    let starting_lock = p.join(".restored.restore-7-00000001.lock");
+    std::fs::write(&starting_lock, b"").unwrap();
+    let lockless = p.join(".restored.restore-8-00000002");
+    std::fs::create_dir(&lockless).unwrap();
+
+    let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &p.join("restored"))
+        .await
+        .unwrap();
+    assert!(out.swept.is_empty(), "{:?}", out.swept);
+    assert!(starting_lock.exists() && lockless.exists());
+
+    age(&starting_lock, STALE_STAGING_AFTER * 2);
+    age(&lockless, STALE_STAGING_AFTER * 2);
+    std::fs::remove_dir_all(p.join("restored")).unwrap();
+    let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &p.join("restored"))
+        .await
+        .unwrap();
+    let mut swept = out.swept.clone();
+    swept.sort();
+    assert_eq!(swept, [starting_lock, lockless]);
+}
+
+/// N7: where the lock file cannot be locked (a filesystem without advisory
+/// locks), the restore still succeeds, and a restore that then fails leaves
+/// nothing behind: no lock file, no staging directory, no created parent.
+#[tokio::test]
+async fn a_restore_without_advisory_locks_works_and_leaks_nothing() {
+    let b = in_memory();
+    let (db, _dir) = two_generations(&b.store).await;
+    let parent = tempfile::tempdir().unwrap();
+    let into = parent.path().join("restored");
+    inject_fault(&into, Fault::Lock);
+    let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &into)
+        .await
+        .unwrap();
+    assert_eq!(out.commits, db.read().wal_total_commits().unwrap());
+    assert_eq!(dir_entries(parent.path()), ["restored"]);
+
+    let into = parent.path().join("deeper").join("restored");
+    inject_fault(&into, Fault::Lock);
+    backup::restore::fail_next_install_into(&into);
+    restore_from_store(Arc::clone(&b.store), PREFIX, None, &into)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        dir_entries(parent.path()),
+        ["restored"],
+        "the lock file, the staging directory and the created parent are gone"
+    );
+}
+
+/// N9: a restore that cannot start (the prefix holds no backup) removes
+/// nothing: killed restores' leftovers stay for one that can.
+#[tokio::test]
+async fn a_restore_that_finds_no_backup_sweeps_nothing() {
+    let b = in_memory();
+    let parent = tempfile::tempdir().unwrap();
+    let p = parent.path();
+    let stale = p.join(".restored.restore-4242-0a1b2c3d");
+    std::fs::create_dir(&stale).unwrap();
+    let lock = p.join(".restored.restore-4242-0a1b2c3d.lock");
+    std::fs::write(&lock, b"").unwrap();
+    age(&stale, STALE_STAGING_AFTER * 2);
+    age(&lock, STALE_STAGING_AFTER * 2);
+    let e = restore_from_store(Arc::clone(&b.store), PREFIX, None, &p.join("restored"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, RestoreS3Error::NoBackup { .. }), "{e}");
+    assert!(stale.exists() && lock.exists());
+}
+
+/// N8: a timestamp that resolves to a commit an older manifest holds says
+/// nothing about a damaged tail after the newest one: that restore point
+/// does not need it. (A commit index never reaches this check; a timestamp
+/// does.) The same tail still warns a restore of the newest point.
+#[tokio::test]
+async fn a_timestamp_restoring_an_older_manifest_does_not_report_the_newest_tail() {
+    for (backend, b) in buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&b.store, &db, dir.path());
+        insert(&db, "a", 3);
+        w.run_once().await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        insert(&db, "b", 2);
+        w.run_once().await.unwrap();
+        let newest_key =
+            String::from_utf8(get(&b.store, &latest_key(PREFIX)).await.unwrap()).unwrap();
+        let older = manifest_key(PREFIX, 3);
+        assert!(get(&b.store, &older).await.is_some(), "{backend}");
+        insert(&db, "c", 2);
+        w.run_once().await.unwrap();
+        // Make the third manifest's segments a tail after the second, and
+        // damage the first of them.
+        let third = latest(&b.store).await;
+        let third_key =
+            String::from_utf8(get(&b.store, &latest_key(PREFIX)).await.unwrap()).unwrap();
+        b.store
+            .delete(&ObjectPath::from(third_key.as_str()))
+            .await
+            .unwrap();
+        put(&b.store, &latest_key(PREFIX), newest_key.into_bytes()).await;
+        let second = latest(&b.store).await;
+        let tail_seg = third
+            .segments
+            .iter()
+            .find(|s| !second.segments.iter().any(|t| t.key == s.key))
+            .unwrap_or_else(|| panic!("{backend}: no tail segment"));
+        let mut bytes = get(&b.store, &tail_seg.key).await.unwrap();
+        bytes.truncate(bytes.len() - 1);
+        put(&b.store, &tail_seg.key, bytes).await;
+
+        let at_ms = db.read().commit_time_ms(1).unwrap();
+        let at =
+            time::OffsetDateTime::from_unix_timestamp_nanos(at_ms as i128 * 1_000_000).unwrap();
+        let into = tempfile::tempdir().unwrap();
+        let out = restore_from_store(
+            Arc::clone(&b.store),
+            PREFIX,
+            Some(RestoreTarget::Timestamp(at)),
+            &into.path().join("at"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.manifest, older,
+            "{backend}: the older manifest holds it"
+        );
+        assert_eq!(out.tail_note, None, "{backend}");
+        let newest = restore_from_store(Arc::clone(&b.store), PREFIX, None, &into.path().join("n"))
+            .await
+            .unwrap();
+        assert!(newest.tail_note.is_some(), "{backend}");
+    }
+}
+
+/// N8: a failed fsync of the parent after the final rename is not a failed
+/// restore: the store is in place, and `install_note` says what is in doubt.
+#[tokio::test]
+async fn a_failed_parent_sync_after_the_rename_is_a_note_not_a_failure() {
+    let b = in_memory();
+    let (db, _dir) = two_generations(&b.store).await;
+    let parent = tempfile::tempdir().unwrap();
+    let into = parent.path().join("restored");
+    inject_fault(&into, Fault::DirSync);
+    let out = restore_from_store(Arc::clone(&b.store), PREFIX, None, &into)
+        .await
+        .unwrap();
+    let note = out.install_note.expect("a note");
+    assert!(note.contains("syncing its parent directory"), "{note}");
+    assert!(note.contains("in place"), "{note}");
+    assert_eq!(counts_of(&into), counts(&db));
 }
