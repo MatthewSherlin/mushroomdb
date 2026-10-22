@@ -13,7 +13,7 @@ mod ws;
 
 use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
 
-pub use http::TxLimits;
+pub use http::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 
 /// The root this crate's `tracing` events are filtered by.

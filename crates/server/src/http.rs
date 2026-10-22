@@ -42,8 +42,8 @@ use tower_http::services::ServeDir;
 // `forbidden`, ...) instead of widening each of them to `pub(crate)`.
 #[path = "tx.rs"]
 mod tx;
-pub use tx::TxLimits;
 pub(crate) use tx::TxStore;
+pub use tx::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
 
 /// Build the HTTP router over `db`. The graph read endpoints (`/query`,
 /// `/node/{key}`, its `/edges` and `/neighborhood`), `/health`, `/metrics` and
@@ -330,6 +330,7 @@ pub async fn serve(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -355,6 +356,7 @@ pub async fn serve_with_role_tokens(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -385,6 +387,7 @@ pub async fn serve_with_ui(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -408,6 +411,7 @@ pub async fn serve_with_ui_and_role_tokens(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -434,6 +438,7 @@ pub async fn serve_with_embedded_ui(
         None,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -468,6 +473,7 @@ pub async fn serve_with_shutdown(
         Some(shutdown),
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -490,6 +496,7 @@ pub async fn serve_with_role_tokens_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -505,6 +512,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -516,6 +524,7 @@ pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -540,6 +549,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -556,6 +566,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -567,6 +578,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -590,6 +602,7 @@ pub async fn serve_with_embedded_ui_and_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -606,6 +619,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     serve_inner(
         db,
@@ -617,6 +631,7 @@ pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
         Some(shutdown),
         ready_flag,
         keys,
+        tx_limits,
     )
     .await
 }
@@ -639,6 +654,7 @@ async fn serve_inner(
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -646,7 +662,7 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let txs = TxStore::new(TxLimits::from_env());
+    let txs = TxStore::new(tx_limits);
     let app = build_app_with_ready_and_txs(
         db,
         token,
@@ -736,6 +752,7 @@ pub async fn serve_tls_with_shutdown(
         shutdown,
         Arc::new(AtomicBool::new(true)),
         None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -754,6 +771,7 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
     keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     let config = crate::tls::http_rustls_config(&cert_path, &key_path)?;
     let listener = std::net::TcpListener::bind(addr)?;
@@ -762,7 +780,7 @@ pub async fn serve_tls_with_shutdown_with_ready_flag(
     if ready.send(local).is_err() {
         eprintln!("serve_tls: readiness receiver dropped before bind notify");
     }
-    let txs = TxStore::new(TxLimits::from_env());
+    let txs = TxStore::new(tx_limits);
     let app = build_app_with_ready_and_txs(
         db,
         token,

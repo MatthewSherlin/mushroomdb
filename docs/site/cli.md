@@ -71,6 +71,7 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                  [--bolt-port <port>] [--bolt-tls | --bolt-plaintext] [--bolt-advertised-host <host>] [--bolt-advertised-port <port>]
                  [--bolt-database <name>] [--bolt-max-connections <n>] [--bolt-tx-timeout-secs <secs>] [--bookmark-timeout-secs <secs>]
+                 [--tx-max <n>] [--tx-timeout-secs <secs>] [--tx-max-lifetime-secs <secs>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                    MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix restores the newest backup there into an
@@ -84,9 +85,12 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-tok
                    MUSHROOMDB_BOLT_MAX_CONNECTIONS); --bolt-database names the store (default mushroomdb);
                    --bolt-tx-timeout-secs (default 30) ends an idle transaction; --bookmark-timeout-secs
                    (default 5) bounds a bookmark wait
+                   --tx-max (default 100) open HTTP transactions at once; --tx-timeout-secs (default 30)
+                   ends an idle one and --tx-max-lifetime-secs (default 300) any one; each flag wins over
+                   MUSHROOMDB_TX_MAX, MUSHROOMDB_TX_TIMEOUT_SECS and MUSHROOMDB_TX_MAX_LIFETIME_SECS
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
 
 ### `mcp`
 

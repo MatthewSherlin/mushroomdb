@@ -1081,7 +1081,9 @@ rolls back every open one.
   and the lifetime bound the total, not the size of one.
 - **Limit.** At most `MUSHROOMDB_TX_MAX` transactions are open at once (default 100). `POST /tx/begin`
   beyond that is `503` with `Retry-After: 1` and `too many open transactions (limit N); retry`. The three variables are read when the server starts; a value
-  that is not a positive integer is ignored with a warning.
+  that is not a positive integer is ignored with a warning. `mushroomdb serve` takes the same limits as flags,
+  `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs`; a flag wins over its variable, and must be a
+  positive integer.
 - **One request at a time.** A second request on a transaction while another is still running on it
   is `409` with `{"error": "transaction busy", "code": "busy"}`. A commit conflict is `409` with
   `"code": "conflict"`. A request the client abandons (it hung up, or the 120 s deadline hit) does not

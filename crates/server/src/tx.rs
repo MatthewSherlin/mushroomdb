@@ -118,10 +118,16 @@ impl TxLimits {
     /// value that is unset keeps the default; one that is not a positive
     /// integer keeps the default too and logs a warning.
     pub fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// [`TxLimits::from_env`] reading the three variables through `lookup`
+    /// instead of the process environment.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         Self::from_values(
-            std::env::var(TX_MAX_ENV).ok().as_deref(),
-            std::env::var(TX_TIMEOUT_ENV).ok().as_deref(),
-            std::env::var(TX_MAX_LIFETIME_ENV).ok().as_deref(),
+            lookup(TX_MAX_ENV).as_deref(),
+            lookup(TX_TIMEOUT_ENV).as_deref(),
+            lookup(TX_MAX_LIFETIME_ENV).as_deref(),
         )
     }
 

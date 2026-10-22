@@ -163,6 +163,7 @@ fn main() -> ExitCode {
             tls_cert,
             tls_key,
             bolt,
+            tx,
         }) => {
             // Before anything touches the store (restore, demo, open).
             if let Err(message) =
@@ -300,6 +301,7 @@ fn main() -> ExitCode {
                 tls_key,
                 restore_from_s3,
                 bolt,
+                cli::resolve_tx_limits(&tx, &|name| std::env::var(name).ok()),
             ))
         }
         Ok(Command::Mcp {
@@ -730,6 +732,7 @@ fn run_serve(
     tls_key: Option<PathBuf>,
     restore_from_s3: Option<String>,
     bolt: Option<cli::serve_bolt::BoltSettings>,
+    tx_limits: server::TxLimits,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = rt.block_on(async {
@@ -910,6 +913,7 @@ fn run_serve(
                         stop_rx,
                         ready_flag,
                         Some(access_keys),
+                        tx_limits,
                     )
                     .await;
                 }
@@ -926,6 +930,7 @@ fn run_serve(
                         stop_rx,
                         ready_flag,
                         access_keys,
+                        tx_limits,
                     );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -947,6 +952,7 @@ fn run_serve(
                         stop_rx,
                         ready_flag,
                         Some(access_keys),
+                        tx_limits,
                     )
                     .await
                 }
@@ -960,6 +966,7 @@ fn run_serve(
                         stop_rx,
                         ready_flag,
                         Some(access_keys),
+                        tx_limits,
                     )
                     .await
                 }
@@ -975,6 +982,7 @@ fn run_serve(
                             stop_rx,
                             ready_flag,
                             Some(access_keys),
+                            tx_limits,
                         )
                         .await
                     }
@@ -989,6 +997,7 @@ fn run_serve(
                             stop_rx,
                             ready_flag,
                             Some(access_keys),
+                            tx_limits,
                         )
                         .await
                     }

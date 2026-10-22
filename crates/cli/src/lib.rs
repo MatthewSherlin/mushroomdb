@@ -28,6 +28,7 @@ use mushroomdb::{
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -279,6 +280,10 @@ pub enum Command {
         /// The `--bolt-*` flags; resolved against the environment by
         /// [`serve_bolt::resolve_bolt_settings`].
         bolt: serve_bolt::BoltFlags,
+        /// `--tx-max`, `--tx-timeout-secs`, `--tx-max-lifetime-secs`: the HTTP
+        /// transaction limits; resolved against the environment by
+        /// [`resolve_tx_limits`].
+        tx: TxFlags,
     },
     Mcp {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
@@ -577,6 +582,7 @@ Usage:
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                    [--bolt-port <port>] [--bolt-tls | --bolt-plaintext] [--bolt-advertised-host <host>] [--bolt-advertised-port <port>]
                    [--bolt-database <name>] [--bolt-max-connections <n>] [--bolt-tx-timeout-secs <secs>] [--bookmark-timeout-secs <secs>]
+                   [--tx-max <n>] [--tx-timeout-secs <secs>] [--tx-max-lifetime-secs <secs>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix restores the newest backup there into an
@@ -590,6 +596,9 @@ Usage:
                      MUSHROOMDB_BOLT_MAX_CONNECTIONS); --bolt-database names the store (default mushroomdb);
                      --bolt-tx-timeout-secs (default 30) ends an idle transaction; --bookmark-timeout-secs
                      (default 5) bounds a bookmark wait
+                     --tx-max (default 100) open HTTP transactions at once; --tx-timeout-secs (default 30)
+                     ends an idle one and --tx-max-lifetime-secs (default 300) any one; each flag wins over
+                     MUSHROOMDB_TX_MAX, MUSHROOMDB_TX_TIMEOUT_SECS and MUSHROOMDB_TX_MAX_LIFETIME_SECS
   mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
                     [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
                     [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
@@ -1007,6 +1016,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut bolt = serve_bolt::BoltFlags::default();
+    let mut tx = TxFlags::default();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -1113,6 +1123,8 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
             i += 1;
         } else if let Some(used) = parse_bolt_flag(args, i, &mut bolt)? {
             i += used;
+        } else if let Some(used) = parse_tx_flag(args, i, &mut tx)? {
+            i += used;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1144,7 +1156,76 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         tls_cert,
         tls_key,
         bolt,
+        tx,
     })
+}
+
+/// The HTTP transaction limits as given on `serve`'s command line; `None` is
+/// "not given", which leaves the environment variable (or the default) in
+/// force. Non-zero integers, not `Duration`s, keep [`Command::Serve`] small.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxFlags {
+    /// `--tx-max <n>` (`MUSHROOMDB_TX_MAX`).
+    pub max_open: Option<NonZeroU64>,
+    /// `--tx-timeout-secs <secs>` (`MUSHROOMDB_TX_TIMEOUT_SECS`).
+    pub idle_timeout_secs: Option<NonZeroU64>,
+    /// `--tx-max-lifetime-secs <secs>` (`MUSHROOMDB_TX_MAX_LIFETIME_SECS`).
+    pub max_lifetime_secs: Option<NonZeroU64>,
+}
+
+/// The HTTP transaction limits `serve` runs with: each flag given wins over
+/// its environment variable, read through `env`; a limit given by neither
+/// keeps its default.
+pub fn resolve_tx_limits(
+    flags: &TxFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> server::TxLimits {
+    let mut limits = server::TxLimits::from_lookup(|name| match name {
+        // A flag given: its variable is not read, so an invalid value there
+        // does not warn about a limit that does not apply.
+        server::TX_MAX_ENV if flags.max_open.is_some() => None,
+        server::TX_TIMEOUT_ENV if flags.idle_timeout_secs.is_some() => None,
+        server::TX_MAX_LIFETIME_ENV if flags.max_lifetime_secs.is_some() => None,
+        _ => env(name),
+    });
+    if let Some(n) = flags.max_open {
+        limits.max_open = usize::try_from(n.get()).unwrap_or(usize::MAX);
+    }
+    if let Some(secs) = flags.idle_timeout_secs {
+        limits.idle_timeout = Duration::from_secs(secs.get());
+    }
+    if let Some(secs) = flags.max_lifetime_secs {
+        limits.max_lifetime = Duration::from_secs(secs.get());
+    }
+    limits
+}
+
+/// Reads one `--tx-*` flag at `args[i]` into `tx`, as `--flag value` or
+/// `--flag=value`. Returns how many arguments it used, or `None` when
+/// `args[i]` is not one of them. Every value must be a positive integer.
+fn parse_tx_flag(args: &[&str], i: usize, tx: &mut TxFlags) -> Result<Option<usize>, String> {
+    const VALUED: [&str; 3] = ["--tx-max", "--tx-timeout-secs", "--tx-max-lifetime-secs"];
+    let arg = args[i];
+    let (flag, value, used) = match arg.split_once('=') {
+        Some((flag, value)) if VALUED.contains(&flag) => (flag, value, 1),
+        _ if VALUED.contains(&arg) => {
+            let value = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| format!("missing value for {arg}"))?;
+            (arg, value, 2)
+        }
+        _ => return Ok(None),
+    };
+    let n = value
+        .parse::<NonZeroU64>()
+        .map_err(|_| format!("{flag} must be a positive integer, got: {value}"))?;
+    match flag {
+        "--tx-max" => tx.max_open = Some(n),
+        "--tx-timeout-secs" => tx.idle_timeout_secs = Some(n),
+        _ => tx.max_lifetime_secs = Some(n),
+    }
+    Ok(Some(used))
 }
 
 /// Reads one `--bolt-*` flag (or `--bookmark-timeout-secs`) at `args[i]` into
@@ -3886,6 +3967,7 @@ mod tests {
                         tls_cert,
                         tls_key,
                         bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
@@ -3898,6 +3980,7 @@ mod tests {
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                         assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -3918,6 +4001,7 @@ mod tests {
                         tls_cert,
                         tls_key,
                         bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3933,6 +4017,7 @@ mod tests {
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                         assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -3953,6 +4038,7 @@ mod tests {
                         tls_cert,
                         tls_key,
                         bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3968,6 +4054,7 @@ mod tests {
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                         assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -4425,6 +4512,82 @@ mod tests {
         ] {
             assert!(parse_args(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn serve_parses_the_tx_flags_in_both_spellings_and_refuses_zero() {
+        let tx = |args: &[&str]| match parse_args(args).unwrap() {
+            Command::Serve { tx, .. } => tx,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(tx(&["serve", "/tmp/db"]), TxFlags::default());
+        assert_eq!(
+            tx(&[
+                "serve",
+                "/tmp/db",
+                "--tx-max",
+                "7",
+                "--tx-timeout-secs=4",
+                "--tx-max-lifetime-secs",
+                "60",
+            ]),
+            TxFlags {
+                max_open: NonZeroU64::new(7),
+                idle_timeout_secs: NonZeroU64::new(4),
+                max_lifetime_secs: NonZeroU64::new(60),
+            }
+        );
+        for bad in [
+            &["serve", "/tmp/db", "--tx-max", "0"][..],
+            &["serve", "/tmp/db", "--tx-max"],
+            &["serve", "/tmp/db", "--tx-timeout-secs=0"],
+            &["serve", "/tmp/db", "--tx-max-lifetime-secs", "-5"],
+            &["serve", "/tmp/db", "--tx-timeout-secs", "soon"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_tx_flag_wins_over_its_variable_and_an_unset_flag_leaves_the_variable() {
+        let env = |name: &str| match name {
+            server::TX_MAX_ENV => Some("5".to_string()),
+            server::TX_TIMEOUT_ENV => Some("9".to_string()),
+            server::TX_MAX_LIFETIME_ENV => Some("99".to_string()),
+            _ => None,
+        };
+        let s = Duration::from_secs;
+        let from_env = resolve_tx_limits(&TxFlags::default(), &env);
+        assert_eq!(
+            (
+                from_env.max_open,
+                from_env.idle_timeout,
+                from_env.max_lifetime
+            ),
+            (5, s(9), s(99))
+        );
+        let flags = TxFlags {
+            max_open: NonZeroU64::new(2),
+            idle_timeout_secs: None,
+            max_lifetime_secs: NonZeroU64::new(40),
+        };
+        let mixed = resolve_tx_limits(&flags, &env);
+        assert_eq!(
+            (mixed.max_open, mixed.idle_timeout, mixed.max_lifetime),
+            (2, s(9), s(40))
+        );
+        // Neither: the defaults.
+        assert_eq!(
+            resolve_tx_limits(&TxFlags::default(), &|_| None),
+            server::TxLimits::default()
+        );
+        // A flag given: an invalid variable beside it is not read.
+        let invalid = |name: &str| (name == server::TX_MAX_ENV).then(|| "lots".to_string());
+        let given = TxFlags {
+            max_open: NonZeroU64::new(3),
+            ..TxFlags::default()
+        };
+        assert_eq!(resolve_tx_limits(&given, &invalid).max_open, 3);
     }
 
     #[test]
