@@ -920,6 +920,17 @@ Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
 `collect` accept `DISTINCT`.
 
+Four statistical aggregates read a numeric property or alias: `stDev(x)` (sample
+standard deviation) and `stDevP(x)` (population standard deviation), and
+`percentileCont(x, p)` and `percentileDisc(x, p)`. Names are case-insensitive.
+Nulls are skipped; ints and floats mix; any other value is a type error naming the
+function. `stDev` is null with fewer than two values and `stDevP` with none, and a
+percentile of no values is null. `p` is a number from 0 to 1, a literal or a
+parameter, the same for every row; anything else is an error, even over no rows.
+`percentileDisc` is the nearest-rank value (the input value, with its own type);
+`percentileCont` interpolates linearly between the two nearest ranks and is always
+a float. All four work with grouping keys, `DISTINCT` and aggregate `WITH`.
+
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (read or write RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
 read queries with matching column names. Relationship patterns accept
@@ -1123,6 +1134,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
+| `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |

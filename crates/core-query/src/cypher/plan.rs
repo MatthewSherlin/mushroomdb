@@ -512,9 +512,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             _ => unreachable!(),
         };
         // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
-        if let (AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max, AggArg::Star) =
-            (&func, &arg)
-        {
+        if needs_property_arg(&func) && matches!(arg, AggArg::Star) {
             return Err(format!(
                 "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                 name = func_name(&func),
@@ -539,11 +537,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             match &item.value {
                 RetVal::Agg { func, arg } => {
                     // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
-                    if let (
-                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
-                        AggArg::Star,
-                    ) = (func, arg)
-                    {
+                    if needs_property_arg(func) && matches!(arg, AggArg::Star) {
                         return Err(format!(
                             "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                             name = func_name(func),
@@ -643,11 +637,7 @@ fn compile_with_stage(
         for item in &stage.items {
             match &item.value {
                 RetVal::Agg { func, arg } => {
-                    if let (
-                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
-                        AggArg::Star,
-                    ) = (func, arg)
-                    {
+                    if needs_property_arg(func) && matches!(arg, AggArg::Star) {
                         return Err(format!(
                             "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                             name = func_name(func),
@@ -1817,7 +1807,27 @@ fn check_agg_arg_bound(arg: &AggArg, bound: &BTreeSet<String>) -> Result<(), Str
 /// `SUM(n.age)`, `COUNT(DISTINCT t)`.
 fn agg_column_name(func: &AggFunc, arg: &AggArg) -> String {
     let f = func_name(func);
-    format!("{f}({})", agg_arg_name(arg))
+    match func {
+        AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } => {
+            format!("{f}({}, {})", agg_arg_name(arg), percentile_label(p))
+        }
+        _ => format!("{f}({})", agg_arg_name(arg)),
+    }
+}
+
+/// How a percentile's `p` reads in a default column name.
+fn percentile_label(p: &Operand) -> String {
+    match p {
+        Operand::Lit(core_storage::Value::Int(n)) => n.to_string(),
+        Operand::Lit(core_storage::Value::Float(x)) => x.to_string(),
+        Operand::Param(name) => format!("${name}"),
+        _ => "p".to_string(),
+    }
+}
+
+/// Aggregates that cannot take `*`: they read a value, not a row count.
+fn needs_property_arg(func: &AggFunc) -> bool {
+    !matches!(func, AggFunc::Count | AggFunc::Collect)
 }
 
 fn agg_arg_name(arg: &AggArg) -> String {
@@ -1837,6 +1847,10 @@ fn func_name(func: &AggFunc) -> &'static str {
         AggFunc::Min => "MIN",
         AggFunc::Max => "MAX",
         AggFunc::Collect => "COLLECT",
+        AggFunc::StDev => "stDev",
+        AggFunc::StDevP => "stDevP",
+        AggFunc::PercentileCont { .. } => "percentileCont",
+        AggFunc::PercentileDisc { .. } => "percentileDisc",
     }
 }
 
