@@ -176,6 +176,7 @@ fn segment_excludes_partial_frame() {
 fn manifest_round_trip() {
     let m = Manifest {
         version: MANIFEST_VERSION,
+        lineage: "0123abcd".into(),
         created_at: "2026-10-19T12:00:00Z".into(),
         commit_seq: 4712,
         oldest_commit_seq: 12,
@@ -185,18 +186,21 @@ fn manifest_round_trip() {
             size: 18_432_000,
             crc32: "cbf43926".into(),
             frames: 0,
+            lineage: "0123abcd".into(),
         }],
         wal_generation: 12,
         segments: vec![SegmentEntry {
             key: "pfx/wal/12/00000000000000000000-00000000000000065536".into(),
             crc32: "00000000".into(),
             frames: 17,
+            lineage: "0123abcd".into(),
         }],
     };
     let json = m.to_json();
     let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
     for field in [
         "version",
+        "lineage",
         "created_at",
         "commit_seq",
         "oldest_commit_seq",
@@ -1167,12 +1171,10 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     let dir = tempfile::tempdir().unwrap();
     let db = store_with_a_snapshot(dir.path());
-    let hung: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
-        InMemory::new(),
-        ThrottleConfig {
-            wait_put_per_call: Duration::from_secs(365 * 24 * 3600),
-            ..ThrottleConfig::default()
-        },
+    let inner = mem();
+    let throttled = Arc::new(ThrottledStore::new(
+        Arc::clone(&inner),
+        ThrottleConfig::default(),
     ));
     let (tx, rx) = watch::channel(BackupTrigger::Idle);
     let handle = BackupWorker::spawn(
@@ -1181,13 +1183,21 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
             shutdown_grace_ms: 500,
             ..config(1000)
         },
-        hung,
+        Arc::clone(&throttled) as Arc<dyn ObjectStore>,
         Arc::new(db.clone()),
         dir.path().to_path_buf(),
         rx,
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The worker holds its lease and has uploaded its first restore point.
+    // Now every PUT hangs, and a new snapshot must be uploaded.
+    let first = wait_for_latest(&inner, |_| true).await;
+    throttled.config_mut(|c| c.wait_put_per_call = Duration::from_secs(365 * 24 * 3600));
+    db.write().insert_node("A", "late", vec![]).unwrap();
+    db.write().snapshot_with(ARCHIVING).unwrap();
+    tx.send(BackupTrigger::Snapshot).unwrap();
+    // Less than a renewal interval (10 s): the failures are the snapshot's.
+    tokio::time::sleep(Duration::from_secs(9)).await;
     assert!(
         handle.error_count.load(Ordering::Acquire) >= 3,
         "each timeout is counted"
@@ -1202,6 +1212,11 @@ async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
     );
     let reason = handle.reason.lock().unwrap().clone().unwrap();
     assert!(reason.contains("consecutive failed"), "{reason}");
+    assert_eq!(
+        latest(&inner).await.unwrap().wal_generation,
+        first.wal_generation,
+        "the new snapshot never landed"
+    );
     tx.send(BackupTrigger::Shutdown).unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.join)
         .await

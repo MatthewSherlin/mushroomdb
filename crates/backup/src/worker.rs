@@ -10,8 +10,9 @@
 //! takes no engine lock, so it cannot slow a write. The one exception: when
 //! the files on disk show a snapshot or commits the engine has not seen
 //! (another process wrote them), the worker asks the handle to catch up — the
-//! same metadata check and refresh every read makes. It never writes to the
-//! store directory.
+//! same metadata check and refresh every read makes. It writes one file into
+//! the store directory, once: `backup.lineage`, on the first backup of a store
+//! (see *Lineage*).
 //!
 //! # Consistency
 //!
@@ -41,13 +42,60 @@
 //! names. So at any point — a crash between any two requests included — every
 //! manifest in the bucket verifies, and `LATEST` names one of them.
 //!
+//! # Lineage
+//!
+//! A prefix holds the backups of one store lineage. The first backup of a
+//! store gives it a random lineage id (`backup.lineage`, a side file, so a
+//! store restored from the prefix carries it on). Every manifest and every
+//! object entry names its lineage, and resume checks it before using anything
+//! in the prefix. The worker refuses the prefix — uploads nothing, deletes
+//! nothing, reports unhealthy with the reason — when its newest restore point
+//! is another lineage's, when this store has no lineage but the prefix has
+//! restore points, or when this store holds fewer commits than that restore
+//! point (it was restored from an older backup, or rewound). Archives found
+//! in the prefix are reused only when their number, length and CRC all match
+//! the local file. Retention reads only this lineage's manifests and deletes
+//! only objects of this lineage's generations, never the manifest it just
+//! wrote or the one `LATEST` names.
+//!
+//! # Writes the bucket can refuse
+//!
+//! Every immutable object (segment, side file) is written with
+//! `If-None-Match: *`; an object already there is accepted only with the same
+//! content. Snapshots and archives (multipart) are checked absent first.
+//! Manifests and `LATEST` are written with `If-Match` against the version
+//! this worker last wrote or read. A refusal means another writer is active:
+//! the worker drops its lease and starts over through the lease. A client
+//! without conditional PUT (`MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off`) falls
+//! back to plain writes.
+//!
+//! # The bucket lease
+//!
+//! A spawned worker uploads nothing until it holds the prefix's
+//! [`BucketLease`]. While another instance holds a fresh one the worker
+//! uploads nothing, reports itself unhealthy naming the holder, and tries
+//! again every third of a TTL — so a successor waiting on a holder that died,
+//! or on one shutting down in a rolling deploy, takes over within a TTL. A
+//! separate task renews the lease every third of a TTL; every request that
+//! changes the bucket runs only while [`BucketLease::may_write`] holds and is
+//! cancelled when it stops holding. A lease found lost (taken over) is
+//! dropped, and a lease taken again later starts from the bucket's state
+//! afresh: its previous run's view of the bucket is stale. On shutdown, after
+//! the flush, the lease is deleted. The lease is advisory; see
+//! [`crate::lease`] for what it does and does not guarantee.
+//!
+//! [`BackupWorker::run_once`] and [`BackupWorker::step`] take no lease: they
+//! are for tests and callers that hold one themselves.
+//!
 //! # Health
 //!
 //! A supervisor beside the worker re-evaluates health every `wal_interval_ms`,
 //! whatever the worker is doing, and reports a worker that exits or panics as
-//! unhealthy with the reason. A dead backup never looks healthy.
+//! unhealthy with the reason. A dead backup never looks healthy, and neither
+//! does one kept out of the bucket by its lease.
 
-use crate::disk::{self, DiskState, Ident};
+use crate::disk::{self, DiskState, Ident, LINEAGE_FILE};
+use crate::lease::{new_instance_id, BucketLease, Exclusion, LeaseError, LeaseWatch};
 use crate::manifest::{
     archive_key, crc32_hex, format_crc32, latest_key, manifest_key, object_key, parse_archive_name,
     parse_segment_key, parse_versioned_generation, segment_key, side_key, snapshot_key, FileEntry,
@@ -59,8 +107,8 @@ use crate::BackupError;
 use mushroomdb::{SharedDb, WalPosition};
 use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use object_store::{ObjectStore, PutMode, PutPayload, PutResult, UpdateVersion};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -75,7 +123,8 @@ use tokio::time::Instant;
 ///
 /// `snapshot.intent` is deliberately absent: it describes one machine's
 /// half-finished snapshot and must never be restored onto another (W4 §4).
-pub const SIDE_FILES: [&str; 6] = [
+pub const SIDE_FILES: [&str; 7] = [
+    LINEAGE_FILE,
     "commit_times.bin",
     "roles.json",
     "keys.json",
@@ -99,6 +148,8 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The shortest lag that makes the worker unhealthy: durable data unshipped
 /// for longer than `max(MIN_UNHEALTHY_LAG, 10 × wal_interval)`.
 pub const MIN_UNHEALTHY_LAG: Duration = Duration::from_secs(30);
+/// Retry delay after a failed lease renewal (capped at the renewal interval).
+pub const RENEW_RETRY: Duration = Duration::from_secs(1);
 /// Read size when streaming a snapshot or archive.
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 
@@ -227,6 +278,11 @@ struct HealthState {
     seen_key: Option<WalKey>,
     /// Since when a new restore point has been due and not made.
     base_due_since: Option<Instant>,
+    /// Why the bucket lease keeps this worker from uploading, while it does.
+    lease: Option<String>,
+    /// Why this worker refused the prefix (another lineage, or a rewound
+    /// store). Permanent for the life of the worker.
+    lineage: Option<String>,
     stopped: Option<String>,
 }
 
@@ -284,6 +340,10 @@ impl Health {
         self.lag_s.store(lag.as_secs(), Ordering::Release);
         let reason = if let Some(r) = &s.stopped {
             Some(r.clone())
+        } else if let Some(r) = &s.lineage {
+            Some(r.clone())
+        } else if let Some(r) = &s.lease {
+            Some(r.clone())
         } else if s.consecutive_failures >= UNHEALTHY_AFTER_FAILURES {
             Some(format!(
                 "{} consecutive failed backup steps",
@@ -330,8 +390,10 @@ pub struct BackupWorker {
     /// The snapshot the current generation starts beside.
     snapshot: Option<FileEntry>,
     /// Archives in the bucket, by number, with the local length they were
-    /// uploaded from. An archive is immutable: never uploaded twice.
-    archives: BTreeMap<u64, (u64, FileEntry)>,
+    /// uploaded from. An archive is immutable: never uploaded twice. Entries
+    /// seeded from the bucket at resume are reused only once the local
+    /// file's CRC matches.
+    archives: BTreeMap<u64, Archive>,
     /// Archives the current restore point names.
     base_archives: Vec<u64>,
     /// Side files refreshed at every manifest, by name, with the local
@@ -346,6 +408,42 @@ pub struct BackupWorker {
     panic_next: bool,
     /// LIST requests made, for the retention-cost test.
     lists: u64,
+    /// The bucket lease, while this worker holds it (spawned workers only).
+    lease: Option<Arc<BucketLease>>,
+    /// The task renewing `lease`.
+    renewer: Option<JoinHandle<()>>,
+    /// Leases taken so far; a second one starts from the bucket afresh.
+    tenures: u64,
+    /// The foreign holder last logged, so a wait is logged once.
+    foreign: Option<String>,
+    /// This worker's instance id, the same across every lease attempt.
+    instance_id: String,
+    /// What lease attempts have seen of a suspect foreign lease.
+    watch: LeaseWatch,
+    /// The store's lineage, once resume has established it.
+    lineage: Option<String>,
+    /// Set when resume refused the prefix: the worker uploads nothing more.
+    refused: bool,
+    /// The version of `LATEST` last written or read, for `If-Match`; `None`
+    /// when it does not exist.
+    latest_version: Option<UpdateVersion>,
+    /// The manifest `LATEST` names.
+    latest_target: Option<String>,
+    /// Versions of the manifests this tenure wrote, for `If-Match`.
+    manifest_versions: HashMap<String, UpdateVersion>,
+    /// Generation numbers this tenure allocated.
+    allocated: BTreeSet<u64>,
+}
+
+/// An archive known to be in the bucket.
+#[derive(Debug, Clone)]
+struct Archive {
+    /// Length of the local file it was uploaded from.
+    len: u64,
+    entry: FileEntry,
+    /// Whether the local file is known to have these bytes: uploaded by this
+    /// tenure, or CRC-checked against the entry.
+    verified: bool,
 }
 
 impl BackupWorker {
@@ -388,12 +486,26 @@ impl BackupWorker {
             write_budget: None,
             panic_next: false,
             lists: 0,
+            lease: None,
+            renewer: None,
+            tenures: 0,
+            foreign: None,
+            instance_id: new_instance_id(),
+            watch: LeaseWatch::default(),
+            lineage: None,
+            refused: false,
+            latest_version: None,
+            latest_target: None,
+            manifest_versions: HashMap::new(),
+            allocated: BTreeSet::new(),
         })
     }
 
-    /// Start the worker as a Tokio task. It runs one step at once — reading
-    /// the bucket's previous state and uploading a base restore point — then
-    /// one every `wal_interval_ms`, and one immediately on each trigger.
+    /// Start the worker as a Tokio task. It takes the bucket lease, then runs
+    /// one step at once — reading the bucket's previous state and uploading a
+    /// base restore point — then one every `wal_interval_ms`, and one
+    /// immediately on each trigger. While another instance holds the lease it
+    /// uploads nothing and is unhealthy (see [the module docs](self)).
     ///
     /// # Errors
     ///
@@ -474,6 +586,12 @@ impl BackupWorker {
         }
     }
 
+    /// The instance id this worker takes the bucket lease under, the same
+    /// for every attempt.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     /// Test hook: allow `n` more requests that change the bucket (PUTs and
     /// DELETEs), then fail every one as if the process had been killed just
     /// before it. Drop the worker after the first failure to model a kill
@@ -505,35 +623,185 @@ impl BackupWorker {
             if shutdown {
                 break;
             }
+            // Nothing is uploaded without the bucket lease.
+            if !self.holds_lease() {
+                match until_shutdown(&mut rx, self.take_lease()).await {
+                    None => break,
+                    Some(Some(wait)) => {
+                        delay = wait;
+                        continue;
+                    }
+                    Some(None) => {}
+                }
+            }
             // A step blocked on an unresponsive bucket must not hold up a
             // shutdown: the step is dropped — its in-flight request abandoned
             // — the moment one arrives.
-            let stepped = {
-                let step = self.step();
-                tokio::pin!(step);
-                loop {
-                    tokio::select! {
-                        d = &mut step => break Some(d),
-                        changed = rx.changed() => {
-                            if is_shutdown(changed, &mut rx) {
-                                break None;
-                            }
-                        }
-                    }
-                }
-            };
-            match stepped {
+            match until_shutdown(&mut rx, self.step()).await {
                 Some(d) => delay = d,
                 None => break,
             }
+            if self.refused {
+                break;
+            }
         }
-        let grace = Duration::from_millis(self.config.shutdown_grace_ms);
-        if tokio::time::timeout(grace, self.flush()).await.is_err() {
-            self.error_count.fetch_add(1, Ordering::AcqRel);
-            tracing::warn!(
-                grace_ms = self.config.shutdown_grace_ms,
-                "backup flush did not finish within the shutdown grace; abandoned"
-            );
+        if self.refused {
+            // The prefix is not ours: give the lease back so its owner is not
+            // kept out, and idle, unhealthy, until shutdown.
+            self.release_lease().await;
+            until_shutdown(&mut rx, std::future::pending::<()>()).await;
+            return;
+        }
+        if self.holds_lease() {
+            let grace = Duration::from_millis(self.config.shutdown_grace_ms);
+            if tokio::time::timeout(grace, self.flush()).await.is_err() {
+                self.error_count.fetch_add(1, Ordering::AcqRel);
+                tracing::warn!(
+                    grace_ms = self.config.shutdown_grace_ms,
+                    "backup flush did not finish within the shutdown grace; abandoned"
+                );
+            }
+        }
+        self.release_lease().await;
+    }
+
+    // ── The bucket lease ────────────────────────────────────────────────────
+
+    fn holds_lease(&self) -> bool {
+        self.lease.as_ref().is_some_and(|l| !l.is_lost())
+    }
+
+    /// Try to take the bucket lease. `None` once it is held; otherwise how
+    /// long to wait before trying again.
+    async fn take_lease(&mut self) -> Option<Duration> {
+        if self.lease.as_ref().is_some_and(|l| l.is_lost()) {
+            if let Some(r) = self.renewer.take() {
+                r.abort();
+            }
+            self.lease = None;
+        }
+        let ttl_s = self.config.lease_ttl_s;
+        // A few requests: a read, a conditional write, the two probes.
+        let limit = self.op_timeout() * 4;
+        let acquire = BucketLease::acquire_as(
+            Arc::clone(&self.store),
+            &self.prefix,
+            ttl_s,
+            &self.instance_id,
+            &mut self.watch,
+        );
+        let wait = match tokio::time::timeout(limit, acquire).await {
+            Ok(Ok(lease)) => {
+                self.hold(lease);
+                None
+            }
+            Ok(Err(LeaseError::ForeignActive { instance_id })) => {
+                if self.foreign.as_deref() != Some(instance_id.as_str()) {
+                    tracing::warn!(
+                        holder = %instance_id,
+                        "the backup bucket's lease is held by another instance; \
+                         this one uploads nothing while that lease is fresh"
+                    );
+                    self.foreign = Some(instance_id.clone());
+                }
+                self.health.lock().lease = Some(format!(
+                    "the backup bucket's lease is held by another instance ({instance_id}); \
+                     this instance uploads nothing while it is"
+                ));
+                Some(poll_interval(ttl_s))
+            }
+            Ok(Err(e @ LeaseError::PreconditionsIgnored { .. })) => {
+                tracing::error!(error = %e, "backup is not started");
+                self.health.lock().lease = Some(e.to_string());
+                Some(MAX_BACKOFF)
+            }
+            Ok(Err(LeaseError::Store(e))) if self.config.lease_conditional => {
+                let why = format!(
+                    "taking the bucket lease: {} (if this service rejects conditional PUT \
+                     headers, set MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off)",
+                    crate::redact(&e.to_string())
+                );
+                Some(self.failed(&BackupError::Lease(why)))
+            }
+            Ok(Err(e)) => Some(self.failed(&BackupError::Lease(e.to_string()))),
+            Err(_) => Some(self.failed(&BackupError::Timeout("taking the bucket lease".into()))),
+        };
+        let pos = self.position().await;
+        self.health.observe(&pos, Instant::now());
+        wait
+    }
+
+    /// Hold `lease`: start renewing it, and forget a previous tenure's view
+    /// of the bucket.
+    fn hold(&mut self, lease: BucketLease) {
+        if self.tenures > 0 {
+            self.reset_tenure();
+        }
+        self.tenures += 1;
+        self.foreign = None;
+        self.health.lock().lease = None;
+        match lease.exclusion() {
+            Exclusion::Conditional => tracing::info!(
+                instance_id = lease.instance_id(),
+                "took the backup bucket lease (conditional writes: one writer at a time)"
+            ),
+            Exclusion::BestEffort => tracing::warn!(
+                instance_id = lease.instance_id(),
+                "took the backup bucket lease BEST-EFFORT: conditional writes are off, so two \
+                 instances started together may both upload and overwrite each other's objects"
+            ),
+        }
+        let lease = Arc::new(lease);
+        self.renewer = Some(tokio::spawn(renew_loop(
+            Arc::clone(&lease),
+            self.op_timeout(),
+            self.health.clone(),
+            Arc::clone(&self.error_count),
+        )));
+        self.lease = Some(lease);
+    }
+
+    /// Forget everything known about the bucket: another writer may have
+    /// changed it since this worker last held the lease.
+    fn reset_tenure(&mut self) {
+        self.resumed = false;
+        self.lineage = None;
+        self.latest_version = None;
+        self.latest_target = None;
+        self.manifest_versions.clear();
+        self.allocated.clear();
+        self.next_generation = 0;
+        self.generations.clear();
+        self.current = None;
+        self.snapshot = None;
+        self.archives.clear();
+        self.base_archives.clear();
+        self.side.clear();
+        self.manifest_dirty = false;
+        self.last_manifest_at = None;
+        self.health.lock().shipped = None;
+    }
+
+    /// Stop renewing and delete the lease, if this worker still holds it.
+    async fn release_lease(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        if let Some(r) = self.renewer.take() {
+            r.abort();
+            let _ = r.await;
+        }
+        let Ok(lease) = Arc::try_unwrap(lease) else {
+            return;
+        };
+        match tokio::time::timeout(self.op_timeout(), lease.release()).await {
+            Ok(Ok(())) => tracing::info!("released the backup bucket lease"),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not release the backup bucket lease; it expires by itself")
+            }
+            Err(_) => {
+                tracing::warn!("releasing the backup bucket lease timed out; it expires by itself")
+            }
         }
     }
 
@@ -548,26 +816,29 @@ impl BackupWorker {
                 self.backoff = FIRST_BACKOFF;
                 Duration::from_millis(self.config.wal_interval_ms)
             }
-            Err(e) => {
-                self.error_count.fetch_add(1, Ordering::AcqRel);
-                let failures = {
-                    let mut s = self.health.lock();
-                    s.consecutive_failures += 1;
-                    s.consecutive_failures
-                };
-                let delay = self.backoff;
-                self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-                tracing::warn!(
-                    error = %e,
-                    consecutive_failures = failures,
-                    retry_in_s = delay.as_secs(),
-                    "backup step failed"
-                );
-                delay
-            }
+            Err(e) => self.failed(&e),
         };
         let pos = self.position().await;
         self.health.observe(&pos, Instant::now());
+        delay
+    }
+
+    /// Count a failed step or lease attempt; return the back-off to wait.
+    fn failed(&mut self, e: &BackupError) -> Duration {
+        self.error_count.fetch_add(1, Ordering::AcqRel);
+        let failures = {
+            let mut s = self.health.lock();
+            s.consecutive_failures += 1;
+            s.consecutive_failures
+        };
+        let delay = self.backoff;
+        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        tracing::warn!(
+            error = %e,
+            consecutive_failures = failures,
+            retry_in_s = delay.as_secs(),
+            "backup step failed"
+        );
         delay
     }
 
@@ -610,8 +881,8 @@ impl BackupWorker {
         if std::mem::take(&mut self.panic_next) {
             panic!("test hook: backup worker panics");
         }
-        if !self.resumed {
-            self.resume().await?;
+        if !self.resumed && !self.resume().await? {
+            return self.defer("the store's commit count is not known yet");
         }
         let mut disk = self.observe().await?;
         if disk.intent_nonempty {
@@ -679,8 +950,59 @@ impl BackupWorker {
 
     /// Read what a previous run left in the bucket, so this run never reuses a
     /// generation number and never re-uploads an archive the latest manifest
-    /// names.
-    async fn resume(&mut self) -> Result<(), BackupError> {
+    /// names; and check that the prefix is this store's lineage. `Ok(false)`:
+    /// not yet decidable, try again.
+    ///
+    /// # Errors
+    ///
+    /// [`BackupError::Lineage`] when the prefix belongs to another lineage or
+    /// this store was rewound: the worker then refuses the prefix for good.
+    async fn resume(&mut self) -> Result<bool, BackupError> {
+        let latest = self.latest_manifest().await?;
+        let dir = self.dir.clone();
+        let local = blocking(move || disk::read_lineage(&dir)).await?;
+        let lineage = match (local, &latest) {
+            (Some(ours), Some(m)) if ours != m.lineage => {
+                return Err(self.refuse(format!(
+                    "this backup prefix holds the backups of another store (lineage {}), \
+                     not this one (lineage {ours}); nothing is uploaded or deleted. Point \
+                     MUSHROOMDB_BACKUP_S3_URL at a new prefix, or restore this store from \
+                     that prefix first",
+                    m.lineage
+                )))
+            }
+            (None, Some(m)) => {
+                return Err(self.refuse(format!(
+                    "this backup prefix holds the backups of another store (lineage {}), and \
+                     this store has never been backed up; nothing is uploaded or deleted. \
+                     Point MUSHROOMDB_BACKUP_S3_URL at a new prefix, or restore this store \
+                     from that prefix first",
+                    m.lineage
+                )))
+            }
+            (Some(ours), Some(m)) => match self.position().await.frames {
+                None => return Ok(false),
+                Some(have) if have < m.commit_seq => {
+                    return Err(self.refuse(format!(
+                        "this store holds {have} commits, fewer than the {} of the newest \
+                         restore point in the backup prefix: it was restored from an older \
+                         backup, or rewound. Uploading would bury the newer history, so \
+                         nothing is uploaded or deleted. Point MUSHROOMDB_BACKUP_S3_URL at \
+                         a new prefix",
+                        m.commit_seq
+                    )))
+                }
+                Some(_) => ours,
+            },
+            (Some(ours), None) => ours,
+            (None, None) => {
+                let id = new_instance_id();
+                let (dir, new) = (self.dir.clone(), id.clone());
+                blocking(move || disk::create_lineage(&dir, &new)).await?;
+                tracing::info!(lineage = %id, "this store's first backup: a new backup lineage");
+                id
+            }
+        };
         let wal_dir = ObjectPath::from(object_key(&self.prefix, "wal"));
         for p in self.list(&wal_dir).await?.common_prefixes {
             if let Some(g) = p.filename().and_then(|s| s.parse::<u64>().ok()) {
@@ -696,25 +1018,55 @@ impl BackupWorker {
             }
         }
         let mut highest = self.generations.last().copied();
-        if let Some(m) = self.latest_manifest().await? {
+        if let Some(m) = latest {
             highest = highest.max(Some(m.wal_generation));
             for f in &m.files {
                 if let Some(n) = parse_archive_name(&f.name) {
-                    self.archives.insert(n, (f.size, f.clone()));
+                    self.archives.insert(
+                        n,
+                        Archive {
+                            len: f.size,
+                            entry: f.clone(),
+                            verified: false,
+                        },
+                    );
                 }
             }
         }
         self.next_generation = highest.map_or(0, |g| g + 1);
+        self.lineage = Some(lineage);
         self.resumed = true;
-        Ok(())
+        Ok(true)
     }
 
+    /// Refuse the prefix for the life of this worker, for `why`.
+    fn refuse(&mut self, why: String) -> BackupError {
+        tracing::error!(reason = %why, "backup refuses this prefix");
+        self.health.lock().lineage = Some(why.clone());
+        self.refused = true;
+        BackupError::Lineage(why)
+    }
+
+    /// The lineage resume established; empty before it.
+    fn lineage(&self) -> String {
+        self.lineage.clone().unwrap_or_default()
+    }
+
+    /// The manifest `LATEST` names, remembering `LATEST`'s version and
+    /// target for the next conditional write of it.
     async fn latest_manifest(&mut self) -> Result<Option<Manifest>, BackupError> {
-        let key = match self.get(&latest_key(&self.prefix)).await? {
-            Some(b) => String::from_utf8(b)
-                .map_err(|_| BackupError::Manifest("LATEST is not UTF-8".into()))?,
-            None => return Ok(None),
+        let key = match self.get_versioned(&latest_key(&self.prefix)).await? {
+            Some((b, v)) => {
+                self.latest_version = Some(v);
+                String::from_utf8(b)
+                    .map_err(|_| BackupError::Manifest("LATEST is not UTF-8".into()))?
+            }
+            None => {
+                self.latest_version = None;
+                return Ok(None);
+            }
         };
+        self.latest_target = Some(key.trim().to_string());
         let bytes = self.get(key.trim()).await?.ok_or_else(|| {
             BackupError::Manifest(format!("LATEST names {key}, which does not exist"))
         })?;
@@ -764,14 +1116,39 @@ impl BackupWorker {
         let number = self.next_generation;
         self.next_generation += 1;
         self.generations.insert(number);
+        self.allocated.insert(number);
 
         let mut present = Vec::new();
-        for (n, len, file) in archives {
-            if self.archives.get(&n).is_none_or(|(l, _)| *l != len) {
+        for (n, len, mut file) in archives {
+            let reusable = match self.archives.get(&n) {
+                Some(a) if a.len == len && a.verified => true,
+                Some(a) if a.len == len => {
+                    // Seeded from the bucket: the same number and length are
+                    // not the same bytes until the CRC says so.
+                    let want = a.entry.crc32.clone();
+                    let (crc, f) =
+                        blocking(move || disk::crc32_of(&mut file).map(|c| (c, file))).await?;
+                    file = f;
+                    crc == want
+                }
+                _ => false,
+            };
+            if reusable {
+                if let Some(a) = self.archives.get_mut(&n) {
+                    a.verified = true;
+                }
+            } else {
                 let name = format!("wal.{n}.archive");
                 let key = archive_key(&self.prefix, number, n);
                 let entry = self.put_file(&name, &key, file, true).await?;
-                self.archives.insert(n, (entry.size, entry));
+                self.archives.insert(
+                    n,
+                    Archive {
+                        len: entry.size,
+                        entry,
+                        verified: true,
+                    },
+                );
             }
             present.push(n);
         }
@@ -788,7 +1165,7 @@ impl BackupWorker {
         let archive_frames: u64 = present
             .iter()
             .filter_map(|n| self.archives.get(n))
-            .map(|(_, e)| e.frames)
+            .map(|a| a.entry.frames)
             .sum();
         let snapshot = match snapshot {
             Some((file, _)) => {
@@ -819,13 +1196,14 @@ impl BackupWorker {
         let crc32 = crc32_hex(&bytes);
         let size = bytes.len() as u64;
         let key = side_key(&self.prefix, name, &crc32, size);
-        self.put(&key, bytes).await?;
+        self.put_immutable(&key, bytes, &crc32).await?;
         Ok(FileEntry {
             name: name.to_string(),
             key,
             size,
             crc32,
             frames: 0,
+            lineage: self.lineage(),
         })
     }
 
@@ -902,13 +1280,15 @@ impl BackupWorker {
             let (_, frames) = complete_frames(&bytes);
             let seg_key = segment_key(&self.prefix, number, start, end);
             let crc32 = crc32_hex(&bytes);
-            self.put(&seg_key, bytes).await?;
+            self.put_immutable(&seg_key, bytes, &crc32).await?;
+            let lineage = self.lineage();
             if let Some(g) = self.current.as_mut() {
                 g.cursor = end;
                 g.segments.push(SegmentEntry {
                     key: seg_key,
                     crc32,
                     frames,
+                    lineage,
                 });
             }
             self.record_shipped();
@@ -934,8 +1314,8 @@ impl BackupWorker {
         let mut files = Vec::new();
         files.extend(self.snapshot.clone());
         for n in &self.base_archives {
-            if let Some((_, e)) = self.archives.get(n) {
-                files.push(e.clone());
+            if let Some(a) = self.archives.get(n) {
+                files.push(a.entry.clone());
             }
         }
         files.extend(generation.chain.iter().cloned());
@@ -947,6 +1327,7 @@ impl BackupWorker {
             + generation.segments.iter().map(|s| s.frames).sum::<u64>();
         let manifest = Manifest {
             version: MANIFEST_VERSION,
+            lineage: self.lineage(),
             created_at: now_rfc3339(),
             commit_seq,
             oldest_commit_seq: generation.floor,
@@ -954,30 +1335,37 @@ impl BackupWorker {
             wal_generation: generation.number,
             segments: generation.segments.clone(),
         };
+        // Refuse rather than write a restore point that would not verify.
+        manifest.verify_lineage().map_err(BackupError::Manifest)?;
         let key = manifest_key(&self.prefix, manifest.commit_seq);
-        self.put(&key, manifest.to_json()).await?;
-        self.put(&latest_key(&self.prefix), key.into_bytes())
-            .await?;
+        self.put_manifest(&key, manifest.to_json()).await?;
+        self.put_latest(&key).await?;
         self.manifest_dirty = false;
         self.last_manifest_at = Some(Instant::now());
         if self.config.retain_n > 0 {
-            self.apply_retention().await?;
+            self.apply_retention(&key).await?;
         }
         Ok(())
     }
 
-    /// Keep the newest `retain_n` manifests, then delete every snapshot,
-    /// archive and side file no kept manifest names, and every segment of a
-    /// generation older than every kept manifest's (other than the current
-    /// one). `LATEST` and anything outside those directories is never touched.
+    /// Keep the newest `retain_n` manifests of this lineage, then delete
+    /// what only the dropped ones named.
     ///
-    /// Bounded cost: `wal/` is never listed whole. Only a generation being
-    /// retired has its prefix listed, once; the known generations come from
-    /// one listing of `wal/`'s sub-prefixes at start.
+    /// - Only manifests that parse and name this lineage are counted or
+    ///   deleted; any other manifest under the prefix is left alone.
+    ///   `just_written` and `LATEST`'s target are always kept.
+    /// - Snapshots and archives are deleted when no kept manifest names them
+    ///   and their generation is this lineage's (named by one of its
+    ///   manifests, or allocated by this tenure). Side files are deleted when
+    ///   a dropped manifest named them and no kept one does.
+    /// - Segments: a generation of this lineage older than every kept
+    ///   manifest's (other than the current one) has its prefix listed, once,
+    ///   and its unnamed segments deleted. `wal/` is never listed whole.
     ///
+    /// `LATEST` and anything outside those directories is never touched.
     /// Conservative on doubt: when a kept manifest cannot be read, nothing but
     /// the surplus manifests is deleted.
-    async fn apply_retention(&mut self) -> Result<(), BackupError> {
+    async fn apply_retention(&mut self, just_written: &str) -> Result<(), BackupError> {
         let dir = ObjectPath::from(object_key(&self.prefix, "manifest"));
         let mut keys: Vec<String> = self
             .list(&dir)
@@ -988,37 +1376,64 @@ impl BackupWorker {
             .filter(|k| k.ends_with(".json"))
             .collect();
         keys.sort();
-        if keys.len() <= self.config.retain_n {
+        let ours = self.lineage();
+        let mut mine: Vec<(String, Manifest)> = Vec::new();
+        for k in keys {
+            let Some(bytes) = self.get(&k).await? else {
+                continue;
+            };
+            match Manifest::from_json(&bytes) {
+                Ok(m) if m.lineage == ours => mine.push((k, m)),
+                _ => {}
+            }
+        }
+        if mine.len() <= self.config.retain_n {
             return Ok(());
         }
-        let surplus = keys.len() - self.config.retain_n;
-        for k in &keys[..surplus] {
+        let newest_start = mine.len() - self.config.retain_n;
+        let protected = |k: &str| k == just_written || self.latest_target.as_deref() == Some(k);
+        let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+        for (i, (k, m)) in mine.into_iter().enumerate() {
+            if i >= newest_start || protected(&k) {
+                kept.push((k, m));
+            } else {
+                dropped.push((k, m));
+            }
+        }
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        let mut owned: BTreeSet<u64> = self.allocated.clone();
+        owned.extend(kept.iter().chain(&dropped).map(|(_, m)| m.wal_generation));
+        for (k, _) in &dropped {
             self.delete(k).await?;
         }
         let mut referenced: HashSet<String> = HashSet::new();
         let mut oldest_kept = u64::MAX;
-        for k in &keys[surplus..] {
-            let Some(bytes) = self.get(k).await? else {
-                return Ok(());
-            };
-            let Ok(m) = Manifest::from_json(&bytes) else {
-                return Ok(());
-            };
+        for (_, m) in &kept {
             oldest_kept = oldest_kept.min(m.wal_generation);
-            referenced.extend(m.files.into_iter().map(|f| f.key));
-            referenced.extend(m.segments.into_iter().map(|s| s.key));
+            referenced.extend(m.files.iter().map(|f| f.key.clone()));
+            referenced.extend(m.segments.iter().map(|s| s.key.clone()));
         }
         let mut doomed = Vec::new();
-        for top in ["snapshots", "archives", "side"] {
+        for top in ["snapshots", "archives"] {
             for k in self.list_all(&object_key(&self.prefix, top)).await? {
-                if !referenced.contains(&k) {
+                let ours = parse_versioned_generation(&self.prefix, &k)
+                    .is_some_and(|g| owned.contains(&g));
+                if ours && !referenced.contains(&k) {
                     doomed.push(k);
                 }
             }
         }
+        let side_prefix = object_key(&self.prefix, "side/");
+        let side: BTreeSet<String> = dropped
+            .iter()
+            .flat_map(|(_, m)| m.files.iter().map(|f| f.key.clone()))
+            .filter(|k| k.starts_with(&side_prefix) && !referenced.contains(k))
+            .collect();
+        doomed.extend(side);
         let current = self.current.as_ref().map(|g| g.number);
-        let retiring: Vec<u64> = self
-            .generations
+        let retiring: Vec<u64> = owned
             .iter()
             .copied()
             .filter(|g| *g < oldest_kept && Some(*g) != current)
@@ -1040,7 +1455,7 @@ impl BackupWorker {
             self.generations.remove(&g);
         }
         let keep: HashSet<&String> = referenced.iter().collect();
-        self.archives.retain(|_, (_, e)| keep.contains(&e.key));
+        self.archives.retain(|_, a| keep.contains(&a.entry.key));
         Ok(())
     }
 
@@ -1087,20 +1502,143 @@ impl BackupWorker {
         }
     }
 
-    async fn put(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
+    /// A request that changes the bucket: under the operation deadline and,
+    /// when the worker holds a lease, the lease's fence.
+    async fn fenced<T>(
+        &self,
+        what: impl FnOnce() -> String,
+        fut: impl Future<Output = Result<T, BackupError>>,
+    ) -> Result<T, BackupError> {
+        fence(self.lease.as_deref(), self.deadline(what, fut)).await
+    }
+
+    /// One PUT in `mode`, under the deadline and the fence. The outer error
+    /// is the worker's (deadline, fence, test hook); the inner one is the
+    /// service's answer, for the caller to interpret.
+    async fn put_mode(
+        &mut self,
+        key: &str,
+        payload: PutPayload,
+        mode: PutMode,
+    ) -> Result<Result<PutResult, object_store::Error>, BackupError> {
         self.spend_write()?;
         let path = ObjectPath::from(key);
         let store = Arc::clone(&self.store);
-        self.deadline(|| format!("PUT {key}"), async move {
-            store.put(&path, PutPayload::from(bytes)).await?;
-            Ok(())
+        self.fenced(|| format!("PUT {key}"), async move {
+            Ok(store.put_opts(&path, payload, mode.into()).await)
         })
         .await
     }
 
+    /// Write an immutable object with `If-None-Match: *`. One already there
+    /// is accepted only when its CRC is `crc32` (a retried upload that had
+    /// landed); any other content means another writer.
+    async fn put_immutable(
+        &mut self,
+        key: &str,
+        bytes: Vec<u8>,
+        crc32: &str,
+    ) -> Result<(), BackupError> {
+        let payload = PutPayload::from(bytes);
+        match self.put_mode(key, payload.clone(), PutMode::Create).await? {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::NotImplemented) => {
+                self.put_mode(key, payload, PutMode::Overwrite).await??;
+                Ok(())
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => match self.get(key).await? {
+                Some(b) if crc32_hex(&b) == crc32 => Ok(()),
+                _ => Err(self.conflict(format!("{key} already exists with other content"))),
+            },
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write a manifest: `If-Match` against the version this tenure last
+    /// wrote at `key`; otherwise `If-None-Match: *`, and over an existing one
+    /// only when it is this lineage's (a previous run's restore point at the
+    /// same commit).
+    async fn put_manifest(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
+        let payload = PutPayload::from(bytes);
+        let mode = match self.manifest_versions.get(key) {
+            Some(v) => PutMode::Update(v.clone()),
+            None => PutMode::Create,
+        };
+        let written = match self.put_mode(key, payload.clone(), mode).await? {
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.get_versioned(key).await?;
+                let ours = existing.as_ref().is_some_and(|(b, _)| {
+                    Manifest::from_json(b).is_ok_and(|m| m.lineage == self.lineage())
+                });
+                match existing {
+                    Some((_, v)) if ours => {
+                        self.put_mode(key, payload.clone(), PutMode::Update(v))
+                            .await?
+                    }
+                    _ => return Err(self.conflict(format!("{key} is another lineage's manifest"))),
+                }
+            }
+            other => other,
+        };
+        let r = match written {
+            Ok(r) => r,
+            Err(object_store::Error::NotImplemented) => {
+                self.put_mode(key, payload, PutMode::Overwrite).await??
+            }
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => {
+                return Err(self.conflict(format!("{key} changed since this worker wrote it")))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.manifest_versions
+            .insert(key.to_string(), version_of(r));
+        Ok(())
+    }
+
+    /// Point `LATEST` at `target`, with `If-Match` against the version last
+    /// written or read (`If-None-Match: *` when there was none). A refusal
+    /// means another writer moved it.
+    async fn put_latest(&mut self, target: &str) -> Result<(), BackupError> {
+        let key = latest_key(&self.prefix);
+        let payload = PutPayload::from(target.as_bytes().to_vec());
+        let mode = match &self.latest_version {
+            Some(v) => PutMode::Update(v.clone()),
+            None => PutMode::Create,
+        };
+        let r = match self.put_mode(&key, payload.clone(), mode).await? {
+            Ok(r) => r,
+            Err(object_store::Error::NotImplemented) => {
+                self.put_mode(&key, payload, PutMode::Overwrite).await??
+            }
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::NotFound { .. }) => {
+                return Err(self.conflict("LATEST changed since this worker last wrote it".into()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.latest_version = Some(version_of(r));
+        self.latest_target = Some(target.to_string());
+        Ok(())
+    }
+
+    /// The bucket refused a write because another writer got there first.
+    /// Drop the lease: the worker starts over through it, and resume reads
+    /// the bucket afresh.
+    fn conflict(&mut self, what: String) -> BackupError {
+        let why = format!("another writer is using this backup prefix: {what}");
+        tracing::warn!(reason = %why, "backup write refused by the bucket");
+        if let Some(l) = &self.lease {
+            l.mark_lost();
+            self.health.lock().lease = Some(why.clone());
+        }
+        BackupError::Conflict(why)
+    }
+
     /// Stream `file` to `key`, multipart when large; return its entry, with
     /// its frame count when `count_frames`. Each chunk, and the final commit,
-    /// is under the operation deadline.
+    /// is under the operation deadline and the lease's fence.
     ///
     /// A failure while chunks are being written aborts the upload once. A
     /// failure of the final commit drops it instead: the writer has already
@@ -1113,6 +1651,12 @@ impl BackupWorker {
         file: std::fs::File,
         count_frames: bool,
     ) -> Result<FileEntry, BackupError> {
+        // A multipart upload cannot be conditional here: check the key is
+        // free first. Every snapshot and archive key carries a generation
+        // this worker allocated, so one already there is another writer's.
+        if self.head(key).await? {
+            return Err(self.conflict(format!("{key} already exists")));
+        }
         self.spend_write()?;
         let mut file = tokio::fs::File::from_std(file);
         let mut writer = BufWriter::new(Arc::clone(&self.store), ObjectPath::from(key));
@@ -1121,6 +1665,7 @@ impl BackupWorker {
         let mut size = 0u64;
         let mut buf = vec![0u8; UPLOAD_CHUNK];
         let timeout = self.op_timeout();
+        let lease = self.lease.clone();
         let written: Result<(), BackupError> = async {
             loop {
                 let n = file.read(&mut buf).await?;
@@ -1132,9 +1677,13 @@ impl BackupWorker {
                     counter.feed(&buf[..n]);
                 }
                 size += n as u64;
-                tokio::time::timeout(timeout, writer.write_all(&buf[..n]))
-                    .await
-                    .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+                fence(lease.as_deref(), async {
+                    tokio::time::timeout(timeout, writer.write_all(&buf[..n]))
+                        .await
+                        .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+                    Ok(())
+                })
+                .await?;
             }
         }
         .await;
@@ -1142,15 +1691,20 @@ impl BackupWorker {
             let _ = tokio::time::timeout(timeout, writer.abort()).await;
             return Err(e);
         }
-        tokio::time::timeout(timeout, writer.shutdown())
-            .await
-            .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+        fence(lease.as_deref(), async {
+            tokio::time::timeout(timeout, writer.shutdown())
+                .await
+                .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+            Ok(())
+        })
+        .await?;
         Ok(FileEntry {
             name: name.to_string(),
             key: key.to_string(),
             size,
             crc32: format_crc32(hasher.finalize()),
             frames: counter.frames(),
+            lineage: self.lineage(),
         })
     }
 
@@ -1167,11 +1721,46 @@ impl BackupWorker {
         .await
     }
 
+    async fn get_versioned(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, UpdateVersion)>, BackupError> {
+        let path = ObjectPath::from(key);
+        let store = Arc::clone(&self.store);
+        self.deadline(|| format!("GET {key}"), async move {
+            match store.get(&path).await {
+                Ok(r) => {
+                    let v = UpdateVersion {
+                        e_tag: r.meta.e_tag.clone(),
+                        version: r.meta.version.clone(),
+                    };
+                    Ok(Some((r.bytes().await?.to_vec(), v)))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+    }
+
+    async fn head(&self, key: &str) -> Result<bool, BackupError> {
+        let path = ObjectPath::from(key);
+        let store = Arc::clone(&self.store);
+        self.deadline(|| format!("HEAD {key}"), async move {
+            match store.head(&path).await {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+    }
+
     async fn delete(&mut self, key: &str) -> Result<(), BackupError> {
         self.spend_write()?;
         let path = ObjectPath::from(key);
         let store = Arc::clone(&self.store);
-        self.deadline(|| format!("DELETE {key}"), async move {
+        self.fenced(|| format!("DELETE {key}"), async move {
             match store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                 Err(e) => Err(e.into()),
@@ -1200,6 +1789,120 @@ async fn position_of(source: &Arc<dyn WalSource>) -> WalPosition {
         // The read itself cannot fail; a panicked blocking task falls back to
         // reading here.
         Err(_) => source.durable_wal_position(),
+    }
+}
+
+/// Run `fut` unless a shutdown arrives first; `None` if it did.
+async fn until_shutdown<F: Future>(
+    rx: &mut watch::Receiver<BackupTrigger>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            changed = rx.changed() => {
+                if is_shutdown(changed, rx) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// How often a worker kept out by a foreign lease looks again.
+fn poll_interval(ttl_s: u64) -> Duration {
+    Duration::from_millis(ttl_s.max(1) * 1000 / 3)
+}
+
+/// Run a write while `lease` allows writes, and cancel it the moment it
+/// stops: lost, or not renewed in time. The lease is checked before every
+/// poll of the write, so a process resumed after a freeze is fenced before
+/// the write makes progress, not after. No lease: run it as it is.
+async fn fence<T>(
+    lease: Option<&BucketLease>,
+    fut: impl Future<Output = Result<T, BackupError>>,
+) -> Result<T, BackupError> {
+    let Some(lease) = lease else {
+        return fut.await;
+    };
+    let fenced = || {
+        Err(BackupError::Lease(if lease.is_lost() {
+            "lost to another instance; this one no longer writes to the bucket".into()
+        } else {
+            "not renewed in time; writes are stopped until it is".into()
+        }))
+    };
+    tokio::pin!(fut);
+    let mut wake: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    std::future::poll_fn(|cx| {
+        let Some(deadline) = lease.write_deadline() else {
+            return std::task::Poll::Ready(fenced());
+        };
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(out);
+        }
+        // Look again at the deadline, and at least every second: the wall
+        // clock can jump.
+        let at = deadline.min(Instant::now() + Duration::from_secs(1));
+        let sleep = wake.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        if sleep.deadline() != at {
+            sleep.as_mut().reset(at);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            sleep
+                .as_mut()
+                .reset(Instant::now() + Duration::from_millis(1));
+            cx.waker().wake_by_ref();
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Renew `lease` every third of its TTL, and a second after a failure. Stops
+/// when the lease is found lost; health says why the worker is kept out.
+async fn renew_loop(
+    lease: Arc<BucketLease>,
+    op_timeout: Duration,
+    health: Health,
+    errors: Arc<AtomicU64>,
+) {
+    let every = lease.renew_interval().max(Duration::from_millis(1));
+    let mut wait = every;
+    loop {
+        tokio::time::sleep(wait).await;
+        let why = match tokio::time::timeout(op_timeout, lease.renew()).await {
+            Ok(Ok(())) => {
+                health.lock().lease = None;
+                wait = every;
+                continue;
+            }
+            Ok(Err(e @ LeaseError::Lost { .. })) => {
+                tracing::warn!(error = %e, "lost the backup bucket lease; uploads stop");
+                health.lock().lease = Some(format!(
+                    "{e}; this instance uploads nothing while another holds it"
+                ));
+                return;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "the renewal timed out".to_string(),
+        };
+        errors.fetch_add(1, Ordering::AcqRel);
+        tracing::warn!(error = %why, "backup bucket lease renewal failed; retrying");
+        if !lease.may_write() {
+            health.lock().lease = Some(format!(
+                "the bucket lease could not be renewed ({why}); uploads are stopped until it is"
+            ));
+        }
+        wait = RENEW_RETRY.min(every);
+    }
+}
+
+fn version_of(r: PutResult) -> UpdateVersion {
+    UpdateVersion {
+        e_tag: r.e_tag,
+        version: r.version,
     }
 }
 

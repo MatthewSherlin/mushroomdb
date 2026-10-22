@@ -1450,6 +1450,7 @@ dependencies = [
  "crc32fast",
  "mushroomdb",
  "object_store",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "tempfile",

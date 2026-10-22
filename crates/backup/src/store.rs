@@ -1,7 +1,7 @@
 //! Configuration from the environment, and the object store it names.
 
 use crate::BackupError;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, Checksum};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, Checksum, S3ConditionalPut};
 use object_store::ObjectStore;
 use std::sync::Arc;
 
@@ -34,8 +34,15 @@ pub struct BackupConfig {
     /// `MUSHROOMDB_BACKUP_SSE`: server-side encryption (`AES256`, `aws:kms`,
     /// `aws:kms:dsse`), or `None` for the bucket's default.
     pub sse: Option<String>,
-    /// `MUSHROOMDB_BACKUP_LEASE_TTL`: bucket-lease TTL in seconds.
+    /// `MUSHROOMDB_BACKUP_LEASE_TTL`: bucket-lease TTL in seconds (at least
+    /// 1). The holder renews every third of it and stops writing two thirds
+    /// in; another instance may take the lease over once it is this old.
     pub lease_ttl_s: u64,
+    /// `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL`: `on` (the default) takes and
+    /// renews the lease with conditional PUTs (`If-None-Match` / `If-Match`),
+    /// which AWS S3, R2 and MinIO honor; `off` for a service that rejects
+    /// those headers, leaving the lease best-effort (see [`crate::lease`]).
+    pub lease_conditional: bool,
     /// `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`: the most one object-store request
     /// (one PUT, one part, one GET, one LIST, one DELETE) may take before the
     /// worker gives up on it and counts a failure. The client's own retries
@@ -101,7 +108,23 @@ impl BackupConfig {
             sse: get("MUSHROOMDB_BACKUP_SSE")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
-            lease_ttl_s: number("MUSHROOMDB_BACKUP_LEASE_TTL", DEFAULT_LEASE_TTL_S)?,
+            lease_ttl_s: positive(
+                number("MUSHROOMDB_BACKUP_LEASE_TTL", DEFAULT_LEASE_TTL_S)?,
+                "MUSHROOMDB_BACKUP_LEASE_TTL",
+            )?,
+            lease_conditional: match get("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+                .as_deref()
+            {
+                None | Some("on") => true,
+                Some("off") => false,
+                Some(v) => {
+                    return Err(BackupError::Config(format!(
+                        "MUSHROOMDB_BACKUP_LEASE_CONDITIONAL must be on or off, got {v:?}"
+                    )))
+                }
+            },
             op_timeout_ms: positive(
                 number("MUSHROOMDB_BACKUP_OP_TIMEOUT_MS", DEFAULT_OP_TIMEOUT_MS)?,
                 "MUSHROOMDB_BACKUP_OP_TIMEOUT_MS",
@@ -125,6 +148,7 @@ impl BackupConfig {
             retain_n: DEFAULT_RETAIN_N,
             sse: None,
             lease_ttl_s: DEFAULT_LEASE_TTL_S,
+            lease_conditional: true,
             op_timeout_ms: DEFAULT_OP_TIMEOUT_MS,
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
         }
@@ -173,7 +197,9 @@ pub fn parse_location(url: &str) -> Result<S3Location, BackupError> {
 /// `AWS_REGION`, default `us-east-1`). `r2://` and `minio://` need
 /// `AWS_ENDPOINT_URL`; a plain-`http` endpoint is allowed, for a local MinIO.
 /// Every upload carries an S3 SHA-256 checksum, so the service rejects a body
-/// that was corrupted in transit.
+/// that was corrupted in transit. Conditional PUT (`If-None-Match` /
+/// `If-Match`, for the bucket lease) is on unless `config.lease_conditional`
+/// is false.
 pub fn build_store(config: &BackupConfig) -> Result<Arc<dyn ObjectStore>, BackupError> {
     build_store_with(config, |k| std::env::var(k).ok())
 }
@@ -200,6 +226,9 @@ pub fn build_store_with(
         .with_bucket_name(&loc.bucket)
         .with_region(get("AWS_REGION").unwrap_or_else(|| "us-east-1".into()))
         .with_checksum_algorithm(Checksum::SHA256);
+    if config.lease_conditional {
+        b = b.with_conditional_put(S3ConditionalPut::ETagMatch);
+    }
     if let Some(id) = get("AWS_ACCESS_KEY_ID") {
         b = b.with_access_key_id(id);
     }
@@ -269,6 +298,7 @@ mod tests {
             ("MUSHROOMDB_BACKUP_LEASE_TTL", "9"),
             ("MUSHROOMDB_BACKUP_OP_TIMEOUT_MS", "1500"),
             ("MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS", "2500"),
+            ("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL", "off"),
         ]))
         .unwrap()
         .unwrap();
@@ -283,6 +313,7 @@ mod tests {
         );
         assert_eq!(c.sse.as_deref(), Some("AES256"));
         assert_eq!((c.op_timeout_ms, c.shutdown_grace_ms), (1500, 2500));
+        assert!(!c.lease_conditional);
         let loc = c.location().unwrap();
         assert_eq!((loc.bucket.as_str(), loc.prefix.as_str()), ("bk", "a/b"));
     }
@@ -306,6 +337,23 @@ mod tests {
             ("MUSHROOMDB_BACKUP_WAL_INTERVAL_MS", "0"),
         ]);
         assert!(BackupConfig::from_lookup(zero).is_err());
+        for (k, v) in [
+            ("MUSHROOMDB_BACKUP_LEASE_TTL", "0"),
+            ("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL", "maybe"),
+        ] {
+            let e = env(&[("MUSHROOMDB_BACKUP_S3_URL", "s3://b"), (k, v)]);
+            assert!(BackupConfig::from_lookup(e).is_err(), "{k}={v}");
+        }
+        let on = env(&[
+            ("MUSHROOMDB_BACKUP_S3_URL", "s3://b"),
+            ("MUSHROOMDB_BACKUP_LEASE_CONDITIONAL", " ON "),
+        ]);
+        assert!(
+            BackupConfig::from_lookup(on)
+                .unwrap()
+                .unwrap()
+                .lease_conditional
+        );
     }
 
     #[test]

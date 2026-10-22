@@ -135,6 +135,53 @@ pub fn read_side(
     }
 }
 
+/// The store file naming the backup lineage it belongs to.
+pub const LINEAGE_FILE: &str = "backup.lineage";
+
+/// The store's backup lineage, or `None` when it has never been backed up.
+pub fn read_lineage(dir: &Path) -> io::Result<Option<String>> {
+    Ok(
+        not_found_is_none(std::fs::read_to_string(dir.join(LINEAGE_FILE)))?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    )
+}
+
+/// Give the store the backup lineage `id`: written to a temporary file,
+/// fsynced, renamed into place, and the directory fsynced. The one file the
+/// backup worker ever writes into a store directory.
+pub fn create_lineage(dir: &Path, id: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{LINEAGE_FILE}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(id.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(LINEAGE_FILE))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// CRC-32 of a whole file, read from its start; the file is left at its
+/// start again.
+pub fn crc32_of(file: &mut std::fs::File) -> io::Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut h = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(crate::manifest::format_crc32(h.finalize()))
+}
+
 /// The store's horizon floor (`wal.floor`), or 0.
 pub fn floor(dir: &Path) -> u64 {
     std::fs::read(dir.join("wal.floor"))
