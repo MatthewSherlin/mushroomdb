@@ -505,13 +505,16 @@ impl<'a> Parser<'a> {
     /// write an intersection — `MATCH (t)-[:A]->(c), (t)-[:B]->(c)` binds the
     /// *same* `t` and `c` across both patterns — and every multihop question
     /// an assistant asks is that shape. The returned patterns are appended to
-    /// the same `Vec<Pattern>` a run of separate MATCH clauses produces, so
-    /// the two spellings plan and execute identically.
+    /// the same `Vec<Pattern>` a run of separate MATCH clauses produces; the
+    /// second and later parts carry `continues_match`, because the parts of
+    /// one clause share relationship uniqueness and separate clauses do not.
     fn match_clause(&mut self) -> Result<Vec<Pattern>, String> {
         self.expect(&Tok::Match, "expected MATCH")?;
         let mut out = vec![self.match_pattern()?];
         while self.eat(&Tok::Comma) {
-            out.push(self.match_pattern()?);
+            let mut part = self.match_pattern()?;
+            part.continues_match = true;
+            out.push(part);
         }
         Ok(out)
     }
@@ -560,6 +563,7 @@ impl<'a> Parser<'a> {
             chain: vec![(rel, dest)],
             shortest: true,
             path_var: None,
+            continues_match: false,
         })
     }
 
@@ -576,6 +580,7 @@ impl<'a> Parser<'a> {
             chain,
             shortest: false,
             path_var: None,
+            continues_match: false,
         })
     }
 
@@ -2495,6 +2500,7 @@ SKIP 1 LIMIT 5";
                 ],
                 shortest: false,
                 path_var: None,
+                continues_match: false,
             }],
             optional_clauses: vec![],
             unwinds: vec![],
@@ -2696,6 +2702,7 @@ LIMIT 10";
                     chain: vec![],
                     shortest: false,
                     path_var: None,
+                    continues_match: false,
                 },
                 Pattern {
                     start: node(Some("c"), Some("Company"), vec![]),
@@ -2710,6 +2717,7 @@ LIMIT 10";
                     )],
                     shortest: false,
                     path_var: None,
+                    continues_match: false,
                 },
                 Pattern {
                     start: node(Some("c"), None, vec![]),
@@ -2724,6 +2732,7 @@ LIMIT 10";
                     )],
                     shortest: false,
                     path_var: None,
+                    continues_match: false,
                 },
             ],
             optional_clauses: vec![],

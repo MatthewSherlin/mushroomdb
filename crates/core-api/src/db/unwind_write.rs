@@ -363,6 +363,7 @@ fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn, rels: &[RelCapture]) ->
                     chain: vec![],
                     shortest: false,
                     path_var: None,
+                    continues_match: false,
                 }],
                 where_expr: None,
             });
@@ -395,6 +396,7 @@ fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn, rels: &[RelCapture]) ->
                 )],
                 shortest: false,
                 path_var: None,
+                continues_match: false,
             }],
             where_expr: Some(core_query::cypher::Expr::Cmp {
                 lhs: Operand::FuncCall {

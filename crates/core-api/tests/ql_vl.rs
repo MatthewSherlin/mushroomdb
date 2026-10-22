@@ -163,3 +163,40 @@ fn parameters_in_the_destination_map_work_through_the_api() {
     assert_eq!(rs.len(), 1);
     assert_eq!(rs.row(0).to_vec(), vec![s("c")]);
 }
+
+/// Released 0.9.x drove `MATCH … SET` and `MATCH … DETACH DELETE` from the
+/// same unfiltered hop, so the write landed on every reachable node; the
+/// DETACH DELETE below would have deleted `b`, `c`, `d` and `f`.
+#[test]
+fn a_write_lands_only_on_the_filtered_destination() {
+    let mut db = build_one_batch(&tmp("write"));
+    let none = BTreeMap::new();
+    db.query_write(
+        "MATCH (a {id: 'a'})-[*1..3]->(b:Robot) SET b.hit = true",
+        &none,
+    )
+    .unwrap();
+    let rs = db
+        .query("MATCH (n) WHERE n.hit = true RETURN n", &none)
+        .unwrap();
+    assert_eq!(
+        (0..rs.len())
+            .map(|i| rs.row(i).to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![s("d")]]
+    );
+    db.query_write(
+        "MATCH (a {id: 'a'})-[*1..3]->(b:Person {active: false}) DETACH DELETE b",
+        &none,
+    )
+    .unwrap();
+    let rs = db.query("MATCH (n) RETURN n ORDER BY n", &none).unwrap();
+    let left: Vec<Vec<Option<Value>>> = (0..rs.len()).map(|i| rs.row(i).to_vec()).collect();
+    assert_eq!(
+        left,
+        ["a", "b", "d", "e", "f", "g"]
+            .iter()
+            .map(|k| vec![s(k)])
+            .collect::<Vec<_>>()
+    );
+}

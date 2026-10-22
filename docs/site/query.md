@@ -151,9 +151,19 @@ zero-length variable-length paths are not supported; minimum hop count is 1
 ### Semantics
 
 - **BFS expansion** — each hop expands all neighbours of the current frontier.
-- **Per-path edge uniqueness** — a relationship may not appear twice within the
-  same path (Cypher relationship isomorphism).  This guarantees termination on
-  cyclic graphs.
+- **Relationship uniqueness** — within one `MATCH` clause no relationship is
+  bound twice (Cypher relationship isomorphism): not twice in one walk, not by
+  two hops of a pattern, fixed or variable-length, and not by two
+  comma-separated parts of the clause. So a named path never lists a
+  relationship twice, and `MATCH (a)-[r]->(b), (c)-[s]->(d)` never binds `r`
+  and `s` to the same relationship. Separate clauses do not share the rule:
+  `MATCH (a)-[r]->(b) MATCH (c)-[s]->(d)` may bind both to one relationship,
+  and so may an `OPTIONAL MATCH` that follows a `MATCH`. A relationship
+  variable an earlier clause bound (`MATCH (x)-[r]->(y) MATCH (a)-[r]->(b)`)
+  matches that same relationship again. A write driven by the
+  match (`MATCH … SET`, `MATCH … DETACH DELETE`) sees the same rows. An
+  undirected self-loop is one relationship, walked once. This guarantees
+  termination on cyclic graphs.
 - **The end node is filtered, the nodes in between are not** — the
   destination's label and inline properties (`(b:Person {active: true})`,
   `{id: $id}`) apply to the node each path ends at.  A path may pass through
@@ -969,7 +979,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
-| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
+| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
@@ -1102,7 +1112,7 @@ unexpected-token parse error or other unspecified result.
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
-| Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
+| Multiple patterns in one MATCH | Supported, comma-separated — as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. Still a named error after CREATE |
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |

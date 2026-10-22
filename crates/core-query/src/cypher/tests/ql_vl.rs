@@ -279,9 +279,18 @@ fn aggregates_over_a_filtered_hop_count_only_matching_ends() {
     let fx = fixture();
     let q = "MATCH (a {id: 's'})-[*1..3]->(b:Person {active: true}) RETURN count(*) AS n";
     assert_eq!(rows(&fx, q), vec![vec![Some(Value::Int(3))]]);
-    let q = "MATCH (a {id: 's'})-[*1..3]->(b:Person) RETURN b.active AS act, count(*) AS n \
-             ORDER BY n DESC";
-    assert_eq!(rows(&fx, q).len(), 3, "true / false / null groups only");
+    // Reachable Persons: p1, p3, p5 active; p2 inactive; p4 without the
+    // property. One row per group, with that group's count.
+    let q = "MATCH (a {id: 's'})-[*1..3]->(b:Person) RETURN b.active AS act, count(*) AS n";
+    let mut got = rows(&fx, q);
+    got.sort_by_key(|r| format!("{r:?}"));
+    let mut want = vec![
+        vec![Some(b(true)), Some(Value::Int(3))],
+        vec![Some(b(false)), Some(Value::Int(1))],
+        vec![None, Some(Value::Int(1))],
+    ];
+    want.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(got, want, "true / false / null groups and their counts");
     let q = "MATCH (a {id: 's'})-[*1..3]->(b:Person) \
              WITH b WHERE b.active = true RETURN count(b) AS n";
     assert_eq!(rows(&fx, q), vec![vec![Some(Value::Int(3))]]);

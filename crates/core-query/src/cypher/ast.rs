@@ -146,6 +146,11 @@ pub struct Pattern {
     pub shortest: bool,
     /// The name bound before `=` in `MATCH p = (a)-[r]->(b)`.
     pub path_var: Option<String>,
+    /// True for the second and later comma-separated parts of one MATCH
+    /// clause (`MATCH (a)-[r]->(b), (c)-[s]->(d)`). The parts of one clause
+    /// share relationship uniqueness: no relationship is bound twice across
+    /// them. A pattern that starts a new MATCH clause has `false`.
+    pub continues_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
