@@ -7959,7 +7959,7 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 ### `serve`
 
 ```text
-mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                    --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                    (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                    --tls-cert and --tls-key go together and need a build with the `tls` feature
@@ -12981,8 +12981,14 @@ aborted outright, which severed in-flight responses and subscriptions
 mid-stream. Nothing was ever lost — the WAL holds every commit and the next
 open replays it — but a rolling restart cut off work it did not need to.
 
-A TLS server gets 30 seconds of grace before the listener closes regardless, so
-one stuck request cannot hold a restart open indefinitely.
+The drain is bounded (25 s at the default timeout; a stuck request or an open
+subscriber is cut off then, over plain HTTP and TLS alike), then comes the shutdown snapshot, then, with
+continuous backup on, a final flush to the bucket that deletes the bucket lease
+so a successor starts at once. The whole sequence finishes within
+`--shutdown-timeout-secs` (default 55), and a second SIGTERM or SIGINT exits
+immediately. Give the platform's stop timeout room for all of it (60 s at the
+defaults); see
+[Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
 
 **The log is quiet when the server is healthy.** A line per request is what
 makes a server log unreadable, so the level follows what happened:
@@ -13281,9 +13287,11 @@ holder can stop renewing because it died, or because it is shutting down in a
 rolling deploy. Either way the waiting instance takes over within one TTL plus
 one check, at most 40 s at the default.
 
-Deleting the lease on a clean shutdown, so that a successor can start at once,
-arrives with graceful shutdown (HO-11). Until then, a stopped holder's lease
-expires after its TTL.
+A clean shutdown (SIGTERM or SIGINT) deletes the lease, so a successor holds it
+within a few seconds instead of waiting out the TTL (see
+[Stopping cleanly](#stopping-cleanly-and-the-grace-period)). A holder that is
+killed, or that cannot reach the bucket in time, leaves the lease to expire
+after its TTL.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -13445,6 +13453,85 @@ state, not history, as they are for `asof`.
 backups can never be confused with the ones it came from. Pointed at the
 prefix it was restored from, the backup worker refuses it: it uploads nothing
 and deletes nothing there. Back it up to a new prefix.
+
+## Stopping cleanly, and the grace period
+
+On SIGTERM or SIGINT `serve` stops in three phases, all inside one deadline,
+`--shutdown-timeout-secs` (default 55):
+
+| Phase | What happens | Bound at the defaults |
+| --- | --- | --- |
+| 1. Drain | Stop accepting connections, let requests in flight finish, close live subscribers. Whatever is still open at the bound is cut off. | 25 s |
+| 2. Snapshot | Write the shutdown snapshot. If it has not finished by its bound it is skipped: the WAL holds every commit and the next open replays it. | 8 s (what is left) |
+| 3. Backup | Tell the backup worker to stop. It uploads the last WAL segment and the new snapshot, writes a final restore point, and deletes the bucket lease (only if it still names this instance). | 22 s |
+
+The arithmetic: the backup phase is reserved first. It is
+`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` (10 s) plus one request deadline,
+`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` (10 s), plus 2 s, which is 22 s. The drain
+takes at most 25 s, or less if the deadline leaves less after that reserve. The
+snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
+time to the next one.
+
+**The phases scale with `--shutdown-timeout-secs`.** With at least 55 s (more
+goes to the snapshot) the split above holds. With less, all three phases shrink
+in proportion, but the backup keeps a floor of 2 s and the drain gives way
+first, because a stuck client is what stretches it. The backup's own flush grace
+and request deadline are shrunk to fit its share, so the lease release still
+has a request deadline of its own. At `--shutdown-timeout-secs 25`, for
+example, the drain gets about 11 s, the snapshot about 3 s and the backup about
+10 s. The whole sequence never exceeds the timeout.
+
+Every phase runs even when an earlier one ran out, so the lease is released
+whenever the bucket is reachable. If the bucket is unreachable the log says so,
+the process exits, and the lease expires by itself after its TTL. No
+acknowledged write is lost in any of these cases, because the WAL holds every
+commit.
+
+| Variable or flag | Default | Meaning |
+| --- | --- | --- |
+| `--shutdown-timeout-secs` | `55` | The whole shutdown must finish within this many seconds |
+| `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take before the upload in flight is abandoned |
+| `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request, including the lease release |
+
+**A second SIGTERM or SIGINT exits at once.** An operator who presses Ctrl-C
+twice on a slow shutdown gets an immediate exit. The log says that the backup
+lease, if held, expires on its own after its TTL (at most 40 s until a
+successor holds it).
+
+**Set the platform's stop timeout above `--shutdown-timeout-secs`.** A platform
+that sends SIGKILL earlier cuts the sequence short. Nothing is lost, but the
+lease is left behind and the next start waits for it. The Fly, Compose and Railway templates use 60 s.
+If you raise `--shutdown-timeout-secs`, raise the platform's value by the same
+amount.
+
+| Platform | Setting | Default | Template |
+| --- | --- | --- | --- |
+| Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
+| Docker Compose | `stop_grace_period` | 10 s | `60s` |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
+| Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
+| Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |
+
+Sources, read 2026-10-22:
+[Fly.io configuration](https://docs.fly.io/reference/configuration),
+[Render deploys](https://render.com/docs/deploys) and
+[blueprint spec](https://render.com/docs/blueprint-spec),
+[Railway config as code](https://docs.railway.com/config-as-code/reference).
+Railway's default and maximum are not documented there, so they are
+unverified. Compose and Kubernetes defaults are the tools' standard ones.
+
+**On Render with a disk the window is a fixed 30 s**, shorter than the 55 s
+default, so the Render template sets `--shutdown-timeout-secs 25`. Raising the
+platform value is not possible there; if you drop the disk, you may set
+`maxShutdownDelaySeconds` and a longer `--shutdown-timeout-secs`.
+
+**Backup health never gates `/ready`.** `/ready` answers 503 only until the
+store is open. A rolling deploy starts the new instance while the old one still
+holds the lease, so the new one is backup-unhealthy until the old one stops. If
+`/ready` followed backup health, the platform would never route traffic to the
+new instance and never stop the old one. Watch backup health in the log (it
+warns while the lease is foreign), not through `/ready`.
 
 ## Loopback-first posture
 

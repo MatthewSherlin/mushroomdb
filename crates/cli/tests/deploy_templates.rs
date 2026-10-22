@@ -274,3 +274,56 @@ fn k8s_governing_service_is_headless() {
         .expect("governing Service");
     assert_eq!(service["spec"]["clusterIP"], "None");
 }
+
+/// `serve` drains, snapshots, then flushes the backup and releases its lease
+/// (about 22 s of backup alone at the defaults); a platform that kills it
+/// sooner leaves the lease behind.
+#[test]
+fn deploy_templates_allow_the_shutdown_sequence_to_finish() {
+    for (name, needle) in [
+        ("fly/fly.toml", "\nkill_timeout = 60\n"),
+        (
+            "docker-compose/docker-compose.yml",
+            "stop_grace_period: 60s",
+        ),
+    ] {
+        assert!(
+            template(name).contains(needle),
+            "{name} must contain {needle}"
+        );
+    }
+}
+
+/// A Render service with a persistent disk gets a fixed 30 s shutdown delay;
+/// `maxShutdownDelaySeconds` is refused with a disk, so it must not be set,
+/// and `serve` is told to finish inside the window instead.
+#[test]
+fn the_render_template_fits_its_fixed_shutdown_window() {
+    let text = template("render/render.yaml");
+    assert!(text.contains("disk:"), "the template has a persistent disk");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("maxShutdownDelaySeconds")),
+        "maxShutdownDelaySeconds is not allowed with a disk"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("dockerCommand:")
+                && l.contains("--shutdown-timeout-secs 25")),
+        "serve must be told to finish inside Render's 30 s"
+    );
+}
+
+/// Railway drains the old deployment for `drainingSeconds` before SIGKILL;
+/// it must cover `serve`'s default 55 s shutdown budget.
+#[test]
+fn the_railway_template_drains_long_enough_for_the_shutdown_sequence() {
+    let text = template("railway/railway.json");
+    let seconds: u64 = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"drainingSeconds\":"))
+        .and_then(|v| v.trim().trim_end_matches(',').parse().ok())
+        .expect("railway.json sets deploy.drainingSeconds");
+    assert!(seconds >= 55, "drainingSeconds {seconds} < 55");
+}

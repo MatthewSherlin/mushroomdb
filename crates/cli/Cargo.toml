@@ -25,6 +25,9 @@ doc = false
 default = []
 embed-ui = ["server/embed-ui"]
 tls = ["server/tls"]
+# Test-only hooks in the binary (a slow shutdown snapshot). Enabled for this
+# package's own tests through the self dev-dependency below; never default.
+test-hooks = []
 
 [dependencies]
 # The subscriber lives in the binary. `env-filter` gives MUSHROOMDB_LOG, and
@@ -52,3 +55,7 @@ csv = "1"
 # `keys add`: the token comes from the operating system's random source on every
 # platform. Already in the lock (rand and others use it).
 getrandom = "0.3"
+
+[dev-dependencies]
+# Self dev-dependency: turns on `test-hooks` for this package's tests only.
+mushroomdb-cli = { path = ".", features = ["test-hooks"] }
