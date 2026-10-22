@@ -136,6 +136,8 @@ jobs:
   # scheduler. Release only: the tests are #[ignore]d out of the debug run.
   concurrency-gate:
     runs-on: ubuntu-latest
+    # A hung baseline child or writer loop must not hold a runner for six hours.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -155,6 +157,7 @@ jobs:
           test -x "$exe"
           echo "MUSHROOMDB_GATE_V092=$exe" >> "$GITHUB_ENV"
       - run: cargo test --release -p core-bench --test concurrency_gate -- concurrency_gate --ignored --nocapture --exact
+        timeout-minutes: 20
       # Ledger row 130's scaling pin: a create-edges-and-delete batch of 20k
       # rows within 8x one of 5k (linear is ~4x; the old quadratic 9-16x).
       - run: cargo test --release -p mushroomdb --test batch_vs_commits -- bench_create_edges_and_delete_batch_is_linear --ignored --nocapture
