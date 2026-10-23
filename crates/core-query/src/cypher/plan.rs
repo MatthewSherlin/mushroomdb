@@ -2035,6 +2035,15 @@ pub(crate) fn check_operand_bound(
             }
             check_operand_bound(map, &inner, clause)
         }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            check_operand_bound(list, bound, clause)?;
+            // The variable is bound inside the predicate only.
+            let mut inner = bound.clone();
+            inner.insert(var.clone());
+            check_expr_bound(pred, &inner)
+        }
         Operand::Reduce {
             acc_var,
             init,
@@ -2319,6 +2328,26 @@ fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
                     .as_ref()
                     .map(|f| Box::new(inline_aliases_expr(f, &inner))),
                 map: Box::new(inline_aliases(map, &inner)),
+            }
+        }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            // A RETURN alias named like the variable does not reach inside:
+            // the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| r.alias.as_deref() != Some(var.as_str()))
+                .cloned()
+                .collect();
+            Operand::ListPredicate {
+                kind: *kind,
+                var: var.clone(),
+                list: Box::new(go(list)),
+                pred: Box::new(inline_aliases_expr(pred, &inner)),
             }
         }
         Operand::Reduce {

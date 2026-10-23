@@ -2,10 +2,10 @@
 
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, DdlStatement, EdgeDelete, Expr,
-    HopRange, LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
-    MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
-    OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
-    UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
+    HopRange, LimitSkip, ListPredKind, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt,
+    MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause,
+    OrderItem, OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal,
+    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
 };
 use unwind_write::{Scope, VarKind};
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
@@ -329,6 +329,19 @@ fn pred(expr: Expr) -> Operand {
 
 /// The predicate an expression stands for in a WHERE: a predicate is itself;
 /// any other value is read for its truthiness.
+/// The quantifier a function name spells, in any case.
+fn list_pred_kind(name: &str) -> Option<ListPredKind> {
+    [
+        ("all", ListPredKind::All),
+        ("any", ListPredKind::Any),
+        ("none", ListPredKind::None),
+        ("single", ListPredKind::Single),
+    ]
+    .into_iter()
+    .find(|(n, _)| name.eq_ignore_ascii_case(n))
+    .map(|(_, kind)| kind)
+}
+
 fn into_predicate(op: Operand) -> Expr {
     match op {
         Operand::Pred(expr) => *expr,
@@ -1463,6 +1476,42 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Whether the tokens after `name` `(` read `ident IN`: the head of a
+    /// list predicate. Anything else is an ordinary function call, so a
+    /// user function named `any` keeps working.
+    fn list_predicate_ahead(&self) -> bool {
+        matches!(
+            (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+            (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) if kw.eq_ignore_ascii_case("in")
+        )
+    }
+
+    /// The rest of `all|any|none|single(x IN list WHERE pred)`, after the
+    /// name. It nests like a list literal, so it shares `literal_depth` and
+    /// its limit.
+    fn list_predicate(&mut self, kind: ListPredKind) -> Result<Operand, String> {
+        const SHAPE: &str = "a list predicate takes (x IN list WHERE predicate)";
+        self.expect(&Tok::LParen, "expected '(' after the list predicate name")?;
+        self.enter_literal()?;
+        let var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        let list = self.value_expr()?;
+        if !self.eat(&Tok::Where) {
+            return Err(self.err(SHAPE));
+        }
+        let pred = self.where_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close a list predicate")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListPredicate {
+            kind,
+            var,
+            list: Box::new(list),
+            pred: Box::new(pred),
+        })
+    }
+
     /// The rest of `reduce(acc = init, x IN list | body)`, after the name.
     /// It nests like a list literal, so it shares `literal_depth` and its
     /// limit.
@@ -1619,6 +1668,11 @@ impl<'a> Parser<'a> {
                 }
                 if name.eq_ignore_ascii_case("reduce") && self.peek() == Some(&Tok::LParen) {
                     return self.reduce_call();
+                }
+                if let Some(kind) = list_pred_kind(&name) {
+                    if self.peek() == Some(&Tok::LParen) && self.list_predicate_ahead() {
+                        return self.list_predicate(kind);
+                    }
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
@@ -2672,6 +2726,7 @@ impl<'a> Parser<'a> {
                     | Operand::MapLit(_)
                     | Operand::ListComprehension { .. }
                     | Operand::Reduce { .. }
+                    | Operand::ListPredicate { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) if row => op,
                     Operand::Prop { .. } | Operand::Var(_) => {

@@ -1300,6 +1300,11 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             }
             collect_operand(map, names, seen);
         }
+        Operand::ListPredicate { list, pred, .. } => {
+            collect_operand(list, names, seen);
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(pred, names, seen, 0);
+        }
         Operand::Reduce {
             init, list, body, ..
         } => {
@@ -1665,6 +1670,14 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
                 intern_expr(vars, f);
             }
             intern_operand(vars, map);
+        }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            intern_expr(vars, pred);
         }
         Operand::Reduce {
             acc_var,
@@ -3351,6 +3364,13 @@ fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
             }
             intern_local_vars(vars, map);
         }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            vars.intern(var);
+            intern_local_vars(vars, list);
+            intern_local_vars_expr(vars, pred);
+        }
         Operand::Reduce {
             acc_var,
             init,
@@ -3469,6 +3489,43 @@ fn resolve_operand(
                 out.push(crate::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
+        }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list predicate variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the predicate.
+            let mut scoped = row.clone();
+            let (mut trues, mut falses, mut nulls) = (0usize, 0usize, 0usize);
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                let answer = super::predicate::eval_predicate(
+                    pred,
+                    &mut |op| resolve_operand(view, vars, &scoped, op, params),
+                    &|e| e,
+                )?;
+                match answer {
+                    Some(true) => trues += 1,
+                    Some(false) => falses += 1,
+                    None => nulls += 1,
+                }
+            }
+            Ok(super::predicate::quantify(*kind, trues, falses, nulls).map(Value::Bool))
         }
         Operand::Reduce {
             acc_var,

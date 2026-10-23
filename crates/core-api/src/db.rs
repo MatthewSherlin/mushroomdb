@@ -1115,7 +1115,9 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
                 operand_node_vars(value, out);
             }
         }
-        Operand::ListComprehension { list, .. } => operand_node_vars(list, out),
+        Operand::ListComprehension { list, .. } | Operand::ListPredicate { list, .. } => {
+            operand_node_vars(list, out)
+        }
         Operand::Reduce { init, list, .. } => {
             operand_node_vars(init, out);
             operand_node_vars(list, out);
@@ -1226,6 +1228,11 @@ const COMPREHENSION_IN_WRITE_RETURN: &str =
     "a list comprehension is not supported in the RETURN of a write statement; \
      compute it in a read query, or RETURN the list and filter it afterwards";
 
+/// The refusal for a list predicate in a write statement's RETURN.
+const LIST_PREDICATE_IN_WRITE_RETURN: &str =
+    "a list predicate is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and test it afterwards";
+
 /// The refusal for `reduce()` in a write statement's RETURN.
 const REDUCE_IN_WRITE_RETURN: &str =
     "reduce() is not supported in the RETURN of a write statement; \
@@ -1253,6 +1260,7 @@ fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
     match op {
         Operand::ListComprehension { .. } => Some(COMPREHENSION_IN_WRITE_RETURN),
         Operand::Reduce { .. } => Some(REDUCE_IN_WRITE_RETURN),
+        Operand::ListPredicate { .. } => Some(LIST_PREDICATE_IN_WRITE_RETURN),
         Operand::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
         Operand::BinArith { left, right, .. } => {
             operand_write_return_refusal(left).or_else(|| operand_write_return_refusal(right))
@@ -1366,6 +1374,9 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         }),
         Operand::Reduce { .. } => Err(GraphError::QueryError {
             detail: REDUCE_IN_WRITE_RETURN.into(),
+        }),
+        Operand::ListPredicate { .. } => Err(GraphError::QueryError {
+            detail: LIST_PREDICATE_IN_WRITE_RETURN.into(),
         }),
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
