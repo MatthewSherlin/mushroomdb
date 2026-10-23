@@ -69,11 +69,17 @@ def _error_classes() -> dict[str, type]:
     return out
 
 
+# Classes the binding raises for its own refusals, with no `GraphError` variant
+# behind them (the transaction surface, 0.10 TX-2b).
+_BINDING_ONLY_CODES = {"transaction_closed", "transaction_conflict"}
+
+
 def test_every_graph_error_variant_maps_to_a_distinct_class():
     variants = _graph_error_variants()
     want = {_snake(v) for v in variants}
     assert len(want) == len(variants), "two variants would share a code"
-    assert set(_error_classes()) == want
+    assert set(_error_classes()) - _BINDING_ONLY_CODES == want
+    assert _BINDING_ONLY_CODES <= set(_error_classes())
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +302,8 @@ def test_type_stub_declares_every_error_class():
     stub = (pathlib.Path(spec.origin).parent / "__init__.pyi").read_text()
     assert "class MushroomError(RuntimeError):" in stub
     for cls in _error_classes().values():
-        assert f"class {cls.__name__}(MushroomError):" in stub, cls.__name__
+        base = cls.__mro__[1].__name__
+        assert f"class {cls.__name__}({base}):" in stub, cls.__name__
 
 
 def test_constraint_and_size_errors_have_their_own_classes():

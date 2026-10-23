@@ -1079,9 +1079,7 @@ impl ReaderSnapshot {
             detail: format!("lex: {e}"),
         })?;
         if is_write_tokens(&tokens) {
-            return Err(GraphError::QueryError {
-                detail: "masked queries are read-only".into(),
-            });
+            return Err(GraphError::MaskedReadOnly);
         }
         if let Some(plan) = explain_answer(
             &tokens,

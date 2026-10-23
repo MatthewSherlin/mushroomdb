@@ -5,8 +5,8 @@ use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
     GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, MaskedNodeResult, NamespaceStats,
-    NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope,
-    Value, NS_MAX_LEN, NS_PROP,
+    NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ReaderSnapshot, ResultSet,
+    RuleDef, Scope, SharedDb, Transaction as CoreTransaction, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
@@ -17,6 +17,7 @@ use pyo3::types::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod memory_accessor;
@@ -24,7 +25,36 @@ use memory_accessor::MemoryAccessor;
 
 type Db = CoreDb<RealFs>;
 
-struct Inner(Mutex<Option<Db>>);
+/// The store behind a handle: the plain read-write handle it was opened as, or
+/// — once a transaction has begun — the same loaded store wrapped in the
+/// engine's [`SharedDb`], which is what an interactive transaction runs on.
+///
+/// The wrap happens once, on the first `begin_transaction`, and moves the
+/// store rather than reopening it, so the cross-process write lock the open
+/// took is never released. It is never undone.
+enum Store {
+    Plain(Box<Db>),
+    Shared(SharedDb),
+}
+
+struct Inner(Mutex<Option<Store>>, OpenTransactions);
+
+/// How many transactions are open on a store. `close()` refuses while any is:
+/// a transaction owns a clone of the store, so closing under it would leave the
+/// write lock held by a handle the caller believes is closed.
+#[derive(Default)]
+struct OpenTransactions(AtomicUsize);
+
+/// One open transaction's claim on the count; releasing it is dropping it, so
+/// a transaction that is garbage-collected unfinished still lets `close()`
+/// through.
+struct OpenClaim(Arc<Inner>);
+
+impl Drop for OpenClaim {
+    fn drop(&mut self) {
+        (self.0).1 .0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// What `upsert_node` did, decided under the store lock and reported after it.
 enum Upsert {
@@ -69,7 +99,10 @@ impl GraphDb {
         };
         let db = CoreDb::open_with_options(&path, opts).map_err(graph_err)?;
         Ok(GraphDb {
-            inner: Arc::new(Inner(Mutex::new(Some(db)))),
+            inner: Arc::new(Inner(
+                Mutex::new(Some(Store::Plain(Box::new(db)))),
+                OpenTransactions::default(),
+            )),
             scope: None,
         })
     }
@@ -2393,6 +2426,68 @@ impl GraphDb {
         Ok(d.unbind())
     }
 
+    /// Begin an interactive transaction and return it.
+    ///
+    /// Statements run with `tx.execute(cypher, params=None)` read the store as
+    /// it was at this call, plus the transaction's own earlier writes, and
+    /// nothing reaches the store — or any other handle — until `tx.commit()`
+    /// writes it as one commit and returns that commit's number.
+    /// `tx.rollback()`, or dropping the transaction, discards it. Prefer
+    /// `with db.transaction() as tx:`, which finishes it for you.
+    ///
+    /// A commit raises `TransactionConflict` when another writer changed a
+    /// node this transaction read or wrote since it began; nothing was
+    /// written, and the whole transaction is safe to run again.
+    ///
+    /// Refused with `ReadOnly` on a `read_only=True` handle. A transaction on a
+    /// `scoped()` handle is read-only: its reads go through the scope, its
+    /// writes raise `ReadOnly`, and its commit writes nothing. `close()` raises
+    /// while a transaction is open.
+    ///
+    /// ```python
+    /// tx = db.begin_transaction()
+    /// tx.execute("CREATE (n:Person {id: $id})", {"id": "alice"})
+    /// tx.commit()
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn begin_transaction(&self, py: Python<'_>) -> PyResult<Transaction> {
+        self.begin(py)
+    }
+
+    /// A context manager that runs a block as one transaction: it commits when
+    /// the block ends cleanly and rolls back — re-raising — when it raises.
+    ///
+    /// The transaction begins on entering the block, and `as tx` is the same
+    /// object `begin_transaction()` returns. Calling `tx.commit()` or
+    /// `tx.rollback()` inside the block is allowed and ends the transaction
+    /// early; leaving the block then does nothing more.
+    ///
+    /// ```python
+    /// with db.transaction() as tx:
+    ///     tx.execute("CREATE (n:Person {id: 'alice'})")
+    ///     tx.execute("MATCH (n:Person {id: 'alice'}) SET n.age = 30")
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn transaction(&self) -> PyResult<TransactionContext> {
+        // Refused here rather than on entering, so a handle that can never
+        // begin fails at the line that names the `with`.
+        {
+            let guard = lock(&self.inner.0)?;
+            match guard.as_ref() {
+                None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                Some(Store::Plain(db)) if db.is_read_only() => return Err(read_only_begin()),
+                Some(_) => {}
+            }
+        }
+        Ok(TransactionContext {
+            handle: GraphDb {
+                inner: Arc::clone(&self.inner),
+                scope: self.scope.clone(),
+            },
+            entered: Mutex::new(None),
+        })
+    }
+
     /// Close the handle and release the store.  Further calls raise
     /// `RuntimeError`.  `GraphDb` is also a context manager, so
     /// `with GraphDb.open(path) as db:` closes on exit.
@@ -2402,6 +2497,15 @@ impl GraphDb {
     #[pyo3(text_signature = "($self)")]
     fn close(&self) -> PyResult<()> {
         let mut guard = lock(&self.inner.0)?;
+        // Counted under the same mutex `begin_transaction` claims under, so a
+        // begin cannot slip in between the check and the release.
+        let open = self.inner.1 .0.load(Ordering::SeqCst);
+        if open > 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "cannot close: {open} open transaction(s) on this store; commit or roll them \
+                 back first"
+            )));
+        }
         *guard = None;
         Ok(())
     }
@@ -2450,15 +2554,91 @@ impl GraphDb {
         let out = Python::attach(|py| {
             py.detach(|| {
                 let mut guard = lock(&self.inner.0)?;
-                let db = guard
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-                let out = f(db);
-                drop(guard);
+                let out = match guard.as_mut() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = f(db);
+                        drop(guard);
+                        out
+                    }
+                    // The handle's own lock is released before the engine's:
+                    // a write waits on the store, not on this mutex.
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let mut write = shared.write();
+                        f(&mut write)
+                    }
+                };
                 Ok::<_, PyErr>(out)
             })
         })?;
         out.map_err(graph_err)
+    }
+
+    /// Begin a transaction on this handle's store.
+    ///
+    /// An unscoped handle's first transaction moves the loaded store into the
+    /// engine's shared handle (see [`Store`]); a scoped handle's transaction is
+    /// a read-only view of the store as it is now, resolved through the scope
+    /// once, here.
+    fn begin(&self, py: Python<'_>) -> PyResult<Transaction> {
+        let inner = &self.inner;
+        let scope = &self.scope;
+        // The GIL is released across the store mutex, as everywhere else.
+        let claim = || {
+            inner.1 .0.fetch_add(1, Ordering::SeqCst);
+            OpenClaim(Arc::clone(inner))
+        };
+        let begun = py.detach(|| -> PyResult<core_api::Result<(TxBody, OpenClaim)>> {
+            let mut guard = lock(&inner.0)?;
+            if guard.is_none() {
+                return Err(PyRuntimeError::new_err("GraphDb is closed"));
+            }
+            if matches!(guard.as_ref(), Some(Store::Plain(db)) if db.is_read_only()) {
+                return Err(read_only_begin());
+            }
+            // The claim is taken under the mutex `close()` checks under, and
+            // released by dropping it if the begin below fails.
+            let shared = match guard.as_ref() {
+                Some(Store::Shared(shared)) => (shared.clone(), claim()),
+                Some(Store::Plain(db)) if scope.is_some() => {
+                    // A scoped view reads the plain store in place; no wrap.
+                    let scope = scope.as_ref().expect("checked in the guard");
+                    return Ok(scoped_body(db, scope).map(|body| (body, claim())));
+                }
+                Some(Store::Plain(_)) => {
+                    let Some(Store::Plain(db)) = guard.take() else {
+                        unreachable!("matched Plain under the same guard");
+                    };
+                    // `from_locked` fails only for a read-only handle, refused
+                    // above, so the store is never lost here.
+                    let shared = match SharedDb::from_locked(*db) {
+                        Ok(shared) => shared,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    *guard = Some(Store::Shared(shared.clone()));
+                    (shared, claim())
+                }
+                None => unreachable!("checked open above"),
+            };
+            // From here the handle's own mutex is let go, so a begin that
+            // waits on the store (a writer's fsync) holds no other call up.
+            drop(guard);
+            let (shared, claim) = shared;
+            let body = match scope {
+                Some(scope) => scoped_body(&shared.read(), scope),
+                None => Ok(TxBody::Full(Box::new(shared.begin_transaction()))),
+            };
+            Ok(body.map(|body| (body, claim)))
+        })?;
+        let (body, claim) = begun.map_err(graph_err)?;
+        Ok(Transaction {
+            state: Mutex::new(Some(TxState {
+                body,
+                _claim: claim,
+            })),
+        })
     }
 
     /// Refuse the call when this handle came from `scoped()`.
@@ -2507,11 +2687,20 @@ impl GraphDb {
         let out = Python::attach(|py| {
             py.detach(|| {
                 let guard = lock(&self.inner.0)?;
-                let db = guard
-                    .as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-                let out = f(db);
-                drop(guard);
+                let out = match guard.as_ref() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = f(db);
+                        drop(guard);
+                        out
+                    }
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let read = shared.read();
+                        f(&read)
+                    }
+                };
                 Ok::<_, PyErr>(out)
             })
         })?;
@@ -2570,17 +2759,28 @@ impl GraphDb {
     {
         // GIL released across the lock and the read, like `with_ref`; the
         // guard is dropped before `graph_err` retakes it.
+        let scope = &self.scope;
+        let run = |db: &Db| match scope {
+            Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
+            None => f(db, None),
+        };
         let out = Python::attach(|py| {
             py.detach(|| {
                 let guard = lock(&self.inner.0)?;
-                let db = guard
-                    .as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-                let out = match &self.scope {
-                    Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
-                    None => f(db, None),
+                let out = match guard.as_ref() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = run(db);
+                        drop(guard);
+                        out
+                    }
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let read = shared.read();
+                        run(&read)
+                    }
                 };
-                drop(guard);
                 Ok::<_, PyErr>(out)
             })
         })?;
@@ -2605,6 +2805,225 @@ impl GraphDb {
         let call = Scope::new(role.map(str::to_owned), namespace.map(str::to_owned), None)
             .map_err(graph_err)?;
         Ok(Some(handle.intersect(&call)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive transactions (0.10 TX-2b)
+// ---------------------------------------------------------------------------
+
+/// What a transaction runs on.
+enum TxBody {
+    /// The engine's transaction: writes buffer and commit as one WAL frame.
+    Full(Box<CoreTransaction>),
+    /// A scoped handle's read-only view of the store as it was at `begin`,
+    /// with the scope resolved to a mask once — the engine has no
+    /// scope-aware write path, and the HTTP and Bolt surfaces refuse here too.
+    Scoped {
+        snapshot: ReaderSnapshot,
+        mask: NodeMask,
+    },
+}
+
+fn scoped_body(db: &Db, scope: &Scope) -> core_api::Result<TxBody> {
+    let mask = scope.resolve(db)?;
+    Ok(TxBody::Scoped {
+        snapshot: db.reader(),
+        mask,
+    })
+}
+
+fn read_only_begin() -> PyErr {
+    ReadOnly::new_err(
+        "this handle is read-only and cannot begin a transaction; open the store without \
+         read_only=True",
+    )
+}
+
+fn transaction_finished() -> PyErr {
+    TransactionClosed::new_err(
+        "this transaction is finished: it was committed or rolled back; begin a new one",
+    )
+}
+
+/// A commit's engine error as its Python class: the conflict a retry fixes is
+/// `TransactionConflict`, everything else is what `graph_err` makes of it.
+fn commit_err(e: GraphError) -> PyErr {
+    match &e {
+        GraphError::CasConflict {
+            key,
+            expected,
+            actual,
+        } => Python::attach(|py| {
+            err_with(
+                py,
+                TransactionConflict::new_err(format!(
+                    "transaction conflict: {e}; nothing was written, retry the transaction"
+                )),
+                |v| {
+                    v.setattr("key", key.as_str())?;
+                    v.setattr("expected", *expected)?;
+                    v.setattr("actual", *actual)
+                },
+            )
+        }),
+        _ => graph_err(e),
+    }
+}
+
+struct TxState {
+    body: TxBody,
+    /// Released after `body`, which owns a clone of the store.
+    _claim: OpenClaim,
+}
+
+/// An open interactive transaction, from `db.begin_transaction()` or
+/// `with db.transaction() as tx:`.
+///
+/// One transaction used from two threads is serialised — the calls run one at
+/// a time, never together. Dropping it unfinished is a rollback.
+#[pyclass(name = "Transaction")]
+struct Transaction {
+    /// `None` once committed or rolled back.
+    state: Mutex<Option<TxState>>,
+}
+
+#[pymethods]
+impl Transaction {
+    /// Run one Cypher statement inside the transaction and return its rows, in
+    /// the shape `db.query` and `db.query_write` return.
+    ///
+    /// Reads see the store as it was when the transaction began plus this
+    /// transaction's own writes. Writes are buffered until `commit()`. A
+    /// statement that fails changes nothing and leaves the transaction usable.
+    /// Schema changes (`CREATE INDEX` and the like) are refused inside a
+    /// transaction.
+    ///
+    /// Raises `TransactionClosed` once the transaction is finished.
+    #[pyo3(
+        signature = (cypher, params = None),
+        text_signature = "($self, cypher, params=None)"
+    )]
+    fn execute(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let map = params_to_map(params)?;
+        // Released before waiting on the transaction's mutex, so a second
+        // thread queued behind a running statement does not hold the GIL
+        // against the thread whose statement it is waiting for.
+        let out = py.detach(|| -> PyResult<core_api::Result<ResultSet>> {
+            let mut guard = lock(&self.state)?;
+            let state = guard.as_mut().ok_or_else(transaction_finished)?;
+            match &mut state.body {
+                TxBody::Full(tx) => Ok(tx.execute(cypher, &map)),
+                TxBody::Scoped { snapshot, mask } => {
+                    match snapshot.query_masked(cypher, &map, mask) {
+                        Err(GraphError::MaskedReadOnly) => Err(ReadOnly::new_err(
+                            "this transaction is on a scoped handle, and a scoped handle \
+                                 never writes; begin it on the handle scoped() was called on",
+                        )),
+                        other => Ok(other),
+                    }
+                }
+            }
+        })?;
+        let rs = out.map_err(graph_err)?;
+        result_set_to_rows(py, &rs)
+    }
+
+    /// Write the transaction's changes as one commit and return that commit's
+    /// number. A transaction that wrote nothing writes nothing and returns the
+    /// number of the commit it began on.
+    ///
+    /// The transaction is finished afterwards, whether or not this raised.
+    /// `TransactionConflict` means another writer changed a node it read or
+    /// wrote; nothing was written and running it again is safe.
+    #[pyo3(text_signature = "($self)")]
+    fn commit(&self, py: Python<'_>) -> PyResult<u64> {
+        let out = py.detach(|| -> PyResult<core_api::Result<u64>> {
+            let state = lock(&self.state)?.take().ok_or_else(transaction_finished)?;
+            Ok(match state.body {
+                TxBody::Full(tx) => (*tx).commit(),
+                TxBody::Scoped { snapshot, .. } => Ok(snapshot.version),
+            })
+        })?;
+        out.map_err(commit_err)
+    }
+
+    /// Discard the transaction's changes. Nothing reaches the store.
+    ///
+    /// Raises `TransactionClosed` if it is already finished.
+    #[pyo3(text_signature = "($self)")]
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| -> PyResult<()> {
+            let state = lock(&self.state)?.take().ok_or_else(transaction_finished)?;
+            drop(state);
+            Ok(())
+        })
+    }
+}
+
+impl Transaction {
+    fn is_finished(&self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| Ok(lock(&self.state)?.is_none()))
+    }
+}
+
+/// What `db.transaction()` returns: begins on `__enter__`, commits or rolls
+/// back on `__exit__`.
+#[pyclass(name = "TransactionContext")]
+struct TransactionContext {
+    handle: GraphDb,
+    entered: Mutex<Option<Py<Transaction>>>,
+}
+
+#[pymethods]
+impl TransactionContext {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<Py<Transaction>> {
+        let already_entered = || {
+            PyRuntimeError::new_err(
+                "this transaction block was already entered; call db.transaction() again",
+            )
+        };
+        if lock(&self.entered)?.is_some() {
+            return Err(already_entered());
+        }
+        // Begun before the slot is locked for good: `begin` releases the GIL,
+        // and a thread blocked on the slot with the GIL held would starve it.
+        let tx = Py::new(py, self.handle.begin(py)?)?;
+        let mut slot = lock(&self.entered)?;
+        if slot.is_some() {
+            return Err(already_entered());
+        }
+        *slot = Some(tx.clone_ref(py));
+        Ok(tx)
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Bound<'_, PyAny>,
+        _val: Bound<'_, PyAny>,
+        _tb: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let Some(tx) = lock(&self.entered)?.take() else {
+            return Ok(false);
+        };
+        let tx = tx.bind(py).borrow();
+        // The block may have finished it already.
+        if tx.is_finished(py)? {
+            return Ok(false);
+        }
+        if exc_type.is_none() {
+            tx.commit(py)?;
+        } else {
+            tx.rollback(py)?;
+        }
+        // Never swallows: the block's own exception, if any, propagates.
+        Ok(false)
     }
 }
 
@@ -3720,11 +4139,47 @@ engine_errors! {
     ValueTooLarge, "value_too_large", "A value is larger than the store accepts. Carries `.field`, `.size` and `.limit`, in bytes. Nothing was written.";
 }
 
+// Raised by the transaction surface, not by an engine variant: neither maps to
+// a `GraphError`, so they sit outside `engine_errors!`.
+
+pyo3::create_exception!(
+    mushroomdb,
+    TransactionClosed,
+    MushroomError,
+    "The transaction is finished: it was already committed or rolled back."
+);
+
+pyo3::create_exception!(
+    mushroomdb,
+    TransactionConflict,
+    CasConflict,
+    "A commit found that another writer changed a node this transaction read or wrote.\n\n\
+     Nothing was written, so running the transaction again from the start is always safe. \
+     A `CasConflict`, and carries its `.key`, `.expected` and `.actual`."
+);
+
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
     m.add_class::<MemoryAccessor>()?;
     m.add_class::<Duration>()?;
+    m.add_class::<Transaction>()?;
+    m.add_class::<TransactionContext>()?;
     register_errors(m)?;
+    for (name, code, ty) in [
+        (
+            "TransactionClosed",
+            "transaction_closed",
+            m.py().get_type::<TransactionClosed>(),
+        ),
+        (
+            "TransactionConflict",
+            "transaction_conflict",
+            m.py().get_type::<TransactionConflict>(),
+        ),
+    ] {
+        ty.setattr("code", code)?;
+        m.add(name, ty)?;
+    }
     Ok(())
 }

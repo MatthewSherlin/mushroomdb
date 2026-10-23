@@ -338,6 +338,16 @@ class RealTree(unittest.TestCase):
         grouped = [n for members in gen.GROUPS.values() for n in members]
         self.assertEqual(sorted(names), sorted(grouped))
 
+    def test_the_transaction_object_is_listed_under_the_methods_that_begin_one(self):
+        stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(m[0] for m in stub["transaction_methods"]), ["commit", "execute", "rollback"]
+        )
+        page = gen.generate("python-api", None)
+        for heading in ("### `begin_transaction`", "### `transaction`", "### `Transaction.execute`"):
+            self.assertIn(heading, page)
+        self.assertIn("| `TransactionConflict` |", page)
+
     def test_the_memory_methods_come_from_the_accessor_and_the_aliases_are_a_table(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
         memory = [m[0] for m in stub["memory_methods"]]

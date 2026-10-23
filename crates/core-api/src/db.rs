@@ -2610,6 +2610,11 @@ pub enum AsOfScope<'a> {
 }
 
 impl GraphDb<RealFs> {
+    /// The directory this handle's store lives in.
+    pub(crate) fn store_dir(&self) -> std::path::PathBuf {
+        self.fs.dir().to_path_buf()
+    }
+
     /// Open the database at `dir` with default options.
     ///
     /// Equivalent to `open_with_options(dir, OpenOptions::default())`.

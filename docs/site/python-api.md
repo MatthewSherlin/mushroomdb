@@ -227,6 +227,7 @@ def close(self) -> None
 Close the handle and release the store.
 
 A `scoped()` child shares the one store, so either name closes both.
+Raises `RuntimeError` while a transaction is open on the store.
 
 ## Writing
 
@@ -1572,6 +1573,75 @@ The old top-level names still work on `GraphDb`. Each takes the same arguments, 
 | `forget` | `memory.forget` |
 | `identity_clusters` | `memory.identity_clusters` |
 
+## Transactions
+
+### `begin_transaction`
+
+```python
+def begin_transaction(self) -> Transaction
+```
+
+Begin an interactive transaction and return it.
+
+Reads see the store as it was at this call plus the transaction's own
+writes; `commit()` writes them as one commit, `rollback()` or dropping
+the transaction discards them. Prefer `with db.transaction() as tx:`.
+
+Raises `ReadOnly` on a `read_only=True` handle. A transaction on a
+`scoped()` handle is read-only: reads go through the scope, writes
+raise `ReadOnly`, and its commit writes nothing. `close()` raises while
+a transaction is open.
+
+### `transaction`
+
+```python
+def transaction(self) -> TransactionContext
+```
+
+Run a block as one transaction: commit on a clean exit, roll back and re-raise on an exception.
+
+```python
+with db.transaction() as tx:
+    tx.execute("CREATE (n:Person {id: 'alice'})")
+```
+
+Calling `tx.commit()` or `tx.rollback()` inside the block ends the
+transaction early; leaving the block then does nothing more. Refused
+with `ReadOnly` on a `read_only=True` handle.
+
+### `Transaction.execute`
+
+```python
+def execute(self, cypher: str, params: Params = None) -> list[Row]
+```
+
+Run one Cypher statement and return its rows, shaped as `query` and `query_write` return them.
+
+A statement that fails changes nothing and leaves the transaction
+usable. Schema changes are refused inside a transaction. Raises
+`TransactionClosed` once the transaction is finished.
+
+### `Transaction.commit`
+
+```python
+def commit(self) -> int
+```
+
+Write the transaction as one commit and return that commit's number.
+
+A transaction that wrote nothing writes nothing and returns the number
+of the commit it began on. The transaction is finished afterwards,
+whether or not this raised. Raises `TransactionConflict` when another
+writer changed a node it read or wrote.
+
+### `Transaction.rollback`
+
+```python
+def rollback(self) -> None
+```
+
+Discard the transaction's changes. Raises `TransactionClosed` if it is already finished.
+
 ## Errors
 
 Every error the engine raises is a subclass of `MushroomError`, which subclasses
@@ -1594,6 +1664,8 @@ attributes. Classes may be added; a `code` is never respelled.
 | `CommitOutOfRange` | `commit: int`, `total: int`, `floor: int` | The commit is outside the retained range `floor..total`. |
 | `ViewPropReadOnly` | `view_name: str` | The property is managed by a view and cannot be written directly. |
 | `CasConflict` | `key: str`, `expected: int`, `actual: int` | A compare-and-set precondition was not satisfied. |
+| `TransactionConflict` | `key: str`, `expected: int`, `actual: int` | A commit found that another writer changed a node the transaction read or wrote. |
+| `TransactionClosed` | — | The transaction is finished: it was already committed or rolled back. |
 | `MaskedReadOnly` | — | A write statement reached a scoped or masked query path, which is read-only. |
 | `RoleWriteDenied` | `reason: str` | A role-bound write was denied. |
 | `MushroomBusy` | `holder: int \| None` | Another process holds the store's write lock. |
