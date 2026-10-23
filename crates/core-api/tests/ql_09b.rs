@@ -767,22 +767,27 @@ fn an_unwind_read_is_still_not_a_write() {
 
 // ── Transactions ────────────────────────────────────────────────────────────
 
+/// Inside a transaction the statement runs too (TX-MW, ledger row 144):
+/// buffered until COMMIT, read by the transaction's later statements.
 #[test]
-fn inside_a_transaction_the_statement_is_refused_by_name_and_buffers_nothing() {
+fn inside_a_transaction_the_statement_runs_and_commits_with_it() {
     let dir = tmp("tx");
     let db: SharedDb = SharedDb::open(&dir).unwrap();
     let mut tx = db.begin_transaction();
-    let e = tx.execute(CREATE_PEOPLE, &rows_param(&["a"])).unwrap_err();
-    assert_eq!(
-        detail(e),
-        "not supported in mushroomdb 0.10 inside a transaction: \
-         UNWIND … CREATE / MERGE / SET / REMOVE / DELETE"
-    );
-    // The transaction is still usable and commits nothing.
-    tx.execute("CREATE (:P {id: 'x'})", &none()).unwrap();
+    let rs = tx.execute(CREATE_PEOPLE, &rows_param(&["a", "b"])).unwrap();
+    assert_eq!(count(&rs, "created"), 2);
+    let rs = tx
+        .execute(
+            "UNWIND ['a', 'b'] AS k MATCH (p:Person {id: k}) SET p.seen = true",
+            &none(),
+        )
+        .unwrap();
+    assert_eq!(count(&rs, "properties_set"), 2);
+    assert!(db.reader().node_info("a").is_none(), "not committed yet");
     tx.commit().unwrap();
-    assert!(db.reader().node_info("a").is_none());
-    assert!(db.reader().node_info("x").is_some());
+    let a = db.reader().node_info("a").unwrap();
+    assert_eq!(a.props.get("seen"), Some(&Value::Bool(true)));
+    assert!(db.reader().node_info("b").is_some());
 }
 
 #[test]

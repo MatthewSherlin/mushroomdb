@@ -659,8 +659,9 @@ fn unwind_create_that_fails_on_a_later_row_writes_nothing() {
     assert_eq!(count_rows(&mut conn, "MATCH (n:Person) RETURN COUNT(n)"), 0);
 }
 
+/// TX-MW: the `UNWIND` write form runs inside a transaction too.
 #[test]
-fn unwind_create_inside_a_bolt_transaction_is_a_named_failure() {
+fn unwind_create_inside_a_bolt_transaction_succeeds() {
     let (db, _dir) = open_db("unwind-create-tx");
     let mut conn = in_tx(&db, FULL);
     let message = ClientMessage::Other(
@@ -673,9 +674,10 @@ fn unwind_create_inside_a_bolt_transaction_is_a_named_failure() {
     );
     let out = conn.handle(message);
     assert!(
-        matches!(out.last(), Some(ServerMessage::Failure(_))),
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
         "{out:?}"
     );
+    assert!(db.reader().node_info("a").is_none(), "not committed yet");
 }
 
 // -------------------------------------------------------- in a transaction

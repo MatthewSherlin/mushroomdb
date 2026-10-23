@@ -4753,7 +4753,7 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 
 A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `COMMIT` and an auto-commit `PULL` return one; a transaction that wrote nothing returns the commit its snapshot read. Pass it in a later `BEGIN` or `RUN` to read at least that commit.
 
-In this build some write statements are refused inside a transaction and run only as auto-commit `RUN`: `MATCH … CREATE` / `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `REMOVE … RETURN`. Drivers' managed write transactions (`session.execute_write` and the like) send `BEGIN`, so they are refused there too, with `not supported in mushroomdb 0.10 inside a transaction: …`; send such a statement with `session.run` (auto-commit). See [Write statements](query.md#write-statements).
+Every write statement that runs as an auto-commit `RUN` also runs inside `BEGIN` … `COMMIT`, with the same results and counts: `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`, `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `SET` / `REMOVE … RETURN`. So drivers' managed write transactions (`session.execute_write` and the like), which send `BEGIN`, run them too. Schema statements (`CREATE INDEX`, `CREATE CONSTRAINT` and the rest) are still refused inside a transaction. See [Write statements](query.md#write-statements).
 
 A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those. A `write` or `admin` key from `keys.json` can; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
@@ -5348,8 +5348,9 @@ REMOVE n.score, n.nickname
   (label removal)`. A node has one label in 0.10.
 - `REMOVE r.prop` on a relationship, or on a name `MATCH` did not bind, is a
   parse error.
-- Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
-  it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
+- Inside an interactive transaction `REMOVE` buffers like `SET`, with or
+  without `RETURN`; the `RETURN` reads the transaction's state with the
+  removal applied.
 
 ### `MATCH … SET n = {…}` / `SET n += {…}`
 
@@ -5391,8 +5392,8 @@ SET n = {name: 'Alice', score: 1}
   other node `id` is an ordinary property.
 - `RETURN` projects the post-write state. `properties_set` counts the
   properties set plus the properties removed.
-- Inside an interactive transaction the map forms are refused:
-  `not supported in mushroomdb 0.10 inside a transaction`.
+- Inside an interactive transaction the map forms run as they do auto-commit
+  and are buffered until `COMMIT`.
 
 ### MATCH … DELETE (edge)
 
@@ -5502,11 +5503,11 @@ MERGE (a)-[:LIKES]->(b)
   `MERGE` finds or creates the relationship (and the other end, if that one has a
   label and key) and never creates `a`. A bound end that is null in a row (an
   `OPTIONAL MATCH` that found nothing) is an error, as is `MERGE (a)` alone.
-- In this build it is refused inside an interactive transaction (HTTP `/tx`,
-  Bolt `BEGIN`, and so a driver-managed write transaction such as
-  `session.execute_write`), as the `UNWIND` form is: `not supported in
-  mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE`. Run it as an
-  auto-commit statement (HTTP `/query`, Bolt `RUN` outside `BEGIN`).
+- It runs inside an interactive transaction too (HTTP `/tx`, Bolt `BEGIN`, and
+  so a driver-managed write transaction such as `session.execute_write`), with
+  the same results and counts as auto-commit. It reads the transaction's own
+  earlier writes, and what it writes stays private to the transaction until
+  `COMMIT`.
 
 ### UNWIND … write clauses
 
@@ -5584,9 +5585,10 @@ MERGE (n:Person {id: r.id})
   (nodes deleted) and `relationships_created` (relationships created).
 - **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
   `ingest` of the same rows.
-- Inside an interactive transaction (and so a Bolt `BEGIN`) it is refused by
-  name: `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE /
-  MERGE / SET / REMOVE / DELETE`. Run it as its own statement.
+- Inside an interactive transaction (and so a Bolt `BEGIN`) it runs as it does
+  auto-commit, reading the transaction's own earlier writes; its writes are
+  buffered until `COMMIT`. Constraints and the other checks a commit makes run
+  at `COMMIT`, and a failure there rejects the whole transaction.
 - Under a role-scoped write the `MATCH` is masked, so a hidden node reads as
   absent and nothing is written to it; create and update scope are checked per
   label as for the single statements.
@@ -6246,8 +6248,6 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | A `MATCH`, `UNWIND` or `WITH` after a write clause of an `UNWIND` statement | `not supported in mushroomdb 0.10: a MATCH, UNWIND or WITH clause after a write clause in the same statement; put the reads first` |
 | `UNWIND … MATCH (a)-[r]->(b) DELETE r` | `not supported in mushroomdb 0.10: DELETE of the relationship `r` after UNWIND; delete nodes, or use MATCH … DELETE` |
 | `UNWIND … SET n += x` where `x` is not a map | `SET n += <map>: the value must be a map, got …` |
-| `UNWIND … <write>` inside a transaction | `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE / MERGE / SET / REMOVE / DELETE` |
-| `MATCH … CREATE` / `MATCH … MERGE` inside a transaction (HTTP `/tx`, Bolt `BEGIN`) | `not supported in mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE` |
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN (found …)` |
 | `RETURN *` / `WITH *` with no node, path or value name in scope | `RETURN * / WITH * with no variables in scope` |
@@ -6291,7 +6291,7 @@ unexpected-token parse error or other unspecified result.
 
 | Feature | Status |
 |---|---|
-| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; some write forms are refused inside a transaction in this build: `REMOVE … RETURN`, the `SET` map forms, `UNWIND … <write>` (including `UNWIND … MATCH … CREATE`) and `MATCH … CREATE` / `MATCH … MERGE` — under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; run those as auto-commit statements |
+| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; every write statement runs inside a transaction with the results and counts it gives auto-commit (`MATCH … CREATE` / `MERGE`, `UNWIND … <write>`, the `SET` map forms and `SET` / `REMOVE … RETURN` included), under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; schema statements are refused there |
 | Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, arithmetic expressions (`n.x + 1`, `n.score * 1.5`) and predicates (`n.score > 10`, `NOT n.done`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
@@ -14815,8 +14815,9 @@ cargo test -p sim-harness -- --nocapture 2>&1 | grep -E "crash points|recall|tes
 
 - **Multi-statement transactions** — supported: BEGIN … COMMIT through
   `SharedDb::begin_transaction` and, over Bolt, `BEGIN` / `COMMIT` / `ROLLBACK`, with snapshot isolation and one atomic commit.
-  Covered by `crates/core-api/tests/transaction_integration.rs` and `transaction_overlay.rs`, and for Bolt by `crates/bolt/tests/tx.rs`;
-  the write forms refused inside a transaction are listed in [`query.md`](query.md).
+  Covered by `crates/core-api/tests/transaction_integration.rs`, `transaction_overlay.rs` and `tx_mw.rs` (the same random
+  write statements run auto-commit and inside one transaction give the same results, counts and store), and for Bolt by
+  `crates/bolt/tests/tx.rs`.
 - **Concurrent writer correctness** — the engine is single-writer by design (`RwLock`
   facade). Race conditions between writers are excluded by the architecture, not tested.
 - **Network-layer correctness** — the HTTP and WebSocket layers have golden-shape tests

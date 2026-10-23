@@ -281,21 +281,24 @@ fn match_then_create_under_a_role_stays_inside_its_scope() {
     assert!(!db.has_node("m3"));
 }
 
+/// Inside a transaction it runs too (TX-MW, ledger row 144), reading the
+/// transaction's own earlier write; `tx_mw.rs` covers it in depth.
 #[test]
-fn match_then_create_inside_a_transaction_is_refused_by_name() {
+fn match_then_create_runs_inside_a_transaction() {
     let db: SharedDb = SharedDb::open(&tmp("mc-tx")).unwrap();
     let mut tx = db.begin_transaction();
     tx.execute("CREATE (:P {id: 'x'})", &none()).unwrap();
-    let e = tx
-        .execute("MATCH (p:P {id: 'x'}) CREATE (:P {id: 'y'})", &none())
-        .unwrap_err();
-    assert_eq!(
-        detail(e),
-        "not supported in mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE"
-    );
+    let rs = tx
+        .execute(
+            "MATCH (p:P {id: 'x'}) CREATE (p)-[:K]->(:P {id: 'y'})",
+            &none(),
+        )
+        .unwrap();
+    assert_eq!(made(&rs), (1, 1));
+    assert!(db.reader().node_info("y").is_none(), "not committed yet");
     tx.commit().unwrap();
     assert!(db.reader().node_info("x").is_some());
-    assert!(db.reader().node_info("y").is_none());
+    assert!(db.reader().node_info("y").is_some());
 }
 
 /// A small xorshift generator: the differential is reproducible by seed.

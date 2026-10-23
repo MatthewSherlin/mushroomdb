@@ -11,9 +11,113 @@
 //! function means here what it means in a `RETURN`.
 //!
 //! The overlay is hash-keyed, so a pass over the rows is linear.
+//!
+//! Below the overlay is a [`RowSource`]: the store, for an auto-commit
+//! statement, or a transaction's base snapshot with its buffered writes laid
+//! over it, inside a transaction. The same pass runs over either.
 
 use super::*;
 use core_query::cypher::{eval_operand, Binding};
+
+/// What a statement's per-row writes read beneath their own [`Overlay`].
+///
+/// [`GraphDb`] is one (an auto-commit statement reads the store, masked under
+/// a role-scoped write); a transaction's state is the other (its base snapshot
+/// with its earlier statements' writes laid over it). Every per-row write form
+/// and every `MATCH … SET` / `REMOVE` form computes its batch ops through this
+/// trait, so a statement inside a transaction makes the decisions it makes
+/// auto-commit.
+pub(crate) trait RowSource {
+    /// Run `f` over the view the statement's read part runs in and its values
+    /// are evaluated in.
+    fn row_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> R;
+    /// Whether the node `key` is live.
+    fn row_exists(&self, key: &str) -> bool;
+    /// The node's id in [`Self::row_view`]'s view, if it is live.
+    fn row_id(&self, key: &str) -> Option<u32>;
+    /// Every stored property of the node; empty when it is not live.
+    fn row_props(&self, key: &str) -> BTreeMap<String, Value>;
+    /// One stored property of the node.
+    fn row_prop(&self, key: &str, field: &str) -> Option<Value>;
+    /// The node's label.
+    fn row_label(&self, key: &str) -> Option<String>;
+    /// Whether the manual-or-derived edge `src -[etype]-> dst` is present.
+    fn row_edge(&self, etype: &str, src: &str, dst: &str) -> bool;
+    /// Whether any edge touches the node.
+    fn row_has_edges(&self, key: &str) -> bool;
+    /// Whether a MERGE node exists, after any role-scope check.
+    fn row_merge_existed(&self, label: &str, key: &str) -> Result<bool>;
+    /// The properties a MERGE create arm inserts.
+    fn row_merge_props(
+        &self,
+        key_field: &str,
+        key_value: &Value,
+        named_ns: Option<&Value>,
+    ) -> Result<Vec<(String, Value)>>;
+    /// Whether a view owns the property `field`.
+    fn row_view_owns(&self, field: &str) -> bool;
+}
+
+impl<F: Fs> RowSource for GraphDb<F> {
+    fn row_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> R {
+        match self.pending_write_authz.as_ref() {
+            Some(authz) => f(&self.view_masked(&authz.mask)),
+            None => f(&self.view()),
+        }
+    }
+
+    fn row_exists(&self, key: &str) -> bool {
+        self.has_node(key)
+    }
+
+    fn row_id(&self, key: &str) -> Option<u32> {
+        self.ids.get(key)
+    }
+
+    fn row_props(&self, key: &str) -> BTreeMap<String, Value> {
+        self.node_info(key).map(|n| n.props).unwrap_or_default()
+    }
+
+    fn row_prop(&self, key: &str, field: &str) -> Option<Value> {
+        self.get_prop(key, field)
+    }
+
+    fn row_label(&self, key: &str) -> Option<String> {
+        self.node_ref(key).map(|n| n.label().to_owned())
+    }
+
+    fn row_edge(&self, etype: &str, src: &str, dst: &str) -> bool {
+        self.merge_edge_present(etype, src, dst)
+    }
+
+    fn row_has_edges(&self, key: &str) -> bool {
+        let Some(id) = self.ids.get(key) else {
+            return false;
+        };
+        let tv = self.topo_view();
+        tv.etypes().any(|et| {
+            !tv.neighbors(et, Direction::Out, id).is_empty()
+                || !tv.neighbors(et, Direction::In, id).is_empty()
+        })
+    }
+
+    fn row_merge_existed(&self, label: &str, key: &str) -> Result<bool> {
+        self.merge_node_existed(label, key)
+    }
+
+    fn row_merge_props(
+        &self,
+        key_field: &str,
+        key_value: &Value,
+        named_ns: Option<&Value>,
+    ) -> Result<Vec<(String, Value)>> {
+        self.merge_create_props(key_field, key_value, named_ns)
+    }
+
+    fn row_view_owns(&self, field: &str) -> bool {
+        self.view_store.view_for_prop(field).is_some()
+    }
+}
 
 /// What the statement has done to one node so far.
 pub(super) struct NodeState {
@@ -129,171 +233,162 @@ impl Overlay {
     }
 }
 
-impl<F: Fs> GraphDb<F> {
-    /// Whether the node `key` exists at this point of the statement.
-    pub(super) fn uw_exists(&self, ov: &Overlay, key: &str) -> bool {
-        match ov.nodes.get(key) {
-            Some(state) => state.exists,
-            None => self.has_node(key),
+/// Whether the node `key` exists at this point of the statement.
+pub(super) fn uw_exists<S: RowSource + ?Sized>(src: &S, ov: &Overlay, key: &str) -> bool {
+    match ov.nodes.get(key) {
+        Some(state) => state.exists,
+        None => src.row_exists(key),
+    }
+}
+
+/// The properties of `key` at this point of the statement.
+pub(super) fn uw_props<'o, S: RowSource + ?Sized>(
+    src: &S,
+    ov: &'o mut Overlay,
+    key: &str,
+) -> &'o mut BTreeMap<String, Value> {
+    let state = ov
+        .nodes
+        .entry(key.to_string())
+        .or_insert_with(NodeState::stored);
+    let delta = std::mem::take(&mut state.delta);
+    state.props.get_or_insert_with(|| {
+        let mut props = src.row_props(key);
+        for (field, value) in delta {
+            match value {
+                Some(v) => props.insert(field, v),
+                None => props.remove(&field),
+            };
+        }
+        props
+    })
+}
+
+/// Whether the edge exists at this point of the statement.
+pub(super) fn uw_edge_exists<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &Overlay,
+    etype: &str,
+    from: &str,
+    to: &str,
+) -> bool {
+    if ov
+        .edges
+        .contains(&(etype.to_string(), from.to_string(), to.to_string()))
+    {
+        return true;
+    }
+    let fresh = |key: &str| ov.nodes.get(key).is_some_and(|n| n.created_here);
+    if fresh(from) || fresh(to) {
+        return false;
+    }
+    uw_exists(src, ov, from) && uw_exists(src, ov, to) && src.row_edge(etype, from, to)
+}
+
+/// Whether any edge touches `key` at this point of the statement.
+pub(super) fn uw_has_edges<S: RowSource + ?Sized>(src: &S, ov: &Overlay, key: &str) -> bool {
+    if ov.has_pending_edge(key) {
+        return true;
+    }
+    if ov.nodes.get(key).is_some_and(|n| n.created_here) {
+        return false;
+    }
+    src.row_has_edges(key)
+}
+
+/// Record in the overlay what `SET n = {…}` / `SET n += {…}` does to `key`.
+pub(super) fn uw_apply_map<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &mut Overlay,
+    key: &str,
+    merge: bool,
+    entries: &MapEntries,
+) {
+    let existing = uw_props(src, ov, key).clone();
+    let writes = plan_map_write(key, &existing, merge, entries, &|field| {
+        src.row_view_owns(field)
+    });
+    for write in writes {
+        match write {
+            MapWrite::Set { field, value } => ov.note_set(key, &field, &value),
+            MapWrite::Remove { field } => ov.note_remove(key, &field),
         }
     }
+}
 
-    /// The properties of `key` at this point of the statement.
-    pub(super) fn uw_props<'o>(
-        &self,
-        ov: &'o mut Overlay,
-        key: &str,
-    ) -> &'o mut BTreeMap<String, Value> {
-        let state = ov
-            .nodes
-            .entry(key.to_string())
-            .or_insert_with(NodeState::stored);
-        let delta = std::mem::take(&mut state.delta);
-        state.props.get_or_insert_with(|| {
-            let mut props = self.node_info(key).map(|n| n.props).unwrap_or_default();
-            for (field, value) in delta {
-                match value {
-                    Some(v) => props.insert(field, v),
-                    None => props.remove(&field),
-                };
-            }
-            props
-        })
+/// A property of a node as a read of it would see it at this point of the
+/// statement: the stored or written value, else the identity the engine
+/// exposes as a property (`key`, `id`, `label`).
+fn uw_read_prop<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &mut Overlay,
+    key: &str,
+    field: &str,
+) -> Option<Value> {
+    if !uw_exists(src, ov, key) {
+        return None;
     }
-
-    /// Whether the edge exists at this point of the statement.
-    pub(super) fn uw_edge_exists(&self, ov: &Overlay, etype: &str, src: &str, dst: &str) -> bool {
-        if ov
-            .edges
-            .contains(&(etype.to_string(), src.to_string(), dst.to_string()))
-        {
-            return true;
-        }
-        let fresh = |key: &str| ov.nodes.get(key).is_some_and(|n| n.created_here);
-        if fresh(src) || fresh(dst) {
-            return false;
-        }
-        self.uw_exists(ov, src)
-            && self.uw_exists(ov, dst)
-            && self.merge_edge_present(etype, src, dst)
+    if let Some(v) = uw_props(src, ov, key).get(field) {
+        return Some(v.clone());
     }
-
-    /// Whether any edge touches `key` at this point of the statement.
-    pub(super) fn uw_has_edges(&self, ov: &Overlay, key: &str) -> bool {
-        if ov.has_pending_edge(key) {
-            return true;
-        }
-        if ov.nodes.get(key).is_some_and(|n| n.created_here) {
-            return false;
-        }
-        let Some(id) = self.ids.get(key) else {
-            return false;
-        };
-        let tv = self.topo_view();
-        tv.etypes().any(|et| {
-            !tv.neighbors(et, Direction::Out, id).is_empty()
-                || !tv.neighbors(et, Direction::In, id).is_empty()
-        })
+    match field {
+        "key" | "id" => Some(Value::Str(key.to_string())),
+        "label" => src.row_label(key).map(Value::Str),
+        _ => None,
     }
+}
 
-    /// Record in the overlay what `SET n = {…}` / `SET n += {…}` does to `key`.
-    pub(super) fn uw_apply_map(
-        &self,
-        ov: &mut Overlay,
-        key: &str,
-        merge: bool,
-        entries: &MapEntries,
-    ) {
-        let existing = self.uw_props(ov, key).clone();
-        let writes = plan_map_write(key, &existing, merge, entries, &|field| {
-            self.view_store.view_for_prop(field).is_some()
-        });
-        for write in writes {
-            match write {
-                MapWrite::Set { field, value } => ov.note_set(key, &field, &value),
-                MapWrite::Remove { field } => ov.note_remove(key, &field),
-            }
-        }
-    }
-
-    /// A property of a node as a read of it would see it at this point of the
-    /// statement: the stored or written value, else the identity the engine
-    /// exposes as a property (`key`, `id`, `label`).
-    fn uw_read_prop(&self, ov: &mut Overlay, key: &str, field: &str) -> Option<Value> {
-        if !self.uw_exists(ov, key) {
-            return None;
-        }
-        if let Some(v) = self.uw_props(ov, key).get(field) {
-            return Some(v.clone());
-        }
-        match field {
-            "key" | "id" => Some(Value::Str(key.to_string())),
-            "label" => self.node_info(key).map(|n| Value::Str(n.label)),
-            _ => None,
-        }
-    }
-
-    /// Evaluate `operand` for one row at this point of the statement.
-    ///
-    /// `node_key` answers for a name: `Some(Some(key))` a node, `Some(None)` a
-    /// node variable that is null in this row (an `OPTIONAL MATCH` that found
-    /// nothing), `None` not a node. `values` are the row's other variables.
-    pub(super) fn uw_eval(
-        &self,
-        ov: &mut Overlay,
-        operand: &Operand,
-        node_key: &dyn Fn(&str) -> Option<Option<String>>,
-        values: &[(&str, Value)],
-        params: &BTreeMap<String, Value>,
-    ) -> Result<Option<Value>> {
-        let mut stored: Vec<(String, u32)> = Vec::new();
-        let rewritten = map_leaves(operand, &mut |leaf| match leaf {
-            Operand::Prop { var, field } => {
-                let key = node_key(var)?;
-                Some(match key {
-                    Some(key) => match self.uw_read_prop(ov, &key, field) {
-                        Some(v) => Operand::Lit(v),
-                        None => Operand::Lit(Value::Null),
-                    },
+/// Evaluate `operand` for one row at this point of the statement.
+///
+/// `node_key` answers for a name: `Some(Some(key))` a node, `Some(None)` a
+/// node variable that is null in this row (an `OPTIONAL MATCH` that found
+/// nothing), `None` not a node. `values` are the row's other variables.
+pub(super) fn uw_eval<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &mut Overlay,
+    operand: &Operand,
+    node_key: &dyn Fn(&str) -> Option<Option<String>>,
+    values: &[(&str, Value)],
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    let mut stored: Vec<(String, u32)> = Vec::new();
+    let rewritten = map_leaves(operand, &mut |leaf| match leaf {
+        Operand::Prop { var, field } => {
+            let key = node_key(var)?;
+            Some(match key {
+                Some(key) => match uw_read_prop(src, ov, &key, field) {
+                    Some(v) => Operand::Lit(v),
                     None => Operand::Lit(Value::Null),
-                })
-            }
-            Operand::Var(var) => {
-                let key = node_key(var)?;
-                Some(match key {
-                    Some(key) => match self.ids.get(&key).filter(|_| self.uw_exists(ov, &key)) {
-                        Some(id) if !ov.nodes.get(&key).is_some_and(|n| n.created_here) => {
-                            stored.push((var.clone(), id));
-                            Operand::Var(var.clone())
-                        }
-                        _ => Operand::Lit(Value::Str(key)),
-                    },
-                    None => Operand::Lit(Value::Null),
-                })
-            }
-            _ => None,
-        });
-        let mut bindings: Vec<(&str, Binding)> = values
-            .iter()
-            .map(|(name, v)| (*name, Binding::Value(v.clone())))
-            .collect();
-        for (name, id) in &stored {
-            bindings.push((name.as_str(), Binding::Node(*id)));
+                },
+                None => Operand::Lit(Value::Null),
+            })
         }
-        let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-        let evaluated = match mask_opt {
-            Some(ref mask) => eval_operand(
-                &self.view_masked(mask),
-                &rewritten,
-                &Params(params),
-                &bindings,
-            ),
-            None => eval_operand(&self.view(), &rewritten, &Params(params), &bindings),
-        };
-        evaluated.map_err(|e| GraphError::QueryError {
+        Operand::Var(var) => {
+            let key = node_key(var)?;
+            Some(match key {
+                Some(key) => match src.row_id(&key).filter(|_| uw_exists(src, ov, &key)) {
+                    Some(id) if !ov.nodes.get(&key).is_some_and(|n| n.created_here) => {
+                        stored.push((var.clone(), id));
+                        Operand::Var(var.clone())
+                    }
+                    _ => Operand::Lit(Value::Str(key)),
+                },
+                None => Operand::Lit(Value::Null),
+            })
+        }
+        _ => None,
+    });
+    let mut bindings: Vec<(&str, Binding)> = values
+        .iter()
+        .map(|(name, v)| (*name, Binding::Value(v.clone())))
+        .collect();
+    for (name, id) in &stored {
+        bindings.push((name.as_str(), Binding::Node(*id)));
+    }
+    src.row_view(|view| eval_operand(view, &rewritten, &Params(params), &bindings))
+        .map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
-    }
 }
 
 /// Whether `operand` reads a node variable in `nodes`: a property of it, or the
