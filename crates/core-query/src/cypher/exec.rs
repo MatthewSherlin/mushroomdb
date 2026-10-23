@@ -4567,6 +4567,59 @@ fn distinct_value(
     }
 }
 
+/// The openCypher name of an aggregate, for messages.
+fn agg_name(func: &AggFunc) -> &'static str {
+    match func {
+        AggFunc::Sum => "sum",
+        AggFunc::Avg => "avg",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
+        _ => "aggregate",
+    }
+}
+
+/// The value one row feeds a `sum` / `avg` / `min` / `max`: the property, or
+/// the scalar a bare variable is bound to. Null and an unbound variable give
+/// `None` (contributes nothing); a node, relationship or path is not a value
+/// these aggregates can read and is an error, as for `stDev`.
+fn scalar_agg_input(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    arg: &AggArg,
+    name: &str,
+) -> Result<Option<Value>, String> {
+    let value = match arg {
+        AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
+        AggArg::Var(v) => match vars
+            .slot(v)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref())
+        {
+            Some(Cell::Scalar(x)) => Some(x.clone()),
+            None => None,
+            Some(_) => return Err(format!("{name}(): expected a value, got a graph element")),
+        },
+        _ => None,
+    };
+    Ok(value.filter(|v| !matches!(v, Value::Null)))
+}
+
+/// Keep the smaller (`largest == false`) or larger of the running extreme and
+/// the next value. Any orderable value counts, strings included.
+fn fold_extreme(current: &mut Option<Value>, next: Value, largest: bool) {
+    *current = Some(match current.take() {
+        None => next,
+        Some(prev) => {
+            if cmp_optional(Some(&prev), Some(&next), largest) == std::cmp::Ordering::Greater {
+                next
+            } else {
+                prev
+            }
+        }
+    });
+}
+
 /// Update a single accumulator for one matched row.
 ///
 /// Shared by `agg_stream` (single-aggregate path) and `group_stream` (grouped
@@ -4624,64 +4677,33 @@ fn update_acc(
                 }
             }
         }
-        (AggFunc::Sum, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if let Some(num) = numeric_val(&v) {
-                    if let AggAcc::Sum { val, has_value } = acc {
+        // sum / avg / min / max read one value per row: a property or a bare
+        // variable bound to a scalar (`UNWIND … AS x`, `WITH … AS x`). Row 157:
+        // the bare-variable form used to fall through to the catch-all arm and
+        // contribute nothing, so these returned null.
+        (
+            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+            AggArg::Prop { .. } | AggArg::Var(_),
+        ) => {
+            let Some(v) = scalar_agg_input(view, vars, row, arg, agg_name(func))? else {
+                return Ok(());
+            };
+            match acc {
+                AggAcc::Sum { val, has_value } => {
+                    if let Some(num) = numeric_val(&v) {
                         *val += num;
                         *has_value = true;
                     }
                 }
-            }
-        }
-        (AggFunc::Avg, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if let Some(num) = numeric_val(&v) {
-                    if let AggAcc::Avg { sum, n } = acc {
+                AggAcc::Avg { sum, n } => {
+                    if let Some(num) = numeric_val(&v) {
                         *sum += num;
                         *n += 1;
                     }
                 }
-            }
-        }
-        (AggFunc::Min, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
-                    if let AggAcc::Min(current) = acc {
-                        *current = Some(match current.take() {
-                            None => v,
-                            Some(prev) => {
-                                if cmp_optional(Some(&prev), Some(&v), false)
-                                    == std::cmp::Ordering::Greater
-                                {
-                                    v
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        }
-        (AggFunc::Max, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
-                    if let AggAcc::Max(current) = acc {
-                        *current = Some(match current.take() {
-                            None => v,
-                            Some(prev) => {
-                                if cmp_optional(Some(&prev), Some(&v), true)
-                                    == std::cmp::Ordering::Greater
-                                {
-                                    v
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
+                AggAcc::Min(current) => fold_extreme(current, v, false),
+                AggAcc::Max(current) => fold_extreme(current, v, true),
+                _ => {}
             }
         }
         (AggFunc::Collect, AggArg::Var(v)) => {
@@ -12485,3 +12507,7 @@ LIMIT 10";
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/ql_ag.rs"]
+mod ql_ag;

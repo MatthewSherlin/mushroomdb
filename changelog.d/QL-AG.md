@@ -1,0 +1,2 @@
+### Fixed
+- **`sum`, `avg`, `min` and `max` over a bare variable returned null.** `UNWIND [1,2] AS x RETURN max(x)` (and the same through `WITH x AS y`) gave null instead of 2; the same four over a property were right. `min` and `max` also returned null over strings and now order any non-null value. A node, relationship or path argument is now a named error. Present in released 0.9.x (ledger row 157).
