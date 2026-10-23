@@ -442,6 +442,13 @@ impl RowSource for TxRows<'_, '_> {
         })
     }
 
+    fn row_incident(&self, key: &str) -> Vec<String> {
+        incident_edges_in(self.view, key)
+            .into_iter()
+            .map(|(from, to)| if from == key { to } else { from })
+            .collect()
+    }
+
     fn row_merge_existed(&self, _label: &str, key: &str) -> Result<bool> {
         Ok(self.row_exists(key))
     }
@@ -850,7 +857,14 @@ impl Transaction {
                     })
                 }
             };
-            let staged = stage_ops(src, prepared.take_ops())?;
+            let mut staged = stage_ops(src, prepared.take_ops())?;
+            // A key a MERGE found but did not write still guards the commit,
+            // as the plain MERGE's does.
+            if let Prepared::Rows(pass) = &prepared {
+                for key in pass.merge_keys() {
+                    staged.touch(key);
+                }
+            }
             Ok((prepared, staged))
         })??;
         // Every node the statement read, as a plain read records them: a

@@ -1228,7 +1228,9 @@ fn a_node_deleted_in_the_statement_no_longer_holds_the_edges_made_to_it() {
          MERGE (n:Person {id: k})-[:T]->(m:Person {id: 'm'}) DETACH DELETE n DELETE m",
         &none(),
     );
-    assert_eq!(count(&rs, "deleted"), 2);
+    // n, the relationship its DETACH DELETE removed (TX-MW: counted as
+    // `MATCH … DETACH DELETE` counts it), and m.
+    assert_eq!(count(&rs, "deleted"), 3);
     assert_eq!(db.edge_count(), 0);
 }
 

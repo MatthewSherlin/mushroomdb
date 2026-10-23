@@ -31,7 +31,8 @@
 //! transaction with them laid over it ([`unwind_rows`], [`RowPass::result`]).
 
 use super::row_eval::{
-    reads_node, uw_edge_exists, uw_eval, uw_exists, uw_has_edges, uw_props, Overlay, RowSource,
+    reads_node, uw_edge_exists, uw_edges_removed, uw_eval, uw_exists, uw_has_edges, uw_props,
+    Overlay, RowSource,
 };
 use super::*;
 use core_query::cypher::{
@@ -83,6 +84,9 @@ struct Tally {
     props_set: i64,
     deleted: i64,
     relationships_created: i64,
+    /// The keys every `MERGE` looked up, found or created: a transaction
+    /// guards its commit with them, as its plain `MERGE` does.
+    merge_keys: Vec<String>,
 }
 
 fn err(detail: String) -> GraphError {
@@ -502,6 +506,11 @@ impl RowPass {
         self.tally.created
     }
 
+    /// The keys the statement's `MERGE`s looked up, found or created.
+    pub(crate) fn merge_keys(&self) -> &[String] {
+        &self.tally.merge_keys
+    }
+
     /// The statement's result once its ops are applied: the write counts, or
     /// the `RETURN` projected over `view` (the state with the ops applied).
     pub(crate) fn result(
@@ -816,6 +825,11 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                          Use DETACH DELETE to remove the node and all its edges."
                     )));
                 }
+                // A node and the relationships it takes with it, as
+                // `MATCH … DETACH DELETE` counts them.
+                if *detach {
+                    tally.deleted += uw_edges_removed(src, ov, &key);
+                }
                 ov.node_deleted(&key);
                 ops.push(BatchOp::DeleteNode { key });
                 tally.deleted += 1;
@@ -931,6 +945,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
 ) -> Result<()> {
     let src = ctx.src;
     let (start_key, start_value) = uw_merge_key(&merge.start, ctx, env, ov)?;
+    tally.merge_keys.push(start_key.clone());
     let start_ns = match &merge.start.ns {
         Some(op) => ctx.eval(op, env, ov)?,
         None => None,
@@ -959,6 +974,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     };
 
     let (end_key, end_value) = uw_merge_key(&edge.end, ctx, env, ov)?;
+    tally.merge_keys.push(end_key.clone());
     let end_ns = match &edge.end.ns {
         Some(op) => ctx.eval(op, env, ov)?,
         None => None,

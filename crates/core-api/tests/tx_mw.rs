@@ -191,7 +191,7 @@ fn per_row_writes_read_the_transactions_own_writes() {
             &none(),
         )
         .unwrap();
-    assert_eq!(count(&rs, "deleted"), 1);
+    assert_eq!(count(&rs, "deleted"), 2, "n3 and the edge n1 -> n3");
     let inside = rows(&tx.execute(EDGES, &none()).unwrap());
     assert!(db.reader().node_info("n1").is_none(), "not committed yet");
     tx.commit().unwrap();
@@ -357,6 +357,42 @@ fn row_146_an_edge_between_two_deleted_nodes_is_counted_once_in_a_transaction() 
     assert_eq!(counts, (4, 4));
 }
 
+/// `UNWIND … DETACH DELETE` counts the relationships it removes as
+/// `MATCH … DETACH DELETE` does: an edge between two deleted nodes once, a
+/// self-loop once, and an edge the statement itself created.
+#[test]
+fn unwind_detach_delete_counts_relationships_as_match_detach_delete_does() {
+    let setup = [
+        "CREATE (:X {id: 'p'})",
+        "CREATE (:X {id: 'q'})",
+        "CREATE (:Y {id: 'o'})",
+        "MATCH (a {id: 'p'}), (b {id: 'q'}) CREATE (a)-[:K]->(b)",
+        "MATCH (a {id: 'q'}), (b {id: 'p'}) CREATE (a)-[:K]->(b)",
+        "MATCH (a {id: 'p'}), (b {id: 'p'}) CREATE (a)-[:K]->(b)",
+        "MATCH (a {id: 'p'}), (b {id: 'o'}) CREATE (a)-[:K]->(b)",
+    ];
+    // 2 nodes + p->q, q->p, p->p, p->o.
+    assert_eq!(detach_delete_counts("uw-detach-match", &setup), (6, 6));
+    let unwound = "UNWIND ['p', 'q'] AS k MATCH (n {id: k}) DETACH DELETE n";
+    let created_too = "UNWIND [1] AS i MATCH (a {id: 'p'}), (b {id: 'o'}) \
+                       CREATE (a)-[:L]->(b) DETACH DELETE a";
+    // p and its 4 stored edges, and the edge the statement created.
+    for (q, want) in [(unwound, 6), (created_too, 1 + 4 + 1)] {
+        let auto = SharedDb::open(&tmp("uw-detach-auto")).unwrap();
+        let txd = SharedDb::open(&tmp("uw-detach-tx")).unwrap();
+        for stmt in setup {
+            auto.write().query_write(stmt, &none()).unwrap();
+            txd.write().query_write(stmt, &none()).unwrap();
+        }
+        let a = count(&auto.write().query_write(q, &none()).unwrap(), "deleted");
+        let mut tx = txd.begin_transaction();
+        let b = count(&tx.execute(q, &none()).unwrap(), "deleted");
+        tx.commit().unwrap();
+        assert_eq!((a, b), (want, want), "{q}");
+        assert_eq!(state(&auto), state(&txd), "{q}");
+    }
+}
+
 /// Row 147: a self-loop is one relationship. Auto-commit counted it twice
 /// (once from each end, since 0.9.x); `delete_node`'s report did too.
 #[test]
@@ -469,6 +505,71 @@ fn a_change_to_a_node_the_write_did_not_read_does_not_conflict() {
     assert_eq!(outside(&db, EDGES), vec![vec![Some(s("a")), Some(s("b"))]]);
 }
 
+/// A write that changes the property it matched on still guards the commit
+/// with the node it matched (the read set is taken before the statement's
+/// writes are laid over the transaction).
+#[test]
+fn a_write_that_changes_what_it_matched_on_still_records_the_node() {
+    conflicts_on_the_flag_it_read(
+        "rs-set-matched",
+        "MATCH (a:Person {id: 'a'})-[:K]->(f:Flag {active: true}) SET f.active = false",
+    );
+}
+
+/// A MERGE that finds its node and writes nothing still guards the commit
+/// with the key, as the plain `MERGE` does: deleting (or changing) the node
+/// it found is a conflict.
+#[test]
+fn a_merged_node_that_was_only_found_guards_the_commit() {
+    for (name, other) in [
+        (
+            "merge-found-delete",
+            "MATCH (f:Flag {id: 'f'}) DETACH DELETE f",
+        ),
+        (
+            "merge-found-change",
+            "MATCH (f:Flag {id: 'f'}) SET f.active = false",
+        ),
+    ] {
+        let db = people(name);
+        db.write()
+            .query_write("CREATE (:Flag {id: 'f', active: true})", &none())
+            .unwrap();
+        let mut tx = db.begin_transaction();
+        let rs = tx
+            .execute("UNWIND ['f'] AS k MERGE (:Flag {id: k})", &none())
+            .unwrap();
+        assert_eq!(count(&rs, "created"), 0, "found, not created");
+        // A transaction that writes nothing commits without checking its
+        // reads (TX-1); this one writes something else as well.
+        tx.execute(CONNECT, &ab("a", "b")).unwrap();
+        db.write().query_write(other, &none()).unwrap();
+        let after_other = state(&db);
+        let e = tx.commit().unwrap_err();
+        assert!(
+            matches!(e, GraphError::CasConflict { ref key, .. } if key == "f"),
+            "{name}: {e:?}"
+        );
+        assert_eq!(state(&db), after_other, "{name}: nothing written");
+    }
+}
+
+/// `OPTIONAL MATCH … MERGE` is not a write form: it is refused (a parse
+/// error) on both paths, writes nothing, and the transaction goes on.
+#[test]
+fn optional_match_then_merge_is_a_clean_refusal() {
+    let db = people("optional-merge");
+    let q = "OPTIONAL MATCH (a:Person {id: 'a'}) MERGE (:T {id: 't'})";
+    assert!(db.write().query_write(q, &none()).is_err());
+    assert!(db.reader().query(q, &none()).is_err());
+    let mut tx = db.begin_transaction();
+    assert!(tx.execute(q, &none()).is_err());
+    tx.execute(CONNECT, &ab("a", "b")).unwrap();
+    tx.commit().unwrap();
+    assert!(db.reader().node_info("t").is_none());
+    assert_eq!(outside(&db, EDGES), vec![vec![Some(s("a")), Some(s("b"))]]);
+}
+
 // ── Commit-time checks ──────────────────────────────────────────────────────
 
 /// Two transactions connecting the same pair: both endpoints are in each
@@ -576,7 +677,7 @@ fn random_write(rng: &mut Rng, step: usize) -> String {
     let op = rng.pick(&["=", "<", ">=", "<>"]);
     let t = rng.pick(&["K", "J"]);
     let ret = rng.pick(&["", " RETURN count(*) AS c", " RETURN a.id AS a ORDER BY a"]);
-    match rng.below(13) {
+    match rng.below(14) {
         0 => format!(
             "MATCH (a:{l1}), (b:{l2}) WHERE a.v {op} {k} CREATE (a)-[:{t}]->(b){ret}"
         ),
@@ -603,6 +704,9 @@ fn random_write(rng: &mut Rng, step: usize) -> String {
         9 => format!("MATCH (a:{l1}) WHERE a.v {op} {k} REMOVE a.w RETURN a.id AS a ORDER BY a"),
         10 => format!("MATCH (a:{l1}) WHERE a.v {op} {k} SET a = {{v: {k}, id: a.id}}"),
         11 => format!("MATCH (a:{l1})-[r:{t}]->(b:{l2}) WHERE a.v {op} {k} DELETE r"),
+        12 => format!(
+            "UNWIND range(0, {k}) AS i MATCH (a:{l1}) WHERE a.v = i DETACH DELETE a"
+        ),
         _ => format!(
             "MATCH (a:{l1}) OPTIONAL MATCH (a)-[:K]->(b:{l2}) WITH a, b WHERE b IS NOT NULL \
              MERGE (a)-[:{t}]->(b){ret}"

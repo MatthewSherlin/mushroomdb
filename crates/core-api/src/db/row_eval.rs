@@ -45,6 +45,9 @@ pub(crate) trait RowSource {
     fn row_edge(&self, etype: &str, src: &str, dst: &str) -> bool;
     /// Whether any edge touches the node.
     fn row_has_edges(&self, key: &str) -> bool;
+    /// The other end of each distinct edge that touches the node (the node
+    /// itself for a self-loop, once).
+    fn row_incident(&self, key: &str) -> Vec<String>;
     /// Whether a MERGE node exists, after any role-scope check.
     fn row_merge_existed(&self, label: &str, key: &str) -> Result<bool>;
     /// The properties a MERGE create arm inserts.
@@ -99,6 +102,24 @@ impl<F: Fs> RowSource for GraphDb<F> {
             !tv.neighbors(et, Direction::Out, id).is_empty()
                 || !tv.neighbors(et, Direction::In, id).is_empty()
         })
+    }
+
+    fn row_incident(&self, key: &str) -> Vec<String> {
+        let Some(id) = self.ids.get(key) else {
+            return Vec::new();
+        };
+        let tv = self.topo_view();
+        let mut others = Vec::new();
+        for et in tv.etypes() {
+            let outs = tv.neighbors(et, Direction::Out, id);
+            let ins = tv.neighbors(et, Direction::In, id);
+            for &other in outs.iter().chain(ins.iter().filter(|&&src| src != id)) {
+                if let Some(k) = self.ids.key_of(other) {
+                    others.push(k.to_string());
+                }
+            }
+        }
+        others
     }
 
     fn row_merge_existed(&self, label: &str, key: &str) -> Result<bool> {
@@ -226,6 +247,13 @@ impl Overlay {
         );
     }
 
+    /// Edges the statement created at `key` that are still there.
+    fn pending_edges_at(&self, key: &str) -> usize {
+        self.touching.get(key).map_or(0, |edges| {
+            edges.iter().filter(|e| self.edges.contains(*e)).count()
+        })
+    }
+
     fn has_pending_edge(&self, key: &str) -> bool {
         self.touching
             .get(key)
@@ -294,6 +322,28 @@ pub(super) fn uw_has_edges<S: RowSource + ?Sized>(src: &S, ov: &Overlay, key: &s
         return false;
     }
     src.row_has_edges(key)
+}
+
+/// The relationships a `DETACH DELETE` of `key` removes at this point of the
+/// statement: the ones it created there, and the stored ones whose other end
+/// an earlier row has not already deleted (that row removed and counted
+/// them). A self-loop is one.
+pub(super) fn uw_edges_removed<S: RowSource + ?Sized>(src: &S, ov: &Overlay, key: &str) -> i64 {
+    let mut removed = ov.pending_edges_at(key);
+    if !ov.nodes.get(key).is_some_and(|n| n.created_here) {
+        removed += src
+            .row_incident(key)
+            .iter()
+            .filter(|other| {
+                other.as_str() == key
+                    || !ov
+                        .nodes
+                        .get(other.as_str())
+                        .is_some_and(|n| !n.exists || n.created_here)
+            })
+            .count();
+    }
+    removed as i64
 }
 
 /// Record in the overlay what `SET n = {…}` / `SET n += {…}` does to `key`.

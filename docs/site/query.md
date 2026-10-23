@@ -806,7 +806,8 @@ MERGE (n:Person {id: r.id})
   such a `RETURN` is refused by name.
 - **Counts.** Without `RETURN` the row is `created` (nodes inserted),
   `properties_set` (properties set, plus those removed that existed), `deleted`
-  (nodes deleted) and `relationships_created` (relationships created).
+  (nodes deleted, plus the relationships a `DETACH DELETE` removed with them,
+  counted as `MATCH … DETACH DELETE` counts them) and `relationships_created` (relationships created).
 - **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
   `ingest` of the same rows.
 - Inside an interactive transaction (and so a Bolt `BEGIN`) it runs as it does
