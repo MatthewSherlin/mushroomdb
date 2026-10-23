@@ -5,8 +5,8 @@
 
 use super::Parser;
 use crate::cypher::ast::{
-    CreateEdge, MergeSet, OptionalClause, Pattern, RetItem, RetVal, RowCreateNode, RowMerge,
-    RowMergeEdge, RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr,
+    CreateEdge, MergeSet, OptionalClause, Pattern, RelDir, RetItem, RetVal, RowCreateNode,
+    RowMerge, RowMergeEdge, RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr,
     UnwindWriteStmt, WithStage, WriteStatement, ONE_ROW_VAR,
 };
 use crate::cypher::{Operand, Query, Tok};
@@ -188,6 +188,16 @@ impl Scope {
             .map(|(name, _)| name.clone())
             .collect()
     }
+}
+
+/// The relationship of a per-row CREATE, as written.
+struct CreateRel {
+    var: Option<String>,
+    etype: String,
+    /// `<-[…]-`: the node after the relationship is its start.
+    next_is_src: bool,
+    props: Vec<(String, Operand)>,
+    props_map: Option<Operand>,
 }
 
 /// `UNWIND [1] AS <ONE_ROW_VAR>`: one row for the clauses after it.
@@ -407,17 +417,30 @@ impl<'a> Parser<'a> {
         loop {
             let mut prev = self.row_create_node(scope, anonymous, &mut nodes)?;
             while matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
-                let (etype, next_is_src) = self.create_rel()?;
+                let rel = self.row_create_rel()?;
                 let next = self.row_create_node(scope, anonymous, &mut nodes)?;
-                let (src_var, dst_var) = if next_is_src {
+                let (src_var, dst_var) = if rel.next_is_src {
                     (next.clone(), prev)
                 } else {
                     (prev, next.clone())
                 };
+                if let Some(var) = &rel.var {
+                    if scope.kind(var).is_some() {
+                        return Err(format!(
+                            "CREATE ()-[{var}:{}]->(): `{var}` is already bound; use a new name \
+                             for a new relationship",
+                            rel.etype
+                        ));
+                    }
+                    scope.bind(var, VarKind::Rel);
+                }
                 edges.push(CreateEdge {
                     src_var,
-                    etype,
+                    etype: rel.etype,
                     dst_var,
+                    rel_var: rel.var,
+                    props: rel.props,
+                    props_map: rel.props_map,
                 });
                 prev = next;
             }
@@ -511,7 +534,7 @@ impl<'a> Parser<'a> {
             }
         };
         let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
-            let (rel_var, etype, dir) = self.merge_rel()?;
+            let (rel_var, etype, dir, props) = self.row_merge_rel()?;
             let end = match self.bound_merge_node(scope) {
                 Some(node) => node,
                 None => {
@@ -536,6 +559,7 @@ impl<'a> Parser<'a> {
                 dir,
                 rel_var,
                 end,
+                props,
             })
         } else {
             if start.bound {
@@ -563,10 +587,12 @@ impl<'a> Parser<'a> {
         for item in on_create.iter().chain(&on_match) {
             let var = item.var();
             let names_a_node = var == start.var || edge.as_ref().is_some_and(|e| e.end.var == var);
-            if !names_a_node {
+            let names_the_rel = edge
+                .as_ref()
+                .is_some_and(|e| e.rel_var.as_deref() == Some(var));
+            if !names_a_node && !names_the_rel {
                 return Err(format!(
-                    "SET variable '{var}' does not match a MERGE node variable \
-                     (a relationship takes no SET)"
+                    "SET variable '{var}' does not match a MERGE node or relationship variable"
                 ));
             }
         }
@@ -669,7 +695,7 @@ impl<'a> Parser<'a> {
             let var = self.ident("expected variable after SET")?;
             let merge = self.eat(&Tok::Plus);
             self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-            self.require_node(scope, &var, "SET")?;
+            self.require_entity(scope, &var, "SET")?;
             let value = self.value_expr()?;
             if self.peek() == Some(&Tok::Comma) {
                 return Err(
@@ -684,7 +710,7 @@ impl<'a> Parser<'a> {
         let mut sets: Vec<SetClause> = Vec::new();
         loop {
             let clause = self.set_clause_with(true)?;
-            self.require_node(scope, &clause.var, "SET")?;
+            self.require_entity(scope, &clause.var, "SET")?;
             sets.push(clause);
             if !self.eat(&Tok::Comma) {
                 break;
@@ -705,7 +731,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&Tok::Dot, "expected '.' after variable in REMOVE")?;
             let field = self.ident("expected property name after '.' in REMOVE")?;
-            self.require_node(scope, &var, "REMOVE")?;
+            self.require_entity(scope, &var, "REMOVE")?;
             items.push((var, field));
             if !self.eat(&Tok::Comma) {
                 return Ok(items);
@@ -737,6 +763,131 @@ impl<'a> Parser<'a> {
                 return Ok(vars);
             }
         }
+    }
+
+    /// [`require_node`](Self::require_node), or a single relationship: `SET`
+    /// and `REMOVE` write a relationship's properties as they write a node's.
+    fn require_entity(&self, scope: &Scope, var: &str, clause: &str) -> Result<(), String> {
+        match scope.kind(var) {
+            Some(VarKind::Rel) => Ok(()),
+            _ => self.require_node(scope, var, clause),
+        }
+    }
+
+    /// The relationship of a per-row CREATE: `-[v:T {…}]->`, `<-[:T $p]-`.
+    fn row_create_rel(&mut self) -> Result<CreateRel, String> {
+        let (rel, props, props_map) = self.rel_with_props()?;
+        if rel.hops.is_some() {
+            return Err(super::refusal("CREATE with a variable-length relationship"));
+        }
+        let etype = match rel.etypes.as_slice() {
+            [one] => one.clone(),
+            [] => return Err("expected ':TYPE' in CREATE relationship".to_string()),
+            _ => return Err(super::refusal("CREATE with alternative relationship types")),
+        };
+        let next_is_src = match rel.dir {
+            RelDir::Left => true,
+            RelDir::Right => false,
+            RelDir::Undirected => {
+                return Err("expected '>' — CREATE requires directed relationships".to_string())
+            }
+        };
+        Ok(CreateRel {
+            var: rel.var,
+            etype,
+            next_is_src,
+            props,
+            props_map,
+        })
+    }
+
+    /// The relationship of a per-row MERGE, with its property map: one typed,
+    /// directed, single-hop relationship, as [`merge_rel`](Self::merge_rel).
+    #[allow(clippy::type_complexity)]
+    fn row_merge_rel(
+        &mut self,
+    ) -> Result<(Option<String>, String, RelDir, Vec<(String, Operand)>), String> {
+        let (rel, props, props_map) = self.rel_with_props()?;
+        if props_map.is_some() {
+            return Err(super::refusal(
+                "a $parameter map in a MERGE relationship; name its properties, \
+                 e.g. MERGE (a)-[r:T {k: $p.k}]->(b) ON CREATE SET r += $p",
+            ));
+        }
+        let (var, etype, dir) = self.merge_rel_checked(rel)?;
+        Ok((var, etype, dir, props))
+    }
+
+    /// A relationship pattern whose bracket may end with a property map or a
+    /// `$parameter` map: `-[r:T {k: v}]->`, `<-[:T $p]-`.
+    #[allow(clippy::type_complexity)]
+    fn rel_with_props(
+        &mut self,
+    ) -> Result<
+        (
+            crate::cypher::RelPat,
+            Vec<(String, Operand)>,
+            Option<Operand>,
+        ),
+        String,
+    > {
+        let left = self.eat(&Tok::Lt);
+        self.expect(&Tok::Dash, "expected '-' to start a relationship")?;
+        self.expect(&Tok::LBracket, "expected '[' in a relationship pattern")?;
+        let var = match self.peek() {
+            Some(Tok::Ident(s)) => {
+                let s = s.clone();
+                self.not_reserved(&s)?;
+                self.pos += 1;
+                Some(s)
+            }
+            _ => None,
+        };
+        let mut etypes = Vec::new();
+        if self.eat(&Tok::Colon) {
+            etypes.push(self.ident("expected relationship type identifier after ':'")?);
+            while self.eat(&Tok::Pipe) {
+                self.eat(&Tok::Colon);
+                etypes.push(self.ident("expected relationship type identifier after '|'")?);
+            }
+        }
+        let hops = if self.eat(&Tok::Star) {
+            Some(self.parse_hop_range()?)
+        } else {
+            None
+        };
+        let mut props_map = None;
+        let props = match self.peek() {
+            Some(Tok::LBrace) => self.row_props()?,
+            Some(Tok::Param(name)) => {
+                props_map = Some(Operand::Param(name.clone()));
+                self.pos += 1;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        self.expect(
+            &Tok::RBracket,
+            "expected ']' to close a relationship pattern",
+        )?;
+        self.expect(&Tok::Dash, "expected '-' after ']'")?;
+        let dir = if left {
+            RelDir::Left
+        } else if self.eat(&Tok::Gt) {
+            RelDir::Right
+        } else {
+            RelDir::Undirected
+        };
+        Ok((
+            crate::cypher::RelPat {
+                var,
+                etypes,
+                dir,
+                hops,
+            },
+            props,
+            props_map,
+        ))
     }
 
     fn require_node(&self, scope: &Scope, var: &str, clause: &str) -> Result<(), String> {

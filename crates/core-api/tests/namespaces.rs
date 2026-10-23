@@ -290,6 +290,7 @@ fn write_role(name: &str, labels: &[&str], namespaces: Option<&[&str]>) -> RoleD
             delete_labels: labels_v.clone(),
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
         ..role(name, labels, namespaces)
     }

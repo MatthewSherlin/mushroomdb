@@ -102,13 +102,7 @@ pub(crate) fn match_set_ops<S: RowSource + ?Sized>(
     // on a *node* is an ordinary property and is untouched.
     for s in &stmt.sets {
         if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
-            return Err(GraphError::QueryError {
-                detail: format!(
-                    "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
-                         property holding the pair's insert count",
-                    s.var
-                ),
-            });
+            return Err(edge_count_reserved_error(&s.var));
         }
     }
     let mut lookup_vars = set_vars.clone();
@@ -216,7 +210,15 @@ pub(crate) fn match_set_ops<S: RowSource + ?Sized>(
                             _ => None,
                         })
                 };
-                row_eval::uw_eval(src, &mut overlay, &sc.value, &node_key, &[], params)?
+                row_eval::uw_eval(
+                    src,
+                    &mut overlay,
+                    &sc.value,
+                    &node_key,
+                    &|_| None,
+                    &[],
+                    params,
+                )?
             } else {
                 // The SET value was already evaluated by the executor.
                 match_rs.get(row_i, col).cloned()
@@ -384,7 +386,15 @@ pub(crate) fn match_set_map_ops<S: RowSource + ?Sized>(
                             _ => None,
                         })
                 };
-                row_eval::uw_eval(src, &mut overlay, operand, &node_key, &[], params)?
+                row_eval::uw_eval(
+                    src,
+                    &mut overlay,
+                    operand,
+                    &node_key,
+                    &|_| None,
+                    &[],
+                    params,
+                )?
             } else {
                 match match_rs.get(row_i, col) {
                     None | Some(Value::Null) => None,

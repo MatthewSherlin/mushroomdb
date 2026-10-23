@@ -331,6 +331,13 @@ pub enum Operand {
 /// name out of reach of a written function call.
 pub const LABEL_TEST_FN: &str = " hasLabel";
 
+/// The internal function a write statement reads a relationship's identity
+/// with: `FuncCall { name: REL_ENDS_FN, args: [Var(r)] }` evaluates to the
+/// list `[type, start key, end key]`, in the edge's own direction whatever the
+/// pattern's, or null for a null binding. The leading space keeps it out of
+/// any name a query can spell.
+pub const REL_ENDS_FN: &str = " relEnds";
+
 /// The UNWIND alias of the one-row `UNWIND [1] AS …` a statement that begins
 /// with `MATCH … CREATE/MERGE` or with `OPTIONAL MATCH` is read as. The
 /// leading space keeps it out of reach of a written name, and `RETURN *` does
@@ -598,11 +605,21 @@ pub struct CreateNode {
 }
 
 /// One edge in a CREATE pattern, referencing vars from `CreateStmt.nodes`.
+///
+/// `rel_var`, `props` and `props_map` are the per-row form's (QL-RP): a plain
+/// `CREATE` whose relationship names a variable or carries a map is parsed as
+/// the per-row form, so the plain form's edges leave them empty.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdge {
     pub src_var: String,
     pub etype: String,
     pub dst_var: String,
+    /// `-[r:T]->`: the relationship's variable.
+    pub rel_var: Option<String>,
+    /// `-[:T {k: expr, …}]->`: the relationship's properties.
+    pub props: Vec<(String, Operand)>,
+    /// `-[:T $props]->`: the whole map is this operand; `props` is then empty.
+    pub props_map: Option<Operand>,
 }
 
 /// `MATCH patterns [WHERE expr] SET var.field = literal [, …] [RETURN …]`
@@ -746,7 +763,8 @@ pub struct MergeEdgePat {
     pub end_ns: Option<core_storage::Value>,
     /// Bound variable of the end node (`ON … SET b.x = …`, `RETURN b`).
     pub end_var: Option<String>,
-    /// Bound variable of the relationship (`RETURN r`); it takes no SET.
+    /// Bound variable of the relationship (`RETURN r`). A MERGE that sets
+    /// or maps its relationship's properties is the per-row form instead.
     pub rel_var: Option<String>,
 }
 
@@ -885,4 +903,6 @@ pub struct RowMergeEdge {
     pub dir: RelDir,
     pub rel_var: Option<String>,
     pub end: RowMergeNode,
+    /// `-[:T {k: expr, …}]->`: part of what the MERGE matches (QL-RP).
+    pub props: Vec<(String, Operand)>,
 }

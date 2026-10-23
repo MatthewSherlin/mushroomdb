@@ -99,8 +99,10 @@ fn malformed_patterns_are_errors() {
         "MERGE (a:P {id: 'a'})-[:K]->(b:P)",
         "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b', x: 1})",
         "MERGE (a:P {id: 'a'})-[]->(b:P {id: 'b'})",
-        "MERGE (a:P {id: 'a'})-[:K {w: 1}]->(b:P {id: 'b'})",
+        "MERGE (a:P {id: 'a'})-[:K $props]->(b:P {id: 'b'})",
     ] {
         assert!(parse(q).is_err(), "{q}");
     }
+    // QL-RP: a relationship map is part of what MERGE matches.
+    assert!(parse("MERGE (a:P {id: 'a'})-[:K {w: 1}]->(b:P {id: 'b'})").is_ok());
 }

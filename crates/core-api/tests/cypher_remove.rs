@@ -206,18 +206,18 @@ fn remove_label_is_refused_by_name() {
 }
 
 #[test]
-fn remove_on_a_relationship_or_unbound_variable_is_refused() {
+fn remove_on_an_unbound_variable_is_refused() {
     let mut db = GraphDb::open(&tmp("badvar")).unwrap();
     seed(&mut db);
-    for q in [
-        "MATCH (x:P)-[r:KNOWS]->(y:P) REMOVE r.w",
-        "MATCH (x:P) REMOVE z.a",
-    ] {
-        assert!(
-            matches!(db.query_write(q, &p()), Err(GraphError::QueryError { .. })),
-            "{q}"
-        );
-    }
+    let q = "MATCH (x:P) REMOVE z.a";
+    assert!(
+        matches!(db.query_write(q, &p()), Err(GraphError::QueryError { .. })),
+        "{q}"
+    );
+    // QL-RP: `REMOVE r.w` on a relationship removes its property (a no-op
+    // here, where the relationship has none) instead of being refused.
+    db.query_write("MATCH (x:P)-[r:KNOWS]->(y:P) REMOVE r.w", &p())
+        .unwrap();
 }
 
 #[test]
@@ -395,6 +395,7 @@ fn writer_store(name: &str) -> GraphDb {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })

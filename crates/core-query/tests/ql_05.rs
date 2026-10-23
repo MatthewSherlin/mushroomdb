@@ -51,10 +51,11 @@ fn malformed_remove_is_a_parse_error() {
         "MATCH (n) REMOVE n.x,",
         "MATCH (n) REMOVE n.x junk",
         "MATCH (n) REMOVE z.x",
-        "MATCH (a)-[r:T]->(b) REMOVE r.w",
     ] {
         assert!(parse(q).is_err(), "{q}");
     }
+    // QL-RP: a relationship's property is removable (the per-row form).
+    assert!(parse("MATCH (a)-[r:T]->(b) REMOVE r.w").is_ok());
 }
 
 #[test]

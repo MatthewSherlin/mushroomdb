@@ -242,6 +242,26 @@ impl DeltaLayer {
                     Value::Int(*count as i64),
                 );
             }
+            WalRecord::SetEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+                value,
+            } => {
+                let name = self.field_name(state, base, *field)?;
+                self.edge_props
+                    .set(*etype, *src, *dst, &name, value.clone());
+            }
+            WalRecord::RemoveEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+            } => {
+                let name = self.field_name(state, base, *field)?;
+                self.remove_edge_prop(state, base, (*etype, *src, *dst), &name);
+            }
             WalRecord::RenameNode { old_key, new_key } => {
                 // Recovery-safe: an `old_key` already gone is skipped cleanly.
                 let view = self.view(state, base, None);
@@ -283,6 +303,63 @@ impl DeltaLayer {
             | WalRecord::DisableFulltext { .. } => {}
         }
         Ok(())
+    }
+
+    /// The name an edge-property record's interned `field` stands for.
+    fn field_name(
+        &self,
+        state: &FrozenOverlay,
+        base: &Option<Arc<MappedBase>>,
+        field: u32,
+    ) -> Result<String> {
+        self.view(state, base, None)
+            .sym_name(field)
+            .map(str::to_string)
+            .ok_or_else(|| corrupt(format!("mvcc delta: unknown field sym {field}")))
+    }
+
+    /// Remove one property of an edge as every layer below shows it: the
+    /// edge's whole map, without the field, hides what lies below.
+    fn remove_edge_prop(
+        &mut self,
+        state: &FrozenOverlay,
+        base: &Option<Arc<MappedBase>>,
+        (etype, src, dst): (u32, u32, u32),
+        field: &str,
+    ) {
+        let mut props = self
+            .view(state, base, None)
+            .edge_props
+            .props_of(etype, src, dst);
+        if props.remove(field).is_some() {
+            self.edge_props.replace(etype, src, dst, props);
+        }
+    }
+
+    /// Lay a transaction's relationship-property write over the layer: set
+    /// (`Some`) or remove (`None`) `field` of the edge named by its type and
+    /// end keys. A transaction buffers these by key, not as WAL records: the
+    /// records name the edge by dense ids, which only the commit assigns.
+    pub(crate) fn write_edge_prop(
+        &mut self,
+        state: &FrozenOverlay,
+        base: &Option<Arc<MappedBase>>,
+        (edge_type, src_key, dst_key): (&str, &str, &str),
+        field: &str,
+        value: Option<&Value>,
+    ) {
+        let view = self.view(state, base, None);
+        let (Some(etype), Some(src), Some(dst)) = (
+            view.sym(edge_type),
+            view.node_id(src_key),
+            view.node_id(dst_key),
+        ) else {
+            return;
+        };
+        match value {
+            Some(v) => self.edge_props.set(etype, src, dst, field, v.clone()),
+            None => self.remove_edge_prop(state, base, (etype, src, dst), field),
+        }
     }
 
     /// `IdMap::try_insert` over the layer: a live `key` keeps its id and takes

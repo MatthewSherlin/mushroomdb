@@ -47,7 +47,8 @@ use serde::{Deserialize, Serialize};
 /// Subset rule (enforced at `apply_schema` time):
 /// - `create_labels`, `update_labels`, and `delete_labels` must each be a
 ///   subset of the role's read `labels`.
-/// - `create_edge_types` and `delete_edge_types` have no subset requirement
+/// - `create_edge_types`, `update_edge_types` and `delete_edge_types` have no
+///   subset requirement
 ///   (edge types are not read-scoped).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct WriteScope {
@@ -69,6 +70,13 @@ pub struct WriteScope {
     /// edges cannot be directly deleted by any token, including Full).
     #[serde(default)]
     pub delete_edge_types: Vec<String>,
+    /// Edge types whose relationships the role may SET or REMOVE properties
+    /// on (Cypher `SET r.p`, `SET r += …`, `REMOVE r.p`). Both endpoints must
+    /// be read-visible. Creating a relationship with its property map needs
+    /// only `create_edge_types`, as a node's properties need only
+    /// `create_labels`.
+    #[serde(default)]
+    pub update_edge_types: Vec<String>,
 }
 
 /// One property test a role's visibility may carry, beside `labels`.

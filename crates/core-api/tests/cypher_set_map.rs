@@ -503,10 +503,6 @@ fn malformed_and_unsupported_forms_are_refused_by_name() {
         ("MATCH (n:P) SET n = 5", "neither a map literal"),
         ("MATCH (n:P) SET n = {a: 1}, n.b = 2", "another SET item"),
         ("MATCH (n:P) SET m = {a: 1}", "not a node variable"),
-        (
-            "MATCH (x:P)-[r:KNOWS]->(y:P) SET r = {w: 1}",
-            "relationship",
-        ),
         ("MATCH (n:P) SET n = {a: 1, a: 2}", "duplicate map key"),
         ("MATCH (n:P) SET n = {a: 1", "map literal"),
     ] {
@@ -655,6 +651,7 @@ fn writer_store(name: &str) -> GraphDb {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })

@@ -103,7 +103,6 @@ fn mixed_unbound_relationship_and_malformed_forms_are_errors() {
         "MATCH (n) SET n = {a: 1}, n.b = 2",
         "MATCH (n) SET n = {a: 1}, m = {b: 2}",
         "MATCH (n) SET z = {a: 1}",
-        "MATCH (a)-[r:T]->(b) SET r = {w: 1}",
         "MATCH (n) SET n = {a: 1",
         "MATCH (n) SET n = {a: 1,}",
         "MATCH (n) SET n = {a: 1, a: 2}",
@@ -113,6 +112,8 @@ fn mixed_unbound_relationship_and_malformed_forms_are_errors() {
     ] {
         assert!(parse(q).is_err(), "{q}");
     }
+    // QL-RP: the map forms take a relationship too.
+    assert!(parse("MATCH (a)-[r:T]->(b) SET r = {w: 1}").is_ok());
 }
 
 #[test]
