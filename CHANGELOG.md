@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.4 — aggregates over variables, integer sums, boolean comparisons and rule weights are right
+
+No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot opens under 0.9.3: no byte layout in the snapshot or the WAL changed. One snapshot section's content can differ from what 0.9.3 would have written for the same store, in the one case row 154 below describes, and 0.9.3 reads it.
+
+**Upgrade if your Cypher aggregates a variable, sums integers, or compares booleans, or if you run two weighted rules over one edge type.** Four wrong answers, every one silent, present in every 0.9.x release and fixed on the 0.10 line too. `sum`, `avg`, `min` and `max` of a variable bound by `UNWIND` or `WITH` returned null (row 157). `sum` of integers returned a float and lost exactness above 2^53 (row 158). `WHERE n.flag > false` matched nothing, and `min` / `max` of a boolean returned null (row 160). A rule that lost an edge to another rule could leave its old weight showing on it until the next snapshot (row 154). They show on every surface that runs Cypher or reads an edge property: the CLI, the MCP `query` tool, HTTP, Python, TypeScript and the Rust library.
+
+### Fixed
+
+- **`sum`, `avg`, `min` and `max` over a bare variable use its value.** `MATCH (o:One) UNWIND [1, 2] AS x RETURN max(x)`, or `MATCH (n:N) WITH n.v AS x RETURN max(x)`, returned null instead of the maximum: the four read a property argument and nothing else. `count` and `collect` were right. Affected: any of the four applied to a variable rather than to `n.prop`, grouped or not, DISTINCT or not. What is unchanged: `min` and `max` still read numbers (and now booleans, below), so over strings they still return null; an aggregate of a node variable still returns null (row 157).
+- **`sum` of integers is an integer.** `sum` over `10` and `20` returned `30.0`; it now returns `30`. It returns a float once any input is a float, and an integer sum past 64 bits is now the error `sum(): integer overflow` instead of a rounded float. `avg` is unchanged and still a float. **This changes a result type:** a caller that reads a `sum` of integer properties as a float (a Python `float`, a JSON number with a fraction, `Value::Float` in Rust) now gets an integer. Affected: every `sum` whose inputs are all integers (row 158).
+- **Booleans compare: `false < true`.** `<`, `<=`, `>` and `>=` between two booleans were false, so `WHERE n.flag > false` dropped every row (in a read, in a fused scan with LIMIT, and in a write statement's WHERE), and `min` / `max` of a boolean property returned null. openCypher orders `false` before `true`, as `ORDER BY` already did. A boolean and a value of another type still do not order: `WHERE n.flag > 0` matches nothing. Affected: an ordering comparison or `min` / `max` over booleans (row 160).
+- **A rule's weight stays gone after another rule takes the edge.** Two weighted rules over one edge type, a snapshot, then a change that makes the first rule let the edge go while the second rule claims it: the edge showed the first rule's weight beside the second's, and lost it at the next snapshot. It now shows only the second rule's weight, live, after a snapshot and after a reopen. A snapshot now writes each edge's properties as a live read shows them. Affected: stores with two `weight_prop` rules over one edge type that were snapshotted while one of them owned an edge the other later took (row 154).
+
 ## v0.9.3 — a filtered scan with LIMIT sees every node a snapshot holds
 
 No format version change. A 0.9.2 store opens under 0.9.3, and a 0.9.3 snapshot opens under 0.9.2: the fix is in how a query reads, and no byte a snapshot or the WAL writes has changed.
