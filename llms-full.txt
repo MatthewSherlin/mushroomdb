@@ -4823,6 +4823,44 @@ These parameters are refused with `Neo.ClientError.Request.Invalid`, and the mes
 
 A temporal structure with the wrong number or type of fields fails the same way, as a malformed request. A refused parameter fails the `RUN` before the statement runs, so nothing is written; `RESET` makes the connection ready again.
 
+### Nodes, relationships and paths
+
+A result column that is a bare node, relationship or path variable (`RETURN n`, `RETURN r`, `RETURN p`, and the same names through `WITH`, `RETURN *` or a grouping key) arrives as a graph structure, so `record["n"]["name"]`, `record["r"].type` and a path's nodes work in a driver:
+
+| Returned | Bolt structure | Fields at Bolt 5.0 | Fields at 4.4 |
+|---|---|---|---|
+| node | Node (`0x4E`) | `id`, `labels`, `properties`, `element_id` | `id`, `labels`, `properties` |
+| relationship | Relationship (`0x52`) | `id`, `start_id`, `end_id`, `type`, `properties`, `element_id`, `start_element_id`, `end_element_id` | the first five |
+| path | Path (`0x50`) | `nodes`, `relationships` (UnboundRelationship `0x72`: `id`, `type`, `properties`, `element_id`), `indices` | the same, without element ids |
+
+- **Labels.** A node has one label, so `labels` is a list of one.
+- **Properties.** Everything the node or relationship stores, as the statement saw it: inside a transaction its own writes, after a write its written state.
+- **Element ids** are derived from the element's identity, so they are the same on every connection and after a restart: a node is `n:<key>` (`n:ada`); a relationship is `r:<type>|<start key>|<end key>` (`r:KNOWS|ada|bob`), with `\` and `|` inside a part escaped by a backslash. The store holds at most one relationship of a type in each direction between two nodes, so these name it. Renaming a node gives it a new key and so a new element id.
+- **Integer ids** all fit in 53 bits, so a JavaScript number holds them exactly. A node's `id` (and a relationship's `start_id` / `end_id`) is the node's dense id in the store: assigned when the node is created, never reused after a delete, and kept across a rename. A relationship's `id` is a 53-bit hash of its element id, the same for the same relationship in every result; two relationships can collide (about one chance in two million among 65,000 relationships), so compare element ids when that matters. Node and relationship ids are separate namespaces.
+- **`id(n)` in a query is the node's key**, not the Bolt integer id, so `MATCH (n) WHERE id(n) = $node_id` with a driver's integer id matches nothing. Match on the key instead (`n.id`, or the element id without its `n:`).
+- **Paths** list each node and relationship once; `indices` walks them as Bolt defines, a negative relationship index meaning the hop goes against the relationship's direction.
+- **Scoped connections.** A role-bound token gets only nodes its role can see, and a relationship only when both its ends are visible, as with every other read (see [Scoped access](#scoped-access)).
+- **Lists.** `collect(n)`, `collect(r)`, `collect(p)`, a list of variables of one kind (`[a, b]`) and a path's `p.nodes` and `p.relationships` arrive as lists of Node, Relationship or Path structures. A node or relationship inside a map built in the query (`{who: n}`), or in a list that mixes kinds or values, stays its key or map.
+
+HTTP, Python and the other surfaces render the same columns as they always have: a node as its key string, a path as a map, and a relationship as the map `{type, start, end}` (see [Query language](query.md#return-of-relationships-and-paths)).
+
+### Write counters
+
+The `SUCCESS` that closes a write statement carries a `stats` map, which drivers read as the result summary's counters (`nodes_created`, `contains_updates` and so on):
+
+| Key | Counts |
+|---|---|
+| `nodes-created` | nodes created |
+| `nodes-deleted` | nodes deleted |
+| `relationships-created` | relationships created |
+| `relationships-deleted` | relationships deleted, including those a `DETACH DELETE` removes with their node |
+| `properties-set` | properties set or removed, including those a `CREATE` or a `MERGE` writes with a new node |
+| `labels-added` | one for each node created (a node is created with its label) |
+| `indexes-added`, `indexes-removed` | `CREATE INDEX` / `DROP INDEX` that changed the schema |
+| `constraints-added`, `constraints-removed` | `CREATE CONSTRAINT` / `DROP CONSTRAINT` that changed the schema |
+
+A schema statement's summary has query type `s`, a write's `w` and a read's `r`. Only counters that moved are listed; a driver reads a missing one as 0. A statement that changed nothing (a read, a `MERGE` that matched with nothing to set, `IF NOT EXISTS` on an existing index) has no `stats`. Inside a transaction each statement's `SUCCESS` carries that statement's counters. A write without `RETURN` still returns its one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`), as over HTTP; that row keeps its documented meaning, so its `properties_set` does not count the properties a `CREATE` writes with a node.
+
 ### RESET while a request is running
 
 A `RESET` sent while an earlier request is still running takes effect at the first of these points:
@@ -5083,7 +5121,8 @@ RETURN p.nodes
 ```
 
 A path is a **map** with three fields, so it comes back the same way on every
-surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
+surface (Rust, HTTP JSON, Python, TypeScript, Arrow) as any other map; Bolt
+sends it as a Path structure (see [Return of relationships and paths](#return-of-relationships-and-paths)):
 
 | Field | Value |
 |---|---|
@@ -5111,6 +5150,39 @@ separate limit that is not lifted here.
 - **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
 - Relationship properties are not part of a path; match the relationship with
   its own variable to read them.
+
+---
+
+## Return of relationships and paths
+
+A fixed relationship variable can be returned bare, carried by `WITH`, used as a
+grouping key and sorted by, like a node or a path:
+
+```cypher
+MATCH (a:Person {id: 'ada'})-[r:KNOWS]->(b) RETURN r, b.name
+MATCH (a)-[r:KNOWS]->(b) WITH r, count(*) AS n RETURN r, n
+```
+
+A returned relationship is the map `{type, start, end}`, with the keys of the
+nodes at its stored start and end, the same map a path lists in its
+`relationships`; `ORDER BY r` sorts by that map. A node is still returned as its
+key and a path as its map, so `RETURN n` reads exactly as before on HTTP, in
+Python and in Rust.
+
+Over Bolt the three are graph structures: a node is a Node with its label and
+properties, a relationship a Relationship with its type, ends and properties,
+and a path a Path of both. See [Nodes, relationships and paths](bolt.md#nodes-relationships-and-paths).
+In Rust, a `ResultSet` says which columns are bare nodes, relationships and
+paths (`column_kind`), and a query run inside `mushroomdb::with_entity_detail`
+carries the node, relationship or path behind each of their cells (`entity`).
+
+- A **variable-length** relationship variable (`[rs:T*1..3]`) is still refused
+  bare: it is bound to a hop count, not to one relationship. Return
+  `rs.length`, or name the path (`p = …`) and return `p`.
+- A relationship is a value like the others in a list: `collect(r)`,
+  `collect(DISTINCT r)` and `[r, s]` are lists of its maps.
+- The `RETURN` of every write statement can return a relationship bare,
+  `MATCH … SET` and `MATCH … REMOVE` included.
 
 ---
 
@@ -5200,8 +5272,8 @@ joins against that set — use `WHERE` to correlate.
 
 ## RETURN * and WITH *
 
-`*` stands for every name in scope: the node, path and value variables the
-earlier clauses bound, in byte (code-point) order of name, so uppercase names
+`*` stands for every name in scope: the node, relationship, path and value
+variables the earlier clauses bound, in byte (code-point) order of name, so uppercase names
 come before lowercase ones (`Zed`, `alpha`). Further items may follow
 it.
 
@@ -5211,10 +5283,10 @@ MATCH (p:Person) WITH *, p.age * 2 AS double RETURN p.id, double
 MATCH (p:Person) UNWIND p.tags AS t RETURN DISTINCT *
 ```
 
-The first returns the columns `c` and `p`. Relationship variables, single or
-variable-length (`r`, `[rs*1..3]`), are left out, because a relationship is not
-returned bare (`RETURN r` is a named error); name what you need beside the
-star (`RETURN *, type(r) AS t`). Anonymous nodes and relationships are not
+The first returns the columns `c`, `p` and `r`. A variable-length
+relationship variable (`[rs*1..3]`) is left out, because it is a hop count and
+not returned bare; name what you need beside the star (`RETURN *, rs.length AS
+hops`). Anonymous nodes and relationships are not
 names. A `WITH` replaces what is in scope, so `WITH a RETURN *` returns `a`.
 With nothing left the star is an error, `RETURN * / WITH * with no variables in
 scope`. `RETURN *` works in the `RETURN` of a write statement (the matched and
@@ -5357,6 +5429,12 @@ Write results are always one row with four columns:
 | `properties_set` | individual `set_prop` calls applied |
 | `deleted` | nodes and relationships deleted |
 | `relationships_created` | relationships created (new in 0.10; last, so the first three keep their positions) |
+
+Every write's result, with or without `RETURN`, also carries finer counters
+(`ResultSet::stats` in Rust; the `stats` of a Bolt `SUCCESS`): nodes and
+relationships created and deleted counted apart, properties set including those
+a `CREATE` or a `MERGE` writes with a new node, labels added, and indexes and
+constraints added and removed. See [Write counters](bolt.md#write-counters).
 
 ### CREATE
 
@@ -6368,7 +6446,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
+| Bare `RETURN rs` for a variable-length relationship variable | `cannot return variable-length relationship variable '…' bare; return ….length, or name the path (p = …) and return p` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
 | `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |

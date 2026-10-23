@@ -11,7 +11,7 @@ use core_query::cypher::{
     RetVal, WriteStatement,
 };
 use core_query::{
-    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet, WriteStats,
 };
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
@@ -1030,6 +1030,29 @@ pub(crate) fn write_counts(
     rs
 }
 
+/// What a `CREATE` statement wrote: its nodes, each with its label and its
+/// properties, and its relationships.
+pub(crate) fn create_stats(stmt: &core_query::cypher::CreateStmt) -> WriteStats {
+    let nodes = stmt.nodes.len() as i64;
+    WriteStats {
+        nodes_created: nodes,
+        labels_added: nodes,
+        properties_set: stmt.nodes.iter().map(|n| n.props.len() as i64).sum(),
+        relationships_created: stmt.edges.len() as i64,
+        ..WriteStats::default()
+    }
+}
+
+/// A query result as its caller receives it: with the graph element behind
+/// each bare node, relationship and path cell when the caller asked for them
+/// (Bolt, through [`core_query::cypher::with_entity_detail`]), read from the
+/// `view` the result came from. Every entry point that hands a query result
+/// to its caller passes it through here; nothing else changes.
+pub(crate) fn finish_result(view: &GraphView<'_>, mut rs: ResultSet) -> ResultSet {
+    core_query::cypher::attach_requested_entities(view, &mut rs);
+    rs
+}
+
 pub(crate) fn resolve_merge_set_value(
     op: &Operand,
     params: &BTreeMap<String, Value>,
@@ -1179,6 +1202,11 @@ pub(crate) fn rel_type_alias(var: &str) -> String {
     format!("__rt_{var}")
 }
 
+/// The read-part column that holds relationship `var` itself.
+pub(crate) fn rel_value_alias(var: &str) -> String {
+    format!("__rv_{var}")
+}
+
 fn ret_column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
@@ -1264,14 +1292,18 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
         Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
-        Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
-            detail: format!("missing parameter `{name}`"),
-        }).map(core_query::value_ops::element),
-        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
-            detail: format!(
-                "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
-            ),
-        }),
+        Operand::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GraphError::QueryError {
+                detail: format!("missing parameter `{name}`"),
+            })
+            .map(core_query::value_ops::element),
+        // The relationship as the read part captured it: its
+        // `{type, start, end}` map.
+        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => {
+            Ok(match_rs.get(row, &rel_value_alias(name)).cloned())
+        }
         Operand::Var(name) => Ok(match_rs.get(row, name).cloned()),
         Operand::Prop { var, field } => {
             if rel_vars.iter().any(|r| r == var) {
@@ -11905,11 +11937,12 @@ impl<F: Fs> GraphDb<F> {
         })?;
         // Each UNION part executes against the same masked view, so the mask
         // applies uniformly across the chain.
-        execute_union(&self.view_masked(mask), &union, &Params(params)).map_err(|e| {
-            GraphError::QueryError {
+        let view = self.view_masked(mask);
+        execute_union(&view, &union, &Params(params))
+            .map(|rs| finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
-            }
-        })
+            })
     }
 
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
@@ -13470,11 +13503,12 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("parse: {e}"),
         })?;
         let t0 = std::time::Instant::now();
-        let result = execute_union(&self.view(), &union, &Params(params)).map_err(|e| {
-            GraphError::QueryError {
+        let view = self.view();
+        let result = execute_union(&view, &union, &Params(params))
+            .map(|rs| finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
-            }
-        });
+            });
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         self.slow_query_sink()
             .record(elapsed_ms, cypher, self.commit_seq);
@@ -13609,6 +13643,7 @@ impl<F: Fs> GraphDb<F> {
             batch.insert_edge(&edge.etype, src_key, dst_key);
         }
         batch.commit()?;
+        let stats = create_stats(&stmt);
 
         // Optional RETURN clause: project created bindings as a read result.
         if let Some(returns) = stmt.returns {
@@ -13650,14 +13685,21 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-                GraphError::QueryError {
+            // Masked for a role-scoped write, as the MERGE and MATCH … SET
+            // projections are.
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
                     detail: format!("execute: {e}"),
-                }
-            });
+                });
         }
 
-        Ok(write_counts(created as i64, 0, 0, stmt.edges.len() as i64))
+        Ok(write_counts(created as i64, 0, 0, stmt.edges.len() as i64).with_stats(stats))
     }
 
     fn exec_match_set(
@@ -13815,7 +13857,12 @@ impl<F: Fs> GraphDb<F> {
             other => other,
         })?;
 
-        Ok(write_counts(0, 0, deleted as i64, 0))
+        Ok(
+            write_counts(0, 0, deleted as i64, 0).with_stats(WriteStats {
+                relationships_deleted: deleted as i64,
+                ..WriteStats::default()
+            }),
+        )
     }
 
     /// Execute `MATCH … [DETACH] DELETE <node_var> [, …]`.
@@ -13917,7 +13964,13 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(write_counts(0, 0, nodes_deleted + edges_deleted, 0))
+        Ok(
+            write_counts(0, 0, nodes_deleted + edges_deleted, 0).with_stats(WriteStats {
+                nodes_deleted,
+                relationships_deleted: edges_deleted,
+                ..WriteStats::default()
+            }),
+        )
     }
 
     /// Props the MERGE create arm inserts: the identifying key, plus `ns` when
@@ -14125,12 +14178,15 @@ impl<F: Fs> GraphDb<F> {
         };
         let mut created = 0i64;
         let mut relationships_created = 0i64;
+        let mut created_props = 0i64;
         let mut batch = self.batch();
         if let Some(props) = start_create {
+            created_props += props.len() as i64;
             batch.insert_node(&stmt.label, &start_key, props);
             created += 1;
         }
         if let Some(props) = end_create {
+            created_props += props.len() as i64;
             batch.insert_node(&edge.end_label, &end_key, props);
             created += 1;
         }
@@ -14141,10 +14197,22 @@ impl<F: Fs> GraphDb<F> {
             relationships_created = 1;
             &create_sets
         };
+        // The `ON CREATE` / `ON MATCH` items applied: the write row's
+        // `properties_set` (ledger row 150).
+        let sets_applied = sets.len() as i64;
+        let mut properties_set = sets_applied;
         for (key, field, value) in sets {
             batch.set_prop(key, field, resolve_merge_set_value(value, params)?);
         }
         batch.commit()?;
+        properties_set += created_props;
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            relationships_created,
+            properties_set,
+            ..WriteStats::default()
+        };
 
         // Refresh the role mask so created nodes are visible to this
         // statement's RETURN (read-after-write); see `exec_merge`.
@@ -14209,17 +14277,18 @@ impl<F: Fs> GraphDb<F> {
                 detail: format!("plan: {e}"),
             })?;
             let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            return (if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            })
-            .map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            });
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                });
         }
 
-        Ok(write_counts(created, 0, 0, relationships_created))
+        Ok(write_counts(created, sets_applied, 0, relationships_created).with_stats(stats))
     }
 
     fn exec_merge(
@@ -14274,9 +14343,15 @@ impl<F: Fs> GraphDb<F> {
             Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
         };
         let mut created = 0i64;
+        let mut properties_set = 0i64;
+        // The `ON CREATE` / `ON MATCH` items applied: the write row's
+        // `properties_set` (ledger row 150).
+        let mut sets_applied = 0i64;
         if create_props.is_some() || !stmt.on_match.is_empty() {
             let mut batch = self.batch();
             if let Some(props) = create_props {
+                sets_applied = stmt.on_create.len() as i64;
+                properties_set += (props.len() + stmt.on_create.len()) as i64;
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;
@@ -14284,6 +14359,8 @@ impl<F: Fs> GraphDb<F> {
                 }
                 created = 1;
             } else {
+                sets_applied = stmt.on_match.len() as i64;
+                properties_set += stmt.on_match.len() as i64;
                 for sc in &stmt.on_match {
                     let value = resolve_merge_set_value(&sc.value, params)?;
                     batch.set_prop(&key, &sc.field, value);
@@ -14291,6 +14368,12 @@ impl<F: Fs> GraphDb<F> {
             }
             batch.commit()?;
         }
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            properties_set,
+            ..WriteStats::default()
+        };
 
         // Refresh the role mask so the just-created node is visible to this
         // statement's RETURN (read-after-write). Safe: create_labels ⊆ read labels
@@ -14337,17 +14420,18 @@ impl<F: Fs> GraphDb<F> {
             // Use view_masked when a role-scoped write is in flight so the
             // post-merge projection is consistent with the masked read phase.
             let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            return (if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            })
-            .map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            });
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                });
         }
 
-        Ok(write_counts(created, 0, 0, 0))
+        Ok(write_counts(created, sets_applied, 0, 0).with_stats(stats))
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),

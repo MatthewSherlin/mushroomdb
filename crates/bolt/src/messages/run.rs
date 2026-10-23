@@ -20,6 +20,12 @@
 //! `SUCCESS {has_more: true}`; the last one carries the summary (`type`,
 //! `t_last`, and in auto-commit the `bookmark`).
 //!
+//! A bare node, relationship or path variable goes out as the Bolt Node,
+//! Relationship or Path structure (see [`graph`](super::graph)): every
+//! statement runs inside [`mushroomdb::with_entity_detail`], so the result
+//! carries the element behind each such cell. A write's closing `SUCCESS`
+//! carries its counters as `stats`.
+//!
 //! Rows are checked before they are sent. PackStream writes a string, byte
 //! array, list or map length as 32 bits and a structure's field count as 16, so
 //! a value over 4 GiB or a structure with more than 65535 fields would
@@ -31,8 +37,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mushroomdb::{is_write_query, GraphError, ResultSet, SharedDb, Transaction, Value};
+use mushroomdb::{
+    is_schema_query, is_write_query, with_entity_detail, GraphError, ResultSet, SharedDb,
+    Transaction, Value,
+};
 
+use super::graph;
 use super::values::{
     self, TAG_DATE, TAG_DATE_TIME, TAG_DURATION, TAG_LEGACY_DATE_TIME, TAG_LOCAL_DATE_TIME,
 };
@@ -298,6 +308,14 @@ impl QueryService {
         identity: &Identity,
         request: &RunRequest,
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
+        with_entity_detail(|| self.run_auto_commit_detailed(identity, request))
+    }
+
+    fn run_auto_commit_detailed(
+        &self,
+        identity: &Identity,
+        request: &RunRequest,
+    ) -> Result<Box<dyn ResultCursor>, BoltError> {
         let params = request.params(self.version)?;
         let is_write = is_write_query(&request.query).map_err(BoltError::SyntaxError)?;
         self.wait_for_bookmarks(&request.bookmarks)?;
@@ -337,11 +355,11 @@ impl QueryService {
             }
         };
         let result = result?;
-        Ok(Box::new(RowCursor::new(
-            result,
-            is_write,
-            Some(format_bookmark(seq)),
-        )))
+        // A statement that changes the schema reports query type `s`.
+        let schema = is_write && is_schema_query(&request.query).unwrap_or(false);
+        Ok(Box::new(
+            RowCursor::new(result, is_write, Some(format_bookmark(seq))).with_schema(schema),
+        ))
     }
 
     /// Runs `request` inside `tx`. A scoped identity's `tx` is the
@@ -361,7 +379,8 @@ impl QueryService {
                 "role-bound tokens cannot run statements in an unscoped transaction".into(),
             ));
         }
-        tx.execute(&request.query, &request.params(self.version)?)
+        let params = request.params(self.version)?;
+        with_entity_detail(|| tx.execute(&request.query, &params))
     }
 
     /// Opens a transaction: waits for the request's bookmarks, then freezes
@@ -461,6 +480,8 @@ pub struct RowCursor {
     /// The statement was an auto-commit write, already durable when its rows
     /// are pulled.
     committed: bool,
+    /// The statement changed the schema: its query type is `s`, not `w`.
+    schema: bool,
 }
 
 impl RowCursor {
@@ -475,7 +496,15 @@ impl RowCursor {
             opened: Instant::now(),
             max_len: MAX_PACK_LEN,
             committed,
+            schema: false,
         }
+    }
+
+    /// Marks a statement that changed the schema, so its summary's query
+    /// type is `s`.
+    pub fn with_schema(mut self, schema: bool) -> Self {
+        self.schema = schema;
+        self
     }
 
     /// Lowers the size limit a value is checked against. The real limit is
@@ -523,9 +552,9 @@ impl ResultCursor for RowCursor {
                 .result
                 .row(index)
                 .iter()
-                .map(|cell| match cell {
-                    Some(value) => pack_value(value, version, 0),
-                    None => Ok(PackValue::Null),
+                .enumerate()
+                .map(|(col, cell)| {
+                    graph::pack_cell(self.result.entity(index, col), cell.as_ref(), version, 0)
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| self.committed_note(err))?;
@@ -550,7 +579,14 @@ impl ResultCursor for RowCursor {
         let mut meta = vec![
             (
                 "type".to_string(),
-                PackValue::String(if self.is_write { "w" } else { "r" }.into()),
+                PackValue::String(
+                    match (self.schema, self.is_write) {
+                        (true, _) => "s",
+                        (false, true) => "w",
+                        (false, false) => "r",
+                    }
+                    .into(),
+                ),
             ),
             (
                 "t_last".to_string(),
@@ -559,6 +595,9 @@ impl ResultCursor for RowCursor {
                 ),
             ),
         ];
+        if let Some(stats) = self.result.stats().and_then(graph::stats_map) {
+            meta.push(("stats".to_string(), stats));
+        }
         if let Some(bookmark) = &self.bookmark {
             meta.push(("bookmark".to_string(), PackValue::String(bookmark.clone())));
         }

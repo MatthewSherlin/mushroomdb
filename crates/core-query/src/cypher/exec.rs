@@ -4,6 +4,7 @@ use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
     OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN,
 };
+use crate::cypher::entity::{merge_kinds, output_kinds};
 use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
 use crate::cypher::RelDir;
@@ -176,25 +177,13 @@ impl PathVal {
 }
 
 /// A path as a query result: a map, so it renders on every surface (Rust,
-/// HTTP JSON, Python, TypeScript, Arrow, Bolt) as the existing `Value::Map`
-/// does, with no new `Value` variant. Nodes are their keys, as a bare node
-/// variable is.
+/// HTTP JSON, Python, TypeScript, Arrow) as the existing `Value::Map` does,
+/// with no new `Value` variant. Nodes are their keys, as a bare node variable
+/// is. Bolt sends a Path structure, built from this map (see
+/// [`entity`](crate::cypher::entity)).
 fn path_value(view: &GraphView, path: &PathVal) -> Value {
     let key = |id: u32| Value::Str(view.try_key_of(id).unwrap_or_default().to_owned());
-    let rels = path
-        .rels
-        .iter()
-        .map(|e| {
-            Value::Map(BTreeMap::from([
-                (
-                    "type".to_owned(),
-                    Value::Str(view.sym_name(e.etype).unwrap_or_default().to_owned()),
-                ),
-                ("start".to_owned(), key(e.src)),
-                ("end".to_owned(), key(e.dst)),
-            ]))
-        })
-        .collect();
+    let rels = path.rels.iter().map(|e| rel_value(view, e)).collect();
     Value::Map(BTreeMap::from([
         (
             "nodes".to_owned(),
@@ -202,6 +191,22 @@ fn path_value(view: &GraphView, path: &PathVal) -> Value {
         ),
         ("relationships".to_owned(), Value::List(rels)),
         ("length".to_owned(), Value::Int(path.rels.len() as i64)),
+    ]))
+}
+
+/// A relationship as a query result: the map `{type, start, end}` with the
+/// keys of its stored direction, the form a path's relationships take. It
+/// renders on every surface as a map does; Bolt sends the relationship
+/// itself (see [`entity`](crate::cypher::entity)).
+fn rel_value(view: &GraphView, e: &EdgeRef) -> Value {
+    let key = |id: u32| Value::Str(view.try_key_of(id).unwrap_or_default().to_owned());
+    Value::Map(BTreeMap::from([
+        (
+            "type".to_owned(),
+            Value::Str(view.sym_name(e.etype).unwrap_or_default().to_owned()),
+        ),
+        ("start".to_owned(), key(e.src)),
+        ("end".to_owned(), key(e.dst)),
     ]))
 }
 
@@ -486,9 +491,15 @@ fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
 /// as `SKIP + LIMIT` final rows have been collected.  No intermediate table is
 /// ever fully materialised for the bounded path — the 1 M cap is the safety
 /// net for unbounded queries only.
+///
+/// The result's [`column_kinds`](ResultSet::column_kinds) say which columns
+/// are bare node, relationship and path variables (see
+/// [`entity`](crate::cypher::entity)); no entity details are attached here.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     use crate::cypher::plan::row_bound;
-    execute_inner(view, plan, params, row_bound(plan))
+    let mut rs = execute_inner(view, plan, params, row_bound(plan))?;
+    rs.set_column_kinds(output_kinds(plan));
+    Ok(rs)
 }
 
 /// Execute a read query that may be a `UNION` / `UNION ALL` chain. Each part is
@@ -517,7 +528,10 @@ pub fn execute_union(
                 }
                 // all_flags has one entry per boundary; index i-1 for part i.
                 let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
-                combine_result_sets(prev, rs, all)
+                let kinds = merge_kinds(prev.column_kinds(), rs.column_kinds());
+                let mut combined = combine_result_sets(prev, rs, all);
+                combined.set_column_kinds(kinds);
+                combined
             }
         });
     }
@@ -1079,7 +1093,7 @@ fn execute_inner(
                                         view.try_key_of(*id).map(|k| Value::Str(k.to_owned()))
                                     }
                                     Cell::Path(h) => Some(Value::Int(*h as i64)),
-                                    Cell::Rel(_) => None,
+                                    Cell::Rel(e) => Some(rel_value(view, e)),
                                 })
                         })
                         .collect();
@@ -3346,7 +3360,8 @@ fn resolve_operand(
         },
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
         Operand::Var(name) => {
-            // Bare variable reference: resolve from Cell (scalar alias or node key).
+            // Bare variable reference: resolve from Cell (scalar alias, node
+            // key, relationship map).
             match vars
                 .slot(name)
                 .and_then(|s| row.get(s))
@@ -3358,7 +3373,7 @@ fn resolve_operand(
                     None => Ok(None),
                 },
                 Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
-                Some(Cell::Rel(_)) => Err(format!("variable `{name}` is a relationship")),
+                Some(Cell::Rel(e)) => Ok(Some(rel_value(view, e))),
                 None => Ok(None),
             }
         }
@@ -4671,7 +4686,7 @@ fn update_acc(
         }
         (AggFunc::Collect, AggArg::Var(v)) => {
             // Gather each row's value of `v` — node → key, scalar alias → value,
-            // path → hop count. Nulls (unbound / relationship) are skipped.
+            // path → hop count, relationship → its map. Nulls are skipped.
             let val = vars
                 .slot(v)
                 .and_then(|s| row.get(s))
@@ -4680,7 +4695,7 @@ fn update_acc(
                     Cell::Scalar(x) => Some(x.clone()),
                     Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                     Cell::Path(h) => Some(Value::Int(*h as i64)),
-                    Cell::Rel(_) => None,
+                    Cell::Rel(e) => Some(rel_value(view, e)),
                 });
             if let Some(val) = val {
                 if let AggAcc::Collect(items) = acc {
@@ -5139,7 +5154,7 @@ fn exec_order_by_rows(
                         Cell::Scalar(v) => Some(v.clone()),
                         Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                         Cell::Path(hops) => Some(Value::Int(*hops as i64)),
-                        Cell::Rel(_) => None,
+                        Cell::Rel(e) => Some(rel_value(view, e)),
                     }),
                 OrderTarget::Prop { var, field } => vars
                     .slot(var)
@@ -6179,9 +6194,7 @@ fn project_item(
                 },
                 // Scalar alias produced by a prior WITH stage.
                 Some(Cell::Scalar(val)) => Ok(Some(val.clone())),
-                Some(Cell::Rel(_)) => Err(format!(
-                    "variable `{v}` is a relationship; return its properties ({v}.field) instead"
-                )),
+                Some(Cell::Rel(e)) => Ok(Some(rel_value(view, e))),
                 Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
             }
         }
@@ -6388,6 +6401,10 @@ mod ql_cx;
 #[cfg(test)]
 #[path = "tests/tx_15.rs"]
 mod tx_15;
+
+#[cfg(test)]
+#[path = "tests/tx_ns.rs"]
+mod tx_ns;
 
 #[cfg(test)]
 mod tests {

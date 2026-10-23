@@ -384,6 +384,12 @@ fn pack_to_json(value: &PackValue) -> Json {
                 .map(|(k, v)| (k.clone(), pack_to_json(v)))
                 .collect(),
         ),
+        // A node (TX-NS) is compared by the key HTTP renders it as: its
+        // element id is `n:<key>`.
+        PackValue::Struct(node) if node.tag == 0x4E => match node.fields.get(3) {
+            Some(PackValue::String(element_id)) => json!(element_id.strip_prefix("n:")),
+            other => panic!("a Bolt 5 node carries its element id: {other:?}"),
+        },
         other => panic!("the parity fixture holds no {other:?}"),
     }
 }

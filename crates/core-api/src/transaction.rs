@@ -95,7 +95,7 @@ use core_query::cypher::{
     MatchDeleteNodeStmt, MatchDeleteStmt, MergeStmt, NodePat, Operand, Params, Pattern, Query,
     RetItem, RetVal, UnionQuery, WriteStatement,
 };
-use core_query::{GraphView, ResultSet};
+use core_query::{GraphView, ResultSet, WriteStats};
 use core_storage::wal::WalRecord;
 use core_storage::{Direction, GraphError, Result, Value};
 
@@ -146,16 +146,12 @@ const _: () = {
 /// What a write statement returns once its records are laid over the
 /// transaction.
 enum Outcome {
-    /// The `created, properties_set, deleted, relationships_created` row.
-    Counts {
-        created: i64,
-        props_set: i64,
-        deleted: i64,
-        relationships_created: i64,
-    },
+    /// The `created, properties_set, deleted, relationships_created` row,
+    /// with the statement's [`WriteStats`].
+    Counts(ResultSet),
     /// The statement's `RETURN`, as a query over the transaction's state with
-    /// the statement applied.
-    Return(Box<Query>),
+    /// the statement applied, and what the statement changed.
+    Return(Box<Query>, WriteStats),
 }
 
 /// One statement's effect, held until the statement has fully succeeded.
@@ -619,7 +615,9 @@ impl Transaction {
         }
         let union = parse_read(&tokens).map_err(query_err("parse"))?;
         let rs = self
-            .with_view(|v| execute_union(v, &union, &Params(params)))?
+            .with_view(|v| {
+                execute_union(v, &union, &Params(params)).map(|rs| crate::db::finish_result(v, rs))
+            })?
             .map_err(query_err("execute"))?;
         let keys = self.read_set(&union, params);
         self.record_keys(&keys);
@@ -802,14 +800,11 @@ impl Transaction {
         // holds every earlier statement's.
         self.apply(&staged.records)?;
         let rs = match outcome {
-            Outcome::Counts {
-                created,
-                props_set,
-                deleted,
-                relationships_created,
-            } => write_counts(created, props_set, deleted, relationships_created),
-            Outcome::Return(q) => match self.with_view(|v| run(v, &q, params)) {
-                Ok(Ok(rs)) => rs,
+            Outcome::Counts(rs) => rs,
+            Outcome::Return(q, stats) => match self
+                .with_view(|v| run(v, &q, params).map(|rs| crate::db::finish_result(v, rs)))
+            {
+                Ok(Ok(rs)) => rs.with_stats(stats),
                 Ok(Err(e)) | Err(e) => {
                     if !staged.records.is_empty() {
                         self.revert()?;
@@ -885,24 +880,6 @@ impl Transaction {
         }
     }
 
-    fn counts(created: i64, props_set: i64, deleted: i64) -> Outcome {
-        Self::counts_with_relationships(created, props_set, deleted, 0)
-    }
-
-    fn counts_with_relationships(
-        created: i64,
-        props_set: i64,
-        deleted: i64,
-        relationships_created: i64,
-    ) -> Outcome {
-        Outcome::Counts {
-            created,
-            props_set,
-            deleted,
-            relationships_created,
-        }
-    }
-
     fn stage_create(&self, stmt: CreateStmt, staged: &mut Staged) -> Result<Outcome> {
         let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
         for node in &stmt.nodes {
@@ -942,12 +919,11 @@ impl Transaction {
                 })?;
             staged.insert_edge(&edge.etype, src, dst);
         }
+        let stats = crate::db::create_stats(&stmt);
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts_with_relationships(
-                stmt.nodes.len() as i64,
-                0,
-                0,
-                stmt.edges.len() as i64,
+            return Ok(Outcome::Counts(
+                write_counts(stmt.nodes.len() as i64, 0, 0, stmt.edges.len() as i64)
+                    .with_stats(stats),
             ));
         };
         let patterns = stmt
@@ -960,7 +936,7 @@ impl Transaction {
             .collect();
         let mut q = match_query(patterns, None);
         q.returns = returns;
-        Ok(Outcome::Return(Box::new(q)))
+        Ok(Outcome::Return(Box::new(q), stats))
     }
 
     fn stage_match_delete(
@@ -997,7 +973,12 @@ impl Transaction {
                 deleted += 1;
             }
         }
-        Ok(Self::counts(0, 0, deleted))
+        Ok(Outcome::Counts(write_counts(0, 0, deleted, 0).with_stats(
+            WriteStats {
+                relationships_deleted: deleted,
+                ..WriteStats::default()
+            },
+        )))
     }
 
     fn stage_match_delete_node(
@@ -1022,7 +1003,8 @@ impl Transaction {
                 }
             }
         }
-        let mut deleted = 0i64;
+        let mut nodes_deleted = 0i64;
+        let mut edges_deleted = 0i64;
         // Auto-commit deletes the nodes one at a time, so an edge between two
         // of them is removed — and counted — once, with the first.
         let mut gone: HashSet<&str> = HashSet::new();
@@ -1046,11 +1028,18 @@ impl Transaction {
                 .iter()
                 .filter(|(src, dst)| !gone.contains(src.as_str()) && !gone.contains(dst.as_str()))
                 .count();
-            deleted += 1 + removed_here as i64;
+            nodes_deleted += 1;
+            edges_deleted += removed_here as i64;
             gone.insert(key);
             staged.delete_node(key);
         }
-        Ok(Self::counts(0, 0, deleted))
+        Ok(Outcome::Counts(
+            write_counts(0, 0, nodes_deleted + edges_deleted, 0).with_stats(WriteStats {
+                nodes_deleted,
+                relationships_deleted: edges_deleted,
+                ..WriteStats::default()
+            }),
+        ))
     }
 
     fn stage_merge(
@@ -1085,7 +1074,16 @@ impl Transaction {
         let existed = self.has_key(&key)?;
         staged.touch(&key);
         let mut created = 0i64;
+        let mut properties_set = 0i64;
+        // The `ON CREATE` / `ON MATCH` items applied: the write row's
+        // `properties_set` (ledger row 150).
+        let sets_applied = if existed {
+            stmt.on_match.len()
+        } else {
+            stmt.on_create.len()
+        } as i64;
         if existed {
+            properties_set += stmt.on_match.len() as i64;
             for sc in &stmt.on_match {
                 let value = resolve_merge_set_value(&sc.value, params)?;
                 if sc.field == "id" {
@@ -1099,6 +1097,7 @@ impl Transaction {
             }
         } else {
             let props = merge_node_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref());
+            properties_set += (props.len() + stmt.on_create.len()) as i64;
             staged.insert_node(&stmt.label, &key, props);
             for sc in &stmt.on_create {
                 let value = resolve_merge_set_value(&sc.value, params)?;
@@ -1111,8 +1110,16 @@ impl Transaction {
             }
             created = 1;
         }
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            properties_set,
+            ..WriteStats::default()
+        };
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts(created, 0, 0));
+            return Ok(Outcome::Counts(
+                write_counts(created, sets_applied, 0, 0).with_stats(stats),
+            ));
         };
         let var = stmt.var.as_deref().unwrap_or("_mn0");
         let mut q = match_query(
@@ -1120,7 +1127,7 @@ impl Transaction {
             None,
         );
         q.returns = returns;
-        Ok(Outcome::Return(Box::new(q)))
+        Ok(Outcome::Return(Box::new(q), stats))
     }
 
     /// `MERGE (a)-[:T]->(b)`: the same decisions as `GraphDb::exec_merge_edge`,
@@ -1190,24 +1197,21 @@ impl Transaction {
         staged.touch(&end_key);
         let mut created = 0i64;
         let mut relationships_created = 0i64;
+        let mut properties_set = 0i64;
         if !start_existed {
-            staged.insert_node(
-                &stmt.label,
-                &start_key,
-                merge_node_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref()),
-            );
+            let props = merge_node_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref());
+            properties_set += props.len() as i64;
+            staged.insert_node(&stmt.label, &start_key, props);
             created += 1;
         }
         if !end_existed && end_key != start_key {
-            staged.insert_node(
-                &edge.end_label,
-                &end_key,
-                merge_node_props(
-                    &edge.end_key_field,
-                    &edge.end_key_value,
-                    edge.end_ns.as_ref(),
-                ),
+            let props = merge_node_props(
+                &edge.end_key_field,
+                &edge.end_key_value,
+                edge.end_ns.as_ref(),
             );
+            properties_set += props.len() as i64;
+            staged.insert_node(&edge.end_label, &end_key, props);
             created += 1;
         }
         let sets = if edge_existed {
@@ -1234,12 +1238,18 @@ impl Transaction {
             }
             staged.set_prop(key, &sc.field, value);
         }
+        let sets_applied = sets.len() as i64;
+        properties_set += sets_applied;
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            relationships_created,
+            properties_set,
+            ..WriteStats::default()
+        };
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts_with_relationships(
-                created,
-                0,
-                0,
-                relationships_created,
+            return Ok(Outcome::Counts(
+                write_counts(created, sets_applied, 0, relationships_created).with_stats(stats),
             ));
         };
         let node =
@@ -1279,7 +1289,7 @@ impl Transaction {
             None,
         );
         q.returns = returns;
-        Ok(Outcome::Return(Box::new(q)))
+        Ok(Outcome::Return(Box::new(q), stats))
     }
 
     /// Every node the read part of a write statement binds — named or

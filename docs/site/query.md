@@ -243,7 +243,8 @@ RETURN p.nodes
 ```
 
 A path is a **map** with three fields, so it comes back the same way on every
-surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
+surface (Rust, HTTP JSON, Python, TypeScript, Arrow) as any other map; Bolt
+sends it as a Path structure (see [Return of relationships and paths](#return-of-relationships-and-paths)):
 
 | Field | Value |
 |---|---|
@@ -271,6 +272,39 @@ separate limit that is not lifted here.
 - **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
 - Relationship properties are not part of a path; match the relationship with
   its own variable to read them.
+
+---
+
+## Return of relationships and paths
+
+A fixed relationship variable can be returned bare, carried by `WITH`, used as a
+grouping key and sorted by, like a node or a path:
+
+```cypher
+MATCH (a:Person {id: 'ada'})-[r:KNOWS]->(b) RETURN r, b.name
+MATCH (a)-[r:KNOWS]->(b) WITH r, count(*) AS n RETURN r, n
+```
+
+A returned relationship is the map `{type, start, end}`, with the keys of the
+nodes at its stored start and end, the same map a path lists in its
+`relationships`; `ORDER BY r` sorts by that map. A node is still returned as its
+key and a path as its map, so `RETURN n` reads exactly as before on HTTP, in
+Python and in Rust.
+
+Over Bolt the three are graph structures: a node is a Node with its label and
+properties, a relationship a Relationship with its type, ends and properties,
+and a path a Path of both. See [Nodes, relationships and paths](bolt.md#nodes-relationships-and-paths).
+In Rust, a `ResultSet` says which columns are bare nodes, relationships and
+paths (`column_kind`), and a query run inside `mushroomdb::with_entity_detail`
+carries the node, relationship or path behind each of their cells (`entity`).
+
+- A **variable-length** relationship variable (`[rs:T*1..3]`) is still refused
+  bare: it is bound to a hop count, not to one relationship. Return
+  `rs.length`, or name the path (`p = …`) and return `p`.
+- A relationship is a value like the others in a list: `collect(r)`,
+  `collect(DISTINCT r)` and `[r, s]` are lists of its maps.
+- The `RETURN` of every write statement can return a relationship bare,
+  `MATCH … SET` and `MATCH … REMOVE` included.
 
 ---
 
@@ -360,8 +394,8 @@ joins against that set — use `WHERE` to correlate.
 
 ## RETURN * and WITH *
 
-`*` stands for every name in scope: the node, path and value variables the
-earlier clauses bound, in byte (code-point) order of name, so uppercase names
+`*` stands for every name in scope: the node, relationship, path and value
+variables the earlier clauses bound, in byte (code-point) order of name, so uppercase names
 come before lowercase ones (`Zed`, `alpha`). Further items may follow
 it.
 
@@ -371,10 +405,10 @@ MATCH (p:Person) WITH *, p.age * 2 AS double RETURN p.id, double
 MATCH (p:Person) UNWIND p.tags AS t RETURN DISTINCT *
 ```
 
-The first returns the columns `c` and `p`. Relationship variables, single or
-variable-length (`r`, `[rs*1..3]`), are left out, because a relationship is not
-returned bare (`RETURN r` is a named error); name what you need beside the
-star (`RETURN *, type(r) AS t`). Anonymous nodes and relationships are not
+The first returns the columns `c`, `p` and `r`. A variable-length
+relationship variable (`[rs*1..3]`) is left out, because it is a hop count and
+not returned bare; name what you need beside the star (`RETURN *, rs.length AS
+hops`). Anonymous nodes and relationships are not
 names. A `WITH` replaces what is in scope, so `WITH a RETURN *` returns `a`.
 With nothing left the star is an error, `RETURN * / WITH * with no variables in
 scope`. `RETURN *` works in the `RETURN` of a write statement (the matched and
@@ -517,6 +551,12 @@ Write results are always one row with four columns:
 | `properties_set` | individual `set_prop` calls applied |
 | `deleted` | nodes and relationships deleted |
 | `relationships_created` | relationships created (new in 0.10; last, so the first three keep their positions) |
+
+Every write's result, with or without `RETURN`, also carries finer counters
+(`ResultSet::stats` in Rust; the `stats` of a Bolt `SUCCESS`): nodes and
+relationships created and deleted counted apart, properties set including those
+a `CREATE` or a `MERGE` writes with a new node, labels added, and indexes and
+constraints added and removed. See [Write counters](bolt.md#write-counters).
 
 ### CREATE
 
@@ -1528,7 +1568,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
+| Bare `RETURN rs` for a variable-length relationship variable | `cannot return variable-length relationship variable '…' bare; return ….length, or name the path (p = …) and return p` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
 | `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |
