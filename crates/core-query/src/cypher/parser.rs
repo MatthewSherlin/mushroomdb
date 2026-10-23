@@ -327,8 +327,6 @@ fn pred(expr: Expr) -> Operand {
     Operand::Pred(Box::new(expr))
 }
 
-/// The predicate an expression stands for in a WHERE: a predicate is itself;
-/// any other value is read for its truthiness.
 /// The quantifier a function name spells, in any case.
 fn list_pred_kind(name: &str) -> Option<ListPredKind> {
     [
@@ -342,6 +340,8 @@ fn list_pred_kind(name: &str) -> Option<ListPredKind> {
     .map(|(_, kind)| kind)
 }
 
+/// The predicate an expression stands for in a WHERE: a predicate is itself;
+/// any other value is read for its truthiness.
 fn into_predicate(op: Operand) -> Expr {
     match op {
         Operand::Pred(expr) => *expr,

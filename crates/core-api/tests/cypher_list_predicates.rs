@@ -219,6 +219,20 @@ fn a_list_predicate_in_a_write_return_is_refused_and_writes_nothing() {
 }
 
 #[test]
+fn a_quantifier_name_without_in_is_an_ordinary_function_call() {
+    let (db, dir) = open("plain-call");
+    for q in [
+        "RETURN any(1) AS r",
+        "RETURN all('x') AS r",
+        "RETURN single() AS r",
+    ] {
+        let err = db.query(q, &no_params()).expect_err(q);
+        assert!(err.to_string().contains("unknown function"), "{q}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_malformed_list_predicate_is_a_parse_error() {
     let (db, dir) = open("malformed");
     for q in [
