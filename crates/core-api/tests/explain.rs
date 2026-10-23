@@ -71,6 +71,7 @@ fn role_store(dir: &std::path::Path) -> GraphDb {
                 delete_labels: vec!["P".into()],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })
