@@ -245,6 +245,7 @@ impl Connection {
         self.service = Some(Arc::new(
             QueryService::new(db)
                 .with_bookmark_timeout(bookmark_timeout)
+                .with_version(self.version)
                 .with_interrupt(self.interrupted.clone()),
         ));
         self

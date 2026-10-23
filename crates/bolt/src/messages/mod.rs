@@ -12,6 +12,7 @@ pub mod reset;
 pub mod route;
 pub mod run;
 pub mod tx;
+pub mod values;
 
 use crate::error::BoltError;
 use crate::packstream::{self, PackStruct, PackValue};
