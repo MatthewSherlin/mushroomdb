@@ -178,6 +178,41 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     }
 }
 
+/// Whether a statement that begins with `CREATE` or `MERGE` needs the per-row
+/// form (QL-PM): a `$parameter` inside a node pattern (`{id: $id}`, `(n:P
+/// $props)`), or a map `SET` (`ON CREATE SET n += $props`, `SET n = {…}`).
+/// The per-row form evaluates its values against the statement's parameters,
+/// and runs once, over one row, when no clause before it produces more. A
+/// statement with neither keeps the plain form, which folds its literals
+/// while parsing.
+fn needs_per_row_form(tokens: &[Tok]) -> bool {
+    let mut depth = 0usize;
+    // Before the first `ON CREATE` / `ON MATCH`: the node patterns.
+    let mut in_patterns = true;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth = depth.saturating_sub(1),
+            Tok::Return if depth == 0 => return false,
+            Tok::Ident(_) if depth == 0 && kw(Some(tok), "on") => in_patterns = false,
+            Tok::Param(_) if depth > 0 && in_patterns => return true,
+            // `SET n = …` / `SET n += …`, or the same item after a comma.
+            Tok::Set | Tok::Comma
+                if depth == 0
+                    && matches!(tokens.get(i + 1), Some(Tok::Ident(_)))
+                    && matches!(
+                        (tokens.get(i + 2), tokens.get(i + 3)),
+                        (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+                    ) =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// True if the tokens hold a `REMOVE var.field` or `REMOVE var:Label` clause.
 /// `REMOVE` is an ordinary identifier, so it counts only in clause position:
 /// followed by `name` and then `.` or `:`, and not itself a property or label
@@ -1481,7 +1516,19 @@ impl<'a> Parser<'a> {
             Some(Tok::Param(s)) => {
                 let s = s.clone();
                 self.pos += 1;
-                Ok(Operand::Param(s))
+                // `$p.field` (chained: `$p.a.b`): the map entry, as `$p['field']`.
+                let mut operand = Operand::Param(s);
+                while self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+                {
+                    self.pos += 1;
+                    let field = self.ident("expected a key after '.'")?;
+                    operand = Operand::Index {
+                        base: Box::new(operand),
+                        index: Box::new(Operand::Lit(Value::Str(field))),
+                    };
+                }
+                Ok(operand)
             }
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected identifier")?;
@@ -1763,6 +1810,9 @@ impl<'a> Parser<'a> {
 
     fn write_statement(&mut self) -> Result<WriteStatement, String> {
         match self.peek() {
+            Some(Tok::Create) | Some(Tok::Merge) if needs_per_row_form(&self.toks[self.pos..]) => {
+                self.unwind_write_stmt()
+            }
             Some(Tok::Create) => self.create_stmt(),
             Some(Tok::Merge) => self.merge_stmt(),
             Some(Tok::Match) => self.match_write_stmt(),
@@ -1866,7 +1916,8 @@ impl<'a> Parser<'a> {
     /// Parse the `{key: value, …}` of a plain CREATE or MERGE. A value is a
     /// literal, or any expression that reads no variable, property or
     /// `$parameter` (`1 > 0`, `'a' + 'b'`), which is evaluated here so the
-    /// write (and a MERGE's match) sees the value.
+    /// write (and a MERGE's match) sees the value. A statement whose map reads
+    /// a `$parameter` is the per-row form instead (see [`needs_per_row_form`]).
     fn literal_props(&mut self) -> Result<Vec<(String, Value)>, String> {
         self.expect(&Tok::LBrace, "expected '{'")?;
         let mut out = Vec::new();
@@ -1902,8 +1953,13 @@ impl<'a> Parser<'a> {
         let literal_err = literal.err();
         self.pos = start;
         let operand = match self.value_expr() {
-            // A bare `null` keeps the literal parse's error.
-            Ok(Operand::Lit(Value::Null)) | Err(_) => {
+            Ok(Operand::Lit(Value::Null)) => {
+                self.pos = start;
+                return Err(self.err(&format!(
+                    "property `{key}` is null (a CREATE or MERGE property value cannot be null)"
+                )));
+            }
+            Err(_) => {
                 self.pos = start;
                 return Err(literal_err.unwrap_or_else(|| self.err("expected a property value")));
             }
@@ -1914,18 +1970,22 @@ impl<'a> Parser<'a> {
             Ok(None) => Err(self.err(&format!(
                 "property `{key}` evaluated to null (a CREATE or MERGE property value cannot be null)"
             ))),
+            // Unreachable from `write_statement`, which gives a statement
+            // whose map reads a parameter the per-row form.
             Err(super::exec::FoldError::Param) => Err(self.err(&format!(
-                "parameter references are not supported in {WHAT} (v1 limitation: use literals only)"
+                "property `{key}` reads a $parameter, which this form of the statement cannot evaluate"
             ))),
             Err(super::exec::FoldError::Variable) => Err(self.err(&format!(
-                "expression RHS not supported in {WHAT} (v1 limitation: use literals only)"
+                "property `{key}` reads a variable, and no clause before this CREATE or MERGE binds one"
             ))),
             Err(super::exec::FoldError::Eval(e)) => Err(format!("property `{key}`: {e}")),
         }
     }
 
-    /// Parse a literal value (int, float, string, boolean or list). Parameters and property
-    /// references are not accepted in write statements (v1 limitation).
+    /// Parse a literal value (int, float, string, boolean or list). Anything
+    /// else (a parameter, a variable, an expression) is an error, which
+    /// [`property_value`](Self::property_value) answers by parsing an
+    /// expression instead.
     fn literal_value(&mut self, what: &str) -> Result<Value, String> {
         if self.eat(&Tok::Dash) {
             return match self.peek() {
@@ -1988,12 +2048,12 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Value::Bool(b))
             }
-            Some(Tok::Param(_)) => Err(self.err(&format!(
-                "parameter references are not supported in {what} (v1 limitation: use literals only)"
-            ))),
-            Some(Tok::Ident(_)) => Err(self.err(&format!(
-                "expression RHS not supported in {what} (v1 limitation: use literals only)"
-            ))),
+            Some(Tok::Param(_)) => {
+                Err(self.err(&format!("expected a literal {what}, not a $parameter")))
+            }
+            Some(Tok::Ident(_)) => {
+                Err(self.err(&format!("expected a literal {what}, not a variable")))
+            }
             _ => Err(self.err(&format!("expected literal value for {what}"))),
         }
     }
@@ -2057,6 +2117,12 @@ impl<'a> Parser<'a> {
             return Err(self.err("MERGE requires a label (e.g., MERGE (n:Label {key: 'x'}))"));
         }
         let label = self.ident("expected label identifier after ':'")?;
+        if matches!(self.peek(), Some(Tok::Param(_))) {
+            return Err(refusal(
+                "a $parameter map in a MERGE pattern; name the key and set the rest, \
+                 e.g. MERGE (n:Label {id: $p.id}) ON CREATE SET n += $p",
+            ));
+        }
         if self.peek() != Some(&Tok::LBrace) {
             return Err(self.err(
                 "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
@@ -2460,30 +2526,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `set_clauses` for `MERGE … ON CREATE/ON MATCH SET`: the map forms
-    /// (`n = {…}`, `n += {…}`) are refused by name; MERGE takes property items.
+    /// `set_clauses` for a plain `MERGE … ON CREATE/ON MATCH SET`. A map form
+    /// (`n = {…}`, `n += $p`) never reaches here: `write_statement` gives such
+    /// a statement the per-row form ([`needs_per_row_form`]).
     fn merge_set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
-        self.merge_set_clauses_with(false)
-    }
-
-    /// [`merge_set_clauses`](Self::merge_set_clauses); `row` allows a property
-    /// or variable on the right side (the per-row form after UNWIND).
-    fn merge_set_clauses_with(&mut self, row: bool) -> Result<Vec<SetClause>, String> {
-        let mut sets = Vec::new();
-        loop {
-            if matches!(self.peek(), Some(Tok::Ident(_)))
-                && matches!(
-                    (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
-                    (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
-                )
-            {
-                return Err("not supported in mushroomdb 0.10: MERGE … SET with a map".to_string());
-            }
-            sets.push(self.set_clause_with(row)?);
-            if !self.eat(&Tok::Comma) {
-                return Ok(sets);
-            }
-        }
+        self.set_clauses()
     }
 
     fn set_clauses(&mut self) -> Result<Vec<SetClause>, String> {

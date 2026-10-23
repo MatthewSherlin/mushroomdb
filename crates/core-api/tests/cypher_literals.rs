@@ -248,11 +248,11 @@ fn null_as_a_whole_property_value_keeps_its_existing_errors() {
         .query_write("MATCH (n:T) WHERE n.id = 'a' SET n.x = null", &no_params())
         .unwrap_err();
     assert!(err.to_string().contains("evaluated to null"), "{err}");
-    // CREATE with a null property is the existing literal-only parse error.
+    // CREATE with a null literal property is still a parse error.
     let err = db
         .query_write("CREATE (:L {id: 'c', p: null})", &no_params())
         .unwrap_err();
-    assert!(err.to_string().contains("use literals only"), "{err}");
+    assert!(err.to_string().contains("cannot be null"), "{err}");
     assert_eq!(db.get_prop("a", "x"), Some(Value::Int(7)));
     assert!(db.node_info("c").is_none());
     let _ = std::fs::remove_dir_all(&dir);
