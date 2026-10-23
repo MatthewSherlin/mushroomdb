@@ -596,36 +596,42 @@ fn node(key: &str) -> BatchOp {
     }
 }
 
+/// The map forms run inside a transaction (TX-MW), with the counts and
+/// `RETURN` they give auto-commit, and nothing is visible until COMMIT.
 #[test]
-fn map_forms_inside_a_transaction_are_refused_by_name_and_buffer_nothing() {
+fn map_forms_run_inside_a_transaction() {
     let dir = tmp("tx");
     let db: SharedDb = SharedDb::open(&dir).unwrap();
-    db.submit_batch(vec![node("x")]).unwrap();
+    db.submit_batch(vec![node("x"), node("y")]).unwrap();
     let mut tx = db.begin_transaction();
-    for q in [
-        "MATCH (n:P) WHERE n.id = 'x' SET n = {a: 9}",
-        "MATCH (n:P) WHERE n.id = 'x' SET n += {a: 9}",
-        "MATCH (n:P) WHERE n.id = 'x' SET n += {a: 9} RETURN n.a AS a",
-    ] {
-        match tx.execute(q, &p()).unwrap_err() {
-            GraphError::QueryError { detail } => assert_eq!(
-                detail,
-                "not supported in mushroomdb 0.10 inside a transaction: \
-                 MATCH … SET n = {…} / SET n += {…}",
-                "{q}"
-            ),
-            other => panic!("{q}: expected QueryError, got {other:?}"),
-        }
-    }
-    // The transaction is still usable and nothing was buffered.
-    let inside = tx
-        .execute("MATCH (n:P) WHERE n.id = 'x' RETURN n.a AS a", &p())
+    let rs = tx
+        .execute("MATCH (n:P) WHERE n.id = 'x' SET n = {a: 9}", &p())
         .unwrap();
-    assert_eq!(inside.get(0, "a"), Some(&Value::Int(1)));
+    assert_eq!(
+        rs.get(0, "properties_set"),
+        Some(&Value::Int(2)),
+        "a set, b removed"
+    );
+    let rs = tx
+        .execute(
+            "MATCH (n:P) WHERE n.id = 'y' SET n += {a: 9} RETURN n.a AS a, n.b AS b",
+            &p(),
+        )
+        .unwrap();
+    assert_eq!(rs.get(0, "a"), Some(&Value::Int(9)));
+    assert_eq!(rs.get(0, "b"), Some(&Value::Int(2)));
+    assert_eq!(
+        db.reader().node_info("x").unwrap().props.get("a"),
+        Some(&Value::Int(1)),
+        "not committed yet"
+    );
     tx.commit().unwrap();
-    let info = db.reader().node_info("x").unwrap();
-    assert_eq!(info.props.get("a"), Some(&Value::Int(1)));
-    assert_eq!(info.props.get("b"), Some(&Value::Int(2)));
+    let x = db.reader().node_info("x").unwrap();
+    assert_eq!(x.props.get("a"), Some(&Value::Int(9)));
+    assert_eq!(x.props.get("b"), None);
+    let y = db.reader().node_info("y").unwrap();
+    assert_eq!(y.props.get("a"), Some(&Value::Int(9)));
+    assert_eq!(y.props.get("b"), Some(&Value::Int(2)));
 }
 
 // ── Role-scoped writes ──────────────────────────────────────────────────────

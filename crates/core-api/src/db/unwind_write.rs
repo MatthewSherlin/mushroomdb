@@ -24,8 +24,16 @@
 //!    written store; a node the statement deleted is null.
 //!
 //! The overlay is hash-keyed, so the pass is linear in the rows.
+//!
+//! Phases 1 and 2 read through a [`RowSource`]: the store for an auto-commit
+//! statement ([`GraphDb::exec_unwind_write`]), or a transaction's state, where
+//! the ops are buffered instead of committed and the `RETURN` reads the
+//! transaction with them laid over it ([`unwind_rows`], [`RowPass::result`]).
 
-use super::row_eval::{reads_node, Overlay};
+use super::row_eval::{
+    reads_node, uw_edge_exists, uw_edges_removed, uw_eval, uw_exists, uw_has_edges, uw_props,
+    Overlay, RowSource,
+};
 use super::*;
 use core_query::cypher::{
     ast::OptionalClause, RelDir, RelPat, RowCreateNode, RowMerge, RowMergeNode, RowReturn,
@@ -76,6 +84,9 @@ struct Tally {
     props_set: i64,
     deleted: i64,
     relationships_created: i64,
+    /// The keys every `MERGE` looked up, found or created: a transaction
+    /// guards its commit with them, as its plain `MERGE` does.
+    merge_keys: Vec<String>,
 }
 
 fn err(detail: String) -> GraphError {
@@ -442,8 +453,8 @@ fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn, rels: &[RelCapture]) ->
 }
 
 /// One row of the pass: how a write clause reads the row's values.
-struct RowCtx<'a, F: Fs> {
-    db: &'a GraphDb<F>,
+struct RowCtx<'a, S: RowSource + ?Sized> {
+    src: &'a S,
     rows: &'a ResultSet,
     row: usize,
     cols: &'a Columns,
@@ -453,7 +464,7 @@ struct RowCtx<'a, F: Fs> {
     params: &'a BTreeMap<String, Value>,
 }
 
-impl<F: Fs> RowCtx<'_, F> {
+impl<S: RowSource + ?Sized> RowCtx<'_, S> {
     /// The value of `op` for this row at this point of the statement; `None`
     /// is null.
     fn eval(
@@ -473,9 +484,176 @@ impl<F: Fs> RowCtx<'_, F> {
                 .contains(name)
                 .then(|| env.get(name).cloned())
         };
-        self.db
-            .uw_eval(ov, op, &node_key, &self.values, self.params)
+        uw_eval(self.src, ov, op, &node_key, &self.values, self.params)
     }
+}
+
+/// What the read and write phases of one statement produced: the batch ops to
+/// commit (or buffer), the counts, and what a `RETURN` projects afterwards.
+pub(crate) struct RowPass {
+    /// The statement's writes, in order.
+    pub(crate) ops: Vec<BatchOp>,
+    tally: Tally,
+    /// One entry per row, for the `RETURN`.
+    captured: Vec<Value>,
+    /// The `RETURN` query, planned before anything was written.
+    return_plan: Option<Query>,
+}
+
+impl RowPass {
+    /// Nodes the statement created.
+    pub(crate) fn created(&self) -> i64 {
+        self.tally.created
+    }
+
+    /// The keys the statement's `MERGE`s looked up, found or created.
+    pub(crate) fn merge_keys(&self) -> &[String] {
+        &self.tally.merge_keys
+    }
+
+    /// The statement's result once its ops are applied: the write counts, or
+    /// the `RETURN` projected over `view` (the state with the ops applied).
+    pub(crate) fn result(
+        self,
+        view: &GraphView<'_>,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let Some(query) = self.return_plan else {
+            return Ok(write_counts(
+                self.tally.created,
+                self.tally.props_set,
+                self.tally.deleted,
+                self.tally.relationships_created,
+            ));
+        };
+        let ops = plan(&query).map_err(|e| err(format!("plan: {e}")))?;
+        // Only the parameters the RETURN names go along: the statement's own
+        // (a bulk load's rows) are not copied again.
+        let used = format!("{:?}", query);
+        let mut with_rows: BTreeMap<String, Value> = params
+            .iter()
+            .filter(|(name, _)| used.contains(&format!("{name:?}")))
+            .map(|(name, v)| (name.clone(), v.clone()))
+            .collect();
+        with_rows.insert(ROWS_PARAM.to_string(), Value::List(self.captured));
+        execute(view, &ops, &Params(&with_rows)).map_err(|e| err(format!("execute: {e}")))
+    }
+}
+
+/// Phases 1 and 2 of `UNWIND … <write clauses> [RETURN …]` over `src`: the
+/// read part, then the write clauses per row, as batch ops. Nothing is
+/// written.
+pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
+    src: &S,
+    stmt: &UnwindWriteStmt,
+    params: &BTreeMap<String, Value>,
+) -> Result<RowPass> {
+    // Plan the RETURN first: a statement that cannot be projected must not
+    // commit.
+    let used = stmt.returns.as_ref().map(used_text).unwrap_or_default();
+    let (mut read, rels) = rel_captures(stmt, &used)?;
+    let return_plan = match &stmt.returns {
+        Some(ret) => {
+            let query = return_query(stmt, ret, &rels);
+            plan(&query).map_err(|e| err(format!("plan: {e}")))?;
+            Some(query)
+        }
+        None => None,
+    };
+
+    // Phase 1: the read part, one row per iteration.
+    let mut cols = plan_columns(stmt, &used, &rels);
+    read.returns = std::mem::take(&mut cols.items);
+    let ops = plan(&read).map_err(|e| err(format!("plan: {e}")))?;
+    cols.items = read.returns;
+    let rows = src
+        .row_view(|view| execute(view, &ops, &Params(params)))
+        .map_err(|e| err(format!("execute: {e}")))?;
+
+    // Phase 2: the write clauses, per row.
+    let var_cols: Vec<&str> = cols
+        .items
+        .iter()
+        .filter(|i| i.alias.is_none())
+        .filter_map(|i| match &i.value {
+            RetVal::Var(v) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+    let node_vars: HashSet<&str> = stmt.node_vars.iter().map(String::as_str).collect();
+    let capture = stmt.returns.is_some();
+    let mut captured: Vec<Value> = Vec::new();
+    let mut ov = Overlay::default();
+    let mut ops: Vec<BatchOp> = Vec::new();
+    let mut tally = Tally::default();
+    for row in 0..rows.len() {
+        let mut env: HashMap<&str, String> = HashMap::new();
+        let mut values: Vec<(&str, Value)> = Vec::new();
+        for var in &var_cols {
+            match rows.get(row, var) {
+                Some(Value::Null) | None => {}
+                Some(Value::Str(key)) if node_vars.contains(var) => {
+                    env.insert(var, key.clone());
+                }
+                Some(v) if !node_vars.contains(var) => values.push((var, v.clone())),
+                Some(_) => {}
+            }
+        }
+        let ctx = RowCtx {
+            src,
+            rows: &rows,
+            row,
+            cols: &cols,
+            node_vars: &node_vars,
+            values,
+            params,
+        };
+        for write in &stmt.writes {
+            uw_write(write, &ctx, &mut env, &mut ov, &mut ops, &mut tally)?;
+        }
+        if capture {
+            // Only what the RETURN names: a bare `count(*)` captures an
+            // empty row.
+            let mut entry: BTreeMap<String, Value> = BTreeMap::new();
+            for (name, v) in &ctx.values {
+                if names_used(&used, name) {
+                    entry.insert((*name).to_string(), v.clone());
+                }
+            }
+            for (name, key) in &env {
+                if names_used(&used, name) {
+                    entry.insert((*name).to_string(), Value::Str(key.clone()));
+                }
+            }
+            for rel in &rels {
+                let (left, right, etype) = if rel.merged {
+                    (
+                        env.get(rel.left.as_str()).cloned(),
+                        env.get(rel.right.as_str()).cloned(),
+                        rel.etypes.first().cloned(),
+                    )
+                } else {
+                    let text = |col: &str| match rows.get(row, col) {
+                        Some(Value::Str(k)) => Some(k.clone()),
+                        _ => None,
+                    };
+                    (text(&rel.left), text(&rel.right), text(&rel.field("t")))
+                };
+                for (tag, value) in [("l", left), ("r", right), ("t", etype)] {
+                    if let Some(v) = value {
+                        entry.insert(rel.field(tag), Value::Str(v));
+                    }
+                }
+            }
+            captured.push(Value::Map(entry));
+        }
+    }
+    Ok(RowPass {
+        ops,
+        tally,
+        captured,
+        return_plan,
+    })
 }
 
 impl<F: Fs> GraphDb<F> {
@@ -485,119 +663,14 @@ impl<F: Fs> GraphDb<F> {
         stmt: UnwindWriteStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        // Plan the RETURN first: a statement that cannot be projected must not
-        // commit.
-        let used = stmt.returns.as_ref().map(used_text).unwrap_or_default();
-        let (mut read, rels) = rel_captures(&stmt, &used)?;
-        let return_plan = match &stmt.returns {
-            Some(ret) => {
-                let query = return_query(&stmt, ret, &rels);
-                plan(&query).map_err(|e| err(format!("plan: {e}")))?;
-                Some(query)
-            }
-            None => None,
-        };
-
-        // Phase 1: the read part, one row per iteration.
-        let mut cols = plan_columns(&stmt, &used, &rels);
-        read.returns = std::mem::take(&mut cols.items);
-        let ops = plan(&read).map_err(|e| err(format!("plan: {e}")))?;
-        cols.items = read.returns;
-        let rows = {
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            }
-        }
-        .map_err(|e| err(format!("execute: {e}")))?;
-
-        // Phase 2: the write clauses, per row.
-        let var_cols: Vec<&str> = cols
-            .items
-            .iter()
-            .filter(|i| i.alias.is_none())
-            .filter_map(|i| match &i.value {
-                RetVal::Var(v) => Some(v.as_str()),
-                _ => None,
-            })
-            .collect();
-        let node_vars: HashSet<&str> = stmt.node_vars.iter().map(String::as_str).collect();
-        let capture = stmt.returns.is_some();
-        let mut captured: Vec<Value> = Vec::new();
-        let mut ov = Overlay::default();
-        let mut ops: Vec<BatchOp> = Vec::new();
-        let mut tally = Tally::default();
-        for row in 0..rows.len() {
-            let mut env: HashMap<&str, String> = HashMap::new();
-            let mut values: Vec<(&str, Value)> = Vec::new();
-            for var in &var_cols {
-                match rows.get(row, var) {
-                    Some(Value::Null) | None => {}
-                    Some(Value::Str(key)) if node_vars.contains(var) => {
-                        env.insert(var, key.clone());
-                    }
-                    Some(v) if !node_vars.contains(var) => values.push((var, v.clone())),
-                    Some(_) => {}
-                }
-            }
-            let ctx = RowCtx {
-                db: self,
-                rows: &rows,
-                row,
-                cols: &cols,
-                node_vars: &node_vars,
-                values,
-                params,
-            };
-            for write in &stmt.writes {
-                self.uw_write(write, &ctx, &mut env, &mut ov, &mut ops, &mut tally)?;
-            }
-            if capture {
-                // Only what the RETURN names: a bare `count(*)` captures an
-                // empty row.
-                let mut entry: BTreeMap<String, Value> = BTreeMap::new();
-                for (name, v) in &ctx.values {
-                    if names_used(&used, name) {
-                        entry.insert((*name).to_string(), v.clone());
-                    }
-                }
-                for (name, key) in &env {
-                    if names_used(&used, name) {
-                        entry.insert((*name).to_string(), Value::Str(key.clone()));
-                    }
-                }
-                for rel in &rels {
-                    let (left, right, etype) = if rel.merged {
-                        (
-                            env.get(rel.left.as_str()).cloned(),
-                            env.get(rel.right.as_str()).cloned(),
-                            rel.etypes.first().cloned(),
-                        )
-                    } else {
-                        let text = |col: &str| match rows.get(row, col) {
-                            Some(Value::Str(k)) => Some(k.clone()),
-                            _ => None,
-                        };
-                        (text(&rel.left), text(&rel.right), text(&rel.field("t")))
-                    };
-                    for (tag, value) in [("l", left), ("r", right), ("t", etype)] {
-                        if let Some(v) = value {
-                            entry.insert(rel.field(tag), Value::Str(v));
-                        }
-                    }
-                }
-                captured.push(Value::Map(entry));
-            }
-        }
-
+        let mut pass = unwind_rows(&*self, &stmt, params)?;
+        let ops = std::mem::take(&mut pass.ops);
         if !ops.is_empty() {
             self.commit_batch(ops)?;
         }
         // Refresh the role mask so a created node is visible to the RETURN
         // (read-after-write); see `exec_merge`.
-        if tally.created > 0 {
+        if pass.created() > 0 {
             if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
                 let new_mask = self.mask_for_role(&role)?;
                 if let Some(a) = self.pending_write_authz.as_mut() {
@@ -605,344 +678,283 @@ impl<F: Fs> GraphDb<F> {
                 }
             }
         }
-
-        if let Some(query) = return_plan {
-            let ops = plan(&query).map_err(|e| err(format!("plan: {e}")))?;
-            // Only the parameters the RETURN names go along: the statement's own
-            // (a bulk load's rows) are not copied again.
-            let used = format!("{:?}", query);
-            let mut with_rows: BTreeMap<String, Value> = params
-                .iter()
-                .filter(|(name, _)| used.contains(&format!("{name:?}")))
-                .map(|(name, v)| (name.clone(), v.clone()))
-                .collect();
-            with_rows.insert(ROWS_PARAM.to_string(), Value::List(captured));
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            return if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(&with_rows))
-            } else {
-                execute(&self.view(), &ops, &Params(&with_rows))
-            }
-            .map_err(|e| err(format!("execute: {e}")));
-        }
-        Ok(write_counts(
-            tally.created,
-            tally.props_set,
-            tally.deleted,
-            tally.relationships_created,
-        ))
+        self.row_view(|view| pass.result(view, params))
     }
+}
 
-    /// One write clause for one row.
-    fn uw_write<'v>(
-        &self,
-        write: &'v RowWrite,
-        ctx: &RowCtx<'_, F>,
-        env: &mut HashMap<&'v str, String>,
-        ov: &mut Overlay,
-        ops: &mut Vec<BatchOp>,
-        tally: &mut Tally,
-    ) -> Result<()> {
-        match write {
-            RowWrite::Create { nodes, edges } => {
-                for node in nodes {
-                    self.uw_create_node(node, ctx, env, ov, ops)?;
-                    tally.created += 1;
-                }
-                for edge in edges {
-                    let end = |var: &str, side: &str| -> Result<String> {
-                        env.get(var).cloned().ok_or_else(|| {
-                            err(format!("CREATE edge {side} variable '{var}' is not bound"))
-                        })
-                    };
-                    let src = end(&edge.src_var, "src")?;
-                    let dst = end(&edge.dst_var, "dst")?;
-                    ops.push(BatchOp::InsertEdge {
-                        edge_type: edge.etype.clone(),
-                        src_key: src.clone(),
-                        dst_key: dst.clone(),
-                    });
-                    ov.edge_created(&edge.etype, &src, &dst);
-                    tally.relationships_created += 1;
-                }
-            }
-            RowWrite::Merge(merge) => {
-                self.uw_merge(merge, ctx, env, ov, ops, tally)?;
-            }
-            RowWrite::Set(sets) => {
-                for sc in sets {
-                    let Some(key) = env.get(sc.var.as_str()).cloned() else {
-                        continue; // a null node (OPTIONAL MATCH): nothing to set
-                    };
-                    let Some(v) = ctx.eval(&sc.value, env, ov)? else {
-                        return Err(err(format!(
-                            "SET value for {}.{} evaluated to null",
-                            sc.var, sc.field
-                        )));
-                    };
-                    ov.note_set(&key, &sc.field, &v);
-                    ops.push(BatchOp::SetProp {
-                        key,
-                        field: sc.field.clone(),
-                        value: v,
-                    });
-                    tally.props_set += 1;
-                }
-            }
-            RowWrite::SetMap {
-                var,
-                merge,
-                value: operand,
-            } => {
-                let Some(key) = env.get(var.as_str()).cloned() else {
-                    return Ok(());
-                };
-                let entries: MapEntries = match ctx.eval(operand, env, ov)? {
-                    Some(Value::Map(m)) => m
-                        .into_iter()
-                        .map(|(k, v)| {
-                            (
-                                k,
-                                if matches!(v, Value::Null) {
-                                    None
-                                } else {
-                                    Some(v)
-                                },
-                            )
-                        })
-                        .collect(),
-                    other => {
-                        return Err(err(format!(
-                            "SET {var} {}= <map>: the value must be a map, got {}",
-                            if *merge { "+" } else { "" },
-                            other.map_or("null".to_string(), |v| format!("{v:?}")),
-                        )))
-                    }
-                };
-                let existing = self.uw_props(ov, &key).clone();
-                let writes = plan_map_write(&key, &existing, *merge, &entries, &|field| {
-                    self.view_store.view_for_prop(field).is_some()
-                });
-                for w in writes {
-                    match w {
-                        MapWrite::Set { field, value } => {
-                            tally.props_set += 1;
-                            ov.note_set(&key, &field, &value);
-                            ops.push(BatchOp::SetProp {
-                                key: key.clone(),
-                                field,
-                                value,
-                            });
-                        }
-                        MapWrite::Remove { field } => {
-                            if existing.contains_key(&field) {
-                                tally.props_set += 1;
-                            }
-                            ov.note_remove(&key, &field);
-                            ops.push(BatchOp::RemoveProp {
-                                key: key.clone(),
-                                field,
-                            });
-                        }
-                    }
-                }
-            }
-            RowWrite::Remove(items) => {
-                for (var, field) in items {
-                    let Some(key) = env.get(var.as_str()).cloned() else {
-                        continue;
-                    };
-                    if self.uw_props(ov, &key).contains_key(field) {
-                        tally.props_set += 1;
-                    }
-                    ov.note_remove(&key, field);
-                    ops.push(BatchOp::RemoveProp {
-                        key,
-                        field: field.clone(),
-                    });
-                }
-            }
-            RowWrite::Delete { vars, detach } => {
-                for var in vars {
-                    let Some(key) = env.get(var.as_str()).cloned() else {
-                        continue;
-                    };
-                    if !self.uw_exists(ov, &key) {
-                        continue; // already deleted by an earlier row
-                    }
-                    if !*detach && self.uw_has_edges(ov, &key) {
-                        return Err(err(format!(
-                            "Cannot delete node `{key}` because it still has incident edges. \
-                             Use DETACH DELETE to remove the node and all its edges."
-                        )));
-                    }
-                    ov.node_deleted(&key);
-                    ops.push(BatchOp::DeleteNode { key });
-                    tally.deleted += 1;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn uw_create_node<'v>(
-        &self,
-        node: &'v RowCreateNode,
-        ctx: &RowCtx<'_, F>,
-        env: &mut HashMap<&'v str, String>,
-        ov: &mut Overlay,
-        ops: &mut Vec<BatchOp>,
-    ) -> Result<()> {
-        let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len());
-        for (field, operand) in &node.props {
-            // A null value is an absent property.
-            if let Some(v) = ctx.eval(operand, env, ov)? {
-                props.push((field.clone(), v));
-            }
-        }
-        let key = match props.iter().find(|(f, _)| f == "id") {
-            Some((_, Value::Str(s))) => s.clone(),
-            _ => {
-                return Err(err(format!(
-                    "CREATE node ({}:{}) requires a string 'id' property",
-                    node.var, node.label
-                )))
-            }
-        };
-        if self.uw_exists(ov, &key) {
-            return Err(GraphError::DuplicateKey { key });
-        }
-        ov.node_created(&key, &props);
-        ops.push(BatchOp::InsertNode {
-            label: node.label.clone(),
-            key: key.clone(),
-            props,
-        });
-        env.insert(node.var.as_str(), key);
-        Ok(())
-    }
-
-    /// The key a MERGE node pattern names for this row. A bound node's key is
-    /// the one its variable holds.
-    fn uw_merge_key(
-        node: &RowMergeNode,
-        ctx: &RowCtx<'_, F>,
-        env: &HashMap<&str, String>,
-        ov: &mut Overlay,
-    ) -> Result<(String, Value)> {
-        if node.bound {
-            return match env.get(node.var.as_str()) {
-                Some(key) => Ok((key.clone(), Value::Str(key.clone()))),
-                None => Err(err(format!(
-                    "MERGE ({0}): `{0}` is null in this row, so there is no node to merge from",
-                    node.var
-                ))),
-            };
-        }
-        match ctx.eval(&node.key, env, ov)? {
-            Some(Value::Str(s)) => Ok((s.clone(), Value::Str(s))),
-            other => Err(err(format!(
-                "MERGE key value must be a string (got {:?})",
-                other.unwrap_or(Value::Null)
-            ))),
-        }
-    }
-
-    /// Whether a MERGE node exists at this point, after the role-scope check
-    /// (made once per key, against the store). A bound node must still exist.
-    fn uw_merge_node_existed(&self, ov: &Overlay, node: &RowMergeNode, key: &str) -> Result<bool> {
-        if !node.bound {
-            return self.uw_merge_existed(ov, &node.label, key);
-        }
-        if self.uw_exists(ov, key) {
-            Ok(true)
-        } else {
-            Err(err(format!(
-                "MERGE ({}): the node `{key}` was deleted earlier in the statement",
-                node.var
-            )))
-        }
-    }
-
-    fn uw_merge_existed(&self, ov: &Overlay, label: &str, key: &str) -> Result<bool> {
-        match ov.nodes.get(key) {
-            // Created or deleted by the statement: its own answer.
-            Some(state) if state.created_here || !state.exists => Ok(state.exists),
-            _ => self.merge_node_existed(label, key),
-        }
-    }
-
-    fn uw_merge<'v>(
-        &self,
-        merge: &'v RowMerge,
-        ctx: &RowCtx<'_, F>,
-        env: &mut HashMap<&'v str, String>,
-        ov: &mut Overlay,
-        ops: &mut Vec<BatchOp>,
-        tally: &mut Tally,
-    ) -> Result<()> {
-        let (start_key, start_value) = Self::uw_merge_key(&merge.start, ctx, env, ov)?;
-        let start_ns = match &merge.start.ns {
-            Some(op) => ctx.eval(op, env, ov)?,
-            None => None,
-        };
-        let Some(edge) = &merge.edge else {
-            let existed = self.uw_merge_node_existed(ov, &merge.start, &start_key)?;
-            if !existed {
-                let props = self.merge_create_props(
-                    &merge.start.key_field,
-                    &start_value,
-                    start_ns.as_ref(),
-                )?;
-                ov.node_created(&start_key, &props);
-                ops.push(BatchOp::InsertNode {
-                    label: merge.start.label.clone(),
-                    key: start_key.clone(),
-                    props,
-                });
+/// One write clause for one row.
+fn uw_write<'v, S: RowSource + ?Sized>(
+    write: &'v RowWrite,
+    ctx: &RowCtx<'_, S>,
+    env: &mut HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let src = ctx.src;
+    match write {
+        RowWrite::Create { nodes, edges } => {
+            for node in nodes {
+                uw_create_node(node, ctx, env, ov, ops)?;
                 tally.created += 1;
             }
-            let sets = if existed {
-                &merge.on_match
-            } else {
-                &merge.on_create
-            };
-            env.insert(merge.start.var.as_str(), start_key);
-            self.uw_merge_sets(sets, ctx, env, ov, ops, tally)?;
-            return Ok(());
-        };
-
-        let (end_key, end_value) = Self::uw_merge_key(&edge.end, ctx, env, ov)?;
-        let end_ns = match &edge.end.ns {
-            Some(op) => ctx.eval(op, env, ov)?,
-            None => None,
-        };
-        if start_key == end_key
-            && !merge.start.bound
-            && !edge.end.bound
-            && merge.start.label != edge.end.label
-        {
-            return Err(err(format!(
-                "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
-                merge.start.label, edge.end.label
-            )));
+            for edge in edges {
+                let end = |var: &str, side: &str| -> Result<String> {
+                    env.get(var).cloned().ok_or_else(|| {
+                        err(format!("CREATE edge {side} variable '{var}' is not bound"))
+                    })
+                };
+                let from = end(&edge.src_var, "src")?;
+                let to = end(&edge.dst_var, "dst")?;
+                ops.push(BatchOp::InsertEdge {
+                    edge_type: edge.etype.clone(),
+                    src_key: from.clone(),
+                    dst_key: to.clone(),
+                });
+                ov.edge_created(&edge.etype, &from, &to);
+                tally.relationships_created += 1;
+            }
         }
-        let start_existed = self.uw_merge_node_existed(ov, &merge.start, &start_key)?;
-        let end_existed = if end_key == start_key {
-            start_existed
-        } else {
-            self.uw_merge_node_existed(ov, &edge.end, &end_key)?
+        RowWrite::Merge(merge) => {
+            uw_merge(merge, ctx, env, ov, ops, tally)?;
+        }
+        RowWrite::Set(sets) => {
+            for sc in sets {
+                let Some(key) = env.get(sc.var.as_str()).cloned() else {
+                    continue; // a null node (OPTIONAL MATCH): nothing to set
+                };
+                let Some(v) = ctx.eval(&sc.value, env, ov)? else {
+                    return Err(err(format!(
+                        "SET value for {}.{} evaluated to null",
+                        sc.var, sc.field
+                    )));
+                };
+                ov.note_set(&key, &sc.field, &v);
+                ops.push(BatchOp::SetProp {
+                    key,
+                    field: sc.field.clone(),
+                    value: v,
+                });
+                tally.props_set += 1;
+            }
+        }
+        RowWrite::SetMap {
+            var,
+            merge,
+            value: operand,
+        } => {
+            let Some(key) = env.get(var.as_str()).cloned() else {
+                return Ok(());
+            };
+            let entries: MapEntries = match ctx.eval(operand, env, ov)? {
+                Some(Value::Map(m)) => m
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            if matches!(v, Value::Null) {
+                                None
+                            } else {
+                                Some(v)
+                            },
+                        )
+                    })
+                    .collect(),
+                other => {
+                    return Err(err(format!(
+                        "SET {var} {}= <map>: the value must be a map, got {}",
+                        if *merge { "+" } else { "" },
+                        other.map_or("null".to_string(), |v| format!("{v:?}")),
+                    )))
+                }
+            };
+            let existing = uw_props(src, ov, &key).clone();
+            let writes = plan_map_write(&key, &existing, *merge, &entries, &|field| {
+                src.row_view_owns(field)
+            });
+            for w in writes {
+                match w {
+                    MapWrite::Set { field, value } => {
+                        tally.props_set += 1;
+                        ov.note_set(&key, &field, &value);
+                        ops.push(BatchOp::SetProp {
+                            key: key.clone(),
+                            field,
+                            value,
+                        });
+                    }
+                    MapWrite::Remove { field } => {
+                        if existing.contains_key(&field) {
+                            tally.props_set += 1;
+                        }
+                        ov.note_remove(&key, &field);
+                        ops.push(BatchOp::RemoveProp {
+                            key: key.clone(),
+                            field,
+                        });
+                    }
+                }
+            }
+        }
+        RowWrite::Remove(items) => {
+            for (var, field) in items {
+                let Some(key) = env.get(var.as_str()).cloned() else {
+                    continue;
+                };
+                if uw_props(src, ov, &key).contains_key(field) {
+                    tally.props_set += 1;
+                }
+                ov.note_remove(&key, field);
+                ops.push(BatchOp::RemoveProp {
+                    key,
+                    field: field.clone(),
+                });
+            }
+        }
+        RowWrite::Delete { vars, detach } => {
+            for var in vars {
+                let Some(key) = env.get(var.as_str()).cloned() else {
+                    continue;
+                };
+                if !uw_exists(src, ov, &key) {
+                    continue; // already deleted by an earlier row
+                }
+                if !*detach && uw_has_edges(src, ov, &key) {
+                    return Err(err(format!(
+                        "Cannot delete node `{key}` because it still has incident edges. \
+                         Use DETACH DELETE to remove the node and all its edges."
+                    )));
+                }
+                // A node and the relationships it takes with it, as
+                // `MATCH … DETACH DELETE` counts them.
+                if *detach {
+                    tally.deleted += uw_edges_removed(src, ov, &key);
+                }
+                ov.node_deleted(&key);
+                ops.push(BatchOp::DeleteNode { key });
+                tally.deleted += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn uw_create_node<'v, S: RowSource + ?Sized>(
+    node: &'v RowCreateNode,
+    ctx: &RowCtx<'_, S>,
+    env: &mut HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+) -> Result<()> {
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len());
+    for (field, operand) in &node.props {
+        // A null value is an absent property.
+        if let Some(v) = ctx.eval(operand, env, ov)? {
+            props.push((field.clone(), v));
+        }
+    }
+    let key = match props.iter().find(|(f, _)| f == "id") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => {
+            return Err(err(format!(
+                "CREATE node ({}:{}) requires a string 'id' property",
+                node.var, node.label
+            )))
+        }
+    };
+    if uw_exists(ctx.src, ov, &key) {
+        return Err(GraphError::DuplicateKey { key });
+    }
+    ov.node_created(&key, &props);
+    ops.push(BatchOp::InsertNode {
+        label: node.label.clone(),
+        key: key.clone(),
+        props,
+    });
+    env.insert(node.var.as_str(), key);
+    Ok(())
+}
+
+/// The key a MERGE node pattern names for this row. A bound node's key is
+/// the one its variable holds.
+fn uw_merge_key<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<(String, Value)> {
+    if node.bound {
+        return match env.get(node.var.as_str()) {
+            Some(key) => Ok((key.clone(), Value::Str(key.clone()))),
+            None => Err(err(format!(
+                "MERGE ({0}): `{0}` is null in this row, so there is no node to merge from",
+                node.var
+            ))),
         };
-        let (src_key, dst_key) = match edge.dir {
-            core_query::cypher::RelDir::Left => (end_key.clone(), start_key.clone()),
-            _ => (start_key.clone(), end_key.clone()),
-        };
-        let edge_existed = start_existed
-            && end_existed
-            && self.uw_edge_exists(ov, &edge.etype, &src_key, &dst_key);
-        if !start_existed {
+    }
+    match ctx.eval(&node.key, env, ov)? {
+        Some(Value::Str(s)) => Ok((s.clone(), Value::Str(s))),
+        other => Err(err(format!(
+            "MERGE key value must be a string (got {:?})",
+            other.unwrap_or(Value::Null)
+        ))),
+    }
+}
+
+/// Whether a MERGE node exists at this point, after the role-scope check
+/// (made once per key, against the store). A bound node must still exist.
+fn uw_merge_node_existed<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &Overlay,
+    node: &RowMergeNode,
+    key: &str,
+) -> Result<bool> {
+    if !node.bound {
+        return uw_merge_existed(src, ov, &node.label, key);
+    }
+    if uw_exists(src, ov, key) {
+        Ok(true)
+    } else {
+        Err(err(format!(
+            "MERGE ({}): the node `{key}` was deleted earlier in the statement",
+            node.var
+        )))
+    }
+}
+
+fn uw_merge_existed<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &Overlay,
+    label: &str,
+    key: &str,
+) -> Result<bool> {
+    match ov.nodes.get(key) {
+        // Created or deleted by the statement: its own answer.
+        Some(state) if state.created_here || !state.exists => Ok(state.exists),
+        _ => src.row_merge_existed(label, key),
+    }
+}
+
+fn uw_merge<'v, S: RowSource + ?Sized>(
+    merge: &'v RowMerge,
+    ctx: &RowCtx<'_, S>,
+    env: &mut HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let src = ctx.src;
+    let (start_key, start_value) = uw_merge_key(&merge.start, ctx, env, ov)?;
+    tally.merge_keys.push(start_key.clone());
+    let start_ns = match &merge.start.ns {
+        Some(op) => ctx.eval(op, env, ov)?,
+        None => None,
+    };
+    let Some(edge) = &merge.edge else {
+        let existed = uw_merge_node_existed(src, ov, &merge.start, &start_key)?;
+        if !existed {
             let props =
-                self.merge_create_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+                src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
             ov.node_created(&start_key, &props);
             ops.push(BatchOp::InsertNode {
                 label: merge.start.label.clone(),
@@ -951,63 +963,108 @@ impl<F: Fs> GraphDb<F> {
             });
             tally.created += 1;
         }
-        if !end_existed && end_key != start_key {
-            let props =
-                self.merge_create_props(&edge.end.key_field, &end_value, end_ns.as_ref())?;
-            ov.node_created(&end_key, &props);
-            ops.push(BatchOp::InsertNode {
-                label: edge.end.label.clone(),
-                key: end_key.clone(),
-                props,
-            });
-            tally.created += 1;
-        }
-        let sets = if edge_existed {
+        let sets = if existed {
             &merge.on_match
         } else {
-            ops.push(BatchOp::InsertEdge {
-                edge_type: edge.etype.clone(),
-                src_key: src_key.clone(),
-                dst_key: dst_key.clone(),
-            });
-            ov.edge_created(&edge.etype, &src_key, &dst_key);
-            tally.relationships_created += 1;
             &merge.on_create
         };
         env.insert(merge.start.var.as_str(), start_key);
-        env.insert(edge.end.var.as_str(), end_key);
-        self.uw_merge_sets(sets, ctx, env, ov, ops, tally)
-    }
+        uw_merge_sets(sets, ctx, env, ov, ops, tally)?;
+        return Ok(());
+    };
 
-    /// `ON CREATE SET` / `ON MATCH SET` items of a MERGE; each names a node
-    /// the MERGE bound.
-    fn uw_merge_sets(
-        &self,
-        sets: &[SetClause],
-        ctx: &RowCtx<'_, F>,
-        env: &HashMap<&str, String>,
-        ov: &mut Overlay,
-        ops: &mut Vec<BatchOp>,
-        tally: &mut Tally,
-    ) -> Result<()> {
-        for sc in sets {
-            let Some(v) = ctx.eval(&sc.value, env, ov)? else {
-                return Err(err(format!(
-                    "SET value for {}.{} evaluated to null",
-                    sc.var, sc.field
-                )));
-            };
-            let Some(key) = env.get(sc.var.as_str()).cloned() else {
-                return Err(err(format!("SET variable '{}' is not bound", sc.var)));
-            };
-            ov.note_set(&key, &sc.field, &v);
-            ops.push(BatchOp::SetProp {
-                key,
-                field: sc.field.clone(),
-                value: v,
-            });
-            tally.props_set += 1;
-        }
-        Ok(())
+    let (end_key, end_value) = uw_merge_key(&edge.end, ctx, env, ov)?;
+    tally.merge_keys.push(end_key.clone());
+    let end_ns = match &edge.end.ns {
+        Some(op) => ctx.eval(op, env, ov)?,
+        None => None,
+    };
+    if start_key == end_key
+        && !merge.start.bound
+        && !edge.end.bound
+        && merge.start.label != edge.end.label
+    {
+        return Err(err(format!(
+            "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
+            merge.start.label, edge.end.label
+        )));
     }
+    let start_existed = uw_merge_node_existed(src, ov, &merge.start, &start_key)?;
+    let end_existed = if end_key == start_key {
+        start_existed
+    } else {
+        uw_merge_node_existed(src, ov, &edge.end, &end_key)?
+    };
+    let (src_key, dst_key) = match edge.dir {
+        core_query::cypher::RelDir::Left => (end_key.clone(), start_key.clone()),
+        _ => (start_key.clone(), end_key.clone()),
+    };
+    let edge_existed =
+        start_existed && end_existed && uw_edge_exists(src, ov, &edge.etype, &src_key, &dst_key);
+    if !start_existed {
+        let props = src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+        ov.node_created(&start_key, &props);
+        ops.push(BatchOp::InsertNode {
+            label: merge.start.label.clone(),
+            key: start_key.clone(),
+            props,
+        });
+        tally.created += 1;
+    }
+    if !end_existed && end_key != start_key {
+        let props = src.row_merge_props(&edge.end.key_field, &end_value, end_ns.as_ref())?;
+        ov.node_created(&end_key, &props);
+        ops.push(BatchOp::InsertNode {
+            label: edge.end.label.clone(),
+            key: end_key.clone(),
+            props,
+        });
+        tally.created += 1;
+    }
+    let sets = if edge_existed {
+        &merge.on_match
+    } else {
+        ops.push(BatchOp::InsertEdge {
+            edge_type: edge.etype.clone(),
+            src_key: src_key.clone(),
+            dst_key: dst_key.clone(),
+        });
+        ov.edge_created(&edge.etype, &src_key, &dst_key);
+        tally.relationships_created += 1;
+        &merge.on_create
+    };
+    env.insert(merge.start.var.as_str(), start_key);
+    env.insert(edge.end.var.as_str(), end_key);
+    uw_merge_sets(sets, ctx, env, ov, ops, tally)
+}
+
+/// `ON CREATE SET` / `ON MATCH SET` items of a MERGE; each names a node
+/// the MERGE bound.
+fn uw_merge_sets<S: RowSource + ?Sized>(
+    sets: &[SetClause],
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    for sc in sets {
+        let Some(v) = ctx.eval(&sc.value, env, ov)? else {
+            return Err(err(format!(
+                "SET value for {}.{} evaluated to null",
+                sc.var, sc.field
+            )));
+        };
+        let Some(key) = env.get(sc.var.as_str()).cloned() else {
+            return Err(err(format!("SET variable '{}' is not bound", sc.var)));
+        };
+        ov.note_set(&key, &sc.field, &v);
+        ops.push(BatchOp::SetProp {
+            key,
+            field: sc.field.clone(),
+            value: v,
+        });
+        tally.props_set += 1;
+    }
+    Ok(())
 }

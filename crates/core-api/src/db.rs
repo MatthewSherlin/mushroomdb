@@ -41,7 +41,11 @@ const NS_DEFAULT_IDX: u32 = 0;
 mod call;
 mod ddl;
 pub use ddl::{SchemaError, SchemaErrorKind};
+mod match_write;
 mod row_eval;
+pub(crate) use match_write::{match_remove_ops, match_set_map_ops, match_set_ops, MatchWrite};
+pub(crate) use row_eval::RowSource;
+pub(crate) use unwind_write::{unwind_rows, RowPass};
 mod unwind_write;
 
 pub(crate) use call::{call_statement, run_call};
@@ -1248,8 +1252,8 @@ fn returns_write_return_refusal(returns: &[RetItem]) -> Option<&'static str> {
     })
 }
 
-fn eval_set_return_operand<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_operand<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1276,16 +1280,14 @@ fn eval_set_return_operand<F: Fs>(
             let Some(Value::Str(key)) = match_rs.get(row, var) else {
                 return Ok(None);
             };
-            if let Some(v) = db.get_prop(key, field) {
+            if let Some(v) = db.row_prop(key, field) {
                 return Ok(Some(v));
             }
             // Same stored-wins identity fallback as the read path:
             // n.key / n.id / n.label, not only get_prop.
             Ok(match field.as_str() {
                 "key" | "id" => Some(Value::Str(key.clone())),
-                "label" => db
-                    .node_ref(key)
-                    .map(|n| Value::Str(n.label().to_owned())),
+                "label" => db.row_label(key).map(Value::Str),
                 _ => None,
             })
         }
@@ -1371,8 +1373,8 @@ fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
 
 /// A CASE WHEN condition in a write statement's RETURN: true takes the
 /// branch; false and null do not. Three-valued, as in a read query.
-fn eval_set_return_expr<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_expr<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1463,8 +1465,8 @@ fn eval_set_return_arith(
     }
 }
 
-fn eval_set_return_func<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_func<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1483,7 +1485,7 @@ fn eval_set_return_func<F: Fs>(
             match_rs.get(row, &rel_type_alias(var)).cloned()
         } else {
             match match_rs.get(row, var) {
-                Some(Value::Str(key)) => db.node_ref(key).map(|n| Value::Str(n.label().to_owned())),
+                Some(Value::Str(key)) => db.row_label(key).map(Value::Str),
                 _ => None,
             }
         };
@@ -1612,8 +1614,8 @@ fn eval_set_return_func<F: Fs>(
     }
 }
 
-fn eval_set_return_item<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_item<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1651,8 +1653,8 @@ fn eval_set_return_item<F: Fs>(
 }
 
 /// Project user RETURN from original MATCH rows after SET. No rematch.
-fn project_set_return_rows<F: Fs>(
-    db: &GraphDb<F>,
+fn project_set_return_rows<S: RowSource + ?Sized>(
+    db: &S,
     rel_vars: &[String],
     match_rs: &ResultSet,
     returns: &[RetItem],
@@ -8765,10 +8767,15 @@ impl<F: Fs> GraphDb<F> {
             .filter(|&(_, etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
             .count() as u64;
 
+        // A self-loop is in both the Out and the In list of `id`, and is one
+        // edge: it is counted from the Out side only (ledger row 147).
         let mut total_topo = 0u64;
         for et in tv.etypes() {
             total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
-                + tv.neighbors(et, Direction::In, id).len() as u64;
+                + tv.neighbors(et, Direction::In, id)
+                    .iter()
+                    .filter(|&&src| src != id)
+                    .count() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
@@ -13658,196 +13665,8 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchSetStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        let project_returns = stmt.returns.clone();
-        // Refused before anything is written: the projection runs after the
-        // commit, and must not fail (or differ) once the write has happened.
-        if let Some(detail) = project_returns
-            .as_deref()
-            .and_then(returns_write_return_refusal)
-        {
-            return Err(GraphError::QueryError {
-                detail: detail.into(),
-            });
-        }
-        // Collect unique node vars targeted by SET clauses, plus RETURN bindings
-        // so the post-write projection can look them up by key.
-        let mut set_vars: Vec<String> = Vec::new();
-        for s in &stmt.sets {
-            if !set_vars.contains(&s.var) {
-                set_vars.push(s.var.clone());
-            }
-        }
-        let rel_vars = pattern_rel_vars(&stmt.matches);
-        // `count` is the engine's, on an edge: it is the insert-count §5.13
-        // maintains, and a `SET` that overwrote it would make the number mean
-        // whatever the last writer said rather than how many times the pair was
-        // inserted. Refused by name here, before the match runs, so the caller
-        // is told what is actually wrong instead of meeting the executor's
-        // generic "did not resolve to a node key" — and so the answer does not
-        // depend on whether the pattern happened to match a row. The same name
-        // on a *node* is an ordinary property and is untouched.
-        for s in &stmt.sets {
-            if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
-                return Err(GraphError::QueryError {
-                    detail: format!(
-                        "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
-                         property holding the pair's insert count",
-                        s.var
-                    ),
-                });
-            }
-        }
-        let mut lookup_vars = set_vars.clone();
-        for v in pattern_node_vars(&stmt.matches) {
-            add_var(&mut lookup_vars, &v);
-        }
-        if let Some(ref returns) = project_returns {
-            for v in ret_node_vars(returns) {
-                if !rel_vars.iter().any(|r| r == &v) {
-                    add_var(&mut lookup_vars, &v);
-                }
-            }
-        }
-
-        // Synthesize a read query: MATCH … WHERE … RETURN <lookup_vars>, <set_values…>
-        // SET values are projected as ScalarExpr items so that arithmetic expressions
-        // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
-        let mut set_returns: Vec<RetItem> = lookup_vars
-            .iter()
-            .map(|v| RetItem {
-                value: RetVal::Var(v.clone()),
-                alias: None,
-            })
-            .collect();
-        // One computed column per SET clause; alias is `__sv_<i>`.
-        let set_val_cols: Vec<String> = stmt
-            .sets
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("__sv_{i}"))
-            .collect();
-        for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
-            set_returns.push(RetItem {
-                value: RetVal::ScalarExpr(sc.value.clone()),
-                alias: Some(col.clone()),
-            });
-        }
-        // Capture relationship types while r is bound; SET does not change them.
-        for r in &rel_vars {
-            set_returns.push(RetItem {
-                value: RetVal::FuncCall {
-                    name: "type".into(),
-                    args: vec![Operand::Var(r.clone())],
-                },
-                alias: Some(rel_type_alias(r)),
-            });
-        }
-
-        let read_q = Query {
-            matches: stmt.matches.clone(),
-            optional_clauses: vec![],
-            where_expr: stmt.where_expr.clone(),
-            unwinds: vec![],
-            post_unwind_where: None,
-            stages: vec![],
-            returns: set_returns,
-            distinct: false,
-            order_by: vec![],
-            skip: None,
-            limit: None,
-        };
-        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        // MATCH phase is read-only; borrow ends before batch opens.
-        //
-        // When a role-scoped write is in flight, run the MATCH read through
-        // view_masked so hidden nodes are invisible → hidden ≡ absent ≡
-        // zero-rows (no SetProp ops generated, no existence-oracle 403).
-        // Full-authority writes (pending_write_authz=None) keep view().
-        let match_rs = {
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            }
-        }
-        .map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })?;
-
-        // Collect (key, field, value) for each matched row × each SET clause.
-        //
-        // A value that reads a node's properties is evaluated as its turn comes,
-        // against what the statement has written so far, so two rows for one
-        // node (`MATCH (n), (m) SET n.c = n.c + 1`) and two items of one clause
-        // (`SET n.v = 10, n.w = n.v`) read each other's writes, as in openCypher.
-        // A value with no such read keeps its column from the MATCH.
-        let node_names = pattern_node_vars(&stmt.matches);
-        let dynamic: Vec<bool> = stmt
-            .sets
-            .iter()
-            .map(|sc| {
-                row_eval::reads_node(&sc.value, &node_names)
-                    && !row_eval::reads_node(&sc.value, &rel_vars)
-            })
-            .collect();
-        let any_dynamic = dynamic.iter().any(|d| *d);
-        let mut overlay = row_eval::Overlay::default();
-        let mut set_ops: Vec<(String, String, Value)> = Vec::new();
-        for row_i in 0..match_rs.len() {
-            for ((sc, col), is_dynamic) in stmt.sets.iter().zip(&set_val_cols).zip(&dynamic) {
-                let key = match match_rs.get(row_i, &sc.var) {
-                    Some(Value::Str(k)) => k.clone(),
-                    _ => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET variable '{}' did not resolve to a node key",
-                                sc.var
-                            ),
-                        })
-                    }
-                };
-                let evaluated = if *is_dynamic {
-                    let node_key = |name: &str| -> Option<Option<String>> {
-                        node_names.iter().any(|n| n == name).then(|| {
-                            match match_rs.get(row_i, name) {
-                                Some(Value::Str(k)) => Some(k.clone()),
-                                _ => None,
-                            }
-                        })
-                    };
-                    self.uw_eval(&mut overlay, &sc.value, &node_key, &[], params)?
-                } else {
-                    // The SET value was already evaluated by the executor.
-                    match_rs.get(row_i, col).cloned()
-                };
-                let Some(value) = evaluated.filter(|v| !matches!(v, Value::Null)) else {
-                    return Err(GraphError::QueryError {
-                        detail: format!("SET value for {}.{} evaluated to null", sc.var, sc.field),
-                    });
-                };
-                if any_dynamic {
-                    overlay.note_set(&key, &sc.field, &value);
-                }
-                set_ops.push((key, sc.field.clone(), value));
-            }
-        }
-
-        // Apply as one atomic batch.
-        let props_set = set_ops.len();
-        let mut batch = self.batch();
-        for (key, field, value) in set_ops {
-            batch.set_prop(&key, &field, value);
-        }
-        batch.commit()?;
-
-        if let Some(returns) = project_returns {
-            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
-        }
-
-        Ok(write_counts(0, props_set as i64, 0, 0))
+        let write = match_write::match_set_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
     }
 
     /// `MATCH … [WHERE …] SET n = {…}` and `SET n += {…}`.
@@ -13864,199 +13683,8 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchSetMapStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        let project_returns = stmt.returns.clone();
-        let rel_vars = pattern_rel_vars(&stmt.matches);
-        let mut lookup_vars: Vec<String> = Vec::new();
-        add_var(&mut lookup_vars, &stmt.var);
-        for v in pattern_node_vars(&stmt.matches) {
-            add_var(&mut lookup_vars, &v);
-        }
-        if let Some(ref returns) = project_returns {
-            for v in ret_node_vars(returns) {
-                if !rel_vars.iter().any(|r| r == &v) {
-                    add_var(&mut lookup_vars, &v);
-                }
-            }
-        }
-        let mut match_returns: Vec<RetItem> = lookup_vars
-            .iter()
-            .map(|v| RetItem {
-                value: RetVal::Var(v.clone()),
-                alias: None,
-            })
-            .collect();
-        let value_cols: Vec<String> = (0..stmt.map.len()).map(|i| format!("__sv_{i}")).collect();
-        for ((_, operand), col) in stmt.map.iter().zip(&value_cols) {
-            match_returns.push(RetItem {
-                value: RetVal::ScalarExpr(operand.clone()),
-                alias: Some(col.clone()),
-            });
-        }
-        if let Some(name) = &stmt.param {
-            match_returns.push(RetItem {
-                value: RetVal::ScalarExpr(Operand::Param(name.clone())),
-                alias: Some("__sv_param".into()),
-            });
-        }
-        for r in &rel_vars {
-            match_returns.push(RetItem {
-                value: RetVal::FuncCall {
-                    name: "type".into(),
-                    args: vec![Operand::Var(r.clone())],
-                },
-                alias: Some(rel_type_alias(r)),
-            });
-        }
-        let read_q = Query {
-            matches: stmt.matches.clone(),
-            optional_clauses: vec![],
-            where_expr: stmt.where_expr.clone(),
-            unwinds: vec![],
-            post_unwind_where: None,
-            stages: vec![],
-            returns: match_returns,
-            distinct: false,
-            order_by: vec![],
-            skip: None,
-            limit: None,
-        };
-        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        let match_rs = {
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            }
-        }
-        .map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })?;
-
-        // One entry list per matched row, in row order. A node bound by several
-        // rows is written by each in turn under `+=`; under `=` the last row's
-        // map is the node's final state, so earlier rows for it are dropped.
-        let node_names = pattern_node_vars(&stmt.matches);
-        let map_dynamic = stmt.map.iter().any(|(_, operand)| {
-            row_eval::reads_node(operand, &node_names) && !row_eval::reads_node(operand, &rel_vars)
-        });
-        let mut overlay = row_eval::Overlay::default();
-        let mut per_node: Vec<(String, MapEntries)> = Vec::new();
-        for row_i in 0..match_rs.len() {
-            let key = match match_rs.get(row_i, &stmt.var) {
-                Some(Value::Str(k)) => k.clone(),
-                _ => {
-                    return Err(GraphError::QueryError {
-                        detail: format!(
-                            "SET variable '{}' did not resolve to a node key",
-                            stmt.var
-                        ),
-                    })
-                }
-            };
-            if let Some(name) = &stmt.param {
-                // The parameter is a map: its keys are the map's, a null value
-                // is a null entry. Anything else is a named error, before any
-                // write.
-                let entries = match match_rs.get(row_i, "__sv_param") {
-                    Some(Value::Map(m)) => m
-                        .iter()
-                        .map(|(k, v)| {
-                            let v = if matches!(v, Value::Null) {
-                                None
-                            } else {
-                                Some(v.clone())
-                            };
-                            (k.clone(), v)
-                        })
-                        .collect::<MapEntries>(),
-                    other => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET {} {}= ${name}: the parameter must be a map, got {}",
-                                stmt.var,
-                                if stmt.merge { "+" } else { "" },
-                                other.map_or("null".to_string(), |v| format!("{v:?}")),
-                            ),
-                        })
-                    }
-                };
-                if !stmt.merge {
-                    per_node.retain(|(k, _)| k != &key);
-                }
-                per_node.push((key, entries));
-                continue;
-            }
-            let mut entries: MapEntries = Vec::with_capacity(stmt.map.len());
-            for ((field, operand), col) in stmt.map.iter().zip(&value_cols) {
-                let value = if row_eval::reads_node(operand, &node_names)
-                    && !row_eval::reads_node(operand, &rel_vars)
-                {
-                    // Read as its turn comes, against the statement's own writes.
-                    let node_key = |name: &str| -> Option<Option<String>> {
-                        node_names.iter().any(|n| n == name).then(|| {
-                            match match_rs.get(row_i, name) {
-                                Some(Value::Str(k)) => Some(k.clone()),
-                                _ => None,
-                            }
-                        })
-                    };
-                    self.uw_eval(&mut overlay, operand, &node_key, &[], params)?
-                } else {
-                    match match_rs.get(row_i, col) {
-                        None | Some(Value::Null) => None,
-                        Some(v) => Some(v.clone()),
-                    }
-                };
-                entries.push((field.clone(), value));
-            }
-            if map_dynamic {
-                self.uw_apply_map(&mut overlay, &key, stmt.merge, &entries);
-            }
-            if !stmt.merge {
-                per_node.retain(|(k, _)| k != &key);
-            }
-            per_node.push((key, entries));
-        }
-
-        let mut writes: Vec<(String, MapWrite)> = Vec::new();
-        let mut props_changed = 0i64;
-        for (key, entries) in &per_node {
-            let existing = self.node_info(key).map(|n| n.props).unwrap_or_default();
-            let node_writes = plan_map_write(key, &existing, stmt.merge, entries, &|field| {
-                self.view_store.view_for_prop(field).is_some()
-            });
-            for write in node_writes {
-                match &write {
-                    MapWrite::Set { .. } => props_changed += 1,
-                    MapWrite::Remove { field } => {
-                        if existing.contains_key(field) {
-                            props_changed += 1;
-                        }
-                    }
-                }
-                writes.push((key.clone(), write));
-            }
-        }
-        let mut batch = self.batch();
-        for (key, write) in writes {
-            match write {
-                MapWrite::Set { field, value } => {
-                    batch.set_prop(&key, &field, value);
-                }
-                MapWrite::Remove { field } => {
-                    batch.remove_prop(&key, &field);
-                }
-            }
-        }
-        batch.commit()?;
-
-        if let Some(returns) = project_returns {
-            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
-        }
-        Ok(write_counts(0, props_changed, 0, 0))
+        let write = match_write::match_set_map_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
     }
 
     /// `MATCH … [WHERE …] REMOVE n.f [, …] [RETURN …]`.
@@ -14073,106 +13701,20 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchRemoveStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        let project_returns = stmt.returns.clone();
-        let rel_vars = pattern_rel_vars(&stmt.matches);
-        let mut lookup_vars: Vec<String> = Vec::new();
-        for (var, _) in &stmt.removals {
-            add_var(&mut lookup_vars, var);
-        }
-        for v in pattern_node_vars(&stmt.matches) {
-            add_var(&mut lookup_vars, &v);
-        }
-        if let Some(ref returns) = project_returns {
-            for v in ret_node_vars(returns) {
-                if !rel_vars.iter().any(|r| r == &v) {
-                    add_var(&mut lookup_vars, &v);
-                }
-            }
-        }
-        let mut match_returns: Vec<RetItem> = lookup_vars
-            .iter()
-            .map(|v| RetItem {
-                value: RetVal::Var(v.clone()),
-                alias: None,
-            })
-            .collect();
-        // Capture relationship types while r is bound, as SET does.
-        for r in &rel_vars {
-            match_returns.push(RetItem {
-                value: RetVal::FuncCall {
-                    name: "type".into(),
-                    args: vec![Operand::Var(r.clone())],
-                },
-                alias: Some(rel_type_alias(r)),
-            });
-        }
-        let read_q = Query {
-            matches: stmt.matches.clone(),
-            optional_clauses: vec![],
-            where_expr: stmt.where_expr.clone(),
-            unwinds: vec![],
-            post_unwind_where: None,
-            stages: vec![],
-            returns: match_returns,
-            distinct: false,
-            order_by: vec![],
-            skip: None,
-            limit: None,
-        };
-        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        let match_rs = {
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            }
-        }
-        .map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })?;
+        let write = match_write::match_remove_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
+    }
 
-        // Each (node, field) once, however many rows bound the node.
-        let mut targets: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for row_i in 0..match_rs.len() {
-            for (var, field) in &stmt.removals {
-                let key = match match_rs.get(row_i, var) {
-                    Some(Value::Str(k)) => k.clone(),
-                    _ => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "REMOVE variable '{var}' did not resolve to a node key"
-                            ),
-                        })
-                    }
-                };
-                let pair = (key, field.clone());
-                if seen.insert(pair.clone()) {
-                    targets.push(pair);
-                }
-            }
-        }
-
-        // Counted before the commit, from the state the removals act on.
-        let props_removed = targets
-            .iter()
-            .filter(|(key, field)| self.get_prop(key, field).is_some())
-            .count() as i64;
-        let mut batch = self.batch();
-        for (key, field) in &targets {
-            batch.remove_prop(key, field);
-        }
-        batch.commit()?;
-
-        if let Some(returns) = project_returns {
-            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
-        }
-
-        Ok(write_counts(0, props_removed, 0, 0))
+    /// Commit a `MATCH … SET` / `REMOVE` statement's ops as one batch, then
+    /// project its `RETURN` from the written store.
+    fn commit_match_write(
+        &mut self,
+        mut write: match_write::MatchWrite,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let ops = std::mem::take(&mut write.ops);
+        self.commit_batch(ops)?;
+        write.result(&*self, params)
     }
 
     fn exec_match_delete(

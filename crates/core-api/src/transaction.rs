@@ -43,7 +43,10 @@
 //!   `write_skew_through_label_scan_is_possible`.
 //! - **Not in the read set**: nodes bound only in a `MATCH` after a `WITH`, and
 //!   the intermediate nodes of a variable-length or shortest path. Their
-//!   endpoints and every node a write statement touches are.
+//!   endpoints and every node a write statement touches are. A write
+//!   statement with a read part (`MATCH … SET`, `MATCH … CREATE`, `UNWIND …
+//!   MATCH … MERGE`, …) records every node that read part binds, named or
+//!   anonymous and in every stage, as well as every node it writes.
 //! - A transaction that wrote nothing commits without a WAL frame and without
 //!   checking its reads, and returns the base snapshot's commit number.
 //!
@@ -65,42 +68,40 @@
 //!
 //! # Cypher inside a transaction
 //!
-//! Supported write forms, resolved against the base snapshot plus the buffer:
-//!
-//! - `CREATE (a:L {id: …}) [-[:T]->(b:L {id: …})] [RETURN …]`
-//! - `MATCH … [WHERE …] SET n.f = … [, …]` (without `RETURN`)
-//! - `MATCH … [WHERE …] REMOVE n.f [, …]` (without `RETURN`)
-//! - `MATCH … [WHERE …] DELETE r` (edges)
-//! - `MATCH … [WHERE …] [DETACH] DELETE n` (nodes)
-//! - `MERGE (n:L {id: …}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`
-//! - `MERGE (a:L {id: …})-[:T]->(b:M {id: …}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`
+//! Every statement form an auto-commit write runs, except a schema statement,
+//! runs here with the same results and counters, resolved against the base
+//! snapshot plus the buffer: `CREATE`, `MERGE`, `MATCH … SET` / `SET n = {…}`
+//! / `SET n += {…}` / `REMOVE` / `DELETE` (with or without `RETURN`), and the
+//! per-row forms — `MATCH … CREATE`, `MATCH … MERGE` and `UNWIND … <write>`.
+//! The `MATCH … SET` / `REMOVE` and per-row forms compute their ops through
+//! the same code as auto-commit (`crate::db::RowSource`, with the
+//! transaction's state as the source), so they read a statement's own earlier
+//! rows exactly as auto-commit does; the ops are buffered instead of
+//! committed, and a `RETURN` reads the transaction with them laid over it.
+//! The conflict set of such a statement holds every node it writes and every
+//! node its read part binds (see `statement_read_set`).
 //!
 //! Every read query the engine accepts runs as it would outside a
-//! transaction. A write form that cannot be expressed as buffered ops yet —
-//! today `MATCH … SET … RETURN`, `MATCH … REMOVE … RETURN`, the map forms
-//! `SET n = {…}` / `SET n += {…}` and `UNWIND …` followed by write clauses —
-//! fails with a `QueryError` reading
-//! `not supported in mushroomdb 0.10 inside a transaction: <form>`, and nothing
-//! is buffered; it is never applied outside the transaction.
+//! transaction.
 //!
 //! A statement is atomic inside the transaction: one that fails buffers
 //! nothing, and the transaction stays usable.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use core_query::cypher::{
     execute, execute_union, is_write_tokens, lex, parse_read, parse_write, plan, CreateStmt,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetStmt, MergeStmt, NodePat,
-    Operand, Params, Pattern, Query, RetItem, RetVal, UnionQuery, WriteStatement,
+    MatchDeleteNodeStmt, MatchDeleteStmt, MergeStmt, NodePat, Operand, Params, Pattern, Query,
+    RetItem, RetVal, UnionQuery, WriteStatement,
 };
 use core_query::{GraphView, ResultSet};
 use core_storage::wal::WalRecord;
 use core_storage::{Direction, GraphError, Result, Value};
 
 use crate::db::{
-    add_var, pattern_rel_vars, resolve_merge_set_value, write_counts, BatchOp, Precondition,
-    EDGE_COUNT_PROP, NS_PROP,
+    add_var, match_remove_ops, match_set_map_ops, match_set_ops, resolve_merge_set_value,
+    unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass, RowSource, NS_PROP,
 };
 use crate::layer::DeltaLayer;
 use crate::mask::StoreId;
@@ -162,7 +163,7 @@ enum Outcome {
 struct Staged {
     ops: Vec<BatchOp>,
     records: Vec<WalRecord>,
-    keys: Vec<String>,
+    keys: HashSet<String>,
 }
 
 impl Staged {
@@ -243,19 +244,15 @@ impl Staged {
     }
 
     fn touch(&mut self, key: &str) {
-        add_var(&mut self.keys, key);
+        if !self.keys.contains(key) {
+            self.keys.insert(key.to_string());
+        }
     }
 }
 
 fn query_err(phase: &str) -> impl Fn(String) -> GraphError + '_ {
     move |e| GraphError::QueryError {
         detail: format!("{phase}: {e}"),
-    }
-}
-
-fn not_supported(form: &str) -> GraphError {
-    GraphError::QueryError {
-        detail: format!("not supported in mushroomdb 0.10 inside a transaction: {form}"),
     }
 }
 
@@ -323,14 +320,250 @@ fn run(view: &GraphView<'_>, q: &Query, params: &BTreeMap<String, Value>) -> Res
 }
 
 /// Every key bound to one of `vars` in any row of `rs`.
-fn keys_in(rs: &ResultSet, vars: &[String], out: &mut Vec<String>) {
+fn keys_in(rs: &ResultSet, vars: &[String], out: &mut HashSet<String>) {
     for row in 0..rs.len() {
         for var in vars {
             if let Some(Value::Str(k)) = rs.get(row, var) {
-                add_var(out, k);
+                if !out.contains(k) {
+                    out.insert(k.clone());
+                }
             }
         }
     }
+}
+
+/// The name a `WITH` item binds: its alias, or the variable it passes on.
+fn item_name(item: &RetItem) -> Option<&String> {
+    match (&item.alias, &item.value) {
+        (Some(alias), _) => Some(alias),
+        (None, RetVal::Var(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Whether the `WITH` passes the node `name` on unchanged.
+fn stage_passes(stage: &core_query::cypher::WithStage, name: &str) -> bool {
+    stage.items.iter().any(|item| {
+        matches!(&item.value, RetVal::Var(v) if v == name)
+            && item.alias.as_deref().is_none_or(|a| a == name)
+    })
+}
+
+/// Whether carrying more names through the `WITH` would change its rows: it
+/// aggregates (extra names would become grouping keys), or it binds a name
+/// already carried to something else.
+fn stage_is_boundary(stage: &core_query::cypher::WithStage, carried: &[String]) -> bool {
+    stage.items.iter().any(|item| {
+        matches!(item.value, RetVal::Agg { .. })
+            || item_name(item)
+                .is_some_and(|name| carried.iter().any(|c| c == name) && !stage_passes(stage, name))
+    })
+}
+
+/// Every distinct edge incident on `key` in `v`, as `(src_key, dst_key)`;
+/// empty when `key` is not live.
+fn incident_edges_in(v: &GraphView<'_>, key: &str) -> Vec<(String, String)> {
+    let Some(id) = v.node_id(key) else {
+        return Vec::new();
+    };
+    let mut edges = Vec::new();
+    for etype in v.topo.etypes() {
+        for (dir, flip) in [(Direction::Out, false), (Direction::In, true)] {
+            for &other in v.topo.neighbors(etype, dir, id).as_ref() {
+                let (src, dst) = if flip { (other, id) } else { (id, other) };
+                edges.push((etype, src, dst));
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+        .into_iter()
+        .map(|(_, src, dst)| (v.key_of(src).to_string(), v.key_of(dst).to_string()))
+        .collect()
+}
+
+/// The transaction's state — its base snapshot with its earlier statements'
+/// writes laid over it — as the [`RowSource`] a statement computes its ops
+/// over. A transaction writes with full authority (a role-bound token cannot
+/// write in one), so no role-scope check applies.
+struct TxRows<'v, 'a> {
+    view: &'v GraphView<'a>,
+    db: &'v SharedDb,
+}
+
+impl RowSource for TxRows<'_, '_> {
+    fn row_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> R {
+        f(self.view)
+    }
+
+    fn row_exists(&self, key: &str) -> bool {
+        self.view.node_id(key).is_some()
+    }
+
+    fn row_id(&self, key: &str) -> Option<u32> {
+        self.view.node_id(key)
+    }
+
+    fn row_props(&self, key: &str) -> BTreeMap<String, Value> {
+        self.view
+            .node_id(key)
+            .map(|id| self.view.props.props_of(id))
+            .unwrap_or_default()
+    }
+
+    fn row_prop(&self, key: &str, field: &str) -> Option<Value> {
+        let id = self.view.node_id(key)?;
+        self.view.prop(id, field).map(|v| v.into_value())
+    }
+
+    fn row_label(&self, key: &str) -> Option<String> {
+        let id = self.view.node_id(key)?;
+        self.view.label_of(id).map(str::to_string)
+    }
+
+    fn row_edge(&self, etype: &str, src: &str, dst: &str) -> bool {
+        let v = self.view;
+        let (Some(src), Some(dst), Some(sym)) = (v.node_id(src), v.node_id(dst), v.sym(etype))
+        else {
+            return false;
+        };
+        v.topo.neighbors(sym, Direction::Out, src).contains(&dst)
+    }
+
+    fn row_has_edges(&self, key: &str) -> bool {
+        let v = self.view;
+        let Some(id) = v.node_id(key) else {
+            return false;
+        };
+        v.topo.etypes().any(|et| {
+            !v.topo.neighbors(et, Direction::Out, id).is_empty()
+                || !v.topo.neighbors(et, Direction::In, id).is_empty()
+        })
+    }
+
+    fn row_incident(&self, key: &str) -> Vec<String> {
+        incident_edges_in(self.view, key)
+            .into_iter()
+            .map(|(from, to)| if from == key { to } else { from })
+            .collect()
+    }
+
+    fn row_merge_existed(&self, _label: &str, key: &str) -> Result<bool> {
+        Ok(self.row_exists(key))
+    }
+
+    fn row_merge_props(
+        &self,
+        key_field: &str,
+        key_value: &Value,
+        named_ns: Option<&Value>,
+    ) -> Result<Vec<(String, Value)>> {
+        Ok(merge_node_props(key_field, key_value, named_ns))
+    }
+
+    /// Views are the store's: the live registry answers.
+    fn row_view_owns(&self, field: &str) -> bool {
+        self.db.read().row_view_owns(field)
+    }
+}
+
+/// A `MATCH … SET` / `REMOVE` or per-row statement's ops, computed over the
+/// transaction's state and not yet buffered.
+enum Prepared {
+    Match(MatchWrite),
+    Rows(Box<RowPass>),
+}
+
+impl Prepared {
+    fn take_ops(&mut self) -> Vec<BatchOp> {
+        match self {
+            Prepared::Match(w) => std::mem::take(&mut w.ops),
+            Prepared::Rows(p) => std::mem::take(&mut p.ops),
+        }
+    }
+
+    fn result(self, src: &TxRows<'_, '_>, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        match self {
+            Prepared::Match(w) => w.result(src, params),
+            Prepared::Rows(p) => p.result(src.view, params),
+        }
+    }
+}
+
+/// `ops` as buffered records, with every key they write in the conflict set.
+///
+/// A `DETACH DELETE` records both endpoints of every edge it removes (as the
+/// transaction's own `DETACH DELETE` does), and an `id` property write is
+/// refused here, at the statement, as it is for the other write forms.
+fn stage_ops(src: &TxRows<'_, '_>, ops: Vec<BatchOp>) -> Result<Staged> {
+    let mut staged = Staged::default();
+    // A node's `id` property as the statement's earlier ops left it.
+    let mut ids: HashMap<String, Option<Value>> = HashMap::new();
+    let stored_id = |ids: &HashMap<String, Option<Value>>, key: &str| match ids.get(key) {
+        Some(v) => v.clone(),
+        None => src.row_prop(key, "id"),
+    };
+    for op in ops {
+        match op {
+            BatchOp::InsertNode { label, key, props } => {
+                let id = props
+                    .iter()
+                    .find(|(f, _)| f == "id")
+                    .map(|(_, v)| v.clone());
+                ids.insert(key.clone(), id);
+                staged.insert_node(&label, &key, props);
+            }
+            BatchOp::InsertEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => staged.insert_edge(&edge_type, &src_key, &dst_key),
+            BatchOp::SetProp { key, field, value } => {
+                if field == "id" {
+                    let stored = stored_id(&ids, &key);
+                    crate::db::check_key_property_write(&key, stored.as_ref(), Some(&value))?;
+                    ids.insert(key.clone(), Some(value.clone()));
+                }
+                staged.set_prop(&key, &field, value);
+            }
+            BatchOp::RemoveProp { key, field } => {
+                if field == "id" {
+                    let stored = stored_id(&ids, &key);
+                    crate::db::check_key_property_removal(&key, stored.as_ref())?;
+                    ids.insert(key.clone(), None);
+                }
+                staged.remove_prop(&key, &field);
+            }
+            BatchOp::DeleteNode { key } => {
+                // Edges the statement itself created at `key` already have
+                // both endpoints in the set.
+                for (from, to) in incident_edges_in(src.view, &key) {
+                    staged.touch(&from);
+                    staged.touch(&to);
+                }
+                ids.remove(&key);
+                staged.delete_node(&key);
+            }
+            BatchOp::DeleteEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => staged.delete_edge(&edge_type, &src_key, &dst_key),
+            // No statement form makes these. Listed, not wildcarded, so a new
+            // op is a compile error here rather than a runtime surprise.
+            BatchOp::CreateRule(_)
+            | BatchOp::DeleteRule { .. }
+            | BatchOp::RenameNode { .. }
+            | BatchOp::InsertEdgeUpsert { .. }
+            | BatchOp::InsertNodeOnConflict { .. } => {
+                return Err(GraphError::QueryError {
+                    detail: "internal: a statement made an op a transaction cannot buffer".into(),
+                })
+            }
+        }
+    }
+    Ok(staged)
 }
 
 impl Transaction {
@@ -469,31 +702,17 @@ impl Transaction {
     /// Every distinct edge incident on `key` in the transaction's state, as
     /// `(src_key, dst_key)`; empty when `key` is not live.
     fn incident_edges(&self, key: &str) -> Result<Vec<(String, String)>> {
-        self.with_view(|v| {
-            let Some(id) = v.node_id(key) else {
-                return Vec::new();
-            };
-            let mut edges = Vec::new();
-            for etype in v.topo.etypes() {
-                for (dir, flip) in [(Direction::Out, false), (Direction::In, true)] {
-                    for &other in v.topo.neighbors(etype, dir, id).as_ref() {
-                        let (src, dst) = if flip { (other, id) } else { (id, other) };
-                        edges.push((etype, src, dst));
-                    }
-                }
-            }
-            edges.sort_unstable();
-            edges.dedup();
-            edges
-                .into_iter()
-                .map(|(_, src, dst)| (v.key_of(src).to_string(), v.key_of(dst).to_string()))
-                .collect()
-        })
+        self.with_view(|v| incident_edges_in(v, key))
+    }
+
+    /// Run `f` over the transaction's state as a [`RowSource`].
+    fn with_rows<R>(&self, f: impl FnOnce(&TxRows<'_, '_>) -> R) -> Result<R> {
+        self.with_view(|view| f(&TxRows { view, db: &self.db }))
     }
 
     /// Add `keys` not yet in the conflict set, each with the `last_change` it
     /// had in the base snapshot.
-    fn record_keys(&mut self, keys: &[String]) {
+    fn record_keys(&mut self, keys: &HashSet<String>) {
         let fresh: Vec<(&String, bool)> = keys
             .iter()
             .filter(|k| !self.read_write_keys.contains_key(*k))
@@ -569,30 +788,15 @@ impl Transaction {
         let mut staged = Staged::default();
         let outcome = match stmt {
             WriteStatement::Create(s) => self.stage_create(s, &mut staged)?,
-            WriteStatement::MatchSet(s) => self.stage_match_set(s, params, &mut staged)?,
-            WriteStatement::MatchSetMap(_) => {
-                // The replace form must know which properties the node has and
-                // which a view owns; the buffer cannot answer the second.
-                return Err(not_supported("MATCH … SET n = {…} / SET n += {…}"));
-            }
-            WriteStatement::MatchRemove(s) => self.stage_match_remove(s, params, &mut staged)?,
+            stmt @ (WriteStatement::MatchSet(_)
+            | WriteStatement::MatchSetMap(_)
+            | WriteStatement::MatchRemove(_)
+            | WriteStatement::UnwindWrite(_)) => return self.execute_rows(stmt, params),
             WriteStatement::MatchDelete(s) => self.stage_match_delete(s, params, &mut staged)?,
             WriteStatement::MatchDeleteNode(s) => {
                 self.stage_match_delete_node(s, params, &mut staged)?
             }
             WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
-            WriteStatement::UnwindWrite(s) => {
-                // Per-row writes are evaluated against the statement's own
-                // earlier rows by `GraphDb`'s executor, not the overlay. A
-                // statement that began with MATCH is named as written.
-                let match_led = s.read.unwinds.first().map(|u| u.alias.as_str())
-                    == Some(core_query::cypher::ONE_ROW_VAR);
-                return Err(not_supported(if match_led {
-                    "MATCH … CREATE / MERGE"
-                } else {
-                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE"
-                }));
-            }
         };
         // Only this statement's records are applied: the overlay already
         // holds every earlier statement's.
@@ -616,6 +820,69 @@ impl Transaction {
         };
         self.accept(staged);
         Ok(rs)
+    }
+
+    /// `MATCH … SET` / `REMOVE` and the per-row forms: the ops are computed by
+    /// the code auto-commit runs, over the transaction's state, then buffered;
+    /// a `RETURN` reads the transaction with them laid over it.
+    fn execute_rows(
+        &mut self,
+        stmt: WriteStatement,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        // The statement's read part, for the conflict set: taken before the
+        // statement is consumed, run after it succeeds.
+        let read = match &stmt {
+            WriteStatement::MatchSet(s) => match_query(s.matches.clone(), s.where_expr.clone()),
+            WriteStatement::MatchSetMap(s) => match_query(s.matches.clone(), s.where_expr.clone()),
+            WriteStatement::MatchRemove(s) => match_query(s.matches.clone(), s.where_expr.clone()),
+            WriteStatement::UnwindWrite(s) => s.read.clone(),
+            _ => match_query(Vec::new(), None),
+        };
+        let (prepared, mut staged) = self.with_rows(|src| -> Result<(Prepared, Staged)> {
+            let mut prepared = match stmt {
+                WriteStatement::MatchSet(s) => Prepared::Match(match_set_ops(src, s, params)?),
+                WriteStatement::MatchSetMap(s) => {
+                    Prepared::Match(match_set_map_ops(src, s, params)?)
+                }
+                WriteStatement::MatchRemove(s) => {
+                    Prepared::Match(match_remove_ops(src, s, params)?)
+                }
+                WriteStatement::UnwindWrite(s) => {
+                    Prepared::Rows(Box::new(unwind_rows(src, &s, params)?))
+                }
+                other => {
+                    return Err(GraphError::QueryError {
+                        detail: format!("internal: not a per-row statement: {other:?}"),
+                    })
+                }
+            };
+            let mut staged = stage_ops(src, prepared.take_ops())?;
+            // A key a MERGE found but did not write still guards the commit,
+            // as the plain MERGE's does.
+            if let Prepared::Rows(pass) = &prepared {
+                for key in pass.merge_keys() {
+                    staged.touch(key);
+                }
+            }
+            Ok((prepared, staged))
+        })??;
+        // Every node the statement read, as a plain read records them: a
+        // concurrent change to a node it matched or filtered on is a conflict.
+        staged.keys.extend(self.statement_read_set(&read, params)?);
+        self.apply(&staged.records)?;
+        match self.with_rows(|src| prepared.result(src, params)) {
+            Ok(Ok(rs)) => {
+                self.accept(staged);
+                Ok(rs)
+            }
+            Ok(Err(e)) | Err(e) => {
+                if !staged.records.is_empty() {
+                    self.revert()?;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn counts(created: i64, props_set: i64, deleted: i64) -> Outcome {
@@ -696,138 +963,6 @@ impl Transaction {
         Ok(Outcome::Return(Box::new(q)))
     }
 
-    fn stage_match_set(
-        &self,
-        stmt: MatchSetStmt,
-        params: &BTreeMap<String, Value>,
-        staged: &mut Staged,
-    ) -> Result<Outcome> {
-        if stmt.returns.is_some() {
-            return Err(not_supported("MATCH … SET … RETURN"));
-        }
-        let rel_vars = pattern_rel_vars(&stmt.matches);
-        for s in &stmt.sets {
-            if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
-                return Err(GraphError::QueryError {
-                    detail: format!(
-                        "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
-                         property holding the pair's insert count",
-                        s.var
-                    ),
-                });
-            }
-        }
-        let mut matches = stmt.matches;
-        let mut node_vars = Vec::new();
-        bind_node_vars(&mut matches, &mut 0, &mut node_vars);
-        let mut lookup = node_vars.clone();
-        for s in &stmt.sets {
-            add_var(&mut lookup, &s.var);
-        }
-        let mut q = match_query(matches, stmt.where_expr);
-        q.returns = var_items(&lookup);
-        let set_cols: Vec<String> = (0..stmt.sets.len()).map(|i| format!("__sv_{i}")).collect();
-        for (sc, col) in stmt.sets.iter().zip(&set_cols) {
-            q.returns.push(RetItem {
-                value: RetVal::ScalarExpr(sc.value.clone()),
-                alias: Some(col.clone()),
-            });
-        }
-        let match_rs = self.with_view(|v| run(v, &q, params))??;
-        keys_in(&match_rs, &node_vars, &mut staged.keys);
-        let mut props_set = 0i64;
-        for row in 0..match_rs.len() {
-            for (sc, col) in stmt.sets.iter().zip(&set_cols) {
-                let key = match match_rs.get(row, &sc.var) {
-                    Some(Value::Str(k)) => k.clone(),
-                    _ => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET variable '{}' did not resolve to a node key",
-                                sc.var
-                            ),
-                        })
-                    }
-                };
-                let value =
-                    match_rs
-                        .get(row, col)
-                        .cloned()
-                        .ok_or_else(|| GraphError::QueryError {
-                            detail: format!(
-                                "SET value for {}.{} evaluated to null",
-                                sc.var, sc.field
-                            ),
-                        })?;
-                if sc.field == "id" && !rel_vars.iter().any(|r| r == &sc.var) {
-                    crate::db::check_key_property_write(
-                        &key,
-                        self.stored_prop(&key, "id")?.as_ref(),
-                        Some(&value),
-                    )?;
-                }
-                staged.set_prop(&key, &sc.field, value);
-                props_set += 1;
-            }
-        }
-        Ok(Self::counts(0, props_set, 0))
-    }
-
-    fn stage_match_remove(
-        &self,
-        stmt: MatchRemoveStmt,
-        params: &BTreeMap<String, Value>,
-        staged: &mut Staged,
-    ) -> Result<Outcome> {
-        if stmt.returns.is_some() {
-            return Err(not_supported("MATCH … REMOVE … RETURN"));
-        }
-        let mut matches = stmt.matches;
-        let mut node_vars = Vec::new();
-        bind_node_vars(&mut matches, &mut 0, &mut node_vars);
-        let mut lookup = node_vars.clone();
-        for (var, _) in &stmt.removals {
-            add_var(&mut lookup, var);
-        }
-        let mut q = match_query(matches, stmt.where_expr);
-        q.returns = var_items(&lookup);
-        let match_rs = self.with_view(|v| run(v, &q, params))??;
-        keys_in(&match_rs, &node_vars, &mut staged.keys);
-        let mut targets: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for row in 0..match_rs.len() {
-            for (var, field) in &stmt.removals {
-                let key = match match_rs.get(row, var) {
-                    Some(Value::Str(k)) => k.clone(),
-                    _ => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "REMOVE variable '{var}' did not resolve to a node key"
-                            ),
-                        })
-                    }
-                };
-                let pair = (key, field.clone());
-                if seen.insert(pair.clone()) {
-                    targets.push(pair);
-                }
-            }
-        }
-        let mut props_removed = 0i64;
-        for (key, field) in &targets {
-            let stored = self.stored_prop(key, field)?;
-            if stored.is_some() {
-                props_removed += 1;
-            }
-            if field == "id" {
-                crate::db::check_key_property_removal(key, stored.as_ref())?;
-            }
-            staged.remove_prop(key, field);
-        }
-        Ok(Self::counts(0, props_removed, 0))
-    }
-
     fn stage_match_delete(
         &self,
         stmt: MatchDeleteStmt,
@@ -878,9 +1013,19 @@ impl Transaction {
         q.returns = var_items(&node_vars);
         let match_rs = self.with_view(|v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
+        // In row order, each once: the deletes are buffered in this order.
         let mut doomed: Vec<String> = Vec::new();
-        keys_in(&match_rs, &stmt.node_vars, &mut doomed);
+        for row in 0..match_rs.len() {
+            for var in &stmt.node_vars {
+                if let Some(Value::Str(k)) = match_rs.get(row, var) {
+                    add_var(&mut doomed, k);
+                }
+            }
+        }
         let mut deleted = 0i64;
+        // Auto-commit deletes the nodes one at a time, so an edge between two
+        // of them is removed — and counted — once, with the first.
+        let mut gone: HashSet<&str> = HashSet::new();
         for key in &doomed {
             let edges = self.incident_edges(key)?;
             if !stmt.detach && !edges.is_empty() {
@@ -897,7 +1042,12 @@ impl Transaction {
                 staged.touch(src);
                 staged.touch(dst);
             }
-            deleted += 1 + edges.len() as i64;
+            let removed_here = edges
+                .iter()
+                .filter(|(src, dst)| !gone.contains(src.as_str()) && !gone.contains(dst.as_str()))
+                .count();
+            deleted += 1 + removed_here as i64;
+            gone.insert(key);
             staged.delete_node(key);
         }
         Ok(Self::counts(0, 0, deleted))
@@ -1132,6 +1282,82 @@ impl Transaction {
         Ok(Outcome::Return(Box::new(q)))
     }
 
+    /// Every node the read part of a write statement binds — named or
+    /// anonymous, in its `MATCH` and in every stage after an `UNWIND` or
+    /// `WITH` — for the conflict set, as [`Self::read_set`] records a plain
+    /// read's.
+    ///
+    /// The read part is run again over the state before the statement, with
+    /// every anonymous node named and every node carried to the end, returning
+    /// the distinct node keys. A `WITH` that aggregates, or rebinds a carried
+    /// name, would change the rows if more names were carried through it, so
+    /// the nodes bound before it are collected by running the read part up to
+    /// it instead. Unlike `read_set`, a failure here fails the statement:
+    /// a write must not commit with reads it did not record.
+    fn statement_read_set(
+        &self,
+        read: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<HashSet<String>> {
+        let mut q = read.clone();
+        q.returns.clear();
+        let mut next = 0;
+        let mut carried: Vec<String> = Vec::new();
+        bind_node_vars(&mut q.matches, &mut next, &mut carried);
+        for oc in &mut q.optional_clauses {
+            bind_node_vars(&mut oc.patterns, &mut next, &mut carried);
+        }
+        let mut keys = HashSet::new();
+        for i in 0..q.stages.len() {
+            if stage_is_boundary(&q.stages[i], &carried) {
+                self.read_set_upto(&q, i, &carried, params, &mut keys)?;
+                carried.retain(|name| stage_passes(&q.stages[i], name));
+            } else {
+                let stage = &mut q.stages[i];
+                for name in &carried {
+                    if !stage.items.iter().any(|item| item_name(item) == Some(name)) {
+                        stage.items.push(RetItem {
+                            value: RetVal::Var(name.clone()),
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            let stage = &mut q.stages[i];
+            bind_node_vars(&mut stage.matches, &mut next, &mut carried);
+            for oc in &mut stage.optional_clauses {
+                bind_node_vars(&mut oc.patterns, &mut next, &mut carried);
+            }
+        }
+        self.read_set_upto(&q, q.stages.len(), &carried, params, &mut keys)?;
+        Ok(keys)
+    }
+
+    /// Add to `keys` the distinct keys of `nodes` over `q`'s first `upto`
+    /// stages.
+    fn read_set_upto(
+        &self,
+        q: &Query,
+        upto: usize,
+        nodes: &[String],
+        params: &BTreeMap<String, Value>,
+        keys: &mut HashSet<String>,
+    ) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut prefix = q.clone();
+        prefix.stages.truncate(upto);
+        prefix.returns = var_items(nodes);
+        prefix.distinct = true;
+        prefix.order_by.clear();
+        prefix.skip = None;
+        prefix.limit = None;
+        let rs = self.with_view(|v| run(v, &prefix, params))??;
+        keys_in(&rs, nodes, keys);
+        Ok(())
+    }
+
     /// The node keys a read query matched, for the conflict set.
     ///
     /// Each part's top-level `MATCH` / `OPTIONAL MATCH` patterns and `WHERE`
@@ -1141,8 +1367,8 @@ impl Transaction {
     /// used (a wider set is only more conservative), and a read whose re-run
     /// fails records nothing — snapshot isolation needs the write set, which
     /// every write statement records exactly.
-    fn read_set(&self, union: &UnionQuery, params: &BTreeMap<String, Value>) -> Vec<String> {
-        let mut keys = Vec::new();
+    fn read_set(&self, union: &UnionQuery, params: &BTreeMap<String, Value>) -> HashSet<String> {
+        let mut keys = HashSet::new();
         for part in &union.parts {
             if part.matches.is_empty() && part.optional_clauses.is_empty() {
                 continue;
