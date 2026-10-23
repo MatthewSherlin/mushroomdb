@@ -63,6 +63,11 @@ BINARY_SUFFIXES = (
 )
 # Not ours: lockfiles, whose package names nobody in this repository chose.
 EXEMPT_NAMES = ("Cargo.lock", "package-lock.json")
+# Not ours either: third-party test data vendored unmodified, never our prose.
+# The openCypher TCK's licence headers and NOTICE name the project's original
+# copyright holder, and its files may not be edited (Apache-2.0 section 4).
+# Exactly this directory, so a name anywhere else in vendor/ still fails.
+EXEMPT_DIRS = ("vendor/opencypher-tck/",)
 
 
 def fold(text: str) -> str:
@@ -240,7 +245,7 @@ def main() -> int:
     matcher = Matcher(blocked)
     bad = 0
     for rel in tracked(a.root):
-        if Path(rel).name in EXEMPT_NAMES:
+        if Path(rel).name in EXEMPT_NAMES or rel.startswith(EXEMPT_DIRS):
             continue
         # A path that holds a name must not be printed: the path would be
         # the name. Each component that hits is shown as `[blocked]`, here and

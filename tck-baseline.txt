@@ -1,0 +1,3 @@
+# The openCypher TCK pass rate CI holds: passed / (passed + failed).
+# Raise it in the change that raises the rate: cargo run --release -p tck-runner -- --update-baseline
+0.2142
