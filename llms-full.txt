@@ -5370,6 +5370,19 @@ CREATE (n:Person {id: 'alice', score: 1})
   ```cypher
   CREATE (a:Org {id: 'acme'})-[:MEMBER]->(b:Person {id: 'bob'})
   ```
+- A property value is any expression: a literal, a `$parameter`, a map entry
+  of one (`$p.id`), a list or map built from them, arithmetic, a function call
+  (`CREATE (:Person {id: $id, name: toUpper($name), tags: [$tag, 'new']})`).
+  The node stores the value, typed parameters (`Date`, `DateTime`, …) as their
+  type; a parameter whose value is null leaves that property out, and a
+  missing parameter is an error naming it.
+- `CREATE (n:Person $props)` takes the whole property map from a parameter. A
+  null value in the map is left out; a parameter that is not a map is an error
+  naming it, and the map must hold a string `id`.
+- A statement whose map reads a `$parameter` runs as the per-row form
+  ([UNWIND … write](#unwind--write-clauses)) over one row, so it meets the
+  same checks and stores what the same statement with the values written as
+  literals stores. A literal `null` value (`{p: null}`) is a parse error.
 
 ### MATCH … SET
 
@@ -5447,9 +5460,8 @@ SET n = {name: 'Alice', score: 1}
   removes the key under `+=`. A parameter that is not a map is an error naming
   it, before anything is written. `SET n = m` (a variable) is refused
   (`not supported in mushroomdb 0.10`), as is mixing the map form with
-  `SET n.prop = …` in one clause, and `MERGE … ON CREATE/ON MATCH SET n = {…}`
-  (`not supported in mushroomdb 0.10: MERGE … SET with a map`). `n` must be a
-  node.
+  `SET n.prop = …` in one clause. `n` must be a node. A `MERGE` takes the map
+  forms in `ON CREATE SET` / `ON MATCH SET` (see [MERGE](#merge)).
 - `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms, and as
   every other write path: on a node whose `id` equals its key, restating the key
   is accepted and anything else is an error pointing at `rename_node`; on any
@@ -5503,8 +5515,18 @@ MERGE (n:Person {id: 'alice'})
 - A role bound to exactly one namespace stamps that namespace when the
   pattern does not name `ns`. A role bound to two or more must name one.
 - `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
-  insert-or-skip. Both may appear on one MERGE.
-- Other extra properties are not supported.
+  insert-or-skip. Both may appear on one MERGE. Their items are `n.prop = …`,
+  `n += <map>` and `n = <map>`, in any mix, with the semantics of
+  `SET n += …` and `SET n = …` after `MATCH`: `MERGE (n:Person {id: $id}) ON CREATE SET n
+  += $props` creates the node with the parameter's properties, and under `ON
+  MATCH SET n += $props` a null value removes that key.
+- The key (and `ns`) may be any expression, `$parameter`s included
+  (`MERGE (n:Person {id: $id})`); the MERGE matches on the value exactly as it
+  does on the same literal. A key that evaluates to null is an error, as is a
+  key that is not a string.
+- Other extra properties are not supported, and neither is a parameter map in
+  the pattern (`MERGE (n:Person $props)`, refused by name): name the key and set
+  the rest, `MERGE (n:Person {id: $props.id}) ON CREATE SET n += $props`.
 
 #### MERGE with a relationship
 
@@ -5599,7 +5621,9 @@ MERGE (n:Person {id: r.id})
 - **Clauses.** After the read part: `CREATE` (a node, a chain, comma-separated
   patterns, or `(a)` naming a node an earlier clause bound), `MERGE` (a node, or
   a node-relationship-node pattern whose ends may be `(a)` nodes an earlier
-  clause bound, with `ON CREATE SET` / `ON MATCH SET`),
+  clause bound, with `ON CREATE SET` / `ON MATCH SET`, whose items may be the
+  map forms `n += <map>` / `n = <map>`), `CREATE (n:L $props)` (the whole map
+  from a parameter),
   `SET n.f = expr [, …]`, `SET n = <map>` and `SET n += <map>` (the map is a
   literal, a `$parameter`, a row or any expression that evaluates to a map),
   `REMOVE n.f`, `DELETE n` and `DETACH DELETE n`, then an optional `RETURN`. A
@@ -5631,7 +5655,7 @@ MERGE (n:Person {id: r.id})
 - **Null.** A property whose value is null in `CREATE` is left out, so a sparse
   row creates a node without it. `SET n.f = <null>` is an error, as for a single
   `SET`; in a map, a null entry removes the property under `+=` and is an absent
-  key under `=`. A `MERGE` key must be a string.
+  key under `=`. A `MERGE` key must be a string; a null key is an error.
 - **`RETURN`.** One row for each row the writes ran for, in order, after the
   commit. The read part is not run again: each row keeps the nodes and values it
   wrote with, and `RETURN` reads their properties from the committed state, so a
@@ -6118,8 +6142,8 @@ A comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IS NULL`, `IS NOT NULL`, `IN`,
 expression position, not only in `WHERE`: `RETURN` and `WITH` items, `ORDER BY`
 keys, list and map elements, a list comprehension's filter and projection, a
 `reduce` body, function arguments, `CASE` branches, `SET` values, `CREATE` and
-`MERGE` property values (in a plain `CREATE` / `MERGE` the value reads no variable,
-property or `$param`, and is evaluated before the write), and an `UNWIND` source.
+`MERGE` property values (`$param`s included; a variable or property only when
+a clause before the `CREATE` / `MERGE` binds it), and an `UNWIND` source.
 
 ```cypher
 MATCH (n:Person) RETURN n.name, n.age >= 18 AS adult
@@ -6271,6 +6295,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
 | `$param` in WHERE | `WHERE n.age > $min` |
 | `$param` in SET | `SET n.score = $val` |
+| `$param.field` (a map parameter's entry) | `WHERE n.id = $p.id`, `CREATE (:P {id: $p.id})` — `$p['id']` too; an absent key is null |
 | `COUNT(*)`, `COUNT(var)`, `SUM`, `AVG`, `MIN`, `MAX` (single) | `RETURN COUNT(*), SUM(n.score)` |
 | Grouped aggregation (single or multiple keys, multiple aggs) | `RETURN n.city, COUNT(*) AS c ORDER BY c DESC` |
 | `WITH` projection + aliasing | `WITH n.name AS nm RETURN nm` |
@@ -6299,7 +6324,8 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
 | Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression that reads no variable, property or `$param` (`{flag: 1 > 0, n: 2 + 3}`); it is evaluated before the write, and a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A value that evaluates to null is a named error |
+| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
+| `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props` — evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |

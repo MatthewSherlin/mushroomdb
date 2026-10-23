@@ -376,14 +376,13 @@ fn set_on_the_relationship_or_an_unbound_variable_is_refused() {
     assert!(!db.has_node("a"), "statement unapplied");
 }
 
+/// QL-PM: a map SET under a relationship MERGE sets the map on that end.
 #[test]
-fn a_map_set_under_merge_keeps_its_named_refusal() {
-    let mut db = GraphDb::open(&tmp("map-refusal")).unwrap();
-    let e = db
-        .query_write(&format!("{MERGE} ON CREATE SET a = {{x: 1}}"), &p())
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("MERGE … SET with a map"), "{e}");
+fn a_map_set_under_merge_sets_the_map() {
+    let mut db = GraphDb::open(&tmp("map-set")).unwrap();
+    db.query_write(&format!("{MERGE} ON CREATE SET a += {{x: 1}}"), &p())
+        .unwrap();
+    assert_eq!(db.get_prop("a", "x"), Some(Value::Int(1)));
 }
 
 #[test]

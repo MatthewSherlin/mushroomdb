@@ -256,13 +256,15 @@ pub enum Operand {
         left: Box<Operand>,
         right: Box<Operand>,
     },
-    /// List subscript: `n.tags[0]`, `n.location[1]`, `$list[$i]`.
+    /// Subscript: `n.tags[0]`, `n.location[1]`, `$list[$i]`, and a map entry
+    /// `$p['id']` (which `$p.id` parses to).
     ///
-    /// Evaluates `base`, which must be a `Value::List`, and returns the
-    /// element at `index`. A negative index counts from the end
-    /// (openCypher §3.4.4). An out-of-range index, a non-list base, or a
-    /// non-integer index all evaluate to null rather than erroring, so a
-    /// subscript behaves like a missing property.
+    /// Evaluates `base`: a `Value::List` gives the element at an integer
+    /// `index`, where a negative index counts from the end (openCypher
+    /// §3.4.4); a `Value::Map` gives the entry at a string `index`. An
+    /// out-of-range index, an absent key, any other base, or an index of the
+    /// wrong type all evaluate to null rather than erroring, so a subscript
+    /// behaves like a missing property.
     Index {
         base: Box<Operand>,
         index: Box<Operand>,
@@ -819,6 +821,11 @@ pub struct RowCreateNode {
     pub var: String,
     pub label: String,
     pub props: Vec<(String, Operand)>,
+    /// `(n:L $props)`: the whole property map is this operand (a
+    /// `$parameter`), evaluated per row; `props` is then empty. A value that is
+    /// not a map is an error naming the parameter, and a null entry is not
+    /// stored.
+    pub props_map: Option<Operand>,
 }
 
 /// A per-row MERGE: one node, or two nodes and the relationship between them.
@@ -826,8 +833,34 @@ pub struct RowCreateNode {
 pub struct RowMerge {
     pub start: RowMergeNode,
     pub edge: Option<RowMergeEdge>,
-    pub on_create: Vec<SetClause>,
-    pub on_match: Vec<SetClause>,
+    pub on_create: Vec<MergeSet>,
+    pub on_match: Vec<MergeSet>,
+}
+
+/// One item of a per-row MERGE's `ON CREATE SET` / `ON MATCH SET`, in source
+/// order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeSet {
+    /// `n.f = expr`
+    Prop(SetClause),
+    /// `n = <map>` (`merge` false) or `n += <map>` (`merge` true); `value`
+    /// evaluates to a map per row, with the semantics of `SET n = …` /
+    /// `SET n += …`.
+    Map {
+        var: String,
+        merge: bool,
+        value: Operand,
+    },
+}
+
+impl MergeSet {
+    /// The node variable the item sets.
+    pub fn var(&self) -> &str {
+        match self {
+            MergeSet::Prop(sc) => &sc.var,
+            MergeSet::Map { var, .. } => var,
+        }
+    }
 }
 
 /// A MERGE node pattern: its single identifying property and optional `ns`.

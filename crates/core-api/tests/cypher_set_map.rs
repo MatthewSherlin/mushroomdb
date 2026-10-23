@@ -899,23 +899,27 @@ fn key_property_refusals_hold_inside_a_transaction_too() {
 
 // ── MERGE with a map ────────────────────────────────────────────────────────
 
+/// QL-PM: a MERGE's `ON CREATE SET` / `ON MATCH SET` take the map forms,
+/// with the semantics of `SET n = {…}` / `SET n += {…}`.
 #[test]
-fn merge_set_with_a_map_is_refused_by_name() {
+fn merge_set_with_a_map_sets_the_map() {
     let mut db = GraphDb::open(&tmp("merge-map")).unwrap();
-    for q in [
-        "MERGE (n:P {id: 'm'}) ON CREATE SET n = {a: 1}",
-        "MERGE (n:P {id: 'm'}) ON MATCH SET n += {a: 1}",
-        "MERGE (n:P {id: 'm'}) ON CREATE SET n.b = 1, n = {a: 1}",
-    ] {
-        match query_err(&mut db, q) {
-            GraphError::QueryError { detail } => assert!(
-                detail.contains("not supported in mushroomdb 0.10: MERGE … SET with a map"),
-                "{q}: {detail}"
-            ),
-            other => panic!("{q}: expected QueryError, got {other:?}"),
-        }
-    }
-    assert!(db.node_info("m").is_none());
+    db.query_write(
+        "MERGE (n:P {id: 'm'}) ON CREATE SET n.b = 1, n += {a: 1} ON MATCH SET n = {c: 3}",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("m", "a"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("m", "b"), Some(Value::Int(1)));
+    db.query_write(
+        "MERGE (n:P {id: 'm'}) ON CREATE SET n.b = 1, n += {a: 1} ON MATCH SET n = {c: 3}",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("m", "a"), None);
+    assert_eq!(db.get_prop("m", "b"), None);
+    assert_eq!(db.get_prop("m", "c"), Some(Value::Int(3)));
+    assert_eq!(db.get_prop("m", "id"), Some(Value::Str("m".into())));
 }
 
 // ── A node that does not carry `id == key` is not covered ───────────────────

@@ -10,7 +10,7 @@ mod temporal;
 pub use ast::{
     operand_label, ret_val_label, AggArg, AggFunc, CallReturn, CreateEdge, CreateNode, CreateStmt,
     DdlStatement, EdgeDelete, Expr, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt,
-    MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OrderItem,
+    MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeSet, MergeStmt, NodePat, Operand, OrderItem,
     OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, RowCreateNode,
     RowMerge, RowMergeEdge, RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr,
     UnwindWriteStmt, WithStage, WriteStatement, YieldItem, LABEL_TEST_FN, ONE_ROW_VAR,

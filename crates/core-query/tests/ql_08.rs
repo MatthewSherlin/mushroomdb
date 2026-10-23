@@ -86,10 +86,6 @@ fn unsupported_patterns_are_refused_by_name() {
             "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b'})-[:K]->(c:P {id: 'c'})",
             "not supported in mushroomdb 0.10: MERGE with more than one relationship",
         ),
-        (
-            "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b'}) ON CREATE SET a = {x: 1}",
-            "not supported in mushroomdb 0.10: MERGE … SET with a map",
-        ),
     ] {
         assert_eq!(parse(q).unwrap_err(), want, "{q}");
     }

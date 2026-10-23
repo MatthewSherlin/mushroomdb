@@ -205,14 +205,24 @@ pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> O
     }
 }
 
-/// One element of a list value, openCypher subscript semantics.
+/// One element of a list value, or one entry of a map value, openCypher
+/// subscript semantics.
 ///
-/// A negative index counts from the end. A non-list base, a non-integer
-/// index, or an out-of-range index all give null — a subscript reads like a
-/// property that is not there, never an error.
+/// A list takes an integer index; a negative one counts from the end. A map
+/// takes a string key (`$p['id']`, and `$p.id`, which parses to it). Any other
+/// base, an index of the wrong type, an out-of-range index or an absent key
+/// all give null — a subscript reads like a property that is not there,
+/// never an error.
 pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
-    let (Some(Value::List(items)), Some(idx)) = (base, index) else {
+    let (Some(base), Some(idx)) = (base, index) else {
         return None;
+    };
+    let (items, idx) = match (base, idx) {
+        (Value::Map(mut entries), Value::Str(key)) => {
+            return entries.remove(&key).and_then(element)
+        }
+        (Value::List(items), idx) => (items, idx),
+        _ => return None,
     };
     let i = match idx {
         Value::Int(n) => n,
