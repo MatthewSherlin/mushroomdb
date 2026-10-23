@@ -360,20 +360,26 @@ fn unsupported_shapes_are_refused_by_name_and_write_nothing() {
 }
 
 #[test]
-fn set_on_the_relationship_or_an_unbound_variable_is_refused() {
+fn set_on_an_unbound_variable_is_refused() {
     let mut db = GraphDb::open(&tmp("set-vars")).unwrap();
     for q in [
-        "MERGE (a:P {id: 'a'})-[r:K]->(b:P {id: 'b'}) ON CREATE SET r.w = 1",
         "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b'}) ON CREATE SET z.w = 1",
         "MERGE (:P {id: 'a'})-[:K]->(b:P {id: 'b'}) ON CREATE SET a.w = 1",
     ] {
         let e = detail(err_of(&mut db, q));
         assert!(
-            e.contains("does not match a MERGE node variable"),
+            e.contains("does not match a MERGE node or relationship variable"),
             "{q}: {e}"
         );
     }
     assert!(!db.has_node("a"), "statement unapplied");
+    // QL-RP: the relationship's own variable takes a SET.
+    db.query_write(
+        "MERGE (a:P {id: 'a'})-[r:K]->(b:P {id: 'b'}) ON CREATE SET r.w = 1",
+        &p(),
+    )
+    .unwrap();
+    assert_eq!(db.get_edge_prop("K", "a", "b", "w"), Some(Value::Int(1)));
 }
 
 /// QL-PM: a map SET under a relationship MERGE sets the map on that end.
@@ -703,6 +709,7 @@ fn scoped_store(name: &str, create_labels: &[&str], edge_types: &[&str]) -> Grap
                 delete_labels: vec![],
                 create_edge_types: edge_types.iter().map(|s| s.to_string()).collect(),
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })

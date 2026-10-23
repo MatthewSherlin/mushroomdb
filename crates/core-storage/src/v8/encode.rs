@@ -1145,11 +1145,14 @@ fn edge_props_to_data(ep: &EdgeProps) -> EdgePropsData {
 /// Merge an archived base `EdgePropsData` with an in-memory overlay, producing
 /// the `EdgePropsData` for the next snapshot.
 ///
-/// Algorithm:
-/// 1. Emit all base entries whose key `(etype, src, dst)` is NOT tombstoned in
-///    the overlay and NOT superseded by an overlay entry (base entry wins only
-///    when absent from overlay map).
-/// 2. Emit all overlay entries (overlay wins over base for the same key).
+/// Algorithm — the same precedence `EdgePropsView` reads with:
+/// 1. A tombstoned key emits the overlay entry alone (or nothing): the base
+///    is hidden for it.
+/// 2. A key with an overlay entry and no tombstone emits the base fields with
+///    the overlay's laid over them, field by field. Emitting the overlay entry
+///    alone dropped every base field it did not name — a relationship property
+///    written after a snapshot lost the pair's insert `count` at the next one.
+/// 3. Every other base entry is copied as it is.
 ///
 /// Entries in the result are sorted by (etype, src, dst) ascending.
 fn edge_props_merge_to_data(
@@ -1168,13 +1171,21 @@ fn edge_props_merge_to_data(
 
     let mut entries: Vec<EdgePropEntry> = Vec::new();
 
-    // Base entries not tombstoned and not superseded by overlay.
+    // Base entries not tombstoned; one the overlay also writes is merged
+    // below, with the overlay's fields over its own.
+    let mut merged_base: BTreeMap<(u32, u32, u32), BTreeMap<String, Value>> = BTreeMap::new();
     for entry in base.entries.iter() {
         let et = u32::from(entry.etype);
         let s = u32::from(entry.src);
         let d = u32::from(entry.dst);
         let key = (et, s, d);
-        if tombstoned_keys.contains(&key) || overlay_keys.contains(&key) {
+        if tombstoned_keys.contains(&key) {
+            continue;
+        }
+        if overlay_keys.contains(&key) {
+            let props: BTreeMap<String, Value> =
+                bincode::deserialize(entry.props_blob.as_slice()).unwrap_or_default();
+            merged_base.insert(key, props);
             continue;
         }
         entries.push(EdgePropEntry {
@@ -1185,9 +1196,15 @@ fn edge_props_merge_to_data(
         });
     }
 
-    // Overlay entries (these take priority over any matching base entry).
+    // Overlay entries (their fields take priority over the base's).
     for (et, s, d, props) in overlay.sorted_entries() {
-        let props_blob = bincode::serialize(props).unwrap_or_default();
+        let props_blob = match merged_base.remove(&(et, s, d)) {
+            Some(mut below) => {
+                below.extend(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+                bincode::serialize(&below).unwrap_or_default()
+            }
+            None => bincode::serialize(props).unwrap_or_default(),
+        };
         entries.push(EdgePropEntry {
             etype: et,
             src: s,

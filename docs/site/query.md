@@ -543,6 +543,9 @@ CREATE (n:Person {id: 'alice', score: 1})
   ([UNWIND … write](#unwind--write-clauses)) over one row, so it meets the
   same checks and stores what the same statement with the values written as
   literals stores. A literal `null` value (`{p: null}`) is a parse error.
+- The relationship takes a property map too:
+  `CREATE (a:Org {id: 'acme'})-[:MEMBER {since: 2020}]->(b:Person {id: 'bob'})`.
+  See [Relationship properties](#relationship-properties).
 
 ### MATCH … SET
 
@@ -583,8 +586,9 @@ REMOVE n.score, n.nickname
 - The write result's `properties_set` column counts the properties removed.
 - `REMOVE n:Label` is refused: `not supported in mushroomdb 0.10: REMOVE n:Label
   (label removal)`. A node has one label in 0.10.
-- `REMOVE r.prop` on a relationship, or on a name `MATCH` did not bind, is a
-  parse error.
+- `REMOVE r.prop` removes a relationship's property (see
+  [Relationship properties](#relationship-properties)). A name `MATCH` did not
+  bind is a parse error.
 - Inside an interactive transaction `REMOVE` buffers like `SET`, with or
   without `RETURN`; the `RETURN` reads the transaction's state with the
   removal applied.
@@ -620,7 +624,8 @@ SET n = {name: 'Alice', score: 1}
   removes the key under `+=`. A parameter that is not a map is an error naming
   it, before anything is written. `SET n = m` (a variable) is refused
   (`not supported in mushroomdb 0.10`), as is mixing the map form with
-  `SET n.prop = …` in one clause. `n` must be a node. A `MERGE` takes the map
+  `SET n.prop = …` in one clause. `n` is a node or a relationship (see
+  [Relationship properties](#relationship-properties)). A `MERGE` takes the map
   forms in `ON CREATE SET` / `ON MATCH SET` (see [MERGE](#merge)).
 - `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms, and as
   every other write path: on a node whose `id` equals its key, restating the key
@@ -702,7 +707,10 @@ RETURN a, b
   duplicated, and a write that matches in full logs nothing.
 - `ON MATCH SET` runs when both nodes and the edge already existed; otherwise the
   missing nodes and the edge are created and `ON CREATE SET` runs. A `SET` item
-  names the start or the end node (`a.x`, `b.x`), never the relationship.
+  names the start node, the end node or the relationship (`a.x`, `b.x`,
+  `r.x`, `r += {…}`).
+- The relationship may carry a property map, which is part of what the
+  `MERGE` matches (see [Relationship properties](#relationship-properties)).
 - Everything is one write batch: one commit, rules re-evaluate for every
   assignment, and every write meets the usual checks (constraints, the `id`
   rule, namespaces: both nodes must share one, as for any edge).
@@ -711,9 +719,80 @@ RETURN a, b
 - A role-scoped write needs create or update scope on both labels and the edge
   type in `create_edge_types`; a hidden end node reads as absent.
 - One relationship, with one type and a direction. Undirected, variable-length,
-  `[:A|B]`, an untyped relationship, relationship properties and a second
-  relationship are refused by name (`not supported in mushroomdb 0.10: …`).
+  `[:A|B]`, an untyped relationship, a `$parameter` map on the relationship and
+  a second relationship are refused by name (`not supported in mushroomdb
+  0.10: …`).
 - Inside an interactive transaction it is buffered like the single-node form.
+
+### Relationship properties
+
+A relationship carries properties, as a node does. They are written with the
+same forms:
+
+```cypher
+CREATE (a:Person {id: 'alice'})-[:KNOWS {since: 2019, via: 'work'}]->(b:Person {id: 'bob'})
+
+MATCH (a:Person {id: 'alice'}), (b:Person {id: 'bob'})
+MERGE (a)-[r:KNOWS {since: 2019}]->(b)
+  ON CREATE SET r.first = true
+  ON MATCH SET r.seen = coalesce(r.seen, 0) + 1
+
+MATCH (:Person {id: 'alice'})-[r:KNOWS]->(:Person {id: 'bob'})
+SET r.weight = 0.8, r += $extra
+REMOVE r.via
+```
+
+- `CREATE` and `MERGE` take a map on the relationship, `-[:T {k: v, …}]->`.
+  A value is any expression, as in a node's map: a literal, a `$parameter`, a
+  matched node's property, an `UNWIND` row's field. `CREATE` also takes the
+  whole map from a parameter, `-[:T $props]->`. A null value is left out.
+- `SET r.p = v`, `SET r += <map>`, `SET r = <map>` and `REMOVE r.p` write them,
+  with the semantics the node forms have: `+=` sets the listed keys and a null
+  removes one; `=` leaves exactly the map's non-null keys; removing a property
+  the relationship lacks does nothing. `SET r.p = null` is an error, as on a
+  node. The relationship is the one the pattern matched, whichever way the
+  pattern is written (`->`, `<-` or undirected).
+- **One property map per relationship.** A relationship is identified by its
+  type, its start node and its end node; a repeated `CREATE` of the same pair
+  does not add a second relationship beside it (on a store that called
+  `enable_multiplicity()` it raises the pair's `count`). So:
+  - `CREATE` of a pair that already has its relationship, with no map, does
+    what it did before: nothing, or the count on a multiplicity store. The
+    relationship keeps its properties.
+  - `CREATE` of such a pair with a map is refused: `a relationship between
+    these nodes with this type already exists; use MERGE … SET to change its
+    properties`. That holds for a relationship created earlier in the same
+    statement too.
+  - `MERGE` matches the pair, then its map: a relationship whose properties
+    hold every value of the map (compared as `=` compares them) is matched and
+    `ON MATCH SET` runs; a missing pair is created with the map and `ON CREATE
+    SET` runs. A pair whose relationship holds other values for the map's keys
+    is refused with the same message, rather than creating a second one.
+    `MERGE` without a map matches the pair whatever it carries.
+- `count` is reserved: it is the pair's insert count. Writing it in any form
+  (`SET r.count`, a map naming it, `REMOVE r.count`, a `CREATE` or `MERGE` map)
+  is refused by name; reading `r.count` works.
+- A relationship type a rule derives takes no property write from a user:
+  every form above on such a type is refused by name. A rule's own weights are
+  still written by the rule.
+- A value that reads the relationship's own properties (`SET r.w = r.w + 1`)
+  reads what the statement has written so far, as for a node.
+- The write result's `properties_set` counts relationship properties set and
+  removed by `SET`, `REMOVE` and `ON CREATE` / `ON MATCH SET`, as it counts a
+  node's; the map of a `CREATE` or `MERGE` pattern is part of the creation and
+  is not counted, as a created node's properties are not.
+- A role-scoped write needs the relationship type in the role's
+  `update_edge_types` to write a property of an existing relationship, and both
+  ends visible. Creating a relationship with its map needs only
+  `create_edge_types`, as a node's properties need only `create_labels`.
+- Inside an interactive transaction every form runs as it does auto-commit and
+  reads the transaction's own writes. A refusal by a rule-owned type, the
+  reserved `count` or an existing pair is the statement's.
+- The properties are stored durably like a node's: they survive a reopen, a
+  snapshot, `open_at`, a backup and a restore. The first relationship-property
+  write moves a store to the V11 format, so a 0.9.x binary refuses it by name
+  instead of misreading it. `properties(r)`, `keys(r)` and `r.p` read them, as
+  does `get_edge_prop` in the Rust and Python APIs.
 
 ### MATCH … CREATE / MATCH … MERGE
 

@@ -192,10 +192,14 @@ pub struct WriteScope {
     pub delete_labels: Vec<String>,      // DELETE / DETACH DELETE visible nodes
     pub create_edge_types: Vec<String>,  // INSERT EDGE between two visible endpoints
     pub delete_edge_types: Vec<String>,  // DELETE user-owned edges (not derived)
+    pub update_edge_types: Vec<String>,  // SET / REMOVE relationship properties (0.10)
 }
 ```
 
-All fields default to empty (read-only). Each label field must be a subset of the
+All fields default to empty (read-only). `update_edge_types` lets a role write
+the properties of an existing relationship of those types (Cypher `SET r.p`,
+`SET r += …`, `REMOVE r.p`) between two visible nodes; creating a relationship
+with its property map needs only `create_edge_types`. Each label field must be a subset of the
 role's read `labels` — `apply_schema` rejects disjoint write and read scopes with
 an error naming the role and offending label.
 

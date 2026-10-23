@@ -2,7 +2,7 @@
 
 use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
-    OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN,
+    OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN, REL_ENDS_FN,
 };
 use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
@@ -2474,6 +2474,9 @@ fn eval_func(
     if name == LABEL_TEST_FN {
         return label_test(args, view, vars, row);
     }
+    if name == REL_ENDS_FN {
+        return rel_ends(args, view, vars, row);
+    }
     let norm = name.to_ascii_lowercase();
     match norm.as_str() {
         "tolower" => {
@@ -2849,6 +2852,36 @@ fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, S
     Ok(Some(Value::List(items)))
 }
 
+/// [`REL_ENDS_FN`]: the relationship bound to the one variable argument, as
+/// `[type, start key, end key]`.
+fn rel_ends(
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    let [Operand::Var(var)] = args else {
+        return Err("internal: relEnds takes one relationship variable".into());
+    };
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    match row.get(slot).and_then(|c| c.as_ref()) {
+        Some(Cell::Rel(e)) => {
+            let etype = view.sym_name(e.etype).unwrap_or("").to_owned();
+            Ok(Some(Value::List(vec![
+                Value::Str(etype),
+                Value::Str(view.key_of(e.src).to_owned()),
+                Value::Str(view.key_of(e.dst).to_owned()),
+            ])))
+        }
+        None => Ok(None),
+        Some(_) => Err(format!(
+            "`{var}` is not a single relationship; a property write names one relationship"
+        )),
+    }
+}
+
 /// The properties of a node, relationship or map, in key order. Nothing is
 /// left out: a vector-valued property (an embedding) is a list of floats like
 /// any other and appears like any other list. `None` is null: a null or unmatched binding, a node the scope's
@@ -3172,6 +3205,12 @@ fn eval_convert_scalar(
 pub enum Binding {
     Value(Value),
     Node(u32),
+    /// A relationship: its type symbol and its two ends' ids.
+    Rel {
+        etype: u32,
+        src: u32,
+        dst: u32,
+    },
 }
 
 /// Evaluate one operand against named bindings, with the same evaluator a
@@ -3193,6 +3232,11 @@ pub fn eval_operand(
         row[slot] = Some(match binding {
             Binding::Value(v) => Cell::Scalar(v.clone()),
             Binding::Node(id) => Cell::Node(*id),
+            Binding::Rel { etype, src, dst } => Cell::Rel(crate::traverse::EdgeRef {
+                etype: *etype,
+                src: *src,
+                dst: *dst,
+            }),
         });
     }
     // A list comprehension or `reduce` binds its own variables in a row slot,

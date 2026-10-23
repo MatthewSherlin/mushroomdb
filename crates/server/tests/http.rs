@@ -3813,6 +3813,7 @@ fn agent_write_scope() -> WriteScope {
         delete_labels: vec!["AgentNote".into()],
         create_edge_types: vec!["RECALLS".into()],
         delete_edge_types: vec!["RECALLS".into()],
+        update_edge_types: vec![],
     }
 }
 
@@ -3975,6 +3976,7 @@ async fn scoped_delete_node_scope_denied() {
                 delete_labels: vec![], // no delete scope
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4287,6 +4289,7 @@ async fn scoped_set_prop_scope_denied() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4382,6 +4385,7 @@ async fn scoped_remove_prop_scope_denied() {
                 delete_labels: vec!["AgentNote".into()],
                 create_edge_types: vec!["RECALLS".into()],
                 delete_edge_types: vec!["RECALLS".into()],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4760,6 +4764,7 @@ async fn scoped_ingest_no_create_labels_403() {
                 delete_labels: vec![],
                 create_edge_types: vec!["RECALLS".into()],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -7822,6 +7827,7 @@ fn open_writable_role(name: &str, keys: &mushroomdb::AccessKeys) -> (Router, Sha
                     delete_labels: vec!["Person".into()],
                     create_edge_types: vec!["KNOWS".into()],
                     delete_edge_types: vec!["KNOWS".into()],
+                    update_edge_types: vec![],
                 }),
             }],
             ..Default::default()

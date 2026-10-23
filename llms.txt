@@ -252,6 +252,7 @@ Write scope fields (all default to empty = read-only):
 - `delete_labels` — DELETE or DETACH DELETE visible nodes of these labels
 - `create_edge_types` — INSERT EDGE between two visible endpoints
 - `delete_edge_types` — DELETE user-owned edges of these types
+- `update_edge_types` — SET / REMOVE properties of existing relationships of these types
 
 All label fields must be subsets of the role's read `labels`; `apply_schema`
 rejects disjoint write and read scopes.

@@ -417,6 +417,9 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // A count changes neither the node nor the edge population: the pair it
         // counts was already there, which is why it is written at all.
         | WalRecord::SetEdgeCount { .. }
+        // A relationship property has no mutation event of its own (0.10).
+        | WalRecord::SetEdgePropId { .. }
+        | WalRecord::RemoveEdgePropId { .. }
         // RenameNode carries no node/edge count change; no special event.
         | WalRecord::RenameNode { .. } => None,
     }
@@ -4255,6 +4258,31 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// The rule that derives edges of `edge_type`, if one does.
+    pub(crate) fn rule_owning_edge_type(&self, edge_type: &str) -> Option<String> {
+        self.engine
+            .rules()
+            .find(|r| r.edge_type == edge_type)
+            .map(|r| r.name.clone())
+    }
+
+    /// The name an edge-property record's interned `field` stands for.
+    fn edge_prop_field(&self, field: u32) -> Result<String> {
+        self.syms
+            .resolve(field)
+            .map(str::to_string)
+            .ok_or_else(|| GraphError::Corrupt {
+                detail: format!("wal edge-property record: unknown field intern {field}"),
+            })
+    }
+
+    /// Whether the edge `etype` from `src` to `dst` is in the topology.
+    fn edge_is_live(&self, etype: u32, src: u32, dst: u32) -> bool {
+        self.topo_view()
+            .neighbors(etype, Direction::Out, src)
+            .contains(&dst)
+    }
+
     /// Return an `EdgePropsView` that merges the mmap'd base edge-props section
     /// (when a V8 snapshot is open) with the in-memory WAL overlay.
     ///
@@ -5994,6 +6022,44 @@ impl<F: Fs> GraphDb<F> {
                     );
                 }
             }
+            // ── relationship properties (QL-RP) ──────────────────────────────
+            //
+            // Absolute, like the count: a frame replayed over a snapshot that
+            // already folded it in lands on the same value. An edge that is
+            // not there (a later frame deleted it, and the snapshot holds the
+            // deletion) takes nothing.
+            WalRecord::SetEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+                value,
+            } => {
+                let name = self.edge_prop_field(*field)?;
+                if self.edge_is_live(*etype, *src, *dst) {
+                    Arc::make_mut(&mut self.edge_props).set(
+                        *etype,
+                        *src,
+                        *dst,
+                        &name,
+                        value.clone(),
+                    );
+                }
+            }
+            WalRecord::RemoveEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+            } => {
+                let name = self.edge_prop_field(*field)?;
+                // The base may hold the field, so the edge's whole map is
+                // written back without it, hiding the base for the key.
+                let mut props = self.edge_props_view().props_of(*etype, *src, *dst);
+                if props.remove(&name).is_some() {
+                    Arc::make_mut(&mut self.edge_props).replace(*etype, *src, *dst, props);
+                }
+            }
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
@@ -6099,6 +6165,32 @@ impl<F: Fs> GraphDb<F> {
     fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
         let mut carries_v11 = false;
         for rec in &recs {
+            if let PlannedRec::EdgeProp { field, value, .. } = rec {
+                // Checked as the node-property write of the same value is.
+                if let Some(value) = value {
+                    let probe = WalRecord::SetProp {
+                        key: String::new(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    };
+                    if let Some((field, size)) = oversized_binary(&probe, &self.syms) {
+                        return Err(GraphError::ValueTooLarge {
+                            field,
+                            size,
+                            limit: BINARY_MAX_BYTES,
+                        });
+                    }
+                    if let Some(offset_seconds) = out_of_range_offset(&probe) {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "DateTime offset of {offset_seconds} s is outside ±18:00; a \
+                                 DateTime cannot be stored with it"
+                            ),
+                        });
+                    }
+                }
+                carries_v11 = carries_v11 || !self.v11_features;
+            }
             if let PlannedRec::Rec(rec) = rec {
                 if let Some((field, size)) = oversized_binary(rec, &self.syms) {
                     return Err(GraphError::ValueTooLarge {
@@ -6224,6 +6316,57 @@ impl<F: Fs> GraphDb<F> {
                         src,
                         dst,
                         count,
+                    });
+                    continue;
+                }
+                PlannedRec::EdgeProp {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    field,
+                    value,
+                } => {
+                    if value.as_ref().is_some_and(Value::contains_null) {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "{NULL_PROPERTY_ERROR}: property `{field}` of relationship \
+                                 ({src_key})-[:{edge_type}]->({dst_key}) holds a null (a list \
+                                 or map property with a null element cannot be stored)"
+                            ),
+                        });
+                    }
+                    let (etype, intern) = self.intern_wal(&edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    let (field_id, intern) = self.intern_wal(&field);
+                    if interned.insert(field_id) {
+                        out.push(intern);
+                    }
+                    let src = lookup(&self.ids, &pending, &freed, &src_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing src {src_key}"),
+                        }
+                    })?;
+                    let dst = lookup(&self.ids, &pending, &freed, &dst_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing dst {dst_key}"),
+                        }
+                    })?;
+                    out.push(match value {
+                        Some(value) => WalRecord::SetEdgePropId {
+                            etype,
+                            src,
+                            dst,
+                            field: field_id,
+                            value,
+                        },
+                        None => WalRecord::RemoveEdgePropId {
+                            etype,
+                            src,
+                            dst,
+                            field: field_id,
+                        },
                     });
                     continue;
                 }
@@ -7844,6 +7987,9 @@ impl<F: Fs> GraphDb<F> {
             // A count is not an edge event: the pair it counts already fired one
             // when it was first inserted.
             | WalRecord::SetEdgeCount { .. }
+            // A relationship property has no write event of its own (0.10).
+            | WalRecord::SetEdgePropId { .. }
+            | WalRecord::RemoveEdgePropId { .. }
             | WalRecord::RenameNode { .. } => vec![],
         }
     }
@@ -8162,8 +8308,26 @@ impl<F: Fs> GraphDb<F> {
         let authz_opt = param_authz.or_else(|| self.pending_write_authz.clone());
         if let Some(ref authz) = authz_opt {
             let mut batch_created: BTreeMap<String, String> = BTreeMap::new();
+            // Edges an earlier op of this batch inserts: a property written on
+            // one in the same batch is part of its creation (create scope),
+            // as a node's own `SetProp` after its `InsertNode` is.
+            let mut batch_edges: HashSet<EdgeKey> = HashSet::new();
             for op in &ops {
-                self.check_single_op_authz(authz, op, &batch_created)?;
+                self.check_single_op_authz(authz, op, &batch_created, &batch_edges)?;
+                if let BatchOp::InsertEdge {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                }
+                | BatchOp::InsertEdgeUpsert {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    ..
+                } = op
+                {
+                    batch_edges.insert((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                }
                 // Update batch_created after a passing authz check so that
                 // subsequent ops in this batch see the nodes as "about to exist".
                 match op {
@@ -8223,7 +8387,7 @@ impl<F: Fs> GraphDb<F> {
             // dense rewrite and not here: a duplicate's endpoints and edge type
             // may all be created by earlier ops in this same frame, and nothing
             // in the frame has a dense id yet. See [`PlannedRec`].
-            let mut deferred_counts: Vec<(usize, String, String, String)> = Vec::new();
+            let mut deferred: Vec<(usize, PlannedRec)> = Vec::new();
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
@@ -8317,7 +8481,14 @@ impl<F: Fs> GraphDb<F> {
                             // This is the one gate on discriminant 23 from the
                             // batch path: a store that never opted in queues
                             // nothing here and so writes no such record.
-                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
+                            deferred.push((
+                                recs.len(),
+                                PlannedRec::DuplicateCount {
+                                    edge_type,
+                                    src_key,
+                                    dst_key,
+                                },
+                            ));
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
@@ -8427,35 +8598,68 @@ impl<F: Fs> GraphDb<F> {
                             // Same choke-point, same gate as `BatchOp::InsertEdge`
                             // above: an upsert that finds the pair already there
                             // is a duplicate insert and counts as one.
-                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
+                            deferred.push((
+                                recs.len(),
+                                PlannedRec::DuplicateCount {
+                                    edge_type,
+                                    src_key,
+                                    dst_key,
+                                },
+                            ));
                         }
                     }
-                }
-            }
-            // Splice the deferred counts back into the positions they were
-            // raised at, so a count still sits exactly where the duplicate did
-            // — before any later op in the frame that deletes the pair.
-            let mut planned: Vec<PlannedRec> =
-                Vec::with_capacity(recs.len() + deferred_counts.len());
-            let mut deferred = deferred_counts.into_iter().peekable();
-            for (i, rec) in recs.into_iter().enumerate() {
-                while deferred.peek().is_some_and(|(at, ..)| *at == i) {
-                    let (_, edge_type, src_key, dst_key) = deferred.next().expect("just peeked");
-                    planned.push(PlannedRec::DuplicateCount {
+                    BatchOp::SetEdgeProp {
                         edge_type,
                         src_key,
                         dst_key,
-                    });
+                        field,
+                        value,
+                    } => {
+                        preview.check_edge_prop_write(&edge_type, &src_key, &dst_key, &field)?;
+                        deferred.push((
+                            recs.len(),
+                            PlannedRec::EdgeProp {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                                field,
+                                value: Some(value),
+                            },
+                        ));
+                    }
+                    BatchOp::RemoveEdgeProp {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                        field,
+                    } => {
+                        preview.check_edge_prop_write(&edge_type, &src_key, &dst_key, &field)?;
+                        deferred.push((
+                            recs.len(),
+                            PlannedRec::EdgeProp {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                                field,
+                                value: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            // Splice the deferred entries (counts, relationship properties)
+            // back into the positions they were raised at, so each still sits
+            // exactly where its op did — before any later op in the frame that
+            // deletes the pair.
+            let mut planned: Vec<PlannedRec> = Vec::with_capacity(recs.len() + deferred.len());
+            let mut deferred = deferred.into_iter().peekable();
+            for (i, rec) in recs.into_iter().enumerate() {
+                while deferred.peek().is_some_and(|(at, _)| *at == i) {
+                    planned.push(deferred.next().expect("just peeked").1);
                 }
                 planned.push(PlannedRec::Rec(rec));
             }
-            for (_, edge_type, src_key, dst_key) in deferred {
-                planned.push(PlannedRec::DuplicateCount {
-                    edge_type,
-                    src_key,
-                    dst_key,
-                });
-            }
+            planned.extend(deferred.map(|(_, entry)| entry));
             planned
         };
         // A frame that is nothing but skips or refused rows writes no WAL, but
@@ -10157,8 +10361,8 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Called by [`commit_group`](Self::commit_group) and by the
     /// [`SharedDb`](crate::SharedDb) drain before the group's first append.
-    /// `BatchOp` cannot declare a constraint or range index, so a value is
-    /// the only V11-only record a group can carry.
+    /// `BatchOp` cannot declare a constraint or range index, so a value and a
+    /// relationship-property write are the V11-only records a group can carry.
     pub(crate) fn upgrade_to_v11_for_ops<'a>(
         &mut self,
         groups: impl IntoIterator<Item = &'a [BatchOp]>,
@@ -10173,6 +10377,8 @@ impl<F: Fs> GraphDb<F> {
                     .any(|(_, v)| core_storage::v11_only_type(v).is_some())
             }
             BatchOp::SetProp { value, .. } => core_storage::v11_only_type(value).is_some(),
+            // A relationship-property write is a V11 record whatever its value.
+            BatchOp::SetEdgeProp { .. } | BatchOp::RemoveEdgeProp { .. } => true,
             _ => false,
         };
         if groups.into_iter().any(|ops| ops.iter().any(carries)) {
@@ -11439,6 +11645,7 @@ impl<F: Fs> GraphDb<F> {
         authz: &WriteAuthz,
         op: &BatchOp,
         batch_created: &BTreeMap<String, String>,
+        batch_edges: &HashSet<EdgeKey>,
     ) -> Result<()> {
         // Helper: 3-way node status under the authz mask.
         //
@@ -11587,6 +11794,44 @@ impl<F: Fs> GraphDb<F> {
                                 label
                             ),
                         });
+                    }
+                }
+            }
+
+            // ── UPDATE-class: SetEdgeProp, RemoveEdgeProp ────────────────────
+            //
+            // An edge this batch inserts takes its properties under the create
+            // gate it already passed. Any other needs the edge type in
+            // `update_edge_types` (checked before the endpoint lookup, as the
+            // create-class checks are) and both endpoints visible.
+            BatchOp::SetEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                ..
+            }
+            | BatchOp::RemoveEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                ..
+            } => {
+                let edge = (edge_type.clone(), src_key.clone(), dst_key.clone());
+                if !batch_edges.contains(&edge) {
+                    if !authz.scope.update_edge_types.contains(edge_type) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: edge type '{edge_type}' not in write scope \
+                                 (update_edge_types)"
+                            ),
+                        });
+                    }
+                    for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                        if !matches!(node_status(ep_key), NodeAuthzStatus::Visible(_)) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
                     }
                 }
             }
@@ -13432,9 +13677,10 @@ impl<F: Fs> GraphDb<F> {
     /// Read a single property from an edge.
     ///
     /// Returns `None` when the edge does not exist, the field is absent, or any
-    /// of the string keys cannot be resolved to interned ids.  Only edge props
-    /// written by rules (weight fields) are accessible without a `set_edge_prop`
-    /// binding; topology-only edges (no props set) return `None` for every field.
+    /// of the string keys cannot be resolved to interned ids. Edge properties
+    /// are a rule's weights, the reserved insert `count`, and what Cypher
+    /// writes (`CREATE (a)-[:T {k: v}]->(b)`, `SET r.k = v`); an edge with
+    /// none returns `None` for every field.
     pub fn get_edge_prop(
         &self,
         edge_type: &str,
@@ -14080,8 +14326,8 @@ impl<F: Fs> GraphDb<F> {
             } else {
                 Err(GraphError::QueryError {
                     detail: format!(
-                        "SET variable '{var}' does not match a MERGE node variable \
-                         (a relationship takes no SET)"
+                        "SET variable '{var}' does not match a MERGE node or relationship \
+                         variable"
                     ),
                 })
             }
@@ -15220,6 +15466,13 @@ impl<F: Fs> GraphDb<F> {
                 self.last_change.insert(*dst, seq);
             }
             WalRecord::SetEdgeCount { .. } => {}
+            // A relationship-property write touches the pair, so both ends, as
+            // an edge insert does: a transaction that read the edge conflicts.
+            WalRecord::SetEdgePropId { src, dst, .. }
+            | WalRecord::RemoveEdgePropId { src, dst, .. } => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
             // DeleteNode: node is tombstoned; last_changed(key) returns None for
             // deleted keys (ids.get() returns None post-tombstone), so no update needed.
             // History markers: state no-ops; the underlying mutation already
@@ -17549,9 +17802,9 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
         WalRecord::InsertNodeId { props, .. } => props
             .iter()
             .find_map(|(_, v)| core_storage::v11_only_type(v)),
-        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
-            core_storage::v11_only_type(value)
-        }
+        WalRecord::SetProp { value, .. }
+        | WalRecord::SetPropId { value, .. }
+        | WalRecord::SetEdgePropId { value, .. } => core_storage::v11_only_type(value),
         WalRecord::Batch(inner) => inner.iter().find_map(v11_only_value),
         WalRecord::InsertEdge { .. }
         | WalRecord::CreateRule { .. }
@@ -17575,7 +17828,8 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
         | WalRecord::CreateConstraint { .. }
         | WalRecord::DropConstraint { .. }
         | WalRecord::EnableRangeIndex { .. }
-        | WalRecord::DisableRangeIndex { .. } => None,
+        | WalRecord::DisableRangeIndex { .. }
+        | WalRecord::RemoveEdgePropId { .. } => None,
     }
 }
 
@@ -17623,14 +17877,17 @@ fn declarations_as_records(d: &core_storage::v8::SnapshotDeclarations) -> Vec<Wa
 /// Whether `rec` is a V11-only record: it carries a format-V11 value (see
 /// [`v11_only_value`]), or it is a format-V11 record — a unique-constraint
 /// declaration or withdrawal (discriminants 24 and 25) or a range-index one
-/// (26 and 27). A 0.9.x reader can decode none of them, so the first one a
-/// store writes moves it to the V11 snapshot format (contract C9).
+/// (26 and 27), or a relationship-property write (28 and 29). A 0.9.x reader
+/// can decode none of them, so the first one a store writes moves it to the
+/// V11 snapshot format (contract C9).
 fn rec_is_v11(rec: &WalRecord) -> bool {
     match rec {
         WalRecord::CreateConstraint { .. }
         | WalRecord::DropConstraint { .. }
         | WalRecord::EnableRangeIndex { .. }
-        | WalRecord::DisableRangeIndex { .. } => true,
+        | WalRecord::DisableRangeIndex { .. }
+        | WalRecord::SetEdgePropId { .. }
+        | WalRecord::RemoveEdgePropId { .. } => true,
         WalRecord::Batch(inner) => recs_are_v11(inner),
         _ => v11_only_value(rec).is_some(),
     }
@@ -17662,7 +17919,9 @@ fn out_of_range_offset(rec: &WalRecord) -> Option<i32> {
     match rec {
         WalRecord::InsertNode { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
         WalRecord::InsertNodeId { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
-        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => bad(value),
+        WalRecord::SetProp { value, .. }
+        | WalRecord::SetPropId { value, .. }
+        | WalRecord::SetEdgePropId { value, .. } => bad(value),
         WalRecord::Batch(inner) => inner.iter().find_map(out_of_range_offset),
         _ => None,
     }
@@ -17687,7 +17946,8 @@ fn oversized_binary(rec: &WalRecord, syms: &Interner) -> Option<(String, usize)>
             too_big(v).map(|n| (syms.resolve(*f).unwrap_or_default().to_string(), n))
         }),
         WalRecord::SetProp { field, value, .. } => too_big(value).map(|n| (field.clone(), n)),
-        WalRecord::SetPropId { field, value, .. } => {
+        WalRecord::SetPropId { field, value, .. }
+        | WalRecord::SetEdgePropId { field, value, .. } => {
             too_big(value).map(|n| (syms.resolve(*field).unwrap_or_default().to_string(), n))
         }
         WalRecord::Batch(inner) => inner.iter().find_map(|r| oversized_binary(r, syms)),
@@ -17704,12 +17964,23 @@ fn oversized_binary(rec: &WalRecord, syms: &Interner) -> Option<(String, usize)>
 /// *same* frame, so no id for them exists until the dense rewrite allocates it.
 /// Carrying the keys this far and resolving them there is what lets the count
 /// survive the shape a mirror rebuild writes (defect #24).
+///
+/// A relationship-property write is the other: it names the edge by dense
+/// triple and its field by an interned id, for the same reason.
 enum PlannedRec {
     Rec(WalRecord),
     DuplicateCount {
         edge_type: String,
         src_key: String,
         dst_key: String,
+    },
+    /// Set (`Some`) or remove (`None`) property `field` of the edge.
+    EdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+        value: Option<Value>,
     },
 }
 
@@ -17774,6 +18045,45 @@ pub enum BatchOp {
         props: Vec<(String, Value)>,
         on_conflict: OnConflict,
     },
+    /// Set property `field` of the edge `src_key -[edge_type]-> dst_key`
+    /// (Cypher relationship maps and `SET r…`, QL-RP). The edge must exist at
+    /// that point of the batch; `count` is reserved and a rule-owned edge type
+    /// takes no user property write.
+    SetEdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+        value: Value,
+    },
+    /// Remove property `field` of the edge; a no-op when it lacks it. Refused
+    /// as [`BatchOp::SetEdgeProp`] is.
+    RemoveEdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+    },
+}
+
+/// The refusal for a user write to the reserved edge property [`EDGE_COUNT_PROP`].
+pub(crate) fn edge_count_reserved_error(var: &str) -> GraphError {
+    GraphError::QueryError {
+        detail: format!(
+            "cannot SET {var}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
+             property holding the pair's insert count"
+        ),
+    }
+}
+
+/// The refusal for a user property write to an edge type a rule derives.
+pub(crate) fn rule_owned_edge_type_error(edge_type: &str, rule: &str) -> GraphError {
+    GraphError::RuleOwned {
+        detail: format!(
+            "relationship type {edge_type} is derived by rule '{rule}'; a rule-owned edge \
+             type takes no user property write"
+        ),
+    }
 }
 
 /// Three-way node visibility status used by `check_single_op_authz`.
@@ -18163,6 +18473,40 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             });
         }
         Ok(!self.has_edge(edge_type, src_key, dst_key))
+    }
+
+    /// The refusals a relationship-property write makes, in order: the
+    /// reserved `count`, a rule-owned edge type (a rule's edges carry the
+    /// rule's properties), and an edge that is not there at this point of the
+    /// batch.
+    fn check_edge_prop_write(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+    ) -> Result<()> {
+        if field == EDGE_COUNT_PROP {
+            return Err(edge_count_reserved_error(&format!(
+                "({src_key})-[:{edge_type}]->({dst_key})"
+            )));
+        }
+        let owner =
+            self.db.engine.rules().find(|r| {
+                r.edge_type == edge_type && !self.overlay.deleted_rules.contains(&r.name)
+            });
+        if let Some(rule) = owner {
+            return Err(rule_owned_edge_type_error(edge_type, &rule.name));
+        }
+        if !self.has_edge(edge_type, src_key, dst_key) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "no relationship ({src_key})-[:{edge_type}]->({dst_key}) to write property \
+                     `{field}` on"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {

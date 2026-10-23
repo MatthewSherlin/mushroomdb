@@ -31,13 +31,14 @@
 //! transaction with them laid over it ([`unwind_rows`], [`RowPass::result`]).
 
 use super::row_eval::{
-    reads_node, uw_edge_exists, uw_edges_removed, uw_eval, uw_exists, uw_has_edges, uw_props,
-    Overlay, RowSource,
+    reads_node, reads_rel_prop, uw_edge_exists, uw_edge_props, uw_edges_removed, uw_eval,
+    uw_exists, uw_has_edges, uw_props, EdgeKey, Overlay, RowSource,
 };
 use super::*;
 use core_query::cypher::{
-    ast::OptionalClause, MergeSet, RelDir, RelPat, RowCreateNode, RowMerge, RowMergeNode,
-    RowReturn, RowWrite, UnwindClause, UnwindExpr, UnwindWriteStmt,
+    ast::OptionalClause, CreateEdge, MergeSet, RelDir, RelPat, RowCreateNode, RowMerge,
+    RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt,
+    REL_ENDS_FN,
 };
 
 /// The parameter that carries the captured rows to the `RETURN` query.
@@ -55,9 +56,43 @@ struct Columns {
     dynamic: bool,
 }
 
+/// The refusal for a `CREATE` with a property map, or a `MERGE` whose map
+/// differs, on a pair that already has its relationship: one property map per
+/// (type, start, end) (QL-RP).
+pub(crate) const REL_EXISTS: &str = "a relationship between these nodes with this type already \
+     exists; use MERGE … SET to change its properties";
+
+/// A relationship variable's binding in a row's environment: the edge's
+/// type and end keys, length-prefixed so any key round-trips.
+fn rel_binding((t, a, b): &EdgeKey) -> String {
+    format!("{}:{}:{}:{t}{a}{b}", t.len(), a.len(), b.len())
+}
+
+/// The edge a [`rel_binding`] names.
+fn rel_of(binding: &str) -> Option<EdgeKey> {
+    let mut parts = binding.splitn(4, ':');
+    let lt: usize = parts.next()?.parse().ok()?;
+    let la: usize = parts.next()?.parse().ok()?;
+    let lb: usize = parts.next()?.parse().ok()?;
+    let rest = parts.next()?;
+    if rest.len() != lt + la + lb {
+        return None;
+    }
+    Some((
+        rest.get(..lt)?.to_string(),
+        rest.get(lt..lt + la)?.to_string(),
+        rest.get(lt + la..)?.to_string(),
+    ))
+}
+
+/// The column a read-part relationship's identity is projected under.
+fn rel_ends_col(var: &str) -> String {
+    format!("__uwe_{var}")
+}
+
 impl Columns {
-    fn operand(&mut self, op: &Operand, node_vars: &[String]) {
-        if reads_node(op, node_vars) {
+    fn operand(&mut self, op: &Operand, node_vars: &[String], rel_vars: &[String]) {
+        if reads_node(op, node_vars) || reads_rel_prop(op, rel_vars) {
             self.dynamic = true;
             return;
         }
@@ -199,6 +234,21 @@ fn rel_captures(stmt: &UnwindWriteStmt, used: &str) -> Result<(Query, Vec<RelCap
     let mut read = stmt.read.clone();
     let mut rels = read_rel_captures(&mut read, &wanted)?;
     for write in &stmt.writes {
+        if let RowWrite::Create { edges, .. } = write {
+            for edge in edges {
+                if let Some(var) = edge.rel_var.as_ref().filter(|v| wanted.contains(v)) {
+                    rels.retain(|r| &r.var != var);
+                    rels.push(RelCapture {
+                        var: var.clone(),
+                        left: edge.src_var.clone(),
+                        right: edge.dst_var.clone(),
+                        dir: RelDir::Right,
+                        etypes: vec![edge.etype.clone()],
+                        merged: true,
+                    });
+                }
+            }
+        }
         if let RowWrite::Merge(merge) = write {
             if let Some(edge) = &merge.edge {
                 if let Some(var) = edge.rel_var.as_ref().filter(|v| wanted.contains(v)) {
@@ -220,7 +270,7 @@ fn rel_captures(stmt: &UnwindWriteStmt, used: &str) -> Result<(Query, Vec<RelCap
 
 /// The columns the read part projects: every variable the write clauses or the
 /// `RETURN` need, and one per write operand that does not read a node.
-fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Columns {
+fn plan_columns(stmt: &UnwindWriteStmt, used: &str, captures: &[RelCapture]) -> Columns {
     let mut cols = Columns {
         by_operand: HashMap::new(),
         items: Vec::new(),
@@ -232,6 +282,7 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
         alias: Some("__uw_row".into()),
     });
     let nodes = &stmt.node_vars;
+    let rels = &stmt.rel_vars;
     let mut var_names: Vec<String> = Vec::new();
     let mut note_var = |v: &str| {
         if stmt.scope.iter().any(|s| s == v) && !var_names.iter().any(|n| n == v) {
@@ -243,15 +294,21 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
             RowWrite::Create { nodes: made, edges } => {
                 for node in made {
                     for (_, op) in &node.props {
-                        cols.operand(op, nodes);
+                        cols.operand(op, nodes, rels);
                     }
                     if let Some(op) = &node.props_map {
-                        cols.operand(op, nodes);
+                        cols.operand(op, nodes, rels);
                     }
                 }
                 for edge in edges {
                     note_var(&edge.src_var);
                     note_var(&edge.dst_var);
+                    for (_, op) in &edge.props {
+                        cols.operand(op, nodes, rels);
+                    }
+                    if let Some(op) = &edge.props_map {
+                        cols.operand(op, nodes, rels);
+                    }
                 }
             }
             RowWrite::Merge(merge) => {
@@ -260,25 +317,30 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
                     if end.bound {
                         note_var(&end.var);
                     } else {
-                        merge_operands(end, &mut cols, nodes);
+                        merge_operands(end, &mut cols, nodes, rels);
+                    }
+                }
+                if let Some(edge) = &merge.edge {
+                    for (_, op) in &edge.props {
+                        cols.operand(op, nodes, rels);
                     }
                 }
                 for item in merge.on_create.iter().chain(&merge.on_match) {
                     match item {
-                        MergeSet::Prop(sc) => cols.operand(&sc.value, nodes),
-                        MergeSet::Map { value, .. } => cols.operand(value, nodes),
+                        MergeSet::Prop(sc) => cols.operand(&sc.value, nodes, rels),
+                        MergeSet::Map { value, .. } => cols.operand(value, nodes, rels),
                     }
                 }
             }
             RowWrite::Set(sets) => {
                 for sc in sets {
                     note_var(&sc.var);
-                    cols.operand(&sc.value, nodes);
+                    cols.operand(&sc.value, nodes, rels);
                 }
             }
             RowWrite::SetMap { var, value, .. } => {
                 note_var(var);
-                cols.operand(value, nodes);
+                cols.operand(value, nodes, rels);
             }
             RowWrite::Remove(items) => {
                 for (var, _) in items {
@@ -316,8 +378,19 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
             alias: None,
         });
     }
+    // The identity of each read-part relationship a write clause names, in
+    // the edge's own direction whatever the pattern's.
+    for var in read_rels_written(stmt) {
+        cols.items.push(RetItem {
+            value: RetVal::FuncCall {
+                name: REL_ENDS_FN.into(),
+                args: vec![Operand::Var(var.clone())],
+            },
+            alias: Some(rel_ends_col(&var)),
+        });
+    }
     // The ends and the type of each relationship the RETURN names.
-    for rel in rels.iter().filter(|r| !r.merged) {
+    for rel in captures.iter().filter(|r| !r.merged) {
         for end in [&rel.left, &rel.right] {
             if !projected.contains(end) {
                 projected.push(end.clone());
@@ -338,11 +411,39 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
     cols
 }
 
-fn merge_operands(node: &RowMergeNode, cols: &mut Columns, nodes: &[String]) {
-    cols.operand(&node.key, nodes);
+fn merge_operands(node: &RowMergeNode, cols: &mut Columns, nodes: &[String], rels: &[String]) {
+    cols.operand(&node.key, nodes, rels);
     if let Some(ns) = &node.ns {
-        cols.operand(ns, nodes);
+        cols.operand(ns, nodes, rels);
     }
+}
+
+/// The relationship variables the read part binds that a write clause names:
+/// each is projected as its identity so a write can find the edge.
+fn read_rels_written(stmt: &UnwindWriteStmt) -> Vec<String> {
+    let made: HashSet<&str> = stmt
+        .writes
+        .iter()
+        .flat_map(|w| match w {
+            RowWrite::Create { edges, .. } => edges
+                .iter()
+                .filter_map(|e| e.rel_var.as_deref())
+                .collect::<Vec<_>>(),
+            RowWrite::Merge(m) => m
+                .edge
+                .as_ref()
+                .and_then(|e| e.rel_var.as_deref())
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let text = format!("{:?}", stmt.writes);
+    stmt.rel_vars
+        .iter()
+        .filter(|v| !made.contains(v.as_str()) && names_used(&text, v))
+        .cloned()
+        .collect()
 }
 
 /// The read query a `RETURN` runs after the commit. It unwinds the rows the
@@ -465,6 +566,8 @@ struct RowCtx<'a, S: RowSource + ?Sized> {
     row: usize,
     cols: &'a Columns,
     node_vars: &'a HashSet<&'a str>,
+    /// Every relationship variable of the statement.
+    rel_vars: &'a HashSet<&'a str>,
     /// The row's non-node variables.
     values: Vec<(&'a str, Value)>,
     params: &'a BTreeMap<String, Value>,
@@ -490,7 +593,20 @@ impl<S: RowSource + ?Sized> RowCtx<'_, S> {
                 .contains(name)
                 .then(|| env.get(name).cloned())
         };
-        uw_eval(self.src, ov, op, &node_key, &self.values, self.params)
+        let rel_key = |name: &str| -> Option<Option<EdgeKey>> {
+            self.rel_vars
+                .contains(name)
+                .then(|| env.get(name).and_then(|b| rel_of(b)))
+        };
+        uw_eval(
+            self.src,
+            ov,
+            op,
+            &node_key,
+            &rel_key,
+            &self.values,
+            self.params,
+        )
     }
 }
 
@@ -591,6 +707,8 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
         })
         .collect();
     let node_vars: HashSet<&str> = stmt.node_vars.iter().map(String::as_str).collect();
+    let rel_vars: HashSet<&str> = stmt.rel_vars.iter().map(String::as_str).collect();
+    let read_rels = read_rels_written(stmt);
     let capture = stmt.returns.is_some();
     let mut captured: Vec<Value> = Vec::new();
     let mut ov = Overlay::default();
@@ -609,12 +727,23 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
                 Some(_) => {}
             }
         }
+        for var in &read_rels {
+            if let Some(Value::List(ends)) = rows.get(row, &rel_ends_col(var)) {
+                if let [Value::Str(t), Value::Str(a), Value::Str(b)] = ends.as_slice() {
+                    env.insert(
+                        var.as_str(),
+                        rel_binding(&(t.clone(), a.clone(), b.clone())),
+                    );
+                }
+            }
+        }
         let ctx = RowCtx {
             src,
             rows: &rows,
             row,
             cols: &cols,
             node_vars: &node_vars,
+            rel_vars: &rel_vars,
             values,
             params,
         };
@@ -631,7 +760,7 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
                 }
             }
             for (name, key) in &env {
-                if names_used(&used, name) {
+                if names_used(&used, name) && !rel_vars.contains(name) {
                     entry.insert((*name).to_string(), Value::Str(key.clone()));
                 }
             }
@@ -767,20 +896,7 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 tally.created += 1;
             }
             for edge in edges {
-                let end = |var: &str, side: &str| -> Result<String> {
-                    env.get(var).cloned().ok_or_else(|| {
-                        err(format!("CREATE edge {side} variable '{var}' is not bound"))
-                    })
-                };
-                let from = end(&edge.src_var, "src")?;
-                let to = end(&edge.dst_var, "dst")?;
-                ops.push(BatchOp::InsertEdge {
-                    edge_type: edge.etype.clone(),
-                    src_key: from.clone(),
-                    dst_key: to.clone(),
-                });
-                ov.edge_created(&edge.etype, &from, &to);
-                tally.relationships_created += 1;
+                uw_create_edge(edge, ctx, env, ov, ops, tally)?;
             }
         }
         RowWrite::Merge(merge) => {
@@ -788,6 +904,10 @@ fn uw_write<'v, S: RowSource + ?Sized>(
         }
         RowWrite::Set(sets) => {
             for sc in sets {
+                if ctx.rel_vars.contains(sc.var.as_str()) {
+                    uw_set_rel_prop(sc, ctx, env, ov, ops, tally)?;
+                    continue;
+                }
                 let Some(key) = env.get(sc.var.as_str()).cloned() else {
                     continue; // a null node (OPTIONAL MATCH): nothing to set
                 };
@@ -819,13 +939,22 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 merge: *merge,
                 value: operand,
             };
-            uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
+            if ctx.rel_vars.contains(var.as_str()) {
+                uw_set_rel_map(&set, &key, ctx, env, ov, ops, tally)?;
+            } else {
+                uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
+            }
         }
         RowWrite::Remove(items) => {
             for (var, field) in items {
                 let Some(key) = env.get(var.as_str()).cloned() else {
                     continue;
                 };
+                if ctx.rel_vars.contains(var.as_str()) {
+                    let edge = bound_rel(var, &key)?;
+                    uw_remove_rel_prop(var, &edge, field, ctx, ov, ops, tally)?;
+                    continue;
+                }
                 if uw_props(src, ov, &key).contains_key(field) {
                     tally.props_set += 1;
                 }
@@ -1135,6 +1264,29 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     };
     let edge_existed =
         start_existed && end_existed && uw_edge_exists(src, ov, &edge.etype, &src_key, &dst_key);
+    let rel: EdgeKey = (edge.etype.clone(), src_key.clone(), dst_key.clone());
+    let rel_var = edge.rel_var.as_deref().unwrap_or("r");
+    let rel_props = uw_rel_map(rel_var, &edge.props, None, ctx, env, ov)?;
+    if !rel_props.is_empty() {
+        refuse_rule_owned(src, &edge.etype)?;
+    }
+    // The map is part of what MERGE matches: a pair whose relationship
+    // carries other values is not created again beside it (one property map
+    // per pair), it is refused.
+    if edge_existed {
+        let existing = uw_edge_props(src, ov, &rel);
+        let matches = rel_props.iter().all(|(field, value)| {
+            existing
+                .get(field)
+                .is_some_and(|v| core_query::values_equal(v, value))
+        });
+        if !matches {
+            return Err(err(format!(
+                "MERGE (…)-[:{}]->(…) from '{src_key}' to '{dst_key}': {REL_EXISTS}",
+                edge.etype
+            )));
+        }
+    }
     if !start_existed {
         let props = src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
         ov.node_created(&start_key, &props);
@@ -1165,10 +1317,14 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         });
         ov.edge_created(&edge.etype, &src_key, &dst_key);
         tally.relationships_created += 1;
+        write_fresh_rel_props(&rel, rel_props, ov, ops);
         &merge.on_create
     };
     env.insert(merge.start.var.as_str(), start_key);
     env.insert(edge.end.var.as_str(), end_key);
+    if let Some(var) = edge.rel_var.as_deref() {
+        env.insert(var, rel_binding(&rel));
+    }
     uw_merge_sets(sets, ctx, env, ov, ops, tally)
 }
 
@@ -1184,6 +1340,10 @@ fn uw_merge_sets<S: RowSource + ?Sized>(
 ) -> Result<()> {
     for item in sets {
         let sc = match item {
+            MergeSet::Prop(sc) if ctx.rel_vars.contains(sc.var.as_str()) => {
+                uw_set_rel_prop(sc, ctx, env, ov, ops, tally)?;
+                continue;
+            }
             MergeSet::Prop(sc) => sc,
             MergeSet::Map { var, merge, value } => {
                 let Some(key) = env.get(var.as_str()).cloned() else {
@@ -1194,7 +1354,11 @@ fn uw_merge_sets<S: RowSource + ?Sized>(
                     merge: *merge,
                     value,
                 };
-                uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
+                if ctx.rel_vars.contains(var.as_str()) {
+                    uw_set_rel_map(&set, &key, ctx, env, ov, ops, tally)?;
+                } else {
+                    uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
+                }
                 continue;
             }
         };
@@ -1214,6 +1378,260 @@ fn uw_merge_sets<S: RowSource + ?Sized>(
             value: v,
         });
         tally.props_set += 1;
+    }
+    Ok(())
+}
+
+// ── Relationship properties (QL-RP) ─────────────────────────────────────────
+
+/// The edge a relationship variable's binding names.
+fn bound_rel(var: &str, binding: &str) -> Result<EdgeKey> {
+    rel_of(binding).ok_or_else(|| err(format!("internal: `{var}` holds no relationship")))
+}
+
+/// Refuse a user property write to an edge type a rule derives.
+fn refuse_rule_owned<S: RowSource + ?Sized>(src: &S, edge_type: &str) -> Result<()> {
+    match src.row_rule_owning(edge_type) {
+        Some(rule) => Err(rule_owned_edge_type_error(edge_type, &rule)),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a user write to the reserved `count`.
+fn refuse_reserved(var: &str, field: &str) -> Result<()> {
+    if field == EDGE_COUNT_PROP {
+        return Err(edge_count_reserved_error(var));
+    }
+    Ok(())
+}
+
+/// The properties a relationship pattern's map gives for this row: its
+/// entries (a null one left out), or the `$parameter` map's.
+fn uw_rel_map<S: RowSource + ?Sized>(
+    var: &str,
+    props: &[(String, Operand)],
+    props_map: Option<&Operand>,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<BTreeMap<String, Value>> {
+    let mut out: BTreeMap<String, Value> = BTreeMap::new();
+    if let Some(operand) = props_map {
+        match ctx.eval(operand, env, ov)? {
+            Some(Value::Map(m)) => {
+                out.extend(m.into_iter().filter(|(_, v)| !matches!(v, Value::Null)))
+            }
+            other => {
+                return Err(err(format!(
+                    "relationship property map: {} must be a map, got {}",
+                    match operand {
+                        Operand::Param(name) => format!("the parameter `{name}`"),
+                        _ => "the value".to_string(),
+                    },
+                    other.map_or("null".to_string(), |v| format!("{v:?}")),
+                )))
+            }
+        }
+    }
+    for (field, operand) in props {
+        if let Some(v) = ctx.eval(operand, env, ov)? {
+            out.insert(field.clone(), v);
+        }
+    }
+    for field in out.keys() {
+        refuse_reserved(var, field)?;
+    }
+    Ok(out)
+}
+
+/// The properties of a relationship the statement has just created. Like a
+/// created node's, they are part of the creation and not counted in
+/// `properties_set`.
+fn write_fresh_rel_props(
+    rel: &EdgeKey,
+    props: BTreeMap<String, Value>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+) {
+    for (field, value) in &props {
+        ops.push(BatchOp::SetEdgeProp {
+            edge_type: rel.0.clone(),
+            src_key: rel.1.clone(),
+            dst_key: rel.2.clone(),
+            field: field.clone(),
+            value: value.clone(),
+        });
+    }
+    ov.edge_props_fresh(rel, props);
+}
+
+/// One relationship of a `CREATE`. A pair that already has its relationship
+/// keeps the multiplicity behaviour when the pattern carries no map, and is
+/// refused when it carries one (one property map per pair).
+fn uw_create_edge<'v, S: RowSource + ?Sized>(
+    edge: &'v CreateEdge,
+    ctx: &RowCtx<'_, S>,
+    env: &mut HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let end = |var: &str, side: &str| -> Result<String> {
+        env.get(var)
+            .cloned()
+            .ok_or_else(|| err(format!("CREATE edge {side} variable '{var}' is not bound")))
+    };
+    let from = end(&edge.src_var, "src")?;
+    let to = end(&edge.dst_var, "dst")?;
+    let rel: EdgeKey = (edge.etype.clone(), from.clone(), to.clone());
+    let var = edge.rel_var.as_deref().unwrap_or("r");
+    let props = uw_rel_map(var, &edge.props, edge.props_map.as_ref(), ctx, env, ov)?;
+    if !props.is_empty() {
+        refuse_rule_owned(ctx.src, &edge.etype)?;
+    }
+    let existed = uw_edge_exists(ctx.src, ov, &edge.etype, &from, &to);
+    if existed && !props.is_empty() {
+        return Err(err(format!(
+            "CREATE ({from})-[:{}]->({to}): {REL_EXISTS}",
+            edge.etype
+        )));
+    }
+    ops.push(BatchOp::InsertEdge {
+        edge_type: edge.etype.clone(),
+        src_key: from.clone(),
+        dst_key: to.clone(),
+    });
+    ov.edge_created(&edge.etype, &from, &to);
+    tally.relationships_created += 1;
+    if !existed {
+        write_fresh_rel_props(&rel, props, ov, ops);
+    }
+    if let Some(var) = edge.rel_var.as_deref() {
+        env.insert(var, rel_binding(&rel));
+    }
+    Ok(())
+}
+
+/// `SET r.f = expr` on a relationship.
+fn uw_set_rel_prop<S: RowSource + ?Sized>(
+    sc: &SetClause,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    refuse_reserved(&sc.var, &sc.field)?;
+    let Some(binding) = env.get(sc.var.as_str()) else {
+        return Ok(()); // a null relationship (OPTIONAL MATCH): nothing to set
+    };
+    let rel = bound_rel(&sc.var, binding)?;
+    refuse_rule_owned(ctx.src, &rel.0)?;
+    let Some(value) = ctx.eval(&sc.value, env, ov)? else {
+        return Err(err(format!(
+            "SET value for {}.{} evaluated to null",
+            sc.var, sc.field
+        )));
+    };
+    set_rel_prop(&rel, &sc.field, value, ov, ops, tally);
+    Ok(())
+}
+
+fn set_rel_prop(
+    rel: &EdgeKey,
+    field: &str,
+    value: Value,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) {
+    ov.note_edge_write(rel, field, Some(&value));
+    ops.push(BatchOp::SetEdgeProp {
+        edge_type: rel.0.clone(),
+        src_key: rel.1.clone(),
+        dst_key: rel.2.clone(),
+        field: field.to_string(),
+        value,
+    });
+    tally.props_set += 1;
+}
+
+/// `REMOVE r.f`: a property the relationship lacks is a no-op, not counted.
+fn uw_remove_rel_prop<S: RowSource + ?Sized>(
+    var: &str,
+    rel: &EdgeKey,
+    field: &str,
+    ctx: &RowCtx<'_, S>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    refuse_reserved(var, field)?;
+    refuse_rule_owned(ctx.src, &rel.0)?;
+    if !uw_edge_props(ctx.src, ov, rel).contains_key(field) {
+        return Ok(());
+    }
+    ov.note_edge_write(rel, field, None);
+    ops.push(BatchOp::RemoveEdgeProp {
+        edge_type: rel.0.clone(),
+        src_key: rel.1.clone(),
+        dst_key: rel.2.clone(),
+        field: field.to_string(),
+    });
+    tally.props_set += 1;
+    Ok(())
+}
+
+/// `SET r = <map>` / `SET r += <map>` on a relationship: `+=` sets the listed
+/// keys and a null removes; `=` makes the user's properties exactly the map's
+/// non-null entries. The reserved `count` is never removed, and naming it is
+/// refused.
+fn uw_set_rel_map<S: RowSource + ?Sized>(
+    set: &MapSet<'_>,
+    binding: &str,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let rel = bound_rel(set.var, binding)?;
+    refuse_rule_owned(ctx.src, &rel.0)?;
+    let entries: Vec<(String, Option<Value>)> = match ctx.eval(set.value, env, ov)? {
+        Some(Value::Map(m)) => m
+            .into_iter()
+            .map(|(k, v)| (k, (!matches!(v, Value::Null)).then_some(v)))
+            .collect(),
+        other => {
+            return Err(err(format!(
+                "SET {} {}= <map>: the value must be a map, got {}",
+                set.var,
+                if set.merge { "+" } else { "" },
+                other.map_or("null".to_string(), |v| format!("{v:?}")),
+            )))
+        }
+    };
+    for (field, _) in &entries {
+        refuse_reserved(set.var, field)?;
+    }
+    let existing = uw_edge_props(ctx.src, ov, &rel).clone();
+    if !set.merge {
+        let kept: HashSet<&str> = entries
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(f, _)| f.as_str())
+            .collect();
+        for field in existing.keys() {
+            if field != EDGE_COUNT_PROP && !kept.contains(field.as_str()) {
+                uw_remove_rel_prop(set.var, &rel, field, ctx, ov, ops, tally)?;
+            }
+        }
+    }
+    for (field, value) in entries {
+        match value {
+            Some(v) => set_rel_prop(&rel, &field, v, ov, ops, tally),
+            None => uw_remove_rel_prop(set.var, &rel, &field, ctx, ov, ops, tally)?,
+        }
     }
     Ok(())
 }

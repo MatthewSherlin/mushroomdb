@@ -275,6 +275,42 @@ fn a_range_index_declaration_upgrades() {
     assert_eq!(peek_snapshot_version(&dir), Some(11));
 }
 
+/// QL-RP: a relationship-property write is a V11 record (discriminants 28 and
+/// 29). The store's first one writes the V11 snapshot before the record is
+/// appended, so v0.9.2 — which accepts no 11 — refuses the store by name
+/// instead of truncating the WAL at a frame it cannot decode.
+#[test]
+fn a_relationship_property_write_upgrades_before_its_record() {
+    assert!(!V0_9_2_ACCEPTS.contains(&11));
+    let dir = tmp("edge-prop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.query_write(
+        "CREATE (:N {id: 'a'})-[:T]->(:N {id: 'b'})",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(peek_snapshot_version(&dir), None);
+    let before = decode_all(&wal_bytes(&dir)).0.len();
+    db.query_write("MATCH ()-[r:T]->() SET r.w = 1", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(peek_snapshot_version(&dir), Some(11));
+    let recs = decode_all(&wal_bytes(&dir)).0;
+    assert_eq!(recs.len(), before + 1, "one frame, after the upgrade");
+    let carries = |r: &WalRecord| match r {
+        WalRecord::Batch(inner) => inner
+            .iter()
+            .any(|r| matches!(r, WalRecord::SetEdgePropId { .. })),
+        r => matches!(r, WalRecord::SetEdgePropId { .. }),
+    };
+    assert!(carries(recs.last().unwrap()), "{:?}", recs.last());
+    db.query_write("MATCH ()-[r:T]->() REMOVE r.w", &BTreeMap::new())
+        .unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.is_v11());
+    assert_eq!(db.get_edge_prop("T", "a", "b", "w"), None);
+}
+
 /// A declaration refused by the data does no upgrade: the conflict scan runs
 /// before the record is built.
 #[test]

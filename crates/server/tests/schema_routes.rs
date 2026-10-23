@@ -80,6 +80,7 @@ fn open(name: &str) -> (Router, SharedDb) {
                     delete_labels: vec!["P".into()],
                     create_edge_types: vec![],
                     delete_edge_types: vec![],
+                    update_edge_types: vec![],
                 }),
             }],
             ..Default::default()

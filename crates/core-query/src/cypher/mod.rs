@@ -13,7 +13,7 @@ pub use ast::{
     MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeSet, MergeStmt, NodePat, Operand, OrderItem,
     OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, RowCreateNode,
     RowMerge, RowMergeEdge, RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr,
-    UnwindWriteStmt, WithStage, WriteStatement, YieldItem, LABEL_TEST_FN, ONE_ROW_VAR,
+    UnwindWriteStmt, WithStage, WriteStatement, YieldItem, LABEL_TEST_FN, ONE_ROW_VAR, REL_ENDS_FN,
 };
 pub use exec::{eval_operand, execute, execute_union, Binding, Params};
 pub use lexer::{lex, Tok};

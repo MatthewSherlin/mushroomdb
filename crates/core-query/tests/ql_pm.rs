@@ -94,7 +94,10 @@ fn merge_set_takes_a_map() {
     assert!(matches!(s.writes.as_slice(), [RowWrite::Merge(_)]));
     // A map SET on a name that is not a MERGE node is refused.
     let e = parse("MERGE (n:P {id: $id}) ON CREATE SET m += $props").unwrap_err();
-    assert!(e.contains("does not match a MERGE node variable"), "{e}");
+    assert!(
+        e.contains("does not match a MERGE node or relationship variable"),
+        "{e}"
+    );
 }
 
 #[test]

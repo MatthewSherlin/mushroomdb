@@ -1682,27 +1682,28 @@ impl<'a> EdgePropsView<'a> {
 
     /// Look up a field value for `(etype, src, dst)`.
     ///
-    /// 1. If tombstoned in overlay → `None` (deletion masking).
-    /// 2. If present in overlay map → return overlay value (owned clone).
+    /// 1. If present in overlay map → return overlay value (owned clone).
+    /// 2. If tombstoned in overlay → `None`: the overlay entry, if any, is the
+    ///    whole of the edge's properties (see [`EdgeProps`]).
     /// 3. Binary-search the archived base (zero-copy decode on hit).
     /// 4. `None` if absent everywhere.
     pub fn get(&self, etype: u32, src: u32, dst: u32, field: &str) -> Option<Value> {
         if let Some(tx) = self.layer {
-            if tx.is_tombstoned(etype, src, dst) {
-                return None;
-            }
             if let Some(v) = tx.get(etype, src, dst, field) {
                 return Some(v.clone());
             }
+            if tx.is_tombstoned(etype, src, dst) {
+                return None;
+            }
             return self.below_tx().get(etype, src, dst, field);
-        }
-        // Tombstone check — masks both overlay and base entries.
-        if self.overlay.is_tombstoned(etype, src, dst) {
-            return None;
         }
         // Overlay lookup.
         if let Some(v) = self.overlay.get(etype, src, dst, field) {
             return Some(v.clone());
+        }
+        // Tombstone check — masks the base entry.
+        if self.overlay.is_tombstoned(etype, src, dst) {
+            return None;
         }
         // Archive fallback.
         let base = self.base?;
@@ -1733,7 +1734,7 @@ impl<'a> EdgePropsView<'a> {
     ) -> std::collections::BTreeMap<String, Value> {
         if let Some(tx) = self.layer {
             if tx.is_tombstoned(etype, src, dst) {
-                return std::collections::BTreeMap::new();
+                return tx.props_of(etype, src, dst).cloned().unwrap_or_default();
             }
             let mut out = self.below_tx().props_of(etype, src, dst);
             if let Some(own) = tx.props_of(etype, src, dst) {
@@ -1742,7 +1743,11 @@ impl<'a> EdgePropsView<'a> {
             return out;
         }
         if self.overlay.is_tombstoned(etype, src, dst) {
-            return std::collections::BTreeMap::new();
+            return self
+                .overlay
+                .props_of(etype, src, dst)
+                .cloned()
+                .unwrap_or_default();
         }
         let mut out: std::collections::BTreeMap<String, Value> = self
             .base

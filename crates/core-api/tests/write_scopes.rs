@@ -125,6 +125,7 @@ fn writer_role() -> RoleDef {
             delete_labels: vec!["MyLabel".into()],
             create_edge_types: vec!["KNOWS".into()],
             delete_edge_types: vec!["KNOWS".into()],
+            update_edge_types: vec![],
         }),
     }
 }
@@ -302,6 +303,7 @@ fn test_update_scope_denied() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };
@@ -657,6 +659,7 @@ fn test_merge_update_only_hidden_eq_absent() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };
@@ -730,6 +733,7 @@ fn test_merge_create_only_disclosure_pinned() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };
@@ -810,6 +814,7 @@ fn test_merge_on_create_set_with_role_authz() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };
@@ -1193,6 +1198,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
                 delete_labels: vec!["MyLabel".into()],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };

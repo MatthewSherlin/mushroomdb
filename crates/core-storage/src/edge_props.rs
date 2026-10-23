@@ -8,6 +8,17 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (`ArchivedEdgeProps`).  Only post-snapshot changes land here.  Deletions of
 /// base-only edges are recorded in `tombstones` so the view layer can mask them
 /// without materialising the full base into RAM.
+///
+/// For one key the overlay is in one of three states, and every reader (the
+/// views in `v8::seam`, the snapshot merge in `v8::encode`) reads them alike:
+///
+/// - **no entry, no tombstone**: the layer below answers;
+/// - **an entry, no tombstone**: the entry's fields win over the layer below,
+///   whose other fields still show (a field-wise merge);
+/// - **tombstoned** (with or without an entry): the layer below is hidden for
+///   the key, and the entry, if any, is all of the edge's properties. This is
+///   a deleted edge (no entry), a deleted edge written again, or an edge one of
+///   whose properties was removed ([`EdgeProps::replace`]).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EdgeProps {
     map: BTreeMap<(u32, u32, u32), BTreeMap<String, Value>>,
@@ -35,9 +46,11 @@ impl EdgeProps {
         Self::default()
     }
 
+    /// Set one field. A tombstone stays: after a delete (or a
+    /// [`replace`](Self::replace)) the entry is the whole of the edge's
+    /// properties, so a field written now must not bring back the fields the
+    /// layer below still holds for the key.
     pub fn set(&mut self, etype: u32, src: u32, dst: u32, field: &str, value: Value) {
-        // A set un-tombstones the edge (it is being (re-)created).
-        self.tombstones.remove(&(etype, src, dst));
         self.touched.insert((etype, src, dst));
         self.map
             .entry((etype, src, dst))
@@ -65,6 +78,21 @@ impl EdgeProps {
         self.map.remove(&(etype, src, dst));
         self.tombstones.insert((etype, src, dst));
         self.touched.insert((etype, src, dst));
+    }
+
+    /// Make `props` the whole of the edge's properties, hiding whatever the
+    /// layer below holds for it: how one property is removed when the layer
+    /// below may still hold it. `props` is the edge's full map as a read of it
+    /// sees it, minus what the caller removes.
+    pub fn replace(&mut self, etype: u32, src: u32, dst: u32, props: BTreeMap<String, Value>) {
+        let key = (etype, src, dst);
+        if props.is_empty() {
+            self.map.remove(&key);
+        } else {
+            self.map.insert(key, props);
+        }
+        self.tombstones.insert(key);
+        self.touched.insert(key);
     }
 
     /// Whether any key was written since the last [`take_touched`](Self::take_touched).
@@ -192,15 +220,29 @@ mod tests {
         assert!(!copy.is_tombstoned(0, 1, 2));
     }
 
+    /// A field written after a delete is visible, and the tombstone stays, so
+    /// the fields the layer below holds for the deleted edge stay hidden.
     #[test]
-    fn set_clears_tombstone() {
+    fn set_after_a_delete_keeps_the_tombstone() {
         let mut e = EdgeProps::new();
         e.set(0, 1, 2, "score", Value::Float(1.0));
         e.remove_edge(0, 1, 2);
         assert!(e.is_tombstoned(0, 1, 2));
-        // Re-set: tombstone cleared, value visible again.
         e.set(0, 1, 2, "score", Value::Float(2.0));
-        assert!(!e.is_tombstoned(0, 1, 2));
+        assert!(e.is_tombstoned(0, 1, 2));
         assert_eq!(e.get(0, 1, 2, "score"), Some(&Value::Float(2.0)));
+    }
+
+    #[test]
+    fn replace_is_the_whole_map_and_hides_the_layer_below() {
+        let mut e = EdgeProps::new();
+        let props: BTreeMap<String, Value> = [("a".to_string(), Value::Int(1))].into();
+        e.replace(0, 1, 2, props.clone());
+        assert!(e.is_tombstoned(0, 1, 2));
+        assert_eq!(e.props_of(0, 1, 2), Some(&props));
+        e.replace(0, 1, 2, BTreeMap::new());
+        assert!(e.is_tombstoned(0, 1, 2));
+        assert_eq!(e.props_of(0, 1, 2), None);
+        assert_eq!(e.take_touched().len(), 1);
     }
 }

@@ -213,6 +213,80 @@ fn needs_per_row_form(tokens: &[Tok]) -> bool {
     false
 }
 
+/// True if the statement writes a relationship's properties, or names a
+/// relationship a `CREATE` makes (QL-RP): a property map or `$parameter`
+/// inside a `-[ … ]-` bracket, a `CREATE … -[r…]-` variable, or a `SET` /
+/// `REMOVE` item whose target is a relationship variable. Such a statement is
+/// parsed as the per-row form, the one executor that writes relationship
+/// properties.
+fn writes_relationship_properties(tokens: &[Tok]) -> bool {
+    let mut rel_vars: Vec<&str> = Vec::new();
+    let mut in_create = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Tok::Create => in_create = true,
+            Tok::Match | Tok::Merge | Tok::With | Tok::Unwind | Tok::Return | Tok::Set => {
+                in_create = false
+            }
+            Tok::LBracket if i > 0 && tokens[i - 1] == Tok::Dash => {
+                if let Some(Tok::Ident(name)) = tokens.get(i + 1) {
+                    if in_create {
+                        return true;
+                    }
+                    rel_vars.push(name);
+                }
+                let mut j = i + 1;
+                while j < tokens.len() && tokens[j] != Tok::RBracket {
+                    if matches!(tokens[j], Tok::LBrace | Tok::Param(_)) {
+                        return true;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if rel_vars.is_empty() {
+        return false;
+    }
+    // A SET / REMOVE item's target: the name right after `SET`, `REMOVE` or a
+    // comma of that clause, outside any bracket.
+    let mut depth = 0usize;
+    let mut in_items = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+            Tok::RParen | Tok::RBracket | Tok::RBrace => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            Tok::Set => in_items = true,
+            _ if kw(Some(tok), "remove") => in_items = true,
+            Tok::Comma if in_items => {}
+            Tok::Ident(name) if in_items => {
+                let target = i > 0
+                    && (matches!(tokens[i - 1], Tok::Set | Tok::Comma)
+                        || kw(tokens.get(i - 1), "remove"));
+                if target && rel_vars.contains(&name.as_str()) {
+                    return true;
+                }
+            }
+            Tok::Create
+            | Tok::Merge
+            | Tok::Match
+            | Tok::With
+            | Tok::Unwind
+            | Tok::Return
+            | Tok::Delete
+            | Tok::Detach => in_items = false,
+            _ if kw(Some(tok), "on") => in_items = false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// True if the tokens hold a `REMOVE var.field` or `REMOVE var:Label` clause.
 /// `REMOVE` is an ordinary identifier, so it counts only in clause position:
 /// followed by `name` and then `.` or `:`, and not itself a property or label
@@ -1810,7 +1884,10 @@ impl<'a> Parser<'a> {
 
     fn write_statement(&mut self) -> Result<WriteStatement, String> {
         match self.peek() {
-            Some(Tok::Create) | Some(Tok::Merge) if needs_per_row_form(&self.toks[self.pos..]) => {
+            Some(Tok::Create) | Some(Tok::Merge)
+                if needs_per_row_form(&self.toks[self.pos..])
+                    || writes_relationship_properties(&self.toks[self.pos..]) =>
+            {
                 self.unwind_write_stmt()
             }
             Some(Tok::Create) => self.create_stmt(),
@@ -1878,6 +1955,9 @@ impl<'a> Parser<'a> {
                 src_var,
                 etype,
                 dst_var,
+                rel_var: None,
+                props: Vec::new(),
+                props_map: None,
             });
             nodes.push(next);
         }
@@ -2172,6 +2252,11 @@ impl<'a> Parser<'a> {
     /// single-hop relationship.
     fn merge_rel(&mut self) -> Result<(Option<String>, String, RelDir), String> {
         let rel = self.rel()?;
+        self.merge_rel_checked(rel)
+    }
+
+    /// MERGE's checks on its relationship: single-hop, directed, one type.
+    fn merge_rel_checked(&self, rel: RelPat) -> Result<(Option<String>, String, RelDir), String> {
         if rel.hops.is_some() {
             return Err(
                 "not supported in mushroomdb 0.10: MERGE with a variable-length relationship"
@@ -2281,9 +2366,12 @@ impl<'a> Parser<'a> {
     fn match_write_stmt(&mut self) -> Result<WriteStatement, String> {
         // `MATCH … CREATE …` / `MATCH … MERGE …` run per matched row, as the
         // `UNWIND [1] AS _ MATCH …` form does.
+        // So do the statements that write a relationship's properties
+        // (`MATCH ()-[r]->() SET r.w = 1`): the per-row executor writes them.
         if self.toks[self.pos..]
             .iter()
             .any(|t| matches!(t, Tok::Create | Tok::Merge))
+            || writes_relationship_properties(&self.toks[self.pos..])
         {
             return self.unwind_write_stmt();
         }
