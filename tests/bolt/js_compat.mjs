@@ -186,21 +186,31 @@ async function explicitTxCommit(ctx) {
   check(num(committed.get('c')) === 1, `${committed.get('c')} committed nodes, expected 1`);
 
   session = ctx.driver.session();
-  let ids;
+  let rows;
   try {
     await session.executeWrite((tx) =>
-      tx.run('MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)', { a: 'p-auto', b: 'p-tx' }),
-    );
-    ids = await session.executeRead(async (tx) => {
-      const result = await tx.run('MATCH (a {id: $a})-[:K]->(b) RETURN b.id AS id ORDER BY id', {
+      tx.run('MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K {since: $y}]->(b)', {
         a: 'p-auto',
-      });
-      return result.records.map((r) => r.get('id'));
+        b: 'p-tx',
+        y: 2019,
+      }),
+    );
+    rows = await session.executeRead(async (tx) => {
+      const result = await tx.run(
+        'MATCH (a {id: $a})-[rel:K]->(b) RETURN b.id AS id, rel ORDER BY id',
+        { a: 'p-auto' },
+      );
+      return result.records.map((r) => [r.get('id'), r.get('rel')]);
     });
   } finally {
     await session.close();
   }
+  const ids = rows.map(([id]) => id);
   check(JSON.stringify(ids) === '["p-tx"]', `managed read saw ${JSON.stringify(ids)}`);
+  // QL-RP: a relationship property written from Cypher reads back through the driver.
+  const rel = rows[0][1];
+  check(rel.type === 'K', `relationship type ${rel.type}`);
+  check(num(rel.properties.since) === 2019, `relationship properties ${JSON.stringify(rel.properties)}`);
 }
 
 // 6. Explicit transaction rollback: the node is absent afterwards.
