@@ -212,7 +212,17 @@ pub fn check_query(q: &Query) -> Result<(), String> {
         scope = check_stage(scope, stage)?;
     }
     check_items(&scope, &q.returns)?;
-    check_order_by(&scope, &q.order_by, &q.returns)?;
+    // ORDER BY after RETURN sees RETURN's names: an alias shadows an earlier
+    // binding of the same name (`RETURN a AS p ORDER BY p.name`).
+    let mut order_scope = scope.clone();
+    for item in &q.returns {
+        if let Some(alias) = &item.alias {
+            order_scope
+                .vars
+                .insert(alias.clone(), item_kind(&scope, &item.value));
+        }
+    }
+    check_order_by(&order_scope, &q.order_by, &q.returns)?;
     Ok(())
 }
 
@@ -714,6 +724,8 @@ fn check_argument_kinds(scope: &Scope, name: &str, args: &[Operand]) -> Result<(
     if refused {
         let what = match arg {
             Operand::Var(v) => format!("`{v}`, {}", kind.describe()),
+            Operand::Lit(v) if v != &Value::Null => crate::value_ops::type_name_of(v).to_string(),
+            Operand::ListLit(_) => "a list".to_string(),
             _ => kind.describe().to_string(),
         };
         return Err(refuse(

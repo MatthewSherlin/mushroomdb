@@ -85,6 +85,8 @@ fn a_name_used_as_two_kinds_of_thing_is_a_type_conflict() {
             "MATCH (r) OPTIONAL MATCH ()-[r]-() RETURN r",
         ],
     );
+    let err = read_err("RETURN properties(1)");
+    assert!(err.contains("properties() cannot take an integer"), "{err}");
     let err = read_err("MATCH ()-[r]-() MATCH (r) RETURN r");
     assert!(err.contains("`r`"), "the message names the variable: {err}");
 }
@@ -298,6 +300,12 @@ fn valid_queries_pass_the_check() {
         "MATCH (a), (b) MATCH p = shortestPath((a)-[*]-(b)) RETURN p",
         "MATCH (a) OPTIONAL MATCH (a)-[r]->(b) RETURN a, r, b",
         "OPTIONAL MATCH (a) RETURN a",
+        // ORDER BY after RETURN sees RETURN's aliases, which shadow an
+        // earlier binding of the same name (QL-VE review I1).
+        "MATCH p = (a:Person)-[:KNOWS]->(b) RETURN a AS p ORDER BY p.name",
+        "WITH 1 AS m RETURN {a: m} AS m ORDER BY m.a",
+        "WITH [1, 2] AS tags RETURN {x: tags} AS tags ORDER BY tags.x",
+        "WITH 'abc' AS s MATCH (n:Person) RETURN n AS s ORDER BY s.name",
     ] {
         let tokens = lex(src).unwrap_or_else(|e| panic!("lex `{src}`: {e}"));
         if let Err(e) = parse_read(&tokens) {

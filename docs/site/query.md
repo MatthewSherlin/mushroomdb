@@ -1566,7 +1566,8 @@ map can`, `list index must be an integer, got …`, `map key must be a string, g
 Before QL-VE they were null. A subscript of a node, relationship or path variable
 reads nothing (null). An unaliased subscript names its own column
 (`n.location[0]`), so two subscripts of one list are two distinct columns. A
-write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does.
+write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does,
+except that a subscript of a variable there reads nothing rather than raising.
 
 ### Examples
 
@@ -1715,6 +1716,16 @@ that is not an integer (``range() expects integer arguments, got a string``); an
 `properties()` of a value that is not a node, relationship, map or null
 (``properties() expects a node, a relationship or a map, got an integer``). Each
 was null before QL-VE; a null argument is still null.
+
+`range()` takes integers only, so a float bound is an error even when it is whole
+(`range(0, 3.0)`; a driver that sends numbers as floats must send integers), while
+a list subscript reads a whole float index as an integer (`[1, 2, 3][1.0]` is `2`).
+A write statement's `RETURN` reads a subscript of any variable leniently (null),
+where a read query raises for a variable holding a value that is not a list or map.
+
+Not checked at compile time (refused, if at all, when a row reaches them): an
+`ORDER BY` expression when the projection aggregates, and a relationship's
+property map in a pattern (`-[r:T {w: foo()}]->`).
 
 Kept as before, under the boolean coercion above: a node or relationship as a
 `WHERE` predicate reads as true.
