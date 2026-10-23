@@ -282,3 +282,106 @@ fn refused_parameters_fail_the_request_and_store_nothing() {
     );
     assert_eq!(count, vec![vec![int(1)]], "the node kept no value");
 }
+
+/// The edge cases of each encoding: instants before 1970 (floored seconds
+/// with non-negative nanoseconds, and a 4.4 local-seconds form shifted by a
+/// negative offset), a negative Duration, and Binary at every PackStream
+/// length-marker boundary (`0xCC` ≤ 255 < `0xCD` ≤ 65535 < `0xCE`).
+fn edge_cases(version: (u8, u8)) -> Vec<(String, PackValue, Value)> {
+    // 1969-07-20T20:17:40.5-05:00.
+    let seconds_utc = -14_164_940;
+    let offset = -18_000;
+    let date_time = if version >= (5, 0) {
+        st(0x49, vec![int(seconds_utc), int(500_000_000), int(offset)])
+    } else {
+        st(
+            0x46,
+            vec![int(seconds_utc + offset), int(500_000_000), int(offset)],
+        )
+    };
+    // One microsecond before the epoch, two hours east.
+    let just_before = if version >= (5, 0) {
+        st(0x49, vec![int(-1), int(999_999_000), int(7_200)])
+    } else {
+        st(0x46, vec![int(7_199), int(999_999_000), int(7_200)])
+    };
+    let mut cases = vec![
+        (
+            "date_time_1969".to_string(),
+            date_time,
+            Value::DateTime {
+                micros_utc: seconds_utc * 1_000_000 + 500_000,
+                offset_seconds: offset as i32,
+            },
+        ),
+        (
+            "date_time_just_before_epoch".to_string(),
+            just_before,
+            Value::DateTime {
+                micros_utc: -1,
+                offset_seconds: 7_200,
+            },
+        ),
+        (
+            // 1900-01-01T00:00:00.000001.
+            "local_1900".to_string(),
+            st(0x64, vec![int(-2_208_988_800), int(1_000)]),
+            Value::LocalDateTime(-2_208_988_800 * 1_000_000 + 1),
+        ),
+        (
+            // -(14 months, 3 days, 14706.789000001 s): floored seconds.
+            "negative_duration".to_string(),
+            st(
+                0x45,
+                vec![int(-14), int(-3), int(-14_707), int(210_999_999)],
+            ),
+            Value::Duration {
+                months: -14,
+                days: -3,
+                nanos: -14_706_789_000_001,
+            },
+        ),
+    ];
+    for len in [255usize, 256, 65_535, 65_536] {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        cases.push((
+            format!("binary_{len}"),
+            PackValue::Bytes(bytes.clone()),
+            Value::Binary(bytes),
+        ));
+    }
+    cases
+}
+
+#[test]
+fn temporal_edge_cases_round_trip_through_storage_at_each_version() {
+    for version in VERSIONS {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SharedDb::open(dir.path()).unwrap();
+            let mut conn = connected(&db, version);
+            for (key, wire, engine) in edge_cases(version) {
+                let echoed = store(&mut conn, &key, wire.clone(), " RETURN n.v");
+                assert_eq!(echoed, vec![vec![wire.clone()]], "{key} at {version:?}");
+                let seen = db
+                    .reader()
+                    .query(
+                        "MATCH (n:T) WHERE n.id = $k RETURN n.v",
+                        &[("k".to_string(), Value::Str(key.clone()))].into(),
+                    )
+                    .unwrap();
+                assert_eq!(seen.get(0, "n.v"), Some(&engine), "{key} at {version:?}");
+            }
+        }
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut conn = connected(&db, version);
+        for (key, wire, _) in edge_cases(version) {
+            let back = rows(
+                &mut conn,
+                "MATCH (n:T) WHERE n.id = $k RETURN n.v",
+                vec![("k", PackValue::String(key.clone()))],
+            );
+            assert_eq!(back, vec![vec![wire]], "{key} at {version:?} after reopen");
+        }
+    }
+}
