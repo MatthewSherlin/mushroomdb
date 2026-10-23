@@ -132,6 +132,33 @@ A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, a
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
 
+## Value types
+
+Results and `RUN` parameters use the same mapping in both directions. A value sent as a parameter, stored, and read back arrives as it was sent.
+
+| mushroomdb value | Bolt value | Notes |
+|---|---|---|
+| null, boolean, integer, float, string, list, map | the PackStream type of the same name | |
+| binary | Bytes | Up to 1 MiB as a stored property. |
+| date | Date structure (`0x44`) | Days since 1970-01-01. |
+| local date-time | LocalDateTime structure (`0x64`) | Seconds and nanoseconds. |
+| date-time with a UTC offset | DateTime structure: `0x49` at Bolt 5.0, `0x46` at 4.4 | 5.0 counts seconds in UTC; 4.4 counts seconds in local time. A client must use the form its version uses; the other is refused. The offset is at most ±18:00. |
+| duration | Duration structure (`0x45`) | Months, days, seconds and nanoseconds, kept exactly. |
+
+mushroomdb keeps date-times to the microsecond. A result is sent with nanoseconds = microseconds × 1000. A local date-time or date-time parameter with a nanosecond part that is not a whole number of microseconds is refused, not rounded. A parameter too large for the engine's fields is refused too, for example a date past 32 bits of days, or a duration whose seconds overflow 64 bits of nanoseconds.
+
+These parameters are refused with `Neo.ClientError.Request.Invalid`, and the message names the type:
+
+| Bolt value | Why |
+|---|---|
+| DateTime with a named time zone (`0x69`, `0x66`) | Only a UTC offset is stored, not a zone name. Send the offset form. |
+| Time (`0x54`), LocalTime (`0x74`) | There is no time-of-day type. |
+| Point2D (`0x58`), Point3D (`0x59`) | There is no spatial type. |
+| Node, Relationship, Path | A graph entity is not a parameter value. |
+| any other structure tag | Unknown. |
+
+A temporal structure with the wrong number or type of fields fails the same way, as a malformed request. A refused parameter fails the `RUN` before the statement runs, so nothing is written; `RESET` makes the connection ready again.
+
 ### RESET while a request is running
 
 A `RESET` sent while an earlier request is still running takes effect at the first of these points:

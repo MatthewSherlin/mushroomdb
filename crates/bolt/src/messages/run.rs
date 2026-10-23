@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 
 use mushroomdb::{is_write_query, GraphError, ResultSet, SharedDb, Transaction, Value};
 
+use super::values::{
+    self, TAG_DATE, TAG_DATE_TIME, TAG_DURATION, TAG_LEGACY_DATE_TIME, TAG_LOCAL_DATE_TIME,
+};
 use super::{check_depth, MAX_PACK_LEN, TAG_RECORD};
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
@@ -121,19 +124,27 @@ impl RunRequest {
         })
     }
 
-    /// The parameters as engine values. A Bolt null is `Value::Null`, so
-    /// `$p IS NULL` is true for it; it is not left out, as the HTTP route
-    /// leaves a JSON null out. A structure is refused as a client error.
-    pub fn params(&self) -> Result<BTreeMap<String, Value>, BoltError> {
+    /// The parameters as engine values, read as the negotiated `version`
+    /// spells them. A Bolt null is `Value::Null`, so `$p IS NULL` is true for
+    /// it; it is not left out, as the HTTP route leaves a JSON null out. A
+    /// temporal structure becomes the engine's temporal value (see
+    /// [`values`](super::values)); any other structure is refused as a client
+    /// error.
+    pub fn params(&self, version: (u8, u8)) -> Result<BTreeMap<String, Value>, BoltError> {
         let mut out = BTreeMap::new();
         for (name, value) in &self.parameters {
-            out.insert(name.clone(), param_value(name, value, 0)?);
+            out.insert(name.clone(), param_value(name, value, version, 0)?);
         }
         Ok(out)
     }
 }
 
-fn param_value(name: &str, value: &PackValue, depth: usize) -> Result<Value, BoltError> {
+fn param_value(
+    name: &str,
+    value: &PackValue,
+    version: (u8, u8),
+    depth: usize,
+) -> Result<Value, BoltError> {
     if depth > MAX_DEPTH {
         return Err(BoltError::Invalid(format!(
             "parameter {name:?} is nested too deeply"
@@ -149,20 +160,16 @@ fn param_value(name: &str, value: &PackValue, depth: usize) -> Result<Value, Bol
         PackValue::List(items) => Value::List(
             items
                 .iter()
-                .map(|item| param_value(name, item, depth + 1))
+                .map(|item| param_value(name, item, version, depth + 1))
                 .collect::<Result<_, _>>()?,
         ),
         PackValue::Map(entries) => Value::Map(
             entries
                 .iter()
-                .map(|(k, v)| Ok((k.clone(), param_value(name, v, depth + 1)?)))
+                .map(|(k, v)| Ok((k.clone(), param_value(name, v, version, depth + 1)?)))
                 .collect::<Result<_, BoltError>>()?,
         ),
-        PackValue::Struct(_) => {
-            return Err(BoltError::Invalid(format!(
-                "parameter {name:?} is a structure; structure parameters are not supported yet"
-            )))
-        }
+        PackValue::Struct(s) => values::struct_param(name, s, version)?,
     })
 }
 
@@ -225,6 +232,9 @@ fn read_key_refusal() -> BoltError {
 pub struct QueryService {
     db: SharedDb,
     bookmark_timeout: Duration,
+    /// The negotiated Bolt version, which picks how temporal parameters are
+    /// read.
+    version: (u8, u8),
     /// Set when the client's `RESET` arrives while a request is running; a
     /// bookmark wait ends when it is set.
     interrupt: Arc<AtomicBool>,
@@ -246,6 +256,7 @@ impl QueryService {
         Self {
             db,
             bookmark_timeout: DEFAULT_BOOKMARK_TIMEOUT,
+            version: (5, 0),
             interrupt: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -254,6 +265,12 @@ impl QueryService {
     /// flag).
     pub(crate) fn with_interrupt(mut self, flag: Arc<AtomicBool>) -> Self {
         self.interrupt = flag;
+        self
+    }
+
+    /// Reads parameters as Bolt `version` spells them.
+    pub(crate) fn with_version(mut self, version: (u8, u8)) -> Self {
+        self.version = version;
         self
     }
 
@@ -271,7 +288,7 @@ impl QueryService {
         identity: &Identity,
         request: &RunRequest,
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
-        let params = request.params()?;
+        let params = request.params(self.version)?;
         let is_write = is_write_query(&request.query).map_err(BoltError::SyntaxError)?;
         self.wait_for_bookmarks(&request.bookmarks)?;
         if is_write && matches!(identity, Identity::ReadOnlyRole(_)) {
@@ -329,7 +346,7 @@ impl QueryService {
         if matches!(identity, Identity::Role(_) | Identity::ReadOnlyRole(_)) {
             return Err(tx_role_refusal());
         }
-        tx.execute(&request.query, &request.params()?)
+        tx.execute(&request.query, &request.params(self.version)?)
     }
 
     /// Opens a transaction: waits for the request's bookmarks, then freezes
@@ -537,7 +554,9 @@ fn structure(tag: u8, fields: Vec<PackValue>) -> PackValue {
 
 /// An engine value as PackStream. `version` picks the `DateTime` form: from
 /// Bolt 5.0 it is UTC-based (`0x49`), before that it counts local seconds
-/// (`0x46`).
+/// (`0x46`). The structures' field orders are listed in
+/// [`values`](super::values); microseconds go out as `micros × 1000`
+/// nanoseconds.
 pub fn pack_value(value: &Value, version: (u8, u8), depth: usize) -> Result<PackValue, BoltError> {
     if depth > MAX_DEPTH {
         return Err(BoltError::TooLarge(
@@ -565,9 +584,9 @@ pub fn pack_value(value: &Value, version: (u8, u8), depth: usize) -> Result<Pack
         Value::Binary(bytes) => PackValue::Bytes(bytes.clone()),
         // A null element of a query-built list or map (never stored).
         Value::Null => PackValue::Null,
-        Value::Date(days) => structure(0x44, vec![int(*days)]),
+        Value::Date(days) => structure(TAG_DATE, vec![int(*days)]),
         Value::LocalDateTime(micros) => structure(
-            0x64,
+            TAG_LOCAL_DATE_TIME,
             vec![
                 int(micros.div_euclid(MICROS_PER_SECOND)),
                 int(micros.rem_euclid(MICROS_PER_SECOND) * 1000),
@@ -579,11 +598,14 @@ pub fn pack_value(value: &Value, version: (u8, u8), depth: usize) -> Result<Pack
         } => {
             let seconds = micros_utc.div_euclid(MICROS_PER_SECOND);
             let nanos = micros_utc.rem_euclid(MICROS_PER_SECOND) * 1000;
-            if version >= (5, 0) {
-                structure(0x49, vec![int(seconds), int(nanos), int(*offset_seconds)])
+            if values::uses_utc_date_time(version) {
+                structure(
+                    TAG_DATE_TIME,
+                    vec![int(seconds), int(nanos), int(*offset_seconds)],
+                )
             } else {
                 structure(
-                    0x46,
+                    TAG_LEGACY_DATE_TIME,
                     vec![
                         int(seconds + i64::from(*offset_seconds)),
                         int(nanos),
@@ -597,7 +619,7 @@ pub fn pack_value(value: &Value, version: (u8, u8), depth: usize) -> Result<Pack
             days,
             nanos,
         } => structure(
-            0x45,
+            TAG_DURATION,
             vec![
                 int(*months),
                 int(*days),
@@ -671,7 +693,7 @@ mod tests {
         .unwrap();
         assert!(!format!("{secret:?}").contains("secret-param"));
         assert_eq!(
-            secret.params().unwrap().get("x"),
+            secret.params((5, 0)).unwrap().get("x"),
             Some(&Value::Str("secret-param".into()))
         );
     }
@@ -872,7 +894,7 @@ mod tests {
             PackValue::Map(vec![]),
         ])
         .unwrap();
-        let params = req.params().unwrap();
+        let params = req.params((5, 0)).unwrap();
         assert_eq!(params.get("kept"), Some(&Value::Int(1)));
         assert_eq!(params.get("top"), Some(&Value::Null));
         assert_eq!(
