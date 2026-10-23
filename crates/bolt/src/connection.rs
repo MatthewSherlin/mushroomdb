@@ -97,6 +97,13 @@ pub trait OpenTransaction: Send {
         cypher: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<Box<dyn ResultCursor>, BoltError>;
+
+    /// Whether the transaction applies a role's mask itself. A role token's
+    /// or `read` key's statements run only in one that does; any other is
+    /// refused to them.
+    fn is_scoped(&self) -> bool {
+        false
+    }
 }
 
 /// An open result cursor. Dropping it closes it.
@@ -506,7 +513,7 @@ impl Connection {
     /// A malformed request is a protocol violation; an unknown database, a
     /// bookmark timeout or a user to impersonate fails.
     fn handle_begin(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
-        let Some(service) = self.service.clone() else {
+        let (Some(service), Some(identity)) = (self.service.clone(), self.identity.clone()) else {
             return self.fail(BoltError::NotSupported(
                 "BEGIN is not supported on a connection with no database".into(),
             ));
@@ -520,7 +527,7 @@ impl Connection {
         if let Err(err) = select_database(self.routing.as_ref(), request.database.as_deref()) {
             return self.fail(err);
         }
-        let tx = match service.begin(&request) {
+        let tx = match service.begin(&identity, &request) {
             Ok(tx) => tx,
             Err(err) => {
                 return self

@@ -1197,9 +1197,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
 {
+    blocking_write_with(f, graph_err).await
+}
+
+/// [`blocking_write`] with the engine error answered by `on_err`.
+async fn blocking_write_with<T, F>(
+    f: F,
+    on_err: fn(GraphError) -> Response,
+) -> std::result::Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(graph_err(e)),
+        Ok(Err(e)) => Err(on_err(e)),
         Err(_) => Err(err_response("write task panicked")),
     }
 }
@@ -1521,6 +1533,18 @@ fn role_mask_err(e: GraphError) -> Response {
     }
 }
 
+/// Convert a role-scoped write's error into an HTTP response: a role the
+/// store no longer defines is 401, as it is for a read (`role_mask_err`) and
+/// over Bolt; anything else is [`graph_err`]. Unlike `role_mask_err`, a
+/// `Corrupt` keeps `graph_err`'s text, since on the write path it need not be
+/// about roles.
+fn role_write_err(e: GraphError) -> Response {
+    match e {
+        GraphError::KeyNotFound { key } if key.starts_with("role:") => unauthorized(),
+        other => graph_err(other),
+    }
+}
+
 fn err_response(detail: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1765,9 +1789,10 @@ async fn query(
             let cypher_c = cypher.clone();
             let params_c = params.clone();
             let db = state.db.clone();
-            return match blocking_write(move || {
-                db.write().query_write_authz(&role, &cypher_c, &params_c)
-            })
+            return match blocking_write_with(
+                move || db.write().query_write_authz(&role, &cypher_c, &params_c),
+                role_write_err,
+            )
             .await
             {
                 Ok(rs) => format_query_result(rs, format),

@@ -172,8 +172,8 @@ when you revoke an admin key.
 
 **Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
 tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
-`read` key reads under its role and is refused every statement that writes (and every statement in an
-explicit transaction) with `Neo.ClientError.Security.Forbidden`.
+`read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
+statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
 
 `keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
 keys back, so reissue or copy the file deliberately.

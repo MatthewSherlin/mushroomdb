@@ -10,7 +10,9 @@
 //!   the reply. A role token's reads run under its mask. Bookmarks in `extra`
 //!   delay the statement until the store has reached them.
 //! - **In a transaction** (state `InTx`): `Transaction::execute`, which buffers
-//!   writes and reads its own writes.
+//!   writes and reads its own writes. A role token's or `read` key's
+//!   transaction reads through the role's mask on its `BEGIN` snapshot and
+//!   refuses writes, as HTTP `/tx` does (see `messages::tx::ScopedTransaction`).
 //!
 //! The reply to `RUN` is `SUCCESS {fields, t_first}`; rows stay in a cursor
 //! until `PULL {n, qid}` sends up to `n` of them as `RECORD`s (`n = -1` is all)
@@ -35,7 +37,7 @@ use super::{check_depth, MAX_PACK_LEN, TAG_RECORD};
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
 use crate::messages::hello::Identity;
-use crate::messages::tx::{BeginRequest, ReadOnlyTransaction};
+use crate::messages::tx::{BeginRequest, ReadOnlyTransaction, ScopedTransaction};
 use crate::packstream::{PackStruct, PackValue, MAX_DEPTH};
 
 /// How long a statement waits for the store to reach a bookmark.
@@ -206,18 +208,26 @@ impl StreamRequest {
     }
 }
 
-/// The refusal for a role token that runs a statement in an explicit
-/// transaction: `Transaction::execute` does not apply a role's mask or write
-/// scope, so it must not be reachable by one.
-fn tx_role_refusal() -> BoltError {
-    BoltError::Forbidden(
-        "role-bound tokens cannot run statements in an explicit transaction".into(),
-    )
+/// The refusal for a role token that writes in an explicit transaction, word
+/// for word what HTTP `/tx/{id}/run` gives it: the transaction engine has no
+/// role-scoped write path (ledger row 140).
+pub(crate) fn tx_role_write_refusal() -> BoltError {
+    BoltError::Forbidden("role-bound token: writes are not permitted inside a transaction".into())
 }
 
-/// The refusal for a `read` key that runs a statement that writes.
-fn read_key_refusal() -> BoltError {
+/// The refusal for a `read` key that runs a statement that writes, the text
+/// HTTP gives it.
+pub(crate) fn read_key_refusal() -> BoltError {
     BoltError::Forbidden("read-tier key: writes are not permitted".into())
+}
+
+/// An error from a role-scoped statement: a role the store no longer defines
+/// is a failed login, as it is over HTTP (401); anything else maps as usual.
+pub(crate) fn role_mask_error(err: GraphError) -> BoltError {
+    match err {
+        GraphError::KeyNotFound { key } if key.starts_with("role:") => BoltError::Unauthorized,
+        other => BoltError::from(other),
+    }
 }
 
 /// What `RUN` needs from the store.
@@ -289,7 +299,7 @@ impl QueryService {
                 }
                 Identity::ReadOnlyRole(_) => unreachable!("refused above"),
             };
-            (result, self.db.reader().version)
+            (result.map_err(role_mask_error), self.db.reader().version)
         } else {
             match identity {
                 // The read the HTTP route makes for a full token (UNION
@@ -297,21 +307,19 @@ impl QueryService {
                 // together; until its parser matches, Bolt follows HTTP.
                 Identity::Full | Identity::Write => {
                     let result = self.db.read().query(&request.query, &params);
-                    (result, self.db.reader().version)
+                    (result.map_err(BoltError::from), self.db.reader().version)
                 }
                 Identity::Role(role) | Identity::ReadOnlyRole(role) => {
                     let snapshot = self.db.reader();
                     let result = snapshot
                         .mask_for_role(role)
-                        .and_then(|mask| snapshot.query_masked(&request.query, &params, &mask));
+                        .and_then(|mask| snapshot.query_masked(&request.query, &params, &mask))
+                        .map_err(role_mask_error);
                     (result, snapshot.version)
                 }
             }
         };
-        let result = result.map_err(|err| match err {
-            GraphError::KeyNotFound { key } if key.starts_with("role:") => BoltError::Unauthorized,
-            other => BoltError::from(other),
-        })?;
+        let result = result?;
         Ok(Box::new(RowCursor::new(
             result,
             is_write,
@@ -319,15 +327,22 @@ impl QueryService {
         )))
     }
 
-    /// Runs `request` inside `tx`.
+    /// Runs `request` inside `tx`. A scoped identity's `tx` is the
+    /// [`ScopedTransaction`] [`begin`](Self::begin) gave it, which applies the
+    /// role. A scoped identity holding any other transaction (one handed to
+    /// [`Connection::enter_tx`](crate::connection::Connection::enter_tx)
+    /// directly) is refused: `Transaction::execute` applies no mask.
     pub fn run_in_tx(
         &self,
         identity: &Identity,
         tx: &mut dyn OpenTransaction,
         request: &RunRequest,
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
-        if matches!(identity, Identity::Role(_) | Identity::ReadOnlyRole(_)) {
-            return Err(tx_role_refusal());
+        let scoped = matches!(identity, Identity::Role(_) | Identity::ReadOnlyRole(_));
+        if scoped && !tx.is_scoped() {
+            return Err(BoltError::Forbidden(
+                "role-bound tokens cannot run statements in an unscoped transaction".into(),
+            ));
         }
         tx.execute(&request.query, &request.params()?)
     }
@@ -335,8 +350,31 @@ impl QueryService {
     /// Opens a transaction: waits for the request's bookmarks, then freezes
     /// the snapshot every statement of the transaction reads. Blocks while it
     /// waits. A `mode: "r"` request gets a transaction that refuses writes.
-    pub fn begin(&self, request: &BeginRequest) -> Result<Box<dyn OpenTransaction>, BoltError> {
+    ///
+    /// A role token or a `read` key gets a [`ScopedTransaction`], as HTTP
+    /// `/tx/begin` gives it a scoped body: the role's mask is resolved here, on
+    /// the snapshot every statement reads, so a role the store no longer
+    /// defines is refused at `BEGIN`. It is read-only whatever `mode` says.
+    pub fn begin(
+        &self,
+        identity: &Identity,
+        request: &BeginRequest,
+    ) -> Result<Box<dyn OpenTransaction>, BoltError> {
         self.wait_for_bookmarks(&request.bookmarks)?;
+        let role = match identity {
+            Identity::Full | Identity::Write => None,
+            Identity::Role(role) => Some((role, false)),
+            Identity::ReadOnlyRole(role) => Some((role, true)),
+        };
+        if let Some((role, read_tier_key)) = role {
+            let snapshot = self.db.reader();
+            let mask = snapshot.mask_for_role(role).map_err(role_mask_error)?;
+            return Ok(Box::new(ScopedTransaction::new(
+                snapshot,
+                mask,
+                read_tier_key,
+            )));
+        }
         let tx: Box<dyn OpenTransaction> = Box::new(self.db.begin_transaction());
         Ok(if request.read_only {
             Box::new(ReadOnlyTransaction::new(tx))

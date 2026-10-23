@@ -844,6 +844,11 @@ fn a_pull_naming_another_qid_fails() {
 #[test]
 fn a_role_token_cannot_run_in_a_transaction() {
     let (db, _dir) = open_db("tx-role");
+    // The leak the refusal prevents is a read through a transaction that
+    // applies no mask, so a read is refused as well as a write.
+    let mut conn = in_tx(&db, ROLE);
+    let out = conn.handle(run("MATCH (n) RETURN n"));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
     let mut conn = in_tx(&db, ROLE);
     let out = conn.handle(run("CREATE (n:Sneak {id: 's1'})"));
     assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
