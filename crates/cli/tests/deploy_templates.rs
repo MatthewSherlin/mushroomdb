@@ -79,8 +79,12 @@ fn deploy_templates_show_backup_and_restore_on_boot_commented_out() {
             "{name} does not say what restore on boot does"
         );
         assert!(
-            text.contains("TODO(HO-14/HO-15)"),
-            "{name} lacks the placeholder"
+            text.contains("Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set"),
+            "{name} does not say how backup is turned on"
+        );
+        assert!(
+            !text.contains("TODO(HO-14/HO-15)"),
+            "{name} keeps a stale TODO"
         );
     }
     assert!(!template("railway/railway.json").contains("MUSHROOMDB_"));
@@ -295,7 +299,7 @@ fn k8s_token_comes_from_an_external_required_secret_and_no_secret_object_ships()
     let text = template("k8s/statefulset.yaml");
     assert!(!text.contains("<set-me>"), "no placeholder token value");
     assert!(!text.contains("stringData"));
-    assert!(text.contains("TODO(HO-14/HO-15)"));
+    assert!(text.contains("Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set"));
     let Some(documents) = k8s_documents() else {
         return;
     };

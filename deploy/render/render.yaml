@@ -55,5 +55,5 @@ services:
       # Restore on boot: an empty disk restores the newest backup there before serving.
       # - key: MUSHROOMDB_RESTORE_FROM_S3
       #   value: s3://<bucket>/<prefix>
-      # TODO(HO-14/HO-15): the rest of the backup settings go here. Nothing in
-      # this file turns backup on yet.
+      # Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+      # settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.
