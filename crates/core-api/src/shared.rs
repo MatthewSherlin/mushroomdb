@@ -874,6 +874,30 @@ impl SharedDb {
         ))
     }
 
+    /// Wrap a plain read-write handle into a shared one, keeping the
+    /// cross-process write lock the handle already holds.
+    ///
+    /// For a binding that opened with [`GraphDb::open`] — and so owns the
+    /// store's lock for the handle's lifetime — and now needs a [`SharedDb`]
+    /// to begin interactive transactions. Nothing is reopened: the loaded
+    /// state moves into the shared handle as it is, and the lock is released
+    /// only when the last clone of the result is dropped, so other openers see
+    /// the same [`GraphError::Busy`] they saw before the wrap.
+    ///
+    /// Fails with [`GraphError::ReadOnly`] for a read-only handle: it has no
+    /// lock to keep and nothing a transaction could commit to.
+    pub fn from_locked(db: GraphDb<RealFs>) -> Result<Self> {
+        if db.is_read_only() {
+            return Err(GraphError::ReadOnly);
+        }
+        let dir = db.store_dir();
+        Ok(Self::from_db_and_dir_with_sync(
+            db,
+            dir,
+            Arc::new(sync_wal_at),
+        ))
+    }
+
     /// Open with an injectable WAL sync function.
     ///
     /// Allows tests to inject fsync failures through the live drain thread
