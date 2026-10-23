@@ -1,0 +1,2 @@
+### Added
+- **`all`, `any`, `none` and `single` over lists.** `all(x IN list WHERE predicate)` and its three siblings parse in every expression position and follow openCypher's three-valued answers: `all` and `none` are true, `any` and `single` false, over an empty list; a null predicate answer makes the result null unless it is already decided; a null list gives null. The variable is scoped to the predicate. They are refused by name in the `RETURN` of a write statement, as list comprehensions are. (QL-LQ)

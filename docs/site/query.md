@@ -1407,11 +1407,15 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `nodes(p)` | path | `List` | the path's nodes in walk order; the same as `p.nodes`, so over Bolt a list of Nodes |
 | `relationships(p)` | path | `List` | the path's relationships in walk order, each a `{type, start, end}` map; the same as `p.relationships`, so over Bolt a list of Relationships |
 | `length(p)` | path | `Int` | the number of relationships in the path; the same as `p.length` |
-| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `time(…)`, `localtime(…)` | | | error: `not supported in mushroomdb 0.10: time types` |
+| `date([x])` | `String`, `Map` or temporal | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null → null; unreadable, out-of-range or wrong-type input → an error naming the function. Storing a result moves the store to the V11 format |
+| `localdatetime([x])` | `String`, `Map` or temporal | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `datetime([x])` | `String`, `Map` or temporal | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00, `+0530` and `+05` read too), a string with no offset is read as UTC; no argument is now. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`, any of them fractional) or `duration("P1Y2M3DT4H")`. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `date.truncate(unit, x[, map])`, `localdatetime.truncate(…)`, `datetime.truncate(…)` | `String`, temporal, `Map` | the namespace's type | `x` cut to `unit` (`millennium`, `century`, `decade`, `year`, `weekYear`, `quarter`, `month`, `week`, `day`, and for the date-time types `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond`); `map` then sets fields below the unit: `date.truncate('week', d, {dayOfWeek: 2})` |
+| `date.statement([tz])`, `.transaction([tz])`, `.realtime([tz])`, the same on `localdatetime` and `datetime` | offset `String` or `{timezone: …}` | the namespace's type | the current instant, as `date()` gives it, on the clock of the offset `tz` (default UTC). Each call reads the clock |
+| `datetime.fromepoch(s, ns)`, `datetime.fromepochmillis(ms)` | `Int` | `DateTime` | the UTC instant `s` seconds plus `ns` nanoseconds, or `ms` milliseconds, after 1970-01-01 |
+| `duration.between(a, b)`, `duration.inMonths(a, b)`, `duration.inDays(a, b)`, `duration.inSeconds(a, b)` | temporal ×2 | `Duration` | from `a` to `b`: whole months, then whole days, then the time (`between`), or all of it in one unit. Two values with offsets compare as instants; otherwise each is read on its own wall clock, a date at midnight |
+| `time(…)`, `localtime(…)`, and the `time.` and `localtime.` functions | | | error: `not supported in mushroomdb 0.10: time types` |
 
 ### Temporal values
 
@@ -1427,15 +1431,46 @@ days.
 the duration's time part. Durations add, subtract, and scale with `*` and `/` by
 a number. An out-of-range result is null.
 
+A constructor gives a value or an error that names the function, never null for
+a bad input: an unreadable string, an unknown, conflicting or out-of-range map
+field, and an argument of the wrong type are errors. A null argument, or a null
+map field (`date({year: n.y})` with no `y`), gives null.
+
 Strings must be the extended ISO 8601 form the types print: `datetime` needs a
-time (`datetime("2024-03-15")` is null) and `date` takes no time
-(`date("2024-03-15T10:00:00")` is null; convert with `date(datetime(…))`).
-Compact forms (`20240315`) and named time zones (`[Europe/Paris]`, or a `timezone`
-key in a map) are not supported and give null. A map constructor takes
-`year` (required), `month`, `day`, and, for `localdatetime` and `datetime`,
-`hour`, `minute`, `second`, `millisecond`, `microsecond` and `nanosecond`, all
-integers; a `datetime` map is read as UTC. Years outside about ±5.88 million for
-`Date`, and ±292 thousand for date-times, give null.
+time (`datetime("2024-03-15")` is an error) and `date` takes no time
+(`date("2024-03-15T10:00:00")` is an error; convert with `date(datetime(…))`).
+Compact forms (`20240315`), week and ordinal date strings (`2015-W30-2`,
+`2015-202`) and fractional duration strings other than seconds (`P1.5D`) are
+not read and are errors.
+
+A map constructor names its date in one of four ways, with `year` required:
+`month` and `day`; `week` and `dayOfWeek` (ISO weeks, so `year` is the
+week-year: `{year: 1817, week: 1}` is 1816-12-30); `quarter` and
+`dayOfQuarter`; or `ordinalDay`. A field needs the one above it (`day` needs
+`month`, `minute` needs `hour`); omitted fields default to the first day and to
+midnight. `localdatetime` and `datetime` add `hour`, `minute`, `second`,
+`millisecond`, `microsecond` and `nanosecond`; the sub-second fields are parts of
+one fraction (`{millisecond: 123, microsecond: 456}` is `.123456`, and
+`microsecond: 645876` alone is `.645876`). `datetime` also takes `timezone`, an
+offset string (`'+01:00'`, `'Z'`), and `epochSeconds` or `epochMillis` in place
+of the date and time fields; with no `timezone` it is UTC.
+
+A map can also start from another value and override fields: `date: x` takes
+`x`'s date, `time: x` its time of day (and offset), `datetime: x` both:
+`date({date: d, day: 1})`, `localdatetime({date: d, time: t, second: 0})`.
+Given a `timezone`, a `datetime: x` with an offset keeps its instant
+(`datetime({datetime: x, timezone: '+05:00'})` moves the wall clock), a
+`time: x` with an offset moves its time of day, and a local one keeps its wall
+clock. An override that leaves the day invalid for the new month or year is
+an error, not a clamp: `date({date: date('2020-01-31'), month: 2})` fails, as
+does `date({year: 1900, month: 2, day: 29})` (1900 is not a leap year; 2000 is).
+
+Values hold microseconds. A nanosecond field, or a string with more than six
+fraction digits, is truncated to the microsecond toward the earlier instant,
+never rounded; durations keep nanoseconds. Named time zones
+(`'Europe/Paris'`, `[Europe/Paris]`) fail with
+`not supported in mushroomdb 0.10: named time zones`. Years outside about ±5.88
+million for `Date`, and ±292 thousand for date-times, are an error.
 
 A temporal value can be stored: `SET n.d = date("2024-01-01")` writes a `Date`.
 The first such write moves the store to the V11 snapshot format, which 0.9.x
@@ -1515,11 +1550,12 @@ for nested literals).
 As a value a predicate is three-valued: true, false or null. A comparison or `IN`
 with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
 `NOT null` is null; `null AND false` is false and `null OR true` is true;
-`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Only numbers,
-strings, temporal values of one type, and binary values order; any other pair
-compares as null under `<`, `<=`, `>` and `>=`, so `1 < 'a'`, `false < true` and
-`[1] < [2]` are all null (booleans and lists do not order). Values of different
-types are unequal (`1 = 'a'` is false).
+`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Numbers,
+strings, booleans (`false` before `true`), temporal values of one type, and binary
+values order; any other pair compares as null under `<`, `<=`, `>` and `>=`, so
+`1 < 'a'`, `true < 1` and `[1] < [2]` are all null (lists do not order), while
+`false < true` is true. Values of different types are unequal (`1 = 'a'` is
+false).
 
 A non-boolean operand of `NOT`, `AND`, `OR` or `XOR`, or a whole `WHERE` that is a
 bare value (`WHERE n.flag`), reads as true unless it is empty or zero (a non-empty
@@ -1590,10 +1626,16 @@ MATCH (n:Place) RETURN n.location[0] AS lat, n.location[1] AS lon
 MATCH (n:Place) WHERE n.tags[-1] = 'primary' RETURN key(n)
 ```
 
-Out of range, a non-list base and a non-integer index all evaluate to `null` —
-never an error, and never a match. An unaliased subscript names its own column
+An index out of range, an absent map key, and a null base or index evaluate to
+`null`. A base that is not a list or a map (`'abc'[0]`, `123[0]`), a list index
+that is not an integer (`[1, 2][true]`, `[1, 2][1.5]`) and a map key that is not a
+string (`{a: 1}[0]`) are type errors: `a string cannot be indexed; only a list or a
+map can`, `list index must be an integer, got …`, `map key must be a string, got …`.
+Before QL-VE they were null. A subscript of a node, relationship or path variable
+reads nothing (null). An unaliased subscript names its own column
 (`n.location[0]`), so two subscripts of one list are two distinct columns. A
-write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does.
+write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does,
+except that a subscript of a variable there reads nothing rather than raising.
 
 ### Examples
 
@@ -1628,7 +1670,7 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)` — null in gives null, a wrong type is an error naming the function |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
-| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
+| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range → null; a non-list base or a non-integer index is a type error |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
 | `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
 | Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d` — projects with or without a HAVING clause |
@@ -1694,10 +1736,12 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | List and map literals | `RETURN [1, n.x, 'a'] AS l, {a: 1, b: [2, 3]} AS m` — elements and values are any expression; `` {`c d`: 1} `` quotes a key. A map's keys come back sorted, not in written order: `keys({b: 1, a: 2})` is `['a', 'b']` |
 | Null inside a list or map | `RETURN [1, null] AS l`, `[n.x, n.missing]`, `{a: null}` — the element stays null in every output (Rust `Value::Null`, JSON `null`, Python `None`, TS `null`, Arrow text `[1, null]`). `size([null]) = 1`, `head([null, 1])` is null, `keys({a: null})` is `['a']`. Equality is three-valued: `[1, null] = [1, null]` is null (the row is dropped), `[1, null] = [2, null]` is false. A stored property cannot hold one (see Named-error) |
 | List comprehensions | `RETURN [x IN n.tags WHERE x <> 'old' \| x] AS active`, `[x IN [1, 2, 3] \| x * 10]`, `[x IN n.scores WHERE x > 0]` — `WHERE` and `\| expr` are each optional (no `\| expr` keeps the element). Usable in `WHERE`, `RETURN`, `ORDER BY`, `UNWIND` and as a function argument, and they nest. The variable exists only inside the comprehension and shadows an outer variable of the same name there. A null list (or a non-list) gives null; a null element is a real element, so it passes through `\| expr`, and a `WHERE` that is null drops it. Not supported in the `RETURN` of a write statement (see Named-error) |
+| List predicates | `WHERE all(x IN n.scores WHERE x > 0)`, `RETURN any(t IN n.tags WHERE t = 'new') AS fresh`, `none(…)`, `single(…)` — `all|any|none|single(x IN list WHERE predicate)`, the `WHERE` required. Usable anywhere an expression is, and they nest with each other and with comprehensions. The variable exists only inside the predicate and shadows an outer variable of the same name there. Three-valued, over the predicate's answer for each element: `all` is false if any answer is false, else null if any is null, else true (true on an empty list); `any` is true if any answer is true, else null if any is null, else false; `none` is false if any answer is true, else null if any is null, else true; `single` is false if more than one answer is true, else null if any is null, else true exactly when one answer is true (false on an empty list). A null list (or a non-list) gives null. In a `WHERE`, a null answer drops the row. Not supported in the `RETURN` of a write statement (see Named-error) |
 | `reduce()` | `RETURN reduce(total = 0, x IN n.scores \| total + x) AS sum`, `reduce(s = '', w IN n.words \| s + w)` — `reduce(acc = init, x IN list \| expr)`. `init` and `list` are read in the enclosing scope; `acc` and `x` exist only inside `expr` and shadow outer names there. An empty list gives `init`; a null list (or a non-list) gives null; a null `expr` value makes the accumulator null for the next step. Usable anywhere an expression is, and it nests with itself and with list comprehensions. Not supported in the `RETURN` of a write statement (see Named-error) |
 | Query without `MATCH` | `RETURN 1 + 1 AS x`, `UNWIND [1, 2, 3] AS x RETURN x`, `WITH 1 AS a RETURN a` — reads no graph and runs against one empty row; `UNWIND [] AS x` gives no rows |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
+| Temporal constructors and namespaced temporal functions | `RETURN date({year: 1984, week: 10, dayOfWeek: 3}) AS d`, `datetime({date: d, hour: 12, timezone: '+01:00'})`, `date.truncate('month', n.at)`, `duration.between(a.since, b.since)`, `datetime.fromepochmillis(n.ms)` — see [Temporal values](#temporal-values); a bad input is an error, never null |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
 | `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
@@ -1709,6 +1753,51 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok` — a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
+
+### Compile-time checks
+
+After a statement parses, and before it is planned or reads a row, a check refuses
+what openCypher defines as an error whatever the data. The error is a `parse:`
+error whose message opens with the openCypher error kind and names the variable
+or function: ``parse: VariableTypeConflict: `r` is a relationship and cannot be
+used as a node``. A name whose kind is known only when a row is read (an `UNWIND`
+alias, a `$param`, a function's result) is never refused for its kind.
+
+| Kind | Refused | Example |
+|---|---|---|
+| `VariableTypeConflict` | A name bound as a node, relationship, path or literal value, then used in a pattern as another of these, in one `MATCH` or a later one | `MATCH ()-[r]-() MATCH (r)`, `MATCH (r)-[r]-()`, `MATCH r = ()-[]-(), (r)`, `WITH 123 AS n MATCH (n)` |
+| `VariableAlreadyBound` | A path name that is already bound, or that names a part of its own pattern; a `CREATE` of a bound node alone | `MATCH (p) MATCH p = ()-[]-()`, `MATCH p = (p)-[]-()`, `MATCH (a) CREATE (a)` |
+| `InvalidAggregation` | An aggregate in a `WHERE`, or in an `ORDER BY` whose projection does not aggregate | `MATCH (a) WHERE count(a) > 10`, `WITH n.x AS x ORDER BY max(n.y)` |
+| `NoExpressionAlias` | An aggregate in `WITH` with no `AS` (an unaliased scalar still names itself) | `WITH a, count(*)` |
+| `ColumnNameConflict` | Two `WITH` items with one name | `WITH 1 AS a, 2 AS a` |
+| `InvalidClauseComposition` | `UNION` and `UNION ALL` in one query | `RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a` |
+| `DifferentColumnsInUnion` | `UNION` parts whose columns (aliases, variables, `var.field`) differ | `RETURN 1 AS a UNION RETURN 2 AS b` |
+| `UnknownFunction` | A call of a function that does not exist, even where no row would reach it | `MATCH (a) RETURN foo(a)` |
+| `InvalidArgumentType` | `type()` of a node or path; `length()` of a node or relationship; `size()` of a path; `properties()` of a literal number, string, boolean or list; `IN` a literal that is not a list; a property of a literal number, string, boolean or list; a path property other than `length`, `nodes`, `relationships` | `MATCH (n) RETURN type(n)`, `RETURN properties(1)`, `RETURN 1 IN 123`, `WITH 123 AS x RETURN x.num`, `MATCH p = ()-[*]->() WHERE p.name = 'a'` |
+
+Planning reads no row either: its errors (an unbound variable, a duplicate
+`RETURN` column, `ORDER BY` a column a `DISTINCT` projection drops) are `plan:`
+errors on every read entry point.
+
+Type errors at run time, where the value is known only then: a subscript of the
+wrong type (see [List subscripts](#list-subscripts)); `range()` with an argument
+that is not an integer (``range() expects integer arguments, got a string``); and
+`properties()` of a value that is not a node, relationship, map or null
+(``properties() expects a node, a relationship or a map, got an integer``). Each
+was null before QL-VE; a null argument is still null.
+
+`range()` takes integers only, so a float bound is an error even when it is whole
+(`range(0, 3.0)`; a driver that sends numbers as floats must send integers), while
+a list subscript reads a whole float index as an integer (`[1, 2, 3][1.0]` is `2`).
+A write statement's `RETURN` reads a subscript of any variable leniently (null),
+where a read query raises for a variable holding a value that is not a list or map.
+
+Not checked at compile time (refused, if at all, when a row reaches them): an
+`ORDER BY` expression when the projection aggregates, and a relationship's
+property map in a pattern (`-[r:T {w: foo()}]->`).
+
+Kept as before, under the boolean coercion above: a node or relationship as a
+`WHERE` predicate reads as true.
 
 ### Named-error
 
@@ -1732,12 +1821,15 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN (found …)` |
 | `RETURN *` / `WITH *` with no node, path or value name in scope | `RETURN * / WITH * with no variables in scope` |
 | `RETURN *` after a `CALL` with no `YIELD` list | `RETURN * after CALL needs a YIELD list; name the columns with YIELD` |
+| A temporal constructor or function given a bad input (`date({year: 2024, month: 13})`, `date('nope')`, `date(42)`) | ``date(): `month` 13 is outside 1..=12``, `date(): cannot read 'nope' as a Date`, `date() expects a string, a map or a temporal value, got an integer` |
+| A named time zone (`datetime({year: 2024, timezone: 'Europe/Paris'})`) | `not supported in mushroomdb 0.10: named time zones` |
 | A label test on a value (`UNWIND [1] AS x RETURN x:L`) | ``x:L: `x` is not a node or a relationship`` |
 | Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
 | List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
+| List predicate in the `RETURN` of a write statement | `a list predicate is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and test it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | ``execute: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — the message lists every scalar function |
+| Unknown function name | ``parse: UnknownFunction: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — refused at compile time (see [Compile-time checks](#compile-time-checks)); the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
@@ -1766,9 +1858,7 @@ unexpected-token parse error or other unspecified result.
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
 | A node with no label or no string `id` (`CREATE ()`, `CREATE (:A {name: 'x'})`): a parse error or a named error; the label and the key are required |
 | Comma-separated patterns in `CREATE` (`CREATE (a:A {id: 'a'}), (b:B {id: 'b'})`): a parse error; use a chain or two `CREATE` clauses |
-| List predicates `all(…)`, `any(…)`, `none(…)`, `single(…)` (a parse error) |
 | List slices `l[1..3]`, `l[..2]` (a parse error) |
-| Namespaced temporal functions `date.truncate`, `datetime.fromepoch`, `duration.between`, `duration.inMonths`, … (a parse error) |
 | Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
 | Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
 | `OPTIONAL MATCH` followed by a write clause (`OPTIONAL MATCH (n) SET n.x = 1`): a parse error |

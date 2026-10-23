@@ -2,10 +2,10 @@
 
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, DdlStatement, EdgeDelete, Expr,
-    HopRange, LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
-    MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
-    OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
-    UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
+    HopRange, LimitSkip, ListPredKind, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt,
+    MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause,
+    OrderItem, OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal,
+    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
 };
 use unwind_write::{Scope, VarKind};
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
@@ -28,6 +28,8 @@ const MAX_EXPR_DEPTH: usize = MAX_PAREN_DEPTH;
 
 /// Parse a tokenized Cypher subset query. Every failure is `Err(String)`; this
 /// function never panics on a well-formed `&[Tok]` (including empty / garbage).
+/// A query that parses is then checked ([`check`](super::check)): an invalid
+/// one is refused before it is planned.
 pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
     let mut p = Parser {
         toks: tokens,
@@ -41,6 +43,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         // error here. Use `parse_read` to accept a `UNION` chain.
         return Err(p.unsupported_or_unexpected("unexpected tokens after query"));
     }
+    super::check::check_query(&q)?;
     Ok(q)
 }
 
@@ -59,7 +62,8 @@ pub(crate) fn kw(tok: Option<&Tok>, word: &str) -> bool {
     matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(word))
 }
 
-/// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
+/// Parse a read query, accepting a `UNION` / `UNION ALL` chain, and check it
+/// ([`check`](super::check)).
 pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     let mut p = Parser {
         toks: tokens,
@@ -81,11 +85,14 @@ pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     if p.pos < p.toks.len() {
         return Err(p.err("unexpected tokens after UNION query"));
     }
-    Ok(UnionQuery { parts, all_flags })
+    let union = UnionQuery { parts, all_flags };
+    super::check::check_union(&union)?;
+    Ok(union)
 }
 
 /// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
-/// Returns `Err` for read queries or malformed write statements.
+/// Returns `Err` for read queries or malformed write statements, and for a
+/// statement the compile-time check ([`check`](super::check)) refuses.
 pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
     let mut p = Parser {
         toks: tokens,
@@ -93,7 +100,9 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
         literal_depth: 0,
         expr_depth: 0,
     };
-    p.write_statement()
+    let stmt = p.write_statement()?;
+    super::check::check_write(&stmt)?;
+    Ok(stmt)
 }
 
 /// Parse a procedure call statement, `CALL ns.name(args) [YIELD …] [WHERE …]
@@ -325,6 +334,19 @@ fn is_null_literal(name: &str) -> bool {
 /// A predicate in a value position.
 fn pred(expr: Expr) -> Operand {
     Operand::Pred(Box::new(expr))
+}
+
+/// The quantifier a function name spells, in any case.
+fn list_pred_kind(name: &str) -> Option<ListPredKind> {
+    [
+        ("all", ListPredKind::All),
+        ("any", ListPredKind::Any),
+        ("none", ListPredKind::None),
+        ("single", ListPredKind::Single),
+    ]
+    .into_iter()
+    .find(|(n, _)| name.eq_ignore_ascii_case(n))
+    .map(|(_, kind)| kind)
 }
 
 /// The predicate an expression stands for in a WHERE: a predicate is itself;
@@ -1463,6 +1485,42 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Whether the tokens after `name` `(` read `ident IN`: the head of a
+    /// list predicate. Anything else is an ordinary function call, so a
+    /// user function named `any` keeps working.
+    fn list_predicate_ahead(&self) -> bool {
+        matches!(
+            (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+            (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) if kw.eq_ignore_ascii_case("in")
+        )
+    }
+
+    /// The rest of `all|any|none|single(x IN list WHERE pred)`, after the
+    /// name. It nests like a list literal, so it shares `literal_depth` and
+    /// its limit.
+    fn list_predicate(&mut self, kind: ListPredKind) -> Result<Operand, String> {
+        const SHAPE: &str = "a list predicate takes (x IN list WHERE predicate)";
+        self.expect(&Tok::LParen, "expected '(' after the list predicate name")?;
+        self.enter_literal()?;
+        let var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        let list = self.value_expr()?;
+        if !self.eat(&Tok::Where) {
+            return Err(self.err(SHAPE));
+        }
+        let pred = self.where_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close a list predicate")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListPredicate {
+            kind,
+            var,
+            list: Box::new(list),
+            pred: Box::new(pred),
+        })
+    }
+
     /// The rest of `reduce(acc = init, x IN list | body)`, after the name.
     /// It nests like a list literal, so it shares `literal_depth` and its
     /// limit.
@@ -1620,21 +1678,27 @@ impl<'a> Parser<'a> {
                 if name.eq_ignore_ascii_case("reduce") && self.peek() == Some(&Tok::LParen) {
                     return self.reduce_call();
                 }
+                if let Some(kind) = list_pred_kind(&name) {
+                    if self.peek() == Some(&Tok::LParen) && self.list_predicate_ahead() {
+                        return self.list_predicate(kind);
+                    }
+                }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
-                    // Function arguments may be arbitrary arithmetic expressions.
-                    self.pos += 1; // consume '('
-                    let mut args = Vec::new();
-                    if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.value_expr()?);
-                        while self.eat(&Tok::Comma) {
-                            args.push(self.value_expr()?);
-                        }
-                    }
-                    self.expect(&Tok::RParen, "expected ')' to close function call")?;
+                    let args = self.function_args()?;
                     Ok(Operand::FuncCall { name, args })
                 } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
+                    // `ns.name(…)` is a namespaced function call
+                    // (`date.truncate(…)`); no property access is followed
+                    // by `(`.
+                    if self.peek() == Some(&Tok::LParen) {
+                        let args = self.function_args()?;
+                        return Ok(Operand::FuncCall {
+                            name: format!("{name}.{field}"),
+                            args,
+                        });
+                    }
                     Ok(Operand::Prop { var: name, field })
                 } else if let Some(b) = bool_literal(&name) {
                     Ok(Operand::Lit(Value::Bool(b)))
@@ -1653,6 +1717,21 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// `(arg, …)` of a function call, from its `(`. Arguments may be
+    /// arbitrary arithmetic expressions.
+    fn function_args(&mut self) -> Result<Vec<Operand>, String> {
+        self.expect(&Tok::LParen, "expected '(' to open function call")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            args.push(self.value_expr()?);
+            while self.eat(&Tok::Comma) {
+                args.push(self.value_expr()?);
+            }
+        }
+        self.expect(&Tok::RParen, "expected ')' to close function call")?;
+        Ok(args)
     }
 
     /// `var:Label` after the variable: a label predicate, parsed to the
@@ -2672,6 +2751,7 @@ impl<'a> Parser<'a> {
                     | Operand::MapLit(_)
                     | Operand::ListComprehension { .. }
                     | Operand::Reduce { .. }
+                    | Operand::ListPredicate { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) if row => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
@@ -3532,7 +3612,7 @@ LIMIT 10";
     #[test]
     fn union_query_parses_into_parts() {
         use super::parse_read;
-        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m").unwrap())
+        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m AS n").unwrap())
             .expect("UNION parses");
         assert_eq!(u.parts.len(), 2);
         assert_eq!(u.all_flags, vec![true]);

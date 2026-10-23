@@ -6,7 +6,7 @@
 //! and a comprehension filter evaluate with the same function and keep a row
 //! only when the answer is true (`exec::eval_expr`).
 
-use super::ast::{Expr, Operand};
+use super::ast::{Expr, ListPredKind, Operand};
 use crate::filter::{eval_cmp3, CmpOp};
 use core_storage::Value;
 
@@ -21,6 +21,23 @@ pub fn eval_predicate<E>(
     error: &dyn Fn(String) -> E,
 ) -> Result<Option<bool>, E> {
     eval(expr, resolve, error, 0)
+}
+
+/// The answer of `all`/`any`/`none`/`single` given how many of the predicate's
+/// per-element answers were true, false and null. See `ListPredKind` for the
+/// tables; the TCK's "lists containing nulls" scenarios are the authority.
+pub fn quantify(kind: ListPredKind, trues: usize, falses: usize, nulls: usize) -> Option<bool> {
+    match kind {
+        ListPredKind::All if falses > 0 => Some(false),
+        ListPredKind::All => (nulls == 0).then_some(true),
+        ListPredKind::Any if trues > 0 => Some(true),
+        ListPredKind::Any => (nulls == 0).then_some(false),
+        ListPredKind::None if trues > 0 => Some(false),
+        ListPredKind::None => (nulls == 0).then_some(true),
+        ListPredKind::Single if trues > 1 => Some(false),
+        ListPredKind::Single if nulls > 0 => None,
+        ListPredKind::Single => Some(trues == 1),
+    }
 }
 
 /// How a value reads as a predicate, at the root of a WHERE (`WHERE n.flag`)

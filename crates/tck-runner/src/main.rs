@@ -151,10 +151,11 @@ fn main() -> ExitCode {
                 Outcome::Pass(Some(raised)) => {
                     let _ = writeln!(
                         out,
-                        "PASS-ERROR {}\n  expected {} at {}; engine: {}",
+                        "PASS-ERROR {}\n  expected {} at {}: {}; engine: {}",
                         s.label(),
                         raised.expected_type,
                         raised.expected_phase,
+                        raised.expected_detail,
                         raised.engine_message.replace('\n', " ")
                     );
                 }

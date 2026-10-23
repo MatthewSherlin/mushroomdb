@@ -18,8 +18,8 @@
 //! [`UnifiedIndex::lookup_range`] exactly those its `eval_cmp` puts within the
 //! bounds. Keys are stored by variant, so the lookups bridge what the keys do
 //! not: `Int` and `Float` are one numeric class (`2 = 2.0`), compared as `f64`
-//! by total order (`-0.0 < 0.0`, `NaN` above `+inf`); `Bool` is not ordered;
-//! two `DateTime`s at one instant are equal yet ordered by offset.
+//! by total order (`-0.0 < 0.0`, `NaN` above `+inf`); `false` orders before
+//! `true` (defect row 160); two `DateTime`s at one instant are equal yet ordered by offset.
 //!
 //! Nothing here is persisted: declarations replay from the WAL and the
 //! postings rebuild at open ([`UnifiedIndex::rebuild_all`]).
@@ -463,8 +463,9 @@ impl UnifiedIndex {
     /// So, as in the scan: a bound orders only with its own class — numbers
     /// (`Int` and `Float` together, compared as `f64` by total order: `-0.0`
     /// sorts below `0.0`, `NaN` above `+inf` and `-NaN` below `-inf`), `Str`,
-    /// `Date`, `LocalDateTime`, `DateTime` (by instant, then by offset), or
-    /// `Binary`; a `Bool`, `List`, `Map` or `Duration` bound, or two bounds of
+    /// `Date`, `LocalDateTime`, `DateTime` (by instant, then by offset),
+    /// `Binary`, or `Bool` (`false` before `true`, defect row 160); a `List`,
+    /// `Map` or `Duration` bound, or two bounds of
     /// different classes, match nothing; an empty or inverted range matches
     /// nothing. With both bounds `None`, every indexed node is returned.
     ///
@@ -492,9 +493,11 @@ impl UnifiedIndex {
             OrderClass::DateTime => {
                 datetime_range(postings, self.offsets.get(&pair(label, field)), lo, hi)
             }
-            OrderClass::Str | OrderClass::Date | OrderClass::LocalDateTime | OrderClass::Binary => {
-                key_range(postings, lo, hi)
-            }
+            OrderClass::Str
+            | OrderClass::Date
+            | OrderClass::LocalDateTime
+            | OrderClass::Binary
+            | OrderClass::Bool => key_range(postings, lo, hi),
         }
     }
 
@@ -744,6 +747,7 @@ enum OrderClass {
     LocalDateTime,
     DateTime,
     Binary,
+    Bool,
 }
 
 fn order_class(v: &Value) -> Option<OrderClass> {
@@ -754,9 +758,8 @@ fn order_class(v: &Value) -> Option<OrderClass> {
         Value::LocalDateTime(_) => Some(OrderClass::LocalDateTime),
         Value::DateTime { .. } => Some(OrderClass::DateTime),
         Value::Binary(_) => Some(OrderClass::Binary),
-        Value::Bool(_) | Value::List(_) | Value::Map(_) | Value::Duration { .. } | Value::Null => {
-            None
-        }
+        Value::Bool(_) => Some(OrderClass::Bool),
+        Value::List(_) | Value::Map(_) | Value::Duration { .. } | Value::Null => None,
     }
 }
 
@@ -785,7 +788,7 @@ fn admits(ord: std::cmp::Ordering, lower: bool, inclusive: bool) -> bool {
 }
 
 /// A range over a class whose key order is the scan's order: `Str`, `Date`,
-/// `LocalDateTime` and `Binary`.
+/// `LocalDateTime`, `Binary` and `Bool`.
 fn key_range<'a>(
     postings: &'a Postings,
     lo: Option<(&Value, bool)>,
@@ -823,8 +826,8 @@ fn key_range<'a>(
     )
 }
 
-/// A class [`UnifiedIndex::lookup_ordered`] walks: one a range orders
-/// within, or `Bool`, which sorts (between strings and dates) but has no range.
+/// A class [`UnifiedIndex::lookup_ordered`] walks with no bound: one a range
+/// orders within, or `Bool` (between strings and dates), walked as its two keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortClass {
     Ordered(OrderClass),
@@ -934,6 +937,7 @@ fn ordered_class<'a>(
                 OrderClass::Str => ValueKey::Str(String::new()),
                 OrderClass::Date => ValueKey::DateDays(0),
                 OrderClass::LocalDateTime => ValueKey::LocalDateTimeMicros(0),
+                OrderClass::Bool => ValueKey::Bool(false),
                 _ => ValueKey::BinaryBytes(Vec::new()),
             };
             let buckets = variant_run(postings, &variant, key_bound(lo), key_bound(hi), descending);
@@ -1511,8 +1515,9 @@ mod tests {
         assert_eq!(range(&ix, None, None), vec![0, 1, 2, 3, 4]);
     }
 
-    /// The scan's classes: numbers together, every other ordered type alone,
-    /// `Bool` never ordered, and bounds of two classes match nothing.
+    /// The scan's classes: numbers together, every other ordered type alone
+    /// (`Bool` with `false` before `true`, row 160), and bounds of two classes
+    /// match nothing.
     #[test]
     fn a_range_matches_its_class_as_the_scan_does() {
         let mut ix = UnifiedIndex::new();
@@ -1534,7 +1539,11 @@ mod tests {
             vec![2]
         );
         assert_eq!(range(&ix, Some((&Value::Date(0), true)), None), vec![5]);
-        assert!(range(&ix, Some((&Value::Bool(false), false)), None).is_empty());
+        assert_eq!(
+            range(&ix, Some((&Value::Bool(false), false)), None),
+            vec![3]
+        );
+        assert!(range(&ix, None, Some((&Value::Bool(false), true))).is_empty());
         assert!(range(
             &ix,
             Some((&iv(0), true)),

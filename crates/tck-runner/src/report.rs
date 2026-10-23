@@ -179,8 +179,9 @@ pub fn conformance_page(
         "A scenario that expects an error passes on any error, so the pass rate counts \
          two kinds of pass. The strict rate counts only the passes that checked a result, \
          plus the error passes whose error came from the phase the TCK names (compile \
-         time: the lexer, parser or planner; runtime: execution). CI holds both rates \
-         to `tck-baseline.txt`.\n"
+         time: the lexer, parser or planner; runtime: execution) and, when the engine's \
+         error names its openCypher kind (`VariableTypeConflict: …`), is that kind. CI \
+         holds both rates to `tck-baseline.txt`.\n"
     );
     let _ = writeln!(p, "| Pass | Scenarios |\n|---|---|");
     let _ = writeln!(
@@ -189,10 +190,13 @@ pub fn conformance_page(
         passed - error_passes
     );
     let _ = writeln!(p, "| Raised an error the TCK expects | {error_passes} |");
-    let _ = writeln!(p, "| … in the phase the TCK names | {matched} |");
     let _ = writeln!(
         p,
-        "| … in another phase (any error accepted) | {} |",
+        "| … in the phase (and of the kind) the TCK names | {matched} |"
+    );
+    let _ = writeln!(
+        p,
+        "| … in another phase or of another kind (any error accepted) | {} |",
         error_passes - matched
     );
     let _ = writeln!(

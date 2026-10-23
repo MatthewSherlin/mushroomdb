@@ -511,10 +511,28 @@ pub fn execute_union(
     union: &crate::cypher::parser::UnionQuery,
     params: &Params,
 ) -> Result<ResultSet, String> {
+    let plans = plan_union(union)?;
+    execute_planned_union(view, &plans, &union.all_flags, params)
+}
+
+/// Plan every part of a read query. Planning reads no row and no parameter,
+/// so its errors (an unbound variable, a duplicate column) are compile-time
+/// errors; callers report them as `plan:` before anything executes.
+pub fn plan_union(union: &crate::cypher::parser::UnionQuery) -> Result<Vec<Vec<PlanOp>>, String> {
+    union.parts.iter().map(crate::cypher::plan::plan).collect()
+}
+
+/// Execute the parts [`plan_union`] planned and combine them as
+/// [`execute_union`] does; `all_flags` is the query's `UnionQuery::all_flags`.
+pub fn execute_planned_union(
+    view: &GraphView,
+    plans: &[Vec<PlanOp>],
+    all_flags: &[bool],
+    params: &Params,
+) -> Result<ResultSet, String> {
     let mut acc: Option<ResultSet> = None;
-    for (i, part) in union.parts.iter().enumerate() {
-        let ops = crate::cypher::plan::plan(part)?;
-        let rs = execute(view, &ops, params)?;
+    for (i, ops) in plans.iter().enumerate() {
+        let rs = execute(view, ops, params)?;
         acc = Some(match acc {
             None => rs,
             Some(prev) => {
@@ -527,7 +545,7 @@ pub fn execute_union(
                     ));
                 }
                 // all_flags has one entry per boundary; index i-1 for part i.
-                let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
+                let all = all_flags.get(i - 1).copied().unwrap_or(false);
                 let kinds = merge_kinds(prev.column_kinds(), rs.column_kinds());
                 let mut combined = combine_result_sets(prev, rs, all);
                 combined.set_column_kinds(kinds);
@@ -536,7 +554,7 @@ pub fn execute_union(
         });
     }
     // `parse_read` guarantees at least one part.
-    Ok(acc.expect("UNION query has at least one part"))
+    acc.ok_or_else(|| "a read query has at least one part".to_string())
 }
 
 fn combine_result_sets(mut acc: ResultSet, other: ResultSet, all: bool) -> ResultSet {
@@ -1300,6 +1318,11 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             }
             collect_operand(map, names, seen);
         }
+        Operand::ListPredicate { list, pred, .. } => {
+            collect_operand(list, names, seen);
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(pred, names, seen, 0);
+        }
         Operand::Reduce {
             init, list, body, ..
         } => {
@@ -1665,6 +1688,14 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
                 intern_expr(vars, f);
             }
             intern_operand(vars, map);
+        }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            intern_expr(vars, pred);
         }
         Operand::Reduce {
             acc_var,
@@ -2427,6 +2458,31 @@ const SCALAR_FUNCS: &[&str] = &[
     "localtime",
 ];
 
+/// The error for a call of a function that does not exist, listing every
+/// one that does.
+pub(crate) fn unknown_function_message(name: &str) -> String {
+    format!(
+        "unknown function `{name}`; supported: {}, {}",
+        SCALAR_FUNCS.join(", "),
+        temporal::namespaced_names().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Whether `name` (any case) names a function [`eval_func`] evaluates: a
+/// [`SCALAR_FUNCS`] name, a namespaced temporal function, a `time.` /
+/// `localtime.` name (refused by name when called), or an internal one. The
+/// compile-time check refuses any other call (QL-VE); aggregates are not
+/// function calls and are not listed.
+pub(crate) fn is_known_function(name: &str) -> bool {
+    if name == LABEL_TEST_FN || name == REL_ENDS_FN {
+        return true;
+    }
+    let norm = name.to_ascii_lowercase();
+    SCALAR_FUNCS.iter().any(|f| f.eq_ignore_ascii_case(&norm))
+        || temporal::namespaced(&norm).is_some()
+        || temporal::is_time_type_namespace(&norm)
+}
+
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
 /// `endsWith`). Null in either argument → null; non-string args → null.
 fn eval_string_predicate(
@@ -2932,18 +2988,25 @@ fn eval_func(
         // QL-13: the time-of-day types are not in 0.10 (contract C3).
         "time" | "localtime" => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
         "date" | "localdatetime" | "datetime" | "duration" => {
-            let a = resolve_fn_args(name, args, 0..=1, view, vars, row, params)?;
-            let [arg, _, _] = a;
+            // A duration has no "now": it needs its argument.
+            let arity = if norm == "duration" { 1..=1 } else { 0..=1 };
+            let [arg, _, _] = resolve_fn_args(name, args, arity, view, vars, row, params)?;
             // A null argument is null; no argument is the current instant.
             if args.len() == 1 && arg.is_none() {
                 return Ok(None);
             }
-            Ok(temporal::construct(&norm, arg, args.is_empty()))
+            temporal::construct(&norm, arg)
         }
-        _ => Err(format!(
-            "unknown function `{name}`; supported: {}",
-            SCALAR_FUNCS.join(", ")
-        )),
+        // QL-TF: `date.truncate`, `duration.between`, … (QL-13 refuses the
+        // `time` and `localtime` namespaces with the types).
+        n if temporal::is_time_type_namespace(n) => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        n => match temporal::namespaced(n) {
+            Some((canonical, arity)) => {
+                let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+                temporal::call_namespaced(canonical, a, args.len())
+            }
+            None => Err(unknown_function_message(name)),
+        },
     }
 }
 
@@ -2954,6 +3017,19 @@ const RANGE_MAX_ELEMENTS: u128 = 10_000_000;
 /// `range(start, end, step)` with an inclusive end. Null or non-integer
 /// arguments are null; a zero step is an error.
 fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, String> {
+    // An argument that is not an integer is an error (QL-VE, the TCK's
+    // List11); a null one is null.
+    let given = if has_step { &a[..] } else { &a[..2] };
+    if let Some(bad) = given
+        .iter()
+        .flatten()
+        .find(|v| !matches!(v, Value::Int(_) | Value::Null))
+    {
+        return Err(format!(
+            "range() expects integer arguments, got {}",
+            crate::value_ops::type_name_of(bad)
+        ));
+    }
     let (Some(Value::Int(start)), Some(Value::Int(end))) = (&a[0], &a[1]) else {
         return Ok(None);
     };
@@ -3052,9 +3128,30 @@ fn properties_of_arg(
     })
 }
 
+/// `properties(x)` of a value that is not a node, relationship, map or null
+/// is an error (QL-VE, the TCK's Graph9); `keys` keeps its null.
+fn check_properties_arg(
+    arg: &Operand,
+    vars: &VarTable,
+    row: &Row,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    if bound_to_graph_element(vars, row, arg) {
+        return Ok(());
+    }
+    match value {
+        None | Some(Value::Null) | Some(Value::Map(_)) => Ok(()),
+        Some(other) => Err(format!(
+            "properties() expects a node, a relationship or a map, got {}",
+            crate::value_ops::type_name_of(other)
+        )),
+    }
+}
+
 /// List and map functions (QL-03c). Null in → null out; an argument of the
-/// wrong type → null, never an error. Only a wrong argument count, a zero
-/// `range` step and an oversized `range` are errors.
+/// wrong type → null, except `range()` with a non-integer argument and
+/// `properties()` of a non-map value (QL-VE: type errors). A wrong argument
+/// count, a zero `range` step and an oversized `range` are errors too.
 fn eval_list_scalar(
     norm: &str,
     name: &str,
@@ -3070,6 +3167,10 @@ fn eval_list_scalar(
                 "{name}() requires exactly 1 argument(s), got {}",
                 args.len()
             ));
+        }
+        if norm == "properties" && !bound_to_graph_element(vars, row, &args[0]) {
+            let value = resolve_operand(view, vars, row, &args[0], params)?;
+            check_properties_arg(&args[0], vars, row, value.as_ref())?;
         }
         let props = properties_of_arg(&args[0], view, vars, row, params)?;
         return Ok(props.map(|map| {
@@ -3468,6 +3569,13 @@ fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
             }
             intern_local_vars(vars, map);
         }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            vars.intern(var);
+            intern_local_vars(vars, list);
+            intern_local_vars_expr(vars, pred);
+        }
         Operand::Reduce {
             acc_var,
             init,
@@ -3502,6 +3610,20 @@ fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
             intern_local_vars(vars, list);
         }
     }
+}
+
+/// Whether `op` is a variable bound, in this row, to a node, relationship
+/// or path.
+fn bound_to_graph_element(vars: &VarTable, row: &Row, op: &Operand) -> bool {
+    let Operand::Var(name) = op else {
+        return false;
+    };
+    matches!(
+        vars.slot(name)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref()),
+        Some(Cell::Node(_) | Cell::Rel(_) | Cell::Path(_))
+    )
 }
 
 fn resolve_operand(
@@ -3542,7 +3664,12 @@ fn resolve_operand(
         Operand::Index { base, index } => {
             let base_val = resolve_operand(view, vars, row, base, params)?;
             let idx_val = resolve_operand(view, vars, row, index, params)?;
-            Ok(crate::value_ops::index_list(base_val, idx_val))
+            // A node, relationship or path variable resolves to its key, map
+            // or hop count; a subscript of one reads nothing, as before.
+            if bound_to_graph_element(vars, row, base) {
+                return Ok(crate::value_ops::index_list(base_val, idx_val));
+            }
+            crate::value_ops::index_value(base_val, idx_val)
         }
         // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
@@ -3586,6 +3713,43 @@ fn resolve_operand(
                 out.push(crate::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
+        }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list predicate variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the predicate.
+            let mut scoped = row.clone();
+            let (mut trues, mut falses, mut nulls) = (0usize, 0usize, 0usize);
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                let answer = super::predicate::eval_predicate(
+                    pred,
+                    &mut |op| resolve_operand(view, vars, &scoped, op, params),
+                    &|e| e,
+                )?;
+                match answer {
+                    Some(true) => trues += 1,
+                    Some(false) => falses += 1,
+                    None => nulls += 1,
+                }
+            }
+            Ok(super::predicate::quantify(*kind, trues, falses, nulls).map(Value::Bool))
         }
         Operand::Reduce {
             acc_var,
@@ -6576,6 +6740,14 @@ mod ql_04;
 mod ql_13;
 
 #[cfg(test)]
+#[path = "tests/ql_tf.rs"]
+mod ql_tf;
+
+#[cfg(test)]
+#[path = "tests/ql_ve.rs"]
+mod ql_ve;
+
+#[cfg(test)]
 #[path = "tests/ql_14.rs"]
 mod ql_14;
 
@@ -6711,12 +6883,15 @@ mod tests {
         plan(&parse(&lex(src).expect("lex")).expect("parse")).expect("plan")
     }
 
+    /// Lex, parse (with the compile-time check), plan and execute `src`; an
+    /// error from any stage is the `Err`.
     pub(super) fn run(
         view: &GraphView,
         src: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet, String> {
-        execute(view, &compile(src), &Params(params))
+        let ops = plan(&parse(&lex(src)?)?)?;
+        execute(view, &ops, &Params(params))
     }
 
     fn s(v: &str) -> Value {
@@ -11086,20 +11261,22 @@ LIMIT 10";
             &fx.view(),
             "MATCH (t:Talent) WHERE t.key = 't1' \
              RETURN t.location[0] AS lat, t.location[1] AS lon, \
-                    t.location[-1] AS last, t.location[7] AS oob, t.status[0] AS notalist",
+                    t.location[-1] AS last, t.location[7] AS oob",
             &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
             rows_of(&rs),
-            vec![vec![
-                Some(f(40.71)),
-                Some(f(-74.01)),
-                Some(f(-74.01)),
-                None,
-                None
-            ]]
+            vec![vec![Some(f(40.71)), Some(f(-74.01)), Some(f(-74.01)), None]]
         );
+        // QL-VE: a subscript of a string was null and is a type error now.
+        let err = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.key = 't1' RETURN t.status[0] AS notalist",
+            &BTreeMap::new(),
+        )
+        .expect_err("a string cannot be indexed");
+        assert!(err.contains("a string cannot be indexed"), "{err}");
     }
 
     /// `n.key` filters, orders and matches — not only projects. Each of
@@ -11983,16 +12160,35 @@ LIMIT 10";
             "range(n.nope, 5)",
             "range(1, n.nope)",
             "range(1, 5, n.nope)",
-            "range(\"a\", 5)",
-            "range(1, 2.5)",
-            "range(1, 5, \"2\")",
             "keys(42)",
             "keys(\"abc\")",
-            "properties(42)",
-            "properties($l)",
         ] {
             assert_eq!(eval(expr), None, "{expr}");
         }
+        // QL-VE: these were null and are type errors now.
+        for (expr, want) in [
+            (
+                "range(\"a\", 5)",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "range(1, 2.5)",
+                "range() expects integer arguments, got a float",
+            ),
+            (
+                "range(1, 5, \"2\")",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "properties($l)",
+                "properties() expects a node, a relationship or a map, got a list",
+            ),
+        ] {
+            let err = eval_err(expr);
+            assert!(err.contains(want), "{expr}: {err}");
+        }
+        // A literal argument is refused before the query runs.
+        assert!(eval_err("properties(42)").starts_with("InvalidArgumentType: "));
     }
 
     #[test]

@@ -1,13 +1,20 @@
-//! The temporal function surface (QL-13): `date`, `localdatetime`, `datetime`
-//! and `duration`, plus the arithmetic between a temporal value and a
-//! duration.
+//! The temporal function surface (QL-13, QL-TF): `date`, `localdatetime`,
+//! `datetime` and `duration`, the namespaced temporal functions
+//! (`date.truncate`, `datetime.fromepoch`, `duration.between`, the clocks),
+//! and the arithmetic between a temporal value and a duration.
 //!
 //! The value types, their ISO 8601 text and their ordering live in
-//! `core-storage` and `value_ops`; this module only builds values from query
-//! arguments. An argument that is not a usable input (an unparseable string, a
-//! map with an unknown key or an out-of-range field, any other type) gives
-//! null, never an error. Only a wrong argument count, and `time()` /
-//! `localtime()`, are errors.
+//! `core-storage` and `value_ops`; this module builds values from query
+//! arguments. A constructor or function gives a value or an error naming the
+//! function, never null for a bad input (QL-TF): an unreadable string, an
+//! unknown, conflicting or out-of-range map field and a wrong argument type
+//! are errors. A null argument, or a null map field, is null. `time()`,
+//! `localtime()` and their namespaces, and named time zones, are refused by
+//! name.
+//!
+//! Precision: values hold microseconds. A constructor truncates nanosecond
+//! digits toward the earlier instant, as the ISO 8601 parser does (QL-13's
+//! rule, kept here); it never rounds. Durations keep nanoseconds.
 //!
 //! Storing a temporal value moves the store to the V11 snapshot format, at
 //! the write path's choke point; a query result carrying one changes nothing
@@ -20,10 +27,17 @@ use core_storage::types::{
 };
 use core_storage::Value;
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
 const NANOS_PER_MICRO: i64 = 1_000;
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const NANOS_PER_DAY: i64 = 86_400 * NANOS_PER_SECOND;
+/// The mean Gregorian month, which a fractional month of a duration becomes.
+const DAYS_PER_MEAN_MONTH: f64 = 365.2425 / 12.0;
+/// A `DateTime` offset is within ±18:00.
+const MAX_OFFSET_SECONDS: i64 = 18 * 3600;
 
 /// The largest year magnitude calendar math is attempted for. A `Date` holds
 /// an `i32` day count, about +-5.88 million years, so anything past this is
@@ -34,38 +48,156 @@ const MAX_YEAR: u64 = 100_000_000;
 /// The error `time()` and `localtime()` give: time-of-day types are not in 0.10.
 pub const TIME_TYPES_REFUSAL: &str = "not supported in mushroomdb 0.10: time types";
 
-/// Evaluate a temporal constructor given its already-resolved argument, if
-/// any. `arg_count` has been checked by the caller to be 0 or 1.
-pub fn construct(norm: &str, arg: Option<Value>, no_arg: bool) -> Option<Value> {
-    match norm {
-        "date" => {
-            if no_arg {
-                return Some(Value::Date(now_micros().div_euclid(MICROS_PER_DAY) as i32));
-            }
-            date_from(arg?)
+/// The error a named time zone (`Europe/Paris`, `[Europe/Paris]`) gives: 0.10
+/// has UTC offsets only.
+pub const ZONE_ID_REFUSAL: &str = "not supported in mushroomdb 0.10: named time zones";
+
+type Fallible<T> = Result<T, String>;
+
+/// `<fname>(): <message>`.
+fn fail(fname: &str, message: impl std::fmt::Display) -> String {
+    format!("{fname}(): {message}")
+}
+
+/// A value's type, as an error names it.
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Int(_) => "an integer",
+        Value::Float(_) => "a float",
+        Value::Str(_) => "a string",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Date(_) => "a Date",
+        Value::LocalDateTime(_) => "a LocalDateTime",
+        Value::DateTime { .. } => "a DateTime",
+        Value::Duration { .. } => "a Duration",
+        Value::Binary(_) => "binary data",
+    }
+}
+
+/// The three temporal types a constructor builds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Date,
+    LocalDateTime,
+    DateTime,
+}
+
+impl Kind {
+    fn of(norm: &str) -> Option<Kind> {
+        match norm {
+            "date" => Some(Kind::Date),
+            "localdatetime" => Some(Kind::LocalDateTime),
+            "datetime" => Some(Kind::DateTime),
+            _ => None,
         }
-        "localdatetime" => {
-            if no_arg {
-                return Some(Value::LocalDateTime(now_micros()));
-            }
-            local_datetime_from(arg?)
+    }
+
+    fn has_time(self) -> bool {
+        self != Kind::Date
+    }
+
+    fn type_name(self) -> &'static str {
+        match self {
+            Kind::Date => "Date",
+            Kind::LocalDateTime => "LocalDateTime",
+            Kind::DateTime => "DateTime",
         }
-        "datetime" => {
-            if no_arg {
-                return Some(Value::DateTime {
-                    micros_utc: now_micros(),
-                    offset_seconds: 0,
-                });
-            }
-            datetime_from(arg?)
+    }
+}
+
+/// A temporal value taken apart on its own wall clock: the local day, the
+/// local time of day in nanoseconds, and the UTC offset when it has one.
+#[derive(Clone, Copy)]
+struct Parts {
+    days: i64,
+    nanos: i64,
+    offset: Option<i32>,
+}
+
+impl Parts {
+    fn of(v: &Value) -> Option<Parts> {
+        match *v {
+            Value::Date(d) => Some(Parts {
+                days: i64::from(d),
+                nanos: 0,
+                offset: None,
+            }),
+            Value::LocalDateTime(us) => Some(Parts::local(i128::from(us), None)),
+            Value::DateTime {
+                micros_utc,
+                offset_seconds,
+            } => Some(Parts::local(
+                i128::from(micros_utc) + i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND),
+                Some(offset_seconds),
+            )),
+            _ => None,
         }
-        "duration" => {
-            if no_arg {
-                return None;
-            }
-            duration_from(arg?)
+    }
+
+    /// Local microseconds since the epoch, split.
+    fn local(micros: i128, offset: Option<i32>) -> Parts {
+        let per_day = i128::from(MICROS_PER_DAY);
+        Parts {
+            days: micros.div_euclid(per_day) as i64,
+            nanos: micros.rem_euclid(per_day) as i64 * NANOS_PER_MICRO,
+            offset,
         }
-        _ => None,
+    }
+
+    /// Local microseconds since the epoch; sub-microsecond nanoseconds are
+    /// truncated (`nanos` is never negative).
+    fn local_micros(&self) -> i128 {
+        i128::from(self.days) * i128::from(MICROS_PER_DAY)
+            + i128::from(self.nanos / NANOS_PER_MICRO)
+    }
+
+    fn into_value(self, kind: Kind, fname: &str) -> Fallible<Value> {
+        match kind {
+            Kind::Date => i32::try_from(self.days)
+                .map(Value::Date)
+                .map_err(|_| fail(fname, "the date is out of range")),
+            Kind::LocalDateTime => i64::try_from(self.local_micros())
+                .map(Value::LocalDateTime)
+                .map_err(|_| fail(fname, "the date-time is out of range")),
+            Kind::DateTime => {
+                let offset_seconds = self.offset.unwrap_or(0);
+                let utc = self.local_micros()
+                    - i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND);
+                let micros_utc =
+                    i64::try_from(utc).map_err(|_| fail(fname, "the date-time is out of range"))?;
+                Ok(Value::DateTime {
+                    micros_utc,
+                    offset_seconds,
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constructors
+// ---------------------------------------------------------------------------
+
+/// Evaluate `date(x)`, `localdatetime(x)`, `datetime(x)` or `duration(x)`.
+/// `arg` is `None` when the call has no argument; the caller has checked the
+/// argument count and turned a null argument into null. `Ok(None)`: a map
+/// field is null.
+pub fn construct(norm: &str, arg: Option<Value>) -> Fallible<Option<Value>> {
+    if norm == "duration" {
+        return match arg {
+            Some(v) => duration_from(v),
+            None => Err("duration() requires exactly 1 argument(s), got 0".to_string()),
+        };
+    }
+    let Some(kind) = Kind::of(norm) else {
+        return Err(format!("unknown function `{norm}`"));
+    };
+    match arg {
+        None => now(kind, 0).map(Some),
+        Some(v) => temporal_from(kind, norm, v),
     }
 }
 
@@ -76,219 +208,969 @@ fn now_micros() -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Constructors
-// ---------------------------------------------------------------------------
+/// The current instant as `kind`, on the clock of `offset_seconds`.
+fn now(kind: Kind, offset_seconds: i32) -> Fallible<Value> {
+    let local =
+        i128::from(now_micros()) + i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND);
+    Parts::local(local, Some(offset_seconds)).into_value(kind, kind_fn(kind))
+}
 
-fn date_from(arg: Value) -> Option<Value> {
-    match arg {
-        Value::Str(s) => iso8601_to_date(&s).map(Value::Date),
-        Value::Map(m) => {
-            let f = CivilFields::from_map(&m, &["year", "month", "day"])?;
-            Some(Value::Date(i32::try_from(f.days()?).ok()?))
-        }
-        Value::Date(d) => Some(Value::Date(d)),
-        Value::LocalDateTime(us) => date_of_micros(us),
-        Value::DateTime {
-            micros_utc,
-            offset_seconds,
-        } => date_of_micros(micros_utc.checked_add(i64::from(offset_seconds) * MICROS_PER_SECOND)?),
-        _ => None,
+fn kind_fn(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Date => "date",
+        Kind::LocalDateTime => "localdatetime",
+        Kind::DateTime => "datetime",
     }
 }
 
-fn date_of_micros(local_micros: i64) -> Option<Value> {
-    Some(Value::Date(
-        i32::try_from(local_micros.div_euclid(MICROS_PER_DAY)).ok()?,
+fn temporal_from(kind: Kind, fname: &str, arg: Value) -> Fallible<Option<Value>> {
+    match arg {
+        Value::Str(s) => parse_text(kind, fname, &s).map(Some),
+        Value::Map(m) => from_map(kind, fname, &m, None),
+        other => match Parts::of(&other) {
+            // Another temporal value: its date, its wall clock, or (for a
+            // `DateTime` from a local value) UTC.
+            Some(parts) => parts.into_value(kind, fname).map(Some),
+            None => Err(format!(
+                "{fname}() expects a string, a map or a temporal value, got {}",
+                type_name(&other)
+            )),
+        },
+    }
+}
+
+/// A string with no offset is read as UTC by `datetime`, the openCypher
+/// default zone. An offset may omit its colon (`+0100`) or its minutes (`+01`).
+fn parse_text(kind: Kind, fname: &str, s: &str) -> Fallible<Value> {
+    if s.contains('[') {
+        return Err(ZONE_ID_REFUSAL.to_string());
+    }
+    let parsed = match kind {
+        Kind::Date => iso8601_to_date(s).map(Value::Date),
+        Kind::LocalDateTime => iso8601_to_local_datetime(s).map(Value::LocalDateTime),
+        Kind::DateTime => {
+            let text = with_extended_offset(s);
+            match iso8601_to_datetime(&text) {
+                Some((micros_utc, offset_seconds)) => Some(Value::DateTime {
+                    micros_utc,
+                    offset_seconds,
+                }),
+                None => iso8601_to_local_datetime(&text).map(|micros_utc| Value::DateTime {
+                    micros_utc,
+                    offset_seconds: 0,
+                }),
+            }
+        }
+    };
+    parsed.ok_or_else(|| {
+        fail(
+            fname,
+            format!("cannot read '{s}' as a {}", kind.type_name()),
+        )
+    })
+}
+
+/// `s` with a trailing basic-format offset (`+0100`, `+01`) rewritten to the
+/// extended form the ISO 8601 parser reads (`+01:00`).
+fn with_extended_offset(s: &str) -> String {
+    if let Some(t) = s.find('T') {
+        let tail = &s[t..];
+        if let Some(i) = tail.rfind(['+', '-']) {
+            if let Some(seconds) = offset_seconds_of(&tail[i..]) {
+                return format!("{}{}", &s[..t + i], offset_text(seconds));
+            }
+        }
+    }
+    s.to_string()
+}
+
+/// `Z`, or `±HH`, `±HHMM`, `±HH:MM`, `±HHMMSS`, `±HH:MM:SS` within ±18:00.
+fn offset_seconds_of(s: &str) -> Option<i32> {
+    if s == "Z" {
+        return Some(0);
+    }
+    let (negative, body) = match s.as_bytes().first()? {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => return None,
+    };
+    let groups: Vec<&str> = if body.contains(':') {
+        body.split(':').collect()
+    } else if body.len() % 2 == 0 {
+        (0..body.len())
+            .step_by(2)
+            .map(|i| body.get(i..i + 2).unwrap_or(""))
+            .collect()
+    } else {
+        return None;
+    };
+    if !(1..=3).contains(&groups.len())
+        || groups
+            .iter()
+            .any(|g| g.len() != 2 || !g.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let part = |i: usize| -> i64 { groups.get(i).map_or(0, |g| g.parse().unwrap_or(99)) };
+    let (h, m, sec) = (part(0), part(1), part(2));
+    let total = h * 3600 + m * 60 + sec;
+    if m > 59 || sec > 59 || total > MAX_OFFSET_SECONDS {
+        return None;
+    }
+    let total = i32::try_from(total).ok()?;
+    Some(if negative { -total } else { total })
+}
+
+fn offset_text(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let abs = seconds.unsigned_abs();
+    let (h, m, s) = (abs / 3600, abs / 60 % 60, abs % 60);
+    if s == 0 {
+        format!("{sign}{h:02}:{m:02}")
+    } else {
+        format!("{sign}{h:02}:{m:02}:{s:02}")
+    }
+}
+
+/// A `timezone` value: an offset string. A named zone is refused by name.
+fn parse_timezone(fname: &str, v: &Value) -> Fallible<i32> {
+    let Value::Str(s) = v else {
+        return Err(fail(
+            fname,
+            format!("`timezone` must be a string, got {}", type_name(v)),
+        ));
+    };
+    if let Some(seconds) = offset_seconds_of(s) {
+        return Ok(seconds);
+    }
+    if s.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Err(ZONE_ID_REFUSAL.to_string());
+    }
+    Err(fail(
+        fname,
+        format!("`timezone` '{s}' is not an offset within ±18:00"),
     ))
 }
 
-fn local_datetime_from(arg: Value) -> Option<Value> {
-    match arg {
-        Value::Str(s) => iso8601_to_local_datetime(&s).map(Value::LocalDateTime),
-        Value::Map(m) => Some(Value::LocalDateTime(micros_from_map(&m)?)),
-        Value::Date(d) => Some(Value::LocalDateTime(
-            i64::from(d).checked_mul(MICROS_PER_DAY)?,
-        )),
-        Value::LocalDateTime(us) => Some(Value::LocalDateTime(us)),
-        Value::DateTime {
-            micros_utc,
-            offset_seconds,
-        } => Some(Value::LocalDateTime(
-            micros_utc.checked_add(i64::from(offset_seconds) * MICROS_PER_SECOND)?,
-        )),
-        _ => None,
-    }
-}
-
-/// A string with no offset is read as UTC, the openCypher default zone.
-fn datetime_from(arg: Value) -> Option<Value> {
-    let utc = |micros_utc| Value::DateTime {
-        micros_utc,
-        offset_seconds: 0,
-    };
-    match arg {
-        Value::Str(s) => match iso8601_to_datetime(&s) {
-            Some((micros_utc, offset_seconds)) => Some(Value::DateTime {
-                micros_utc,
-                offset_seconds,
-            }),
-            None => iso8601_to_local_datetime(&s).map(utc),
-        },
-        Value::Map(m) => Some(utc(micros_from_map(&m)?)),
-        Value::Date(d) => Some(utc(i64::from(d).checked_mul(MICROS_PER_DAY)?)),
-        Value::LocalDateTime(us) => Some(utc(us)),
-        Value::DateTime {
-            micros_utc,
-            offset_seconds,
-        } => Some(Value::DateTime {
-            micros_utc,
-            offset_seconds,
-        }),
-        _ => None,
-    }
-}
-
-fn duration_from(arg: Value) -> Option<Value> {
-    match arg {
-        Value::Str(s) => iso8601_to_duration(&s).map(|(months, days, nanos)| Value::Duration {
-            months,
-            days,
-            nanos,
-        }),
-        Value::Map(m) => duration_from_map(&m),
-        Value::Duration { .. } => Some(arg),
-        _ => None,
-    }
-}
-
-/// An integer field of a constructor map: `Ok(None)` if absent, `Err` if
-/// present and not an integer.
-fn int_field(m: &BTreeMap<String, Value>, key: &str) -> Result<Option<i64>, ()> {
+/// An integer field of a constructor map: `Ok(None)` if absent.
+fn int_field(fname: &str, m: &BTreeMap<String, Value>, key: &str) -> Fallible<Option<i64>> {
     match m.get(key) {
         None => Ok(None),
         Some(Value::Int(n)) => Ok(Some(*n)),
-        Some(_) => Err(()),
+        Some(other) => Err(fail(
+            fname,
+            format!("`{key}` must be an integer, got {}", type_name(other)),
+        )),
     }
 }
 
-/// `year`/`month`/`day` of a map constructor.
-struct CivilFields {
-    year: i64,
-    month: i64,
-    day: i64,
-}
-
-impl CivilFields {
-    /// `year` is required; `month` and `day` default to 1. A key outside
-    /// `allowed` is refused.
-    fn from_map(m: &BTreeMap<String, Value>, allowed: &[&str]) -> Option<CivilFields> {
-        if m.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return None;
-        }
-        Some(CivilFields {
-            year: int_field(m, "year").ok()??,
-            month: int_field(m, "month").ok()?.unwrap_or(1),
-            day: int_field(m, "day").ok()?.unwrap_or(1),
-        })
-    }
-
-    fn days(&self) -> Option<i64> {
-        if self.year.unsigned_abs() > MAX_YEAR || !(1..=12).contains(&self.month) {
-            return None;
-        }
-        let month = self.month as u32;
-        if self.day < 1 || self.day > i64::from(days_in_month(self.year, month)) {
-            return None;
-        }
-        Some(days_from_civil(self.year, month, self.day as u32))
+fn check_range(fname: &str, key: &str, v: i64, range: RangeInclusive<i64>) -> Fallible<i64> {
+    if range.contains(&v) {
+        Ok(v)
+    } else {
+        Err(fail(
+            fname,
+            format!("`{key}` {v} is outside {}..={}", range.start(), range.end()),
+        ))
     }
 }
 
-fn micros_from_map(m: &BTreeMap<String, Value>) -> Option<i64> {
-    const KEYS: [&str; 9] = [
-        "year",
-        "month",
-        "day",
-        "hour",
-        "minute",
-        "second",
-        "millisecond",
-        "microsecond",
-        "nanosecond",
-    ];
-    if m.keys().any(|k| !KEYS.contains(&k.as_str())) {
-        return None;
-    }
-    let days = CivilFields::from_map(m, &KEYS)?.days()?;
-    let field = |key: &str, max: i64| -> Option<i64> {
-        let n = int_field(m, key).ok()?.unwrap_or(0);
-        (0..=max).contains(&n).then_some(n)
-    };
-    let hour = field("hour", 23)?;
-    let minute = field("minute", 59)?;
-    let second = field("second", 59)?;
-    let milli = field("millisecond", 999)?;
-    let micro = field("microsecond", 999)?;
-    let nano = field("nanosecond", 999)?;
-    // Sub-second fields add up the way openCypher reads them: a millisecond,
-    // a microsecond and a nanosecond field are three parts of one fraction.
-    let fraction_micros = milli * 1000 + micro + nano / NANOS_PER_MICRO;
-    days.checked_mul(MICROS_PER_DAY)?
-        .checked_add((hour * 3600 + minute * 60 + second) * MICROS_PER_SECOND + fraction_micros)
+const DATE_FIELDS: [&str; 8] = [
+    "year",
+    "month",
+    "day",
+    "week",
+    "dayOfWeek",
+    "quarter",
+    "dayOfQuarter",
+    "ordinalDay",
+];
+const TIME_FIELDS: [&str; 6] = [
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+];
+const EPOCH_FIELDS: [&str; 2] = ["epochSeconds", "epochMillis"];
+
+/// Whether a `kind` map takes `key`. A truncation's map has no selecting
+/// keys: the truncated value is its base.
+fn takes_field(kind: Kind, key: &str, truncating: bool) -> bool {
+    DATE_FIELDS.contains(&key)
+        || (!truncating && key == "date")
+        || (kind.has_time()
+            && (TIME_FIELDS.contains(&key)
+                || (!truncating && (key == "time" || key == "datetime"))))
+        || (kind == Kind::DateTime
+            && (key == "timezone" || (!truncating && EPOCH_FIELDS.contains(&key))))
 }
 
-fn duration_from_map(m: &BTreeMap<String, Value>) -> Option<Value> {
-    const KEYS: [&str; 10] = [
-        "years",
-        "months",
-        "weeks",
-        "days",
-        "hours",
-        "minutes",
-        "seconds",
-        "milliseconds",
-        "microseconds",
-        "nanoseconds",
-    ];
-    if m.keys().any(|k| !KEYS.contains(&k.as_str())) {
-        return None;
-    }
-    // Calendar units are whole numbers; the clock units may be fractional,
-    // and the fraction is carried down into nanoseconds.
-    let whole = |key: &str| -> Option<i64> { Some(int_field(m, key).ok()?.unwrap_or(0)) };
-    let clock_nanos = |key: &str, nanos_per_unit: f64| -> Option<i64> {
-        match m.get(key) {
-            None => Some(0),
-            Some(Value::Int(n)) => (*n as i128 * nanos_per_unit as i128).try_into().ok(),
-            Some(Value::Float(f)) => {
-                let n = f * nanos_per_unit;
-                (n.is_finite() && n.abs() < i64::MAX as f64).then(|| n.round() as i64)
+/// A map constructor, or (with `truncated`) a truncation's field overrides.
+///
+/// The base is the value a `date`, `time` or `datetime` key selects (or the
+/// truncated value); fields override it. Without a base, `year` is required
+/// and a field needs the one above it (`day` needs `month`). A `datetime`
+/// base given a `timezone` keeps its instant, a `time` base its time of day
+/// on the new clock; a local base, and a truncation, keep their wall clock.
+fn from_map(
+    kind: Kind,
+    fname: &str,
+    m: &BTreeMap<String, Value>,
+    truncated: Option<Parts>,
+) -> Fallible<Option<Value>> {
+    let truncating = truncated.is_some();
+    // `{timezone: …}` alone is the current instant on that clock.
+    if !truncating && m.len() == 1 {
+        if let Some(tz) = m.get("timezone") {
+            if matches!(tz, Value::Null) {
+                return Ok(None);
             }
-            Some(_) => None,
+            return now(kind, parse_timezone(fname, tz)?).map(Some);
+        }
+    }
+    if let Some(key) = m.keys().find(|k| !takes_field(kind, k, truncating)) {
+        return Err(fail(fname, format!("unknown field `{key}`")));
+    }
+    if m.values().any(|v| matches!(v, Value::Null)) {
+        return Ok(None);
+    }
+    let tz = m
+        .get("timezone")
+        .map(|v| parse_timezone(fname, v))
+        .transpose()?;
+    if EPOCH_FIELDS.iter().any(|k| m.contains_key(*k)) {
+        return from_epoch_fields(fname, m, tz).map(Some);
+    }
+    let (date_base, time_base) = match truncated {
+        Some(p) => (Some(p.days), Some((p.nanos, p.offset))),
+        None => selected_bases(fname, m, tz)?,
+    };
+    let days = resolve_date(fname, m, date_base)?;
+    let (nanos, base_offset) = if kind.has_time() {
+        let nanos = resolve_time(fname, m, time_base.map(|(n, _)| n))?;
+        (nanos, time_base.and_then(|(_, o)| o))
+    } else {
+        (0, None)
+    };
+    Parts {
+        days,
+        nanos,
+        offset: tz.or(base_offset),
+    }
+    .into_value(kind, fname)
+    .map(Some)
+}
+
+/// A time base: the time of day in nanoseconds, and the offset it has.
+type TimeBase = (i64, Option<i32>);
+
+/// The date base and the time base a constructor map's `datetime`, `date`
+/// and `time` keys select.
+fn selected_bases(
+    fname: &str,
+    m: &BTreeMap<String, Value>,
+    tz: Option<i32>,
+) -> Fallible<(Option<i64>, Option<TimeBase>)> {
+    let temporal = |key: &str, v: &Value| -> Fallible<Parts> {
+        Parts::of(v).ok_or_else(|| {
+            fail(
+                fname,
+                format!("`{key}` must be a temporal value, got {}", type_name(v)),
+            )
+        })
+    };
+    if let Some(v) = m.get("datetime") {
+        if let Some(other) = ["date", "time"].into_iter().find(|k| m.contains_key(*k)) {
+            return Err(fail(
+                fname,
+                format!("`datetime` cannot be combined with `{other}`"),
+            ));
+        }
+        let mut p = temporal("datetime", v)?;
+        if let (Some(tz), Some(o)) = (tz, p.offset) {
+            let shift = i128::from(tz - o) * i128::from(MICROS_PER_SECOND);
+            p = Parts::local(p.local_micros() + shift, Some(tz));
+        }
+        return Ok((Some(p.days), Some((p.nanos, p.offset))));
+    }
+    let date_base = match m.get("date") {
+        Some(v) => Some(temporal("date", v)?.days),
+        None => None,
+    };
+    let time_base = match m.get("time") {
+        None => None,
+        Some(v @ (Value::LocalDateTime(_) | Value::DateTime { .. })) => {
+            let mut p = temporal("time", v)?;
+            if let (Some(tz), Some(o)) = (tz, p.offset) {
+                p.nanos =
+                    (p.nanos + i64::from(tz - o) * NANOS_PER_SECOND).rem_euclid(NANOS_PER_DAY);
+                p.offset = Some(tz);
+            }
+            Some((p.nanos, p.offset))
+        }
+        Some(v) => {
+            return Err(fail(
+                fname,
+                format!(
+                    "`time` must be a value with a time of day, got {}",
+                    type_name(v)
+                ),
+            ))
         }
     };
-    let months = whole("years")?
-        .checked_mul(12)?
-        .checked_add(whole("months")?)?;
-    let days = whole("weeks")?
-        .checked_mul(7)?
-        .checked_add(whole("days")?)?;
-    let nanos = [
-        clock_nanos("hours", 3_600e9)?,
-        clock_nanos("minutes", 60e9)?,
-        clock_nanos("seconds", 1e9)?,
-        clock_nanos("milliseconds", 1e6)?,
-        clock_nanos("microseconds", 1e3)?,
-        clock_nanos("nanoseconds", 1.0)?,
-    ]
-    .into_iter()
-    .try_fold(0i64, i64::checked_add)?;
-    Some(Value::Duration {
-        months: i32::try_from(months).ok()?,
-        days: i32::try_from(days).ok()?,
-        nanos,
+    Ok((date_base, time_base))
+}
+
+/// `datetime({epochSeconds | epochMillis, [sub-second fields], [timezone]})`.
+fn from_epoch_fields(fname: &str, m: &BTreeMap<String, Value>, tz: Option<i32>) -> Fallible<Value> {
+    let epoch = if m.contains_key("epochSeconds") {
+        "epochSeconds"
+    } else {
+        "epochMillis"
+    };
+    const WITH_EPOCH: [&str; 4] = ["millisecond", "microsecond", "nanosecond", "timezone"];
+    if let Some(other) = m
+        .keys()
+        .find(|k| k.as_str() != epoch && !WITH_EPOCH.contains(&k.as_str()))
+    {
+        return Err(fail(
+            fname,
+            format!("`{epoch}` cannot be combined with `{other}`"),
+        ));
+    }
+    let base = int_field(fname, m, epoch)?.unwrap_or(0);
+    let scale = if epoch == "epochSeconds" {
+        MICROS_PER_SECOND
+    } else {
+        1_000
+    };
+    let mut nanos = 0i128;
+    for (key, per) in [
+        ("millisecond", 1_000_000i128),
+        ("microsecond", 1_000),
+        ("nanosecond", 1),
+    ] {
+        nanos += i128::from(int_field(fname, m, key)?.unwrap_or(0)) * per;
+    }
+    let utc = i128::from(base) * i128::from(scale) + nanos.div_euclid(i128::from(NANOS_PER_MICRO));
+    let offset = tz.unwrap_or(0);
+    Parts::local(
+        utc + i128::from(offset) * i128::from(MICROS_PER_SECOND),
+        Some(offset),
+    )
+    .into_value(Kind::DateTime, fname)
+}
+
+/// Which way a map names its date: calendar (`month`/`day`), ISO week
+/// (`week`/`dayOfWeek`), quarter (`quarter`/`dayOfQuarter`) or ordinal day.
+const DATE_GROUPS: [[&str; 2]; 4] = [
+    ["month", "day"],
+    ["week", "dayOfWeek"],
+    ["quarter", "dayOfQuarter"],
+    ["ordinalDay", "ordinalDay"],
+];
+
+/// The day a map's date fields name, over `base` (days since the epoch).
+fn resolve_date(fname: &str, m: &BTreeMap<String, Value>, base: Option<i64>) -> Fallible<i64> {
+    let field = |key: &str| int_field(fname, m, key);
+    for key in DATE_FIELDS {
+        field(key)?;
+    }
+    let present: Vec<(usize, &str)> = DATE_GROUPS
+        .iter()
+        .enumerate()
+        .filter_map(|(g, keys)| keys.iter().find(|k| m.contains_key(**k)).map(|k| (g, *k)))
+        .collect();
+    if let [(_, first), (_, second), ..] = present.as_slice() {
+        return Err(fail(
+            fname,
+            format!("`{second}` cannot be combined with `{first}`"),
+        ));
+    }
+    let year = field("year")?;
+    if base.is_none() && year.is_none() {
+        return Err(fail(fname, "`year` is required"));
+    }
+    if year.is_some_and(|y| y.unsigned_abs() > MAX_YEAR) {
+        return Err(fail(fname, "the date is out of range"));
+    }
+    let needs = |lower: &str, upper: &str| -> Fallible<()> {
+        if base.is_none() && m.contains_key(lower) && !m.contains_key(upper) {
+            return Err(fail(fname, format!("`{lower}` needs `{upper}`")));
+        }
+        Ok(())
+    };
+    let base_civil = base.map(civil_from_days);
+    match present.first().map(|(g, _)| *g) {
+        None | Some(0) => {
+            needs("day", "month")?;
+            let (by, bm, bd) = base_civil.unwrap_or((year.unwrap_or(0), 1, 1));
+            let y = year.unwrap_or(by);
+            let month = check_range(
+                fname,
+                "month",
+                field("month")?.unwrap_or(i64::from(bm)),
+                1..=12,
+            )?;
+            let max_day = i64::from(days_in_month(y, month as u32));
+            let day = check_range(
+                fname,
+                "day",
+                field("day")?.unwrap_or(i64::from(bd)),
+                1..=max_day,
+            )?;
+            Ok(days_from_civil(y, month as u32, day as u32))
+        }
+        Some(1) => {
+            needs("dayOfWeek", "week")?;
+            let (bwy, bw, bdow) = match base {
+                Some(d) => iso_week(d),
+                None => (year.unwrap_or(0), 1, 1),
+            };
+            let wy = year.unwrap_or(bwy);
+            let max_week = weeks_in_week_year(wy);
+            let week = check_range(fname, "week", field("week")?.unwrap_or(bw), 1..=max_week)?;
+            let dow = check_range(
+                fname,
+                "dayOfWeek",
+                field("dayOfWeek")?.unwrap_or(bdow),
+                1..=7,
+            )?;
+            Ok(week_year_start(wy) + (week - 1) * 7 + (dow - 1))
+        }
+        Some(2) => {
+            needs("dayOfQuarter", "quarter")?;
+            let (bq, bdoq, by) = match (base, base_civil) {
+                (Some(d), Some((y, month, _))) => {
+                    let q = i64::from((month - 1) / 3 + 1);
+                    (q, d - quarter_start(y, q) + 1, y)
+                }
+                _ => (1, 1, year.unwrap_or(0)),
+            };
+            let y = year.unwrap_or(by);
+            let q = check_range(fname, "quarter", field("quarter")?.unwrap_or(bq), 1..=4)?;
+            let start = quarter_start(y, q);
+            let len = if q == 4 {
+                days_from_civil(y + 1, 1, 1) - start
+            } else {
+                quarter_start(y, q + 1) - start
+            };
+            let doq = check_range(
+                fname,
+                "dayOfQuarter",
+                field("dayOfQuarter")?.unwrap_or(bdoq),
+                1..=len,
+            )?;
+            Ok(start + doq - 1)
+        }
+        Some(_) => {
+            let y = year.unwrap_or_else(|| base_civil.map_or(0, |(y, _, _)| y));
+            let len = if is_leap_year(y) { 366 } else { 365 };
+            let ordinal = check_range(
+                fname,
+                "ordinalDay",
+                field("ordinalDay")?.unwrap_or(1),
+                1..=len,
+            )?;
+            Ok(days_from_civil(y, 1, 1) + ordinal - 1)
+        }
+    }
+}
+
+/// The time of day (nanoseconds) a map's time fields name, over `base`.
+///
+/// `millisecond`, `microsecond` and `nanosecond` are parts of one fraction:
+/// each is 0–999 under a larger one given beside it, and otherwise spans the
+/// whole fraction (`microsecond: 645876`, `nanosecond: 645876123`). Over a
+/// base, a part not given keeps the base's digits.
+fn resolve_time(fname: &str, m: &BTreeMap<String, Value>, base: Option<i64>) -> Fallible<i64> {
+    let field = |key: &str| int_field(fname, m, key);
+    if base.is_none() {
+        for (lower, upper) in [("minute", "hour"), ("second", "minute")] {
+            if m.contains_key(lower) && !m.contains_key(upper) {
+                return Err(fail(fname, format!("`{lower}` needs `{upper}`")));
+            }
+        }
+        if let Some(sub) = ["millisecond", "microsecond", "nanosecond"]
+            .into_iter()
+            .find(|k| m.contains_key(*k))
+        {
+            if !m.contains_key("second") {
+                return Err(fail(fname, format!("`{sub}` needs `second`")));
+            }
+        }
+    }
+    let base = base.unwrap_or(0);
+    let base_seconds = base / NANOS_PER_SECOND;
+    let base_fraction = base % NANOS_PER_SECOND;
+    let hour = check_range(
+        fname,
+        "hour",
+        field("hour")?.unwrap_or(base_seconds / 3600),
+        0..=23,
+    )?;
+    let minute = check_range(
+        fname,
+        "minute",
+        field("minute")?.unwrap_or(base_seconds / 60 % 60),
+        0..=59,
+    )?;
+    let second = check_range(
+        fname,
+        "second",
+        field("second")?.unwrap_or(base_seconds % 60),
+        0..=59,
+    )?;
+    let (milli, micro, nano) = (
+        field("millisecond")?,
+        field("microsecond")?,
+        field("nanosecond")?,
+    );
+    let fraction = if milli.is_none() && micro.is_none() && nano.is_none() {
+        base_fraction
+    } else {
+        let milli = match milli {
+            Some(v) => check_range(fname, "millisecond", v, 0..=999)?,
+            None => base_fraction / 1_000_000,
+        };
+        let micro_max = if m.contains_key("millisecond") {
+            999
+        } else {
+            999_999
+        };
+        let micro = match micro {
+            Some(v) => check_range(fname, "microsecond", v, 0..=micro_max)?,
+            None => base_fraction / 1_000 % 1_000,
+        };
+        let nano_max = if m.contains_key("microsecond") {
+            999
+        } else if m.contains_key("millisecond") {
+            999_999
+        } else {
+            999_999_999
+        };
+        let nano = match nano {
+            Some(v) => check_range(fname, "nanosecond", v, 0..=nano_max)?,
+            None => base_fraction % 1_000,
+        };
+        let fraction = milli * 1_000_000 + micro * 1_000 + nano;
+        if fraction >= NANOS_PER_SECOND {
+            return Err(fail(
+                fname,
+                "the sub-second fields add up to a second or more",
+            ));
+        }
+        fraction
+    };
+    Ok((hour * 3600 + minute * 60 + second) * NANOS_PER_SECOND + fraction)
+}
+
+fn duration_from(arg: Value) -> Fallible<Option<Value>> {
+    match arg {
+        Value::Str(s) => iso8601_to_duration(&s)
+            .map(|(months, days, nanos)| {
+                Some(Value::Duration {
+                    months,
+                    days,
+                    nanos,
+                })
+            })
+            .ok_or_else(|| fail("duration", format!("cannot read '{s}' as a Duration"))),
+        Value::Map(m) => duration_from_map(&m),
+        Value::Duration { .. } => Ok(Some(arg)),
+        other => Err(format!(
+            "duration() expects a string or a map, got {}",
+            type_name(&other)
+        )),
+    }
+}
+
+/// One tier of a duration (months, days or nanoseconds): a whole count and
+/// the fraction carried down from fractional fields.
+#[derive(Default)]
+struct Tier {
+    whole: i128,
+    fraction: f64,
+}
+
+impl Tier {
+    /// Add `n` of a unit worth `per` of this tier. `Err`: not finite, or far
+    /// past any field's range.
+    fn add(&mut self, n: &Value, per: i128) -> Result<(), ()> {
+        match n {
+            Value::Int(i) => self.whole += i128::from(*i) * per,
+            Value::Float(f) => self.add_float(f * per as f64)?,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+
+    fn add_float(&mut self, x: f64) -> Result<(), ()> {
+        if !x.is_finite() || x.abs() > 1e30 {
+            return Err(());
+        }
+        let whole = x.trunc();
+        self.whole += whole as i128;
+        self.fraction += x - whole;
+        Ok(())
+    }
+}
+
+/// `duration({…})`. Every field may be fractional; a fraction carries down,
+/// a month as the mean Gregorian month (30.436875 days) and a day as 24 hours.
+fn duration_from_map(m: &BTreeMap<String, Value>) -> Fallible<Option<Value>> {
+    const KEYS: [(&str, usize, i128); 10] = [
+        ("years", 0, 12),
+        ("months", 0, 1),
+        ("weeks", 1, 7),
+        ("days", 1, 1),
+        ("hours", 2, 3_600 * NANOS_PER_SECOND as i128),
+        ("minutes", 2, 60 * NANOS_PER_SECOND as i128),
+        ("seconds", 2, NANOS_PER_SECOND as i128),
+        ("milliseconds", 2, 1_000_000),
+        ("microseconds", 2, 1_000),
+        ("nanoseconds", 2, 1),
+    ];
+    if let Some(key) = m.keys().find(|k| !KEYS.iter().any(|(n, _, _)| n == k)) {
+        return Err(fail("duration", format!("unknown field `{key}`")));
+    }
+    if m.values().any(|v| matches!(v, Value::Null)) {
+        return Ok(None);
+    }
+    let out_of_range = || fail("duration", "the duration is out of range");
+    let mut tiers: [Tier; 3] = Default::default();
+    for (key, tier, per) in KEYS {
+        if let Some(v) = m.get(key) {
+            if !matches!(v, Value::Int(_) | Value::Float(_)) {
+                return Err(fail(
+                    "duration",
+                    format!("`{key}` must be a number, got {}", type_name(v)),
+                ));
+            }
+            tiers[tier].add(v, per).map_err(|_| out_of_range())?;
+        }
+    }
+    let month_fraction = tiers[0].fraction;
+    tiers[1]
+        .add_float(month_fraction * DAYS_PER_MEAN_MONTH)
+        .map_err(|_| out_of_range())?;
+    let day_fraction = tiers[1].fraction;
+    tiers[2]
+        .add_float(day_fraction * NANOS_PER_DAY as f64)
+        .map_err(|_| out_of_range())?;
+    let nanos = tiers[2].whole + tiers[2].fraction.round() as i128;
+    Ok(Some(Value::Duration {
+        months: i32::try_from(tiers[0].whole).map_err(|_| out_of_range())?,
+        days: i32::try_from(tiers[1].whole).map_err(|_| out_of_range())?,
+        nanos: i64::try_from(nanos).map_err(|_| out_of_range())?,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Namespaced functions
+// ---------------------------------------------------------------------------
+
+/// The namespaced temporal functions: canonical name and argument counts.
+const NAMESPACED: [(&str, usize, usize); 18] = [
+    ("date.truncate", 2, 3),
+    ("localdatetime.truncate", 2, 3),
+    ("datetime.truncate", 2, 3),
+    ("date.statement", 0, 1),
+    ("date.transaction", 0, 1),
+    ("date.realtime", 0, 1),
+    ("localdatetime.statement", 0, 1),
+    ("localdatetime.transaction", 0, 1),
+    ("localdatetime.realtime", 0, 1),
+    ("datetime.statement", 0, 1),
+    ("datetime.transaction", 0, 1),
+    ("datetime.realtime", 0, 1),
+    ("datetime.fromepoch", 2, 2),
+    ("datetime.fromepochmillis", 1, 1),
+    ("duration.between", 2, 2),
+    ("duration.inMonths", 2, 2),
+    ("duration.inDays", 2, 2),
+    ("duration.inSeconds", 2, 2),
+];
+
+/// The canonical names of the namespaced temporal functions.
+pub fn namespaced_names() -> impl Iterator<Item = &'static str> {
+    NAMESPACED.iter().map(|(n, _, _)| *n)
+}
+
+/// A namespaced temporal function's canonical name and argument counts, for a
+/// name in any case.
+pub fn namespaced(name: &str) -> Option<(&'static str, RangeInclusive<usize>)> {
+    NAMESPACED
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+        .map(|(n, lo, hi)| (*n, *lo..=*hi))
+}
+
+/// Whether `norm` (lower case) is in the `time` or `localtime` namespace,
+/// which 0.10 refuses with [`TIME_TYPES_REFUSAL`].
+pub fn is_time_type_namespace(norm: &str) -> bool {
+    norm.starts_with("time.") || norm.starts_with("localtime.")
+}
+
+/// Call the namespaced function `canonical` (from [`namespaced`]) on its
+/// first `n` resolved arguments; a null argument is null.
+pub fn call_namespaced(
+    canonical: &str,
+    args: [Option<Value>; 3],
+    n: usize,
+) -> Fallible<Option<Value>> {
+    if args.iter().take(n).any(Option::is_none) {
+        return Ok(None);
+    }
+    let [a, b, c] = args;
+    let (a, b) = (a.unwrap_or(Value::Null), b.unwrap_or(Value::Null));
+    let namespace = canonical.split('.').next().unwrap_or(canonical);
+    match canonical {
+        "date.truncate" | "localdatetime.truncate" | "datetime.truncate" => {
+            let kind = Kind::of(namespace).unwrap_or(Kind::Date);
+            truncate(canonical, kind, a, b, c)
+        }
+        "datetime.fromepoch" => from_epoch(canonical, a, b, NANOS_PER_SECOND).map(Some),
+        "datetime.fromepochmillis" => from_epoch(canonical, a, Value::Int(0), 1_000_000).map(Some),
+        "duration.between" | "duration.inMonths" | "duration.inDays" | "duration.inSeconds" => {
+            between(canonical, a, b).map(Some)
+        }
+        "date.statement"
+        | "date.transaction"
+        | "date.realtime"
+        | "localdatetime.statement"
+        | "localdatetime.transaction"
+        | "localdatetime.realtime"
+        | "datetime.statement"
+        | "datetime.transaction"
+        | "datetime.realtime" => {
+            let kind = Kind::of(namespace).unwrap_or(Kind::Date);
+            clock(canonical, kind, (n == 1).then_some(a)).map(Some)
+        }
+        // `namespaced` lists every name above; a name it does not list is
+        // never dispatched here, and must not read the clock if it is.
+        other => Err(format!("unknown function `{other}`")),
+    }
+}
+
+/// `<type>.statement/transaction/realtime([timezone])`: the current instant,
+/// as `<type>()` gives it (QL-13's clock), on the clock of `timezone`.
+fn clock(fname: &str, kind: Kind, arg: Option<Value>) -> Fallible<Value> {
+    let offset = match arg {
+        None => 0,
+        Some(Value::Map(m)) if m.len() == 1 && m.contains_key("timezone") => {
+            parse_timezone(fname, &m["timezone"])?
+        }
+        Some(v @ Value::Str(_)) => parse_timezone(fname, &v)?,
+        Some(other) => {
+            return Err(format!(
+                "{fname}() expects a timezone string or map, got {}",
+                type_name(&other)
+            ))
+        }
+    };
+    now(kind, offset)
+}
+
+/// `datetime.fromepoch(seconds, nanoseconds)` (`nanos_per_unit` 10^9) and
+/// `datetime.fromepochmillis(milliseconds)` (10^6): a UTC `DateTime`.
+fn from_epoch(fname: &str, a: Value, b: Value, nanos_per_unit: i64) -> Fallible<Value> {
+    let (Value::Int(count), Value::Int(extra_nanos)) = (a, b) else {
+        return Err(if nanos_per_unit == NANOS_PER_SECOND {
+            format!("{fname}() expects integers")
+        } else {
+            format!("{fname}() expects an integer")
+        });
+    };
+    let nanos = i128::from(count) * i128::from(nanos_per_unit) + i128::from(extra_nanos);
+    Parts::local(nanos.div_euclid(i128::from(NANOS_PER_MICRO)), Some(0))
+        .into_value(Kind::DateTime, fname)
+}
+
+/// `<type>.truncate(unit, value[, fields])`: `value` cut down to `unit` on
+/// its own wall clock (a `DateTime` keeps its offset), then `fields` set the
+/// parts below the unit, as a map constructor's fields override its base.
+fn truncate(
+    fname: &str,
+    kind: Kind,
+    unit: Value,
+    value: Value,
+    fields: Option<Value>,
+) -> Fallible<Option<Value>> {
+    let Value::Str(unit) = unit else {
+        return Err(format!(
+            "{fname}() expects a unit string, got {}",
+            type_name(&unit)
+        ));
+    };
+    let Some(p) = Parts::of(&value) else {
+        return Err(format!(
+            "{fname}() expects a temporal value, got {}",
+            type_name(&value)
+        ));
+    };
+    let fields = match fields {
+        None => BTreeMap::new(),
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(format!(
+                "{fname}() expects a map of fields, got {}",
+                type_name(&other)
+            ))
+        }
+    };
+    let u = unit.to_ascii_lowercase();
+    let time_unit = match u.as_str() {
+        "millennium" | "century" | "decade" | "year" | "weekyear" | "quarter" | "month"
+        | "week" | "day" => false,
+        "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond" => true,
+        _ => return Err(fail(fname, format!("unknown unit '{unit}'"))),
+    };
+    if time_unit && (kind == Kind::Date || matches!(value, Value::Date(_))) {
+        return Err(fail(fname, format!("cannot truncate a Date to `{unit}`")));
+    }
+    let (y, m, _) = civil_from_days(p.days);
+    let days = match u.as_str() {
+        "millennium" => days_from_civil(y.div_euclid(1000) * 1000, 1, 1),
+        "century" => days_from_civil(y.div_euclid(100) * 100, 1, 1),
+        "decade" => days_from_civil(y.div_euclid(10) * 10, 1, 1),
+        "year" => days_from_civil(y, 1, 1),
+        "weekyear" => week_year_start(iso_week(p.days).0),
+        "quarter" => days_from_civil(y, (m - 1) / 3 * 3 + 1, 1),
+        "month" => days_from_civil(y, m, 1),
+        "week" => p.days - (day_of_week(p.days) - 1),
+        _ => p.days,
+    };
+    let step = match u.as_str() {
+        "hour" => 3_600 * NANOS_PER_SECOND,
+        "minute" => 60 * NANOS_PER_SECOND,
+        "second" => NANOS_PER_SECOND,
+        "millisecond" => 1_000_000,
+        "microsecond" => 1_000,
+        "nanosecond" => 1,
+        _ => NANOS_PER_DAY,
+    };
+    let truncated = Parts {
+        days,
+        nanos: p.nanos - p.nanos % step,
+        offset: p.offset,
+    };
+    from_map(kind, fname, &fields, Some(truncated))
+}
+
+/// `duration.between(a, b)` and `duration.inMonths/inDays/inSeconds(a, b)`.
+///
+/// Two values with offsets are compared as instants (`b` moved onto `a`'s
+/// clock); otherwise each is read on its own wall clock, a date at midnight.
+/// Months, then days, count only whole units from `a` towards `b` (a part day
+/// or month does not count), and the rest is the time.
+fn between(fname: &str, a: Value, b: Value) -> Fallible<Value> {
+    let parts = |v: &Value| {
+        Parts::of(v)
+            .ok_or_else(|| format!("{fname}() expects temporal values, got {}", type_name(v)))
+    };
+    let (pa, pb) = (parts(&a)?, parts(&b)?);
+    let from = pa.local_micros();
+    let mut to = pb.local_micros();
+    if let (Some(oa), Some(ob)) = (pa.offset, pb.offset) {
+        to += i128::from(oa - ob) * i128::from(MICROS_PER_SECOND);
+    }
+    let out_of_range = || fail(fname, "the duration is out of range");
+    let (months, days, micros) = match fname {
+        "duration.between" => {
+            let months = until(from, to, Unit::Months);
+            let moved = i64::try_from(from)
+                .ok()
+                .zip(i32::try_from(months).ok())
+                .and_then(|(f, mo)| shift_micros(f, mo, 0, 0))
+                .ok_or_else(out_of_range)?;
+            let moved = i128::from(moved);
+            let days = until(moved, to, Unit::Days);
+            (months, days, to - moved - days * i128::from(MICROS_PER_DAY))
+        }
+        "duration.inMonths" => (until(from, to, Unit::Months), 0, 0),
+        "duration.inDays" => (0, until(from, to, Unit::Days), 0),
+        _ => (0, 0, to - from),
+    };
+    Ok(Value::Duration {
+        months: i32::try_from(months).map_err(|_| out_of_range())?,
+        days: i32::try_from(days).map_err(|_| out_of_range())?,
+        nanos: i64::try_from(micros * i128::from(NANOS_PER_MICRO)).map_err(|_| out_of_range())?,
     })
+}
+
+enum Unit {
+    Months,
+    Days,
+}
+
+/// Whole months or days from local `from` to local `to` (microseconds),
+/// truncated toward zero: the end day steps back (or forward) one when its
+/// time of day has not yet reached `from`'s.
+fn until(from: i128, to: i128, unit: Unit) -> i128 {
+    let per_day = i128::from(MICROS_PER_DAY);
+    let (from_day, from_time) = (from.div_euclid(per_day), from.rem_euclid(per_day));
+    let (to_day, to_time) = (to.div_euclid(per_day), to.rem_euclid(per_day));
+    let end = if to_day > from_day && to_time < from_time {
+        to_day - 1
+    } else if to_day < from_day && to_time > from_time {
+        to_day + 1
+    } else {
+        to_day
+    };
+    match unit {
+        Unit::Days => end - from_day,
+        Unit::Months => {
+            let packed = |day: i128| {
+                let (y, m, d) = civil_from_days(day as i64);
+                (i128::from(y) * 12 + i128::from(m) - 1) * 32 + i128::from(d)
+            };
+            (packed(end) - packed(from_day)) / 32
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ISO weeks and quarters
+// ---------------------------------------------------------------------------
+
+/// ISO day of the week, Monday 1 to Sunday 7 (1970-01-01 was a Thursday).
+fn day_of_week(days: i64) -> i64 {
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// The Monday that starts ISO week-year `year`: the week holding 4 January.
+fn week_year_start(year: i64) -> i64 {
+    let jan4 = days_from_civil(year, 1, 4);
+    jan4 - (day_of_week(jan4) - 1)
+}
+
+fn weeks_in_week_year(year: i64) -> i64 {
+    (week_year_start(year + 1) - week_year_start(year)) / 7
+}
+
+/// `(week-year, week, day of week)` of a day.
+fn iso_week(days: i64) -> (i64, i64, i64) {
+    let (year, _, _) = civil_from_days(days);
+    let week_year = if days >= week_year_start(year + 1) {
+        year + 1
+    } else if days < week_year_start(year) {
+        year - 1
+    } else {
+        year
+    };
+    (
+        week_year,
+        (days - week_year_start(week_year)) / 7 + 1,
+        day_of_week(days),
+    )
+}
+
+/// The first day of quarter `q` (1–4) of `year`.
+fn quarter_start(year: i64, q: i64) -> i64 {
+    days_from_civil(year, (q as u32 - 1) * 3 + 1, 1)
 }
 
 // ---------------------------------------------------------------------------

@@ -211,8 +211,9 @@ pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> O
 /// A list takes an integer index; a negative one counts from the end. A map
 /// takes a string key (`$p['id']`, and `$p.id`, which parses to it). Any other
 /// base, an index of the wrong type, an out-of-range index or an absent key
-/// all give null — a subscript reads like a property that is not there,
-/// never an error.
+/// all give null. Queries use [`index_value`], which makes a base or an
+/// index of the wrong type an error (QL-VE); this lenient form remains for a
+/// subscript of a node, relationship or path variable, which reads nothing.
 pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
     let (Some(base), Some(idx)) = (base, index) else {
         return None;
@@ -235,6 +236,56 @@ pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
         return None;
     }
     items.into_iter().nth(pos as usize).and_then(element)
+}
+
+/// A subscript `base[index]` with openCypher's type errors (QL-VE): the
+/// base must be a list or a map, a list takes an integer index (an integral
+/// float is read as one) and a map a string key. A null base or index is
+/// null; an out-of-range index or an absent key is null, as in
+/// [`index_list`].
+pub fn index_value(base: Option<Value>, index: Option<Value>) -> Result<Option<Value>, String> {
+    let (Some(b), Some(i)) = (&base, &index) else {
+        return Ok(None);
+    };
+    match (b, i) {
+        (_, Value::Null) | (Value::Null, _) => return Ok(None),
+        (Value::List(_), Value::Int(_)) => {}
+        (Value::List(_), Value::Float(f)) if f.fract() == 0.0 && f.is_finite() => {}
+        (Value::List(_), other) => {
+            return Err(format!(
+                "list index must be an integer, got {}",
+                type_name_of(other)
+            ))
+        }
+        (Value::Map(_), Value::Str(_)) => {}
+        (Value::Map(_), other) => {
+            return Err(format!(
+                "map key must be a string, got {}",
+                type_name_of(other)
+            ))
+        }
+        (other, _) => {
+            return Err(format!(
+                "{} cannot be indexed; only a list or a map can",
+                type_name_of(other)
+            ))
+        }
+    }
+    Ok(index_list(base, index))
+}
+
+/// The name of a value's type, for messages: `an integer`, `a list`, …
+pub fn type_name_of(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_) => "an integer",
+        Value::Float(_) => "a float",
+        Value::Str(_) => "a string",
+        Value::Bool(_) => "a boolean",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Null => "null",
+        _ => "a temporal or binary value",
+    }
 }
 
 /// A list element or map value read out as a query value: a
