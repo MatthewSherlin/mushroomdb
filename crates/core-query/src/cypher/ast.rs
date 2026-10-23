@@ -322,6 +322,19 @@ pub enum Operand {
     Pred(Box<Expr>),
 }
 
+/// The function a label predicate `x:Label` is parsed to:
+/// `FuncCall { name: LABEL_TEST_FN, args: [Var(x), Lit(Str(Label))] }`. It is
+/// true when `x` is a node with that label or a relationship of that type,
+/// false when it is not, and null when `x` is null. The leading space keeps the
+/// name out of reach of a written function call.
+pub const LABEL_TEST_FN: &str = " hasLabel";
+
+/// The UNWIND alias of the one-row `UNWIND [1] AS …` a statement that begins
+/// with `MATCH … CREATE/MERGE` or with `OPTIONAL MATCH` is read as. The
+/// leading space keeps it out of reach of a written name, and `RETURN *` does
+/// not list it.
+pub const ONE_ROW_VAR: &str = " one row";
+
 /// The column name an operand gets in a RETURN or WITH item that has no
 /// `AS` alias.
 ///
@@ -826,6 +839,10 @@ pub struct RowMergeNode {
     pub key_field: String,
     pub key: Operand,
     pub ns: Option<Operand>,
+    /// `(v)` naming a node an earlier clause bound (`MATCH (a) MERGE
+    /// (a)-[:T]->(b:L {id: …})`): the MERGE uses that node and never creates
+    /// it. `label` is empty, and `key_field` and `key` are not read.
+    pub bound: bool,
 }
 
 /// The relationship and end node of a per-row `MERGE (a)-[:T]->(b)`.

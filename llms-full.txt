@@ -5132,6 +5132,27 @@ joins against that set — use `WHERE` to correlate.
 
 ---
 
+## RETURN * and WITH *
+
+`*` stands for every name in scope: the node, path and value variables the
+earlier clauses bound, in alphabetical order of name. Further items may follow
+it.
+
+```cypher
+MATCH (p:Person)-[r:WORKS_AT]->(c:Company) RETURN *
+MATCH (p:Person) WITH *, p.age * 2 AS double RETURN p.id, double
+MATCH (p:Person) UNWIND p.tags AS t RETURN DISTINCT *
+```
+
+The first returns the columns `c` and `p`. Relationship variables, single or
+variable-length (`r`, `[rs*1..3]`), are left out, because a relationship is not
+returned bare (`RETURN r` is a named error); name what you need beside the
+star (`RETURN *, type(r) AS t`). Anonymous nodes and relationships are not
+names. A `WITH` replaces what is in scope, so `WITH a RETURN *` returns `a`.
+With nothing left the star is an error, `RETURN * / WITH * with no variables in
+scope`. `RETURN *` works in the `RETURN` of a write statement (the matched and
+created nodes) and after `CALL … YIELD` (the yielded names).
+
 ## UNWIND
 
 `UNWIND` expands a list into one row per element.  Null or empty lists produce
@@ -5265,7 +5286,7 @@ Write results are always one row with three columns:
 
 | Column | Meaning |
 |---|---|
-| `created` | nodes inserted |
+| `created` | nodes and relationships created |
 | `properties_set` | individual `set_prop` calls applied |
 | `deleted` | edges deleted |
 
@@ -5443,6 +5464,43 @@ RETURN a, b
   relationship are refused by name (`not supported in mushroomdb 0.10: …`).
 - Inside an interactive transaction it is buffered like the single-node form.
 
+### MATCH … CREATE / MATCH … MERGE
+
+A `MATCH` followed by a `CREATE` or a `MERGE` runs the write once for each row
+the `MATCH` finds:
+
+```cypher
+MATCH (a:Person {id: 'alice'}), (b:Person {id: 'bob'})
+CREATE (a)-[:KNOWS]->(b)
+```
+
+```cypher
+MATCH (p:Person) WHERE p.score > 10
+CREATE (b:Badge {id: 'badge-' + p.id})-[:FOR]->(p)
+SET p.badged = true
+RETURN b.id
+```
+
+```cypher
+MATCH (a:Person {id: 'alice'}), (b:Person {id: 'bob'})
+MERGE (a)-[:LIKES]->(b)
+  ON CREATE SET a.likes = 1
+  ON MATCH SET a.likes = a.likes + 1
+```
+
+- It is the statement `UNWIND [1] AS _ MATCH … CREATE …`, and runs exactly as
+  that does (see [UNWIND … write clauses](#unwind--write-clauses)): the same
+  clauses after the `MATCH` (`WHERE`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, then
+  `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` in any order, then `RETURN`), the
+  same per-row values, one batch, the same counts and the same role and
+  transaction rules. A `MATCH` that finds no row writes nothing.
+- A `MERGE` end written `(a)`, a node an earlier clause bound, is that node: the
+  `MERGE` finds or creates the relationship (and the other end, if that one has a
+  label and key) and never creates `a`. A bound end that is null in a row (an
+  `OPTIONAL MATCH` that found nothing) is an error, as is `MERGE (a)` alone.
+- Inside an interactive transaction it is refused by name: `not supported in
+  mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE`.
+
 ### UNWIND … write clauses
 
 The bulk-load idiom: the write clauses run once for each row the `UNWIND` (and
@@ -5468,7 +5526,8 @@ MERGE (n:Person {id: r.id})
 
 - **Clauses.** After the read part: `CREATE` (a node, a chain, comma-separated
   patterns, or `(a)` naming a node an earlier clause bound), `MERGE` (a node, or
-  a node-relationship-node pattern, with `ON CREATE SET` / `ON MATCH SET`),
+  a node-relationship-node pattern whose ends may be `(a)` nodes an earlier
+  clause bound, with `ON CREATE SET` / `ON MATCH SET`),
   `SET n.f = expr [, …]`, `SET n = <map>` and `SET n += <map>` (the map is a
   literal, a `$parameter`, a row or any expression that evaluates to a map),
   `REMOVE n.f`, `DELETE n` and `DETACH DELETE n`, then an optional `RETURN`. A
@@ -5513,9 +5572,9 @@ MERGE (n:Person {id: r.id})
   of the read part or of a `MERGE` (`RETURN type(r), r.count`) is found again
   between its two end nodes; a variable-length relationship (`[r:T*1..3]`) in
   such a `RETURN` is refused by name.
-- **Counts.** Without `RETURN` the row is `created` (nodes inserted),
-  `properties_set` (properties set, plus those removed that existed) and
-  `deleted` (nodes deleted).
+- **Counts.** Without `RETURN` the row is `created` (nodes and relationships
+  created), `properties_set` (properties set, plus those removed that existed)
+  and `deleted` (nodes deleted).
 - **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
   `ingest` of the same rows.
 - Inside an interactive transaction (and so a Bolt `BEGIN`) it is refused by
@@ -5525,9 +5584,8 @@ MERGE (n:Person {id: r.id})
   absent and nothing is written to it; create and update scope are checked per
   label as for the single statements.
 - Not supported: deleting a relationship (`DELETE r`) after `UNWIND`, `REMOVE
-  n:Label`, a map form followed by another `SET` item in the same clause (use two
-  `SET` clauses), and a statement that starts with `MATCH` and then `UNWIND` a
-  write clause.
+  n:Label`, and a map form followed by another `SET` item in the same clause (use
+  two `SET` clauses).
 
 ---
 
@@ -5709,17 +5767,13 @@ prefix, the regular-expression operator `lex:`).
 | `CALL` in a subscription (`subscribe_query`) | `not supported in mushroomdb 0.10: CALL here (a procedure call runs only as a read query of its own)` |
 | `REMOVE n:Label` | `not supported in mushroomdb 0.10: REMOVE n:Label (label removal)` |
 | `SET n:Label` | `not supported in mushroomdb 0.10: SET n:Label (label assignment)` |
-| `WHERE n:Label`, `RETURN n:Label` | `not supported in mushroomdb 0.10: a label predicate (n:Label) in an expression; put the label in the pattern` |
-| `(n:A:B)`, `(n:A\|B)` | `not supported in mushroomdb 0.10: more than one label (n:A:B, n:A\|B); a node has one label` |
-| `WHERE (n)-[:K]->()`, `NOT (n)-->()`, `exists((n)-->())`, `size((n)-->())` | `not supported in mushroomdb 0.10: pattern predicate (a relationship pattern used as an expression)` |
+| `(n:A:B)`, `(n:A\|B)`, `WHERE n:A:B` | `not supported in mushroomdb 0.10: more than one label (n:A:B, n:A\|B); a node has one label` |
+| `WHERE (n)-[:K]->()`, `NOT (n)-->()`, `exists((n)-->())`, `size((n)-->())` | `not supported in mushroomdb 0.10: pattern predicate (a relationship pattern used as an expression)` — test the pattern with `OPTIONAL MATCH (n)-[:K]->(m) WITH n, count(m) AS c WHERE c > 0` |
 | `[(n)-->(m) \| m.name]` | `not supported in mushroomdb 0.10: pattern comprehension [(n)-->(m) \| …]` |
-| `RETURN *`, `WITH *` | `not supported in mushroomdb 0.10: RETURN * / WITH * (name each item)` |
 | `RETURN n {.name, .age}` | `not supported in mushroomdb 0.10: map projection (n {.key, …})` |
 | `n.name =~ 'a.*'` | `not supported in mushroomdb 0.10: regular-expression match (=~)` |
 | `LOAD CSV …` | `not supported in mushroomdb 0.10: LOAD CSV` |
 | `USE db …` | `not supported in mushroomdb 0.10: USE (database selection)` |
-| `OPTIONAL MATCH` as the first clause | `not supported in mushroomdb 0.10: OPTIONAL MATCH as the first clause; begin with MATCH` |
-| `MATCH … CREATE`, `MATCH … MERGE` | `not supported in mushroomdb 0.10: CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now` — the `UNWIND` form runs the same `MATCH` then the write, once |
 | `allShortestPaths(…)` | `not supported in mushroomdb 0.10: allShortestPaths` |
 
 The other refusals of this release (forms of `MERGE`, `SET` maps, `UNWIND`
@@ -5739,6 +5793,20 @@ RETURN a, COUNT(b)
 ```
 
 Edgeless nodes return `COUNT(b) = 0` — the outer row is never dropped.
+
+### A leading OPTIONAL MATCH
+
+A query may begin with `OPTIONAL MATCH`. It runs against one row, as `UNWIND [1]
+AS _ OPTIONAL MATCH …` does, so it returns the rows it finds, or one row of nulls
+when it finds none:
+
+```cypher
+OPTIONAL MATCH (n:Person {id: 'nobody'})
+RETURN n, n.name
+```
+
+returns one row, `null, null`. Clauses may follow it as they follow an `UNWIND`
+(`MATCH`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, `WHERE`).
 
 ### WHERE inside OPTIONAL MATCH
 
@@ -5991,6 +6059,30 @@ predicate is. `SET n.flag = n.score > 10` stores a boolean; a predicate that is
 null is the existing `SET value for n.flag evaluated to null` error. An unaliased
 predicate column is named `<expr>`.
 
+### Label predicates
+
+`n:Label` is true when the node `n` has that label and false when it has
+another; `r:TYPE` does the same for a relationship's type. It is an expression
+like any other, in `WHERE`, `RETURN`, `WITH`, `CASE`, a comprehension or a `SET`
+value, and it binds tighter than `NOT`, `AND` and the comparisons:
+
+```cypher
+MATCH (n) WHERE n:Person OR n:Company RETURN n.id
+MATCH (p:Person) OPTIONAL MATCH (p)-[:WORKS_AT]->(c)
+RETURN p.id, c:Company AS employed
+MATCH (a)-[r]->(b) WHERE NOT r:BLOCKS RETURN b.id
+```
+
+- Three-valued: a null node (an `OPTIONAL MATCH` that found nothing) gives null,
+  so `WHERE NOT c:Company` drops that row as well.
+- It reads the node's label, not a property: a node that stores a property
+  called `label` does not change the answer (`n.label` reads the stored value).
+- A node has one label in 0.10, so `n:A:B` and `n:A|B` are refused by name
+  (`not supported in mushroomdb 0.10: more than one label …`). On a value that is
+  not a node or a relationship it is an error naming the variable.
+- It is never turned into an index lookup; the label in the pattern
+  (`MATCH (n:Person)`) is what selects nodes by label.
+
 ### List subscripts
 
 A subscript reads one element of a list-valued property or expression. A
@@ -6072,6 +6164,10 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `UNWIND … MERGE` | `UNWIND $rows AS r MERGE (n:Person {id: r.id}) ON CREATE SET n.at = r.at` — a row sees the rows before it; node and relationship forms |
 | `UNWIND … MATCH … SET` / `SET n += r` / `REMOVE` / `DELETE` / `DETACH DELETE` | `UNWIND $rows AS r MATCH (n {id: r.id}) SET n += r` |
 | `OPTIONAL MATCH` (left-outer-join) | `MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, b` |
+| A leading `OPTIONAL MATCH` | `OPTIONAL MATCH (n:Person {id: 'x'}) RETURN n` — one row of nulls when nothing matches |
+| `RETURN *` / `WITH *` | `MATCH (p:Person)-[r:KNOWS]->(q) RETURN *` — the node, path and value names in scope, in alphabetical order (here `p`, `q`); see [RETURN * and WITH *](#return--and-with-) |
+| Label predicates `n:Label`, `r:TYPE` | `MATCH (n) WHERE n:Person OR n:Company RETURN n.id, n:Person AS person` — see [Label predicates](#label-predicates) |
+| `MATCH … CREATE` / `MATCH … MERGE` | `MATCH (a {id: 'x'}), (b {id: 'y'}) CREATE (a)-[:K]->(b)`, `MATCH (a), (b) MERGE (a)-[:K]->(b)` — once per matched row; see [MATCH … CREATE / MATCH … MERGE](#match--create--match--merge) |
 | `OPTIONAL MATCH … WHERE` (filter in optional scope) | `OPTIONAL MATCH (a)-[r]->(b) WHERE b.score > 5` |
 | Multiple chained `OPTIONAL MATCH` | `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (a)-[:S]->(c)` |
 | `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
@@ -6136,7 +6232,10 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `UNWIND … SET n += x` where `x` is not a map | `SET n += <map>: the value must be a map, got …` |
 | `UNWIND … <write>` inside a transaction | `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE / MERGE / SET / REMOVE / DELETE` |
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
-| Multi-statement / unknown top-level keyword | `parse error: expected MATCH, UNWIND, WITH or RETURN (found …)` |
+| Multi-statement / unknown top-level keyword | `parse error: expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN (found …)` |
+| `RETURN *` / `WITH *` with no node, path or value name in scope | `RETURN * / WITH * with no variables in scope` |
+| `RETURN *` after a `CALL` with no `YIELD` list | `RETURN * after CALL needs a YIELD list; name the columns with YIELD` |
+| A label test on a value (`UNWIND [1] AS x RETURN x:L`) | ``x:L: `x` is not a node or a relationship`` |
 | Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
 | List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
@@ -6157,7 +6256,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
 | A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
 | An unknown procedure, or `YIELD` of a column it does not return | `execute: unknown procedure: <ns>.<name>`, ``execute: YIELD `<field>`: <ns>.<name> returns no such column; it returns: …`` |
-| `FOREACH`, `EXISTS { }` / `COUNT { }` / `COLLECT { }` and `CALL { }` subqueries, `CALL` inside a larger query, `SET n:Label`, label predicates, more than one label, pattern predicates and comprehensions, `RETURN *`, map projections, `=~`, `LOAD CSV`, `USE`, a leading `OPTIONAL MATCH`, `MATCH … CREATE`, `allShortestPaths` | `not supported in mushroomdb 0.10: <feature>` — the full list is under [Unsupported features](#unsupported-features) |
+| `FOREACH`, `EXISTS { }` / `COUNT { }` / `COLLECT { }` and `CALL { }` subqueries, `CALL` inside a larger query, `SET n:Label`, more than one label, pattern predicates and comprehensions, map projections, `=~`, `LOAD CSV`, `USE`, `allShortestPaths` | `not supported in mushroomdb 0.10: <feature>` — the full list is under [Unsupported features](#unsupported-features) |
 
 ### Absent
 

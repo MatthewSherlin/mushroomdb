@@ -580,12 +580,17 @@ impl Transaction {
                 self.stage_match_delete_node(s, params, &mut staged)?
             }
             WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
-            WriteStatement::UnwindWrite(_) => {
+            WriteStatement::UnwindWrite(s) => {
                 // Per-row writes are evaluated against the statement's own
-                // earlier rows by `GraphDb`'s executor, not the overlay.
-                return Err(not_supported(
-                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE",
-                ));
+                // earlier rows by `GraphDb`'s executor, not the overlay. A
+                // statement that began with MATCH is named as written.
+                let match_led = s.read.unwinds.first().map(|u| u.alias.as_str())
+                    == Some(core_query::cypher::ONE_ROW_VAR);
+                return Err(not_supported(if match_led {
+                    "MATCH … CREATE / MERGE"
+                } else {
+                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE"
+                }));
             }
         };
         // Only this statement's records are applied: the overlay already
@@ -667,7 +672,8 @@ impl Transaction {
             staged.insert_edge(&edge.etype, src, dst);
         }
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts(stmt.nodes.len() as i64, 0, 0));
+            let created = stmt.nodes.len() + stmt.edges.len();
+            return Ok(Self::counts(created as i64, 0, 0));
         };
         let patterns = stmt
             .nodes
@@ -1049,6 +1055,7 @@ impl Transaction {
             &match_sets
         } else {
             staged.insert_edge(&edge.etype, src_key, dst_key);
+            created += 1;
             &create_sets
         };
         for (key, sc) in sets {

@@ -166,12 +166,8 @@ fn each_refused_form_is_named_wherever_it_stands() {
             "SET n:Label (label assignment)",
         ),
         (
-            "MATCH (n) WHERE n:Person RETURN n",
-            "a label predicate (n:Label) in an expression; put the label in the pattern",
-        ),
-        (
-            "MATCH (n) RETURN n:Person AS p",
-            "a label predicate (n:Label) in an expression; put the label in the pattern",
+            "MATCH (n) WHERE n:Person:Company RETURN n",
+            "more than one label (n:A:B, n:A|B); a node has one label",
         ),
         (
             "MATCH (n:A:B) RETURN n",
@@ -207,15 +203,6 @@ fn each_refused_form_is_named_wherever_it_stands() {
             "pattern comprehension [(n)-->(m) | …]",
         ),
         // Projections.
-        ("MATCH (n) RETURN *", "RETURN * / WITH * (name each item)"),
-        (
-            "MATCH (n) RETURN DISTINCT *",
-            "RETURN * / WITH * (name each item)",
-        ),
-        (
-            "MATCH (n) WITH * RETURN n",
-            "RETURN * / WITH * (name each item)",
-        ),
         (
             "MATCH (n) RETURN n {.name, .age} AS m",
             "map projection (n {.key, …})",
@@ -230,18 +217,6 @@ fn each_refused_form_is_named_wherever_it_stands() {
             "LOAD CSV",
         ),
         ("USE other MATCH (n) RETURN n", "USE (database selection)"),
-        (
-            "OPTIONAL MATCH (n) RETURN n",
-            "OPTIONAL MATCH as the first clause; begin with MATCH",
-        ),
-        (
-            "MATCH (a), (b) CREATE (a)-[:K]->(b)",
-            "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now",
-        ),
-        (
-            "MATCH (a {id: 'x'}) MERGE (a)-[:K]->(b:B {id: 'y'})",
-            "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now",
-        ),
         (
             "MATCH p = allShortestPaths((a)-[*]-(b)) RETURN p",
             "allShortestPaths",
@@ -425,9 +400,9 @@ fn on_match_is_not_a_match_clause() {
     ] {
         assert!(parse_write(&lex(q).unwrap()).is_ok(), "{q}");
     }
-    // A failure after ON MATCH is not reported as MATCH … CREATE.
+    // A failure after ON MATCH is not read as a MATCH … CREATE statement.
     let err = statement_err("MERGE (a:P {id: 'a'}) ON MATCH SET a.n = 1 CREATE (b:P {id: 'q'})");
-    assert!(!err.contains("after a MATCH clause"), "{err}");
+    assert!(err.contains("unexpected tokens after MERGE"), "{err}");
 }
 
 #[test]

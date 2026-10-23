@@ -5,8 +5,9 @@ use super::ast::{
     HopRange, LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
     MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
     OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
-    UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
 };
+use unwind_write::{Scope, VarKind};
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
 /// is the merge (`+=`) form, and the map's entries.
 type SetMapClause = (String, bool, Vec<(String, Operand)>, Option<String>);
@@ -156,8 +157,12 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
         first if kw(first, "drop") => true,
+        // `MATCH … SET|DELETE|REMOVE|CREATE|MERGE …`.
         Some(Tok::Match) => {
-            tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)) || has_remove_clause(tokens)
+            tokens
+                .iter()
+                .any(|t| matches!(t, Tok::Set | Tok::Delete | Tok::Create | Tok::Merge))
+                || has_remove_clause(tokens)
         }
         // `UNWIND … CREATE|MERGE|SET|DELETE|REMOVE …`: a write when any write
         // clause follows; `UNWIND … RETURN` stays a read.
@@ -323,41 +328,48 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::Match) {
             matches.extend(self.match_clause()?);
         }
+        // A leading OPTIONAL MATCH reads as `UNWIND [1] AS <ONE_ROW_VAR>
+        // OPTIONAL MATCH …`: it runs against one row, so it gives one row of
+        // nulls when nothing matches.
+        let leading_optional = matches.is_empty() && self.peek() == Some(&Tok::Optional);
         // A query may also open with UNWIND, WITH or RETURN; it then reads
         // nothing from the graph and runs against one empty row.
         if matches.is_empty()
+            && !leading_optional
             && !matches!(
                 self.peek(),
                 Some(Tok::Unwind) | Some(Tok::With) | Some(Tok::Return)
             )
         {
-            return Err(self.err("expected MATCH, UNWIND, WITH or RETURN"));
+            return Err(self.err("expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN"));
         }
-        // Optional WHERE clause that follows the required MATCH(es) — may come
-        // before or after OPTIONAL MATCH.  In standard Cypher, WHERE applies to
-        // the preceding MATCH, so `MATCH (a) WHERE … OPTIONAL MATCH … RETURN`
-        // is legal.  Parse it here, then parse OPTIONAL MATCHes, then check
-        // again in case WHERE follows the OPTIONAL MATCHes instead.
-        let where_expr_pre = if self.eat(&Tok::Where) {
-            Some(self.where_expr()?)
-        } else {
-            None
-        };
-        // Optional MATCH clauses (zero or more, after required MATCHes + WHERE).
-        let mut optional_clauses = Vec::new();
-        while self.peek() == Some(&Tok::Optional) {
-            optional_clauses.push(self.optional_match_clause()?);
-        }
-        // WHERE may also appear *after* OPTIONAL MATCHes (if not already seen).
-        let where_expr = if where_expr_pre.is_some() {
-            where_expr_pre
-        } else if self.eat(&Tok::Where) {
-            Some(self.where_expr()?)
-        } else {
-            None
-        };
-        // Optional top-level UNWIND clauses (after WHERE, before WITH).
+        let mut scope = Scope::default();
         let mut unwinds = Vec::new();
+        let mut optional_clauses = Vec::new();
+        let mut where_expr = None;
+        if leading_optional {
+            scope.bind_hidden(ONE_ROW_VAR, VarKind::Scalar);
+            unwinds.push(unwind_write::one_row_unwind());
+        } else {
+            // Optional WHERE clause that follows the required MATCH(es) — may
+            // come before or after OPTIONAL MATCH.  In standard Cypher, WHERE
+            // applies to the preceding MATCH, so `MATCH (a) WHERE … OPTIONAL
+            // MATCH … RETURN` is legal.  Parse it here, then parse OPTIONAL
+            // MATCHes, then check again in case WHERE follows the OPTIONAL
+            // MATCHes instead.
+            if self.eat(&Tok::Where) {
+                where_expr = Some(self.where_expr()?);
+            }
+            // Optional MATCH clauses (zero or more, after required MATCHes + WHERE).
+            while self.peek() == Some(&Tok::Optional) {
+                optional_clauses.push(self.optional_match_clause()?);
+            }
+            // WHERE may also appear *after* OPTIONAL MATCHes (if not already seen).
+            if where_expr.is_none() && self.eat(&Tok::Where) {
+                where_expr = Some(self.where_expr()?);
+            }
+        }
+        // Optional top-level UNWIND clauses (after WHERE, before WITH).
         while self.peek() == Some(&Tok::Unwind) {
             unwinds.push(self.unwind_clause()?);
         }
@@ -370,16 +382,18 @@ impl<'a> Parser<'a> {
         // WITH pipeline stages (zero or more). After an UNWIND the stages may
         // also be plain MATCH / OPTIONAL MATCH / UNWIND clauses.
         let mut stages = Vec::new();
+        scope.bind_clauses(&matches, &optional_clauses, &unwinds);
         if unwinds.is_empty() {
             while self.peek() == Some(&Tok::With) {
-                stages.push(self.with_stage()?);
+                let stage = self.with_stage(&scope)?;
+                scope.after_with(&stage.items);
+                scope.bind_clauses(&stage.matches, &stage.optional_clauses, &stage.unwinds);
+                stages.push(stage);
             }
         } else {
-            let mut scope = unwind_write::Scope::default();
-            scope.bind_clauses(&matches, &optional_clauses, &unwinds);
             self.stages_after_unwind(&mut scope, &mut stages)?;
         }
-        let (distinct, returns) = self.return_clause()?;
+        let (distinct, returns) = self.return_clause(&scope)?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
         let order_by = if self.peek() == Some(&Tok::Order) {
             self.order_clause(&aliases)?
@@ -474,37 +488,9 @@ impl<'a> Parser<'a> {
             {
                 "more than one label (n:A:B, n:A|B); a node has one label"
             }
-            Tok::Colon if matches!((prev, next), (Some(Tok::Ident(_)), Some(Tok::Ident(_)))) => {
-                "a label predicate (n:Label) in an expression; put the label in the pattern"
-            }
-            Tok::Star
-                if matches!(prev, Some(Tok::Return | Tok::With))
-                    || (kw(prev, "distinct")
-                        && matches!(
-                            self.pos.checked_sub(2).and_then(at),
-                            Some(Tok::Return | Tok::With)
-                        )) =>
-            {
-                "RETURN * / WITH * (name each item)"
-            }
-            Tok::Optional if self.pos == 0 => {
-                "OPTIONAL MATCH as the first clause; begin with MATCH"
-            }
-            Tok::Create | Tok::Merge if self.match_clause_before() => {
-                "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now"
-            }
             _ => return None,
         };
         Some(refusal(feature))
-    }
-
-    /// Whether a `MATCH` clause comes before the cursor. The `MATCH` of
-    /// `MERGE … ON MATCH SET` is not one.
-    fn match_clause_before(&self) -> bool {
-        self.toks[..self.pos]
-            .iter()
-            .enumerate()
-            .any(|(i, t)| *t == Tok::Match && !(i > 0 && kw(self.toks.get(i - 1), "on")))
     }
 
     /// Whether the tokens at the cursor open a relationship pattern used as an
@@ -595,12 +581,10 @@ impl<'a> Parser<'a> {
 
     /// Parse one `WITH <items> [WHERE] [ORDER BY] [SKIP] [LIMIT] [MATCH]* [UNWIND]* [WHERE]`
     /// stage and return a `WithStage`.
-    fn with_stage(&mut self) -> Result<WithStage, String> {
+    /// `scope` is what is in scope before the WITH (for `WITH *`).
+    fn with_stage(&mut self, scope: &Scope) -> Result<WithStage, String> {
         self.expect(&Tok::With, "expected WITH")?;
-        let mut items = vec![self.ret_item()?];
-        while self.eat(&Tok::Comma) {
-            items.push(self.ret_item()?);
-        }
+        let items = self.projection_items(scope)?;
         // Optional WHERE / HAVING immediately after WITH items.
         let where_expr = if self.eat(&Tok::Where) {
             Some(self.where_expr()?)
@@ -1537,6 +1521,10 @@ impl<'a> Parser<'a> {
                     // Evaluates to query null; inside a list or map it is kept
                     // as a `Value::Null` element.
                     Ok(Operand::Lit(Value::Null))
+                } else if self.peek() == Some(&Tok::Colon)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+                {
+                    self.label_predicate(name)
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
                     Ok(Operand::Var(name))
@@ -1544,6 +1532,23 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// `var:Label` after the variable: a label predicate, parsed to the
+    /// [`LABEL_TEST_FN`] call. A node has one label in 0.10, so `var:A:B` and
+    /// `var:A|B` are refused by name.
+    fn label_predicate(&mut self, var: String) -> Result<Operand, String> {
+        self.expect(&Tok::Colon, "expected ':' before a label")?;
+        let label = self.ident("expected a label after ':'")?;
+        if matches!(self.peek(), Some(Tok::Colon | Tok::Pipe)) {
+            return Err(refusal(
+                "more than one label (n:A:B, n:A|B); a node has one label",
+            ));
+        }
+        Ok(Operand::FuncCall {
+            name: LABEL_TEST_FN.to_string(),
+            args: vec![Operand::Var(var), Operand::Lit(Value::Str(label))],
+        })
     }
 
     /// Parse a generic `CASE WHEN <cond> THEN <value> … [ELSE <value>] END`.
@@ -1584,20 +1589,23 @@ impl<'a> Parser<'a> {
         self.value_expr()
     }
 
-    fn return_clause(&mut self) -> Result<(bool, Vec<RetItem>), String> {
+    /// `RETURN [DISTINCT] items`; `scope` is what is in scope (for `RETURN *`).
+    fn return_clause(&mut self, scope: &Scope) -> Result<(bool, Vec<RetItem>), String> {
         if !self.eat(&Tok::Return) {
             return Err(self.unsupported_or_unexpected("expected RETURN"));
         }
         let distinct = self.eat_ident_kw("distinct");
-        let mut items = vec![self.ret_item()?];
-        while self.eat(&Tok::Comma) {
-            items.push(self.ret_item()?);
-        }
-        Ok((distinct, items))
+        Ok((distinct, self.projection_items(scope)?))
     }
 
-    fn return_items(&mut self) -> Result<Vec<RetItem>, String> {
-        let mut items = vec![self.ret_item()?];
+    /// The items of a RETURN or WITH: `item [, item …]`, or `* [, item …]`,
+    /// where `*` stands for every name in `scope` (see [`Scope::star_items`]).
+    fn projection_items(&mut self, scope: &Scope) -> Result<Vec<RetItem>, String> {
+        let mut items = if self.eat(&Tok::Star) {
+            scope.star_items()?
+        } else {
+            vec![self.ret_item()?]
+        };
         while self.eat(&Tok::Comma) {
             items.push(self.ret_item()?);
         }
@@ -1691,7 +1699,10 @@ impl<'a> Parser<'a> {
         let value = match op {
             Operand::Var(name) => RetVal::Var(name),
             Operand::Prop { var, field } => RetVal::Prop { var, field },
-            Operand::FuncCall { name, args } => RetVal::FuncCall { name, args },
+            // A label test names its column like any other predicate.
+            Operand::FuncCall { name, args } if name != LABEL_TEST_FN => {
+                RetVal::FuncCall { name, args }
+            }
             other => RetVal::ScalarExpr(other),
         };
         let alias = if self.eat(&Tok::As) {
@@ -1770,7 +1781,15 @@ impl<'a> Parser<'a> {
         let mut stmt = self.create_pattern()?;
         // Optional RETURN clause: `CREATE (n:L {…}) RETURN n` or `RETURN n.id AS id`.
         if self.eat(&Tok::Return) {
-            stmt.returns = Some(self.return_items()?);
+            let mut scope = Scope::default();
+            for (i, node) in stmt.nodes.iter().enumerate() {
+                match &node.var {
+                    // `create_node` names an anonymous node `_cn<index>`.
+                    Some(v) if *v != format!("_cn{i}") => scope.bind(v, VarKind::Node),
+                    _ => {}
+                }
+            }
+            stmt.returns = Some(self.projection_items(&scope)?);
         }
         if self.pos < self.toks.len() {
             return Err(self.err("unexpected tokens after CREATE"));
@@ -2157,7 +2176,21 @@ impl<'a> Parser<'a> {
         }
         // Optional RETURN clause.
         let returns = if self.eat(&Tok::Return) {
-            Some(self.return_items()?)
+            let mut scope = Scope::default();
+            let names = [
+                (var.as_ref(), VarKind::Node),
+                (
+                    edge.as_ref().and_then(|e| e.end_var.as_ref()),
+                    VarKind::Node,
+                ),
+                (edge.as_ref().and_then(|e| e.rel_var.as_ref()), VarKind::Rel),
+            ];
+            for (name, kind) in names {
+                if let Some(name) = name {
+                    scope.bind(name, kind);
+                }
+            }
+            Some(self.projection_items(&scope)?)
         } else {
             None
         };
@@ -2180,6 +2213,14 @@ impl<'a> Parser<'a> {
     // ── MATCH … SET / MATCH … DELETE ─────────────────────────────────────────
 
     fn match_write_stmt(&mut self) -> Result<WriteStatement, String> {
+        // `MATCH … CREATE …` / `MATCH … MERGE …` run per matched row, as the
+        // `UNWIND [1] AS _ MATCH …` form does.
+        if self.toks[self.pos..]
+            .iter()
+            .any(|t| matches!(t, Tok::Create | Tok::Merge))
+        {
+            return self.unwind_write_stmt();
+        }
         // Parse MATCH clauses (same as read query).
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -2200,7 +2241,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1; // consume SET
                 let (var, merge, map, param) = self.set_map_clause(&matches)?;
                 let returns = if self.eat(&Tok::Return) {
-                    Some(self.return_items()?)
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
                 } else {
                     None
                 };
@@ -2221,7 +2262,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1; // consume SET
                 let sets = self.set_clauses()?;
                 let returns = if self.eat(&Tok::Return) {
-                    Some(self.return_items()?)
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
                 } else {
                     None
                 };
@@ -2282,7 +2323,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1; // consume REMOVE
                 let removals = self.remove_items(&matches)?;
                 let returns = if self.eat(&Tok::Return) {
-                    Some(self.return_items()?)
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
                 } else {
                     None
                 };

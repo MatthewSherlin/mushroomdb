@@ -1450,6 +1450,23 @@ fn eval_set_return_func<F: Fs>(
     args: &[Operand],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
+    if name == core_query::cypher::LABEL_TEST_FN {
+        // `x:Label`: the node's label, or the relationship's captured type.
+        let [Operand::Var(var), Operand::Lit(Value::Str(label))] = args else {
+            return Err(GraphError::QueryError {
+                detail: "a label test (x:Label) needs a node or relationship variable".into(),
+            });
+        };
+        let actual = if rel_vars.iter().any(|r| r == var) {
+            match_rs.get(row, &rel_type_alias(var)).cloned()
+        } else {
+            match match_rs.get(row, var) {
+                Some(Value::Str(key)) => db.node_ref(key).map(|n| Value::Str(n.label().to_owned())),
+                _ => None,
+            }
+        };
+        return Ok(actual.map(|a| Value::Bool(a == Value::Str(label.clone()))));
+    }
     let norm = name.to_ascii_lowercase();
     if norm == "type" {
         if args.len() != 1 {
@@ -13561,6 +13578,7 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("CREATE edge dst variable '{}' is not bound", edge.dst_var),
                 })?;
             batch.insert_edge(&edge.etype, src_key, dst_key);
+            created += 1;
         }
         batch.commit()?;
 
@@ -14592,6 +14610,7 @@ impl<F: Fs> GraphDb<F> {
             &match_sets
         } else {
             batch.insert_edge(&edge.etype, src_key, dst_key);
+            created += 1;
             &create_sets
         };
         for (key, field, value) in sets {

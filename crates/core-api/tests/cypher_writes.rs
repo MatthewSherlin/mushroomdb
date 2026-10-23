@@ -111,7 +111,7 @@ fn create_node_and_edge() {
             &no_params(),
         )
         .unwrap();
-    assert_eq!(rs.get(0, "created"), Some(&Value::Int(2)));
+    assert_eq!(rs.get(0, "created"), Some(&Value::Int(3))); // nodes and relationships (row 143)
     assert!(db.has_node("alice"));
     assert!(db.has_node("bob"));
     let nbrs = db

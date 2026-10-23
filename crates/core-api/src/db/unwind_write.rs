@@ -240,9 +240,13 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
                 }
             }
             RowWrite::Merge(merge) => {
-                merge_operands(&merge.start, &mut cols, nodes);
-                if let Some(edge) = &merge.edge {
-                    merge_operands(&edge.end, &mut cols, nodes);
+                let ends = std::iter::once(&merge.start).chain(merge.edge.as_ref().map(|e| &e.end));
+                for end in ends {
+                    if end.bound {
+                        note_var(&end.var);
+                    } else {
+                        merge_operands(end, &mut cols, nodes);
+                    }
                 }
                 for sc in merge.on_create.iter().chain(&merge.on_match) {
                     cols.operand(&sc.value, nodes);
@@ -659,6 +663,7 @@ impl<F: Fs> GraphDb<F> {
                         dst_key: dst.clone(),
                     });
                     ov.edge_created(&edge.etype, &src, &dst);
+                    tally.created += 1;
                 }
             }
             RowWrite::Merge(merge) => {
@@ -817,13 +822,23 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
-    /// The key a MERGE node pattern names for this row.
+    /// The key a MERGE node pattern names for this row. A bound node's key is
+    /// the one its variable holds.
     fn uw_merge_key(
         node: &RowMergeNode,
         ctx: &RowCtx<'_, F>,
         env: &HashMap<&str, String>,
         ov: &mut Overlay,
     ) -> Result<(String, Value)> {
+        if node.bound {
+            return match env.get(node.var.as_str()) {
+                Some(key) => Ok((key.clone(), Value::Str(key.clone()))),
+                None => Err(err(format!(
+                    "MERGE ({0}): `{0}` is null in this row, so there is no node to merge from",
+                    node.var
+                ))),
+            };
+        }
         match ctx.eval(&node.key, env, ov)? {
             Some(Value::Str(s)) => Ok((s.clone(), Value::Str(s))),
             other => Err(err(format!(
@@ -834,7 +849,21 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Whether a MERGE node exists at this point, after the role-scope check
-    /// (made once per key, against the store).
+    /// (made once per key, against the store). A bound node must still exist.
+    fn uw_merge_node_existed(&self, ov: &Overlay, node: &RowMergeNode, key: &str) -> Result<bool> {
+        if !node.bound {
+            return self.uw_merge_existed(ov, &node.label, key);
+        }
+        if self.uw_exists(ov, key) {
+            Ok(true)
+        } else {
+            Err(err(format!(
+                "MERGE ({}): the node `{key}` was deleted earlier in the statement",
+                node.var
+            )))
+        }
+    }
+
     fn uw_merge_existed(&self, ov: &Overlay, label: &str, key: &str) -> Result<bool> {
         match ov.nodes.get(key) {
             // Created or deleted by the statement: its own answer.
@@ -858,7 +887,7 @@ impl<F: Fs> GraphDb<F> {
             None => None,
         };
         let Some(edge) = &merge.edge else {
-            let existed = self.uw_merge_existed(ov, &merge.start.label, &start_key)?;
+            let existed = self.uw_merge_node_existed(ov, &merge.start, &start_key)?;
             if !existed {
                 let props = self.merge_create_props(
                     &merge.start.key_field,
@@ -888,17 +917,21 @@ impl<F: Fs> GraphDb<F> {
             Some(op) => ctx.eval(op, env, ov)?,
             None => None,
         };
-        if start_key == end_key && merge.start.label != edge.end.label {
+        if start_key == end_key
+            && !merge.start.bound
+            && !edge.end.bound
+            && merge.start.label != edge.end.label
+        {
             return Err(err(format!(
                 "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
                 merge.start.label, edge.end.label
             )));
         }
-        let start_existed = self.uw_merge_existed(ov, &merge.start.label, &start_key)?;
+        let start_existed = self.uw_merge_node_existed(ov, &merge.start, &start_key)?;
         let end_existed = if end_key == start_key {
             start_existed
         } else {
-            self.uw_merge_existed(ov, &edge.end.label, &end_key)?
+            self.uw_merge_node_existed(ov, &edge.end, &end_key)?
         };
         let (src_key, dst_key) = match edge.dir {
             core_query::cypher::RelDir::Left => (end_key.clone(), start_key.clone()),
@@ -938,6 +971,7 @@ impl<F: Fs> GraphDb<F> {
                 dst_key: dst_key.clone(),
             });
             ov.edge_created(&edge.etype, &src_key, &dst_key);
+            tally.created += 1;
             &merge.on_create
         };
         env.insert(merge.start.var.as_str(), start_key);

@@ -6,6 +6,7 @@
 //! and `YIELD` is a keyword only right after the call's argument list, so both
 //! still name properties, labels and variables everywhere else.
 
+use super::unwind_write::{Scope, VarKind};
 use super::{kw, refusal, Parser};
 use crate::cypher::ast::{CallReturn, ProcCallStmt, YieldItem};
 use crate::cypher::Tok;
@@ -36,7 +37,7 @@ impl<'a> Parser<'a> {
             None
         };
         let ret = if self.peek() == Some(&Tok::Return) {
-            Some(self.call_return()?)
+            Some(self.call_return(yields.as_deref())?)
         } else {
             None
         };
@@ -115,9 +116,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `RETURN [DISTINCT] items [ORDER BY …] [SKIP n] [LIMIT n]`.
-    fn call_return(&mut self) -> Result<CallReturn, String> {
-        let (distinct, items) = self.return_clause()?;
+    /// `RETURN [DISTINCT] items [ORDER BY …] [SKIP n] [LIMIT n]`. `RETURN *`
+    /// stands for the `YIELD` names; with no `YIELD` list it is refused, since
+    /// the procedure's columns are known only when it runs.
+    fn call_return(&mut self, yields: Option<&[YieldItem]>) -> Result<CallReturn, String> {
+        let mut scope = Scope::default();
+        match yields {
+            Some(items) => {
+                for item in items {
+                    scope.bind(item.name(), VarKind::Scalar);
+                }
+            }
+            None if self.toks.get(self.pos + 1) == Some(&Tok::Star)
+                || (kw(self.toks.get(self.pos + 1), "distinct")
+                    && self.toks.get(self.pos + 2) == Some(&Tok::Star)) =>
+            {
+                return Err(
+                    "RETURN * after CALL needs a YIELD list; name the columns with YIELD"
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+        let (distinct, items) = self.return_clause(&scope)?;
         let aliases: Vec<&str> = items.iter().filter_map(|r| r.alias.as_deref()).collect();
         let order_by = if self.peek() == Some(&Tok::Order) {
             self.order_clause(&aliases)?
