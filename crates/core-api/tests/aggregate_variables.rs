@@ -10,6 +10,9 @@
 //! than `null` and maps, so a null reaches an aggregate here as a missing
 //! property (`MATCH (n) WITH n.v AS x`).
 //!
+//! Row 158 is pinned here too: `sum` of integers is an integer, a float once
+//! any input is a float, and an integer overflow is an error.
+//!
 //! What 0.9.4 does not change: `min` / `max` still read numbers (and, from row
 //! 160, booleans) only, and an aggregate of a node variable still contributes
 //! nothing. 0.10 changes both, so neither is pinned here.
@@ -277,7 +280,7 @@ fn distinct(vals: &[Option<Value>]) -> Vec<Option<Value>> {
 }
 
 /// Reference answers computed by hand from the generated numbers and nulls.
-/// `sum` is compared by value: its type is row 158's concern.
+/// `sum` of integers is an integer (row 158); `avg` is always a float.
 fn reference(f: &str, vals: &[Option<Value>]) -> Option<Value> {
     let present: Vec<Option<Value>> = vals.iter().filter(|v| v.is_some()).cloned().collect();
     let nums: Vec<f64> = present.iter().filter_map(num).collect();
@@ -300,7 +303,15 @@ fn reference(f: &str, vals: &[Option<Value>]) -> Option<Value> {
     };
     match f {
         "count" => int(present.len() as i64),
-        "sum" => (!nums.is_empty()).then(|| Value::Float(nums.iter().sum())),
+        "sum" if nums.is_empty() => None,
+        "sum" if present.iter().all(|v| matches!(v, Some(Value::Int(_)))) => int(present
+            .iter()
+            .map(|v| match v {
+                Some(Value::Int(n)) => *n,
+                _ => unreachable!(),
+            })
+            .sum()),
+        "sum" => float(nums.iter().sum()),
         "avg" => {
             (!nums.is_empty()).then(|| Value::Float(nums.iter().sum::<f64>() / nums.len() as f64))
         }
@@ -308,11 +319,6 @@ fn reference(f: &str, vals: &[Option<Value>]) -> Option<Value> {
         "min" => pick(false),
         _ => unreachable!(),
     }
-}
-
-/// `sum` compared by value, whatever its numeric type.
-fn as_float(v: Option<Value>) -> Option<Value> {
-    num(&v).map(Value::Float).or(v)
 }
 
 fn gen_values(rng: &mut Lcg) -> Vec<Option<Value>> {
@@ -366,10 +372,7 @@ fn randomized_differential_against_a_hand_reference() {
                     queries.push(format!("MATCH (n:{label}) RETURN {f}({d}n.v)"));
                 }
                 for q in queries {
-                    let mut got = one(&db, &q);
-                    if f == "sum" {
-                        got = as_float(got);
-                    }
+                    let got = one(&db, &q);
                     assert!(
                         close(&got, &want),
                         "case {case}: `{q}` -> {got:?}, want {want:?}"
@@ -394,10 +397,7 @@ fn randomized_differential_against_a_hand_reference() {
                     .iter()
                     .find(|r| r[0] == int(k))
                     .unwrap_or_else(|| panic!("case {case}: `{q}` has no group {k}"));
-                let mut cell = row[1].clone();
-                if f == "sum" {
-                    cell = as_float(cell);
-                }
+                let cell = row[1].clone();
                 let want = reference(f, &group);
                 assert!(
                     close(&cell, &want),
@@ -406,4 +406,62 @@ fn randomized_differential_against_a_hand_reference() {
             }
         }
     }
+}
+
+/// Row 158: `sum` of integers returned a float (`6.0` for 1 + 2 + 3).
+#[test]
+fn sum_of_integers_is_an_integer() {
+    let mut db = open("sum-int");
+    assert_eq!(
+        one(&db, &format!("{ONE} UNWIND [1, 2, 3] AS x RETURN sum(x)")),
+        int(6)
+    );
+    assert_eq!(
+        one(&db, &format!("{ONE} UNWIND [1, 2.5] AS x RETURN sum(x)")),
+        float(3.5)
+    );
+    assert_eq!(
+        one(&db, &format!("{ONE} UNWIND [2.5, 1] AS x RETURN sum(x)")),
+        float(3.5)
+    );
+    assert_eq!(
+        one(&db, &format!("{ONE} UNWIND [] AS x RETURN sum(x)")),
+        None
+    );
+    // avg stays a float.
+    assert_eq!(
+        one(&db, &format!("{ONE} UNWIND [1, 2, 3] AS x RETURN avg(x)")),
+        float(2.0)
+    );
+    // Exact above 2^53, where a float sum would round.
+    assert_eq!(
+        one(
+            &db,
+            &format!("{ONE} UNWIND [9007199254740993, 1] AS x RETURN sum(x)")
+        ),
+        int(9007199254740994)
+    );
+    let e = try_rows(
+        &db,
+        &format!("{ONE} UNWIND [9223372036854775807, 1] AS x RETURN sum(x)"),
+    )
+    .unwrap_err();
+    assert!(e.contains("sum(): integer overflow"), "{e}");
+    // A property sum is the same, grouped and not, and DISTINCT too.
+    nodes(
+        &mut db,
+        "N",
+        &[
+            (Some(0), int(10)),
+            (Some(0), int(20)),
+            (Some(1), int(5)),
+            (Some(1), None),
+        ],
+    );
+    assert_eq!(one(&db, "MATCH (n:N) RETURN sum(n.v)"), int(35));
+    assert_eq!(one(&db, "MATCH (n:N) RETURN sum(DISTINCT n.v)"), int(35));
+    assert_eq!(
+        rows(&db, "MATCH (n:N) RETURN n.k, sum(n.v) ORDER BY n.k"),
+        vec![vec![int(0), int(30)], vec![int(1), int(5)]]
+    );
 }

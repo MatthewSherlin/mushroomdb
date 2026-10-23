@@ -327,6 +327,9 @@ Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 Each also takes a bare variable bound by `UNWIND` or `WITH`
 (`MATCH (o:One) UNWIND [1, 2] AS x RETURN max(x)` is `2`). `MIN` and `MAX`
 read numbers; a null or missing value contributes nothing.
+`SUM` of integers is an integer (an overflow past 64 bits is the error
+`sum(): integer overflow`) and is a float once any input is a float; `AVG` is
+always a float.
 
 ### DISTINCT inside an aggregate
 
