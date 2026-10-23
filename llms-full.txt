@@ -5369,6 +5369,12 @@ RETURN AVG(r.score)
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
 
+Each takes a property or a bare variable (`UNWIND [1, 2] AS x RETURN max(x)`).
+`SUM` of integers is an integer (an overflow past 64 bits is an error) and is a
+float once any input is a float; `AVG` is always a float. `MIN` and `MAX` order
+any non-null value, strings included. `SUM`, `AVG`, `MIN` and `MAX` of a node or
+relationship variable are errors.
+
 ### DISTINCT inside an aggregate
 
 `count(DISTINCT x)` and `collect(DISTINCT x)` deduplicate within each group

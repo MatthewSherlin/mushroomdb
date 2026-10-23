@@ -4396,8 +4396,12 @@ fn execute_pull(
 /// Running state for a single aggregate accumulation.
 enum AggAcc {
     Count(u64),
+    /// `sum`: integers add exactly as `i64` (an overflow is an error); once a
+    /// float is seen the result is a float.
     Sum {
-        val: f64,
+        ints: i64,
+        floats: f64,
+        any_float: bool,
         has_value: bool,
     },
     Avg {
@@ -4475,7 +4479,9 @@ impl AggAcc {
             },
             AggFunc::Count => AggAcc::Count(0),
             AggFunc::Sum => AggAcc::Sum {
-                val: 0.0,
+                ints: 0,
+                floats: 0.0,
+                any_float: false,
                 has_value: false,
             },
             AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
@@ -4492,11 +4498,18 @@ impl AggAcc {
             // a wrong (negative) count. Clamping to i64::MAX is the least-
             // surprising failure mode.
             AggAcc::Count(n) => Some(Value::Int(i64::try_from(n).unwrap_or(i64::MAX))),
-            AggAcc::Sum { val, has_value } => {
-                if has_value {
-                    Some(Value::Float(val))
-                } else {
+            AggAcc::Sum {
+                ints,
+                floats,
+                any_float,
+                has_value,
+            } => {
+                if !has_value {
                     None
+                } else if any_float {
+                    Some(Value::Float(ints as f64 + floats))
+                } else {
+                    Some(Value::Int(ints))
                 }
             }
             AggAcc::Avg { sum, n } => {
@@ -4728,6 +4741,59 @@ fn distinct_value(
     }
 }
 
+/// The openCypher name of an aggregate, for messages.
+fn agg_name(func: &AggFunc) -> &'static str {
+    match func {
+        AggFunc::Sum => "sum",
+        AggFunc::Avg => "avg",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
+        _ => "aggregate",
+    }
+}
+
+/// The value one row feeds a `sum` / `avg` / `min` / `max`: the property, or
+/// the scalar a bare variable is bound to. Null and an unbound variable give
+/// `None` (contributes nothing); a node, relationship or path is not a value
+/// these aggregates can read and is an error, as for `stDev`.
+fn scalar_agg_input(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    arg: &AggArg,
+    name: &str,
+) -> Result<Option<Value>, String> {
+    let value = match arg {
+        AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
+        AggArg::Var(v) => match vars
+            .slot(v)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref())
+        {
+            Some(Cell::Scalar(x)) => Some(x.clone()),
+            None => None,
+            Some(_) => return Err(format!("{name}(): expected a value, got a graph element")),
+        },
+        _ => None,
+    };
+    Ok(value.filter(|v| !matches!(v, Value::Null)))
+}
+
+/// Keep the smaller (`largest == false`) or larger of the running extreme and
+/// the next value. Any orderable value counts, strings included.
+fn fold_extreme(current: &mut Option<Value>, next: Value, largest: bool) {
+    *current = Some(match current.take() {
+        None => next,
+        Some(prev) => {
+            if cmp_optional(Some(&prev), Some(&next), largest) == std::cmp::Ordering::Greater {
+                next
+            } else {
+                prev
+            }
+        }
+    });
+}
+
 /// Update a single accumulator for one matched row.
 ///
 /// Shared by `agg_stream` (single-aggregate path) and `group_stream` (grouped
@@ -4785,64 +4851,46 @@ fn update_acc(
                 }
             }
         }
-        (AggFunc::Sum, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if let Some(num) = numeric_val(&v) {
-                    if let AggAcc::Sum { val, has_value } = acc {
-                        *val += num;
+        // sum / avg / min / max read one value per row: a property or a bare
+        // variable bound to a scalar (`UNWIND … AS x`, `WITH … AS x`). Row 157:
+        // the bare-variable form used to fall through to the catch-all arm and
+        // contribute nothing, so these returned null.
+        (
+            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+            AggArg::Prop { .. } | AggArg::Var(_),
+        ) => {
+            let Some(v) = scalar_agg_input(view, vars, row, arg, agg_name(func))? else {
+                return Ok(());
+            };
+            match acc {
+                AggAcc::Sum {
+                    ints,
+                    floats,
+                    any_float,
+                    has_value,
+                } => match v {
+                    Value::Int(n) => {
+                        *ints = ints
+                            .checked_add(n)
+                            .ok_or_else(|| "sum(): integer overflow".to_string())?;
                         *has_value = true;
                     }
-                }
-            }
-        }
-        (AggFunc::Avg, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if let Some(num) = numeric_val(&v) {
-                    if let AggAcc::Avg { sum, n } = acc {
+                    Value::Float(f) => {
+                        *floats += f;
+                        *any_float = true;
+                        *has_value = true;
+                    }
+                    _ => {}
+                },
+                AggAcc::Avg { sum, n } => {
+                    if let Some(num) = numeric_val(&v) {
                         *sum += num;
                         *n += 1;
                     }
                 }
-            }
-        }
-        (AggFunc::Min, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
-                    if let AggAcc::Min(current) = acc {
-                        *current = Some(match current.take() {
-                            None => v,
-                            Some(prev) => {
-                                if cmp_optional(Some(&prev), Some(&v), false)
-                                    == std::cmp::Ordering::Greater
-                                {
-                                    v
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        }
-        (AggFunc::Max, AggArg::Prop { var, field }) => {
-            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
-                    if let AggAcc::Max(current) = acc {
-                        *current = Some(match current.take() {
-                            None => v,
-                            Some(prev) => {
-                                if cmp_optional(Some(&prev), Some(&v), true)
-                                    == std::cmp::Ordering::Greater
-                                {
-                                    v
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
+                AggAcc::Min(current) => fold_extreme(current, v, false),
+                AggAcc::Max(current) => fold_extreme(current, v, true),
+                _ => {}
             }
         }
         (AggFunc::Collect, AggArg::Var(v)) => {
@@ -6566,6 +6614,10 @@ mod ql_11;
 #[cfg(test)]
 #[path = "tests/ql_cx.rs"]
 mod ql_cx;
+
+#[cfg(test)]
+#[path = "tests/ql_ag.rs"]
+mod ql_ag;
 
 #[cfg(test)]
 #[path = "tests/tx_15.rs"]
@@ -8531,8 +8583,8 @@ LIMIT 10";
         let params = BTreeMap::new();
         let rs = run(&v, "MATCH (n:N) RETURN SUM(n.v)", &params).expect("SUM");
         assert_eq!(rs.columns(), &["SUM(n.v)".to_string()]);
-        // 10.0 + 20.0 = 30.0 (null skipped)
-        assert_eq!(rs.row(0), &[Some(f(30.0))]);
+        // 10 + 20 = 30 (null skipped)
+        assert_eq!(rs.row(0), &[Some(i(30))]);
 
         // All props null → result is null.
         let rs_null = run(&v, "MATCH (n:N) RETURN SUM(n.missing)", &params).expect("SUM null");
@@ -8805,14 +8857,14 @@ LIMIT 10";
                 .find(|&i| rs.row(i)[0].as_ref() == Some(cat) && rs.row(i)[1].as_ref() == Some(sub))
         };
         let a1 = find(&s("A"), &s("1")).expect("group (A,1) must exist");
-        assert_eq!(rs.row(a1)[2], Some(f(30.0)), "(A,1) SUM must be 30.0");
+        assert_eq!(rs.row(a1)[2], Some(i(30)), "(A,1) SUM must be 30");
         assert_eq!(rs.row(a1)[3], Some(f(15.0)), "(A,1) AVG must be 15.0");
 
         let a2 = find(&s("A"), &s("2")).expect("group (A,2) must exist");
-        assert_eq!(rs.row(a2)[2], Some(f(5.0)), "(A,2) SUM must be 5.0");
+        assert_eq!(rs.row(a2)[2], Some(i(5)), "(A,2) SUM must be 5");
 
         let b1 = find(&s("B"), &s("1")).expect("group (B,1) must exist");
-        assert_eq!(rs.row(b1)[2], Some(f(100.0)), "(B,1) SUM must be 100.0");
+        assert_eq!(rs.row(b1)[2], Some(i(100)), "(B,1) SUM must be 100.0");
         assert_eq!(rs.row(b1)[3], Some(f(100.0)), "(B,1) AVG must be 100.0");
     }
 
