@@ -87,12 +87,20 @@ impl ViewCatalog<'_, '_> {
 
 impl ProcCatalog for ViewCatalog<'_, '_> {
     fn labels(&self) -> Vec<String> {
-        let labels: BTreeSet<String> = self
-            .nodes()
-            .into_iter()
-            .filter_map(|id| self.view.label_of(id).map(str::to_string))
+        // One pass over the label column: no id list is built, and only the
+        // distinct label symbols are resolved to names.
+        let syms: BTreeSet<u32> = self
+            .view
+            .label_syms()
+            .enumerate()
+            .filter(|&(id, sym)| sym != u32::MAX && self.view.visible(id as u32))
+            .map(|(_, sym)| sym)
             .collect();
-        labels.into_iter().collect()
+        let names: BTreeSet<String> = syms
+            .into_iter()
+            .filter_map(|sym| self.view.sym_name(sym).map(str::to_string))
+            .collect();
+        names.into_iter().collect()
     }
 
     fn relationship_types(&self) -> Vec<String> {
@@ -123,6 +131,23 @@ impl ProcCatalog for ViewCatalog<'_, '_> {
             true
         });
         keys.into_iter().collect()
+    }
+
+    fn relationship_patterns(&self) -> Vec<(String, String, String)> {
+        let nodes = self.nodes();
+        let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        self.for_each_edge(&nodes, |etype, src, dst| {
+            if let (Some(from), Some(to)) = (self.view.label_sym(src), self.view.label_sym(dst)) {
+                seen.insert((etype, from, to));
+            }
+            true
+        });
+        let name = |sym: u32| self.view.sym_name(sym).map(str::to_string);
+        let patterns: BTreeSet<(String, String, String)> = seen
+            .into_iter()
+            .filter_map(|(etype, from, to)| Some((name(etype)?, name(from)?, name(to)?)))
+            .collect();
+        patterns.into_iter().collect()
     }
 
     fn indexes(&self) -> Vec<SchemaRow> {

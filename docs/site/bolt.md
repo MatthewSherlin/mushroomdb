@@ -132,6 +132,18 @@ A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, a
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
 
+## Catalog procedures
+
+`RUN` answers the procedure calls graph browsers and driver tools send to
+discover a store: `CALL db.labels()`, `CALL db.relationshipTypes()`,
+`CALL db.propertyKeys()`, `CALL db.indexes()`, `CALL db.constraints()`,
+`CALL dbms.components()` and `CALL db.schema.visualization()`, with the columns
+named in [Procedures](query.md#procedures-call). `dbms.components()` reports the
+name `mushroomdb`, the engine version, and the edition `open`. A role-bound
+token sees only the labels, relationship types, property keys, indexes and
+constraints of the nodes its role can read, as it does for every other read.
+Calls other than these are an unknown-procedure error.
+
 ### RESET while a request is running
 
 A `RESET` sent while an earlier request is still running takes effect at the first of these points:

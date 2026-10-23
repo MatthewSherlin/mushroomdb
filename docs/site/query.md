@@ -893,6 +893,42 @@ The full form is `CALL ns.name(args) [YIELD field [AS alias], …] [WHERE …]
 | Procedure | Arguments | Columns |
 |---|---|---|
 | `db.ping()` | none | `success` (always `true`) |
+| `db.labels()` | none | `label` |
+| `db.relationshipTypes()` | none | `relationshipType` |
+| `db.propertyKeys()` | none | `propertyKey` |
+| `db.indexes()` | none | `name`, `type`, `labelsOrTypes`, `properties`, `state` |
+| `db.constraints()` | none | `name`, `type`, `labelsOrTypes`, `properties` |
+| `dbms.components()` | none | `name`, `versions`, `edition` |
+| `db.schema.visualization()` | none | `nodes`, `relationships` |
+
+Every procedure takes no arguments; passing one is the error `<ns>.<name> takes
+no arguments, got <n>`. The catalog procedures list what the caller can see and
+nothing else: a role, a mask or a namespace never learns a label, relationship
+type, property key, index or constraint that only nodes outside its scope
+carry.
+
+- **`db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`** return one
+  column, one row per name, sorted. A label is listed when a visible node has
+  it; a relationship type when it joins two visible nodes; a property key when
+  it is set on a visible node or on a relationship between visible nodes.
+- **`db.indexes()`, `db.constraints()`** return the rows `SHOW INDEXES` and
+  `SHOW CONSTRAINTS` return (see [Schema statements](#schema-statements-ddl)), with
+  the label and property each in a one-element list under `labelsOrTypes` and
+  `properties`, the shape common driver tools read. `type` is the index kind
+  (`range`, `equality`, `fulltext`) or `unique`; `state` is always `online`.
+- **`dbms.components()`** returns one row: `name` is `mushroomdb`, `versions` is
+  a one-element list holding the engine's version, and `edition` is `open`.
+- **`db.schema.visualization()`** returns one row. `nodes` lists one map
+  `{label}` per label; `relationships` lists one map `{type, from, to}` for each
+  type, source label and target label that actually occur together.
+
+Cost: the name procedures read the store's label column or its relationships
+once, so they take time in proportion to the nodes and relationships the caller
+can see. Measured on a release build with 100,000 nodes and 100,000
+relationships: `db.labels()` about 0.6 ms; `db.relationshipTypes()`,
+`db.propertyKeys()` and `db.schema.visualization()` about 15 ms to 16 ms. The
+index and constraint procedures read the declared schema and are
+sub-millisecond.
 
 An unknown procedure is the error `unknown procedure: <ns>.<name>`.
 

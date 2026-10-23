@@ -142,3 +142,118 @@ fn the_mcp_query_tool_runs_a_call() {
         assert_eq!(rs["rows"], json!([[true]]), "{arguments}");
     }
 }
+
+/// `open`'s store plus a `Q` node, a `P`-`P` edge `LIKES`, a `P`-`Q` edge
+/// `HIDDEN` and an index on each label: the role `writer` reads `P` only.
+fn open_with_hidden(name: &str) -> (Router, SharedDb) {
+    let (app, db) = open(name);
+    {
+        let mut w = db.write();
+        let ns = || ("ns".to_string(), mushroomdb::Value::Str("a".into()));
+        w.insert_node(
+            "P",
+            "p2",
+            vec![ns(), ("shown".into(), mushroomdb::Value::Int(1))],
+        )
+        .unwrap();
+        w.insert_node(
+            "Q",
+            "q1",
+            vec![ns(), ("secret".into(), mushroomdb::Value::Int(2))],
+        )
+        .unwrap();
+        w.insert_edge("LIKES", "p1", "p2").unwrap();
+        w.insert_edge("HIDDEN", "p1", "q1").unwrap();
+        w.query_write(
+            "CREATE INDEX p_shown FOR (n:P) ON (n.shown)",
+            &Default::default(),
+        )
+        .unwrap();
+        w.query_write(
+            "CREATE INDEX q_secret FOR (n:Q) ON (n.secret)",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+    (app, db)
+}
+
+/// The first column of every row, as strings.
+fn first_column(rows: &Json) -> Vec<String> {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every catalog procedure answers through `ask` with `P` and `LIKES` only.
+fn assert_role_scoped(ask: &dyn Fn(&str) -> Json, at: &str) {
+    let rows = |q: &str| ask(q)["rows"].clone();
+    assert_eq!(first_column(&rows("CALL db.labels()")), ["P"], "{at}");
+    assert_eq!(
+        first_column(&rows("CALL db.relationshipTypes()")),
+        ["LIKES"],
+        "{at}"
+    );
+    let keys = first_column(&rows("CALL db.propertyKeys()"));
+    assert!(keys.contains(&"shown".to_string()), "{at}: {keys:?}");
+    assert!(!keys.contains(&"secret".to_string()), "{at}: {keys:?}");
+    assert_eq!(
+        first_column(&rows("CALL db.indexes()")),
+        ["p_shown"],
+        "{at}"
+    );
+    assert!(
+        rows("CALL db.constraints()").as_array().unwrap().is_empty(),
+        "{at}"
+    );
+    let picture = rows("CALL db.schema.visualization()").to_string();
+    assert!(picture.contains("LIKES"), "{at}: {picture}");
+    for hidden in ["Q", "HIDDEN", "secret"] {
+        assert!(!picture.contains(hidden), "{at}: {hidden} in {picture}");
+    }
+}
+
+#[tokio::test]
+async fn http_role_token_lists_only_its_own_schema() {
+    let (app, _db) = open_with_hidden("http-scope");
+    let (status, out) = post(&app, "full", json!({"cypher": "CALL db.labels()"})).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(first_column(&out["rows"]), ["P", "Q"]);
+    // `post` is async, so gather each procedure's answer first.
+    let mut answers: HashMap<String, Json> = HashMap::new();
+    for q in [
+        "CALL db.labels()",
+        "CALL db.relationshipTypes()",
+        "CALL db.propertyKeys()",
+        "CALL db.indexes()",
+        "CALL db.constraints()",
+        "CALL db.schema.visualization()",
+    ] {
+        let (status, out) = post(&app, "rtok", json!({ "cypher": q })).await;
+        assert_eq!(status, StatusCode::OK, "{q}: {out}");
+        answers.insert(q.to_string(), out);
+    }
+    assert_role_scoped(&|q| answers[q].clone(), "http role token");
+}
+
+#[test]
+fn the_mcp_query_tool_with_a_role_lists_only_its_own_schema() {
+    let (_, db) = open_with_hidden("mcp-scope");
+    let ask = |q: &str| -> Json {
+        let line = format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "query", "arguments": {"cypher": q, "role": "writer"}}})
+        );
+        let mut reader = Cursor::new(line.into_bytes());
+        let mut writer = Cursor::new(Vec::new());
+        server::run_mcp_stdio(db.clone(), None, &mut reader, &mut writer).unwrap();
+        let out = String::from_utf8(writer.into_inner()).unwrap();
+        let reply: Json = serde_json::from_str(out.lines().next().expect("one reply")).unwrap();
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    assert_role_scoped(&ask, "mcp role");
+}
