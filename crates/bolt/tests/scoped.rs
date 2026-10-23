@@ -361,3 +361,64 @@ fn a_read_mode_begin_for_a_role_still_refuses_with_the_role_text() {
     let err = failure(&mut alpha, run("CREATE (n:Doc {id: 'r1', ns: 'tenant-a'})"));
     assert_eq!(err, BoltError::Forbidden(TX_ROLE_WRITE_REFUSAL.into()));
 }
+
+/// QL-RP x TX-17: over Bolt, a role writes an existing relationship's
+/// properties only with its type in `update_edge_types`, as over HTTP; creating
+/// a relationship with its map needs only `create_edge_types`.
+#[test]
+fn a_relationship_property_write_goes_through_update_edge_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let role = |name: &str, ns: &str, update_edge_types: Vec<String>| RoleDef {
+        name: name.into(),
+        keys: vec![],
+        labels: vec!["Doc".into()],
+        visible_where: None,
+        namespaces: Some(vec![ns.into()]),
+        write: Some(WriteScope {
+            create_edge_types: vec!["CITES".into()],
+            update_edge_types,
+            ..WriteScope::default()
+        }),
+    };
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![
+                role("alpha", "tenant-a", vec![]),
+                role("beta", "tenant-b", vec!["CITES".into()]),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    db.submit_batch(vec![
+        node("Doc", "a1", "tenant-a"),
+        node("Doc", "a2", "tenant-a"),
+        node("Doc", "b1", "tenant-b"),
+        node("Doc", "b2", "tenant-b"),
+    ])
+    .unwrap();
+    let weight = |src: &str, dst: &str| db.read().get_edge_prop("CITES", src, dst, "w");
+
+    let mut alpha = connected(&db, ALPHA);
+    rows(
+        &mut alpha,
+        "MATCH (a:Doc {id: 'a1'}), (b:Doc {id: 'a2'}) CREATE (a)-[:CITES {w: 1}]->(b)",
+    );
+    assert_eq!(weight("a1", "a2"), Some(Value::Int(1)));
+    let err = failure(&mut alpha, run("MATCH ()-[r:CITES]->() SET r.w = 2"));
+    assert!(matches!(err, BoltError::Forbidden(_)), "{err:?}");
+    assert_eq!(weight("a1", "a2"), Some(Value::Int(1)));
+
+    let mut beta = connected(&db, BETA);
+    rows(
+        &mut beta,
+        "MATCH (a:Doc {id: 'b1'}), (b:Doc {id: 'b2'}) CREATE (a)-[:CITES {w: 1}]->(b)",
+    );
+    rows(&mut beta, "MATCH ()-[r:CITES]->() SET r.w = 2");
+    assert_eq!(weight("b1", "b2"), Some(Value::Int(2)));
+    assert_eq!(
+        weight("a1", "a2"),
+        Some(Value::Int(1)),
+        "beta cannot see alpha's edge"
+    );
+}
