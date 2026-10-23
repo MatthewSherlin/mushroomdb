@@ -52,11 +52,20 @@ fn create_single_node() {
             &no_params(),
         )
         .unwrap();
-    assert_eq!(rs.columns(), &["created", "properties_set", "deleted"]);
+    assert_eq!(
+        rs.columns(),
+        &[
+            "created",
+            "properties_set",
+            "deleted",
+            "relationships_created"
+        ]
+    );
     assert_eq!(rs.len(), 1);
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(1)));
     assert_eq!(rs.get(0, "properties_set"), Some(&Value::Int(0)));
     assert_eq!(rs.get(0, "deleted"), Some(&Value::Int(0)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(0)));
     assert!(db.has_node("alice"));
     assert_eq!(
         db.get_prop("alice", "name"),
@@ -111,7 +120,8 @@ fn create_node_and_edge() {
             &no_params(),
         )
         .unwrap();
-    assert_eq!(rs.get(0, "created"), Some(&Value::Int(3))); // nodes and relationships (row 143)
+    assert_eq!(rs.get(0, "created"), Some(&Value::Int(2)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     assert!(db.has_node("alice"));
     assert!(db.has_node("bob"));
     let nbrs = db

@@ -170,7 +170,8 @@ fn create_with_an_edge_between_two_new_nodes_per_row() {
         "UNWIND $rows AS r CREATE (:A {id: r.a})-[:LINKS]->(:B {id: r.b})",
         &params,
     );
-    assert_eq!(count(&rs, "created"), 6); // nodes and relationships (row 143)
+    assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(count(&rs, "relationships_created"), 2);
     assert_eq!(db.edge_count(), 2);
     let edges = db.node_edges("a2").unwrap();
     assert_eq!(edges.len(), 1);
@@ -194,7 +195,12 @@ fn create_an_edge_between_nodes_matched_per_row() {
         "UNWIND $edges AS e MATCH (x:Person {id: e.from}), (y:Person {id: e.to}) CREATE (x)-[:KNOWS]->(y)",
         &params,
     );
-    assert_eq!(count(&rs, "created"), 2); // nodes and relationships (row 143)
+    assert_eq!(count(&rs, "created"), 0);
+    assert_eq!(
+        count(&rs, "relationships_created"),
+        2,
+        "row 143: the edges are counted"
+    );
     assert_eq!(
         db.edge_count(),
         2,
@@ -233,7 +239,8 @@ fn comma_separated_patterns_create_each_and_may_share_an_edge() {
         "UNWIND ['a', 'b'] AS k CREATE (x:N {id: k}), (y:M {id: toUpper(k)}), (x)-[:T]->(y)",
         &none(),
     );
-    assert_eq!(count(&rs, "created"), 6); // nodes and relationships (row 143)
+    assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(count(&rs, "relationships_created"), 2);
     assert_eq!(db.edge_count(), 2);
     assert!(db.has_node("A") && db.has_node("b"));
 }
@@ -535,11 +542,8 @@ fn merge_a_relationship_per_row_creates_each_node_and_edge_once() {
     )]);
     let q = "UNWIND $rows AS r MERGE (x:P {id: r.a})-[:K]->(y:P {id: r.b}) ON CREATE SET y.hit = 1";
     let rs = run(&mut db, q, &params);
-    assert_eq!(
-        count(&rs, "created"),
-        6,
-        "a, b and c once each, and three relationships"
-    );
+    assert_eq!(count(&rs, "created"), 3, "a, b and c once each");
+    assert_eq!(count(&rs, "relationships_created"), 3);
     assert_eq!(db.edge_count(), 3, "a->b, a->c, c->b");
     assert_eq!(wal_frames(&dir), 1);
     // Again: everything exists.
@@ -1201,7 +1205,8 @@ fn a_plain_delete_beside_many_created_edges_deletes_each_and_keeps_the_edges() {
          CREATE (a:N {id: toString(rand())})-[:T]->(b:N {id: toString(rand())}) DELETE x",
         &none(),
     );
-    assert_eq!(count(&rs, "created"), 6000); // nodes and relationships (row 143)
+    assert_eq!(count(&rs, "created"), 4000);
+    assert_eq!(count(&rs, "relationships_created"), 2000);
     assert_eq!(count(&rs, "deleted"), 2000);
     assert_eq!(db.edge_count(), 2000);
 }

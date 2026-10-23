@@ -75,6 +75,7 @@ struct Tally {
     created: i64,
     props_set: i64,
     deleted: i64,
+    relationships_created: i64,
 }
 
 fn err(detail: String) -> GraphError {
@@ -624,13 +625,12 @@ impl<F: Fs> GraphDb<F> {
             }
             .map_err(|e| err(format!("execute: {e}")));
         }
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(tally.created)),
-            Some(Value::Int(tally.props_set)),
-            Some(Value::Int(tally.deleted)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(
+            tally.created,
+            tally.props_set,
+            tally.deleted,
+            tally.relationships_created,
+        ))
     }
 
     /// One write clause for one row.
@@ -663,7 +663,7 @@ impl<F: Fs> GraphDb<F> {
                         dst_key: dst.clone(),
                     });
                     ov.edge_created(&edge.etype, &src, &dst);
-                    tally.created += 1;
+                    tally.relationships_created += 1;
                 }
             }
             RowWrite::Merge(merge) => {
@@ -971,7 +971,7 @@ impl<F: Fs> GraphDb<F> {
                 dst_key: dst_key.clone(),
             });
             ov.edge_created(&edge.etype, &src_key, &dst_key);
-            tally.created += 1;
+            tally.relationships_created += 1;
             &merge.on_create
         };
         env.insert(merge.start.var.as_str(), start_key);

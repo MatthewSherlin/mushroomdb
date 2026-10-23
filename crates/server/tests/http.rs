@@ -1502,13 +1502,19 @@ async fn cypher_write_over_http_is_durable() {
     let v = parse_json(&body);
     assert_eq!(
         v["columns"],
-        json!(["created", "properties_set", "deleted"])
+        json!([
+            "created",
+            "properties_set",
+            "deleted",
+            "relationships_created"
+        ])
     );
     let rows = v["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], json!(1), "created=1");
     assert_eq!(rows[0][1], json!(0), "properties_set=0");
     assert_eq!(rows[0][2], json!(0), "deleted=0");
+    assert_eq!(rows[0][3], json!(0), "relationships_created=0");
 
     // Read back via the same SharedDb handle to confirm node is live.
     assert!(

@@ -52,6 +52,11 @@ fn count(rs: &mushroomdb::ResultSet, col: &str) -> i64 {
     }
 }
 
+/// `(created, relationships_created)`: nodes and relationships a write made.
+fn made(rs: &mushroomdb::ResultSet) -> (i64, i64) {
+    (count(rs, "created"), count(rs, "relationships_created"))
+}
+
 fn rows(rs: &mushroomdb::ResultSet) -> Rows {
     (0..rs.len()).map(|i| rs.row(i).to_vec()).collect()
 }
@@ -103,7 +108,7 @@ fn match_then_create_links_the_matched_nodes() {
         &mut db,
         "MATCH (a:Person {id: 'a'}), (b:Person {id: 'b'}) CREATE (a)-[:KNOWS]->(b)",
     );
-    assert_eq!(count(&rs, "created"), 1, "one relationship created");
+    assert_eq!(made(&rs), (0, 1), "no node, one relationship");
     assert_eq!(
         read(&db, "MATCH (x)-[:KNOWS]->(y) RETURN x.id AS x, y.id AS y"),
         vec![vec![Some(s("a")), Some(s("b"))]]
@@ -149,7 +154,7 @@ fn match_then_create_takes_the_read_clauses_of_the_unwind_form() {
         &mut db,
         "MATCH (p:Person {id: 'a'}) UNWIND ['x', 'y'] AS k CREATE (:T {id: k})-[:OF]->(p)",
     );
-    assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(made(&rs), (2, 2));
     let rs = write(
         &mut db,
         "MATCH (p:Person) WHERE p.v < 3 OPTIONAL MATCH (p)<-[:OF]-(t:T) \
@@ -188,14 +193,14 @@ fn match_then_merge_merges_per_row_and_bound_ends_are_matched() {
     // The form QL-12 refused: a MERGE from a node the MATCH bound.
     let q = "MATCH (a {id: 'a'}) MERGE (a)-[:K]->(b:B {id: 'y'})";
     let rs = write(&mut db, q);
-    assert_eq!(count(&rs, "created"), 2, "node b and the relationship");
+    assert_eq!(made(&rs), (1, 1), "node b and the relationship");
     let rs = write(&mut db, q);
-    assert_eq!(count(&rs, "created"), 0, "the second run matches both");
+    assert_eq!(made(&rs), (0, 0), "the second run matches both");
     // Both ends bound; ON CREATE / ON MATCH set the bound nodes.
     let q = "MATCH (a:Person {id: 'a'}), (b:Person {id: 'b'}) \
              MERGE (a)-[:LIKES]->(b) ON CREATE SET a.n = 1 ON MATCH SET a.n = a.n + 1";
-    assert_eq!(count(&write(&mut db, q), "created"), 1);
-    assert_eq!(count(&write(&mut db, q), "created"), 0);
+    assert_eq!(made(&write(&mut db, q)), (0, 1));
+    assert_eq!(made(&write(&mut db, q)), (0, 0));
     assert_eq!(
         read(
             &db,
@@ -402,8 +407,10 @@ fn match_then_write_equals_the_unwind_form_randomized() {
     assert!(failed < 180, "{failed} of 360 statements failed");
 }
 
-// ── Row 143: a created relationship is counted ─────────────────────────────
+// ── Row 143: relationships_created ─────────────────────────────────────────
 
+/// `created` counts nodes, as documented since 0.9; `relationships_created`
+/// counts relationships, on every create path.
 #[test]
 fn row_143_every_create_path_counts_its_relationships() {
     let mut db = people("row143");
@@ -412,31 +419,39 @@ fn row_143_every_create_path_counts_its_relationships() {
         &mut db,
         "UNWIND [1] AS x MATCH (a:Person {id: 'a'}), (b:Person {id: 'b'}) CREATE (a)-[:K]->(b)",
     );
-    assert_eq!(count(&rs, "created"), 1);
-    // CREATE of two nodes and the relationship between them.
+    assert_eq!(made(&rs), (0, 1));
+    assert_eq!(
+        rs.columns(),
+        [
+            "created",
+            "properties_set",
+            "deleted",
+            "relationships_created"
+        ]
+    );
+    // CREATE of two nodes and the relationship between them: still 2 nodes.
     let rs = write(&mut db, "CREATE (:N {id: 'n1'})-[:K]->(:N {id: 'n2'})");
-    assert_eq!(count(&rs, "created"), 3);
+    assert_eq!(made(&rs), (2, 1));
     // Per-row CREATE of a node and a relationship to a bound node.
     let rs = write(
         &mut db,
         "UNWIND ['p', 'q'] AS k MATCH (a:Person {id: 'a'}) CREATE (a)-[:K]->(:N {id: k})",
     );
-    assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(made(&rs), (2, 2));
     // MERGE of a relationship: nodes and relationship created, then matched.
     let q = "MERGE (:M {id: 'm1'})-[:K]->(:M {id: 'm2'})";
-    assert_eq!(count(&write(&mut db, q), "created"), 3);
-    assert_eq!(count(&write(&mut db, q), "created"), 0);
+    assert_eq!(made(&write(&mut db, q)), (2, 1));
+    assert_eq!(made(&write(&mut db, q)), (0, 0));
     // MERGE of only the relationship between existing nodes.
     let q = "MERGE (:M {id: 'm2'})-[:J]->(:M {id: 'm1'})";
-    assert_eq!(count(&write(&mut db, q), "created"), 1);
+    assert_eq!(made(&write(&mut db, q)), (0, 1));
     // Per-row MERGE of a relationship.
     let q = "UNWIND ['m1', 'm2'] AS k MERGE (:M {id: k})-[:L]->(:M {id: 'm3'})";
-    assert_eq!(
-        count(&write(&mut db, q), "created"),
-        3,
-        "m3 and two relationships"
-    );
-    assert_eq!(count(&write(&mut db, q), "created"), 0);
+    assert_eq!(made(&write(&mut db, q)), (1, 2), "m3 and two relationships");
+    assert_eq!(made(&write(&mut db, q)), (0, 0));
+    // A write that creates nothing reports zero for both.
+    let rs = write(&mut db, "MATCH (n:M {id: 'm1'}) SET n.x = 1");
+    assert_eq!(made(&rs), (0, 0));
 }
 
 #[test]
@@ -446,11 +461,11 @@ fn row_143_a_transaction_counts_its_relationships_too() {
     let rs = tx
         .execute("CREATE (:N {id: 'a'})-[:K]->(:N {id: 'b'})", &none())
         .unwrap();
-    assert_eq!(count(&rs, "created"), 3);
+    assert_eq!(made(&rs), (2, 1));
     let rs = tx
         .execute("MERGE (:N {id: 'a'})-[:J]->(:N {id: 'b'})", &none())
         .unwrap();
-    assert_eq!(count(&rs, "created"), 1);
+    assert_eq!(made(&rs), (0, 1));
     tx.commit().unwrap();
 }
 

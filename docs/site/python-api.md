@@ -512,9 +512,10 @@ Execute a Cypher write statement.
 
 CREATE / MATCH…SET / MATCH…REMOVE / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
 
-Returns a one-row result dict with keys `created`, `properties_set` and
-`deleted`, unless the statement carries its own `RETURN` projection, in
-which case the projected rows are returned instead.
+Returns a one-row result dict with keys `created` (nodes),
+`properties_set`, `deleted` and `relationships_created`, unless the
+statement carries its own `RETURN` projection, in which case the
+projected rows are returned instead.
 
 `params` takes the same shapes as `query`: `None`, a dict, or a list of
 `(name, value)` tuples.

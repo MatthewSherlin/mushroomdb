@@ -639,8 +639,9 @@ impl GraphDb {
     /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE /
     /// MATCH…DETACH DELETE / MERGE).
     ///
-    /// Returns a one-row result dict with keys `created`, `properties_set`,
-    /// and `deleted`, unless the statement has its own `RETURN` projection.
+    /// Returns a one-row result dict with keys `created` (nodes),
+    /// `properties_set`, `deleted` and `relationships_created`, unless the
+    /// statement has its own `RETURN` projection.
     ///
     /// `params` takes the same shapes as `query`: `None`, a `dict`, or a list
     /// of `(name, value)` tuples.

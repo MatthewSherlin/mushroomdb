@@ -508,13 +508,14 @@ mushroomdb supports a Cypher write subset.  Every write statement flows through
 the same mutation path as the Rust API — the rule engine fires incrementally and
 the WAL commits with a single fsync before the response is returned.
 
-Write results are always one row with three columns:
+Write results are always one row with four columns:
 
 | Column | Meaning |
 |---|---|
-| `created` | nodes and relationships created |
+| `created` | nodes inserted |
 | `properties_set` | individual `set_prop` calls applied |
 | `deleted` | edges deleted |
+| `relationships_created` | relationships created (new in 0.10; last, so the first three keep their positions) |
 
 ### CREATE
 
@@ -798,9 +799,9 @@ MERGE (n:Person {id: r.id})
   of the read part or of a `MERGE` (`RETURN type(r), r.count`) is found again
   between its two end nodes; a variable-length relationship (`[r:T*1..3]`) in
   such a `RETURN` is refused by name.
-- **Counts.** Without `RETURN` the row is `created` (nodes and relationships
-  created), `properties_set` (properties set, plus those removed that existed)
-  and `deleted` (nodes deleted).
+- **Counts.** Without `RETURN` the row is `created` (nodes inserted),
+  `properties_set` (properties set, plus those removed that existed), `deleted`
+  (nodes deleted) and `relationships_created` (relationships created).
 - **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
   `ingest` of the same rows.
 - Inside an interactive transaction (and so a Bolt `BEGIN`) it is refused by
