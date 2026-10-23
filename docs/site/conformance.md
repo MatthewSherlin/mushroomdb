@@ -88,10 +88,10 @@ Each failing scenario is counted once, under the first step that failed.
 | Kind | Scenarios |
 |---|---|
 | setup: parser gap | 733 |
-| parser gap | 240 |
+| parser gap | 238 |
 | setup: runtime error | 124 |
 | ruled deviation | 111 |
-| runtime error (semantics difference) | 60 |
+| runtime error (semantics difference) | 62 |
 | semantics difference | 50 |
 | named unsupported feature | 3 |
 | setup: named unsupported feature | 1 |
@@ -130,6 +130,7 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: expected RETURN (found Set) | parser gap | 4 | clauses/set/Set1.feature: [8] Ignore null when setting property |
 | unexpected error: parse: expected … or … in a list literal (found Ident(…)) | parser gap | 4 | expressions/literals/Literals7.feature: [5] Return a list containing a hexadecimal integer |
 | setup failed: parse: CREATE (a): … is not a node bound by an earlier clause; a new node needs a label, e.g. (a:Label {id: …}… | setup: parser gap | 3 | clauses/remove/Remove1.feature: [3] Remove a single relationship property |
+| unexpected error: execute: unbound variable … | runtime error (semantics difference) | 3 | expressions/graph/Graph9.feature: [3] `properties()` on null |
 | unexpected error: parse: MERGE requires a property map with exactly one key (found RParen) | parser gap | 3 | clauses/merge/Merge1.feature: [2] Merge node with label |
 | unexpected error: parse: collect() is only supported as a top-level RETURN/WITH aggregate | parser gap | 3 | clauses/return/Return6.feature: [6] Handle aggregates inside non-aggregate expressions |
 | unexpected error: parse: expected RETURN (found Delete) | parser gap | 3 | clauses/delete/Delete1.feature: [4] Delete on null node |
@@ -137,7 +138,6 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: unary minus only applies to numeric literals (found LParen) | parser gap | 3 | expressions/precedence/Precedence2.feature: [4] Numeric unary negative takes precedence over exponentiation |
 | unexpected error: refused as not supported: a MATCH, UNWIND or WITH clause after a write clause in the same statement | named unsupported feature | 3 | clauses/create/Create6.feature: [5] Filtering after creating nodes affects the result set but not the side effects |
 | unexpected error: parse: CASE requires at least one WHEN ... THEN branch (found Dash) | parser gap | 2 | expressions/conditional/Conditional2.feature: [1] Simple cases over integers (example 1) |
-| unexpected error: parse: MERGE requires a label (found LBrace) | parser gap | 2 | clauses/merge/Merge5.feature: [10] Merge should bind a path |
 
 ### Scenarios that ran and failed one check
 
@@ -146,7 +146,7 @@ A scenario whose query ran is checked to the end even after a check fails. These
 | Cause | Scenarios |
 |---|---|
 | ruled deviation: 0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans) | 110 |
-| wrong result: column names differ | 17 |
+| wrong result: column names differ | 27 |
 | wrong result: values differ | 16 |
 | wrong result: row order differs | 2 |
 | a write without RETURN returns its counter row (the TCK expects no rows) | 1 |
@@ -196,13 +196,13 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `duration.indays` | yes | 10 / 10 | 12 |
 | `duration.inmonths` | yes | 15 / 15 | 12 |
 | `duration.inseconds` | yes | 14 / 15 | 34 |
-| `endnode` | no | 0 / 1 | 0 |
+| `endnode` | yes | 0 / 1 | 0 |
 | `foo` | no | 1 / 1 | 0 |
 | `head` | yes | 1 / 5 | 0 |
 | `keys` | yes | 10 / 28 | 0 |
 | `labels` | yes | 0 / 12 | 10 |
 | `last` | yes | 0 / 1 | 0 |
-| `length` | no | 2 / 8 | 0 |
+| `length` | yes | 2 / 8 | 0 |
 | `localdatetime` | yes | 202 / 234 | 96 |
 | `localdatetime.realtime` | yes | 1 / 1 | 0 |
 | `localdatetime.statement` | yes | 1 / 1 | 0 |
@@ -215,19 +215,19 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `localtime.truncate` | yes | 0 / 0 | 44 |
 | `max` | yes | 22 / 29 | 0 |
 | `min` | yes | 0 / 9 | 0 |
-| `nodes` | no | 1 / 12 | 0 |
+| `nodes` | yes | 1 / 12 | 0 |
 | `percentilecont` | yes | 0 / 6 | 0 |
 | `percentiledisc` | yes | 0 / 7 | 0 |
 | `properties` | yes | 4 / 7 | 0 |
 | `rand` | yes | 64 / 65 | 0 |
 | `range` | yes | 75 / 93 | 2 |
-| `relationships` | no | 0 / 7 | 0 |
+| `relationships` | yes | 0 / 7 | 0 |
 | `reverse` | yes | 63 / 64 | 0 |
 | `sign` | yes | 0 / 1 | 0 |
 | `size` | yes | 130 / 151 | 10 |
 | `split` | yes | 1 / 2 | 0 |
 | `sqrt` | yes | 0 / 1 | 0 |
-| `startnode` | no | 0 / 1 | 0 |
+| `startnode` | yes | 0 / 1 | 0 |
 | `substring` | yes | 1 / 1 | 0 |
 | `sum` | yes | 0 / 31 | 0 |
 | `tail` | yes | 0 / 9 | 0 |
