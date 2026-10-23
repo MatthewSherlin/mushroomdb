@@ -8767,10 +8767,15 @@ impl<F: Fs> GraphDb<F> {
             .filter(|&(_, etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
             .count() as u64;
 
+        // A self-loop is in both the Out and the In list of `id`, and is one
+        // edge: it is counted from the Out side only (ledger row 147).
         let mut total_topo = 0u64;
         for et in tv.etypes() {
             total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
-                + tv.neighbors(et, Direction::In, id).len() as u64;
+                + tv.neighbors(et, Direction::In, id)
+                    .iter()
+                    .filter(|&&src| src != id)
+                    .count() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.

@@ -320,6 +320,155 @@ fn an_id_rewrite_is_refused_at_the_statement() {
     );
 }
 
+// ── Rows 146 and 147: DETACH DELETE counts ─────────────────────────────────
+
+/// `deleted` of `MATCH (n:X) DETACH DELETE n`, auto-commit and inside a
+/// transaction, over the same graph.
+fn detach_delete_counts(name: &str, setup: &[&str]) -> (i64, i64) {
+    let auto = SharedDb::open(&tmp(&format!("{name}-auto"))).unwrap();
+    let txd = SharedDb::open(&tmp(&format!("{name}-tx"))).unwrap();
+    for q in setup {
+        auto.write().query_write(q, &none()).unwrap();
+        txd.write().query_write(q, &none()).unwrap();
+    }
+    let q = "MATCH (n:X) DETACH DELETE n";
+    let a = count(&auto.write().query_write(q, &none()).unwrap(), "deleted");
+    let mut tx = txd.begin_transaction();
+    let b = count(&tx.execute(q, &none()).unwrap(), "deleted");
+    tx.commit().unwrap();
+    assert_eq!(state(&auto), state(&txd), "{name}");
+    (a, b)
+}
+
+/// Row 146: an edge between two nodes one `DETACH DELETE` removes is one
+/// deleted relationship, inside a transaction as auto-commit. Two nodes
+/// joined both ways: 2 nodes + 2 relationships.
+#[test]
+fn row_146_an_edge_between_two_deleted_nodes_is_counted_once_in_a_transaction() {
+    let counts = detach_delete_counts(
+        "row146",
+        &[
+            "CREATE (:X {id: 'p'})",
+            "CREATE (:X {id: 'q'})",
+            "MATCH (a {id: 'p'}), (b {id: 'q'}) CREATE (a)-[:K]->(b)",
+            "MATCH (a {id: 'q'}), (b {id: 'p'}) CREATE (a)-[:K]->(b)",
+        ],
+    );
+    assert_eq!(counts, (4, 4));
+}
+
+/// Row 147: a self-loop is one relationship. Auto-commit counted it twice
+/// (once from each end, since 0.9.x); `delete_node`'s report did too.
+#[test]
+fn row_147_a_self_loop_is_deleted_once() {
+    let setup = [
+        "CREATE (:X {id: 's'})",
+        "CREATE (:Y {id: 'o'})",
+        "MATCH (a {id: 's'}), (b {id: 's'}) CREATE (a)-[:K]->(b)",
+        "MATCH (a {id: 's'}), (b {id: 'o'}) CREATE (a)-[:K]->(b)",
+    ];
+    assert_eq!(
+        detach_delete_counts("row147", &setup),
+        (3, 3),
+        "node + 2 edges"
+    );
+    let db = SharedDb::open(&tmp("row147-api")).unwrap();
+    for q in setup {
+        db.write().query_write(q, &none()).unwrap();
+    }
+    let report = db.write().delete_node("s").unwrap();
+    assert_eq!(report.manual_edges, 2);
+    assert_eq!(report.derived_edges, 0);
+}
+
+// ── The conflict set holds every node a write read ─────────────────────────
+
+/// Flag `f` (active) hangs off person `a`. `stmt` runs in a transaction;
+/// another writer then turns the flag off and commits. The transaction read
+/// the flag, so its commit must fail with `CasConflict` and write nothing.
+fn conflicts_on_the_flag_it_read(name: &str, stmt: &str) {
+    let db = people(name);
+    db.write()
+        .query_write("CREATE (:Flag {id: 'f', active: true})", &none())
+        .unwrap();
+    db.write()
+        .query_write(
+            "MATCH (a {id: 'a'}), (f {id: 'f'}) CREATE (a)-[:K]->(f)",
+            &none(),
+        )
+        .unwrap();
+    let before = state(&db);
+    let mut tx = db.begin_transaction();
+    let rs = tx.execute(stmt, &none()).unwrap();
+    assert!(!rows(&rs).is_empty(), "{stmt}");
+    db.write()
+        .query_write("MATCH (f:Flag {id: 'f'}) SET f.active = false", &none())
+        .unwrap();
+    let flipped = state(&db);
+    assert_ne!(flipped, before);
+    let e = tx.commit().unwrap_err();
+    assert!(
+        matches!(e, GraphError::CasConflict { ref key, .. } if key == "f"),
+        "{stmt}: {e:?}"
+    );
+    assert_eq!(state(&db), flipped, "{stmt}: nothing written");
+}
+
+#[test]
+fn match_set_conflicts_on_an_anonymous_node_it_filtered_on() {
+    conflicts_on_the_flag_it_read(
+        "rs-set-anon",
+        "MATCH (a:Person {id: 'a'})-[:K]->(:Flag {active: true}) SET a.ok = true",
+    );
+}
+
+#[test]
+fn match_create_conflicts_on_a_node_it_read_but_did_not_write() {
+    conflicts_on_the_flag_it_read(
+        "rs-create-named",
+        "MATCH (a:Person {id: 'a'})-[:K]->(f:Flag) WHERE f.active \
+         CREATE (a)-[:L]->(:T {id: 't'})",
+    );
+    conflicts_on_the_flag_it_read(
+        "rs-create-anon",
+        "MATCH (a:Person {id: 'a'})-[:K]->(:Flag {active: true}) \
+         CREATE (a)-[:L]->(:T {id: 't'})",
+    );
+}
+
+#[test]
+fn unwind_match_merge_conflicts_on_a_node_it_read() {
+    conflicts_on_the_flag_it_read(
+        "rs-unwind-merge",
+        "UNWIND ['a'] AS k MATCH (p:Person {id: k})-[:K]->(:Flag {active: true}) \
+         MERGE (p)-[:L]->(:T {id: 't'})",
+    );
+}
+
+/// A node read before an aggregating `WITH` is recorded too (the read part
+/// is run up to the `WITH` for it).
+#[test]
+fn a_node_read_before_an_aggregating_with_is_recorded() {
+    conflicts_on_the_flag_it_read(
+        "rs-with-agg",
+        "MATCH (a:Person {id: 'a'})-[:K]->(:Flag {active: true}) \
+         WITH a, count(*) AS n CREATE (a)-[:L]->(:T {id: 't', n: n})",
+    );
+}
+
+/// A change to a node the statement never read is not a conflict.
+#[test]
+fn a_change_to_a_node_the_write_did_not_read_does_not_conflict() {
+    let db = people("rs-unrelated");
+    let mut tx = db.begin_transaction();
+    tx.execute(CONNECT, &ab("a", "b")).unwrap();
+    db.write()
+        .query_write("MATCH (n:Person {id: 'd'}) SET n.v = 40", &none())
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(outside(&db, EDGES), vec![vec![Some(s("a")), Some(s("b"))]]);
+}
+
 // ── Commit-time checks ──────────────────────────────────────────────────────
 
 /// Two transactions connecting the same pair: both endpoints are in each
@@ -410,9 +559,6 @@ fn random_seed_graph(rng: &mut Rng) -> Vec<String> {
     }
     for _ in 0..rng.below(6) {
         let (x, y) = (rng.below(n), rng.below(n));
-        if x == y {
-            continue; // no self-loops: see `random_write`
-        }
         stmts.push(format!(
             "MATCH (x {{id: 'n{x}'}}), (y {{id: 'n{y}'}}) CREATE (x)-[:K]->(y)"
         ));
@@ -422,10 +568,7 @@ fn random_seed_graph(rng: &mut Rng) -> Vec<String> {
 
 /// A random write statement of a form that was refused in a transaction,
 /// or a plain one, so later statements read the earlier ones' writes.
-///
-/// No statement makes a self-loop: auto-commit `DETACH DELETE` counts a
-/// self-loop as two deleted relationships (once from each end), which the
-/// transaction does not copy; reported with TX-MW, outside its scope.
+/// Self-loops are made too: both modes count one as one relationship.
 fn random_write(rng: &mut Rng, step: usize) -> String {
     let l1 = rng.pick(&["A", "B", "C"]);
     let l2 = rng.pick(&["A", "B", "C"]);
@@ -435,8 +578,7 @@ fn random_write(rng: &mut Rng, step: usize) -> String {
     let ret = rng.pick(&["", " RETURN count(*) AS c", " RETURN a.id AS a ORDER BY a"]);
     match rng.below(13) {
         0 => format!(
-            "MATCH (a:{l1}), (b:{l2}) WHERE a.v {op} {k} AND a.id <> b.id \
-             CREATE (a)-[:{t}]->(b){ret}"
+            "MATCH (a:{l1}), (b:{l2}) WHERE a.v {op} {k} CREATE (a)-[:{t}]->(b){ret}"
         ),
         1 => format!(
             "MATCH (a:{l1}) WHERE a.v {op} {k} \

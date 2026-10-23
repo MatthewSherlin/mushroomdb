@@ -494,9 +494,6 @@ pub(crate) struct RowPass {
     captured: Vec<Value>,
     /// The `RETURN` query, planned before anything was written.
     return_plan: Option<Query>,
-    /// The keys of the nodes the read part bound, when the source asked for
-    /// them ([`unwind_rows`]'s `record_reads`).
-    pub(crate) read_keys: HashSet<String>,
 }
 
 impl RowPass {
@@ -536,13 +533,11 @@ impl RowPass {
 
 /// Phases 1 and 2 of `UNWIND … <write clauses> [RETURN …]` over `src`: the
 /// read part, then the write clauses per row, as batch ops. Nothing is
-/// written. With `record_reads`, the keys of the nodes the read part bound are
-/// collected (a transaction's conflict set).
+/// written.
 pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
     src: &S,
     stmt: &UnwindWriteStmt,
     params: &BTreeMap<String, Value>,
-    record_reads: bool,
 ) -> Result<RowPass> {
     // Plan the RETURN first: a statement that cannot be projected must not
     // commit.
@@ -579,7 +574,6 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
     let node_vars: HashSet<&str> = stmt.node_vars.iter().map(String::as_str).collect();
     let capture = stmt.returns.is_some();
     let mut captured: Vec<Value> = Vec::new();
-    let mut read_keys: HashSet<String> = HashSet::new();
     let mut ov = Overlay::default();
     let mut ops: Vec<BatchOp> = Vec::new();
     let mut tally = Tally::default();
@@ -590,9 +584,6 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
             match rows.get(row, var) {
                 Some(Value::Null) | None => {}
                 Some(Value::Str(key)) if node_vars.contains(var) => {
-                    if record_reads && !read_keys.contains(key) {
-                        read_keys.insert(key.clone());
-                    }
                     env.insert(var, key.clone());
                 }
                 Some(v) if !node_vars.contains(var) => values.push((var, v.clone())),
@@ -653,7 +644,6 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
         tally,
         captured,
         return_plan,
-        read_keys,
     })
 }
 
@@ -664,7 +654,7 @@ impl<F: Fs> GraphDb<F> {
         stmt: UnwindWriteStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        let mut pass = unwind_rows(&*self, &stmt, params, false)?;
+        let mut pass = unwind_rows(&*self, &stmt, params)?;
         let ops = std::mem::take(&mut pass.ops);
         if !ops.is_empty() {
             self.commit_batch(ops)?;

@@ -15,10 +15,8 @@ pub(crate) struct MatchWrite {
     props: i64,
     /// The relationship variables and the `RETURN` items, when it has one.
     projection: Option<(Vec<String>, Vec<RetItem>)>,
-    /// The columns of `rows` that hold node keys or relationship variables.
-    pub(crate) node_vars: Vec<String>,
     /// The MATCH's rows.
-    pub(crate) rows: ResultSet,
+    rows: ResultSet,
 }
 
 impl MatchWrite {
@@ -224,7 +222,6 @@ pub(crate) fn match_set_ops<S: RowSource + ?Sized>(
         ops,
         props: props_set,
         projection: project_returns.map(|returns| (rel_vars, returns)),
-        node_vars: lookup_vars,
         rows: match_rs,
     })
 }
@@ -423,7 +420,6 @@ pub(crate) fn match_set_map_ops<S: RowSource + ?Sized>(
         ops,
         props: props_changed,
         projection: project_returns.map(|returns| (rel_vars, returns)),
-        node_vars: lookup_vars,
         rows: match_rs,
     })
 }
@@ -531,7 +527,6 @@ pub(crate) fn match_remove_ops<S: RowSource + ?Sized>(
         ops,
         props: props_removed,
         projection: project_returns.map(|returns| (rel_vars, returns)),
-        node_vars: lookup_vars,
         rows: match_rs,
     })
 }
