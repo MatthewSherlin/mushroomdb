@@ -104,6 +104,7 @@ fn fixture() -> (SharedDb, tempfile::TempDir) {
                         update_labels: vec!["Doc".into()],
                         delete_labels: vec!["Doc".into()],
                         create_edge_types: vec!["REFS".into()],
+                        update_edge_types: vec![],
                         delete_edge_types: vec![],
                     }),
                 },
