@@ -31,6 +31,8 @@ fn is_orderable_pair(lhs: &Value, rhs: &Value) -> bool {
             Value::Int(_) | Value::Float(_),
             Value::Int(_) | Value::Float(_)
         ) | (Value::Str(_), Value::Str(_))
+            // Row 160: openCypher orders false before true.
+            | (Value::Bool(_), Value::Bool(_))
     )
 }
 
@@ -162,12 +164,19 @@ mod tests {
             &Value::Str("b".into()),
             &Value::Str("b".into())
         ));
-        // ordering ops only for numeric/numeric and str/str
-        assert!(!eval_cmp(
+        // ordering ops within a class: numbers, strings, booleans (row 160:
+        // false before true); never across classes, never for lists
+        assert!(eval_cmp(
             &CmpOp::Lt,
             &Value::Bool(false),
             &Value::Bool(true)
         ));
+        assert!(!eval_cmp(
+            &CmpOp::Gt,
+            &Value::Bool(false),
+            &Value::Bool(true)
+        ));
+        assert!(!eval_cmp(&CmpOp::Lt, &Value::Bool(false), &Value::Int(1)));
         assert!(!eval_cmp(
             &CmpOp::Lt,
             &Value::List(vec![]),

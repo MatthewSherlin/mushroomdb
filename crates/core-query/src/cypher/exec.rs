@@ -2876,9 +2876,10 @@ fn scalar_agg_input(
 }
 
 /// Keep the smaller (`largest == false`) or larger of the running extreme and
-/// the next value. Only a number counts, as for a property argument.
+/// the next value. A number or a boolean counts (row 160: `false` before
+/// `true`); any other value is skipped.
 fn fold_extreme(current: &mut Option<Value>, next: Value, largest: bool) {
-    if numeric_val(&next).is_none() {
+    if numeric_val(&next).is_none() && !matches!(next, Value::Bool(_)) {
         return;
     }
     *current = Some(match current.take() {
