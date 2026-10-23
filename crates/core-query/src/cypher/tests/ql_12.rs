@@ -236,11 +236,11 @@ fn each_refused_form_is_named_wherever_it_stands() {
         ),
         (
             "MATCH (a), (b) CREATE (a)-[:K]->(b)",
-            "CREATE or MERGE after MATCH (MATCH … CREATE)",
+            "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now",
         ),
         (
             "MATCH (a {id: 'x'}) MERGE (a)-[:K]->(b:B {id: 'y'})",
-            "CREATE or MERGE after MATCH (MATCH … CREATE)",
+            "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now",
         ),
         (
             "MATCH p = allShortestPaths((a)-[*]-(b)) RETURN p",
@@ -414,4 +414,36 @@ fn arguments_are_evaluated_parameters_included() {
     // An argument reads no variable.
     let err = run_call("CALL db.ping(n.x)", &BTreeMap::new()).unwrap_err();
     assert!(err.contains("unbound variable"), "{err}");
+}
+
+#[test]
+fn on_match_is_not_a_match_clause() {
+    // MERGE … ON MATCH SET parses as on the base commit.
+    for q in [
+        "MERGE (a:P {id: 'a'}) ON MATCH SET a.n = 1",
+        "MERGE (a:P {id: 'a'}) ON CREATE SET a.n = 0 ON MATCH SET a.n = 1 RETURN a.n",
+    ] {
+        assert!(parse_write(&lex(q).unwrap()).is_ok(), "{q}");
+    }
+    // A failure after ON MATCH is not reported as MATCH … CREATE.
+    let err = statement_err("MERGE (a:P {id: 'a'}) ON MATCH SET a.n = 1 CREATE (b:P {id: 'q'})");
+    assert!(!err.contains("after a MATCH clause"), "{err}");
+}
+
+#[test]
+fn the_pattern_lookahead_claims_only_relationship_shapes() {
+    // A list subtraction that is not a relationship shape still parses.
+    for q in [
+        "MATCH (x) RETURN (x.v) - [1] AS d",
+        "MATCH (x) RETURN (x) - [1] AS d",
+        "MATCH (x) RETURN (x) - 1 AS d",
+    ] {
+        assert!(parse_read(&lex(q).unwrap()).is_ok(), "{q}");
+    }
+    // `(x) - [y]` reads as a relationship and is refused (it was a type error
+    // at run time on the base commit).
+    assert_eq!(
+        statement_err("MATCH (x) RETURN (x) - [y] AS d"),
+        format!("{NS}pattern predicate (a relationship pattern used as an expression)")
+    );
 }

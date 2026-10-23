@@ -490,12 +490,21 @@ impl<'a> Parser<'a> {
             Tok::Optional if self.pos == 0 => {
                 "OPTIONAL MATCH as the first clause; begin with MATCH"
             }
-            Tok::Create | Tok::Merge if self.toks[..self.pos].contains(&Tok::Match) => {
-                "CREATE or MERGE after MATCH (MATCH … CREATE)"
+            Tok::Create | Tok::Merge if self.match_clause_before() => {
+                "CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now"
             }
             _ => return None,
         };
         Some(refusal(feature))
+    }
+
+    /// Whether a `MATCH` clause comes before the cursor. The `MATCH` of
+    /// `MERGE … ON MATCH SET` is not one.
+    fn match_clause_before(&self) -> bool {
+        self.toks[..self.pos]
+            .iter()
+            .enumerate()
+            .any(|(i, t)| *t == Tok::Match && !(i > 0 && kw(self.toks.get(i - 1), "on")))
     }
 
     /// Whether the tokens at the cursor open a relationship pattern used as an
@@ -1230,7 +1239,10 @@ impl<'a> Parser<'a> {
     /// Parse a unary-level arithmetic expression (handles unary `-`).
     fn arith_unary(&mut self) -> Result<Operand, String> {
         if self.eat(&Tok::Dash) {
-            // Unary minus: fold into the next atom.
+            // Unary minus: fold into the next atom. Only a number takes one,
+            // which `pattern_ahead` relies on: it reads `(v)--(…)` and
+            // `(v)<--…` as relationship patterns. A change that lets unary
+            // minus take any expression must revisit that lookahead.
             return match self.peek() {
                 Some(Tok::Int(n)) => {
                     let n = *n;

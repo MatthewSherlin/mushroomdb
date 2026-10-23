@@ -5677,7 +5677,10 @@ lock-free reader, a transaction (`Transaction::execute`, where it sees the
 transaction's own writes), HTTP `/query` (with `as_of`, `mask` or `namespace`
 too), Bolt `RUN` and the MCP `query` tool. Under a role, a mask or a namespace,
 a procedure sees only the nodes the caller can see, the relationships between
-them, and the schema rows `SHOW` gives that caller.
+them, and the schema rows `SHOW` gives that caller. `query_write_authz` refuses
+any statement, a call included, for a role with no write scope, as it refuses
+`SHOW`; such a role reads through `query_masked` (HTTP `/query` routes a call
+there).
 
 **What is refused.** `CALL` inside a larger query — after `MATCH`, `WITH` or
 `UNWIND`, or followed by any clause other than `WHERE` and `RETURN` (a second
@@ -5716,7 +5719,7 @@ prefix, the regular-expression operator `lex:`).
 | `LOAD CSV …` | `not supported in mushroomdb 0.10: LOAD CSV` |
 | `USE db …` | `not supported in mushroomdb 0.10: USE (database selection)` |
 | `OPTIONAL MATCH` as the first clause | `not supported in mushroomdb 0.10: OPTIONAL MATCH as the first clause; begin with MATCH` |
-| `MATCH … CREATE`, `MATCH … MERGE` | `not supported in mushroomdb 0.10: CREATE or MERGE after MATCH (MATCH … CREATE)` |
+| `MATCH … CREATE`, `MATCH … MERGE` | `not supported in mushroomdb 0.10: CREATE or MERGE after a MATCH clause; use UNWIND [1] AS _ MATCH … CREATE … for now` — the `UNWIND` form runs the same `MATCH` then the write, once |
 | `allShortestPaths(…)` | `not supported in mushroomdb 0.10: allShortestPaths` |
 
 The other refusals of this release (forms of `MERGE`, `SET` maps, `UNWIND`
