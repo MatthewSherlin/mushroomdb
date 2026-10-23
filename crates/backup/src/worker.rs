@@ -228,6 +228,10 @@ pub struct BackupHandle {
     /// `backup_lag_s`: seconds the oldest durable, unshipped WAL byte has
     /// waited; 0 when everything durable is shipped.
     pub lag_s: Arc<AtomicU64>,
+    /// Whether this worker holds the bucket lease right now: false while
+    /// another instance holds it, after the lease is lost or cannot be
+    /// renewed, and once the worker has released it.
+    pub lease_held: Arc<AtomicBool>,
     /// Why the worker is unhealthy, while it is; once it has stopped, why it
     /// stopped (`"stopped"` after a shutdown, the panic message after a panic).
     pub reason: Arc<Mutex<Option<String>>>,
@@ -242,6 +246,7 @@ pub struct BackupCounters {
     pub last_success_ts: Arc<AtomicU64>,
     pub healthy: Arc<AtomicBool>,
     pub lag_s: Arc<AtomicU64>,
+    pub lease_held: Arc<AtomicBool>,
     pub reason: Arc<Mutex<Option<String>>>,
 }
 
@@ -306,6 +311,7 @@ struct Health {
     healthy: Arc<AtomicBool>,
     lag_s: Arc<AtomicU64>,
     last_success_ts: Arc<AtomicU64>,
+    lease_held: Arc<AtomicBool>,
     reason: Arc<Mutex<Option<String>>>,
     limit: Duration,
 }
@@ -378,6 +384,7 @@ impl Health {
     fn stop(&self, why: String) {
         self.lock().stopped = Some(why.clone());
         self.healthy.store(false, Ordering::Release);
+        self.lease_held.store(false, Ordering::Release);
         *self.reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
     }
 }
@@ -488,6 +495,7 @@ impl BackupWorker {
                 healthy: Arc::new(AtomicBool::new(true)),
                 lag_s: Arc::new(AtomicU64::new(0)),
                 last_success_ts: Arc::new(AtomicU64::new(0)),
+                lease_held: Arc::new(AtomicBool::new(false)),
                 reason: Arc::default(),
                 limit,
             },
@@ -550,6 +558,7 @@ impl BackupWorker {
             last_success_ts,
             healthy,
             lag_s,
+            lease_held,
             reason,
         } = self.counters();
         let health = self.health.clone();
@@ -590,6 +599,7 @@ impl BackupWorker {
             last_success_ts,
             healthy,
             lag_s,
+            lease_held,
             reason,
             join,
         }
@@ -603,6 +613,7 @@ impl BackupWorker {
             last_success_ts: Arc::clone(&self.health.last_success_ts),
             healthy: Arc::clone(&self.health.healthy),
             lag_s: Arc::clone(&self.health.lag_s),
+            lease_held: Arc::clone(&self.health.lease_held),
             reason: Arc::clone(&self.health.reason),
         }
     }
@@ -709,6 +720,7 @@ impl BackupWorker {
                 r.abort();
             }
             self.lease = None;
+            self.health.lease_held.store(false, Ordering::Release);
         }
         let ttl_s = self.config.lease_ttl_s;
         // A few requests: a read, a conditional write, the two probes.
@@ -735,6 +747,7 @@ impl BackupWorker {
                     );
                     self.foreign = Some(instance_id.clone());
                 }
+                self.health.lease_held.store(false, Ordering::Release);
                 self.health.lock().lease = Some(format!(
                     "the backup bucket's lease is held by another instance ({instance_id}); \
                      this instance uploads nothing while it is"
@@ -743,6 +756,7 @@ impl BackupWorker {
             }
             Ok(Err(e @ LeaseError::PreconditionsIgnored { .. })) => {
                 tracing::error!(error = %e, "backup is not started");
+                self.health.lease_held.store(false, Ordering::Release);
                 self.health.lock().lease = Some(e.to_string());
                 Some(MAX_BACKOFF)
             }
@@ -772,6 +786,7 @@ impl BackupWorker {
         self.tenures += 1;
         self.foreign = None;
         self.health.lock().lease = None;
+        self.health.lease_held.store(true, Ordering::Release);
         match lease.exclusion() {
             Exclusion::Conditional => tracing::info!(
                 instance_id = lease.instance_id(),
@@ -818,6 +833,7 @@ impl BackupWorker {
 
     /// Stop renewing and delete the lease, if this worker still holds it.
     async fn release_lease(&mut self) {
+        self.health.lease_held.store(false, Ordering::Release);
         let Some(lease) = self.lease.take() else {
             return;
         };
@@ -1983,11 +1999,13 @@ async fn renew_loop(
         let why = match tokio::time::timeout(op_timeout, lease.renew()).await {
             Ok(Ok(())) => {
                 health.lock().lease = None;
+                health.lease_held.store(true, Ordering::Release);
                 wait = every;
                 continue;
             }
             Ok(Err(e @ LeaseError::Lost { .. })) => {
                 tracing::warn!(error = %e, "lost the backup bucket lease; uploads stop");
+                health.lease_held.store(false, Ordering::Release);
                 health.lock().lease = Some(format!(
                     "{e}; this instance uploads nothing while another holds it"
                 ));
@@ -1999,6 +2017,7 @@ async fn renew_loop(
         errors.fetch_add(1, Ordering::AcqRel);
         tracing::warn!(error = %why, "backup bucket lease renewal failed; retrying");
         if !lease.may_write() {
+            health.lease_held.store(false, Ordering::Release);
             health.lock().lease = Some(format!(
                 "the bucket lease could not be renewed ({why}); uploads are stopped until it is"
             ));

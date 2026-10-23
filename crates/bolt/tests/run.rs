@@ -419,13 +419,25 @@ fn a_structure_parameter_is_a_client_error_not_a_server_fault() {
             s("MATCH (n) RETURN COUNT(n)"),
             PackValue::Map(vec![(
                 "d".into(),
-                PackValue::Struct(PackStruct::new(0x44, vec![PackValue::Int(1)])),
+                // Point2D: dates and durations are accepted (TX-20), points are not.
+                PackValue::Struct(PackStruct::new(
+                    0x58,
+                    vec![
+                        PackValue::Int(7203),
+                        PackValue::Float(1.0),
+                        PackValue::Float(2.0),
+                    ],
+                )),
             )]),
             PackValue::Map(vec![]),
         ],
     );
     let out = conn.handle(message);
     assert_eq!(failure_code(&out), "Neo.ClientError.Request.Invalid");
+    let Some(ServerMessage::Failure(err)) = out.last() else {
+        unreachable!()
+    };
+    assert!(err.message().contains("Point2D"), "{}", err.message());
 }
 
 #[test]
@@ -844,6 +856,11 @@ fn a_pull_naming_another_qid_fails() {
 #[test]
 fn a_role_token_cannot_run_in_a_transaction() {
     let (db, _dir) = open_db("tx-role");
+    // The leak the refusal prevents is a read through a transaction that
+    // applies no mask, so a read is refused as well as a write.
+    let mut conn = in_tx(&db, ROLE);
+    let out = conn.handle(run("MATCH (n) RETURN n"));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");
     let mut conn = in_tx(&db, ROLE);
     let out = conn.handle(run("CREATE (n:Sneak {id: 's1'})"));
     assert_eq!(failure_code(&out), "Neo.ClientError.Security.Forbidden");

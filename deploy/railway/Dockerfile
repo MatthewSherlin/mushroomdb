@@ -13,7 +13,18 @@
 #                                 setting; the image is unchanged). UNVERIFIED without a
 #                                 real deploy.
 #
-# The Bolt port (7687) is added by HO-15.
+# Bolt is OFF in this template: Railway reaches a service only through its HTTP
+# domain unless you enable a TCP proxy, and the TCP proxy is not documented to
+# encrypt (UNVERIFIED), so this file never opens it for you. To use Bolt,
+# enable the proxy yourself (service Settings > Networking > TCP Proxy, enter
+# internal port 7687), then set these service variables:
+#   MUSHROOMDB_BOLT_PORT             7687   turns the listener on
+#   MUSHROOMDB_BOLT_ADVERTISED_HOST  <the proxy domain Railway shows you>
+#   MUSHROOMDB_BOLT_ADVERTISED_PORT  <the proxy port Railway shows you>
+# Bolt takes the same token as HTTP. Prefer private networking, or run
+# --tls-cert/--tls-key on the server, over plaintext on a public proxy.
+# Railway's config as code has no TCP proxy setting that was found in its docs
+# (UNVERIFIED), so this is dashboard-only.
 #   MUSHROOMDB_BACKUP_S3_URL    s3://<bucket>/<prefix>   continuous backup, off unless set;
 #                                                        AWS_* credentials as service variables
 #   MUSHROOMDB_RESTORE_FROM_S3  s3://<bucket>/<prefix>   restore on boot: an empty volume restores

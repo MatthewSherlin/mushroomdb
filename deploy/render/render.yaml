@@ -16,6 +16,11 @@
 # managed platforms" (push the wrapper to a registry, or use runtime: docker).
 # Status: confirmed at the release gate by a real Render
 # deploy; it has not been run yet.
+#
+# NO BOLT: a Render web service exposes only HTTP, so Bolt (7687) is not
+# reachable from outside and this template does not start it. A Render private
+# service can take other ports, reachable only from your other Render services
+# (UNVERIFIED here; docs/site/deployment.md, "Exposing the Bolt port").
 services:
   - type: web
     name: mushroomdb

@@ -18,7 +18,7 @@ use crate::json::{
 use crate::{AppState, AuthIdentity, ReadOnlyKey};
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,10 +31,11 @@ use mushroomdb::{
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::{Display, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use tower_http::services::ServeDir;
 
 // The `/tx/*` routes and the open-transaction store. Declared here, not in
@@ -930,6 +931,7 @@ fn build_app_with_cors(
         addr,
         tls_active,
         started_at: std::time::Instant::now(),
+        started_unix_s: unix_seconds_now(),
         ready,
         access_keys: keys,
         txs,
@@ -1197,9 +1199,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
 {
+    blocking_write_with(f, graph_err).await
+}
+
+/// [`blocking_write`] with the engine error answered by `on_err`.
+async fn blocking_write_with<T, F>(
+    f: F,
+    on_err: fn(GraphError) -> Response,
+) -> std::result::Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(graph_err(e)),
+        Ok(Err(e)) => Err(on_err(e)),
         Err(_) => Err(err_response("write task panicked")),
     }
 }
@@ -1521,6 +1535,18 @@ fn role_mask_err(e: GraphError) -> Response {
     }
 }
 
+/// Convert a role-scoped write's error into an HTTP response: a role the
+/// store no longer defines is 401, as it is for a read (`role_mask_err`) and
+/// over Bolt; anything else is [`graph_err`]. Unlike `role_mask_err`, a
+/// `Corrupt` keeps `graph_err`'s text, since on the write path it need not be
+/// about roles.
+fn role_write_err(e: GraphError) -> Response {
+    match e {
+        GraphError::KeyNotFound { key } if key.starts_with("role:") => unauthorized(),
+        other => graph_err(other),
+    }
+}
+
 fn err_response(detail: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1765,9 +1791,10 @@ async fn query(
             let cypher_c = cypher.clone();
             let params_c = params.clone();
             let db = state.db.clone();
-            return match blocking_write(move || {
-                db.write().query_write_authz(&role, &cypher_c, &params_c)
-            })
+            return match blocking_write_with(
+                move || db.write().query_write_authz(&role, &cypher_c, &params_c),
+                role_write_err,
+            )
             .await
             {
                 Ok(rs) => format_query_result(rs, format),
@@ -2278,9 +2305,285 @@ async fn stats(
     }
 }
 
+/// The continuous-backup counters `GET /metrics` reports as
+/// `mushroomdb_backup_*`. The serve loop registers them with
+/// [`register_backup_metrics`] when backup is configured; without that, no
+/// backup series is emitted at all (absent, not zero, so an alert on
+/// `mushroomdb_backup_lag_seconds` cannot be satisfied by a store that was
+/// never backed up).
+#[derive(Debug, Clone)]
+pub struct BackupMetrics {
+    /// Failed backup steps since start.
+    pub error_count: Arc<AtomicU64>,
+    /// Unix seconds of the last moment everything durable was shipped; 0
+    /// before the first.
+    pub last_success_ts: Arc<AtomicU64>,
+    /// Seconds the oldest durable, unshipped WAL byte has waited.
+    pub lag_s: Arc<AtomicU64>,
+    /// Whether the worker reports itself healthy.
+    pub healthy: Arc<AtomicBool>,
+    /// Whether the worker holds the bucket lease right now.
+    pub lease_held: Arc<AtomicBool>,
+}
+
+/// The Bolt listener's counters `GET /metrics` reports as
+/// `mushroomdb_bolt_connections_*`; absent when Bolt is off.
+#[derive(Debug, Clone)]
+pub struct BoltMetrics {
+    /// Connections being served now.
+    pub open: Arc<AtomicU64>,
+    /// Connections admitted since the listener started.
+    pub accepted: Arc<AtomicU64>,
+}
+
+static BOLT_METRICS: std::sync::Mutex<Option<BoltMetrics>> = std::sync::Mutex::new(None);
+
+/// Report `metrics` on `GET /metrics` from now on. Like
+/// [`register_backup_metrics`] this is per process: one process serves one
+/// store's metrics.
+pub fn register_bolt_metrics(metrics: BoltMetrics) {
+    *BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+}
+
+fn registered_bolt_metrics() -> Option<BoltSample> {
+    let guard = BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().map(|m| BoltSample {
+        open: m.open.load(Ordering::Acquire),
+        accepted_total: m.accepted.load(Ordering::Acquire),
+    })
+}
+
+/// One reading of the Bolt counters.
+struct BoltSample {
+    open: u64,
+    accepted_total: u64,
+}
+
+static BACKUP_METRICS: std::sync::Mutex<Option<BackupMetrics>> = std::sync::Mutex::new(None);
+
+/// Report `metrics` on `GET /metrics` from now on. Replaces an earlier call.
+///
+/// The registration is process-wide: one process serves one store's metrics,
+/// as `mushroomdb serve` does. Serving several stores from one process would
+/// need these threaded through `AppState` instead.
+pub fn register_backup_metrics(metrics: BackupMetrics) {
+    *BACKUP_METRICS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+}
+
+fn registered_backup_metrics() -> Option<BackupSample> {
+    let guard = BACKUP_METRICS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().map(|m| BackupSample {
+        upload_errors_total: m.error_count.load(Ordering::Acquire),
+        last_success_ts: m.last_success_ts.load(Ordering::Acquire),
+        lag_s: m.lag_s.load(Ordering::Acquire),
+        healthy: m.healthy.load(Ordering::Acquire),
+        lease_held: m.lease_held.load(Ordering::Acquire),
+    })
+}
+
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One reading of the backup counters.
+struct BackupSample {
+    upload_errors_total: u64,
+    last_success_ts: u64,
+    lag_s: u64,
+    healthy: bool,
+    lease_held: bool,
+}
+
+/// Everything the text exposition reports, read once.
+struct PrometheusSample {
+    nodes_live: u64,
+    nodes_tombstoned: u64,
+    edges_live: u64,
+    commits_total: u64,
+    wal_size_bytes: Option<u64>,
+    rss_bytes: Option<u64>,
+    process_start_time_seconds: u64,
+    slow_queries_total: u64,
+    transactions_open: u64,
+    bolt: Option<BoltSample>,
+    backup: Option<BackupSample>,
+}
+
+/// Whether `Accept` asks for the Prometheus text format rather than JSON.
+///
+/// JSON is the default: a caller with no `Accept`, `*/*`, a browser's
+/// `text/html,...` or a client that lists `application/json` among others
+/// (`application/json, text/plain, */*`) gets JSON. Only a caller that names
+/// `text/plain` or `application/openmetrics-text` and not JSON gets text, which
+/// is what a Prometheus scraper sends. Quality values are not weighed.
+fn wants_prometheus_text(headers: &HeaderMap) -> bool {
+    let mut text = false;
+    for value in headers.get_all(header::ACCEPT) {
+        let Ok(value) = value.to_str() else { continue };
+        for range in value.split(',') {
+            let media = range
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            match media.as_str() {
+                "application/json" => return false,
+                "text/plain" | "application/openmetrics-text" => text = true,
+                _ => {}
+            }
+        }
+    }
+    text
+}
+
+/// One metric family in the text exposition format, version 0.0.4.
+fn write_family(out: &mut String, name: &str, kind: &str, help: &str, value: impl Display) {
+    let _ = write!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+    );
+}
+
+/// The Prometheus text exposition (version 0.0.4), written by hand: no
+/// labels, so no cardinality to manage, and a gauge whose source is
+/// unavailable on this platform (`rss_bytes`) is left out rather than
+/// reported as 0.
+fn format_prometheus(s: &PrometheusSample) -> String {
+    let mut out = String::with_capacity(2048);
+    write_family(
+        &mut out,
+        "mushroomdb_nodes_live",
+        "gauge",
+        "Live (non-tombstoned) nodes.",
+        s.nodes_live,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_nodes_tombstoned",
+        "gauge",
+        "Soft-deleted nodes not yet compacted away.",
+        s.nodes_tombstoned,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_edges_live",
+        "gauge",
+        "Edges in the store.",
+        s.edges_live,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_commits_total",
+        "counter",
+        "Commits since the store was created (the commit sequence number).",
+        s.commits_total,
+    );
+    if let Some(bytes) = s.wal_size_bytes {
+        write_family(
+            &mut out,
+            "mushroomdb_wal_size_bytes",
+            "gauge",
+            "On-disk size of the write-ahead log in bytes.",
+            bytes,
+        );
+    }
+    if let Some(bytes) = s.rss_bytes {
+        write_family(
+            &mut out,
+            "mushroomdb_rss_bytes",
+            "gauge",
+            "Resident set size of the server process in bytes.",
+            bytes,
+        );
+    }
+    write_family(
+        &mut out,
+        "mushroomdb_process_start_time_seconds",
+        "gauge",
+        "Start time of the server as seconds since the Unix epoch.",
+        s.process_start_time_seconds,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_slow_queries_total",
+        "counter",
+        "Read queries that met the slow-query threshold since start.",
+        s.slow_queries_total,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_http_transactions_open",
+        "gauge",
+        "Open interactive HTTP transactions.",
+        s.transactions_open,
+    );
+    if let Some(b) = &s.bolt {
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_open",
+            "gauge",
+            "Bolt connections being served now.",
+            b.open,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_accepted_total",
+            "counter",
+            "Bolt connections admitted since the listener started.",
+            b.accepted_total,
+        );
+    }
+    if let Some(b) = &s.backup {
+        write_family(
+            &mut out,
+            "mushroomdb_backup_upload_errors_total",
+            "counter",
+            "Failed continuous-backup steps since start.",
+            b.upload_errors_total,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_last_success_timestamp_seconds",
+            "gauge",
+            "Unix time of the last moment all durable data was shipped; 0 before the first.",
+            b.last_success_ts,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_lag_seconds",
+            "gauge",
+            "Seconds the oldest durable, unshipped WAL byte has waited; 0 when all is shipped.",
+            b.lag_s,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_healthy",
+            "gauge",
+            "1 while the backup worker reports itself healthy, else 0.",
+            u8::from(b.healthy),
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_lease_held",
+            "gauge",
+            "1 while this instance holds the backup bucket lease, else 0.",
+            u8::from(b.lease_held),
+        );
+    }
+    out
+}
+
 async fn metrics(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
+    headers: HeaderMap,
 ) -> Response {
     // Mirror /stats auth: deny role tokens — counters leak graph size.
     if let AuthIdentity::Role(_) = identity {
@@ -2294,6 +2597,30 @@ async fn metrics(
     let commit_seq = snap.commit_seq();
     let wal_size_bytes = snap.wal_size_bytes().ok();
     let slow_snap = snap.slow_query_snapshot();
+    if wants_prometheus_text(&headers) {
+        let text = format_prometheus(&PrometheusSample {
+            nodes_live: nodes_live as u64,
+            nodes_tombstoned: nodes_tombstoned as u64,
+            edges_live: edges,
+            commits_total: commit_seq,
+            wal_size_bytes,
+            rss_bytes: rss_bytes(),
+            process_start_time_seconds: state.started_unix_s,
+            slow_queries_total: slow_snap.count,
+            transactions_open: state.txs.open_count() as u64,
+            bolt: registered_bolt_metrics(),
+            backup: registered_backup_metrics(),
+        });
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE),
+                (header::VARY, "Accept"),
+            ],
+            text,
+        )
+            .into_response();
+    }
     let uptime_s = state.started_at.elapsed().as_secs();
     let slow_entries: Vec<Js> = slow_snap
         .last
@@ -2306,7 +2633,7 @@ async fn metrics(
             })
         })
         .collect();
-    json_ok(json!({
+    let mut response = json_ok(json!({
         "nodes_live": nodes_live,
         "nodes_tombstoned": nodes_tombstoned,
         "edges": edges,
@@ -2319,8 +2646,15 @@ async fn metrics(
             "count": slow_snap.count,
             "last": slow_entries,
         },
-    }))
+    }));
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    response
 }
+
+/// `Content-Type` of the Prometheus text exposition.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Resident set size of the current process in bytes.
 ///
@@ -3710,6 +4044,99 @@ impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
 
 #[cfg(test)]
 mod tests {
+    fn prom_sample(
+        backup: Option<BackupSample>,
+        bolt: Option<BoltSample>,
+        rss: Option<u64>,
+    ) -> PrometheusSample {
+        PrometheusSample {
+            nodes_live: 3,
+            nodes_tombstoned: 1,
+            edges_live: 2,
+            commits_total: 9,
+            wal_size_bytes: Some(4096),
+            rss_bytes: rss,
+            process_start_time_seconds: 1_700_000_000,
+            slow_queries_total: 4,
+            transactions_open: 2,
+            bolt,
+            backup,
+        }
+    }
+
+    #[test]
+    fn prometheus_text_has_help_and_type_for_every_sample() {
+        let text = format_prometheus(&prom_sample(None, None, Some(1024)));
+        let samples: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(samples.contains(&"mushroomdb_nodes_live 3"));
+        assert!(samples.contains(&"mushroomdb_commits_total 9"));
+        assert!(samples.contains(&"mushroomdb_http_transactions_open 2"));
+        for line in &samples {
+            let name = line.split(' ').next().unwrap();
+            assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name} TYPE");
+        }
+        assert!(!text.contains("backup"));
+        assert!(!text.contains("bolt"), "no Bolt series with Bolt off");
+    }
+
+    #[test]
+    fn prometheus_text_reports_bolt_connections_when_bolt_is_on() {
+        let text = format_prometheus(&prom_sample(
+            None,
+            Some(BoltSample {
+                open: 3,
+                accepted_total: 41,
+            }),
+            None,
+        ));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_open gauge\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_open 3\n"));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_accepted_total counter\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_accepted_total 41\n"));
+    }
+
+    #[test]
+    fn prometheus_text_omits_an_unavailable_gauge_and_adds_backup_series() {
+        let text = format_prometheus(&prom_sample(
+            Some(BackupSample {
+                upload_errors_total: 5,
+                last_success_ts: 1_700_000_123,
+                lag_s: 7,
+                healthy: false,
+                lease_held: true,
+            }),
+            None,
+            None,
+        ));
+        assert!(!text.contains("mushroomdb_rss_bytes"));
+        assert!(text.contains("# TYPE mushroomdb_backup_upload_errors_total counter\n"));
+        assert!(text.contains("\nmushroomdb_backup_upload_errors_total 5\n"));
+        assert!(text.contains("\nmushroomdb_backup_last_success_timestamp_seconds 1700000123\n"));
+        assert!(text.contains("\nmushroomdb_backup_lag_seconds 7\n"));
+        assert!(text.contains("\nmushroomdb_backup_healthy 0\n"));
+        assert!(text.contains("# TYPE mushroomdb_backup_lease_held gauge\n"));
+        assert!(text.contains("\nmushroomdb_backup_lease_held 1\n"));
+    }
+
+    #[test]
+    fn accept_negotiation_defaults_to_json() {
+        let accept = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, HeaderValue::from_str(v).unwrap());
+            wants_prometheus_text(&h)
+        };
+        assert!(!wants_prometheus_text(&HeaderMap::new()));
+        assert!(!accept("*/*"));
+        assert!(!accept("application/json, text/plain, */*"));
+        assert!(!accept("text/html,application/xhtml+xml"));
+        assert!(accept("text/plain"));
+        assert!(accept("TEXT/PLAIN;version=0.0.4;q=0.5"));
+        assert!(accept(
+            "application/openmetrics-text;version=1.0.0,*/*;q=0.1"
+        ));
+    }
+
     use super::*;
     use crate::json::result_set_json;
     use mushroomdb::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};

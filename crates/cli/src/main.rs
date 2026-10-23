@@ -1326,6 +1326,11 @@ async fn bind_bolt(
         drain_timeout: drain,
         ..bolt::server::BoltConfig::default()
     };
+    // `GET /metrics` reports the listener's connection counters.
+    server::register_bolt_metrics(server::BoltMetrics {
+        open: config.stats.open.clone(),
+        accepted: config.stats.accepted.clone(),
+    });
     config.connection.tx_timeout = settings.tx_timeout;
     config.connection.bookmark_timeout = settings.bookmark_timeout;
     if settings.tls {
@@ -1435,6 +1440,14 @@ fn start_backup(
         worker.adopt_lease(lease.detach());
     }
     let handle = worker.start(rx);
+    // `GET /metrics` reports the worker's counters as `mushroomdb_backup_*`.
+    server::register_backup_metrics(server::BackupMetrics {
+        error_count: handle.error_count.clone(),
+        last_success_ts: handle.last_success_ts.clone(),
+        lag_s: handle.lag_s.clone(),
+        healthy: handle.healthy.clone(),
+        lease_held: handle.lease_held.clone(),
+    });
     Ok((Some((tx, handle, budget)), plan))
 }
 

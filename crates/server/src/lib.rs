@@ -13,7 +13,10 @@ mod ws;
 
 use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
 
-pub use http::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
+pub use http::{
+    register_backup_metrics, register_bolt_metrics, BackupMetrics, BoltMetrics, TxLimits,
+    TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV,
+};
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 
 /// The root this crate's `tracing` events are filtered by.
@@ -75,6 +78,8 @@ struct AppState {
     tls_active: bool,
     /// Instant the router was first built; used by `GET /metrics` uptime_s.
     started_at: std::time::Instant,
+    /// The same instant as Unix seconds; `mushroomdb_process_start_time_seconds`.
+    started_unix_s: u64,
     /// `GET /ready` answers 200 while this is true and 503 while it is false.
     /// True at every construction site except the `serve` command, which
     /// starts it false and sets it once the store is open.
