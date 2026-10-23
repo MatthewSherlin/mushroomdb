@@ -324,6 +324,10 @@ RETURN AVG(r.score)
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
 
+Each also takes a bare variable bound by `UNWIND` or `WITH`
+(`MATCH (o:One) UNWIND [1, 2] AS x RETURN max(x)` is `2`). `MIN` and `MAX`
+read numbers; a null or missing value contributes nothing.
+
 ### DISTINCT inside an aggregate
 
 `count(DISTINCT x)` and `collect(DISTINCT x)` deduplicate within each group
