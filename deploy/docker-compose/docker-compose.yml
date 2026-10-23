@@ -11,13 +11,20 @@ services:
     image: ghcr.io/matthewsherlin/mushroomdb:latest
     ports:
       - "8080:8080"
-      # The Bolt port (7687) is added by HO-15; it is intentionally absent here.
+      # Bolt, on this machine only: bound to 127.0.0.1 so it is not exposed to
+      # the network by accident. To expose it, change the left side to
+      # "7687:7687" and put TLS in front (--tls-cert/--tls-key, or a TCP proxy
+      # that terminates TLS); Bolt takes the same token as HTTP.
+      - "127.0.0.1:7687:7687"
     volumes:
       - mushroomdb-data:/data
     environment:
       # Required. The server refuses a non-loopback bind without a token.
       MUSHROOMDB_TOKEN: ${MUSHROOMDB_TOKEN:?set MUSHROOMDB_TOKEN to a strong secret}
       MUSHROOMDB_LOG_FORMAT: json
+      MUSHROOMDB_BOLT_PORT: "7687"
+      # A wildcard bind cannot be handed to a driver; this is the host clients use.
+      MUSHROOMDB_BOLT_ADVERTISED_HOST: localhost
       # S3 settings the backup worker will read. They are wired to the bundled
       # object store so HO-14/HO-15 only add the mushroomdb-specific variables.
       AWS_ENDPOINT_URL: http://minio:9000
