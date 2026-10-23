@@ -4235,8 +4235,12 @@ fn execute_pull(
 /// Running state for a single aggregate accumulation.
 enum AggAcc {
     Count(u64),
+    /// `sum`: integers add exactly as `i64` (an overflow is an error); once a
+    /// float is seen the result is a float.
     Sum {
-        val: f64,
+        ints: i64,
+        floats: f64,
+        any_float: bool,
         has_value: bool,
     },
     Avg {
@@ -4314,7 +4318,9 @@ impl AggAcc {
             },
             AggFunc::Count => AggAcc::Count(0),
             AggFunc::Sum => AggAcc::Sum {
-                val: 0.0,
+                ints: 0,
+                floats: 0.0,
+                any_float: false,
                 has_value: false,
             },
             AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
@@ -4331,11 +4337,18 @@ impl AggAcc {
             // a wrong (negative) count. Clamping to i64::MAX is the least-
             // surprising failure mode.
             AggAcc::Count(n) => Some(Value::Int(i64::try_from(n).unwrap_or(i64::MAX))),
-            AggAcc::Sum { val, has_value } => {
-                if has_value {
-                    Some(Value::Float(val))
-                } else {
+            AggAcc::Sum {
+                ints,
+                floats,
+                any_float,
+                has_value,
+            } => {
+                if !has_value {
                     None
+                } else if any_float {
+                    Some(Value::Float(ints as f64 + floats))
+                } else {
+                    Some(Value::Int(ints))
                 }
             }
             AggAcc::Avg { sum, n } => {
@@ -4689,12 +4702,25 @@ fn update_acc(
                 return Ok(());
             };
             match acc {
-                AggAcc::Sum { val, has_value } => {
-                    if let Some(num) = numeric_val(&v) {
-                        *val += num;
+                AggAcc::Sum {
+                    ints,
+                    floats,
+                    any_float,
+                    has_value,
+                } => match v {
+                    Value::Int(n) => {
+                        *ints = ints
+                            .checked_add(n)
+                            .ok_or_else(|| "sum(): integer overflow".to_string())?;
                         *has_value = true;
                     }
-                }
+                    Value::Float(f) => {
+                        *floats += f;
+                        *any_float = true;
+                        *has_value = true;
+                    }
+                    _ => {}
+                },
                 AggAcc::Avg { sum, n } => {
                     if let Some(num) = numeric_val(&v) {
                         *sum += num;
@@ -6419,6 +6445,10 @@ mod ql_12;
 #[cfg(test)]
 #[path = "tests/ql_cx.rs"]
 mod ql_cx;
+
+#[cfg(test)]
+#[path = "tests/ql_ag.rs"]
+mod ql_ag;
 
 #[cfg(test)]
 #[path = "tests/tx_15.rs"]
@@ -8384,8 +8414,8 @@ LIMIT 10";
         let params = BTreeMap::new();
         let rs = run(&v, "MATCH (n:N) RETURN SUM(n.v)", &params).expect("SUM");
         assert_eq!(rs.columns(), &["SUM(n.v)".to_string()]);
-        // 10.0 + 20.0 = 30.0 (null skipped)
-        assert_eq!(rs.row(0), &[Some(f(30.0))]);
+        // 10 + 20 = 30 (null skipped)
+        assert_eq!(rs.row(0), &[Some(i(30))]);
 
         // All props null → result is null.
         let rs_null = run(&v, "MATCH (n:N) RETURN SUM(n.missing)", &params).expect("SUM null");
@@ -8658,14 +8688,14 @@ LIMIT 10";
                 .find(|&i| rs.row(i)[0].as_ref() == Some(cat) && rs.row(i)[1].as_ref() == Some(sub))
         };
         let a1 = find(&s("A"), &s("1")).expect("group (A,1) must exist");
-        assert_eq!(rs.row(a1)[2], Some(f(30.0)), "(A,1) SUM must be 30.0");
+        assert_eq!(rs.row(a1)[2], Some(i(30)), "(A,1) SUM must be 30");
         assert_eq!(rs.row(a1)[3], Some(f(15.0)), "(A,1) AVG must be 15.0");
 
         let a2 = find(&s("A"), &s("2")).expect("group (A,2) must exist");
-        assert_eq!(rs.row(a2)[2], Some(f(5.0)), "(A,2) SUM must be 5.0");
+        assert_eq!(rs.row(a2)[2], Some(i(5)), "(A,2) SUM must be 5");
 
         let b1 = find(&s("B"), &s("1")).expect("group (B,1) must exist");
-        assert_eq!(rs.row(b1)[2], Some(f(100.0)), "(B,1) SUM must be 100.0");
+        assert_eq!(rs.row(b1)[2], Some(i(100)), "(B,1) SUM must be 100.0");
         assert_eq!(rs.row(b1)[3], Some(f(100.0)), "(B,1) AVG must be 100.0");
     }
 
@@ -12507,7 +12537,3 @@ LIMIT 10";
         );
     }
 }
-
-#[cfg(test)]
-#[path = "tests/ql_ag.rs"]
-mod ql_ag;
