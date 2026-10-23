@@ -12,21 +12,21 @@ mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every 
 
 | | Scenarios |
 |---|---|
-| Passed | 1291 |
-| Failed | 2033 |
+| Passed | 1755 |
+| Failed | 1569 |
 | Skipped | 573 |
 | Total | 3897 |
-| Pass rate | 38.8% (`0.3884`) |
+| Pass rate | 52.8% (`0.5280`) |
 
 A scenario that expects an error passes on any error, so the pass rate counts two kinds of pass. The strict rate counts only the passes that checked a result, plus the error passes whose error came from the phase the TCK names (compile time: the lexer, parser or planner; runtime: execution). CI holds both rates to `tck-baseline.txt`.
 
 | Pass | Scenarios |
 |---|---|
-| Checked a result or side effects | 1050 |
+| Checked a result or side effects | 1514 |
 | Raised an error the TCK expects | 241 |
 | … in the phase the TCK names | 92 |
 | … in another phase (any error accepted) | 149 |
-| Strict pass rate | 34.4% (`0.3436`) |
+| Strict pass rate | 48.3% (`0.4832`) |
 
 ## By area
 
@@ -46,7 +46,7 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 | `clauses/union` | 8 | 4 | 0 | 66.7% |
 | `clauses/unwind` | 11 | 3 | 0 | 78.6% |
 | `clauses/with` | 2 | 27 | 0 | 6.9% |
-| `clauses/with-orderBy` | 63 | 203 | 26 | 23.7% |
+| `clauses/with-orderBy` | 68 | 198 | 26 | 25.6% |
 | `clauses/with-skip-limit` | 0 | 9 | 0 | 0.0% |
 | `clauses/with-where` | 0 | 18 | 1 | 0.0% |
 | `expressions/aggregation` | 2 | 33 | 0 | 5.7% |
@@ -65,7 +65,7 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 | `expressions/precedence` | 51 | 70 | 0 | 42.1% |
 | `expressions/quantifier` | 591 | 13 | 0 | 97.8% |
 | `expressions/string` | 2 | 30 | 0 | 6.2% |
-| `expressions/temporal` | 45 | 546 | 413 | 7.6% |
+| `expressions/temporal` | 504 | 87 | 413 | 85.3% |
 | `expressions/typeConversion` | 21 | 26 | 0 | 44.7% |
 | `useCases/countingSubgraphMatches` | 0 | 11 | 0 | 0.0% |
 | `useCases/triadicSelection` | 0 | 19 | 0 | 0.0% |
@@ -87,49 +87,50 @@ Each failing scenario is counted once, under the first step that failed.
 
 | Kind | Scenarios |
 |---|---|
-| setup: parser gap | 737 |
-| parser gap | 502 |
-| semantics difference | 289 |
+| setup: parser gap | 733 |
 | error not raised (missing validation) | 239 |
-| setup: runtime error | 120 |
+| parser gap | 238 |
+| setup: runtime error | 124 |
 | ruled deviation | 110 |
-| runtime error (semantics difference) | 32 |
+| runtime error (semantics difference) | 62 |
+| semantics difference | 59 |
 | named unsupported feature | 3 |
 | setup: named unsupported feature | 1 |
 
 | Cause | Kind | Scenarios | First scenario |
 |---|---|---|---|
-| setup failed: parse: unexpected tokens after CREATE (found Comma) | setup: parser gap | 325 | clauses/delete/Delete3.feature: [1] Detach deleting paths |
-| unexpected error: parse: unexpected tokens after UNION query (found LParen) | parser gap | 260 | expressions/temporal/Temporal1.feature: [11] Should construct date time from epoch |
-| wrong result: values differ | semantics difference | 255 | clauses/with-orderBy/WithOrderBy1.feature: [9] Sort lists in ascending order |
+| setup failed: parse: unexpected tokens after CREATE (found Comma) | setup: parser gap | 335 | clauses/delete/Delete3.feature: [1] Detach deleting paths |
 | expected SyntaxError not raised | error not raised (missing validation) | 184 | clauses/create/Create1.feature: [13] Fail when creating a node that is already bound |
 | setup failed: parse: CREATE node requires a label (found LBrace) | setup: parser gap | 174 | clauses/create/Create3.feature: [5] WITH-CREATE: Nodes are not created when aliases are applied to variable names |
-| setup failed: CREATE/MERGE node requires a string `id` property (the node key) | setup: runtime error | 120 | clauses/create/Create2.feature: [10] Create a single self loop on an existing node |
+| setup failed: CREATE/MERGE node requires a string `id` property (the node key) | setup: runtime error | 124 | clauses/create/Create2.feature: [10] Create a single self loop on an existing node |
 | ruled deviation: 0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans) | ruled deviation | 110 | expressions/boolean/Boolean1.feature: [8] Fail on conjunction of at least one non-booleans (example 1) |
 | setup failed: parse: CREATE node requires a label (found RParen) | setup: parser gap | 110 | clauses/create/Create3.feature: [1] MATCH-CREATE |
 | unexpected error: parse: expected variable or … in aggregate argument (found LParen) | parser gap | 59 | expressions/precedence/Precedence1.feature: [14] Exclusive disjunction takes precedence over inclusive disjunction in every combination of truth values |
-| setup failed: parse: unexpected tokens after CREATE (found Create) | setup: parser gap | 46 | clauses/create/Create2.feature: [5] Create a single relationship between two existing nodes |
+| setup failed: parse: unexpected tokens after CREATE (found Create) | setup: parser gap | 49 | clauses/create/Create2.feature: [5] Create a single relationship between two existing nodes |
 | setup failed: parse: CREATE node requires a label (found Dash) | setup: parser gap | 38 | clauses/delete/Delete2.feature: [1] Delete relationships |
 | expected TypeError not raised | error not raised (missing validation) | 33 | expressions/graph/Graph6.feature: [9] Fail when performing property access on a non-graph element (example 1) |
 | wrong result: column names differ | semantics difference | 30 | clauses/return/Return6.feature: [17] Handle constants and parameters inside an expression which contains an aggregation expression |
 | unexpected error: parse: unexpected tokens after UNION query (found Ident(…)) | parser gap | 27 | expressions/literals/Literals3.feature: [1] Return a short positive hexadecimal integer |
+| wrong result: values differ | semantics difference | 25 | clauses/with-orderBy/WithOrderBy1.feature: [9] Sort lists in ascending order |
 | unexpected error: parse: CREATE node requires a label (found LBrace) | parser gap | 24 | clauses/create/Create1.feature: [7] Create a single node with a property |
 | expected ArgumentError not raised | error not raised (missing validation) | 22 | expressions/list/List11.feature: [5] Fail on invalid argument types for `range()` (example 1) |
 | setup failed: lex: illegal character … at position # | setup: parser gap | 19 | useCases/triadicSelection/TriadicSelection1.feature: [1] Handling triadic friend of a friend |
-| setup failed: parse: property … evaluated to null (a CREATE or MERGE property value cannot be null) (found RBrace) | setup: parser gap | 17 | clauses/with-orderBy/WithOrderBy1.feature: [41] Sort by a date time variable projected from a node property in ascending order (example 1) |
 | unexpected error: parse: CREATE node requires a label (found RParen) | parser gap | 15 | clauses/create/Create1.feature: [1] Create a single node |
 | unexpected error: parse: expected … to close a list subscript (found Dot) | parser gap | 13 | expressions/list/List2.feature: [1] List slice |
 | unexpected error: CREATE/MERGE node requires a string `id` property (the node key) | runtime error (semantics difference) | 12 | clauses/create/Create1.feature: [3] Create a single node with a label |
 | unexpected error: parse: CREATE node requires a label (found Dash) | parser gap | 12 | clauses/create/Create2.feature: [13] Create a single relationship with a property |
 | unexpected error: parse: expected … in a relationship pattern (found Dash) | parser gap | 12 | clauses/delete/Delete3.feature: [2] Delete on null path |
+| unexpected error: execute: date(): cannot read … as a Date | runtime error (semantics difference) | 11 | expressions/temporal/Temporal10.feature: [9] Should handle large durations |
 | unexpected error: parse: expected operand (property, literal, or parameter) (found Dot) | parser gap | 9 | expressions/list/List2.feature: [3] List slice with implicit start |
 | unexpected error: execute: division by zero | runtime error (semantics difference) | 8 | expressions/comparison/Comparison1.feature: [8] Equality and inequality of NaN (example 1) |
+| unexpected error: execute: datetime(): cannot read … as a DateTime | runtime error (semantics difference) | 7 | expressions/temporal/Temporal2.feature: [5] Should parse date time from string (example 2) |
+| unexpected error: execute: localdatetime(): cannot read … as a LocalDateTime | runtime error (semantics difference) | 7 | expressions/temporal/Temporal10.feature: [10] Should handle large durations in seconds |
 | unexpected error: parse: CASE requires at least one WHEN ... THEN branch (found Int(#)) | parser gap | 7 | expressions/conditional/Conditional2.feature: [1] Simple cases over integers (example 2) |
 | unexpected error: parse: unary minus only applies to numeric literals (found Dot) | parser gap | 7 | expressions/literals/Literals5.feature: [10] Return a negative zero float without integer digits |
 | unexpected error: execute: duplicate RETURN column … | runtime error (semantics difference) | 6 | expressions/temporal/Temporal7.feature: [1] Should compare dates (example 1) |
+| unexpected error: execute: duration(): cannot read … as a Duration | runtime error (semantics difference) | 5 | expressions/temporal/Temporal2.feature: [7] Should parse duration from string (example 2) |
 | setup failed: parse: CREATE node requires a label (found end of input) | setup: parser gap | 4 | clauses/return/Return4.feature: [8] Support column renaming for aggregations |
 | unexpected error: parse: expected RETURN (found Ident(…)) | parser gap | 4 | clauses/remove/Remove1.feature: [5] Ignore null when removing property from a node |
-| unexpected error: parse: expected RETURN (found LParen) | parser gap | 4 | expressions/temporal/Temporal10.feature: [1] Should split between boundaries correctly (example 1) |
 | unexpected error: parse: expected RETURN (found Set) | parser gap | 4 | clauses/set/Set1.feature: [8] Ignore null when setting property |
 | unexpected error: parse: expected … or … in a list literal (found Ident(…)) | parser gap | 4 | expressions/literals/Literals7.feature: [5] Return a list containing a hexadecimal integer |
 | setup failed: parse: CREATE (a): … is not a node bound by an earlier clause; a new node needs a label, e.g. (a:Label {id: …}… | setup: parser gap | 3 | clauses/remove/Remove1.feature: [3] Remove a single relationship property |
@@ -138,7 +139,6 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: collect() is only supported as a top-level RETURN/WITH aggregate | parser gap | 3 | clauses/return/Return6.feature: [6] Handle aggregates inside non-aggregate expressions |
 | unexpected error: parse: expected RETURN (found Delete) | parser gap | 3 | clauses/delete/Delete1.feature: [4] Delete on null node |
 | unexpected error: parse: expected field name after … (found Dot) | parser gap | 3 | expressions/list/List2.feature: [9] List slice with null range (example 1) |
-| unexpected error: parse: unary minus only applies to numeric literals (found LParen) | parser gap | 3 | expressions/precedence/Precedence2.feature: [4] Numeric unary negative takes precedence over exponentiation |
 
 ### Scenarios that ran and failed one check
 
@@ -146,12 +146,12 @@ A scenario whose query ran is checked to the end even after a check fails. These
 
 | Cause | Scenarios |
 |---|---|
-| wrong result: values differ | 255 |
 | expected SyntaxError not raised | 184 |
 | ruled deviation: 0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans) | 110 |
 | expected TypeError not raised | 33 |
+| wrong result: values differ | 25 |
 | expected ArgumentError not raised | 22 |
-| wrong result: column names differ | 15 |
+| wrong result: column names differ | 17 |
 | wrong result: row order differs | 2 |
 | a write without RETURN returns its counter row (the TCK expects no rows) | 1 |
 | wrong result: row count differs | 1 |
@@ -178,25 +178,25 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `avg` | yes | 1 / 6 | 0 |
 | `ceil` | yes | 0 / 1 | 0 |
 | `coalesce` | yes | 27 / 30 | 0 |
-| `collect` | yes | 7 / 96 | 2 |
+| `collect` | yes | 9 / 96 | 2 |
 | `count` | yes | 77 / 183 | 3 |
-| `date` | yes | 10 / 177 | 45 |
-| `date.realtime` | no | 0 / 1 | 0 |
-| `date.statement` | no | 0 / 1 | 0 |
-| `date.transaction` | no | 0 / 1 | 0 |
-| `date.truncate` | no | 0 / 51 | 0 |
-| `datetime` | yes | 8 / 251 | 169 |
-| `datetime.fromepoch` | no | 0 / 1 | 0 |
-| `datetime.fromepochmillis` | no | 0 / 1 | 0 |
-| `datetime.realtime` | no | 0 / 1 | 0 |
-| `datetime.statement` | no | 0 / 1 | 0 |
-| `datetime.transaction` | no | 0 / 1 | 0 |
-| `datetime.truncate` | no | 0 / 74 | 31 |
-| `duration` | yes | 20 / 74 | 18 |
-| `duration.between` | no | 0 / 15 | 18 |
-| `duration.indays` | no | 0 / 10 | 12 |
-| `duration.inmonths` | no | 0 / 15 | 12 |
-| `duration.inseconds` | no | 0 / 15 | 34 |
+| `date` | yes | 145 / 177 | 45 |
+| `date.realtime` | yes | 1 / 1 | 0 |
+| `date.statement` | yes | 1 / 1 | 0 |
+| `date.transaction` | yes | 1 / 1 | 0 |
+| `date.truncate` | yes | 51 / 51 | 0 |
+| `datetime` | yes | 223 / 251 | 169 |
+| `datetime.fromepoch` | yes | 1 / 1 | 0 |
+| `datetime.fromepochmillis` | yes | 1 / 1 | 0 |
+| `datetime.realtime` | yes | 1 / 1 | 0 |
+| `datetime.statement` | yes | 1 / 1 | 0 |
+| `datetime.transaction` | yes | 1 / 1 | 0 |
+| `datetime.truncate` | yes | 74 / 74 | 31 |
+| `duration` | yes | 23 / 74 | 18 |
+| `duration.between` | yes | 10 / 15 | 18 |
+| `duration.indays` | yes | 10 / 10 | 12 |
+| `duration.inmonths` | yes | 15 / 15 | 12 |
+| `duration.inseconds` | yes | 12 / 15 | 34 |
 | `endnode` | no | 0 / 1 | 0 |
 | `foo` | no | 0 / 1 | 0 |
 | `head` | yes | 1 / 5 | 0 |
@@ -204,16 +204,16 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `labels` | yes | 0 / 12 | 10 |
 | `last` | yes | 0 / 1 | 0 |
 | `length` | no | 0 / 8 | 0 |
-| `localdatetime` | yes | 11 / 234 | 96 |
-| `localdatetime.realtime` | no | 0 / 1 | 0 |
-| `localdatetime.statement` | no | 0 / 1 | 0 |
-| `localdatetime.transaction` | no | 0 / 1 | 0 |
-| `localdatetime.truncate` | no | 0 / 74 | 0 |
+| `localdatetime` | yes | 201 / 234 | 96 |
+| `localdatetime.realtime` | yes | 1 / 1 | 0 |
+| `localdatetime.statement` | yes | 1 / 1 | 0 |
+| `localdatetime.transaction` | yes | 1 / 1 | 0 |
+| `localdatetime.truncate` | yes | 74 / 74 | 0 |
 | `localtime` | yes | 0 / 0 | 144 |
-| `localtime.realtime` | no | 0 / 0 | 1 |
-| `localtime.statement` | no | 0 / 0 | 1 |
-| `localtime.transaction` | no | 0 / 0 | 1 |
-| `localtime.truncate` | no | 0 / 0 | 44 |
+| `localtime.realtime` | yes | 0 / 0 | 1 |
+| `localtime.statement` | yes | 0 / 0 | 1 |
+| `localtime.transaction` | yes | 0 / 0 | 1 |
+| `localtime.truncate` | yes | 0 / 0 | 44 |
 | `max` | yes | 4 / 29 | 0 |
 | `min` | yes | 0 / 9 | 0 |
 | `nodes` | no | 1 / 12 | 0 |
@@ -221,11 +221,11 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `percentiledisc` | yes | 0 / 7 | 0 |
 | `properties` | yes | 1 / 7 | 0 |
 | `rand` | yes | 64 / 65 | 0 |
-| `range` | yes | 50 / 93 | 2 |
+| `range` | yes | 52 / 93 | 2 |
 | `relationships` | no | 0 / 7 | 0 |
 | `reverse` | yes | 63 / 64 | 0 |
 | `sign` | yes | 0 / 1 | 0 |
-| `size` | yes | 126 / 151 | 10 |
+| `size` | yes | 128 / 151 | 10 |
 | `split` | yes | 1 / 2 | 0 |
 | `sqrt` | yes | 0 / 1 | 0 |
 | `startnode` | no | 0 / 1 | 0 |
@@ -233,10 +233,10 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `sum` | yes | 0 / 31 | 0 |
 | `tail` | yes | 0 / 9 | 0 |
 | `time` | yes | 0 / 0 | 149 |
-| `time.realtime` | no | 0 / 0 | 1 |
-| `time.statement` | no | 0 / 0 | 1 |
-| `time.transaction` | no | 0 / 0 | 1 |
-| `time.truncate` | no | 0 / 0 | 48 |
+| `time.realtime` | yes | 0 / 0 | 1 |
+| `time.statement` | yes | 0 / 0 | 1 |
+| `time.transaction` | yes | 0 / 0 | 1 |
+| `time.truncate` | yes | 0 / 0 | 48 |
 | `toboolean` | yes | 4 / 10 | 0 |
 | `tofloat` | yes | 4 / 11 | 0 |
 | `tointeger` | yes | 7 / 18 | 0 |
@@ -320,7 +320,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `clauses/union/Union2.feature` | 4 | 1 | 0 |
 | `clauses/union/Union3.feature` | 0 | 2 | 0 |
 | `clauses/unwind/Unwind1.feature` | 11 | 3 | 0 |
-| `clauses/with-orderBy/WithOrderBy1.feature` | 17 | 63 | 16 |
+| `clauses/with-orderBy/WithOrderBy1.feature` | 22 | 58 | 16 |
 | `clauses/with-orderBy/WithOrderBy2.feature` | 4 | 69 | 10 |
 | `clauses/with-orderBy/WithOrderBy3.feature` | 40 | 53 | 0 |
 | `clauses/with-orderBy/WithOrderBy4.feature` | 2 | 18 | 0 |
@@ -424,16 +424,16 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `expressions/string/String4.feature` | 1 | 0 | 0 |
 | `expressions/string/String8.feature` | 0 | 9 | 0 |
 | `expressions/string/String9.feature` | 0 | 9 | 0 |
-| `expressions/temporal/Temporal1.feature` | 24 | 130 | 53 |
-| `expressions/temporal/Temporal10.feature` | 0 | 55 | 76 |
-| `expressions/temporal/Temporal2.feature` | 4 | 29 | 20 |
-| `expressions/temporal/Temporal3.feature` | 1 | 73 | 109 |
-| `expressions/temporal/Temporal4.feature` | 4 | 21 | 14 |
+| `expressions/temporal/Temporal1.feature` | 154 | 0 | 53 |
+| `expressions/temporal/Temporal10.feature` | 47 | 8 | 76 |
+| `expressions/temporal/Temporal2.feature` | 5 | 28 | 20 |
+| `expressions/temporal/Temporal3.feature` | 74 | 0 | 109 |
+| `expressions/temporal/Temporal4.feature` | 13 | 12 | 14 |
 | `expressions/temporal/Temporal5.feature` | 0 | 4 | 3 |
 | `expressions/temporal/Temporal6.feature` | 12 | 2 | 3 |
 | `expressions/temporal/Temporal7.feature` | 0 | 12 | 6 |
 | `expressions/temporal/Temporal8.feature` | 0 | 21 | 6 |
-| `expressions/temporal/Temporal9.feature` | 0 | 199 | 123 |
+| `expressions/temporal/Temporal9.feature` | 199 | 0 | 123 |
 | `expressions/typeConversion/TypeConversion1.feature` | 4 | 6 | 0 |
 | `expressions/typeConversion/TypeConversion2.feature` | 6 | 6 | 0 |
 | `expressions/typeConversion/TypeConversion3.feature` | 4 | 7 | 0 |

@@ -1676,19 +1676,20 @@ impl<'a> Parser<'a> {
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
-                    // Function arguments may be arbitrary arithmetic expressions.
-                    self.pos += 1; // consume '('
-                    let mut args = Vec::new();
-                    if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.value_expr()?);
-                        while self.eat(&Tok::Comma) {
-                            args.push(self.value_expr()?);
-                        }
-                    }
-                    self.expect(&Tok::RParen, "expected ')' to close function call")?;
+                    let args = self.function_args()?;
                     Ok(Operand::FuncCall { name, args })
                 } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
+                    // `ns.name(…)` is a namespaced function call
+                    // (`date.truncate(…)`); no property access is followed
+                    // by `(`.
+                    if self.peek() == Some(&Tok::LParen) {
+                        let args = self.function_args()?;
+                        return Ok(Operand::FuncCall {
+                            name: format!("{name}.{field}"),
+                            args,
+                        });
+                    }
                     Ok(Operand::Prop { var: name, field })
                 } else if let Some(b) = bool_literal(&name) {
                     Ok(Operand::Lit(Value::Bool(b)))
@@ -1707,6 +1708,21 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// `(arg, …)` of a function call, from its `(`. Arguments may be
+    /// arbitrary arithmetic expressions.
+    fn function_args(&mut self) -> Result<Vec<Operand>, String> {
+        self.expect(&Tok::LParen, "expected '(' to open function call")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            args.push(self.value_expr()?);
+            while self.eat(&Tok::Comma) {
+                args.push(self.value_expr()?);
+            }
+        }
+        self.expect(&Tok::RParen, "expected ')' to close function call")?;
+        Ok(args)
     }
 
     /// `var:Label` after the variable: a label predicate, parsed to the

@@ -2828,18 +2828,29 @@ fn eval_func(
         // QL-13: the time-of-day types are not in 0.10 (contract C3).
         "time" | "localtime" => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
         "date" | "localdatetime" | "datetime" | "duration" => {
-            let a = resolve_fn_args(name, args, 0..=1, view, vars, row, params)?;
-            let [arg, _, _] = a;
+            // A duration has no "now": it needs its argument.
+            let arity = if norm == "duration" { 1..=1 } else { 0..=1 };
+            let [arg, _, _] = resolve_fn_args(name, args, arity, view, vars, row, params)?;
             // A null argument is null; no argument is the current instant.
             if args.len() == 1 && arg.is_none() {
                 return Ok(None);
             }
-            Ok(temporal::construct(&norm, arg, args.is_empty()))
+            temporal::construct(&norm, arg)
         }
-        _ => Err(format!(
-            "unknown function `{name}`; supported: {}",
-            SCALAR_FUNCS.join(", ")
-        )),
+        // QL-TF: `date.truncate`, `duration.between`, … (QL-13 refuses the
+        // `time` and `localtime` namespaces with the types).
+        n if temporal::is_time_type_namespace(n) => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        n => match temporal::namespaced(n) {
+            Some((canonical, arity)) => {
+                let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+                temporal::call_namespaced(canonical, a, args.len())
+            }
+            None => Err(format!(
+                "unknown function `{name}`; supported: {}, {}",
+                SCALAR_FUNCS.join(", "),
+                temporal::namespaced_names().collect::<Vec<_>>().join(", ")
+            )),
+        },
     }
 }
 
@@ -6466,6 +6477,10 @@ mod ql_04;
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]
 mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_tf.rs"]
+mod ql_tf;
 
 #[cfg(test)]
 #[path = "tests/ql_14.rs"]
