@@ -4,7 +4,7 @@
 //! transaction, with the store left exactly as the same statement with the
 //! values written as literals leaves it.
 
-use mushroomdb::{GraphError, SharedDb, Value};
+use mushroomdb::{GraphError, SharedDb, Value, WriteStats};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -166,26 +166,11 @@ fn pairs() -> Vec<Pair> {
     ]
 }
 
-/// Results with their values, the write counters included.
-fn result(rs: &mushroomdb::ResultSet) -> (Vec<String>, Rows) {
-    (rs.columns().to_vec(), rows(rs))
-}
-
-/// [`result`] for comparing the per-row form with the plain one. The plain
-/// `MERGE` reports `properties_set` 0 for its `ON CREATE SET` / `ON MATCH
-/// SET` items where the per-row form counts them (a counter defect of the
-/// plain form, reported with QL-PM), so that one column is left out of a
-/// MERGE's comparison; every other column, and the store, must agree.
-fn comparable(q: &str, rs: &mushroomdb::ResultSet) -> (Vec<String>, Rows) {
-    let (columns, mut rows) = result(rs);
-    if q.starts_with("MERGE") {
-        if let Some(i) = columns.iter().position(|c| c == "properties_set") {
-            for row in &mut rows {
-                row[i] = None;
-            }
-        }
-    }
-    (columns, rows)
+/// Results with their values, the write row and the driver counters
+/// (`properties_set` included: the per-row form a parameter takes and the
+/// plain form a literal takes count `ON CREATE` / `ON MATCH` items alike).
+fn result(rs: &mushroomdb::ResultSet) -> (Vec<String>, Rows, Option<WriteStats>) {
+    (rs.columns().to_vec(), rows(rs), rs.stats().copied())
 }
 
 // ── The differential: parameters vs literals ────────────────────────────────
@@ -198,7 +183,8 @@ fn parameters_leave_the_store_the_literal_form_leaves_auto_commit() {
         let q = pair.with_params;
         let a = write(&by_params, q, &pair.params);
         let b = write(&by_literals, pair.literal, &none());
-        assert_eq!(comparable(q, &a), comparable(q, &b), "{q}");
+        assert!(a.stats().is_some(), "{q}: no driver counters");
+        assert_eq!(result(&a), result(&b), "{q}");
     }
     // Every statement a second time: the CREATEs fail alike, the MERGEs match.
     for pair in pairs() {
@@ -206,7 +192,7 @@ fn parameters_leave_the_store_the_literal_form_leaves_auto_commit() {
         let a = by_params.write().query_write(q, &pair.params);
         let b = by_literals.write().query_write(pair.literal, &none());
         match (a, b) {
-            (Ok(a), Ok(b)) => assert_eq!(comparable(q, &a), comparable(q, &b), "{q}"),
+            (Ok(a), Ok(b)) => assert_eq!(result(&a), result(&b), "{q}"),
             (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
             (a, b) => panic!("{}: {a:?} vs {b:?}", pair.with_params),
         }
@@ -446,6 +432,53 @@ fn merge_on_create_set_takes_a_map_parameter() {
     write(&lit, lq, &none());
     write(&lit, lq, &none());
     assert_eq!(state(&db), state(&lit));
+}
+
+/// Ledger row 150 on the path a parameter takes: a parameterised `MERGE`
+/// counts its `ON CREATE SET` / `ON MATCH SET` items in the write row, as the
+/// literal form does since TX-NS, auto-commit and inside a transaction.
+#[test]
+fn a_parameterised_merge_counts_its_set_items_as_the_literal_form_does() {
+    let statements = [
+        (
+            "MERGE (n:P {id: $id}) ON CREATE SET n.x = $x, n.y = $x",
+            "MERGE (n:P {id: 'a'}) ON CREATE SET n.x = 1, n.y = 1",
+            2,
+        ),
+        (
+            "MERGE (n:P {id: $id}) ON CREATE SET n.x = $x ON MATCH SET n.z = $x",
+            "MERGE (n:P {id: 'a'}) ON CREATE SET n.x = 1 ON MATCH SET n.z = 1",
+            1,
+        ),
+        ("MERGE (n:P {id: $id})", "MERGE (n:P {id: 'a'})", 0),
+        (
+            "MERGE (a:P {id: $id})-[:K]->(b:P {id: $b}) ON CREATE SET b.v = $x, a.w = $x",
+            "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b'}) ON CREATE SET b.v = 1, a.w = 1",
+            2,
+        ),
+        (
+            "MERGE (a:P {id: $id})-[:K]->(b:P {id: $b}) ON MATCH SET b.v = $x",
+            "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'b'}) ON MATCH SET b.v = 1",
+            1,
+        ),
+    ];
+    let p = params(&[("id", s("a")), ("b", s("b")), ("x", Value::Int(1))]);
+    let by_params = open("row150-params");
+    let by_literals = open("row150-literals");
+    let in_tx = open("row150-params-tx");
+    let mut tx = in_tx.begin_transaction();
+    for (q, literal, want) in statements {
+        let a = write(&by_params, q, &p);
+        let b = write(&by_literals, literal, &none());
+        let t = tx.execute(q, &p).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(count(&a, "properties_set"), want, "auto-commit: {q}");
+        assert_eq!(count(&t, "properties_set"), want, "in a transaction: {q}");
+        assert_eq!(result(&a), result(&b), "{q}");
+        assert_eq!(result(&a), result(&t), "{q}");
+    }
+    tx.commit().unwrap();
+    assert_eq!(state(&by_params), state(&by_literals));
+    assert_eq!(state(&by_params), state(&in_tx));
 }
 
 #[test]
