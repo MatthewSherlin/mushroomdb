@@ -5339,6 +5339,30 @@ async fn metrics_prometheus_text_format() {
     assert!(m.keys().all(|k| !k.contains("backup")), "{m:?}");
 }
 
+/// `mushroomdb_edges_live` counts live edges only: a deleted edge, and the
+/// edges a deleted node took with it, leave the gauge.
+#[tokio::test]
+async fn metrics_edges_live_drops_deleted_edges() {
+    let (app, db) = open("metrics-edges-live");
+    for key in ["a", "b", "c", "d"] {
+        seed_person(&db, key);
+    }
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    db.write().insert_edge("KNOWS", "b", "c").unwrap();
+    db.write().insert_edge("KNOWS", "c", "d").unwrap();
+    db.write().insert_edge("KNOWS", "d", "a").unwrap();
+    assert!(db.write().delete_edge("KNOWS", "a", "b").unwrap());
+    // `c` takes b→c and c→d with it; only d→a is left.
+    db.write().delete_node("c").unwrap();
+
+    let (status, body, _) = send(app, get_accepting("/metrics", "text/plain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let m = parse_exposition(&String::from_utf8(body).unwrap());
+    assert_eq!(m["mushroomdb_edges_live"].1, 1.0);
+    assert_eq!(m["mushroomdb_nodes_live"].1, 3.0);
+    assert_eq!(m["mushroomdb_nodes_tombstoned"].1, 1.0);
+}
+
 /// Prometheus's own Accept header, and OpenMetrics alone, get the text format.
 #[tokio::test]
 async fn metrics_prometheus_scraper_accept_headers() {
