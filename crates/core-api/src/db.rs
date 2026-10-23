@@ -4276,6 +4276,19 @@ impl<F: Fs> GraphDb<F> {
             })
     }
 
+    /// Whether the store (before the batch being judged) holds the edge
+    /// `src_key -[edge_type]-> dst_key`.
+    fn edge_in_store(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        match (
+            self.syms.get(edge_type),
+            self.ids.get(src_key),
+            self.ids.get(dst_key),
+        ) {
+            (Some(etype), Some(src), Some(dst)) => self.edge_is_live(etype, src, dst),
+            _ => false,
+        }
+    }
+
     /// Whether the edge `etype` from `src` to `dst` is in the topology.
     fn edge_is_live(&self, etype: u32, src: u32, dst: u32) -> bool {
         self.topo_view()
@@ -8308,9 +8321,13 @@ impl<F: Fs> GraphDb<F> {
         let authz_opt = param_authz.or_else(|| self.pending_write_authz.clone());
         if let Some(ref authz) = authz_opt {
             let mut batch_created: BTreeMap<String, String> = BTreeMap::new();
-            // Edges an earlier op of this batch inserts: a property written on
+            // Edges an earlier op of this batch creates: a property written on
             // one in the same batch is part of its creation (create scope),
-            // as a node's own `SetProp` after its `InsertNode` is.
+            // as a node's own `SetProp` after its `InsertNode` is. Only a pair
+            // the store does not already hold counts, as `batch_created` takes
+            // only keys absent from the store: re-inserting an existing pair
+            // (`MATCH (a), (b) CREATE (a)-[r:T]->(b) SET r.w = …`) binds the
+            // stored edge, and a write to it is an update.
             let mut batch_edges: HashSet<EdgeKey> = HashSet::new();
             for op in &ops {
                 self.check_single_op_authz(authz, op, &batch_created, &batch_edges)?;
@@ -8326,7 +8343,9 @@ impl<F: Fs> GraphDb<F> {
                     ..
                 } = op
                 {
-                    batch_edges.insert((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                    if !self.edge_in_store(edge_type, src_key, dst_key) {
+                        batch_edges.insert((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                    }
                 }
                 // Update batch_created after a passing authz check so that
                 // subsequent ops in this batch see the nodes as "about to exist".

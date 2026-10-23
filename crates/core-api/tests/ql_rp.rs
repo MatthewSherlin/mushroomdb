@@ -13,8 +13,8 @@
 //! rule-owned edge type takes no user property write.
 
 use mushroomdb::{
-    schema::Schema, GraphError, Predicate, RealFs, RoleDef, RuleDef, SharedDb, SnapshotOptions,
-    Value, WriteScope,
+    schema::Schema, Direction, GraphError, Predicate, RealFs, RoleDef, RuleDef, SharedDb,
+    SnapshotOptions, Value, WriteScope,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -193,10 +193,10 @@ fn create_with_a_map_on_an_existing_pair_is_refused_and_without_one_is_unchanged
     // Inside one statement, too: the second CREATE sees the first.
     let e = refused(
         &mut db,
-        "CREATE (x:P {id: 'x'})-[:T {w: 1}]->(y:P {id: 'y'}) WITH x, y CREATE (x)-[:T {w: 2}]->(y)",
+        "CREATE (x:P {id: 'x'})-[:T {w: 1}]->(y:P {id: 'y'}) CREATE (x)-[:T {w: 2}]->(y)",
         &p(),
     );
-    assert!(e.contains(EXISTS) || e.contains("not supported"), "{e}");
+    assert!(e.contains(EXISTS), "{e}");
     assert_eq!(db.commit_seq(), before, "nothing written");
     // Without a map: today's behaviour (no second edge, no count on a store
     // that did not opt in), and the properties stay.
@@ -741,4 +741,95 @@ fn row_151_map_forms_and_set_id_give_the_same_answer() {
         .unwrap();
     tx.commit().unwrap();
     assert_eq!(shared.read().get_prop("nk", "id"), Some(s("other")));
+}
+
+/// Review I1: re-`CREATE`ing a pair that already has its relationship binds
+/// the existing edge, so a property written on it in the same statement is an
+/// update, not part of a creation: a create-only role is refused, on a plain
+/// store and on a multiplicity store. A role with update scope may, and a
+/// genuinely new edge takes its properties under create scope alone.
+#[test]
+fn recreating_an_existing_pair_does_not_bypass_update_scope() {
+    const RECREATE_SET: &str =
+        "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) CREATE (a)-[r:T]->(b) SET r.w = 99";
+    for multiplicity in [false, true] {
+        let mut db = scoped(&format!("i1-create-only-{multiplicity}"), &[]);
+        if multiplicity {
+            db.enable_multiplicity().unwrap();
+        }
+        let before = db.commit_seq();
+        match db.query_write_authz("writer", RECREATE_SET, &p()) {
+            Err(GraphError::RoleWriteDenied { reason }) => {
+                assert!(reason.contains("update_edge_types"), "{reason}")
+            }
+            other => panic!("multiplicity={multiplicity}: {other:?}"),
+        }
+        assert_eq!(db.commit_seq(), before, "nothing written");
+        assert_eq!(prop(&db, "T", "a", "b", "w"), Some(Value::Int(1)));
+        // A new pair with a SET in the same statement is part of its creation.
+        run(&mut db, "CREATE (:P {id: 'c'})");
+        db.query_write_authz(
+            "writer",
+            "MATCH (a:P {id: 'a'}), (c:P {id: 'c'}) CREATE (a)-[r:T]->(c) SET r.w = 5",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(prop(&db, "T", "a", "c", "w"), Some(Value::Int(5)));
+
+        let mut db = scoped(&format!("i1-create-update-{multiplicity}"), &["T"]);
+        if multiplicity {
+            db.enable_multiplicity().unwrap();
+        }
+        db.query_write_authz("writer", RECREATE_SET, &p()).unwrap();
+        assert_eq!(prop(&db, "T", "a", "b", "w"), Some(Value::Int(99)));
+    }
+}
+
+fn weighted(name: &str, field: &str, weight: &str) -> RuleDef {
+    RuleDef {
+        name: name.into(),
+        predicate: Predicate::FieldEqual {
+            field: field.into(),
+        },
+        weight_prop: Some(weight.into()),
+        ..same_region_rule()
+    }
+}
+
+/// Ledger row 154: two weighted rules over one edge type. Rule `ra` owns the
+/// edge (weight `wa`), a snapshot archives `wa`, then `ra` retracts and `rb`
+/// claims the edge (weight `wb`). The retracted rule's archived weight must
+/// not reappear live and then vanish at the next snapshot: the read is the
+/// same live, after a snapshot and after a reopen.
+#[test]
+fn row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot() {
+    let dir = tmp("row154");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(weighted("ra", "region", "wa")).unwrap();
+    run(&mut db, "CREATE (:P {id: 'a', region: 'eu', team: 't'})");
+    run(&mut db, "CREATE (:P {id: 'b', region: 'eu', team: 't'})");
+    db.create_rule(weighted("rb", "team", "wb")).unwrap();
+    let read = |db: &GraphDb| {
+        (
+            db.neighbors("a", "SAME", Direction::Out)
+                .unwrap()
+                .contains(&"b".to_string()),
+            prop(db, "SAME", "a", "b", "wa"),
+            prop(db, "SAME", "a", "b", "wb"),
+        )
+    };
+    assert_eq!(read(&db).1, Some(Value::Float(1.0)), "ra owns the edge");
+    db.snapshot().unwrap();
+    run(&mut db, "MATCH (n:P {id: 'b'}) SET n.region = 'us'");
+    let live = read(&db);
+    assert!(live.0, "rb keeps the edge");
+    assert_eq!(
+        live.1, None,
+        "ra's archived weight is gone with its ownership"
+    );
+    assert_eq!(live.2, Some(Value::Float(1.0)));
+    db.snapshot().unwrap();
+    assert_eq!(read(&db), live, "after a snapshot");
+    drop(db);
+    assert_eq!(read(&GraphDb::open(&dir).unwrap()), live, "after a reopen");
 }

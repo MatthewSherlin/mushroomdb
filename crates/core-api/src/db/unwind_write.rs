@@ -438,12 +438,66 @@ fn read_rels_written(stmt: &UnwindWriteStmt) -> Vec<String> {
             _ => Vec::new(),
         })
         .collect();
-    let text = format!("{:?}", stmt.writes);
+    let named = names_in_writes(&stmt.writes);
     stmt.rel_vars
         .iter()
-        .filter(|v| !made.contains(v.as_str()) && names_used(&text, v))
+        .filter(|v| !made.contains(v.as_str()) && named.contains(v.as_str()))
         .cloned()
         .collect()
+}
+
+/// Every variable the write clauses name: a `SET` / `REMOVE` / `DELETE`
+/// target, and every variable or property an operand of theirs reads.
+fn names_in_writes(writes: &[RowWrite]) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    let mut operands: Vec<&Operand> = Vec::new();
+    for write in writes {
+        match write {
+            RowWrite::Create { nodes, edges } => {
+                for node in nodes {
+                    operands.extend(node.props.iter().map(|(_, op)| op));
+                    operands.extend(node.props_map.as_ref());
+                }
+                for edge in edges {
+                    operands.extend(edge.props.iter().map(|(_, op)| op));
+                    operands.extend(edge.props_map.as_ref());
+                }
+            }
+            RowWrite::Merge(merge) => {
+                if let Some(edge) = &merge.edge {
+                    operands.extend(edge.props.iter().map(|(_, op)| op));
+                }
+                for item in merge.on_create.iter().chain(&merge.on_match) {
+                    names.insert(item.var().to_string());
+                    match item {
+                        MergeSet::Prop(sc) => operands.push(&sc.value),
+                        MergeSet::Map { value, .. } => operands.push(value),
+                    }
+                }
+            }
+            RowWrite::Set(sets) => {
+                for sc in sets {
+                    names.insert(sc.var.clone());
+                    operands.push(&sc.value);
+                }
+            }
+            RowWrite::SetMap { var, value, .. } => {
+                names.insert(var.clone());
+                operands.push(value);
+            }
+            RowWrite::Remove(items) => names.extend(items.iter().map(|(v, _)| v.clone())),
+            RowWrite::Delete { vars, .. } => names.extend(vars.iter().cloned()),
+        }
+    }
+    for op in operands {
+        super::row_eval::map_leaves(op, &mut |leaf| {
+            if let Operand::Prop { var, .. } | Operand::Var(var) = leaf {
+                names.insert(var.clone());
+            }
+            None
+        });
+    }
+    names
 }
 
 /// The read query a `RETURN` runs after the commit. It unwinds the rows the

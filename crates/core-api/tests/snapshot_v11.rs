@@ -311,6 +311,38 @@ fn a_relationship_property_write_upgrades_before_its_record() {
     assert_eq!(db.get_edge_prop("T", "a", "b", "w"), None);
 }
 
+/// The same from a store that already has a V9 snapshot: writes that carry
+/// no V11 record, and a relationship-property write refused before it is
+/// framed (the reserved `count`), leave `snapshot.bin` byte-identical; the
+/// first accepted one moves it to 11, and the reopened store keeps both the
+/// property and the earlier data.
+#[test]
+fn a_v9_store_moves_to_v11_at_its_first_relationship_property_write() {
+    let dir = tmp("edge-prop-v9");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let none = BTreeMap::new();
+    db.query_write("CREATE (:N {id: 'a'})-[:T]->(:N {id: 'b'})", &none)
+        .unwrap();
+    db.snapshot().unwrap();
+    assert_eq!(peek_snapshot_version(&dir), Some(9));
+    let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    db.query_write("CREATE (:N {id: 'c'})", &none).unwrap();
+    db.query_write("MATCH ()-[r:T]->() REMOVE r.absent", &none)
+        .unwrap();
+    assert!(db
+        .query_write("MATCH ()-[r:T]->() SET r.count = 3", &none)
+        .is_err());
+    assert!(!db.is_v11());
+    assert_eq!(std::fs::read(dir.join("snapshot.bin")).unwrap(), snap);
+    db.query_write("MATCH ()-[r:T]->() SET r.w = 1", &none)
+        .unwrap();
+    assert_eq!(peek_snapshot_version(&dir), Some(11));
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_edge_prop("T", "a", "b", "w"), Some(Value::Int(1)));
+    assert!(db.has_node("c"));
+}
+
 /// A declaration refused by the data does no upgrade: the conflict scan runs
 /// before the record is built.
 #[test]
