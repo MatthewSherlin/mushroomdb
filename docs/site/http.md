@@ -1505,6 +1505,8 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `dst`), `node_deleted` (`key`), `rule_created`, `rule_deleted` and `rule_rebuilt` (`name`),
 `batch_applied` (`ops`) and `ingested` (`label`, `inserted`). The lag notice here is
 `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
+A write to a relationship's own properties (`SET r.p`, a `CREATE` relationship map) has no frame
+yet, here or on `/subscribe` (ledger row 155, planned for 0.11).
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
 the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
