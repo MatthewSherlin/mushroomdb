@@ -708,6 +708,7 @@ fn check_argument_kinds(scope: &Scope, name: &str, args: &[Operand]) -> Result<(
         "type" => matches!(kind, Kind::Node | Kind::Path),
         "length" => matches!(kind, Kind::Node | Kind::Rel),
         "size" => kind == Kind::Path,
+        "properties" => kind == Kind::Value(ValueType::NoProperties),
         _ => false,
     };
     if refused {

@@ -1356,7 +1356,14 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         Operand::Index { base, index } => {
             let base_val = eval_set_return_operand(db, match_rs, row, rel_vars, base, params)?;
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
-            Ok(core_query::value_ops::index_list(base_val, idx_val))
+            // A variable here is a matched node or relationship; a subscript
+            // of one reads nothing, as in a read query. Any other base is
+            // held to the read query's type errors (QL-VE).
+            if matches!(base.as_ref(), Operand::Var(_)) {
+                return Ok(core_query::value_ops::index_list(base_val, idx_val));
+            }
+            core_query::value_ops::index_value(base_val, idx_val)
+                .map_err(|detail| GraphError::QueryError { detail })
         }
         // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {

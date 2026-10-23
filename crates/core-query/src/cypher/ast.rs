@@ -282,9 +282,10 @@ pub enum Operand {
     /// Evaluates `base`: a `Value::List` gives the element at an integer
     /// `index`, where a negative index counts from the end (openCypher
     /// §3.4.4); a `Value::Map` gives the entry at a string `index`. An
-    /// out-of-range index, an absent key, any other base, or an index of the
-    /// wrong type all evaluate to null rather than erroring, so a subscript
-    /// behaves like a missing property.
+    /// out-of-range index, an absent key, or a null base or index evaluate
+    /// to null. Any other base, or an index of the wrong type, is a type
+    /// error (QL-VE); a node, relationship or path variable as the base reads
+    /// nothing.
     Index {
         base: Box<Operand>,
         index: Box<Operand>,

@@ -2900,6 +2900,19 @@ const RANGE_MAX_ELEMENTS: u128 = 10_000_000;
 /// `range(start, end, step)` with an inclusive end. Null or non-integer
 /// arguments are null; a zero step is an error.
 fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, String> {
+    // An argument that is not an integer is an error (QL-VE, the TCK's
+    // List11); a null one is null.
+    let given = if has_step { &a[..] } else { &a[..2] };
+    if let Some(bad) = given
+        .iter()
+        .flatten()
+        .find(|v| !matches!(v, Value::Int(_) | Value::Null))
+    {
+        return Err(format!(
+            "range() expects integer arguments, got {}",
+            crate::value_ops::type_name_of(bad)
+        ));
+    }
     let (Some(Value::Int(start)), Some(Value::Int(end))) = (&a[0], &a[1]) else {
         return Ok(None);
     };
@@ -2998,9 +3011,30 @@ fn properties_of_arg(
     })
 }
 
+/// `properties(x)` of a value that is not a node, relationship, map or null
+/// is an error (QL-VE, the TCK's Graph9); `keys` keeps its null.
+fn check_properties_arg(
+    arg: &Operand,
+    vars: &VarTable,
+    row: &Row,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    if bound_to_graph_element(vars, row, arg) {
+        return Ok(());
+    }
+    match value {
+        None | Some(Value::Null) | Some(Value::Map(_)) => Ok(()),
+        Some(other) => Err(format!(
+            "properties() expects a node, a relationship or a map, got {}",
+            crate::value_ops::type_name_of(other)
+        )),
+    }
+}
+
 /// List and map functions (QL-03c). Null in → null out; an argument of the
-/// wrong type → null, never an error. Only a wrong argument count, a zero
-/// `range` step and an oversized `range` are errors.
+/// wrong type → null, except `range()` with a non-integer argument and
+/// `properties()` of a non-map value (QL-VE: type errors). A wrong argument
+/// count, a zero `range` step and an oversized `range` are errors too.
 fn eval_list_scalar(
     norm: &str,
     name: &str,
@@ -3016,6 +3050,10 @@ fn eval_list_scalar(
                 "{name}() requires exactly 1 argument(s), got {}",
                 args.len()
             ));
+        }
+        if norm == "properties" && !bound_to_graph_element(vars, row, &args[0]) {
+            let value = resolve_operand(view, vars, row, &args[0], params)?;
+            check_properties_arg(&args[0], vars, row, value.as_ref())?;
         }
         let props = properties_of_arg(&args[0], view, vars, row, params)?;
         return Ok(props.map(|map| {
@@ -3457,6 +3495,20 @@ fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
     }
 }
 
+/// Whether `op` is a variable bound, in this row, to a node, relationship
+/// or path.
+fn bound_to_graph_element(vars: &VarTable, row: &Row, op: &Operand) -> bool {
+    let Operand::Var(name) = op else {
+        return false;
+    };
+    matches!(
+        vars.slot(name)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref()),
+        Some(Cell::Node(_) | Cell::Rel(_) | Cell::Path(_))
+    )
+}
+
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -3495,7 +3547,12 @@ fn resolve_operand(
         Operand::Index { base, index } => {
             let base_val = resolve_operand(view, vars, row, base, params)?;
             let idx_val = resolve_operand(view, vars, row, index, params)?;
-            Ok(crate::value_ops::index_list(base_val, idx_val))
+            // A node, relationship or path variable resolves to its key, map
+            // or hop count; a subscript of one reads nothing, as before.
+            if bound_to_graph_element(vars, row, base) {
+                return Ok(crate::value_ops::index_list(base_val, idx_val));
+            }
+            crate::value_ops::index_value(base_val, idx_val)
         }
         // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
@@ -11029,20 +11086,22 @@ LIMIT 10";
             &fx.view(),
             "MATCH (t:Talent) WHERE t.key = 't1' \
              RETURN t.location[0] AS lat, t.location[1] AS lon, \
-                    t.location[-1] AS last, t.location[7] AS oob, t.status[0] AS notalist",
+                    t.location[-1] AS last, t.location[7] AS oob",
             &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
             rows_of(&rs),
-            vec![vec![
-                Some(f(40.71)),
-                Some(f(-74.01)),
-                Some(f(-74.01)),
-                None,
-                None
-            ]]
+            vec![vec![Some(f(40.71)), Some(f(-74.01)), Some(f(-74.01)), None]]
         );
+        // QL-VE: a subscript of a string was null and is a type error now.
+        let err = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.key = 't1' RETURN t.status[0] AS notalist",
+            &BTreeMap::new(),
+        )
+        .expect_err("a string cannot be indexed");
+        assert!(err.contains("a string cannot be indexed"), "{err}");
     }
 
     /// `n.key` filters, orders and matches — not only projects. Each of
@@ -11926,16 +11985,35 @@ LIMIT 10";
             "range(n.nope, 5)",
             "range(1, n.nope)",
             "range(1, 5, n.nope)",
-            "range(\"a\", 5)",
-            "range(1, 2.5)",
-            "range(1, 5, \"2\")",
             "keys(42)",
             "keys(\"abc\")",
-            "properties(42)",
-            "properties($l)",
         ] {
             assert_eq!(eval(expr), None, "{expr}");
         }
+        // QL-VE: these were null and are type errors now.
+        for (expr, want) in [
+            (
+                "range(\"a\", 5)",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "range(1, 2.5)",
+                "range() expects integer arguments, got a float",
+            ),
+            (
+                "range(1, 5, \"2\")",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "properties($l)",
+                "properties() expects a node, a relationship or a map, got a list",
+            ),
+        ] {
+            let err = eval_err(expr);
+            assert!(err.contains(want), "{expr}: {err}");
+        }
+        // A literal argument is refused before the query runs.
+        assert!(eval_err("properties(42)").starts_with("InvalidArgumentType: "));
     }
 
     #[test]

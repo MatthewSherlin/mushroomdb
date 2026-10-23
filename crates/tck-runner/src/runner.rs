@@ -193,6 +193,11 @@ pub const RULED_DEVIATIONS: &[(&str, &str, &str)] = &[
         "[4] Fail when using NOT on a non-boolean literal",
         "0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans)",
     ),
+    (
+        "expressions/pattern/Pattern1.feature",
+        "[11] Fail on checking self pattern",
+        "0.10 keeps boolean coercion (a node as a WHERE predicate reads as true)",
+    ),
 ];
 
 fn ruled_deviation(scenario: &Scenario) -> Option<&'static str> {

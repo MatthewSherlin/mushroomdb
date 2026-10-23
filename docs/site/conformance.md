@@ -12,21 +12,21 @@ mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every 
 
 | | Scenarios |
 |---|---|
-| Passed | 1956 |
-| Failed | 1368 |
+| Passed | 2002 |
+| Failed | 1322 |
 | Skipped | 573 |
 | Total | 3897 |
-| Pass rate | 58.8% (`0.5884`) |
+| Pass rate | 60.2% (`0.6023`) |
 
 A scenario that expects an error passes on any error, so the pass rate counts two kinds of pass. The strict rate counts only the passes that checked a result, plus the error passes whose error came from the phase the TCK names (compile time: the lexer, parser or planner; runtime: execution) and, when the engine's error names its openCypher kind (`VariableTypeConflict: …`), is that kind. CI holds both rates to `tck-baseline.txt`.
 
 | Pass | Scenarios |
 |---|---|
 | Checked a result or side effects | 1523 |
-| Raised an error the TCK expects | 433 |
-| … in the phase (and of the kind) the TCK names | 416 |
+| Raised an error the TCK expects | 479 |
+| … in the phase (and of the kind) the TCK names | 462 |
 | … in another phase or of another kind (any error accepted) | 17 |
-| Strict pass rate | 58.3% (`0.5833`) |
+| Strict pass rate | 59.7% (`0.5972`) |
 
 ## By area
 
@@ -54,10 +54,10 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 | `expressions/comparison` | 35 | 37 | 0 | 48.6% |
 | `expressions/conditional` | 0 | 13 | 0 | 0.0% |
 | `expressions/existentialSubqueries` | 0 | 0 | 10 | — |
-| `expressions/graph` | 10 | 38 | 13 | 20.8% |
-| `expressions/list` | 105 | 72 | 8 | 59.3% |
+| `expressions/graph` | 13 | 35 | 13 | 27.1% |
+| `expressions/list` | 145 | 32 | 8 | 81.9% |
 | `expressions/literals` | 83 | 48 | 0 | 63.4% |
-| `expressions/map` | 39 | 5 | 0 | 88.6% |
+| `expressions/map` | 42 | 2 | 0 | 95.5% |
 | `expressions/mathematical` | 1 | 5 | 0 | 16.7% |
 | `expressions/null` | 36 | 8 | 0 | 81.8% |
 | `expressions/path` | 2 | 5 | 0 | 28.6% |
@@ -90,10 +90,9 @@ Each failing scenario is counted once, under the first step that failed.
 | setup: parser gap | 733 |
 | parser gap | 240 |
 | setup: runtime error | 124 |
-| ruled deviation | 110 |
+| ruled deviation | 111 |
 | runtime error (semantics difference) | 60 |
 | semantics difference | 50 |
-| error not raised (missing validation) | 47 |
 | named unsupported feature | 3 |
 | setup: named unsupported feature | 1 |
 
@@ -110,8 +109,6 @@ Each failing scenario is counted once, under the first step that failed.
 | wrong result: column names differ | semantics difference | 30 | clauses/return/Return6.feature: [17] Handle constants and parameters inside an expression which contains an aggregation expression |
 | unexpected error: parse: unexpected tokens after UNION query (found Ident(…)) | parser gap | 27 | expressions/literals/Literals3.feature: [1] Return a short positive hexadecimal integer |
 | unexpected error: parse: CREATE node requires a label (found LBrace) | parser gap | 24 | clauses/create/Create1.feature: [7] Create a single node with a property |
-| expected ArgumentError not raised | error not raised (missing validation) | 22 | expressions/list/List11.feature: [5] Fail on invalid argument types for `range()` (example 1) |
-| expected TypeError not raised | error not raised (missing validation) | 21 | expressions/list/List1.feature: [6] Fail when indexing a non-list #Example: <exampleName> (example 1) |
 | setup failed: lex: illegal character … at position # | setup: parser gap | 19 | useCases/triadicSelection/TriadicSelection1.feature: [1] Handling triadic friend of a friend |
 | wrong result: values differ | semantics difference | 16 | clauses/with-orderBy/WithOrderBy1.feature: [9] Sort lists in ascending order |
 | unexpected error: parse: CREATE node requires a label (found RParen) | parser gap | 15 | clauses/create/Create1.feature: [1] Create a single node |
@@ -128,7 +125,6 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: unary minus only applies to numeric literals (found Dot) | parser gap | 7 | expressions/literals/Literals5.feature: [10] Return a negative zero float without integer digits |
 | unexpected error: plan: duplicate RETURN column … | runtime error (semantics difference) | 6 | expressions/temporal/Temporal7.feature: [1] Should compare dates (example 1) |
 | unexpected error: execute: duration(): cannot read … as a Duration | runtime error (semantics difference) | 5 | expressions/temporal/Temporal2.feature: [7] Should parse duration from string (example 2) |
-| expected SyntaxError not raised | error not raised (missing validation) | 4 | expressions/graph/Graph9.feature: [5] `properties()` failing on an integer literal |
 | setup failed: parse: CREATE node requires a label (found end of input) | setup: parser gap | 4 | clauses/return/Return4.feature: [8] Support column renaming for aggregations |
 | unexpected error: parse: expected RETURN (found Ident(…)) | parser gap | 4 | clauses/remove/Remove1.feature: [5] Ignore null when removing property from a node |
 | unexpected error: parse: expected RETURN (found Set) | parser gap | 4 | clauses/set/Set1.feature: [8] Ignore null when setting property |
@@ -139,6 +135,9 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: expected RETURN (found Delete) | parser gap | 3 | clauses/delete/Delete1.feature: [4] Delete on null node |
 | unexpected error: parse: expected field name after … (found Dot) | parser gap | 3 | expressions/list/List2.feature: [9] List slice with null range (example 1) |
 | unexpected error: parse: unary minus only applies to numeric literals (found LParen) | parser gap | 3 | expressions/precedence/Precedence2.feature: [4] Numeric unary negative takes precedence over exponentiation |
+| unexpected error: refused as not supported: a MATCH, UNWIND or WITH clause after a write clause in the same statement | named unsupported feature | 3 | clauses/create/Create6.feature: [5] Filtering after creating nodes affects the result set but not the side effects |
+| unexpected error: parse: CASE requires at least one WHEN ... THEN branch (found Dash) | parser gap | 2 | expressions/conditional/Conditional2.feature: [1] Simple cases over integers (example 1) |
+| unexpected error: parse: MERGE requires a label (found LBrace) | parser gap | 2 | clauses/merge/Merge5.feature: [10] Merge should bind a path |
 
 ### Scenarios that ran and failed one check
 
@@ -147,13 +146,11 @@ A scenario whose query ran is checked to the end even after a check fails. These
 | Cause | Scenarios |
 |---|---|
 | ruled deviation: 0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans) | 110 |
-| expected ArgumentError not raised | 22 |
-| expected TypeError not raised | 21 |
 | wrong result: column names differ | 17 |
 | wrong result: values differ | 16 |
-| expected SyntaxError not raised | 4 |
 | wrong result: row order differs | 2 |
 | a write without RETURN returns its counter row (the TCK expects no rows) | 1 |
+| ruled deviation: 0.10 keeps boolean coercion (a node as a WHERE predicate reads as true) | 1 |
 | wrong result: row count differs | 1 |
 
 ## Expected errors
@@ -162,12 +159,13 @@ A scenario that expects an error passes on any error. This table shows, for the 
 
 | TCK error | Phase | Passed | Engine `lex:` / `parse:` | Engine `plan:` / `execute:` | Other |
 |---|---|---|---|---|---|
-| `ArgumentError` | runtime | 4 | 0 | 4 | 0 |
+| `ArgumentError` | runtime | 26 | 0 | 26 | 0 |
 | `ProcedureError` | compile time | 2 | 0 | 2 | 0 |
 | `SemanticError` | runtime | 2 | 2 | 0 | 0 |
-| `SyntaxError` | compile time | 412 | 364 | 48 | 0 |
+| `SyntaxError` | compile time | 415 | 367 | 48 | 0 |
+| `TypeError` | any time | 18 | 0 | 18 | 0 |
 | `TypeError` | compile time | 12 | 12 | 0 | 0 |
-| `TypeError` | runtime | 1 | 1 | 0 | 0 |
+| `TypeError` | runtime | 4 | 1 | 3 | 0 |
 
 ## Functions
 
@@ -220,9 +218,9 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `nodes` | no | 1 / 12 | 0 |
 | `percentilecont` | yes | 0 / 6 | 0 |
 | `percentiledisc` | yes | 0 / 7 | 0 |
-| `properties` | yes | 1 / 7 | 0 |
+| `properties` | yes | 4 / 7 | 0 |
 | `rand` | yes | 64 / 65 | 0 |
-| `range` | yes | 53 / 93 | 2 |
+| `range` | yes | 75 / 93 | 2 |
 | `relationships` | no | 0 / 7 | 0 |
 | `reverse` | yes | 63 / 64 | 0 |
 | `sign` | yes | 0 / 1 | 0 |
@@ -368,9 +366,9 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `expressions/graph/Graph6.feature` | 8 | 6 | 0 |
 | `expressions/graph/Graph7.feature` | 0 | 3 | 0 |
 | `expressions/graph/Graph8.feature` | 0 | 8 | 0 |
-| `expressions/graph/Graph9.feature` | 1 | 6 | 0 |
-| `expressions/list/List1.feature` | 4 | 19 | 0 |
-| `expressions/list/List11.feature` | 44 | 23 | 0 |
+| `expressions/graph/Graph9.feature` | 4 | 3 | 0 |
+| `expressions/list/List1.feature` | 22 | 1 | 0 |
+| `expressions/list/List11.feature` | 66 | 1 | 0 |
 | `expressions/list/List12.feature` | 1 | 6 | 0 |
 | `expressions/list/List2.feature` | 0 | 15 | 0 |
 | `expressions/list/List3.feature` | 7 | 0 | 0 |
@@ -387,7 +385,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `expressions/literals/Literals7.feature` | 15 | 5 | 0 |
 | `expressions/literals/Literals8.feature` | 24 | 3 | 0 |
 | `expressions/map/Map1.feature` | 18 | 1 | 0 |
-| `expressions/map/Map2.feature` | 11 | 3 | 0 |
+| `expressions/map/Map2.feature` | 14 | 0 | 0 |
 | `expressions/map/Map3.feature` | 10 | 1 | 0 |
 | `expressions/mathematical/Mathematical11.feature` | 0 | 1 | 0 |
 | `expressions/mathematical/Mathematical13.feature` | 0 | 1 | 0 |

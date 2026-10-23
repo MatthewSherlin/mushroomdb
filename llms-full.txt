@@ -6458,8 +6458,13 @@ MATCH (n:Place) RETURN n.location[0] AS lat, n.location[1] AS lon
 MATCH (n:Place) WHERE n.tags[-1] = 'primary' RETURN key(n)
 ```
 
-Out of range, a non-list base and a non-integer index all evaluate to `null` —
-never an error, and never a match. An unaliased subscript names its own column
+An index out of range, an absent map key, and a null base or index evaluate to
+`null`. A base that is not a list or a map (`'abc'[0]`, `123[0]`), a list index
+that is not an integer (`[1, 2][true]`, `[1, 2][1.5]`) and a map key that is not a
+string (`{a: 1}[0]`) are type errors: `a string cannot be indexed; only a list or a
+map can`, `list index must be an integer, got …`, `map key must be a string, got …`.
+Before QL-VE they were null. A subscript of a node, relationship or path variable
+reads nothing (null). An unaliased subscript names its own column
 (`n.location[0]`), so two subscripts of one list are two distinct columns. A
 write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does.
 
@@ -6495,7 +6500,7 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
-| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
+| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range → null; a non-list base or a non-integer index is a type error |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
 | `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
 | Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d` — projects with or without a HAVING clause |
@@ -6598,16 +6603,21 @@ alias, a `$param`, a function's result) is never refused for its kind.
 | `InvalidClauseComposition` | `UNION` and `UNION ALL` in one query | `RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a` |
 | `DifferentColumnsInUnion` | `UNION` parts whose columns (aliases, variables, `var.field`) differ | `RETURN 1 AS a UNION RETURN 2 AS b` |
 | `UnknownFunction` | A call of a function that does not exist, even where no row would reach it | `MATCH (a) RETURN foo(a)` |
-| `InvalidArgumentType` | `type()` of a node or path; `length()` of a node or relationship; `size()` of a path; `IN` a literal that is not a list; a property of a literal number, string, boolean or list; a path property other than `length`, `nodes`, `relationships` | `MATCH (n) RETURN type(n)`, `RETURN 1 IN 123`, `WITH 123 AS x RETURN x.num`, `MATCH p = ()-[*]->() WHERE p.name = 'a'` |
+| `InvalidArgumentType` | `type()` of a node or path; `length()` of a node or relationship; `size()` of a path; `properties()` of a literal number, string, boolean or list; `IN` a literal that is not a list; a property of a literal number, string, boolean or list; a path property other than `length`, `nodes`, `relationships` | `MATCH (n) RETURN type(n)`, `RETURN properties(1)`, `RETURN 1 IN 123`, `WITH 123 AS x RETURN x.num`, `MATCH p = ()-[*]->() WHERE p.name = 'a'` |
 
 Planning reads no row either: its errors (an unbound variable, a duplicate
 `RETURN` column, `ORDER BY` a column a `DISTINCT` projection drops) are `plan:`
 errors on every read entry point.
 
-Not checked yet, and kept as before: a subscript, `range()` or `properties()` of a
-value of the wrong type is null (`'abc'[0]`, `range('a', 5)`, `properties(42)`),
-where openCypher raises a type error; and a node or relationship as a `WHERE`
-predicate reads as true, under the boolean coercion above.
+Type errors at run time, where the value is known only then: a subscript of the
+wrong type (see [List subscripts](#list-subscripts)); `range()` with an argument
+that is not an integer (``range() expects integer arguments, got a string``); and
+`properties()` of a value that is not a node, relationship, map or null
+(``properties() expects a node, a relationship or a map, got an integer``). Each
+was null before QL-VE; a null argument is still null.
+
+Kept as before, under the boolean coercion above: a node or relationship as a
+`WHERE` predicate reads as true.
 
 ### Named-error
 

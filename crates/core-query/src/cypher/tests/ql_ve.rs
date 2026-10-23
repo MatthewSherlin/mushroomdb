@@ -8,7 +8,7 @@
 //! openCypher error kind first. The `valid_*` corpus pins the other half of the
 //! contract: queries that ran before still parse.
 
-use super::tests::{eval, run, Fx};
+use super::tests::{eval, eval_err, run, Fx};
 use crate::cypher::{lex, parse_read, parse_write};
 use core_storage::Value;
 use std::collections::BTreeMap;
@@ -212,6 +212,10 @@ fn an_argument_of_a_kind_the_function_cannot_take_is_refused() {
             "MATCH (n) RETURN length(n)",
             "MATCH ()-[r]->() RETURN length(r)",
             "MATCH p = (a)-[*]->(b) RETURN size(p)",
+            // Graph9 [5]-[7].
+            "RETURN properties(1)",
+            "RETURN properties('Cypher')",
+            "RETURN properties([true, false])",
             // List5 [42].
             "RETURN 1 IN true",
             "RETURN 1 IN 123.4",
@@ -319,6 +323,115 @@ fn valid_queries_pass_the_check() {
         "valid queries must pass the check:\n{}",
         refused.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime type errors (List1, List11, Map2, Graph9): a type error is an
+// error, not a null (controller ruling 2026-10-23)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn indexing_a_value_that_is_not_a_list_or_map_is_an_error() {
+    // List1 [6] / [7]; Map2 [8].
+    for base in ["true", "123", "4.7", "'1'"] {
+        let err = eval_err(&format!("{base}[0]"));
+        assert!(err.contains("cannot be indexed"), "{base}: {err}");
+    }
+    // List1 [8] / [9]: a list takes an integer.
+    for idx in ["true", "4.7", "'1'", "[1]", "{x: 3}"] {
+        let err = eval_err(&format!("[1, 2, 3][{idx}]"));
+        assert!(
+            err.contains("list index must be an integer"),
+            "{idx}: {err}"
+        );
+    }
+    // Map2 [6] / [7]: a map takes a string.
+    for idx in ["0", "12.3", "true"] {
+        let err = eval_err(&format!("{{name: 'Apa'}}[{idx}]"));
+        assert!(err.contains("map key must be a string"), "{idx}: {err}");
+    }
+    // Through parameters, as the TCK passes them.
+    let mut fx = Fx::new();
+    fx.add("N", "x", vec![]);
+    let mut params = BTreeMap::new();
+    params.insert("expr".to_string(), Value::Int(100));
+    params.insert("idx".to_string(), Value::Int(0));
+    let err = run(
+        &fx.view(),
+        "WITH $expr AS expr, $idx AS idx RETURN expr[idx] AS r",
+        &params,
+    )
+    .expect_err("an integer cannot be indexed");
+    assert!(err.contains("cannot be indexed"), "{err}");
+}
+
+#[test]
+fn indexing_of_the_right_types_is_unchanged() {
+    assert_eq!(eval("[1, 2, 3][1]"), Some(Value::Int(2)));
+    assert_eq!(eval("[1, 2, 3][-1]"), Some(Value::Int(3)));
+    assert_eq!(eval("[1, 2, 3][1.0]"), Some(Value::Int(2)));
+    assert_eq!(eval("[1, 2, 3][7]"), None);
+    assert_eq!(eval("[1, 2, 3][null]"), None);
+    assert_eq!(eval("null[0]"), None);
+    assert_eq!(eval("{a: 1}['a']"), Some(Value::Int(1)));
+    assert_eq!(eval("{a: 1}['b']"), None);
+    // A subscript of a node variable reads nothing, as before.
+    assert_eq!(eval("n['x']"), None);
+}
+
+#[test]
+fn range_takes_integers_only() {
+    // List11 [5].
+    for args in [
+        "true, 1, 1",
+        "0, true, 1",
+        "0, 1, true",
+        "-1.1, 1, 1",
+        "0.0, 1, 1",
+        "0, 1.1, 1",
+        "0, 1, 1.1",
+        "'xyz', 1, 1",
+        "0, 'xyz', 1",
+        "[0], 1, 1",
+        "0, [1], 1",
+        "{start: 0}, 1, 1",
+        "0, 1, {step: 1}",
+    ] {
+        let err = eval_err(&format!("range({args})"));
+        assert!(
+            err.contains("range() expects integer arguments"),
+            "range({args}): {err}"
+        );
+    }
+    assert_eq!(
+        eval("range(0, 2)"),
+        Some(Value::List(vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(2)
+        ]))
+    );
+    assert_eq!(eval("range(null, 2)"), None);
+}
+
+#[test]
+fn properties_of_a_value_that_has_none_is_an_error() {
+    // Graph9 [5]-[7] at run time, through a parameter.
+    let mut fx = Fx::new();
+    fx.add("N", "x", vec![]);
+    for v in [
+        Value::Int(1),
+        Value::Str("Cypher".into()),
+        Value::List(vec![]),
+    ] {
+        let mut params = BTreeMap::new();
+        params.insert("v".to_string(), v.clone());
+        let err =
+            run(&fx.view(), "RETURN properties($v) AS p", &params).expect_err("no properties");
+        assert!(err.contains("properties() expects"), "{v:?}: {err}");
+    }
+    assert_eq!(eval("properties(null)"), None);
+    assert!(matches!(eval("properties(n)"), Some(Value::Map(_))));
 }
 
 // ---------------------------------------------------------------------------
