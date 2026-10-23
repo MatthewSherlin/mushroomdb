@@ -196,6 +196,49 @@ fn auto_commit_create_is_durable_and_visible_to_the_next_statement() {
     assert_eq!(seen.get(0, "COUNT(n)"), Some(&Value::Int(1)));
 }
 
+/// QL-CX's fourth write-result column reaches a Bolt client as a field, in
+/// its documented position, with the count of relationships created.
+#[test]
+fn a_write_result_carries_relationships_created_as_its_fourth_field() {
+    let (db, _dir) = open_db("rels-created");
+    let mut conn = connected(&db, FULL);
+    for id in ["a", "b"] {
+        let out = conn.handle(run(&format!("CREATE (n:P {{id: '{id}'}})")));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{out:?}"
+        );
+        conn.handle(pull(-1));
+    }
+    let out = conn.handle(run(
+        "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) CREATE (a)-[:K]->(b)",
+    ));
+    let [header] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        get(meta(header), "fields"),
+        Some(&PackValue::List(vec![
+            s("created"),
+            s("properties_set"),
+            s("deleted"),
+            s("relationships_created"),
+        ]))
+    );
+    let out = conn.handle(pull(-1));
+    let (rows, end) = rows_and_end(&out);
+    assert_eq!(
+        rows,
+        vec![&vec![
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(1),
+        ]]
+    );
+    assert_eq!(get(meta(end), "type"), Some(&s("w")));
+}
+
 #[test]
 fn a_write_bookmark_is_at_least_the_commit_and_a_later_run_may_wait_on_it() {
     let (db, _dir) = open_db("bookmark");
