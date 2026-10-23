@@ -127,7 +127,8 @@ fn call_and_schema_statements_have_plans() {
 
 #[test]
 fn a_union_lists_each_part() {
-    let json = explain_bare("MATCH (a:A) RETURN a.x UNION MATCH (b:B) RETURN b.x");
+    // The parts name one column: QL-VE refuses a UNION whose columns differ.
+    let json = explain_bare("MATCH (a:A) RETURN a.x AS x UNION MATCH (b:B) RETURN b.x AS x");
     assert!(json.contains(r#""op":"Union""#), "{json}");
     assert!(
         json.contains(r#""label":"A""#) && json.contains(r#""label":"B""#),
