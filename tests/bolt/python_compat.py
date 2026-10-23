@@ -111,11 +111,31 @@ def autocommit_read(ctx: Context) -> None:
     check(total >= 5, f"count(n) is {total}, expected at least the 5 seeded")
 
 
-# 4. Auto-commit write: CREATE a node, then see it in a later read.
+# 4. Auto-commit write: CREATE a node from parameters, MERGE from parameters
+#    (one that matches, one that creates), then see both in a later read.
 def autocommit_write(ctx: Context) -> None:
     with ctx.driver.session() as session:
-        session.run("CREATE (p:Person {id: 'p-auto', name: 'Ada', age: 36})").consume()
-        session.run("MATCH (p:Person {id: $id}) SET p.nick = $nick", id="p-auto", nick="ada").consume()
+        created = session.run(
+            "CREATE (p:Person {id: $id, name: $name, age: $age})", id="p-auto", name="Ada", age=36
+        ).consume().counters
+        check(
+            (created.nodes_created, created.labels_added, created.properties_set) == (1, 1, 3),
+            f"CREATE counters {created}",
+        )
+        matched = session.run(
+            "MERGE (p:Person {id: $id}) ON CREATE SET p.nick = $other ON MATCH SET p.nick = $nick",
+            id="p-auto",
+            nick="ada",
+            other="new",
+        ).consume().counters
+        check(
+            (matched.nodes_created, matched.properties_set) == (0, 1),
+            f"matching MERGE counters {matched}",
+        )
+        made = session.run(
+            "MERGE (p:Person {id: $id}) ON CREATE SET p.name = $name", id="p-merged", name="Lin"
+        ).consume().counters
+        check(made.nodes_created == 1 and made.contains_updates, f"creating MERGE counters {made}")
     record = single(
         ctx,
         "MATCH (p:Person {id: $id}) RETURN p.name AS name, p.age AS age, p.nick AS nick",
@@ -125,6 +145,8 @@ def autocommit_write(ctx: Context) -> None:
         (record["name"], record["age"], record["nick"]) == ("Ada", 36, "ada"),
         f"read back {dict(record)}",
     )
+    merged = single(ctx, "MATCH (p:Person {id: $id}) RETURN p.name AS name", id="p-merged")
+    check(merged["name"] == "Lin", f"read back {dict(merged)}")
 
 
 # 5. Explicit transaction commit, then the managed transactions users write.
@@ -384,11 +406,11 @@ SCENARIOS: list[tuple[str, Callable[[Context], None]]] = [
 
 
 def seed(ctx: Context) -> None:
-    # One statement per node: CREATE takes one pattern (or one chain), and a
-    # property in a CREATE pattern is a literal, not a parameter (query.md).
+    # One statement per node: CREATE takes one pattern (or one chain); a label
+    # is not a parameter, a property value is.
     with ctx.driver.session() as session:
         for label, key in SEED:
-            session.run(f"CREATE (:{label} {{id: '{key}'}})").consume()
+            session.run(f"CREATE (:{label} {{id: $id}})", id=key).consume()
 
 
 def main(argv: list[str]) -> int:

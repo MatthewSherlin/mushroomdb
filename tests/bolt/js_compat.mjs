@@ -77,7 +77,7 @@ async function single(ctx, query, params = {}) {
 async function consume(ctx, query, params = {}) {
   const session = ctx.driver.session();
   try {
-    await session.run(query, params);
+    return (await session.run(query, params)).summary;
   } finally {
     await session.close();
   }
@@ -122,10 +122,41 @@ async function autocommitRead(ctx) {
   check(num(total) >= 5, `count(n) is ${total}, expected at least the 5 seeded`);
 }
 
-// 4. Auto-commit write: CREATE a node, then see it in a later read.
+// 4. Auto-commit write: CREATE a node from parameters, MERGE from parameters
+//    (one that matches, one that creates), then see both in a later read.
 async function autocommitWrite(ctx) {
-  await consume(ctx, "CREATE (p:Person {id: 'p-auto', name: 'Ada', age: 36})");
-  await consume(ctx, 'MATCH (p:Person {id: $id}) SET p.nick = $nick', { id: 'p-auto', nick: 'ada' });
+  const created = (
+    await consume(ctx, 'CREATE (p:Person {id: $id, name: $name, age: $age})', {
+      id: 'p-auto',
+      name: 'Ada',
+      age: 36,
+    })
+  ).counters.updates();
+  check(
+    created.nodesCreated === 1 && created.labelsAdded === 1 && created.propertiesSet === 3,
+    `CREATE counters ${JSON.stringify(created)}`,
+  );
+  const matched = (
+    await consume(
+      ctx,
+      'MERGE (p:Person {id: $id}) ON CREATE SET p.nick = $other ON MATCH SET p.nick = $nick',
+      { id: 'p-auto', nick: 'ada', other: 'new' },
+    )
+  ).counters.updates();
+  check(
+    matched.nodesCreated === 0 && matched.propertiesSet === 1,
+    `matching MERGE counters ${JSON.stringify(matched)}`,
+  );
+  const made = (
+    await consume(ctx, 'MERGE (p:Person {id: $id}) ON CREATE SET p.name = $name', {
+      id: 'p-merged',
+      name: 'Lin',
+    })
+  ).counters;
+  check(
+    made.updates().nodesCreated === 1 && made.containsUpdates(),
+    `creating MERGE counters ${JSON.stringify(made.updates())}`,
+  );
   const record = await single(
     ctx,
     'MATCH (p:Person {id: $id}) RETURN p.name AS name, p.age AS age, p.nick AS nick',
@@ -133,6 +164,10 @@ async function autocommitWrite(ctx) {
   );
   const got = [record.get('name'), num(record.get('age')), record.get('nick')];
   check(JSON.stringify(got) === '["Ada",36,"ada"]', `read back ${JSON.stringify(got)}`);
+  const merged = await single(ctx, 'MATCH (p:Person {id: $id}) RETURN p.name AS name', {
+    id: 'p-merged',
+  });
+  check(merged.get('name') === 'Lin', `read back ${merged.get('name')}`);
 }
 
 // 5. Explicit transaction commit, then the managed transactions users write.
@@ -458,10 +493,10 @@ const SCENARIOS = [
 ];
 
 async function seed(ctx) {
-  // One statement per node: CREATE takes one pattern (or one chain), and a
-  // property in a CREATE pattern is a literal, not a parameter (query.md).
+  // One statement per node: CREATE takes one pattern (or one chain); a label
+  // is not a parameter, a property value is.
   for (const [label, key] of SEED) {
-    await consume(ctx, `CREATE (:${label} {id: '${key}'})`);
+    await consume(ctx, `CREATE (:${label} {id: $id})`, { id: key });
   }
 }
 

@@ -148,7 +148,7 @@ Every pull request and push to `main` runs the official Python driver 6.4.1 and 
 | 1 | Connect and authenticate | The token logs in; the server reports `MushroomDB/<version>` at Bolt 5.0 |
 | 2 | Refused token | A wrong token fails with `Unauthorized` |
 | 3 | Auto-commit read | `MATCH (n) RETURN count(n)` returns an integer; a label count matches the data |
-| 4 | Auto-commit write | A `CREATE`, then a `SET` from parameters, read back by a later statement |
+| 4 | Auto-commit write | A `CREATE (:Person {id: $id, …})` from parameters, a `MERGE` from parameters that matches and one that creates, read back by a later statement, with the drivers' summary counters |
 | 5 | Transaction commit | `BEGIN`, a write the transaction reads back, `COMMIT`; then a managed write transaction running `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)` and a managed read transaction that sees the edge |
 | 6 | Transaction rollback | A rolled-back write, and a managed transaction whose function throws, both leave nothing behind |
 | 7 | Streaming | 1000 rows of `MATCH (n:Row) RETURN n` pulled 100 at a time |
@@ -158,11 +158,7 @@ Every pull request and push to `main` runs the official Python driver 6.4.1 and 
 | 11 | Routing scheme | The driver asks `ROUTE` and runs its reads and writes on the advertised address |
 | 12 | Bookmarks | A read on a second session, given the first session's bookmark, sees the first session's commit |
 
-Where these drivers meet the query language's current limits:
-
-- A node returned bare (`RETURN n`) arrives as its key string, not a Node structure (see [Cypher](query.md)); scenario 7 checks for the Node structure and fails until it is sent. A relationship variable cannot be returned bare.
-- A property inside a `CREATE` or `MERGE` pattern is a literal, not a `$parameter`. Pass values with `SET n.p = $v`, `SET n += $props`, or `UNWIND $rows AS r CREATE (:L {id: r.id})`.
-- A write statement returns one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`); the drivers' result summary counters are empty.
+Where these drivers meet the server's current limits: a node or relationship inside a map built in the query, inside a list that mixes kinds, or behind a function arrives as its key or its `{type, start, end}` map, not as a Node or Relationship structure (see [Nodes, relationships and paths](#nodes-relationships-and-paths)). No scenario depends on that form.
 
 ## Transactions and bookmarks
 
