@@ -374,6 +374,11 @@ impl Transaction {
             }
             return Ok(self.base_snap.frozen.schema.show(&stmt));
         }
+        // `CALL` reads the transaction's state, its own writes included.
+        if let Some(call) = crate::db::call_statement(&tokens)? {
+            let schema = &self.base_snap.frozen.schema;
+            return self.with_view(|v| crate::db::run_call(&call, v, schema, params))?;
+        }
         if is_write_tokens(&tokens) {
             let stmt = parse_write(&tokens).map_err(query_err("parse"))?;
             return self.execute_write(stmt, params);

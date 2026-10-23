@@ -507,6 +507,56 @@ impl DdlStatement {
     }
 }
 
+// ─── Procedure call AST ──────────────────────────────────────────────────────
+
+/// `CALL ns.name(args) [YIELD f [AS a], …] [WHERE …] [RETURN …]`: a call of a
+/// built-in procedure, a read statement of its own. Produced by
+/// [`parse_call`](super::parse_call); executed by
+/// [`execute_call`](super::proc::execute_call) on every read entry point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcCallStmt {
+    /// Every part of the dotted name but the last, joined by `.`: `db` in
+    /// `db.ping`, `db.schema` in `db.schema.visualization`.
+    pub ns: String,
+    /// The last part of the dotted name.
+    pub name: String,
+    /// The arguments: any expressions that read no variable (`$param`s and
+    /// literals), evaluated before the call.
+    pub args: Vec<Operand>,
+    /// The `YIELD` items. `None` for no `YIELD`, or `YIELD *`: every column
+    /// the procedure returns, under its own name.
+    pub yields: Option<Vec<YieldItem>>,
+    /// `WHERE` after `YIELD`, over the yielded names.
+    pub where_expr: Option<Expr>,
+    /// The `RETURN` that follows, if any. Without one the statement returns
+    /// the yielded columns.
+    pub ret: Option<CallReturn>,
+}
+
+/// One `field [AS alias]` of a `YIELD`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldItem {
+    pub field: String,
+    pub alias: Option<String>,
+}
+
+impl YieldItem {
+    /// The name the yielded column is bound to.
+    pub fn name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.field)
+    }
+}
+
+/// `RETURN [DISTINCT] items [ORDER BY …] [SKIP n] [LIMIT n]` after a `CALL`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallReturn {
+    pub distinct: bool,
+    pub items: Vec<RetItem>,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
+}
+
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
 ///
 /// `nodes` is in encounter order. `edges` reference node vars that appear in

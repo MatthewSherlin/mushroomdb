@@ -4,8 +4,8 @@ use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, DdlStatement, EdgeDelete, Expr,
     HopRange, LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
     MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
-    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
-    UnwindExpr, WithStage, WriteStatement,
+    OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
+    UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
 /// is the merge (`+=`) form, and the map's entries.
@@ -93,6 +93,31 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
         expr_depth: 0,
     };
     p.write_statement()
+}
+
+/// Parse a procedure call statement, `CALL ns.name(args) [YIELD …] [WHERE …]
+/// [RETURN …]` (QL-12). Callers tell a call apart with [`is_call_tokens`]
+/// first. `CALL { … }` is refused as a subquery, and a call followed by any
+/// other clause as a call inside a larger query.
+pub fn parse_call(tokens: &[Tok]) -> Result<ProcCallStmt, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+    };
+    p.call_statement()
+}
+
+/// Whether the tokens begin a `CALL` statement. No read or write statement
+/// can begin with the word, so a malformed call is reported as one.
+pub fn is_call_tokens(tokens: &[Tok]) -> bool {
+    kw(tokens.first(), "call")
+}
+
+/// The error for an openCypher form this release recognises and does not run.
+pub(crate) fn refusal(feature: &str) -> String {
+    format!("not supported in mushroomdb 0.10: {feature}")
 }
 
 /// Parse a schema statement (`CREATE INDEX`, `DROP INDEX`, `SHOW INDEXES`,
@@ -209,6 +234,7 @@ struct MergeNode<V = Value> {
     ns: Option<V>,
 }
 
+mod call;
 mod ddl;
 mod unwind_write;
 
@@ -237,6 +263,9 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: &str) -> String {
+        if let Some(refused) = self.unsupported_form() {
+            return refused;
+        }
         match self.peek() {
             Some(tok) => format!("parse error at token {}: {msg} (found {tok:?})", self.pos),
             None => format!(
@@ -408,6 +437,118 @@ impl<'a> Parser<'a> {
                 "CASE is not supported".to_string()
             }
             _ => self.err(msg),
+        }
+    }
+
+    /// The refusal for an openCypher form this release does not run, when the
+    /// parse failed at its first token. [`err`](Self::err) asks this first, so
+    /// a form that no parser branch accepts is named instead of reported as
+    /// an unexpected token. It looks only at a failure point: wherever one of
+    /// these words parses (as a name), no error is raised and this never runs.
+    fn unsupported_form(&self) -> Option<String> {
+        let at = |i: usize| self.toks.get(i);
+        let prev = self.pos.checked_sub(1).and_then(at);
+        let next = at(self.pos + 1);
+        let feature = match self.peek()? {
+            Tok::Ident(word) => match word.to_ascii_lowercase().as_str() {
+                "call" if matches!(next, Some(Tok::LBrace | Tok::LParen)) => "CALL subquery",
+                "call" if matches!(next, Some(Tok::Ident(_))) && self.pos == 0 => {
+                    "CALL here (a procedure call runs only as a read query of its own)"
+                }
+                "call" if matches!(next, Some(Tok::Ident(_))) => "CALL inside a larger query",
+                "foreach" if next == Some(&Tok::LParen) => "FOREACH",
+                "load" if kw(next, "csv") => "LOAD CSV",
+                "use" if self.pos == 0 && matches!(next, Some(Tok::Ident(_))) => {
+                    "USE (database selection)"
+                }
+                "allshortestpaths" if next == Some(&Tok::LParen) => "allShortestPaths",
+                _ => return None,
+            },
+            Tok::LBrace if kw(prev, "exists") => "EXISTS { } subquery",
+            Tok::LBrace if kw(prev, "count") => "COUNT { } subquery",
+            Tok::LBrace if kw(prev, "collect") => "COLLECT { } subquery",
+            Tok::LBrace if next == Some(&Tok::Dot) => "map projection (n {.key, …})",
+            Tok::Colon | Tok::Pipe
+                if matches!(prev, Some(Tok::Ident(_)))
+                    && self.pos.checked_sub(2).and_then(at) == Some(&Tok::Colon) =>
+            {
+                "more than one label (n:A:B, n:A|B); a node has one label"
+            }
+            Tok::Colon if matches!((prev, next), (Some(Tok::Ident(_)), Some(Tok::Ident(_)))) => {
+                "a label predicate (n:Label) in an expression; put the label in the pattern"
+            }
+            Tok::Star
+                if matches!(prev, Some(Tok::Return | Tok::With))
+                    || (kw(prev, "distinct")
+                        && matches!(
+                            self.pos.checked_sub(2).and_then(at),
+                            Some(Tok::Return | Tok::With)
+                        )) =>
+            {
+                "RETURN * / WITH * (name each item)"
+            }
+            Tok::Optional if self.pos == 0 => {
+                "OPTIONAL MATCH as the first clause; begin with MATCH"
+            }
+            Tok::Create | Tok::Merge if self.toks[..self.pos].contains(&Tok::Match) => {
+                "CREATE or MERGE after MATCH (MATCH … CREATE)"
+            }
+            _ => return None,
+        };
+        Some(refusal(feature))
+    }
+
+    /// Whether the tokens at the cursor open a relationship pattern used as an
+    /// expression: a node pattern `(` [var] [`:Label`…] [`{…}`] `)` followed by
+    /// the start of a relationship (`--`, `-[`, `<-`). No arithmetic or
+    /// comparison reads that way: unary minus applies only to a number, so
+    /// `(x) - -(…)` and `(x) < -(…)` are parse errors already.
+    fn pattern_ahead(&self) -> bool {
+        let at = |i: usize| self.toks.get(i);
+        let mut i = self.pos;
+        if at(i) != Some(&Tok::LParen) {
+            return false;
+        }
+        i += 1;
+        if matches!(at(i), Some(Tok::Ident(_))) {
+            i += 1;
+        }
+        while at(i) == Some(&Tok::Colon) && matches!(at(i + 1), Some(Tok::Ident(_))) {
+            i += 2;
+        }
+        if at(i) == Some(&Tok::LBrace) {
+            let mut depth = 0usize;
+            loop {
+                match at(i) {
+                    Some(Tok::LBrace) => depth += 1,
+                    Some(Tok::RBrace) => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    None => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        if at(i) != Some(&Tok::RParen) {
+            return false;
+        }
+        match (at(i + 1), at(i + 2), at(i + 3)) {
+            (Some(Tok::Dash), Some(Tok::Dash), Some(Tok::LParen | Tok::Gt)) => true,
+            (Some(Tok::Dash), Some(Tok::LBracket), after) => matches!(
+                (after, at(i + 4)),
+                (Some(Tok::Colon | Tok::RBracket | Tok::Star), _)
+                    | (
+                        Some(Tok::Ident(_)),
+                        Some(Tok::Colon | Tok::RBracket | Tok::Star | Tok::LBrace)
+                    )
+            ),
+            (Some(Tok::Lt), Some(Tok::Dash), Some(Tok::LBracket | Tok::Dash)) => true,
+            _ => false,
         }
     }
 
@@ -1112,6 +1253,12 @@ impl<'a> Parser<'a> {
 
     /// Parse an atomic operand (leaf of the arithmetic expression tree).
     fn arith_atom(&mut self) -> Result<Operand, String> {
+        // `(n)-[:K]->()` as a value or a predicate.
+        if self.pattern_ahead() {
+            return Err(refusal(
+                "pattern predicate (a relationship pattern used as an expression)",
+            ));
+        }
         // A parenthesized expression: arithmetic or a predicate.
         if self.eat(&Tok::LParen) {
             // `value_expr` bounds the nesting.
@@ -1145,6 +1292,9 @@ impl<'a> Parser<'a> {
     /// comma is refused.
     fn list_literal(&mut self) -> Result<Operand, String> {
         self.expect(&Tok::LBracket, "expected '['")?;
+        if self.pattern_ahead() {
+            return Err(refusal("pattern comprehension [(n)-->(m) | …]"));
+        }
         self.enter_literal()?;
         if let (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) =
             (self.peek(), self.toks.get(self.pos + 1))
@@ -2299,6 +2449,9 @@ impl<'a> Parser<'a> {
     /// bare property or variable is a value like any other.
     fn set_clause_with(&mut self, row: bool) -> Result<SetClause, String> {
         let var = self.ident("expected variable in SET clause")?;
+        if self.peek() == Some(&Tok::Colon) {
+            return Err(refusal("SET n:Label (label assignment)"));
+        }
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;

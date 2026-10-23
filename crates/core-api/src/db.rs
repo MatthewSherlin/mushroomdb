@@ -38,11 +38,13 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod call;
 mod ddl;
 pub use ddl::{SchemaError, SchemaErrorKind};
 mod row_eval;
 mod unwind_write;
 
+pub(crate) use call::{call_statement, run_call};
 pub(crate) use ddl::{
     ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
 };
@@ -11268,6 +11270,19 @@ impl<F: Fs> GraphDb<F> {
                 &authz.mask.visible,
             ));
         }
+        // `CALL` is a read: it sees what the role's mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            return run_call(
+                &call,
+                &self.view_masked(&authz.mask),
+                &self.schema_listing(),
+                params,
+            );
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -11829,6 +11844,15 @@ impl<F: Fs> GraphDb<F> {
             return Ok(self
                 .schema_listing()
                 .show_visible(&stmt, &self.view(), &mask.visible));
+        }
+        // `CALL` sees only what the mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(
+                &call,
+                &self.view_masked(mask),
+                &self.schema_listing(),
+                params,
+            );
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -13393,6 +13417,9 @@ impl<F: Fs> GraphDb<F> {
             }
             return Ok(self.schema_listing().show(&stmt));
         }
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -13457,6 +13484,10 @@ impl<F: Fs> GraphDb<F> {
         })?;
         if let Some(stmt) = ddl_statement(&tokens)? {
             return self.exec_ddl(stmt);
+        }
+        // `CALL` is a read; the write entry point answers it as `query` does.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
         }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),

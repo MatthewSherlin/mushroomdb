@@ -862,6 +862,93 @@ The words these statements use (`INDEX`, `CONSTRAINT`, `DROP`, `SHOW`,
 `UNIQUE`, `REQUIRE`, …) are not reserved: they still name properties, labels
 and variables (`MATCH (show:Index) RETURN show.index`).
 
+## Procedures (`CALL`)
+
+`CALL` runs a built-in procedure. It is a statement of its own:
+
+```cypher
+CALL db.ping()
+CALL db.ping() YIELD success
+CALL db.ping() YIELD success AS ok WHERE ok RETURN ok
+CALL db.ping() YIELD * RETURN success
+```
+
+The full form is `CALL ns.name(args) [YIELD field [AS alias], …] [WHERE …]
+[RETURN … [ORDER BY …] [SKIP n] [LIMIT n]]`.
+
+- **Name.** A dotted name with at least two parts; the namespace is every part
+  but the last (`db.schema.visualization` is `visualization` in `db.schema`).
+  Names are case-sensitive. With no arguments the parentheses may be left out
+  (`CALL db.ping`).
+- **Arguments.** Any expression that reads no variable: literals, `$parameters`
+  and expressions over them (`CALL db.ping($x)`).
+- **`YIELD`.** Picks columns and may rename them with `AS`. With no `YIELD`,
+  or `YIELD *`, every column the procedure returns is bound under its own name.
+  Yielding a column the procedure does not return is an error naming it and
+  listing the columns it does return; binding one name twice is an error.
+- **`WHERE` and `RETURN`.** Filter and project the yielded names as in any
+  read query: expressions, aggregates, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`.
+  Without `RETURN` the statement returns the yielded columns.
+
+| Procedure | Arguments | Columns |
+|---|---|---|
+| `db.ping()` | none | `success` (always `true`) |
+
+An unknown procedure is the error `unknown procedure: <ns>.<name>`.
+
+**Where it runs.** A call is a read and writes nothing. It runs on every read
+entry point: `GraphDb::query` and `query_write`, a read-only (`open_at`) handle
+and `query_at`, `query_masked` and a role-scoped `query_write_authz`, the
+lock-free reader, a transaction (`Transaction::execute`, where it sees the
+transaction's own writes), HTTP `/query` (with `as_of`, `mask` or `namespace`
+too), Bolt `RUN` and the MCP `query` tool. Under a role, a mask or a namespace,
+a procedure sees only the nodes the caller can see, the relationships between
+them, and the schema rows `SHOW` gives that caller.
+
+**What is refused.** `CALL` inside a larger query — after `MATCH`, `WITH` or
+`UNWIND`, or followed by any clause other than `WHERE` and `RETURN` (a second
+`MATCH`, `UNION`) — is the error `not supported in mushroomdb 0.10: CALL inside
+a larger query`. A `CALL { … }` subquery is `not supported in mushroomdb 0.10:
+CALL subquery`.
+
+`CALL`, `YIELD`, `FOREACH`, `EXISTS` and `LOAD` are not reserved: they still
+name properties, labels and variables (`MATCH (call:Yield) RETURN call.exists`).
+
+## Unsupported features
+
+These openCypher forms are recognised and refused with an error that names
+them, `not supported in mushroomdb 0.10: <feature>`, rather than an unexpected
+token. The error is the whole message (a parse error carries the `parse:`
+prefix, the regular-expression operator `lex:`).
+
+| Form | Error message |
+|---|---|
+| `FOREACH (x IN list \| …)` | `not supported in mushroomdb 0.10: FOREACH` |
+| `EXISTS { … }` | `not supported in mushroomdb 0.10: EXISTS { } subquery` |
+| `COUNT { … }` | `not supported in mushroomdb 0.10: COUNT { } subquery` |
+| `COLLECT { … }` | `not supported in mushroomdb 0.10: COLLECT { } subquery` |
+| `CALL { … }`, `CALL (x) { … }` | `not supported in mushroomdb 0.10: CALL subquery` |
+| `MATCH … CALL ns.name()`, `CALL ns.name() MATCH …` | `not supported in mushroomdb 0.10: CALL inside a larger query` |
+| `CALL` in a subscription (`subscribe_query`) | `not supported in mushroomdb 0.10: CALL here (a procedure call runs only as a read query of its own)` |
+| `REMOVE n:Label` | `not supported in mushroomdb 0.10: REMOVE n:Label (label removal)` |
+| `SET n:Label` | `not supported in mushroomdb 0.10: SET n:Label (label assignment)` |
+| `WHERE n:Label`, `RETURN n:Label` | `not supported in mushroomdb 0.10: a label predicate (n:Label) in an expression; put the label in the pattern` |
+| `(n:A:B)`, `(n:A\|B)` | `not supported in mushroomdb 0.10: more than one label (n:A:B, n:A\|B); a node has one label` |
+| `WHERE (n)-[:K]->()`, `NOT (n)-->()`, `exists((n)-->())`, `size((n)-->())` | `not supported in mushroomdb 0.10: pattern predicate (a relationship pattern used as an expression)` |
+| `[(n)-->(m) \| m.name]` | `not supported in mushroomdb 0.10: pattern comprehension [(n)-->(m) \| …]` |
+| `RETURN *`, `WITH *` | `not supported in mushroomdb 0.10: RETURN * / WITH * (name each item)` |
+| `RETURN n {.name, .age}` | `not supported in mushroomdb 0.10: map projection (n {.key, …})` |
+| `n.name =~ 'a.*'` | `not supported in mushroomdb 0.10: regular-expression match (=~)` |
+| `LOAD CSV …` | `not supported in mushroomdb 0.10: LOAD CSV` |
+| `USE db …` | `not supported in mushroomdb 0.10: USE (database selection)` |
+| `OPTIONAL MATCH` as the first clause | `not supported in mushroomdb 0.10: OPTIONAL MATCH as the first clause; begin with MATCH` |
+| `MATCH … CREATE`, `MATCH … MERGE` | `not supported in mushroomdb 0.10: CREATE or MERGE after MATCH (MATCH … CREATE)` |
+| `allShortestPaths(…)` | `not supported in mushroomdb 0.10: allShortestPaths` |
+
+The other refusals of this release (forms of `MERGE`, `SET` maps, `UNWIND`
+writes, `time(…)`) are listed with their features above and under
+[Named-error](#named-error).
+
 ## OPTIONAL MATCH
 
 `OPTIONAL MATCH` applies left-outer-join semantics.  Rows that satisfy the
@@ -1249,6 +1336,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; `WHERE` ranges, `STARTS WITH` and `ORDER BY … LIMIT` on it read the index; see [Schema statements](#schema-statements-ddl) |
 | `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
 | `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
+| `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok` — a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Named-error
@@ -1291,6 +1379,8 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | A range index named `eq_…` or `ft_…` | `index names beginning 'eq_' or 'ft_' are reserved: SHOW INDEXES lists equality and full-text indexes under them; …` |
 | `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
 | A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
+| An unknown procedure, or `YIELD` of a column it does not return | `execute: unknown procedure: <ns>.<name>`, ``execute: YIELD `<field>`: <ns>.<name> returns no such column; it returns: …`` |
+| `FOREACH`, `EXISTS { }` / `COUNT { }` / `COLLECT { }` and `CALL { }` subqueries, `CALL` inside a larger query, `SET n:Label`, label predicates, more than one label, pattern predicates and comprehensions, `RETURN *`, map projections, `=~`, `LOAD CSV`, `USE`, a leading `OPTIONAL MATCH`, `MATCH … CREATE`, `allShortestPaths` | `not supported in mushroomdb 0.10: <feature>` — the full list is under [Unsupported features](#unsupported-features) |
 
 ### Absent
 
@@ -1299,11 +1389,7 @@ unexpected-token parse error or other unspecified result.
 
 | Form |
 |---|
-| Pattern comprehension `[(n)-[r]->(m) | m.prop]` |
 | Chained comparisons `a < b < c` (a parse error) |
-| Regular-expression match `=~` |
-| `EXISTS { … }` subquery predicate |
-| `CALL` procedure invocations |
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
 
 ---
