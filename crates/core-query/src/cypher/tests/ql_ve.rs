@@ -491,4 +491,13 @@ fn row_160_booleans_order_false_before_true() {
     .unwrap();
     assert_eq!(rs.get(0, "lo"), Some(&Value::Bool(false)));
     assert_eq!(rs.get(0, "hi"), Some(&Value::Bool(true)));
+    // Over a bare variable too (QL-AG's accumulator, kept at the bundle-19 merge).
+    let rs = run(
+        &fx.view(),
+        "UNWIND [true, false] AS b RETURN min(b) AS lo, max(b) AS hi",
+        &params,
+    )
+    .unwrap();
+    assert_eq!(rs.get(0, "lo"), Some(&Value::Bool(false)));
+    assert_eq!(rs.get(0, "hi"), Some(&Value::Bool(true)));
 }
