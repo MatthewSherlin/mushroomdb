@@ -16,6 +16,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # The openCypher TCK gate (0.10 QL-10). `cargo test --workspace` above
+      # already ran `tck-runner`'s `test_tck_gate`, which fails when the pass
+      # rate falls below tck-baseline.txt. This step runs the TCK once more to
+      # print the rate, and says so when it rose: CI never writes the baseline
+      # or pushes; it is raised by an ordinary change. A step of this job, not
+      # a job of its own, to stay inside the workflow's concurrent-job limit
+      # (the whole run takes seconds and reuses this job's build).
+      - run: cargo run -p tck-runner -- --check
+        timeout-minutes: 10
       # The examples docs/site/rust.md quotes. `cargo build --workspace
       # --examples` above built them; running the binaries checks each one's
       # assertions without building anything again.
