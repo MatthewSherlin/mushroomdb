@@ -369,6 +369,8 @@ fn fly_exposes_bolt_only_behind_the_tls_handler() {
     assert!(live.contains("internal_port = 7687"));
     assert!(live.contains("MUSHROOMDB_BOLT_PORT = \"7687\""));
     assert!(live.contains("MUSHROOMDB_BOLT_ADVERTISED_HOST"));
+    // A placeholder that resolves could belong to anyone: it must fail closed.
+    assert!(live.contains("MUSHROOMDB_BOLT_ADVERTISED_HOST = \"CHANGE-ME.invalid\""));
     assert!(live.contains("MUSHROOMDB_BOLT_ADVERTISED_PORT = \"7687\""));
     // The public 7687 port carries exactly the `tls` handler, never raw TCP.
     let block = live

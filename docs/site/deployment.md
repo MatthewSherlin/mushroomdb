@@ -119,7 +119,7 @@ Each template under `deploy/` sets `MUSHROOMDB_BOLT_PORT=7687` only where the pl
 
 | Platform | Bolt | How |
 |---|---|---|
-| Fly | Public, TLS at the edge | A TCP service on 7687 with Fly's `tls` handler (no `http` handler). Fly terminates TLS and forwards plaintext to the server, so use the TLS form of the Bolt scheme. `MUSHROOMDB_BOLT_ADVERTISED_HOST` is set to `mushroomdb.fly.dev`: change it to your app's address, or a routing URI hands drivers the wrong host. A shared IPv4 is enough with the `tls` handler. |
+| Fly | Public, TLS at the edge | A TCP service on 7687 with Fly's `tls` handler (no `http` handler). Fly terminates TLS and forwards plaintext to the server, so use the TLS form of the Bolt scheme. `MUSHROOMDB_BOLT_ADVERTISED_HOST` is set to the placeholder `CHANGE-ME.invalid`, which never resolves: change it to your app's address, or a routing URI fails, rather than handing drivers someone else's host. A shared IPv4 is enough with the `tls` handler. |
 | Docker Compose | This machine only | `127.0.0.1:7687:7687`. To expose it, change the mapping to `7687:7687` and put TLS in front (`--tls-cert`/`--tls-key`, or a TCP proxy that ends TLS). |
 | Kubernetes | In the cluster only | A `bolt` container port and a port on the ClusterIP Service; `MUSHROOMDB_BOLT_ADVERTISED_HOST` is the Service name. To reach it from outside, use a LoadBalancer Service with TLS termination, and set the advertised host to its public name. |
 | Render | Not available | A Render web service exposes only HTTP, so the template does not start Bolt. A private service may carry other ports to your other Render services (unverified). |

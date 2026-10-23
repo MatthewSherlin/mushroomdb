@@ -41,8 +41,9 @@ kill_timeout = 60
   # server refuses to start on a non-loopback address without one.
   MUSHROOMDB_BOLT_PORT = "7687"
   # What a routing URI hands drivers: this app's public host and port. CHANGE
-  # the host to your `app` name's address (<app>.fly.dev, or your own domain).
-  MUSHROOMDB_BOLT_ADVERTISED_HOST = "mushroomdb.fly.dev"
+  # the host to your `app` name's address (<app>.fly.dev, or your own domain);
+  # the placeholder never resolves, so a routing URI fails until you do.
+  MUSHROOMDB_BOLT_ADVERTISED_HOST = "CHANGE-ME.invalid"
   MUSHROOMDB_BOLT_ADVERTISED_PORT = "7687"
   # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in
   # `fly secrets set`, never here:
