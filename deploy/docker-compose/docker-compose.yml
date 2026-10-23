@@ -25,8 +25,8 @@ services:
       MUSHROOMDB_BOLT_PORT: "7687"
       # A wildcard bind cannot be handed to a driver; this is the host clients use.
       MUSHROOMDB_BOLT_ADVERTISED_HOST: localhost
-      # S3 settings the backup worker will read. They are wired to the bundled
-      # object store so HO-14/HO-15 only add the mushroomdb-specific variables.
+      # S3 settings the backup worker reads, wired to the bundled object store;
+      # backup itself stays off until MUSHROOMDB_BACKUP_S3_URL is set below.
       AWS_ENDPOINT_URL: http://minio:9000
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
