@@ -1664,7 +1664,7 @@ attributes. Classes may be added; a `code` is never respelled.
 | `CommitOutOfRange` | `commit: int`, `total: int`, `floor: int` | The commit is outside the retained range `floor..total`. |
 | `ViewPropReadOnly` | `view_name: str` | The property is managed by a view and cannot be written directly. |
 | `CasConflict` | `key: str`, `expected: int`, `actual: int` | A compare-and-set precondition was not satisfied. |
-| `TransactionConflict` | — | A commit found that another writer changed a node the transaction read or wrote. |
+| `TransactionConflict` | `key: str`, `expected: int`, `actual: int` | A commit found that another writer changed a node the transaction read or wrote. |
 | `TransactionClosed` | — | The transaction is finished: it was already committed or rolled back. |
 | `MaskedReadOnly` | — | A write statement reached a scoped or masked query path, which is read-only. |
 | `RoleWriteDenied` | `reason: str` | A role-bound write was denied. |

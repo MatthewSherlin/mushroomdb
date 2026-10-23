@@ -438,7 +438,10 @@ def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROU
             parts.append(DEPRECATED_INTRO + "\n\n" + "\n".join(rows))
         sections.append("\n\n".join(parts))
     rows = ["| Class | Fields | Raised when |", "|---|---|---|"]
-    for name, _base, doc, fields in stub["errors"]:
+    own_fields = {name: fields for name, _base, _doc, fields in stub["errors"]}
+    for name, base, doc, fields in stub["errors"]:
+        # A subclass of another error carries that error's fields too.
+        fields = own_fields.get(base, []) + fields
         shown = ", ".join(f"`{field}: {annotation}`" for field, annotation in fields) or "—"
         summary = doc.split("\n\n", 1)[0]
         rows.append(f"| `{name}` | {cell(shown)} | {cell(escape_html(summary))} |")

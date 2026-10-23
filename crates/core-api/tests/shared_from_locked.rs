@@ -80,3 +80,26 @@ fn a_read_only_handle_cannot_be_wrapped() {
         Err(GraphError::ReadOnly)
     ));
 }
+
+#[test]
+fn a_snapshots_masked_write_is_the_typed_masked_read_only_error() {
+    // Both masked entry points refuse a write with the same variant, so a
+    // caller matches the variant, never the message.
+    let dir = tmp("masked");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("P", "a", vec![]).unwrap();
+    let mask = mushroomdb::NodeMask::from_ids([]);
+    let on_db = db
+        .query_masked("CREATE (n:P {id: 'x'})", &no_params(), &mask)
+        .unwrap_err();
+    let on_snapshot = db
+        .reader()
+        .query_masked("CREATE (n:P {id: 'x'})", &no_params(), &mask)
+        .unwrap_err();
+    assert!(matches!(on_db, GraphError::MaskedReadOnly));
+    assert!(
+        matches!(on_snapshot, GraphError::MaskedReadOnly),
+        "{on_snapshot:?}"
+    );
+    assert_eq!(on_db.to_string(), on_snapshot.to_string());
+}

@@ -1076,9 +1076,7 @@ impl ReaderSnapshot {
             detail: format!("lex: {e}"),
         })?;
         if is_write_tokens(&tokens) {
-            return Err(GraphError::QueryError {
-                detail: "masked queries are read-only".into(),
-            });
+            return Err(GraphError::MaskedReadOnly);
         }
         if let Some(stmt) = ddl_statement(&tokens)? {
             let view = self.view(None)?;

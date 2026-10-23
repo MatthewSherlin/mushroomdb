@@ -2586,6 +2586,10 @@ impl GraphDb {
         let inner = &self.inner;
         let scope = &self.scope;
         // The GIL is released across the store mutex, as everywhere else.
+        let claim = || {
+            inner.1 .0.fetch_add(1, Ordering::SeqCst);
+            OpenClaim(Arc::clone(inner))
+        };
         let begun = py.detach(|| -> PyResult<core_api::Result<(TxBody, OpenClaim)>> {
             let mut guard = lock(&inner.0)?;
             if guard.is_none() {
@@ -2594,32 +2598,39 @@ impl GraphDb {
             if matches!(guard.as_ref(), Some(Store::Plain(db)) if db.is_read_only()) {
                 return Err(read_only_begin());
             }
-            let body = match (scope, guard.as_ref()) {
-                (Some(scope), Some(Store::Plain(db))) => scoped_body(db, scope),
-                (Some(scope), Some(Store::Shared(shared))) => scoped_body(&shared.read(), scope),
-                (None, Some(Store::Shared(shared))) => {
-                    Ok(TxBody::Full(Box::new(shared.begin_transaction())))
+            // The claim is taken under the mutex `close()` checks under, and
+            // released by dropping it if the begin below fails.
+            let shared = match guard.as_ref() {
+                Some(Store::Shared(shared)) => (shared.clone(), claim()),
+                Some(Store::Plain(db)) if scope.is_some() => {
+                    // A scoped view reads the plain store in place; no wrap.
+                    let scope = scope.as_ref().expect("checked in the guard");
+                    return Ok(scoped_body(db, scope).map(|body| (body, claim())));
                 }
-                (None, Some(Store::Plain(_))) => {
+                Some(Store::Plain(_)) => {
                     let Some(Store::Plain(db)) = guard.take() else {
                         unreachable!("matched Plain under the same guard");
                     };
-                    match SharedDb::from_locked(*db) {
-                        Ok(shared) => {
-                            let tx = shared.begin_transaction();
-                            *guard = Some(Store::Shared(shared));
-                            Ok(TxBody::Full(Box::new(tx)))
-                        }
-                        Err(e) => Err(e),
-                    }
+                    // `from_locked` fails only for a read-only handle, refused
+                    // above, so the store is never lost here.
+                    let shared = match SharedDb::from_locked(*db) {
+                        Ok(shared) => shared,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    *guard = Some(Store::Shared(shared.clone()));
+                    (shared, claim())
                 }
-                (_, None) => unreachable!("checked open above"),
+                None => unreachable!("checked open above"),
             };
-            // Claimed under the mutex `close()` checks under.
-            Ok(body.map(|body| {
-                inner.1 .0.fetch_add(1, Ordering::SeqCst);
-                (body, OpenClaim(Arc::clone(inner)))
-            }))
+            // From here the handle's own mutex is let go, so a begin that
+            // waits on the store (a writer's fsync) holds no other call up.
+            drop(guard);
+            let (shared, claim) = shared;
+            let body = match scope {
+                Some(scope) => scoped_body(&shared.read(), scope),
+                None => Ok(TxBody::Full(Box::new(shared.begin_transaction()))),
+            };
+            Ok(body.map(|body| (body, claim)))
         })?;
         let (body, claim) = begun.map_err(graph_err)?;
         Ok(Transaction {
@@ -2814,10 +2825,6 @@ enum TxBody {
     },
 }
 
-/// The refusal text the engine gives a write on a masked path; recognised so a
-/// scoped transaction can raise the class a scoped handle's write raises.
-const MASKED_WRITE_REFUSAL: &str = "masked queries are read-only";
-
 fn scoped_body(db: &Db, scope: &Scope) -> core_api::Result<TxBody> {
     let mask = scope.resolve(db)?;
     Ok(TxBody::Scoped {
@@ -2914,14 +2921,10 @@ impl Transaction {
                 TxBody::Full(tx) => Ok(tx.execute(cypher, &map)),
                 TxBody::Scoped { snapshot, mask } => {
                     match snapshot.query_masked(cypher, &map, mask) {
-                        Err(GraphError::QueryError { detail })
-                            if detail == MASKED_WRITE_REFUSAL =>
-                        {
-                            Err(ReadOnly::new_err(
-                                "this transaction is on a scoped handle, and a scoped handle \
+                        Err(GraphError::MaskedReadOnly) => Err(ReadOnly::new_err(
+                            "this transaction is on a scoped handle, and a scoped handle \
                                  never writes; begin it on the handle scoped() was called on",
-                            ))
-                        }
+                        )),
                         other => Ok(other),
                     }
                 }
@@ -2980,14 +2983,20 @@ struct TransactionContext {
 #[pymethods]
 impl TransactionContext {
     fn __enter__(&self, py: Python<'_>) -> PyResult<Py<Transaction>> {
-        // Begun before the slot is locked: `begin` releases the GIL, and a
-        // thread blocked on the slot with the GIL held would starve it.
+        let already_entered = || {
+            PyRuntimeError::new_err(
+                "this transaction block was already entered; call db.transaction() again",
+            )
+        };
+        if lock(&self.entered)?.is_some() {
+            return Err(already_entered());
+        }
+        // Begun before the slot is locked for good: `begin` releases the GIL,
+        // and a thread blocked on the slot with the GIL held would starve it.
         let tx = Py::new(py, self.handle.begin(py)?)?;
         let mut slot = lock(&self.entered)?;
         if slot.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "this transaction block was already entered; call db.transaction() again",
-            ));
+            return Err(already_entered());
         }
         *slot = Some(tx.clone_ref(py));
         Ok(tx)

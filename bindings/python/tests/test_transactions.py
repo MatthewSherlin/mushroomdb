@@ -406,3 +406,73 @@ def test_memory_and_scoped_reads_work_after_the_wrap(db):
     db.memory.remember("Ada likes graphs", about=["ada"])
     assert db.scoped(namespace="default").query("MATCH (n) RETURN count(n) AS c")
     assert db.memory.recall("graphs")
+
+
+def test_the_lock_survives_plain_writes_on_a_wrapped_handle(tmp_path, db):
+    path = str(tmp_path / "store")
+    db.begin_transaction().rollback()
+    db.insert_node("P", "a", {"id": "a"})
+    db.query_write("CREATE (n:P {id: 'b'})")
+    db.set_prop("a", "v", 1)
+    with pytest.raises(mushroomdb.MushroomBusy):
+        GraphDb.open(path)
+
+
+def test_a_transaction_and_handle_writes_interleave_from_two_threads(db):
+    tx = db.begin_transaction()
+    errors: list[BaseException] = []
+
+    def tx_side() -> None:
+        try:
+            for j in range(20):
+                tx.execute("CREATE (n:P {id: $id})", {"id": f"tx{j}"})
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    def handle_side() -> None:
+        try:
+            for j in range(20):
+                db.insert_node("P", f"h{j}", {"id": f"h{j}"})
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (tx_side, handle_side)]
+    for t in threads:
+        t.start()
+    _join(threads)
+    assert errors == []
+    tx.commit()
+    assert len(_ids(db)) == 40
+
+
+def test_the_gil_is_released_while_a_statement_runs(db):
+    """A long `execute` must not stall other Python threads."""
+    import time
+
+    for i in range(1500):
+        db.insert_node("P", f"k{i}", {"id": f"k{i}", "g": i % 7})
+    tx = db.begin_transaction()
+    ticks = 0
+    stop = threading.Event()
+
+    def spin() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            time.sleep(0)
+
+    t = threading.Thread(target=spin, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    before = ticks
+    started = time.perf_counter()
+    rows = tx.execute("MATCH (a:P), (b:P) RETURN count(*) AS c")
+    elapsed = time.perf_counter() - started
+    during = ticks - before
+    stop.set()
+    t.join(_JOIN_SECONDS)
+    assert rows == [{"c": 1500 * 1500}]
+    assert elapsed > 0.05, "the statement was too quick to say anything"
+    # A thread that held the GIL for the whole statement would tick ~0 times.
+    assert during > 20, f"{during} ticks in {elapsed:.2f}s"
+    tx.rollback()
