@@ -13,6 +13,7 @@ members = [
     "crates/code-extract",
     "crates/bolt",
     "crates/backup",
+    "crates/tck-runner",
 ]
 
 [workspace.package]

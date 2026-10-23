@@ -1543,11 +1543,12 @@ MATCH (n:Person) RETURN key(n) AS id, labels(n) AS kinds
 
 ## Cypher coverage
 
-Tested against the current binary (2026-08-24, release build, maturin develop --release);
-the forms below — node key and label, comma-separated patterns, infix string
-predicates, list subscripts, `DISTINCT` aggregates, `WITH` alias scoping — are covered by the
-workspace test suite. Classification: **Supported** = executes without error; **Named-error** =
-rejected with a clear, actionable message; **Absent** = not implemented (not tested here).
+How much of openCypher this release runs is measured by the openCypher TCK on
+every change: [openCypher conformance](conformance.md) has the pass, fail and
+skip counts by area and by feature file, and the causes of the failures. The
+tables below list forms by hand and are covered by the workspace test suite.
+Classification: **Supported** = executes without error; **Named-error** =
+rejected with a clear, actionable message; **Absent** = not implemented.
 
 ### Supported
 
@@ -1557,8 +1558,6 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
-| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
-| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
@@ -1604,7 +1603,6 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
 | Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
 | `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props` — evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
@@ -1670,7 +1668,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, id, labels` |
+| Unknown function name | ``execute: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
@@ -1697,6 +1695,15 @@ unexpected-token parse error or other unspecified result.
 |---|
 | Chained comparisons `a < b < c` (a parse error) |
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
+| A node with no label or no string `id` (`CREATE ()`, `CREATE (:A {name: 'x'})`): a parse error or a named error; the label and the key are required |
+| Comma-separated patterns in `CREATE` (`CREATE (a:A {id: 'a'}), (b:B {id: 'b'})`): a parse error; use a chain or two `CREATE` clauses |
+| List predicates `all(…)`, `any(…)`, `none(…)`, `single(…)` (a parse error) |
+| List slices `l[1..3]`, `l[..2]` (a parse error) |
+| Namespaced temporal functions `date.truncate`, `datetime.fromepoch`, `duration.between`, `duration.inMonths`, … (a parse error) |
+| Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
+| Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
+| `OPTIONAL MATCH` followed by a write clause (`OPTIONAL MATCH (n) SET n.x = 1`): a parse error |
+| An unaliased aggregate column is named in upper case (`count(n)` is the column `COUNT(n)`); alias it (`count(n) AS n`) to choose the name |
 
 ---
 

@@ -93,6 +93,7 @@ Reference:
 - [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
 - [Cypher Query Reference](query.md)
+- [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
 - [Bolt protocol](bolt.md) — the versions the server negotiates and the driver audit behind them
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)

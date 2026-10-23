@@ -6,6 +6,7 @@ benchmarks.md
 cli.md
 concepts.md
 concurrency.md
+conformance.md
 deployment.md
 durability.md
 fulltext.md
