@@ -43,6 +43,7 @@
 # Deploy and backup
 
 - [Running as a service](service.md)
+- [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)
 - [Durability](durability.md)
 - [Several processes, one store](multiprocess.md)

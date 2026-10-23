@@ -59,6 +59,7 @@ SITE_DOCS=(
     masks.md
     service.md
     deployment.md
+    self-host.md
     suggest.md
     limits.md
     benchmarks.md

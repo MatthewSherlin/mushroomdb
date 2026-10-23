@@ -9,4 +9,4 @@
 4. `fsGroup: 65532` lets the non-root image write its volume; your storage class must honor it. If it does not, the pod crash-loops with a permission-denied error on `/data`.
 5. Readiness is `GET /ready`, liveness `GET /health`, and a startup probe allows five minutes for a large open. Memory request 512Mi, limit 1Gi: size them to your data.
 6. After changing the ConfigMap or Secret, run `kubectl rollout restart statefulset/mushroomdb`.
-7. Not yet verified on a live cluster; test with your storage class. Backup settings and the Bolt port arrive with HO-14/HO-15.
+7. Not yet verified on a live cluster; test with your storage class. Backup and restore-on-boot settings are in the ConfigMap, commented out, and the Bolt port is in-cluster only; see `docs/site/deployment.md`.

@@ -557,8 +557,9 @@ window that time plus the store's open time, with a margin:
   machine marked unhealthy until `/ready` answers. What Fly does with such a
   machine is confirmed at the release gate's Fly deploy.
 - **Railway:** `healthcheckTimeout` in `railway.json` (120 s in the template).
-- **Kubernetes:** a `startupProbe` on `/ready` whose `failureThreshold` times
-  `periodSeconds` covers the restore.
+- **Kubernetes:** the template's `startupProbe` (on `/health`; the server binds
+  its port only after a restore on boot, so neither endpoint answers before
+  then) needs a `failureThreshold` times `periodSeconds` that covers the restore.
 - **Docker Compose:** the healthcheck's `start_period`, if you add one.
 - **Render:** the deploy waits for `/ready`. A restore longer than Render's
   wait fails the deploy, so measure it first.
@@ -621,7 +622,7 @@ amount.
 | --- | --- | --- | --- |
 | Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
 | Docker Compose | `stop_grace_period` | 10 s | `60s` |
-| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | `120` |
 | Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
 | Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
 | Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |

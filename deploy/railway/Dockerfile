@@ -30,7 +30,8 @@
 #   MUSHROOMDB_RESTORE_FROM_S3  s3://<bucket>/<prefix>   restore on boot: an empty volume restores
 #                                                        the newest backup there before serving
 # (both commented out here: set them in the dashboard; docs/site/deployment.md)
-# TODO(HO-14/HO-15): the rest of the backup variables go here.
+# Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+# settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.
 FROM ghcr.io/matthewsherlin/mushroomdb:latest
 # Explicit command: no --demo-if-empty, so a production volume is never seeded.
 CMD ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
