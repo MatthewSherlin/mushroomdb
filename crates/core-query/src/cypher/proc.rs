@@ -95,6 +95,8 @@ pub fn call_procedure(
                 rows: vec![vec![
                     text("mushroomdb"),
                     Value::List(vec![text(env!("CARGO_PKG_VERSION"))]),
+                    // The edition names no vendor tier; `open` says only that
+                    // there is one, unrestricted edition.
                     text("open"),
                 ]],
             })

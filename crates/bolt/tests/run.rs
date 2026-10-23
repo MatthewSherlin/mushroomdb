@@ -1243,6 +1243,8 @@ fn a_role_token_lists_only_its_own_schema_through_the_catalog_procedures() {
     for q in [
         "CREATE INDEX public_n FOR (n:Public) ON (n.n)",
         "CREATE INDEX secret_n FOR (n:Secret) ON (n.n)",
+        "CREATE CONSTRAINT public_unique FOR (n:Public) REQUIRE n.n IS UNIQUE",
+        "CREATE CONSTRAINT secret_unique FOR (n:Secret) REQUIRE n.n IS UNIQUE",
     ] {
         db.write().query_write(q, &BTreeMap::new()).unwrap();
     }
@@ -1264,11 +1266,17 @@ fn a_role_token_lists_only_its_own_schema_through_the_catalog_procedures() {
         first_strings(&call_rows(&mut conn, "CALL db.propertyKeys()")),
         ["n"]
     );
+    // The constraint's backing index is listed with the declared one.
+    let mut indexes = first_strings(&call_rows(&mut conn, "CALL db.indexes()"));
+    indexes.sort();
+    assert_eq!(indexes, ["eq_Public_n", "public_n"]);
     assert_eq!(
-        first_strings(&call_rows(&mut conn, "CALL db.indexes()")),
-        ["public_n"]
+        first_strings(&call_rows(&mut conn, "CALL db.constraints()")),
+        ["public_unique"]
     );
-    assert!(call_rows(&mut conn, "CALL db.constraints()").is_empty());
+    let mut all = first_strings(&call_rows(&mut full, "CALL db.constraints()"));
+    all.sort();
+    assert_eq!(all, ["public_unique", "secret_unique"]);
     let picture = format!(
         "{:?}",
         call_rows(&mut conn, "CALL db.schema.visualization()")

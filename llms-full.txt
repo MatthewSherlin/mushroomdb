@@ -5703,18 +5703,23 @@ carry.
   `properties`, the shape common driver tools read. `type` is the index kind
   (`range`, `equality`, `fulltext`) or `unique`; `state` is always `online`.
 - **`dbms.components()`** returns one row: `name` is `mushroomdb`, `versions` is
-  a one-element list holding the engine's version, and `edition` is `open`.
+  a one-element list holding the engine's version, and `edition` is `open`
+  (there is one unrestricted edition, so the column carries no tier name).
 - **`db.schema.visualization()`** returns one row. `nodes` lists one map
   `{label}` per label; `relationships` lists one map `{type, from, to}` for each
-  type, source label and target label that actually occur together.
+  type, source label and target label that actually occur together. The
+  maps are plain values, not graph node and relationship values, so a graph
+  browser lists them rather than drawing a schema diagram.
 
-Cost: the name procedures read the store's label column or its relationships
-once, so they take time in proportion to the nodes and relationships the caller
-can see. Measured on a release build with 100,000 nodes and 100,000
-relationships: `db.labels()` about 0.6 ms; `db.relationshipTypes()`,
-`db.propertyKeys()` and `db.schema.visualization()` about 15 ms to 16 ms. The
-index and constraint procedures read the declared schema and are
-sub-millisecond.
+Cost: the procedures read the store once, so they take time in proportion to
+the nodes and relationships the caller can see. A relationship type stops its
+scan at its first edge between visible nodes, and the node scan for property
+keys ends once every key has been found; `db.propertyKeys()` and
+`db.schema.visualization()` still read every relationship. Measured on a
+release build with 100,000 nodes and 100,000 relationships: `db.labels()` about
+0.5 ms, `db.relationshipTypes()` about 0.3 ms, `db.propertyKeys()` and
+`db.schema.visualization()` about 14 ms to 15 ms. The index and constraint
+procedures read the declared schema and are sub-millisecond.
 
 An unknown procedure is the error `unknown procedure: <ns>.<name>`.
 

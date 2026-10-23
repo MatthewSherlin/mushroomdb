@@ -143,37 +143,40 @@ fn the_mcp_query_tool_runs_a_call() {
     }
 }
 
-/// `open`'s store plus a `Q` node, a `P`-`P` edge `LIKES`, a `P`-`Q` edge
-/// `HIDDEN` and an index on each label: the role `writer` reads `P` only.
-fn open_with_hidden(name: &str) -> (Router, SharedDb) {
+/// `open`'s store plus a `Q` node, a `P`-`P` edge `LIKES`, a `HIDDEN` edge on
+/// `Q`, and an index and a constraint on each label: the role `writer` reads
+/// `P` only. With `cross`, `Q` is in namespace `a` with `P` and `HIDDEN` joins
+/// `p1` to `q1`; without it, `q1` and `q2` are in namespace `b` and `HIDDEN`
+/// joins those (an edge never crosses namespaces).
+fn open_with_hidden(name: &str, cross: bool) -> (Router, SharedDb) {
     let (app, db) = open(name);
     {
         let mut w = db.write();
-        let ns = || ("ns".to_string(), mushroomdb::Value::Str("a".into()));
+        let ns = |ns: &str| ("ns".to_string(), mushroomdb::Value::Str(ns.into()));
+        let secret = |n: i64| ("secret".to_string(), mushroomdb::Value::Int(n));
         w.insert_node(
             "P",
             "p2",
-            vec![ns(), ("shown".into(), mushroomdb::Value::Int(1))],
-        )
-        .unwrap();
-        w.insert_node(
-            "Q",
-            "q1",
-            vec![ns(), ("secret".into(), mushroomdb::Value::Int(2))],
+            vec![ns("a"), ("shown".into(), mushroomdb::Value::Int(1))],
         )
         .unwrap();
         w.insert_edge("LIKES", "p1", "p2").unwrap();
-        w.insert_edge("HIDDEN", "p1", "q1").unwrap();
-        w.query_write(
+        if cross {
+            w.insert_node("Q", "q1", vec![ns("a"), secret(1)]).unwrap();
+            w.insert_edge("HIDDEN", "p1", "q1").unwrap();
+        } else {
+            w.insert_node("Q", "q1", vec![ns("b"), secret(1)]).unwrap();
+            w.insert_node("Q", "q2", vec![ns("b"), secret(2)]).unwrap();
+            w.insert_edge("HIDDEN", "q1", "q2").unwrap();
+        }
+        for q in [
             "CREATE INDEX p_shown FOR (n:P) ON (n.shown)",
-            &Default::default(),
-        )
-        .unwrap();
-        w.query_write(
             "CREATE INDEX q_secret FOR (n:Q) ON (n.secret)",
-            &Default::default(),
-        )
-        .unwrap();
+            "CREATE CONSTRAINT p_unique FOR (n:P) REQUIRE n.shown IS UNIQUE",
+            "CREATE CONSTRAINT q_unique FOR (n:Q) REQUIRE n.secret IS UNIQUE",
+        ] {
+            w.query_write(q, &Default::default()).unwrap();
+        }
     }
     (app, db)
 }
@@ -187,8 +190,18 @@ fn first_column(rows: &Json) -> Vec<String> {
         .collect()
 }
 
-/// Every catalog procedure answers through `ask` with `P` and `LIKES` only.
-fn assert_role_scoped(ask: &dyn Fn(&str) -> Json, at: &str) {
+const CATALOG: [&str; 6] = [
+    "CALL db.labels()",
+    "CALL db.relationshipTypes()",
+    "CALL db.propertyKeys()",
+    "CALL db.indexes()",
+    "CALL db.constraints()",
+    "CALL db.schema.visualization()",
+];
+
+/// Every catalog procedure answers through `ask` with `P`, `LIKES` and the
+/// `P` index and constraint only.
+fn assert_scoped(ask: &dyn Fn(&str) -> Json, at: &str) {
     let rows = |q: &str| ask(q)["rows"].clone();
     assert_eq!(first_column(&rows("CALL db.labels()")), ["P"], "{at}");
     assert_eq!(
@@ -199,13 +212,13 @@ fn assert_role_scoped(ask: &dyn Fn(&str) -> Json, at: &str) {
     let keys = first_column(&rows("CALL db.propertyKeys()"));
     assert!(keys.contains(&"shown".to_string()), "{at}: {keys:?}");
     assert!(!keys.contains(&"secret".to_string()), "{at}: {keys:?}");
+    // The constraint's backing index is listed with the declared one.
+    let mut indexes = first_column(&rows("CALL db.indexes()"));
+    indexes.sort();
+    assert_eq!(indexes, ["eq_P_shown", "p_shown"], "{at}");
     assert_eq!(
-        first_column(&rows("CALL db.indexes()")),
-        ["p_shown"],
-        "{at}"
-    );
-    assert!(
-        rows("CALL db.constraints()").as_array().unwrap().is_empty(),
+        first_column(&rows("CALL db.constraints()")),
+        ["p_unique"],
         "{at}"
     );
     let picture = rows("CALL db.schema.visualization()").to_string();
@@ -215,45 +228,99 @@ fn assert_role_scoped(ask: &dyn Fn(&str) -> Json, at: &str) {
     }
 }
 
-#[tokio::test]
-async fn http_role_token_lists_only_its_own_schema() {
-    let (app, _db) = open_with_hidden("http-scope");
-    let (status, out) = post(&app, "full", json!({"cypher": "CALL db.labels()"})).await;
-    assert_eq!(status, StatusCode::OK, "{out}");
-    assert_eq!(first_column(&out["rows"]), ["P", "Q"]);
-    // `post` is async, so gather each procedure's answer first.
-    let mut answers: HashMap<String, Json> = HashMap::new();
-    for q in [
-        "CALL db.labels()",
-        "CALL db.relationshipTypes()",
-        "CALL db.propertyKeys()",
-        "CALL db.indexes()",
-        "CALL db.constraints()",
-        "CALL db.schema.visualization()",
-    ] {
-        let (status, out) = post(&app, "rtok", json!({ "cypher": q })).await;
-        assert_eq!(status, StatusCode::OK, "{q}: {out}");
+/// An unscoped caller sees both labels' schema, so the fixture is not vacuous.
+fn assert_unscoped(ask: &dyn Fn(&str) -> Json) {
+    let rows = |q: &str| ask(q)["rows"].clone();
+    assert_eq!(first_column(&rows("CALL db.labels()")), ["P", "Q"]);
+    let mut constraints = first_column(&rows("CALL db.constraints()"));
+    constraints.sort();
+    assert_eq!(constraints, ["p_unique", "q_unique"]);
+    assert!(first_column(&rows("CALL db.indexes()")).contains(&"q_secret".to_string()));
+}
+
+/// HTTP `/query` with `token` and the `extra` body fields, every procedure.
+async fn http_answers(app: &Router, token: &str, extra: Json) -> HashMap<String, Json> {
+    let mut answers = HashMap::new();
+    for q in CATALOG {
+        let mut body = json!({ "cypher": q });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, out) = post(app, token, body).await;
+        assert_eq!(status, StatusCode::OK, "{token} {extra} {q}: {out}");
         answers.insert(q.to_string(), out);
     }
-    assert_role_scoped(&|q| answers[q].clone(), "http role token");
+    answers
+}
+
+#[tokio::test]
+async fn http_lists_only_the_schema_in_scope() {
+    let (app, _db) = open_with_hidden("http-scope", true);
+    let all = http_answers(&app, "full", json!({})).await;
+    assert_unscoped(&|q| all[q].clone());
+    for (token, extra, at) in [
+        ("rtok", json!({}), "role token"),
+        ("full", json!({"mask": ["p1", "p2"]}), "mask"),
+        ("rtok", json!({"mask": ["p1", "p2"]}), "role token and mask"),
+    ] {
+        let answers = http_answers(&app, token, extra).await;
+        assert_scoped(&|q| answers[q].clone(), &format!("http {at}"));
+    }
+    let (app, _db) = open_with_hidden("http-scope-ns", false);
+    let all = http_answers(&app, "full", json!({})).await;
+    assert_unscoped(&|q| all[q].clone());
+    for (token, extra, at) in [
+        ("full", json!({"namespace": "a"}), "namespace"),
+        (
+            "rtok",
+            json!({"namespace": "a"}),
+            "role token and namespace",
+        ),
+        ("rtok", json!({}), "role token"),
+    ] {
+        let answers = http_answers(&app, token, extra).await;
+        assert_scoped(&|q| answers[q].clone(), &format!("http {at}"));
+    }
+}
+
+fn mcp_ask(db: &SharedDb, extra: Json, q: &str) -> Json {
+    let mut arguments = json!({ "cypher": q });
+    for (k, v) in extra.as_object().unwrap() {
+        arguments[k] = v.clone();
+    }
+    let line = format!(
+        "{}\n",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "query", "arguments": arguments}})
+    );
+    let mut reader = Cursor::new(line.into_bytes());
+    let mut writer = Cursor::new(Vec::new());
+    server::run_mcp_stdio(db.clone(), None, &mut reader, &mut writer).unwrap();
+    let out = String::from_utf8(writer.into_inner()).unwrap();
+    let reply: Json = serde_json::from_str(out.lines().next().expect("one reply")).unwrap();
+    assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+    serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
 
 #[test]
-fn the_mcp_query_tool_with_a_role_lists_only_its_own_schema() {
-    let (_, db) = open_with_hidden("mcp-scope");
-    let ask = |q: &str| -> Json {
-        let line = format!(
-            "{}\n",
-            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                   "params": {"name": "query", "arguments": {"cypher": q, "role": "writer"}}})
-        );
-        let mut reader = Cursor::new(line.into_bytes());
-        let mut writer = Cursor::new(Vec::new());
-        server::run_mcp_stdio(db.clone(), None, &mut reader, &mut writer).unwrap();
-        let out = String::from_utf8(writer.into_inner()).unwrap();
-        let reply: Json = serde_json::from_str(out.lines().next().expect("one reply")).unwrap();
-        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
-        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
-    };
-    assert_role_scoped(&ask, "mcp role");
+fn mcp_lists_only_the_schema_in_scope() {
+    let (_, db) = open_with_hidden("mcp-scope", true);
+    assert_unscoped(&|q| mcp_ask(&db, json!({}), q));
+    for (extra, at) in [
+        (json!({"role": "writer"}), "role"),
+        (json!({"mask": ["p1", "p2"]}), "mask"),
+    ] {
+        assert_scoped(&|q| mcp_ask(&db, extra.clone(), q), &format!("mcp {at}"));
+    }
+    let (_, db) = open_with_hidden("mcp-scope-ns", false);
+    assert_unscoped(&|q| mcp_ask(&db, json!({}), q));
+    for (extra, at) in [
+        (json!({"namespace": "a"}), "namespace"),
+        (
+            json!({"role": "writer", "namespace": "a"}),
+            "role and namespace",
+        ),
+    ] {
+        assert_scoped(&|q| mcp_ask(&db, extra.clone(), q), &format!("mcp {at}"));
+    }
 }

@@ -433,6 +433,18 @@ fn the_catalog_procedures_run_inside_a_transaction_and_see_its_writes() {
         .unwrap();
     let rs = tx.execute("CALL db.labels()", &p()).unwrap();
     assert_eq!(names(&rs, "label"), ["Fresh"]);
+    tx.execute(
+        "CREATE (a:Fresh {id: 'y'})-[:NEXT]->(b:Fresh {id: 'z'})",
+        &p(),
+    )
+    .unwrap();
+    let rs = tx.execute("CALL db.relationshipTypes()", &p()).unwrap();
+    assert_eq!(names(&rs, "relationshipType"), ["NEXT"]);
+    let rs = tx.execute("CALL db.propertyKeys()", &p()).unwrap();
+    assert!(names(&rs, "propertyKey").contains(&"tag".to_string()));
+    let rs = tx.execute("CALL db.schema.visualization()", &p()).unwrap();
+    let rels = format!("{:?}", rs.get(0, "relationships"));
+    assert!(rels.contains("NEXT") && rels.contains("Fresh"), "{rels}");
     tx.rollback();
     let rs = shared.reader().query("CALL db.labels()", &p()).unwrap();
     assert_eq!(rs.len(), 0);
