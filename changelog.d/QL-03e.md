@@ -1,0 +1,2 @@
+### Added
+- **`elementId`, `startNode`, `endNode`, `nodes`, `relationships` and `length`.** `elementId(n)` and `elementId(r)` return the element id a Bolt driver reads as `element_id` (opaque but stable), `startNode(r)` and `endNode(r)` return a relationship's end nodes (null when the caller's mask hides that end), and `nodes(p)`, `relationships(p)` and `length(p)` read a path as `p.nodes`, `p.relationships` and `p.length` do, over Bolt included. Null in gives null; a wrong type is an error naming the function. `id(n)` is unchanged. (QL-03e).

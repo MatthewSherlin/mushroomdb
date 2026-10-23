@@ -423,3 +423,39 @@ fn a_relationship_carries_the_properties_cypher_wrote_on_it() {
     assert_eq!(map_get(&r.fields[4], "since"), Some(&PackValue::Int(2020)));
     assert_eq!(map_get(&r.fields[4], "via"), None);
 }
+
+#[test]
+fn element_id_matches_the_structures_and_the_functions_render_like_the_path_fields() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) RETURN a, elementId(a), r, elementId(r)",
+    );
+    let (node, rel) = (structure(&rows[0][0]), structure(&rows[0][2]));
+    assert_eq!(
+        rows[0][1], node.fields[3],
+        "elementId(n) is node.element_id"
+    );
+    assert_eq!(rows[0][3], rel.fields[5], "elementId(r) is rel.element_id");
+
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH p = (a {id: 'ada'})-[r:KNOWS]->(b) \
+         RETURN nodes(p), p.nodes, relationships(p), p.relationships, length(p), p.length, \
+         startNode(r), endNode(r)",
+    );
+    assert_eq!(rows[0][0], rows[0][1], "nodes(p) renders as p.nodes");
+    assert_eq!(
+        rows[0][2], rows[0][3],
+        "relationships(p) renders as p.relationships"
+    );
+    assert_eq!(rows[0][4], rows[0][5]);
+    assert_eq!(rows[0][4], PackValue::Int(1));
+    let PackValue::List(nodes) = &rows[0][0] else {
+        panic!("nodes(p) is a list: {:?}", rows[0][0])
+    };
+    assert_eq!(structure(&nodes[0]).tag, 0x4E);
+    assert_eq!(structure(&rows[0][6]).tag, 0x4E, "startNode(r) is a Node");
+    assert_eq!(structure(&rows[0][7]).fields[3], s(&node_element_id("bob")));
+}
