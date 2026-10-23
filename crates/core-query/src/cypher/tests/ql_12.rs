@@ -24,6 +24,9 @@ impl ProcCatalog for EmptyCatalog {
     fn property_keys(&self) -> Vec<String> {
         Vec::new()
     }
+    fn relationship_patterns(&self) -> Vec<(String, String, String)> {
+        Vec::new()
+    }
     fn indexes(&self) -> Vec<SchemaRow> {
         Vec::new()
     }

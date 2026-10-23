@@ -1227,3 +1227,84 @@ fn run_answers_a_procedure_call() {
     let out = conn.handle(run("CALL { MATCH (n) RETURN n }"));
     assert_eq!(failure_code(&out), "Neo.ClientError.Statement.SyntaxError");
 }
+
+/// Every catalog procedure over Bolt: the rows `RUN` + `PULL` return.
+fn call_rows(conn: &mut Connection, query: &str) -> Vec<Vec<PackValue>> {
+    let out = conn.handle(run(query));
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{query}: {out:?}"
+    );
+    let out = conn.handle(pull(-1));
+    rows_and_end(&out).0.into_iter().cloned().collect()
+}
+
+fn first_strings(rows: &[Vec<PackValue>]) -> Vec<String> {
+    rows.iter()
+        .map(|r| match &r[0] {
+            PackValue::String(s) => s.clone(),
+            other => panic!("not a string: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_role_token_lists_only_its_own_schema_through_the_catalog_procedures() {
+    let (db, _dir) = db_with_role("role-catalog");
+    db.write()
+        .insert_edge("LINK", "Public0", "Public1")
+        .unwrap();
+    db.write()
+        .insert_edge("HIDDEN", "Public0", "Secret0")
+        .unwrap();
+    for q in [
+        "CREATE INDEX public_n FOR (n:Public) ON (n.n)",
+        "CREATE INDEX secret_n FOR (n:Secret) ON (n.n)",
+        "CREATE CONSTRAINT public_unique FOR (n:Public) REQUIRE n.n IS UNIQUE",
+        "CREATE CONSTRAINT secret_unique FOR (n:Secret) REQUIRE n.n IS UNIQUE",
+    ] {
+        db.write().query_write(q, &BTreeMap::new()).unwrap();
+    }
+    let mut full = connected(&db, FULL);
+    assert_eq!(
+        first_strings(&call_rows(&mut full, "CALL db.labels()")),
+        ["Public", "Secret"]
+    );
+    let mut conn = connected(&db, ROLE);
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.labels()")),
+        ["Public"]
+    );
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.relationshipTypes()")),
+        ["LINK"]
+    );
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.propertyKeys()")),
+        ["n"]
+    );
+    // The constraint's backing index is listed with the declared one.
+    let mut indexes = first_strings(&call_rows(&mut conn, "CALL db.indexes()"));
+    indexes.sort();
+    assert_eq!(indexes, ["eq_Public_n", "public_n"]);
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.constraints()")),
+        ["public_unique"]
+    );
+    let mut all = first_strings(&call_rows(&mut full, "CALL db.constraints()"));
+    all.sort();
+    assert_eq!(all, ["public_unique", "secret_unique"]);
+    let picture = format!(
+        "{:?}",
+        call_rows(&mut conn, "CALL db.schema.visualization()")
+    );
+    for hidden in ["Secret", "HIDDEN"] {
+        assert!(!picture.contains(hidden), "{hidden} in {picture}");
+    }
+    // The components row a driver tool reads on connect.
+    let rows = call_rows(
+        &mut conn,
+        "CALL dbms.components() YIELD name, versions, edition",
+    );
+    assert_eq!(rows[0][0], s("mushroomdb"));
+}

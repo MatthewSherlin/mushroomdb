@@ -87,42 +87,85 @@ impl ViewCatalog<'_, '_> {
 
 impl ProcCatalog for ViewCatalog<'_, '_> {
     fn labels(&self) -> Vec<String> {
-        let labels: BTreeSet<String> = self
-            .nodes()
-            .into_iter()
-            .filter_map(|id| self.view.label_of(id).map(str::to_string))
+        // One pass over the label column: no id list is built, and only the
+        // distinct label symbols are resolved to names.
+        let syms: BTreeSet<u32> = self
+            .view
+            .label_syms()
+            .enumerate()
+            .filter(|&(id, sym)| sym != u32::MAX && self.view.visible(id as u32))
+            .map(|(_, sym)| sym)
             .collect();
-        labels.into_iter().collect()
-    }
-
-    fn relationship_types(&self) -> Vec<String> {
-        let nodes = self.nodes();
-        let mut seen: BTreeSet<u32> = BTreeSet::new();
-        self.for_each_edge(&nodes, |etype, _, _| {
-            seen.insert(etype);
-            true
-        });
-        let names: BTreeSet<String> = seen
+        let names: BTreeSet<String> = syms
             .into_iter()
             .filter_map(|sym| self.view.sym_name(sym).map(str::to_string))
             .collect();
         names.into_iter().collect()
     }
 
-    fn property_keys(&self) -> Vec<String> {
+    fn relationship_types(&self) -> Vec<String> {
+        // A type is listed at its first edge between two visible nodes, so
+        // the scan stops there for each type.
         let nodes = self.nodes();
-        let mut keys: BTreeSet<String> = self
+        let live = |id: u32| self.view.visible(id) && self.view.label_sym(id).is_some();
+        let names: BTreeSet<String> = self
             .view
-            .props
-            .field_names()
-            .into_iter()
-            .filter(|field| nodes.iter().any(|&id| self.view.prop(id, field).is_some()))
+            .topo
+            .etypes()
+            .filter(|&etype| {
+                nodes.iter().any(|&src| {
+                    self.view
+                        .topo
+                        .neighbors(etype, Direction::Out, src)
+                        .iter()
+                        .any(|&dst| live(dst))
+                })
+            })
+            .filter_map(|sym| self.view.sym_name(sym).map(str::to_string))
             .collect();
+        names.into_iter().collect()
+    }
+
+    fn property_keys(&self) -> Vec<String> {
+        // One pass over the visible nodes, testing only the fields not yet
+        // found, so the pass ends as soon as every field has been seen.
+        let nodes = self.nodes();
+        let mut missing: Vec<String> = self.view.props.field_names();
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for &id in &nodes {
+            if missing.is_empty() {
+                break;
+            }
+            missing.retain(|field| {
+                let found = self.view.prop(id, field).is_some();
+                if found {
+                    keys.insert(field.clone());
+                }
+                !found
+            });
+        }
         self.for_each_edge(&nodes, |etype, src, dst| {
             keys.extend(self.view.edge_props.props_of(etype, src, dst).into_keys());
             true
         });
         keys.into_iter().collect()
+    }
+
+    fn relationship_patterns(&self) -> Vec<(String, String, String)> {
+        let nodes = self.nodes();
+        let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        self.for_each_edge(&nodes, |etype, src, dst| {
+            if let (Some(from), Some(to)) = (self.view.label_sym(src), self.view.label_sym(dst)) {
+                seen.insert((etype, from, to));
+            }
+            true
+        });
+        let name = |sym: u32| self.view.sym_name(sym).map(str::to_string);
+        let patterns: BTreeSet<(String, String, String)> = seen
+            .into_iter()
+            .filter_map(|(etype, from, to)| Some((name(etype)?, name(from)?, name(to)?)))
+            .collect();
+        patterns.into_iter().collect()
     }
 
     fn indexes(&self) -> Vec<SchemaRow> {
