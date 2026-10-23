@@ -36,19 +36,113 @@ pub fn baseline_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tck-baseline.txt")
 }
 
-/// The pass rate recorded in `path`: the first line that is not blank or a
-/// `#` comment, as a fraction (`0.4321`). A missing file is an error.
-pub fn baseline_from_file(path: impl AsRef<Path>) -> Result<f64, String> {
+/// The two rates `tck-baseline.txt` holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Baseline {
+    /// `passed / (passed + failed)`.
+    pub rate: f64,
+    /// The same with only strict passes counted (see [`strict_passes`]).
+    pub strict: f64,
+}
+
+/// The baselines in `text`: the first line that is not blank or a `#`
+/// comment is the pass rate (`0.4321`); the line `strict <rate>` is the
+/// strict rate. Both are required.
+pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let first = lines.next().ok_or("no pass rate in the file")?;
+    let rate = first
+        .parse::<f64>()
+        .map_err(|e| format!("{first:?} is not a pass rate: {e}"))?;
+    let strict_line = lines
+        .find_map(|l| l.strip_prefix("strict "))
+        .ok_or("no `strict <rate>` line in the file")?;
+    let strict = strict_line
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| format!("{strict_line:?} is not a strict pass rate: {e}"))?;
+    Ok(Baseline { rate, strict })
+}
+
+/// The baselines recorded in `path`. A missing file is an error.
+pub fn baselines_from_file(path: impl AsRef<Path>) -> Result<Baseline, String> {
     let path = path.as_ref();
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .ok_or_else(|| format!("{}: no pass rate in the file", path.display()))?;
-    line.parse::<f64>()
-        .map_err(|e| format!("{}: {line:?} is not a pass rate: {e}", path.display()))
+    parse_baseline(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The pass rate recorded in `path` (see [`baselines_from_file`]).
+pub fn baseline_from_file(path: impl AsRef<Path>) -> Result<f64, String> {
+    baselines_from_file(path).map(|b| b.rate)
+}
+
+/// The text `--update-baseline` writes.
+pub fn baseline_text(rate: f64, strict: f64) -> String {
+    format!(
+        "# The openCypher TCK pass rates CI holds; neither may fall.\n\
+         # Line 1: passed / (passed + failed). `strict`: the same, counting a scenario\n\
+         # that expects an error as passed only when the error came from the phase\n\
+         # the TCK names (see docs/site/conformance.md).\n\
+         # Raise them in the change that raises the rates:\n\
+         #   cargo run --release -p tck-runner -- --update-baseline\n\
+         # A change that adds or edits a skip rule says, beside the new rates, how\n\
+         # many scenarios the rule moved: a skip changes the denominator.\n\
+         {}\n\
+         strict {}\n",
+        format_rate(rate),
+        format_rate(strict)
+    )
+}
+
+/// The passes that count toward the strict rate: every scenario that checked
+/// a result, and every error pass whose error came from the expected phase.
+pub fn strict_passes(outcomes: &[Outcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|o| match o {
+            Outcome::Pass(None) => true,
+            Outcome::Pass(Some(raised)) => runner::error_phase_matches(raised),
+            _ => false,
+        })
+        .count()
+}
+
+/// The two rates of a run: `(rate, strict)`.
+pub fn rates(outcomes: &[Outcome]) -> (f64, f64) {
+    let (passed, failed, _) = tally(outcomes);
+    let strict = strict_passes(outcomes);
+    (
+        pass_rate(passed, failed),
+        pass_rate(strict, passed + failed - strict),
+    )
+}
+
+/// Holds both rates to `baseline`: `Err` names each that fell.
+pub fn check_baseline(rate: f64, strict: f64, baseline: &Baseline) -> Result<(), String> {
+    let mut fell = Vec::new();
+    if !holds_baseline(rate, baseline.rate) {
+        fell.push(format!(
+            "TCK pass rate {} fell below the baseline {}",
+            format_rate(rate),
+            format_rate(baseline.rate)
+        ));
+    }
+    if !holds_baseline(strict, baseline.strict) {
+        fell.push(format!(
+            "TCK strict pass rate {} fell below the baseline {}",
+            format_rate(strict),
+            format_rate(baseline.strict)
+        ));
+    }
+    if fell.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} (tck-baseline.txt)", fell.join("; ")))
+    }
 }
 
 /// `passed / (passed + failed)`, or 0 when nothing ran.
@@ -189,6 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn both_rates_are_read_and_held() {
+        let b = parse_baseline(&baseline_text(0.2142, 0.1765)).unwrap();
+        assert_eq!(
+            b,
+            Baseline {
+                rate: 0.2142,
+                strict: 0.1765
+            }
+        );
+        assert!(
+            parse_baseline("0.5\n").is_err(),
+            "a file without the strict line"
+        );
+        assert!(check_baseline(0.2142, 0.1765, &b).is_ok());
+        let err = check_baseline(0.2142, 0.1700, &b).unwrap_err();
+        assert!(
+            err.contains("strict") && !err.contains("TCK pass rate 0.2142"),
+            "{err}"
+        );
+        assert!(check_baseline(0.2100, 0.1765, &b).is_err());
+    }
+
+    #[test]
     fn baseline_compares_at_four_decimals() {
         assert!(holds_baseline(0.43214, 0.4321));
         assert!(!holds_baseline(0.43204, 0.4321));
@@ -200,19 +317,19 @@ mod tests {
     #[test]
     fn test_tck_gate() {
         let scenarios = parse_features(&features_dir());
-        let (passed, failed, skipped) = run_scenarios(&scenarios, TempGraph::new);
-        let rate = pass_rate(passed, failed);
-        let baseline = baseline_from_file(baseline_path()).expect("tck-baseline.txt");
+        let outcomes = run_all(&scenarios, TempGraph::new, default_threads());
+        let (passed, failed, skipped) = tally(&outcomes);
+        let (rate, strict) = rates(&outcomes);
+        let baseline = baselines_from_file(baseline_path()).expect("tck-baseline.txt");
         println!(
-            "TCK: {passed} passed, {failed} failed, {skipped} skipped; pass rate {} (baseline {})",
+            "TCK: {passed} passed, {failed} failed, {skipped} skipped; pass rate {} (baseline {}), strict {} (baseline {})",
             format_rate(rate),
-            format_rate(baseline)
+            format_rate(baseline.rate),
+            format_rate(strict),
+            format_rate(baseline.strict)
         );
-        assert!(
-            holds_baseline(rate, baseline),
-            "TCK pass rate {} fell below the baseline {} in tck-baseline.txt",
-            format_rate(rate),
-            format_rate(baseline)
-        );
+        if let Err(e) = check_baseline(rate, strict, &baseline) {
+            panic!("{e}");
+        }
     }
 }

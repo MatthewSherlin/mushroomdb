@@ -8,9 +8,10 @@
 //! - `--report <path>` writes the conformance page (docs/site/conformance.md).
 //! - `--function-table <path>` writes the Cypher function table (contract C5).
 //! - `--failures <path>` writes every failing scenario with each failed step.
-//! - `--check` exits 1 when the pass rate is below `tck-baseline.txt`, and
-//!   prints the new rate when it is above (it never writes the file).
-//! - `--update-baseline` writes the rate to `tck-baseline.txt` (a local step
+//! - `--check` exits 1 when the pass rate or the strict rate is below
+//!   `tck-baseline.txt`, and prints the new rates when either is above (it
+//!   never writes the file).
+//! - `--update-baseline` writes both rates to `tck-baseline.txt` (a local step
 //!   for the change that raises the baseline; CI never runs it).
 //! - `--filter <text>` runs only scenarios whose label contains the text.
 //! - `--query <cypher>` runs one statement against a fresh store and prints
@@ -24,8 +25,9 @@ use std::process::ExitCode;
 use tck_runner::report::{conformance_page, engine_knows_function, failure_groups, function_table};
 use tck_runner::value::from_cell;
 use tck_runner::{
-    baseline_from_file, baseline_path, default_threads, features_dir, format_rate, holds_baseline,
-    parse_features_checked, pass_rate, run_all, run_query, tally, tck_root, Outcome, TempGraph,
+    baseline_path, baseline_text, baselines_from_file, check_baseline, default_threads,
+    features_dir, format_rate, parse_features_checked, rates, run_all, run_query, tally, tck_root,
+    Outcome, TempGraph,
 };
 
 struct Args {
@@ -101,11 +103,13 @@ fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let outcomes = run_all(&scenarios, TempGraph::new, args.threads);
     let (passed, failed, skipped) = tally(&outcomes);
-    let rate = pass_rate(passed, failed);
+    let (rate, strict) = rates(&outcomes);
     println!(
-        "TCK: {passed} passed, {failed} failed, {skipped} skipped; pass rate {} ({:.1}%) in {:.1}s",
+        "TCK: {passed} passed, {failed} failed, {skipped} skipped; pass rate {} ({:.1}%), strict {} ({:.1}%) in {:.1}s",
         format_rate(rate),
         rate * 100.0,
+        format_rate(strict),
+        strict * 100.0,
         started.elapsed().as_secs_f64()
     );
     for (group, n, _) in failure_groups(&scenarios, &outcomes).into_iter().take(10) {
@@ -170,48 +174,51 @@ fn main() -> ExitCode {
     }
     if args.update_baseline {
         let path = baseline_path();
-        let text = format!(
-            "# The openCypher TCK pass rate CI holds: passed / (passed + failed).\n\
-             # Raise it in the change that raises the rate: cargo run --release -p tck-runner -- --update-baseline\n\
-             {}\n",
-            format_rate(rate)
-        );
+        let text = baseline_text(rate, strict);
         if let Err(e) = std::fs::write(&path, text) {
             eprintln!("write {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
-        println!("wrote {} = {}", path.display(), format_rate(rate));
+        println!(
+            "wrote {} = {}, strict {}",
+            path.display(),
+            format_rate(rate),
+            format_rate(strict)
+        );
     }
     if !errors.is_empty() {
         eprintln!("{} feature files did not parse", errors.len());
         return ExitCode::FAILURE;
     }
     if args.check {
-        let baseline = match baseline_from_file(baseline_path()) {
+        let baseline = match baselines_from_file(baseline_path()) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("{e}");
                 return ExitCode::FAILURE;
             }
         };
-        if !holds_baseline(rate, baseline) {
-            eprintln!(
-                "TCK pass rate {} is below the baseline {} (tck-baseline.txt)",
-                format_rate(rate),
-                format_rate(baseline)
-            );
+        if let Err(e) = check_baseline(rate, strict, &baseline) {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
-        if format_rate(rate) != format_rate(baseline) {
+        let rose = format_rate(rate) != format_rate(baseline.rate)
+            || format_rate(strict) != format_rate(baseline.strict);
+        if rose {
             println!(
-                "TCK pass rate rose: {} -> {}. Raise tck-baseline.txt to {} in a change of its own \
+                "TCK pass rates rose: {} -> {}, strict {} -> {}. Raise tck-baseline.txt in a change of its own \
                  (cargo run --release -p tck-runner -- --update-baseline).",
-                format_rate(baseline),
+                format_rate(baseline.rate),
                 format_rate(rate),
-                format_rate(rate)
+                format_rate(baseline.strict),
+                format_rate(strict)
             );
         } else {
-            println!("TCK pass rate {} holds the baseline", format_rate(rate));
+            println!(
+                "TCK pass rate {} and strict rate {} hold the baseline",
+                format_rate(rate),
+                format_rate(strict)
+            );
         }
     }
     ExitCode::SUCCESS

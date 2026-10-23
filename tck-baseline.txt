@@ -1,3 +1,10 @@
-# The openCypher TCK pass rate CI holds: passed / (passed + failed).
-# Raise it in the change that raises the rate: cargo run --release -p tck-runner -- --update-baseline
+# The openCypher TCK pass rates CI holds; neither may fall.
+# Line 1: passed / (passed + failed). `strict`: the same, counting a scenario
+# that expects an error as passed only when the error came from the phase
+# the TCK names (see docs/site/conformance.md).
+# Raise them in the change that raises the rates:
+#   cargo run --release -p tck-runner -- --update-baseline
+# A change that adds or edits a skip rule says, beside the new rates, how
+# many scenarios the rule moved: a skip changes the denominator.
 0.2142
+strict 0.1730

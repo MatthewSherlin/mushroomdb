@@ -101,6 +101,33 @@ pub struct RaisedError {
     pub engine_message: String,
 }
 
+/// The engine stage an error message names: `lex`, `parse`, `plan`,
+/// `execute`, or `other`.
+pub fn error_stage(message: &str) -> &'static str {
+    let m = message.strip_prefix("query error: ").unwrap_or(message);
+    for stage in ["lex", "parse", "plan", "execute"] {
+        if m.starts_with(stage) && m[stage.len()..].starts_with(':') {
+            return stage;
+        }
+    }
+    "other"
+}
+
+/// Whether the engine raised the error in the phase the TCK names: a
+/// `compile time` error from lexing, parsing or planning, a `runtime` error
+/// from execution, an `any time` error from either. An error that passes
+/// only because some error was raised (a parse error for an unsupported
+/// construct where the TCK expects a runtime `TypeError`) does not match.
+pub fn error_phase_matches(raised: &RaisedError) -> bool {
+    let stage = error_stage(&raised.engine_message);
+    match raised.expected_phase.as_str() {
+        "compile time" => matches!(stage, "lex" | "parse" | "plan"),
+        "runtime" => stage == "execute",
+        "any time" => stage != "other",
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Pass(Option<RaisedError>),
@@ -158,9 +185,14 @@ pub fn run_scenario(scenario: &Scenario, db_factory: &dyn Fn() -> TempGraph) -> 
     }));
     match run {
         Ok(Outcome::Fail(mut failures)) => {
+            // Only the failure the decision explains is relabelled: a
+            // scenario that fails for any other reason keeps its own group.
             if let Some(label) = ruled_deviation(scenario) {
                 if let Some(first) = failures.first_mut() {
-                    first.group = format!("ruled deviation: {label}");
+                    if first.group.starts_with("expected ") && first.group.ends_with(" not raised")
+                    {
+                        first.group = format!("ruled deviation: {label}");
+                    }
                 }
             }
             Outcome::Fail(failures)
@@ -673,5 +705,39 @@ mod tests {
         assert_eq!(fx.get("+nodes"), Some(&2));
         assert_eq!(fx.get("+relationships"), Some(&1));
         assert_eq!(fx.get("+labels"), Some(&2));
+    }
+
+    fn raised(phase: &str, message: &str) -> RaisedError {
+        RaisedError {
+            expected_type: "SyntaxError".into(),
+            expected_phase: phase.into(),
+            engine_message: message.into(),
+        }
+    }
+
+    #[test]
+    fn an_error_matches_only_in_the_phase_the_tck_names() {
+        assert!(error_phase_matches(&raised(
+            "compile time",
+            "query error: parse: x"
+        )));
+        assert!(error_phase_matches(&raised("compile time", "lex: x")));
+        assert!(!error_phase_matches(&raised(
+            "compile time",
+            "query error: execute: x"
+        )));
+        assert!(error_phase_matches(&raised(
+            "runtime",
+            "query error: execute: x"
+        )));
+        assert!(!error_phase_matches(&raised(
+            "runtime",
+            "query error: parse: x"
+        )));
+        assert!(error_phase_matches(&raised(
+            "any time",
+            "query error: plan: x"
+        )));
+        assert!(!error_phase_matches(&raised("runtime", "something else")));
     }
 }

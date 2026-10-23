@@ -2,8 +2,8 @@
 //! table, both built from one TCK run.
 
 use crate::feature::Scenario;
-use crate::runner::{run_query, Outcome, TempGraph};
-use crate::{format_rate, pass_rate, tally};
+use crate::runner::{error_stage, run_query, Outcome, TempGraph};
+use crate::{format_rate, pass_rate, strict_passes, tally};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -112,17 +112,6 @@ fn md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-/// The engine stage an error message names (`parse`, `execute`, …).
-fn error_stage(message: &str) -> &'static str {
-    let m = message.strip_prefix("query error: ").unwrap_or(message);
-    for stage in ["lex", "parse", "plan", "execute"] {
-        if m.starts_with(stage) && m[stage.len()..].starts_with(':') {
-            return stage;
-        }
-    }
-    "other"
-}
-
 /// The conformance page. `functions` is the function table, when one was
 /// built, placed under its own heading.
 pub fn conformance_page(
@@ -177,6 +166,40 @@ pub fn conformance_page(
         "| Pass rate | {} (`{}`) |\n",
         percent(rate),
         format_rate(rate)
+    );
+    let error_passes = outcomes
+        .iter()
+        .filter(|o| matches!(o, Outcome::Pass(Some(_))))
+        .count();
+    let strict = strict_passes(outcomes);
+    let matched = strict - (passed - error_passes);
+    let strict_rate = pass_rate(strict, passed + failed - strict);
+    let _ = writeln!(
+        p,
+        "A scenario that expects an error passes on any error, so the pass rate counts \
+         two kinds of pass. The strict rate counts only the passes that checked a result, \
+         plus the error passes whose error came from the phase the TCK names (compile \
+         time: the lexer, parser or planner; runtime: execution). CI holds both rates \
+         to `tck-baseline.txt`.\n"
+    );
+    let _ = writeln!(p, "| Pass | Scenarios |\n|---|---|");
+    let _ = writeln!(
+        p,
+        "| Checked a result or side effects | {} |",
+        passed - error_passes
+    );
+    let _ = writeln!(p, "| Raised an error the TCK expects | {error_passes} |");
+    let _ = writeln!(p, "| … in the phase the TCK names | {matched} |");
+    let _ = writeln!(
+        p,
+        "| … in another phase (any error accepted) | {} |",
+        error_passes - matched
+    );
+    let _ = writeln!(
+        p,
+        "| Strict pass rate | {} (`{}`) |\n",
+        percent(strict_rate),
+        format_rate(strict_rate)
     );
 
     let _ = writeln!(p, "## By area\n");

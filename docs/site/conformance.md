@@ -18,6 +18,16 @@ mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every 
 | Total | 3897 |
 | Pass rate | 21.4% (`0.2142`) |
 
+A scenario that expects an error passes on any error, so the pass rate counts two kinds of pass. The strict rate counts only the passes that checked a result, plus the error passes whose error came from the phase the TCK names (compile time: the lexer, parser or planner; runtime: execution). CI holds both rates to `tck-baseline.txt`.
+
+| Pass | Scenarios |
+|---|---|
+| Checked a result or side effects | 471 |
+| Raised an error the TCK expects | 241 |
+| … in the phase the TCK names | 104 |
+| … in another phase (any error accepted) | 137 |
+| Strict pass rate | 17.3% (`0.1730`) |
+
 ## By area
 
 | Area | Passed | Failed | Skipped | Pass rate |
