@@ -1,7 +1,7 @@
 //! Nodes, relationships and paths as Bolt structures, and a write's counters.
 //!
 //! The engine marks a result column that is a bare node, relationship or path
-//! variable, and — because the Bolt layer runs every statement inside
+//! variable, or a list of them (`collect(n)`, `[a, b]`, `p.nodes`), and — because the Bolt layer runs every statement inside
 //! [`mushroomdb::with_entity_detail`] — hands over the element behind each
 //! cell. This module writes those elements the way the negotiated version
 //! spells them:
@@ -25,11 +25,17 @@
 //!
 //! Renaming a node gives it a new key and so a new element id.
 //!
-//! **Integer ids** (`id`, `start_id`, `end_id`) are a 63-bit FNV-1a hash of
-//! the element id: stable like the element id, the same for the same element
-//! in every result, never negative. Distinct elements could share one by
-//! collision (about one chance in 2^31 among 65,000 elements); a client that
-//! needs certainty reads the element id.
+//! **Integer ids** all fit in 53 bits, so a JavaScript number holds them
+//! exactly:
+//!
+//! - a node's `id` (and a relationship's `start_id` / `end_id`) is the node's
+//!   dense id in the store: assigned once, never reused after a delete, kept
+//!   across a rename, below 2^32;
+//! - a relationship's `id` is a 53-bit FNV-1a hash of its element id: the
+//!   same for the same relationship in every result. Two relationships could
+//!   share one (about one chance in 2^21 among 65,000 relationships); compare
+//!   element ids when that matters. Node and relationship ids are separate
+//!   namespaces.
 //!
 //! **Labels** are the node's one label (0.10 nodes have exactly one).
 //!
@@ -63,28 +69,43 @@ pub fn relationship_element_id(rel_type: &str, start: &str, end: &str) -> String
     format!("r:{}|{}|{}", escape(rel_type), escape(start), escape(end))
 }
 
-/// The integer id Bolt carries beside an element id: FNV-1a over its bytes,
-/// the top bit cleared so it is never negative.
-pub fn integer_id(element_id: &str) -> i64 {
+/// The largest integer a JavaScript number holds exactly: 2^53 - 1.
+pub const MAX_SAFE_ID: i64 = (1 << 53) - 1;
+
+/// A relationship's integer id: FNV-1a over its element id, kept to 53 bits.
+pub fn relationship_id(element_id: &str) -> i64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0000_01b3;
     let hash = element_id
         .bytes()
         .fold(OFFSET, |h, b| (h ^ u64::from(b)).wrapping_mul(PRIME));
-    (hash & (i64::MAX as u64)) as i64
+    (hash & MAX_SAFE_ID as u64) as i64
 }
 
-/// `entity` as its Bolt structure. `depth` is the nesting the structure sits
-/// at, for the property values' depth check.
-pub fn pack_entity(
-    entity: &Entity,
+/// One result cell: its graph element as a Bolt structure (a list column as a
+/// list of them), else its value. `depth` is the nesting the cell sits at, for
+/// the depth check.
+pub fn pack_cell(
+    entity: Option<&Entity>,
+    value: Option<&Value>,
     version: (u8, u8),
     depth: usize,
 ) -> Result<PackValue, BoltError> {
-    Ok(match entity {
-        Entity::Node(node) => pack_node(node, version, depth)?,
-        Entity::Relationship(rel) => pack_relationship(rel, version, depth)?,
-        Entity::Path(path) => pack_path(path, version, depth)?,
+    Ok(match (entity, value) {
+        (Some(Entity::Node(node)), _) => pack_node(node, version, depth)?,
+        (Some(Entity::Relationship(rel)), _) => pack_relationship(rel, version, depth)?,
+        (Some(Entity::Path(path)), _) => pack_path(path, version, depth)?,
+        (Some(Entity::List(items)), Some(Value::List(values))) if items.len() == values.len() => {
+            PackValue::List(
+                items
+                    .iter()
+                    .zip(values)
+                    .map(|(item, v)| pack_cell(item.as_ref(), Some(v), version, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            )
+        }
+        (_, Some(value)) => pack_value(value, version, depth)?,
+        (_, None) => PackValue::Null,
     })
 }
 
@@ -104,7 +125,7 @@ fn properties(
 fn pack_node(node: &NodeEntity, version: (u8, u8), depth: usize) -> Result<PackValue, BoltError> {
     let element_id = node_element_id(&node.key);
     let mut fields = vec![
-        PackValue::Int(integer_id(&element_id)),
+        PackValue::Int(i64::from(node.id)),
         PackValue::List(vec![PackValue::String(node.label.clone())]),
         properties(&node.properties, version, depth + 1)?,
     ];
@@ -122,9 +143,9 @@ fn pack_relationship(
     let element_id = relationship_element_id(&rel.rel_type, &rel.start, &rel.end);
     let (start, end) = (node_element_id(&rel.start), node_element_id(&rel.end));
     let mut fields = vec![
-        PackValue::Int(integer_id(&element_id)),
-        PackValue::Int(integer_id(&start)),
-        PackValue::Int(integer_id(&end)),
+        PackValue::Int(relationship_id(&element_id)),
+        PackValue::Int(i64::from(rel.start_id)),
+        PackValue::Int(i64::from(rel.end_id)),
         PackValue::String(rel.rel_type.clone()),
         properties(&rel.properties, version, depth + 1)?,
     ];
@@ -145,7 +166,7 @@ fn pack_unbound(
 ) -> Result<PackValue, BoltError> {
     let element_id = relationship_element_id(&rel.rel_type, &rel.start, &rel.end);
     let mut fields = vec![
-        PackValue::Int(integer_id(&element_id)),
+        PackValue::Int(relationship_id(&element_id)),
         PackValue::String(rel.rel_type.clone()),
         properties(&rel.properties, version, depth + 1)?,
     ];
@@ -244,8 +265,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// The dense id the fixtures give a key.
+    fn id_of(key: &str) -> u32 {
+        ["ada", "bob", "cam"]
+            .iter()
+            .position(|k| *k == key)
+            .unwrap() as u32
+    }
+
     fn node(key: &str) -> NodeEntity {
         NodeEntity {
+            id: id_of(key),
             key: key.into(),
             label: "P".into(),
             properties: BTreeMap::from([("name".to_string(), Value::Str(key.to_uppercase()))]),
@@ -257,8 +287,18 @@ mod tests {
             rel_type: t.into(),
             start: start.into(),
             end: end.into(),
+            start_id: id_of(start),
+            end_id: id_of(end),
             properties: BTreeMap::from([("w".to_string(), Value::Int(1))]),
         }
+    }
+
+    fn pack_entity(
+        entity: &Entity,
+        version: (u8, u8),
+        depth: usize,
+    ) -> Result<PackValue, BoltError> {
+        pack_cell(Some(entity), None, version, depth)
     }
 
     fn fields(v: &PackValue) -> (u8, &[PackValue]) {
@@ -269,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn element_ids_are_unambiguous_and_integer_ids_are_stable_and_non_negative() {
+    fn element_ids_are_unambiguous_and_relationship_ids_are_stable_and_js_safe() {
         assert_eq!(node_element_id("ada"), "n:ada");
         assert_eq!(
             relationship_element_id("KNOWS", "ada", "bob"),
@@ -284,11 +324,20 @@ mod tests {
             relationship_element_id("T", "a|b\\", "c"),
             "r:T|a\\|b\\\\|c"
         );
-        for id in ["n:ada", "n:bob", "r:KNOWS|ada|bob", ""] {
-            assert_eq!(integer_id(id), integer_id(id));
-            assert!(integer_id(id) >= 0);
+        assert_eq!(relationship_id("r:K|a|b"), relationship_id("r:K|a|b"));
+        assert_ne!(relationship_id("r:K|a|b"), relationship_id("r:K|b|a"));
+        // Every id fits a JavaScript number exactly.
+        for i in 0..10_000 {
+            let id = relationship_id(&relationship_element_id("T", &format!("k{i}"), "z"));
+            assert!((0..=MAX_SAFE_ID).contains(&id), "{id}");
         }
-        assert_ne!(integer_id("n:ada"), integer_id("n:bob"));
+        assert_eq!(MAX_SAFE_ID, 9_007_199_254_740_991);
+        let top = NodeEntity {
+            id: u32::MAX,
+            ..node("ada")
+        };
+        let packed = pack_entity(&Entity::Node(top), (5, 0), 1).unwrap();
+        assert!(matches!(fields(&packed).1[0], PackValue::Int(n) if n <= MAX_SAFE_ID));
     }
 
     #[test]
@@ -297,7 +346,7 @@ mod tests {
         let (tag, f) = fields(&packed);
         assert_eq!(tag, 0x4E);
         assert_eq!(f.len(), 4);
-        assert_eq!(f[0], PackValue::Int(integer_id("n:ada")));
+        assert_eq!(f[0], PackValue::Int(0), "the dense id");
         assert_eq!(f[1], PackValue::List(vec![PackValue::String("P".into())]));
         assert_eq!(
             f[2],
@@ -314,8 +363,9 @@ mod tests {
         let (tag, f) = fields(&packed);
         assert_eq!(tag, 0x52);
         assert_eq!(f.len(), 8);
-        assert_eq!(f[1], PackValue::Int(integer_id("n:ada")));
-        assert_eq!(f[2], PackValue::Int(integer_id("n:bob")));
+        assert_eq!(f[0], PackValue::Int(relationship_id("r:K|ada|bob")));
+        assert_eq!(f[1], PackValue::Int(0), "ada's dense id");
+        assert_eq!(f[2], PackValue::Int(1), "bob's dense id");
         assert_eq!(f[3], PackValue::String("K".into()));
         assert_eq!(f[5], PackValue::String("r:K|ada|bob".into()));
         assert_eq!(f[6], PackValue::String("n:ada".into()));
@@ -383,6 +433,23 @@ mod tests {
                 ("properties-set".into(), PackValue::Int(3)),
                 ("labels-added".into(), PackValue::Int(2)),
             ])
+        );
+    }
+
+    #[test]
+    fn a_list_cell_packs_each_element_and_keeps_a_null_element() {
+        let entity = Entity::List(vec![Some(Entity::Node(node("ada"))), None]);
+        let value = Value::List(vec![Value::Str("ada".into()), Value::Null]);
+        let packed = pack_cell(Some(&entity), Some(&value), (5, 0), 1).unwrap();
+        let PackValue::List(items) = packed else {
+            panic!("{packed:?}")
+        };
+        assert_eq!(fields(&items[0]).0, 0x4E);
+        assert_eq!(items[1], PackValue::Null);
+        // A cell with no entity is its value.
+        assert_eq!(
+            pack_cell(None, Some(&Value::Int(3)), (5, 0), 1).unwrap(),
+            PackValue::Int(3)
         );
     }
 }

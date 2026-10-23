@@ -3360,7 +3360,8 @@ fn resolve_operand(
         },
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
         Operand::Var(name) => {
-            // Bare variable reference: resolve from Cell (scalar alias or node key).
+            // Bare variable reference: resolve from Cell (scalar alias, node
+            // key, relationship map).
             match vars
                 .slot(name)
                 .and_then(|s| row.get(s))
@@ -3372,7 +3373,7 @@ fn resolve_operand(
                     None => Ok(None),
                 },
                 Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
-                Some(Cell::Rel(_)) => Err(format!("variable `{name}` is a relationship")),
+                Some(Cell::Rel(e)) => Ok(Some(rel_value(view, e))),
                 None => Ok(None),
             }
         }
@@ -4685,7 +4686,7 @@ fn update_acc(
         }
         (AggFunc::Collect, AggArg::Var(v)) => {
             // Gather each row's value of `v` — node → key, scalar alias → value,
-            // path → hop count. Nulls (unbound / relationship) are skipped.
+            // path → hop count, relationship → its map. Nulls are skipped.
             let val = vars
                 .slot(v)
                 .and_then(|s| row.get(s))
@@ -4694,7 +4695,7 @@ fn update_acc(
                     Cell::Scalar(x) => Some(x.clone()),
                     Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                     Cell::Path(h) => Some(Value::Int(*h as i64)),
-                    Cell::Rel(_) => None,
+                    Cell::Rel(e) => Some(rel_value(view, e)),
                 });
             if let Some(val) = val {
                 if let AggAcc::Collect(items) = acc {

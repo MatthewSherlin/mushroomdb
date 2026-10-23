@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bolt::connection::Connection;
-use bolt::messages::graph::{integer_id, node_element_id, relationship_element_id};
+use bolt::messages::graph::{node_element_id, relationship_element_id, MAX_SAFE_ID};
 use bolt::messages::hello::{AuthToken, Hello, TokenAuthenticator};
 use bolt::messages::{ClientMessage, MessageKind, ServerMessage};
 use bolt::packstream::{PackStruct, PackValue};
@@ -151,7 +151,11 @@ fn return_n_is_a_node_structure_in_bolt_5_and_4_4() {
     let node = structure(&rows[0][0]);
     assert_eq!(node.tag, 0x4E);
     assert_eq!(node.fields.len(), 4);
-    assert_eq!(node.fields[0], PackValue::Int(integer_id("n:ada")));
+    assert!(
+        matches!(node.fields[0], PackValue::Int(id) if (0..=MAX_SAFE_ID).contains(&id)),
+        "a node id fits a JavaScript number: {:?}",
+        node.fields[0]
+    );
     assert_eq!(node.fields[1], PackValue::List(vec![s("Person")]));
     assert_eq!(map_get(&node.fields[2], "name"), Some(&s("Ada")));
     assert_eq!(map_get(&node.fields[2], "age"), Some(&PackValue::Int(36)));
@@ -316,4 +320,70 @@ fn a_write_success_carries_its_counters() {
         map_get(stats(&meta).unwrap(), "nodes-created"),
         Some(&int(1))
     );
+}
+
+#[test]
+fn lists_of_nodes_relationships_and_paths_are_lists_of_structures() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+    let tags = |v: &PackValue| -> Vec<u8> {
+        match v {
+            PackValue::List(items) => items.iter().map(|i| structure(i).tag).collect(),
+            other => panic!("not a list: {other:?}"),
+        }
+    };
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a {id: 'ada'})-[:KNOWS]->(b) RETURN a, collect(b) AS friends",
+    );
+    assert_eq!(tags(&rows[0][1]), [0x4E]);
+    let PackValue::List(friends) = &rows[0][1] else {
+        panic!()
+    };
+    assert_eq!(
+        map_get(&structure(&friends[0]).fields[2], "name"),
+        Some(&s("Bob"))
+    );
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a)-[r:KNOWS]->(b) RETURN collect(r) AS rs",
+    );
+    assert_eq!(tags(&rows[0][0]), [0x52]);
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH p = (a {id: 'ada'})-[:KNOWS]->(b) RETURN p.nodes AS ns, p.relationships AS rs, [a, b] AS pair",
+    );
+    assert_eq!(tags(&rows[0][0]), [0x4E, 0x4E]);
+    assert_eq!(tags(&rows[0][1]), [0x52]);
+    assert_eq!(tags(&rows[0][2]), [0x4E, 0x4E]);
+    // A list of values is unchanged.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n:Person) RETURN collect(n.name) AS names",
+    );
+    assert!(
+        matches!(&rows[0][0], PackValue::List(items) if items.iter().all(|i| matches!(i, PackValue::String(_))))
+    );
+}
+
+#[test]
+fn match_set_return_r_is_a_relationship_and_ddl_is_query_type_s() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) SET a.seen = true RETURN r",
+    );
+    assert_eq!(structure(&rows[0][0]).tag, 0x52);
+    let query_type = |meta: &[(String, PackValue)]| {
+        meta.iter()
+            .find(|(k, _)| k == "type")
+            .map(|(_, v)| v.clone())
+    };
+    let (_, meta) = query(&mut conn, "CREATE INDEX p_name FOR (n:Person) ON (n.name)");
+    assert_eq!(query_type(&meta), Some(s("s")));
+    let (_, meta) = query(&mut conn, "MATCH (n {id: 'ada'}) SET n.x = 1");
+    assert_eq!(query_type(&meta), Some(s("w")));
+    let (_, meta) = query(&mut conn, "MATCH (n) RETURN n.id");
+    assert_eq!(query_type(&meta), Some(s("r")));
 }

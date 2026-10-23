@@ -1202,6 +1202,11 @@ pub(crate) fn rel_type_alias(var: &str) -> String {
     format!("__rt_{var}")
 }
 
+/// The read-part column that holds relationship `var` itself.
+pub(crate) fn rel_value_alias(var: &str) -> String {
+    format!("__rv_{var}")
+}
+
 fn ret_column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
@@ -1287,14 +1292,18 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
         Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
-        Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
-            detail: format!("missing parameter `{name}`"),
-        }).map(core_query::value_ops::element),
-        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
-            detail: format!(
-                "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
-            ),
-        }),
+        Operand::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GraphError::QueryError {
+                detail: format!("missing parameter `{name}`"),
+            })
+            .map(core_query::value_ops::element),
+        // The relationship as the read part captured it: its
+        // `{type, start, end}` map.
+        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => {
+            Ok(match_rs.get(row, &rel_value_alias(name)).cloned())
+        }
         Operand::Var(name) => Ok(match_rs.get(row, name).cloned()),
         Operand::Prop { var, field } => {
             if rel_vars.iter().any(|r| r == var) {
@@ -13676,7 +13685,13 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            let view = self.view();
+            // Masked for a role-scoped write, as the MERGE and MATCH … SET
+            // projections are.
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
             return execute(&view, &ops, &Params(params))
                 .map(|rs| finish_result(&view, rs).with_stats(stats))
                 .map_err(|e| GraphError::QueryError {

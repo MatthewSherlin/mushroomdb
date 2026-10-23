@@ -22,7 +22,7 @@
 //! all of them without a second copy of each signature. A caller that never
 //! sets it — HTTP, Python, the CLI — gets results byte-identical to before.
 
-use crate::cypher::ast::{ret_val_label, RetItem, RetVal};
+use crate::cypher::ast::{ret_val_label, AggArg, AggFunc, Operand, RetItem, RetVal};
 use crate::cypher::plan::PlanOp;
 use crate::result::{Entity, EntityKind, NodeEntity, PathEntity, RelationshipEntity, ResultSet};
 use crate::view::GraphView;
@@ -103,6 +103,7 @@ impl NodeCache {
             .node_id(key)
             .filter(|id| view.visible(*id))
             .map(|id| NodeEntity {
+                id,
                 key: key.to_owned(),
                 label: view.label_of(id).unwrap_or_default().to_owned(),
                 properties: view.props.props_of(id),
@@ -125,6 +126,17 @@ fn resolve(
         },
         EntityKind::Relationship => relationship(view, value, cache).map(Entity::Relationship),
         EntityKind::Path => path(view, value, cache).map(Entity::Path),
+        EntityKind::NodeList | EntityKind::RelationshipList | EntityKind::PathList => {
+            let (Value::List(items), Some(element)) = (value, kind.element()) else {
+                return None;
+            };
+            Some(Entity::List(
+                items
+                    .iter()
+                    .map(|item| resolve(view, element, item, cache))
+                    .collect(),
+            ))
+        }
     }
 }
 
@@ -154,6 +166,8 @@ fn relationship(
         rel_type: rel_type.to_owned(),
         start: start.to_owned(),
         end: end.to_owned(),
+        start_id: src,
+        end_id: dst,
         properties: view.edge_props.props_of(etype, src, dst),
     })
 }
@@ -190,7 +204,9 @@ fn path(view: &GraphView, value: &Value, cache: &mut NodeCache) -> Option<PathEn
 
 /// The [`EntityKind`] of each column `plan` returns: a RETURN item (or a
 /// grouping key) that is a bare variable bound to a node, a relationship or a
-/// named path. Variables are followed through every clause that rebinds the
+/// named path, or a list of them: `collect(v)` of such a variable, a list
+/// literal of variables of one kind (`[a, b]`), and a path's `.nodes` and
+/// `.relationships`. Variables are followed through every clause that rebinds the
 /// scope: a `WITH` keeps only its items (an alias of a bare variable keeps the
 /// variable's kind), a grouping keeps its keys, an `UNWIND` alias is a value.
 /// A variable-length relationship variable is no relationship (it renders as
@@ -259,13 +275,20 @@ fn bind_ops(
                     .iter()
                     .map(|(_, item)| item_kind(item, scope))
                     .collect();
-                *scope = keys
+                let agg_kinds: Vec<Option<EntityKind>> = aggs
                     .iter()
-                    .zip(&key_kinds)
-                    .filter_map(|((col, _), kind)| kind.map(|k| (col.clone(), k)))
+                    .map(|(func, arg, _)| agg_kind(func, arg, scope))
                     .collect();
+                let mut next: HashMap<String, EntityKind> = keys
+                    .iter()
+                    .map(|(col, _)| col)
+                    .chain(aggs.iter().map(|(_, _, col)| col))
+                    .zip(key_kinds.iter().chain(&agg_kinds))
+                    .filter_map(|(col, kind)| kind.map(|k| (col.clone(), k)))
+                    .collect();
+                std::mem::swap(scope, &mut next);
                 *out = key_kinds;
-                out.extend(aggs.iter().map(|_| None));
+                out.extend(agg_kinds);
             }
             PlanOp::Unwind { alias, .. } => {
                 scope.remove(alias);
@@ -277,7 +300,7 @@ fn bind_ops(
             PlanOp::Project { items } => {
                 *out = items.iter().map(|item| item_kind(item, scope)).collect();
             }
-            PlanOp::Aggregate { .. } => *out = vec![None],
+            PlanOp::Aggregate { func, arg, .. } => *out = vec![agg_kind(func, arg, scope)],
             PlanOp::Filter { .. }
             | PlanOp::Distinct
             | PlanOp::OrderBy { .. }
@@ -304,7 +327,67 @@ fn carried<'a>(
 
 fn item_kind(item: &RetItem, scope: &HashMap<String, EntityKind>) -> Option<EntityKind> {
     match &item.value {
-        RetVal::Var(v) => scope.get(v).copied(),
+        RetVal::Prop { var, field } => path_part_kind(var, field, scope),
+        RetVal::Agg { func, arg } => agg_kind(func, arg, scope),
+        other => operand_kind(&ret_val_operand(other)?, scope),
+    }
+}
+
+/// `RetVal` as the operand it computes, for the forms that have a kind.
+fn ret_val_operand(value: &RetVal) -> Option<Operand> {
+    match value {
+        RetVal::Var(v) => Some(Operand::Var(v.clone())),
+        RetVal::ScalarExpr(op) => Some(op.clone()),
+        _ => None,
+    }
+}
+
+fn operand_kind(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<EntityKind> {
+    match op {
+        Operand::Var(v) => scope.get(v).copied(),
+        Operand::Prop { var, field } => path_part_kind(var, field, scope),
+        // `[a, b]`: a list of variables that all hold elements of one kind.
+        Operand::ListLit(items) if !items.is_empty() => {
+            let mut kinds = items.iter().map(|item| match item {
+                Operand::Var(v) => scope.get(v).copied(),
+                _ => None,
+            });
+            let first = kinds.next()??;
+            kinds
+                .all(|k| k == Some(first))
+                .then(|| first.list_of())
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// `p.nodes` and `p.relationships` of a path variable.
+fn path_part_kind(
+    var: &str,
+    field: &str,
+    scope: &HashMap<String, EntityKind>,
+) -> Option<EntityKind> {
+    match (scope.get(var), field) {
+        (Some(EntityKind::Path), "nodes") => Some(EntityKind::NodeList),
+        (Some(EntityKind::Path), "relationships") => Some(EntityKind::RelationshipList),
+        _ => None,
+    }
+}
+
+/// `collect(v)` / `collect(DISTINCT v)` of a node, relationship or path
+/// variable is a list of them; no other aggregate has a kind.
+fn agg_kind(
+    func: &AggFunc,
+    arg: &AggArg,
+    scope: &HashMap<String, EntityKind>,
+) -> Option<EntityKind> {
+    if !matches!(func, AggFunc::Collect) {
+        return None;
+    }
+    match arg {
+        AggArg::Var(v) => scope.get(v)?.list_of(),
+        AggArg::Distinct(inner) => agg_kind(func, inner, scope),
         _ => None,
     }
 }

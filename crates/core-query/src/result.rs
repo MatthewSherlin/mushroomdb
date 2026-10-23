@@ -1,9 +1,10 @@
 use core_storage::Value;
 use std::collections::BTreeMap;
 
-/// What a result column holds when it is a bare graph variable: `RETURN n`,
-/// `RETURN r`, `RETURN p`. Any other column (a property, an expression, an
-/// aggregate, a value alias) has no kind.
+/// What a result column holds when it is a bare graph variable (`RETURN n`,
+/// `RETURN r`, `RETURN p`) or a list of them (`collect(n)`, `[a, b]`,
+/// `p.nodes`, `p.relationships`). Any other column (a property, an
+/// expression, any other aggregate, a value alias) has no kind.
 ///
 /// The column's values are rendered as every surface has always seen them —
 /// a node as its key string, a relationship as a `{type, start, end}` map, a
@@ -16,11 +17,43 @@ pub enum EntityKind {
     Node,
     Relationship,
     Path,
+    /// A list of nodes, each rendered as its key.
+    NodeList,
+    /// A list of relationships, each rendered as its map.
+    RelationshipList,
+    /// A list of paths, each rendered as its map.
+    PathList,
+}
+
+impl EntityKind {
+    /// The kind of a list of elements of this kind; `None` for a list of
+    /// lists, which has no kind.
+    pub fn list_of(self) -> Option<EntityKind> {
+        match self {
+            EntityKind::Node => Some(EntityKind::NodeList),
+            EntityKind::Relationship => Some(EntityKind::RelationshipList),
+            EntityKind::Path => Some(EntityKind::PathList),
+            _ => None,
+        }
+    }
+
+    /// The kind of one element, for a list kind.
+    pub fn element(self) -> Option<EntityKind> {
+        match self {
+            EntityKind::NodeList => Some(EntityKind::Node),
+            EntityKind::RelationshipList => Some(EntityKind::Relationship),
+            EntityKind::PathList => Some(EntityKind::Path),
+            _ => None,
+        }
+    }
 }
 
 /// A node as it stood when the query read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeEntity {
+    /// The node's dense id: assigned once, never reused after a delete, and
+    /// kept across a rename.
+    pub id: u32,
     pub key: String,
     pub label: String,
     /// The node's properties as the query's view saw them (a role-scoped
@@ -35,6 +68,9 @@ pub struct RelationshipEntity {
     pub rel_type: String,
     pub start: String,
     pub end: String,
+    /// The dense ids of the start and end nodes.
+    pub start_id: u32,
+    pub end_id: u32,
     pub properties: BTreeMap<String, Value>,
 }
 
@@ -52,6 +88,9 @@ pub enum Entity {
     Node(NodeEntity),
     Relationship(RelationshipEntity),
     Path(PathEntity),
+    /// The elements of a list column, one per list element; `None` for an
+    /// element that is not one (a null).
+    List(Vec<Option<Entity>>),
 }
 
 /// What a write statement changed, counted per effect: the numbers a client
@@ -251,6 +290,7 @@ mod tests {
         rs.set_column_kinds(vec![Some(EntityKind::Node)]);
         assert_eq!(rs.column_kinds(), &[Some(EntityKind::Node), None]);
         let node = Entity::Node(NodeEntity {
+            id: 0,
             key: "k".into(),
             label: "L".into(),
             properties: Default::default(),

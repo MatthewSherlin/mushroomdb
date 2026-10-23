@@ -38,7 +38,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mushroomdb::{
-    is_write_query, with_entity_detail, GraphError, ResultSet, SharedDb, Transaction, Value,
+    is_schema_query, is_write_query, with_entity_detail, GraphError, ResultSet, SharedDb,
+    Transaction, Value,
 };
 
 use super::graph;
@@ -354,11 +355,11 @@ impl QueryService {
             }
         };
         let result = result?;
-        Ok(Box::new(RowCursor::new(
-            result,
-            is_write,
-            Some(format_bookmark(seq)),
-        )))
+        // A statement that changes the schema reports query type `s`.
+        let schema = is_write && is_schema_query(&request.query).unwrap_or(false);
+        Ok(Box::new(
+            RowCursor::new(result, is_write, Some(format_bookmark(seq))).with_schema(schema),
+        ))
     }
 
     /// Runs `request` inside `tx`. A scoped identity's `tx` is the
@@ -479,6 +480,8 @@ pub struct RowCursor {
     /// The statement was an auto-commit write, already durable when its rows
     /// are pulled.
     committed: bool,
+    /// The statement changed the schema: its query type is `s`, not `w`.
+    schema: bool,
 }
 
 impl RowCursor {
@@ -493,7 +496,15 @@ impl RowCursor {
             opened: Instant::now(),
             max_len: MAX_PACK_LEN,
             committed,
+            schema: false,
         }
+    }
+
+    /// Marks a statement that changed the schema, so its summary's query
+    /// type is `s`.
+    pub fn with_schema(mut self, schema: bool) -> Self {
+        self.schema = schema;
+        self
     }
 
     /// Lowers the size limit a value is checked against. The real limit is
@@ -542,10 +553,8 @@ impl ResultCursor for RowCursor {
                 .row(index)
                 .iter()
                 .enumerate()
-                .map(|(col, cell)| match (self.result.entity(index, col), cell) {
-                    (Some(entity), _) => graph::pack_entity(entity, version, 0),
-                    (None, Some(value)) => pack_value(value, version, 0),
-                    (None, None) => Ok(PackValue::Null),
+                .map(|(col, cell)| {
+                    graph::pack_cell(self.result.entity(index, col), cell.as_ref(), version, 0)
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| self.committed_note(err))?;
@@ -570,7 +579,14 @@ impl ResultCursor for RowCursor {
         let mut meta = vec![
             (
                 "type".to_string(),
-                PackValue::String(if self.is_write { "w" } else { "r" }.into()),
+                PackValue::String(
+                    match (self.schema, self.is_write) {
+                        (true, _) => "s",
+                        (false, true) => "w",
+                        (false, false) => "r",
+                    }
+                    .into(),
+                ),
             ),
             (
                 "t_last".to_string(),

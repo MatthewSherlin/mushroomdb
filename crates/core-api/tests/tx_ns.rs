@@ -371,3 +371,64 @@ fn row_150_merge_set_items_are_counted_in_properties_set() {
     }
     tx.commit().unwrap();
 }
+
+#[test]
+fn a_node_keeps_its_dense_id_across_a_rename_and_ids_are_never_reused() {
+    let mut db = graph("ids");
+    let id_of = |db: &GraphDb, key: &str| -> u32 {
+        let rs = with_entity_detail(|| {
+            db.query(&format!("MATCH (n {{id: '{key}'}}) RETURN n"), &none())
+        })
+        .unwrap();
+        node_at(&rs, 0, 0).id
+    };
+    let before = id_of(&db, "bob");
+    db.rename_node("bob", "robert").unwrap();
+    assert_eq!(id_of(&db, "robert"), before, "a rename keeps the id");
+    write(&mut db, "MATCH (n {id: 'robert'}) DETACH DELETE n");
+    write(&mut db, "CREATE (:Person {id: 'bob'})");
+    assert_ne!(
+        id_of(&db, "bob"),
+        before,
+        "a deleted node's id is not reused"
+    );
+}
+
+#[test]
+fn match_set_return_r_returns_the_relationship() {
+    let mut db = graph("set-return-r");
+    let rs = with_entity_detail(|| {
+        db.query_write(
+            "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) SET a.seen = true RETURN r, a",
+            &none(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        rs.column_kinds(),
+        &[Some(EntityKind::Relationship), Some(EntityKind::Node)]
+    );
+    let Some(Entity::Relationship(r)) = rs.entity(0, 0) else {
+        panic!("{:?}", rs.entity(0, 0))
+    };
+    assert_eq!((r.start.as_str(), r.end.as_str()), ("ada", "bob"));
+    // Inside a transaction, and with RETURN *.
+    let shared = SharedDb::open(&tmp("set-return-r-tx")).unwrap();
+    for q in [
+        "CREATE (:P {id: 'a'})",
+        "CREATE (:P {id: 'b'})",
+        "MATCH (a {id: 'a'}), (b {id: 'b'}) CREATE (a)-[:K]->(b)",
+    ] {
+        shared.write().query_write(q, &none()).unwrap();
+    }
+    let mut tx = shared.begin_transaction();
+    let rs = tx
+        .execute(
+            "MATCH (a {id: 'a'})-[r:K]->(b) REMOVE a.x RETURN *",
+            &none(),
+        )
+        .unwrap();
+    assert_eq!(rs.columns(), ["a", "b", "r"]);
+    assert_eq!(rs.column_kind(2), Some(EntityKind::Relationship));
+    tx.rollback();
+}

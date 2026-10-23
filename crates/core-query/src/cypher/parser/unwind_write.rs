@@ -33,9 +33,6 @@ pub(super) struct Scope {
     /// Variable-length relationship names: bound to a hop count, never
     /// returned bare, so not listed by `RETURN *`.
     var_length: Vec<String>,
-    /// Whether `RETURN *` leaves relationship names out: the `RETURN` of a
-    /// `MATCH … SET` / `REMOVE` cannot return a relationship bare.
-    star_skips_rels: bool,
 }
 
 impl Scope {
@@ -62,15 +59,14 @@ impl Scope {
     /// path and value name the query bound that is in scope here, in
     /// alphabetical order. Variable-length relationship variables are left
     /// out, since they are a hop count and not returned bare; so are names
-    /// the parser made up, and every relationship in the `RETURN` of a
-    /// `MATCH … SET` / `REMOVE`. An error when nothing is left.
+    /// the parser made up. An error when nothing is left.
     pub(super) fn star_items(&self) -> Result<Vec<RetItem>, String> {
         let mut names: Vec<&String> = self
             .vars
             .iter()
             .filter(|(name, kind)| {
-                !(*kind == VarKind::Rel && (self.star_skips_rels || self.var_length.contains(name)))
-                    && !self.hidden.contains(name)
+                let var_length = *kind == VarKind::Rel && self.var_length.contains(name);
+                !var_length && !self.hidden.contains(name)
             })
             .map(|(name, _)| name)
             .collect();
@@ -107,13 +103,9 @@ impl Scope {
         }
     }
 
-    /// The names the MATCH patterns of a `MATCH … SET` / `REMOVE` bind, for
-    /// its `RETURN`, which cannot return a relationship bare.
+    /// The names the MATCH patterns of a statement bind.
     pub(super) fn of_patterns(patterns: &[Pattern]) -> Scope {
-        let mut scope = Scope {
-            star_skips_rels: true,
-            ..Scope::default()
-        };
+        let mut scope = Scope::default();
         scope.bind_clauses(patterns, &[], &[]);
         scope
     }

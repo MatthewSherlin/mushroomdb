@@ -132,6 +132,13 @@ pub fn is_write_query(cypher: &str) -> std::result::Result<bool, String> {
     Ok(core_query::cypher::is_write_tokens(&toks))
 }
 
+/// Whether `cypher` is a schema statement (`CREATE INDEX`, `DROP CONSTRAINT`,
+/// `SHOW INDEXES`, …).
+pub fn is_schema_query(cypher: &str) -> std::result::Result<bool, String> {
+    let toks = core_query::cypher::lex(cypher).map_err(|e| format!("lex: {e}"))?;
+    Ok(core_query::cypher::is_ddl_tokens(&toks))
+}
+
 /// Return the number of valid frames in the live WAL of the database at `dir`.
 ///
 /// This is a count of one file, not a commit index: it does not include the

@@ -301,10 +301,10 @@ carries the node, relationship or path behind each of their cells (`entity`).
 - A **variable-length** relationship variable (`[rs:T*1..3]`) is still refused
   bare: it is bound to a hop count, not to one relationship. Return
   `rs.length`, or name the path (`p = …`) and return `p`.
-- The `RETURN` of a `MATCH … SET` or `MATCH … REMOVE` cannot return a
-  relationship bare (``cannot return relationship variable 'r' bare``); return
-  its type with `type(r)`. Every other write statement's `RETURN` can.
-- A relationship inside a list or map is not returned: `collect(r)` skips it.
+- A relationship is a value like the others in a list: `collect(r)`,
+  `collect(DISTINCT r)` and `[r, s]` are lists of its maps.
+- The `RETURN` of every write statement can return a relationship bare,
+  `MATCH … SET` and `MATCH … REMOVE` included.
 
 ---
 
@@ -408,8 +408,7 @@ MATCH (p:Person) UNWIND p.tags AS t RETURN DISTINCT *
 The first returns the columns `c`, `p` and `r`. A variable-length
 relationship variable (`[rs*1..3]`) is left out, because it is a hop count and
 not returned bare; name what you need beside the star (`RETURN *, rs.length AS
-hops`). So is every relationship in the `RETURN` of a `MATCH … SET` or `MATCH …
-REMOVE`, which cannot return one bare. Anonymous nodes and relationships are not
+hops`). Anonymous nodes and relationships are not
 names. A `WITH` replaces what is in scope, so `WITH a RETURN *` returns `a`.
 With nothing left the star is an error, `RETURN * / WITH * with no variables in
 scope`. `RETURN *` works in the `RETURN` of a write statement (the matched and
@@ -1544,7 +1543,6 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Form | Error message (excerpt) |
 |---|---|
 | Bare `RETURN rs` for a variable-length relationship variable | `cannot return variable-length relationship variable '…' bare; return ….length, or name the path (p = …) and return p` |
-| Bare `RETURN r` for a relationship in the `RETURN` of `MATCH … SET` / `REMOVE` | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
 | `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |

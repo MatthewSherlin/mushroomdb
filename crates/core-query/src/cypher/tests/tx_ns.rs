@@ -56,8 +56,17 @@ fn props(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
         .collect()
 }
 
+/// The dense id `graph()` gives a key.
+fn id_of(key: &str) -> u32 {
+    ["ada", "bob", "cam", "sec"]
+        .iter()
+        .position(|k| *k == key)
+        .unwrap() as u32
+}
+
 fn node(key: &str, label: &str, pairs: &[(&str, Value)]) -> NodeEntity {
     NodeEntity {
+        id: id_of(key),
         key: key.into(),
         label: label.into(),
         properties: props(pairs),
@@ -69,6 +78,8 @@ fn rel(t: &str, start: &str, end: &str, pairs: &[(&str, Value)]) -> Relationship
         rel_type: t.into(),
         start: start.into(),
         end: end.into(),
+        start_id: id_of(start),
+        end_id: id_of(end),
         properties: props(pairs),
     }
 }
@@ -316,4 +327,90 @@ fn star_lists_fixed_relationships_but_not_variable_length_ones() {
         ["a", "b", "p", "r", "x"]
     );
     assert_eq!(names("MATCH (x)-[rs*1..2]->(y) RETURN *"), ["x", "y"]);
+}
+
+#[test]
+fn collect_of_a_relationship_returns_its_maps() {
+    // Row I-1 of the TX-NS review: `collect(r)` returned [] silently.
+    let fx = graph();
+    let view = fx.view();
+    let rs = detailed(&view, "MATCH (a)-[r:KNOWS]->(b) RETURN collect(r) AS rs");
+    let Some(Value::List(items)) = &rs.row(0)[0] else {
+        panic!("{:?}", rs.row(0))
+    };
+    assert_eq!(items.len(), 2);
+    assert!(items.contains(&rel_map("KNOWS", "ada", "bob")));
+    assert_eq!(rs.column_kind(0), Some(EntityKind::RelationshipList));
+    let Some(Entity::List(rels)) = rs.entity(0, 0) else {
+        panic!("{:?}", rs.entity(0, 0))
+    };
+    assert!(rels
+        .iter()
+        .all(|r| matches!(r, Some(Entity::Relationship(_)))));
+    let distinct = query(
+        &view,
+        "MATCH (x)-[r:KNOWS]-(y) RETURN collect(DISTINCT r) AS rs",
+    );
+    let Some(Value::List(items)) = &distinct.row(0)[0] else {
+        panic!()
+    };
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn lists_of_nodes_relationships_and_paths_carry_their_elements() {
+    let fx = graph();
+    let view = fx.view();
+    for (q, kind) in [
+        (
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) AS friends",
+            EntityKind::NodeList,
+        ),
+        (
+            "MATCH (a {id: 'ada'}), (b {id: 'bob'}) RETURN [a, b] AS pair",
+            EntityKind::NodeList,
+        ),
+        (
+            "MATCH p = (a {id: 'ada'})-[:KNOWS]->(b) RETURN p.nodes AS ns",
+            EntityKind::NodeList,
+        ),
+        (
+            "MATCH p = (a {id: 'ada'})-[:KNOWS]->(b) RETURN p.relationships AS rs",
+            EntityKind::RelationshipList,
+        ),
+        (
+            "MATCH p = (a {id: 'ada'})-[:KNOWS]->(b) RETURN collect(p) AS ps",
+            EntityKind::PathList,
+        ),
+        (
+            "MATCH (n:Person) WITH collect(n) AS people RETURN people",
+            EntityKind::NodeList,
+        ),
+    ] {
+        let rs = detailed(&view, q);
+        let col = rs.columns().len() - 1;
+        assert_eq!(rs.column_kind(col), Some(kind), "{q}");
+        let Some(Value::List(values)) = &rs.row(0)[col] else {
+            panic!("{q}: {:?}", rs.row(0))
+        };
+        let Some(Entity::List(items)) = rs.entity(0, col) else {
+            panic!("{q}: {:?}", rs.entity(0, col))
+        };
+        assert_eq!(items.len(), values.len(), "{q}");
+        assert!(items.iter().all(Option::is_some), "{q}: {items:?}");
+    }
+    let rels = detailed(
+        &view,
+        "MATCH (a)-[r:KNOWS]->(b)-[s:KNOWS]->(c) RETURN [r, s] AS l",
+    );
+    assert_eq!(rels.column_kind(0), Some(EntityKind::RelationshipList));
+    // A list that mixes kinds, or holds values, has no kind.
+    let mixed = query(
+        &view,
+        "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) RETURN [a, r] AS l, [1, 2] AS v",
+    );
+    assert_eq!(mixed.column_kinds(), &[None, None]);
+    // `collect` of a property is a value list.
+    let names = query(&view, "MATCH (n:Person) RETURN collect(n.name) AS names");
+    assert_eq!(names.column_kind(0), None);
 }
