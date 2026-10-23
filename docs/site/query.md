@@ -1258,6 +1258,11 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
+| `elementId(x)` | node or relationship variable | `String` | the element id a Bolt driver reads as `element_id` (`n:<key>` for a node, `r:<type>\|<start>\|<end>` for a relationship). Opaque but stable: match it, do not parse it. Null in → null; any other argument is a named error |
+| `startNode(r)`, `endNode(r)` | relationship variable | node | the relationship's source or destination node; over Bolt a Node, elsewhere its key. Null when that end is hidden by the caller's mask |
+| `nodes(p)` | path | `List` | the path's nodes in walk order; the same as `p.nodes`, so over Bolt a list of Nodes |
+| `relationships(p)` | path | `List` | the path's relationships in walk order, each a `{type, start, end}` map; the same as `p.relationships`, so over Bolt a list of Relationships |
+| `length(p)` | path | `Int` | the number of relationships in the path; the same as `p.length` |
 | `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
 | `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
 | `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
@@ -1475,6 +1480,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
+| `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)` — null in gives null, a wrong type is an error naming the function |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |

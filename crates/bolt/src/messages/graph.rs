@@ -58,16 +58,9 @@ fn has_element_ids(version: (u8, u8)) -> bool {
     version >= (5, 0)
 }
 
-/// The element id of the node `key`.
-pub fn node_element_id(key: &str) -> String {
-    format!("n:{key}")
-}
-
-/// The element id of the relationship `start -[rel_type]-> end`.
-pub fn relationship_element_id(rel_type: &str, start: &str, end: &str) -> String {
-    let escape = |part: &str| part.replace('\\', "\\\\").replace('|', "\\|");
-    format!("r:{}|{}|{}", escape(rel_type), escape(start), escape(end))
-}
+// The element ids are defined once, in the query layer, because `elementId()`
+// returns the same strings.
+pub use mushroomdb::{node_element_id, relationship_element_id};
 
 /// The largest integer a JavaScript number holds exactly: 2^53 - 1.
 pub const MAX_SAFE_ID: i64 = (1 << 53) - 1;

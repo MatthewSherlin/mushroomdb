@@ -338,6 +338,10 @@ fn ret_val_operand(value: &RetVal) -> Option<Operand> {
     match value {
         RetVal::Var(v) => Some(Operand::Var(v.clone())),
         RetVal::ScalarExpr(op) => Some(op.clone()),
+        RetVal::FuncCall { name, args } => Some(Operand::FuncCall {
+            name: name.clone(),
+            args: args.clone(),
+        }),
         _ => None,
     }
 }
@@ -346,6 +350,7 @@ fn operand_kind(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<Ent
     match op {
         Operand::Var(v) => scope.get(v).copied(),
         Operand::Prop { var, field } => path_part_kind(var, field, scope),
+        Operand::FuncCall { name, args } => func_kind(name, args, scope),
         // `[a, b]`: a list of variables that all hold elements of one kind.
         Operand::ListLit(items) if !items.is_empty() => {
             let mut kinds = items.iter().map(|item| match item {
@@ -358,6 +363,25 @@ fn operand_kind(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<Ent
                 .then(|| first.list_of())
                 .flatten()
         }
+        _ => None,
+    }
+}
+
+/// `nodes(p)` and `relationships(p)` of a path variable are what `p.nodes` and
+/// `p.relationships` are; `startNode(r)` and `endNode(r)` of a relationship
+/// variable are nodes.
+fn func_kind(
+    name: &str,
+    args: &[Operand],
+    scope: &HashMap<String, EntityKind>,
+) -> Option<EntityKind> {
+    let [Operand::Var(var)] = args else {
+        return None;
+    };
+    match (name.to_ascii_lowercase().as_str(), scope.get(var)) {
+        ("nodes", Some(EntityKind::Path)) => Some(EntityKind::NodeList),
+        ("relationships", Some(EntityKind::Path)) => Some(EntityKind::RelationshipList),
+        ("startnode" | "endnode", Some(EntityKind::Relationship)) => Some(EntityKind::Node),
         _ => None,
     }
 }

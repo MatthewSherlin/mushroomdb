@@ -2378,6 +2378,12 @@ const SCALAR_FUNCS: &[&str] = &[
     "decay",
     "key",
     "id",
+    "elementId",
+    "startNode",
+    "endNode",
+    "nodes",
+    "relationships",
+    "length",
     "labels",
     "trim",
     "ltrim",
@@ -2472,6 +2478,101 @@ fn label_test(
         }
     };
     Ok(Some(Value::Bool(holds)))
+}
+
+/// `elementId(x)`, `startNode(r)` and `endNode(r)`: the argument must be a
+/// node or relationship variable (null in gives null). `elementId` is the id
+/// Bolt sends; `startNode` and `endNode` give the end's key, null when the end
+/// is hidden by the mask.
+fn entity_func(
+    fname: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "{fname}() requires exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let var_name = match &args[0] {
+        Operand::Var(var_name) => var_name,
+        Operand::Lit(Value::Null) => return Ok(None),
+        _ => {
+            return Err(format!(
+                "{fname}() argument must be a {} variable (e.g. {fname}(x))",
+                if fname == "elementId" {
+                    "node or relationship"
+                } else {
+                    "relationship"
+                }
+            ))
+        }
+    };
+    let slot = vars
+        .slot(var_name)
+        .ok_or_else(|| format!("unbound variable `{var_name}` in {fname}()"))?;
+    let cell = match row.get(slot).and_then(|c| c.as_ref()) {
+        None | Some(Cell::Scalar(Value::Null)) => return Ok(None), // null binding
+        Some(cell) => cell,
+    };
+    let end_key = |id: u32| {
+        view.visible(id)
+            .then(|| view.try_key_of(id))
+            .flatten()
+            .map(|key| Value::Str(key.to_owned()))
+    };
+    match (fname, cell) {
+        ("elementId", Cell::Node(id)) => Ok(Some(Value::Str(crate::result::node_element_id(
+            view.key_of(*id),
+        )))),
+        ("elementId", Cell::Rel(e)) => {
+            let key = |id: u32| view.try_key_of(id).unwrap_or_default();
+            Ok(Some(Value::Str(crate::result::relationship_element_id(
+                view.sym_name(e.etype).unwrap_or_default(),
+                key(e.src),
+                key(e.dst),
+            ))))
+        }
+        ("startNode", Cell::Rel(e)) => Ok(end_key(e.src)),
+        ("endNode", Cell::Rel(e)) => Ok(end_key(e.dst)),
+        ("elementId", _) => Err(format!(
+            "elementId() argument `{var_name}` is not a node or a relationship"
+        )),
+        (_, _) => Err(format!(
+            "{fname}() argument `{var_name}` is not a relationship"
+        )),
+    }
+}
+
+/// `nodes(p)`, `relationships(p)` and `length(p)`: the field of the path map
+/// that `p.nodes`, `p.relationships` and `p.length` read. Null in gives null;
+/// anything that is not a path is a type error.
+fn path_func(
+    fname: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "{fname}() requires exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    match resolve_operand(view, vars, row, &args[0], params)? {
+        None => Ok(None),
+        Some(Value::Map(mut map)) if map.contains_key("nodes") && map.contains_key("length") => {
+            Ok(map.remove(fname))
+        }
+        Some(_) => Err(format!(
+            "{fname}() argument must be a path (e.g. {fname}(p))"
+        )),
+    }
 }
 
 /// Evaluate one of the supported scalar functions.  Unknown function names
@@ -2597,6 +2698,22 @@ fn eval_func(
                 }
                 None => Ok(None), // null binding → null (optional match scenario)
             }
+        }
+        "elementid" | "startnode" | "endnode" => {
+            let fname = match norm.as_str() {
+                "elementid" => "elementId",
+                "startnode" => "startNode",
+                _ => "endNode",
+            };
+            entity_func(fname, args, view, vars, row)
+        }
+        "nodes" | "relationships" | "length" => {
+            let fname = match norm.as_str() {
+                "nodes" => "nodes",
+                "relationships" => "relationships",
+                _ => "length",
+            };
+            path_func(fname, args, view, vars, row, params)
         }
         "labels" => {
             if args.len() != 1 {
@@ -6377,6 +6494,10 @@ mod ql_15;
 #[cfg(test)]
 #[path = "tests/ql_07.rs"]
 mod ql_07;
+
+#[cfg(test)]
+#[path = "tests/ql_03e.rs"]
+mod ql_03e;
 
 #[cfg(test)]
 #[path = "tests/ql_vl.rs"]
@@ -10787,11 +10908,11 @@ LIMIT 10";
         let fx = assoc_graph();
         let err = run(
             &fx.view(),
-            "MATCH (n:Company) RETURN nodes(n)",
+            "MATCH (n:Company) RETURN nosuchfn(n)",
             &BTreeMap::new(),
         )
         .expect_err("unknown function must error");
-        assert!(err.contains("unknown function `nodes`"), "{err}");
+        assert!(err.contains("unknown function `nosuchfn`"), "{err}");
         assert!(
             err.contains("labels"),
             "error must list what is supported: {err}"
