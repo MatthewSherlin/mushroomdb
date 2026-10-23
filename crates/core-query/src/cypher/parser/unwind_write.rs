@@ -6,10 +6,11 @@
 use super::Parser;
 use crate::cypher::ast::{
     CreateEdge, OptionalClause, Pattern, RetItem, RetVal, RowCreateNode, RowMerge, RowMergeEdge,
-    RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindWriteStmt, WithStage,
-    WriteStatement,
+    RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt,
+    WithStage, WriteStatement, ONE_ROW_VAR,
 };
 use crate::cypher::{Operand, Query, Tok};
+use core_storage::Value;
 
 /// What a name in scope holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,19 +19,32 @@ pub(super) enum VarKind {
     Rel,
     /// A value: an UNWIND alias, a `WITH` alias or any other expression.
     Scalar,
+    /// A named path (`MATCH p = …`).
+    Path,
 }
 
 /// The names in scope at a point of a read part, with what each holds.
 #[derive(Debug, Default)]
 pub(super) struct Scope {
     vars: Vec<(String, VarKind)>,
+    /// Names the parser made up (an anonymous node of a write clause, the
+    /// one-row UNWIND alias): in scope, but not listed by `RETURN *`.
+    hidden: Vec<String>,
 }
 
 impl Scope {
-    fn bind(&mut self, name: &str, kind: VarKind) {
+    pub(super) fn bind(&mut self, name: &str, kind: VarKind) {
         match self.vars.iter_mut().find(|(n, _)| n == name) {
             Some(slot) => slot.1 = kind,
             None => self.vars.push((name.to_string(), kind)),
+        }
+    }
+
+    /// Bind a name the parser made up.
+    pub(super) fn bind_hidden(&mut self, name: &str, kind: VarKind) {
+        self.bind(name, kind);
+        if !self.hidden.iter().any(|h| h == name) {
+            self.hidden.push(name.to_string());
         }
     }
 
@@ -38,7 +52,35 @@ impl Scope {
         self.vars.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
     }
 
+    /// The items `RETURN *` / `WITH *` stands for: every node, path and value
+    /// name the query bound that is in scope here, in alphabetical order.
+    /// Relationship variables (single or variable-length) are left out, since
+    /// a relationship is not returned bare in 0.10 (`RETURN r` is an error);
+    /// so are names the parser made up. An error when nothing is left.
+    pub(super) fn star_items(&self) -> Result<Vec<RetItem>, String> {
+        let mut names: Vec<&String> = self
+            .vars
+            .iter()
+            .filter(|(name, kind)| *kind != VarKind::Rel && !self.hidden.contains(name))
+            .map(|(name, _)| name)
+            .collect();
+        if names.is_empty() {
+            return Err("RETURN * / WITH * with no variables in scope".to_string());
+        }
+        names.sort();
+        Ok(names
+            .into_iter()
+            .map(|name| RetItem {
+                value: RetVal::Var(name.clone()),
+                alias: None,
+            })
+            .collect())
+    }
+
     fn bind_pattern(&mut self, pattern: &Pattern) {
+        if let Some(var) = &pattern.path_var {
+            self.bind(var, VarKind::Path);
+        }
         if let Some(var) = &pattern.start.var {
             self.bind(var, VarKind::Node);
         }
@@ -50,6 +92,13 @@ impl Scope {
                 self.bind(var, VarKind::Node);
             }
         }
+    }
+
+    /// The names the MATCH patterns of a statement bind.
+    pub(super) fn of_patterns(patterns: &[Pattern]) -> Scope {
+        let mut scope = Scope::default();
+        scope.bind_clauses(patterns, &[], &[]);
+        scope
     }
 
     /// Bind what a run of read clauses introduces.
@@ -73,7 +122,7 @@ impl Scope {
     }
 
     /// A `WITH` replaces the scope with its items.
-    fn after_with(&mut self, items: &[RetItem]) {
+    pub(super) fn after_with(&mut self, items: &[RetItem]) {
         let mut next = Scope::default();
         for item in items {
             let carried = match &item.value {
@@ -92,11 +141,11 @@ impl Scope {
     }
 
     /// `WITH` items that carry every node and value in scope into the next stage.
-    /// A relationship variable is not carried.
+    /// A relationship or path variable is not carried.
     fn carry_items(&self) -> Vec<RetItem> {
         self.vars
             .iter()
-            .filter(|(_, kind)| *kind != VarKind::Rel)
+            .filter(|(_, kind)| matches!(kind, VarKind::Node | VarKind::Scalar))
             .map(|(name, _)| RetItem {
                 value: RetVal::Var(name.clone()),
                 alias: None,
@@ -126,9 +175,17 @@ impl Scope {
     fn carried_names(&self) -> Vec<String> {
         self.vars
             .iter()
-            .filter(|(_, kind)| *kind != VarKind::Rel)
+            .filter(|(_, kind)| matches!(kind, VarKind::Node | VarKind::Scalar))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+}
+
+/// `UNWIND [1] AS <ONE_ROW_VAR>`: one row for the clauses after it.
+pub(super) fn one_row_unwind() -> UnwindClause {
+    UnwindClause {
+        list: UnwindExpr::Lit(vec![Value::Int(1)]),
+        alias: ONE_ROW_VAR.to_string(),
     }
 }
 
@@ -165,7 +222,7 @@ impl<'a> Parser<'a> {
                     });
                 }
                 Some(Tok::With) => {
-                    let stage = self.with_stage()?;
+                    let stage = self.with_stage(scope)?;
                     scope.after_with(&stage.items);
                     scope.bind_clauses(&stage.matches, &stage.optional_clauses, &stage.unwinds);
                     stages.push(stage);
@@ -175,10 +232,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UNWIND … [read clauses] <write clause>+ [RETURN …]`.
+    /// `UNWIND … [read clauses] <write clause>+ [RETURN …]`, or the same
+    /// statement opening with `MATCH` (`MATCH … CREATE …`): that one is read as
+    /// `UNWIND [1] AS <ONE_ROW_VAR> MATCH …`, so it runs once per matched row
+    /// exactly as the `UNWIND` form does.
     pub(super) fn unwind_write_stmt(&mut self) -> Result<WriteStatement, String> {
         let mut scope = Scope::default();
         let mut unwinds = Vec::new();
+        if self.peek() != Some(&Tok::Unwind) {
+            scope.bind_hidden(ONE_ROW_VAR, VarKind::Scalar);
+            unwinds.push(one_row_unwind());
+        }
         while self.peek() == Some(&Tok::Unwind) {
             let clause = self.unwind_clause()?;
             scope.bind(&clause.alias, VarKind::Scalar);
@@ -243,7 +307,7 @@ impl<'a> Parser<'a> {
             ));
         }
         let returns = if self.peek() == Some(&Tok::Return) {
-            let (distinct, items) = self.return_clause()?;
+            let (distinct, items) = self.return_clause(&scope)?;
             let aliases: Vec<&str> = items.iter().filter_map(|r| r.alias.as_deref()).collect();
             let order_by = if self.peek() == Some(&Tok::Order) {
                 self.order_clause(&aliases)?
@@ -402,10 +466,16 @@ impl<'a> Parser<'a> {
                      or ({v}) to refer to the bound one"
                 ))
             }
-            Some(v) => v,
-            None => Self::anonymous_var(anonymous),
+            Some(v) => {
+                scope.bind(&v, VarKind::Node);
+                v
+            }
+            None => {
+                let v = Self::anonymous_var(anonymous);
+                scope.bind_hidden(&v, VarKind::Node);
+                v
+            }
         };
-        scope.bind(&var, VarKind::Node);
         nodes.push(RowCreateNode {
             var: var.clone(),
             label,
@@ -417,13 +487,25 @@ impl<'a> Parser<'a> {
     /// `MERGE node [-[:T]-> node] [ON CREATE SET …] [ON MATCH SET …]`.
     fn row_merge(&mut self, scope: &mut Scope, anonymous: &mut usize) -> Result<RowWrite, String> {
         self.expect(&Tok::Merge, "expected MERGE")?;
-        let start = self.merge_node_with("expected '(' after MERGE", Self::row_props)?;
-        let start = self.row_merge_node(start, scope, anonymous)?;
+        let start = match self.bound_merge_node(scope) {
+            Some(node) => node,
+            None => {
+                let start = self.merge_node_with("expected '(' after MERGE", Self::row_props)?;
+                self.row_merge_node(start, scope, anonymous)?
+            }
+        };
         let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
             let (rel_var, etype, dir) = self.merge_rel()?;
-            let end =
-                self.merge_node_with("expected '(' to start the MERGE end node", Self::row_props)?;
-            let end = self.row_merge_node(end, scope, anonymous)?;
+            let end = match self.bound_merge_node(scope) {
+                Some(node) => node,
+                None => {
+                    let end = self.merge_node_with(
+                        "expected '(' to start the MERGE end node",
+                        Self::row_props,
+                    )?;
+                    self.row_merge_node(end, scope, anonymous)?
+                }
+            };
             if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
                 return Err(
                     "not supported in mushroomdb 0.10: MERGE with more than one relationship"
@@ -440,6 +522,13 @@ impl<'a> Parser<'a> {
                 end,
             })
         } else {
+            if start.bound {
+                return Err(format!(
+                    "MERGE ({0}): `{0}` is already bound, so the MERGE matches it as it is; \
+                     MERGE a relationship from it, e.g. MERGE ({0})-[:T]->(b:Label {{id: …}})",
+                    start.var
+                ));
+            }
             None
         };
         let mut on_create = Vec::new();
@@ -474,6 +563,30 @@ impl<'a> Parser<'a> {
         })))
     }
 
+    /// `(v)` at the cursor, where `v` is a node an earlier clause bound: a MERGE
+    /// end that is used as it is. `None` (consuming nothing) for anything else.
+    fn bound_merge_node(&mut self, scope: &Scope) -> Option<RowMergeNode> {
+        let (Some(Tok::LParen), Some(Tok::Ident(var)), Some(Tok::RParen)) = (
+            self.peek(),
+            self.toks.get(self.pos + 1),
+            self.toks.get(self.pos + 2),
+        ) else {
+            return None;
+        };
+        if scope.kind(var) != Some(VarKind::Node) {
+            return None;
+        }
+        self.pos += 3;
+        Some(RowMergeNode {
+            var: var.clone(),
+            label: String::new(),
+            key_field: String::new(),
+            key: Operand::Var(var.clone()),
+            ns: None,
+            bound: true,
+        })
+    }
+
     /// A parsed MERGE node as a [`RowMergeNode`], naming it when anonymous and
     /// binding its variable.
     fn row_merge_node(
@@ -489,16 +602,23 @@ impl<'a> Parser<'a> {
                     node.label
                 ))
             }
-            Some(v) => v,
-            None => Self::anonymous_var(anonymous),
+            Some(v) => {
+                scope.bind(&v, VarKind::Node);
+                v
+            }
+            None => {
+                let v = Self::anonymous_var(anonymous);
+                scope.bind_hidden(&v, VarKind::Node);
+                v
+            }
         };
-        scope.bind(&var, VarKind::Node);
         Ok(RowMergeNode {
             var,
             label: node.label,
             key_field: node.key_field,
             key: node.key_value,
             ns: node.ns,
+            bound: false,
         })
     }
 
@@ -587,6 +707,9 @@ impl<'a> Parser<'a> {
             )),
             Some(VarKind::Scalar) => Err(format!(
                 "{clause} {var}: '{var}' is a value, not a node variable"
+            )),
+            Some(VarKind::Path) => Err(format!(
+                "{clause} {var}: '{var}' is a path, not a node variable"
             )),
             None => Err(format!(
                 "{clause} {var}: '{var}' is not bound by an earlier clause"

@@ -1,10 +1,13 @@
 //! REMOVE, FOREACH, EXISTS, CALL and EXPLAIN were ordinary identifiers before
-//! 0.10 and still are wherever a name can stand. Every query here parsed on
-//! 0.9.x and must keep parsing.
+//! 0.10 and still are wherever a name can stand; so are YIELD and LOAD, which
+//! QL-12 reads as keywords only after a CALL and before CSV. Every query here
+//! parsed on 0.9.x and must keep parsing.
 
 use core_query::cypher::{lex, parse, Tok};
 
-const WORDS: [&str; 5] = ["remove", "foreach", "exists", "call", "explain"];
+const WORDS: [&str; 7] = [
+    "remove", "foreach", "exists", "call", "explain", "yield", "load",
+];
 
 fn casings(word: &str) -> [String; 3] {
     let mixed: String = word
@@ -113,10 +116,10 @@ fn parses(src: &str) -> bool {
 }
 
 /// A shape is a regression if it parses with an ordinary name (`zq`, standing
-/// for base behaviour, where the five words were ordinary names too) and does
-/// not parse with one of the five words.
+/// for base behaviour, where these words were ordinary names too) and does
+/// not parse with one of these words.
 #[test]
-fn the_five_words_are_names_in_every_position() {
+fn the_words_are_names_in_every_position() {
     let mut checked = 0;
     for shape in SHAPES {
         if !parses(&shape.replace('§', "zq")) {
@@ -135,7 +138,7 @@ fn the_five_words_are_names_in_every_position() {
 }
 
 #[test]
-fn the_five_words_lex_as_identifiers() {
+fn the_words_lex_as_identifiers() {
     for word in WORDS {
         for w in casings(word) {
             assert_eq!(lex(&w).unwrap(), vec![Tok::Ident(w.clone())]);

@@ -29,8 +29,8 @@ use core_storage::{
 };
 
 use crate::db::{
-    ddl_statement, schema_change_on_a_read, EdgeInfo, MaskedEdge, MaskedNodeResult, NodeInfo,
-    SchemaListing, SlowQuerySink, SlowQuerySnapshot,
+    call_statement, ddl_statement, run_call, schema_change_on_a_read, EdgeInfo, MaskedEdge,
+    MaskedNodeResult, NodeInfo, SchemaListing, SlowQuerySink, SlowQuerySnapshot,
 };
 use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, RoleMaskCache};
@@ -1039,6 +1039,9 @@ impl ReaderSnapshot {
             }
             return Ok(self.frozen.schema.show(&stmt));
         }
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(None)?, &self.frozen.schema, params);
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -1079,6 +1082,10 @@ impl ReaderSnapshot {
         if let Some(stmt) = ddl_statement(&tokens)? {
             let view = self.view(None)?;
             return Ok(self.frozen.schema.show_visible(&stmt, &view, &mask.visible));
+        }
+        if let Some(call) = call_statement(&tokens)? {
+            let view = self.view(Some(&mask.visible))?;
+            return run_call(&call, &view, &self.frozen.schema, params);
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),

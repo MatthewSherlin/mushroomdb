@@ -153,9 +153,23 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 
 A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `COMMIT` and an auto-commit `PULL` return one; a transaction that wrote nothing returns the commit its snapshot read. Pass it in a later `BEGIN` or `RUN` to read at least that commit.
 
+In this build some write statements are refused inside a transaction and run only as auto-commit `RUN`: `MATCH … CREATE` / `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `REMOVE … RETURN`. Drivers' managed write transactions (`session.execute_write` and the like) send `BEGIN`, so they are refused there too, with `not supported in mushroomdb 0.10 inside a transaction: …`; send such a statement with `session.run` (auto-commit). See [Write statements](query.md#write-statements).
+
 A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's or `read` key's transaction reads through its role and cannot write (see [Scoped access](#scoped-access)); use auto-commit to write with a role. A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
+
+## Catalog procedures
+
+`RUN` answers the procedure calls graph browsers and driver tools send to
+discover a store: `CALL db.labels()`, `CALL db.relationshipTypes()`,
+`CALL db.propertyKeys()`, `CALL db.indexes()`, `CALL db.constraints()`,
+`CALL dbms.components()` and `CALL db.schema.visualization()`, with the columns
+named in [Procedures](query.md#procedures-call). `dbms.components()` reports the
+name `mushroomdb`, the engine version, and the edition `open`. A role-bound
+token sees only the labels, relationship types, property keys, indexes and
+constraints of the nodes its role can read, as it does for every other read.
+Calls other than these are an unknown-procedure error.
 
 ## Value types
 

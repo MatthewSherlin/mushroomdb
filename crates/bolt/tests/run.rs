@@ -196,6 +196,49 @@ fn auto_commit_create_is_durable_and_visible_to_the_next_statement() {
     assert_eq!(seen.get(0, "COUNT(n)"), Some(&Value::Int(1)));
 }
 
+/// QL-CX's fourth write-result column reaches a Bolt client as a field, in
+/// its documented position, with the count of relationships created.
+#[test]
+fn a_write_result_carries_relationships_created_as_its_fourth_field() {
+    let (db, _dir) = open_db("rels-created");
+    let mut conn = connected(&db, FULL);
+    for id in ["a", "b"] {
+        let out = conn.handle(run(&format!("CREATE (n:P {{id: '{id}'}})")));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{out:?}"
+        );
+        conn.handle(pull(-1));
+    }
+    let out = conn.handle(run(
+        "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) CREATE (a)-[:K]->(b)",
+    ));
+    let [header] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        get(meta(header), "fields"),
+        Some(&PackValue::List(vec![
+            s("created"),
+            s("properties_set"),
+            s("deleted"),
+            s("relationships_created"),
+        ]))
+    );
+    let out = conn.handle(pull(-1));
+    let (rows, end) = rows_and_end(&out);
+    assert_eq!(
+        rows,
+        vec![&vec![
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(1),
+        ]]
+    );
+    assert_eq!(get(meta(end), "type"), Some(&s("w")));
+}
+
 #[test]
 fn a_write_bookmark_is_at_least_the_commit_and_a_later_run_may_wait_on_it() {
     let (db, _dir) = open_db("bookmark");
@@ -1206,4 +1249,105 @@ fn ddl_is_refused_inside_an_explicit_transaction() {
         "{out:?}"
     );
     assert!(db.read().range_indexes().is_empty());
+}
+
+// ------------------------------------------------------------ CALL (QL-12)
+
+#[test]
+fn run_answers_a_procedure_call() {
+    let (db, _dir) = open_db("call");
+    let mut conn = connected(&db, FULL);
+    let out = conn.handle(run("CALL db.ping() YIELD success AS ok RETURN ok"));
+    let [header] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        get(meta(header), "fields"),
+        Some(&PackValue::List(vec![s("ok")]))
+    );
+    let out = conn.handle(pull(-1));
+    assert_eq!(rows_and_end(&out).0, vec![&vec![PackValue::Bool(true)]]);
+    let out = conn.handle(run("CALL { MATCH (n) RETURN n }"));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Statement.SyntaxError");
+}
+
+/// Every catalog procedure over Bolt: the rows `RUN` + `PULL` return.
+fn call_rows(conn: &mut Connection, query: &str) -> Vec<Vec<PackValue>> {
+    let out = conn.handle(run(query));
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{query}: {out:?}"
+    );
+    let out = conn.handle(pull(-1));
+    rows_and_end(&out).0.into_iter().cloned().collect()
+}
+
+fn first_strings(rows: &[Vec<PackValue>]) -> Vec<String> {
+    rows.iter()
+        .map(|r| match &r[0] {
+            PackValue::String(s) => s.clone(),
+            other => panic!("not a string: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_role_token_lists_only_its_own_schema_through_the_catalog_procedures() {
+    let (db, _dir) = db_with_role("role-catalog");
+    db.write()
+        .insert_edge("LINK", "Public0", "Public1")
+        .unwrap();
+    db.write()
+        .insert_edge("HIDDEN", "Public0", "Secret0")
+        .unwrap();
+    for q in [
+        "CREATE INDEX public_n FOR (n:Public) ON (n.n)",
+        "CREATE INDEX secret_n FOR (n:Secret) ON (n.n)",
+        "CREATE CONSTRAINT public_unique FOR (n:Public) REQUIRE n.n IS UNIQUE",
+        "CREATE CONSTRAINT secret_unique FOR (n:Secret) REQUIRE n.n IS UNIQUE",
+    ] {
+        db.write().query_write(q, &BTreeMap::new()).unwrap();
+    }
+    let mut full = connected(&db, FULL);
+    assert_eq!(
+        first_strings(&call_rows(&mut full, "CALL db.labels()")),
+        ["Public", "Secret"]
+    );
+    let mut conn = connected(&db, ROLE);
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.labels()")),
+        ["Public"]
+    );
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.relationshipTypes()")),
+        ["LINK"]
+    );
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.propertyKeys()")),
+        ["n"]
+    );
+    // The constraint's backing index is listed with the declared one.
+    let mut indexes = first_strings(&call_rows(&mut conn, "CALL db.indexes()"));
+    indexes.sort();
+    assert_eq!(indexes, ["eq_Public_n", "public_n"]);
+    assert_eq!(
+        first_strings(&call_rows(&mut conn, "CALL db.constraints()")),
+        ["public_unique"]
+    );
+    let mut all = first_strings(&call_rows(&mut full, "CALL db.constraints()"));
+    all.sort();
+    assert_eq!(all, ["public_unique", "secret_unique"]);
+    let picture = format!(
+        "{:?}",
+        call_rows(&mut conn, "CALL db.schema.visualization()")
+    );
+    for hidden in ["Secret", "HIDDEN"] {
+        assert!(!picture.contains(hidden), "{hidden} in {picture}");
+    }
+    // The components row a driver tool reads on connect.
+    let rows = call_rows(
+        &mut conn,
+        "CALL dbms.components() YIELD name, versions, edition",
+    );
+    assert_eq!(rows[0][0], s("mushroomdb"));
 }

@@ -171,6 +171,7 @@ fn create_with_an_edge_between_two_new_nodes_per_row() {
         &params,
     );
     assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(count(&rs, "relationships_created"), 2);
     assert_eq!(db.edge_count(), 2);
     let edges = db.node_edges("a2").unwrap();
     assert_eq!(edges.len(), 1);
@@ -195,6 +196,11 @@ fn create_an_edge_between_nodes_matched_per_row() {
         &params,
     );
     assert_eq!(count(&rs, "created"), 0);
+    assert_eq!(
+        count(&rs, "relationships_created"),
+        2,
+        "row 143: the edges are counted"
+    );
     assert_eq!(
         db.edge_count(),
         2,
@@ -234,6 +240,7 @@ fn comma_separated_patterns_create_each_and_may_share_an_edge() {
         &none(),
     );
     assert_eq!(count(&rs, "created"), 4);
+    assert_eq!(count(&rs, "relationships_created"), 2);
     assert_eq!(db.edge_count(), 2);
     assert!(db.has_node("A") && db.has_node("b"));
 }
@@ -536,6 +543,7 @@ fn merge_a_relationship_per_row_creates_each_node_and_edge_once() {
     let q = "UNWIND $rows AS r MERGE (x:P {id: r.a})-[:K]->(y:P {id: r.b}) ON CREATE SET y.hit = 1";
     let rs = run(&mut db, q, &params);
     assert_eq!(count(&rs, "created"), 3, "a, b and c once each");
+    assert_eq!(count(&rs, "relationships_created"), 3);
     assert_eq!(db.edge_count(), 3, "a->b, a->c, c->b");
     assert_eq!(wal_frames(&dir), 1);
     // Again: everything exists.
@@ -1198,6 +1206,7 @@ fn a_plain_delete_beside_many_created_edges_deletes_each_and_keeps_the_edges() {
         &none(),
     );
     assert_eq!(count(&rs, "created"), 4000);
+    assert_eq!(count(&rs, "relationships_created"), 2000);
     assert_eq!(count(&rs, "deleted"), 2000);
     assert_eq!(db.edge_count(), 2000);
 }

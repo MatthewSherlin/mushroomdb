@@ -99,7 +99,7 @@ use core_storage::wal::WalRecord;
 use core_storage::{Direction, GraphError, Result, Value};
 
 use crate::db::{
-    add_var, pattern_rel_vars, resolve_merge_set_value, write_result_set, BatchOp, Precondition,
+    add_var, pattern_rel_vars, resolve_merge_set_value, write_counts, BatchOp, Precondition,
     EDGE_COUNT_PROP, NS_PROP,
 };
 use crate::layer::DeltaLayer;
@@ -145,11 +145,12 @@ const _: () = {
 /// What a write statement returns once its records are laid over the
 /// transaction.
 enum Outcome {
-    /// The `created, properties_set, deleted` row.
+    /// The `created, properties_set, deleted, relationships_created` row.
     Counts {
         created: i64,
         props_set: i64,
         deleted: i64,
+        relationships_created: i64,
     },
     /// The statement's `RETURN`, as a query over the transaction's state with
     /// the statement applied.
@@ -374,6 +375,11 @@ impl Transaction {
             }
             return Ok(self.base_snap.frozen.schema.show(&stmt));
         }
+        // `CALL` reads the transaction's state, its own writes included.
+        if let Some(call) = crate::db::call_statement(&tokens)? {
+            let schema = &self.base_snap.frozen.schema;
+            return self.with_view(|v| crate::db::run_call(&call, v, schema, params))?;
+        }
         if is_write_tokens(&tokens) {
             let stmt = parse_write(&tokens).map_err(query_err("parse"))?;
             return self.execute_write(stmt, params);
@@ -575,12 +581,17 @@ impl Transaction {
                 self.stage_match_delete_node(s, params, &mut staged)?
             }
             WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
-            WriteStatement::UnwindWrite(_) => {
+            WriteStatement::UnwindWrite(s) => {
                 // Per-row writes are evaluated against the statement's own
-                // earlier rows by `GraphDb`'s executor, not the overlay.
-                return Err(not_supported(
-                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE",
-                ));
+                // earlier rows by `GraphDb`'s executor, not the overlay. A
+                // statement that began with MATCH is named as written.
+                let match_led = s.read.unwinds.first().map(|u| u.alias.as_str())
+                    == Some(core_query::cypher::ONE_ROW_VAR);
+                return Err(not_supported(if match_led {
+                    "MATCH … CREATE / MERGE"
+                } else {
+                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE"
+                }));
             }
         };
         // Only this statement's records are applied: the overlay already
@@ -591,15 +602,8 @@ impl Transaction {
                 created,
                 props_set,
                 deleted,
-            } => {
-                let mut rs = write_result_set();
-                rs.push_row(vec![
-                    Some(Value::Int(created)),
-                    Some(Value::Int(props_set)),
-                    Some(Value::Int(deleted)),
-                ]);
-                rs
-            }
+                relationships_created,
+            } => write_counts(created, props_set, deleted, relationships_created),
             Outcome::Return(q) => match self.with_view(|v| run(v, &q, params)) {
                 Ok(Ok(rs)) => rs,
                 Ok(Err(e)) | Err(e) => {
@@ -615,10 +619,20 @@ impl Transaction {
     }
 
     fn counts(created: i64, props_set: i64, deleted: i64) -> Outcome {
+        Self::counts_with_relationships(created, props_set, deleted, 0)
+    }
+
+    fn counts_with_relationships(
+        created: i64,
+        props_set: i64,
+        deleted: i64,
+        relationships_created: i64,
+    ) -> Outcome {
         Outcome::Counts {
             created,
             props_set,
             deleted,
+            relationships_created,
         }
     }
 
@@ -662,7 +676,12 @@ impl Transaction {
             staged.insert_edge(&edge.etype, src, dst);
         }
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts(stmt.nodes.len() as i64, 0, 0));
+            return Ok(Self::counts_with_relationships(
+                stmt.nodes.len() as i64,
+                0,
+                0,
+                stmt.edges.len() as i64,
+            ));
         };
         let patterns = stmt
             .nodes
@@ -1020,6 +1039,7 @@ impl Transaction {
         staged.touch(&start_key);
         staged.touch(&end_key);
         let mut created = 0i64;
+        let mut relationships_created = 0i64;
         if !start_existed {
             staged.insert_node(
                 &stmt.label,
@@ -1044,6 +1064,7 @@ impl Transaction {
             &match_sets
         } else {
             staged.insert_edge(&edge.etype, src_key, dst_key);
+            relationships_created = 1;
             &create_sets
         };
         for (key, sc) in sets {
@@ -1064,7 +1085,12 @@ impl Transaction {
             staged.set_prop(key, &sc.field, value);
         }
         let Some(returns) = stmt.returns else {
-            return Ok(Self::counts(created, 0, 0));
+            return Ok(Self::counts_with_relationships(
+                created,
+                0,
+                0,
+                relationships_created,
+            ));
         };
         let node =
             |var: Option<&String>, default: &str, label: &str, field: &str, key: &str| NodePat {
