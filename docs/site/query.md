@@ -1482,11 +1482,12 @@ for nested literals).
 As a value a predicate is three-valued: true, false or null. A comparison or `IN`
 with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
 `NOT null` is null; `null AND false` is false and `null OR true` is true;
-`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Only numbers,
-strings, temporal values of one type, and binary values order; any other pair
-compares as null under `<`, `<=`, `>` and `>=`, so `1 < 'a'`, `false < true` and
-`[1] < [2]` are all null (booleans and lists do not order). Values of different
-types are unequal (`1 = 'a'` is false).
+`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Numbers,
+strings, booleans (`false` before `true`), temporal values of one type, and binary
+values order; any other pair compares as null under `<`, `<=`, `>` and `>=`, so
+`1 < 'a'`, `true < 1` and `[1] < [2]` are all null (lists do not order), while
+`false < true` is true. Values of different types are unequal (`1 = 'a'` is
+false).
 
 A non-boolean operand of `NOT`, `AND`, `OR` or `XOR`, or a whole `WHERE` that is a
 bare value (`WHERE n.flag`), reads as true unless it is empty or zero (a non-empty
@@ -1678,6 +1679,36 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok` — a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
+### Compile-time checks
+
+After a statement parses, and before it is planned or reads a row, a check refuses
+what openCypher defines as an error whatever the data. The error is a `parse:`
+error whose message opens with the openCypher error kind and names the variable
+or function: ``parse: VariableTypeConflict: `r` is a relationship and cannot be
+used as a node``. A name whose kind is known only when a row is read (an `UNWIND`
+alias, a `$param`, a function's result) is never refused for its kind.
+
+| Kind | Refused | Example |
+|---|---|---|
+| `VariableTypeConflict` | A name bound as a node, relationship, path or literal value, then used in a pattern as another of these, in one `MATCH` or a later one | `MATCH ()-[r]-() MATCH (r)`, `MATCH (r)-[r]-()`, `MATCH r = ()-[]-(), (r)`, `WITH 123 AS n MATCH (n)` |
+| `VariableAlreadyBound` | A path name that is already bound, or that names a part of its own pattern; a `CREATE` of a bound node alone | `MATCH (p) MATCH p = ()-[]-()`, `MATCH p = (p)-[]-()`, `MATCH (a) CREATE (a)` |
+| `InvalidAggregation` | An aggregate in a `WHERE`, or in an `ORDER BY` whose projection does not aggregate | `MATCH (a) WHERE count(a) > 10`, `WITH n.x AS x ORDER BY max(n.y)` |
+| `NoExpressionAlias` | An aggregate in `WITH` with no `AS` (an unaliased scalar still names itself) | `WITH a, count(*)` |
+| `ColumnNameConflict` | Two `WITH` items with one name | `WITH 1 AS a, 2 AS a` |
+| `InvalidClauseComposition` | `UNION` and `UNION ALL` in one query | `RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a` |
+| `DifferentColumnsInUnion` | `UNION` parts whose columns (aliases, variables, `var.field`) differ | `RETURN 1 AS a UNION RETURN 2 AS b` |
+| `UnknownFunction` | A call of a function that does not exist, even where no row would reach it | `MATCH (a) RETURN foo(a)` |
+| `InvalidArgumentType` | `type()` of a node or path; `length()` of a node or relationship; `size()` of a path; `IN` a literal that is not a list; a property of a literal number, string, boolean or list; a path property other than `length`, `nodes`, `relationships` | `MATCH (n) RETURN type(n)`, `RETURN 1 IN 123`, `WITH 123 AS x RETURN x.num`, `MATCH p = ()-[*]->() WHERE p.name = 'a'` |
+
+Planning reads no row either: its errors (an unbound variable, a duplicate
+`RETURN` column, `ORDER BY` a column a `DISTINCT` projection drops) are `plan:`
+errors on every read entry point.
+
+Not checked yet, and kept as before: a subscript, `range()` or `properties()` of a
+value of the wrong type is null (`'abc'[0]`, `range('a', 5)`, `properties(42)`),
+where openCypher raises a type error; and a node or relationship as a `WHERE`
+predicate reads as true, under the boolean coercion above.
+
 ### Named-error
 
 Forms rejected with a clear, actionable error message (executor returns a typed error; no silent misbehavior).
@@ -1708,7 +1739,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | List predicate in the `RETURN` of a write statement | `a list predicate is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and test it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | ``execute: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — the message lists every scalar function |
+| Unknown function name | ``parse: UnknownFunction: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — refused at compile time (see [Compile-time checks](#compile-time-checks)); the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |

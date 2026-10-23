@@ -28,6 +28,8 @@ const MAX_EXPR_DEPTH: usize = MAX_PAREN_DEPTH;
 
 /// Parse a tokenized Cypher subset query. Every failure is `Err(String)`; this
 /// function never panics on a well-formed `&[Tok]` (including empty / garbage).
+/// A query that parses is then checked ([`check`](super::check)): an invalid
+/// one is refused before it is planned.
 pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
     let mut p = Parser {
         toks: tokens,
@@ -41,6 +43,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         // error here. Use `parse_read` to accept a `UNION` chain.
         return Err(p.unsupported_or_unexpected("unexpected tokens after query"));
     }
+    super::check::check_query(&q)?;
     Ok(q)
 }
 
@@ -59,7 +62,8 @@ pub(crate) fn kw(tok: Option<&Tok>, word: &str) -> bool {
     matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(word))
 }
 
-/// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
+/// Parse a read query, accepting a `UNION` / `UNION ALL` chain, and check it
+/// ([`check`](super::check)).
 pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     let mut p = Parser {
         toks: tokens,
@@ -81,11 +85,14 @@ pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     if p.pos < p.toks.len() {
         return Err(p.err("unexpected tokens after UNION query"));
     }
-    Ok(UnionQuery { parts, all_flags })
+    let union = UnionQuery { parts, all_flags };
+    super::check::check_union(&union)?;
+    Ok(union)
 }
 
 /// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
-/// Returns `Err` for read queries or malformed write statements.
+/// Returns `Err` for read queries or malformed write statements, and for a
+/// statement the compile-time check ([`check`](super::check)) refuses.
 pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
     let mut p = Parser {
         toks: tokens,
@@ -93,7 +100,9 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
         literal_depth: 0,
         expr_depth: 0,
     };
-    p.write_statement()
+    let stmt = p.write_statement()?;
+    super::check::check_write(&stmt)?;
+    Ok(stmt)
 }
 
 /// Parse a procedure call statement, `CALL ns.name(args) [YIELD …] [WHERE …]
@@ -3603,7 +3612,7 @@ LIMIT 10";
     #[test]
     fn union_query_parses_into_parts() {
         use super::parse_read;
-        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m").unwrap())
+        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m AS n").unwrap())
             .expect("UNION parses");
         assert_eq!(u.parts.len(), 2);
         assert_eq!(u.all_flags, vec![true]);

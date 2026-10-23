@@ -511,10 +511,28 @@ pub fn execute_union(
     union: &crate::cypher::parser::UnionQuery,
     params: &Params,
 ) -> Result<ResultSet, String> {
+    let plans = plan_union(union)?;
+    execute_planned_union(view, &plans, &union.all_flags, params)
+}
+
+/// Plan every part of a read query. Planning reads no row and no parameter,
+/// so its errors (an unbound variable, a duplicate column) are compile-time
+/// errors; callers report them as `plan:` before anything executes.
+pub fn plan_union(union: &crate::cypher::parser::UnionQuery) -> Result<Vec<Vec<PlanOp>>, String> {
+    union.parts.iter().map(crate::cypher::plan::plan).collect()
+}
+
+/// Execute the parts [`plan_union`] planned and combine them as
+/// [`execute_union`] does; `all_flags` is the query's `UnionQuery::all_flags`.
+pub fn execute_planned_union(
+    view: &GraphView,
+    plans: &[Vec<PlanOp>],
+    all_flags: &[bool],
+    params: &Params,
+) -> Result<ResultSet, String> {
     let mut acc: Option<ResultSet> = None;
-    for (i, part) in union.parts.iter().enumerate() {
-        let ops = crate::cypher::plan::plan(part)?;
-        let rs = execute(view, &ops, params)?;
+    for (i, ops) in plans.iter().enumerate() {
+        let rs = execute(view, ops, params)?;
         acc = Some(match acc {
             None => rs,
             Some(prev) => {
@@ -527,7 +545,7 @@ pub fn execute_union(
                     ));
                 }
                 // all_flags has one entry per boundary; index i-1 for part i.
-                let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
+                let all = all_flags.get(i - 1).copied().unwrap_or(false);
                 let kinds = merge_kinds(prev.column_kinds(), rs.column_kinds());
                 let mut combined = combine_result_sets(prev, rs, all);
                 combined.set_column_kinds(kinds);
@@ -536,7 +554,7 @@ pub fn execute_union(
         });
     }
     // `parse_read` guarantees at least one part.
-    Ok(acc.expect("UNION query has at least one part"))
+    acc.ok_or_else(|| "a read query has at least one part".to_string())
 }
 
 fn combine_result_sets(mut acc: ResultSet, other: ResultSet, all: bool) -> ResultSet {
@@ -2434,6 +2452,31 @@ const SCALAR_FUNCS: &[&str] = &[
     "localtime",
 ];
 
+/// The error for a call of a function that does not exist, listing every
+/// one that does.
+pub(crate) fn unknown_function_message(name: &str) -> String {
+    format!(
+        "unknown function `{name}`; supported: {}, {}",
+        SCALAR_FUNCS.join(", "),
+        temporal::namespaced_names().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Whether `name` (any case) names a function [`eval_func`] evaluates: a
+/// [`SCALAR_FUNCS`] name, a namespaced temporal function, a `time.` /
+/// `localtime.` name (refused by name when called), or an internal one. The
+/// compile-time check refuses any other call (QL-VE); aggregates are not
+/// function calls and are not listed.
+pub(crate) fn is_known_function(name: &str) -> bool {
+    if name == LABEL_TEST_FN || name == REL_ENDS_FN {
+        return true;
+    }
+    let norm = name.to_ascii_lowercase();
+    SCALAR_FUNCS.iter().any(|f| f.eq_ignore_ascii_case(&norm))
+        || temporal::namespaced(&norm).is_some()
+        || temporal::is_time_type_namespace(&norm)
+}
+
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
 /// `endsWith`). Null in either argument → null; non-string args → null.
 fn eval_string_predicate(
@@ -2845,11 +2888,7 @@ fn eval_func(
                 let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
                 temporal::call_namespaced(canonical, a, args.len())
             }
-            None => Err(format!(
-                "unknown function `{name}`; supported: {}, {}",
-                SCALAR_FUNCS.join(", "),
-                temporal::namespaced_names().collect::<Vec<_>>().join(", ")
-            )),
+            None => Err(unknown_function_message(name)),
         },
     }
 }
@@ -4758,7 +4797,8 @@ fn update_acc(
         }
         (AggFunc::Min, AggArg::Prop { var, field }) => {
             if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
+                // Row 160: booleans order too (false before true).
+                if numeric_val(&v).is_some() || matches!(v, Value::Bool(_)) {
                     if let AggAcc::Min(current) = acc {
                         *current = Some(match current.take() {
                             None => v,
@@ -4778,7 +4818,8 @@ fn update_acc(
         }
         (AggFunc::Max, AggArg::Prop { var, field }) => {
             if let Some(v) = resolve_prop(view, vars, row, var, field)? {
-                if numeric_val(&v).is_some() {
+                // Row 160: booleans order too (false before true).
+                if numeric_val(&v).is_some() || matches!(v, Value::Bool(_)) {
                     if let AggAcc::Max(current) = acc {
                         *current = Some(match current.take() {
                             None => v,
@@ -6483,6 +6524,10 @@ mod ql_13;
 mod ql_tf;
 
 #[cfg(test)]
+#[path = "tests/ql_ve.rs"]
+mod ql_ve;
+
+#[cfg(test)]
 #[path = "tests/ql_14.rs"]
 mod ql_14;
 
@@ -6606,12 +6651,15 @@ mod tests {
         plan(&parse(&lex(src).expect("lex")).expect("parse")).expect("plan")
     }
 
+    /// Lex, parse (with the compile-time check), plan and execute `src`; an
+    /// error from any stage is the `Err`.
     pub(super) fn run(
         view: &GraphView,
         src: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet, String> {
-        execute(view, &compile(src), &Params(params))
+        let ops = plan(&parse(&lex(src)?)?)?;
+        execute(view, &ops, &Params(params))
     }
 
     fn s(v: &str) -> Value {

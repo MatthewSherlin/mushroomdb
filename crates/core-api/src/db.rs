@@ -6,9 +6,9 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::{ret_val_label, ArithOp};
 use core_query::cypher::{
-    execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
-    plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
-    RetVal, WriteStatement,
+    execute, execute_planned_union, is_subscribable, is_write_tokens, lex, parse, parse_read,
+    parse_write, plan, plan_union, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
+    PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{
     eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet, WriteStats,
@@ -12210,10 +12210,13 @@ impl<F: Fs> GraphDb<F> {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         // Each UNION part executes against the same masked view, so the mask
         // applies uniformly across the chain.
         let view = self.view_masked(mask);
-        execute_union(&view, &union, &Params(params))
+        execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
@@ -13779,8 +13782,11 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("parse: {e}"),
         })?;
         let t0 = std::time::Instant::now();
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         let view = self.view();
-        let result = execute_union(&view, &union, &Params(params))
+        let result = execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),

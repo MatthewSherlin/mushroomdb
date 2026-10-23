@@ -243,13 +243,13 @@ fn query_stage_prefixes_lex_plan_and_execute() {
         }
         other => panic!("expected QueryError, got {other:?}"),
     }
-    // Lexes and parses; planning (now folded into execute_union so UNION parts
-    // plan independently) rejects the unbound RETURN variable.
+    // Lexes and parses; planning rejects the unbound RETURN variable before
+    // anything executes (QL-VE: every UNION part is planned first).
     match db.query("MATCH (a) RETURN b", &BTreeMap::new()) {
         Err(GraphError::QueryError { detail }) => {
             assert!(
-                detail.starts_with("execute:"),
-                "planning errors now surface via execute:, got: {detail}"
+                detail.starts_with("plan:"),
+                "planning errors must be prefixed plan:, got: {detail}"
             );
             assert!(
                 detail.contains("b") && (detail.contains("unbound") || detail.contains("Unbound")),

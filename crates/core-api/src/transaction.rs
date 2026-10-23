@@ -91,9 +91,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use core_query::cypher::{
-    execute, execute_union, is_write_tokens, lex, parse_read, parse_write, plan, CreateStmt,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MergeStmt, NodePat, Operand, Params, Pattern, Query,
-    RetItem, RetVal, UnionQuery, WriteStatement,
+    execute, execute_planned_union, is_write_tokens, lex, parse_read, parse_write, plan,
+    plan_union, CreateStmt, MatchDeleteNodeStmt, MatchDeleteStmt, MergeStmt, NodePat, Operand,
+    Params, Pattern, Query, RetItem, RetVal, UnionQuery, WriteStatement,
 };
 use core_query::{GraphView, ResultSet, WriteStats};
 use core_storage::wal::WalRecord;
@@ -701,9 +701,11 @@ impl Transaction {
             return self.execute_write(stmt, params);
         }
         let union = parse_read(&tokens).map_err(query_err("parse"))?;
+        let plans = plan_union(&union).map_err(query_err("plan"))?;
         let rs = self
             .with_view(|v| {
-                execute_union(v, &union, &Params(params)).map(|rs| crate::db::finish_result(v, rs))
+                execute_planned_union(v, &plans, &union.all_flags, &Params(params))
+                    .map(|rs| crate::db::finish_result(v, rs))
             })?
             .map_err(query_err("execute"))?;
         let keys = self.read_set(&union, params);

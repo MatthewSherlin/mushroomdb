@@ -98,6 +98,9 @@ pub struct Failure {
 pub struct RaisedError {
     pub expected_type: String,
     pub expected_phase: String,
+    /// What follows the phase in the step: the openCypher error kind
+    /// (`VariableTypeConflict`), or `*` for any.
+    pub expected_detail: String,
     pub engine_message: String,
 }
 
@@ -118,14 +121,38 @@ pub fn error_stage(message: &str) -> &'static str {
 /// from execution, an `any time` error from either. An error that passes
 /// only because some error was raised (a parse error for an unsupported
 /// construct where the TCK expects a runtime `TypeError`) does not match.
+///
+/// An error that names its openCypher kind (the compile-time check's
+/// `VariableTypeConflict: …`, see [`error_kind`]) matches only when the kind
+/// is the one the TCK names (or the TCK names `*`): the right phase with the
+/// wrong kind is an error for another reason.
 pub fn error_phase_matches(raised: &RaisedError) -> bool {
     let stage = error_stage(&raised.engine_message);
-    match raised.expected_phase.as_str() {
+    let phase = match raised.expected_phase.as_str() {
         "compile time" => matches!(stage, "lex" | "parse" | "plan"),
         "runtime" => stage == "execute",
         "any time" => stage != "other",
         _ => false,
-    }
+    };
+    let kind = match error_kind(&raised.engine_message) {
+        Some(kind) => raised.expected_detail == "*" || raised.expected_detail == kind,
+        None => true,
+    };
+    phase && kind
+}
+
+/// The openCypher error kind an engine message names after its stage, as
+/// `parse: VariableTypeConflict: …` does: a word of two or more capitalised
+/// parts followed by `: `. `None` for a message that names none.
+pub fn error_kind(message: &str) -> Option<&str> {
+    let m = message.strip_prefix("query error: ").unwrap_or(message);
+    let (_, rest) = m.split_once(": ")?;
+    let (word, _) = rest.split_once(": ")?;
+    let camel = word.chars().all(|c| c.is_ascii_alphanumeric())
+        && word.starts_with(|c: char| c.is_ascii_uppercase())
+        && word.chars().filter(char::is_ascii_uppercase).count() >= 2
+        && word.chars().any(|c| c.is_ascii_lowercase());
+    camel.then_some(word)
 }
 
 #[derive(Debug, Clone)]
@@ -493,12 +520,14 @@ fn check_error(run: &mut Run, text: &str) {
     let (ty, after) = rest
         .split_once(" should be raised at ")
         .unwrap_or((rest, ""));
-    let phase = after.split(':').next().unwrap_or("").trim();
+    let (phase, detail) = after.split_once(':').unwrap_or((after, ""));
+    let (phase, detail) = (phase.trim(), detail.trim());
     match &run.result {
         Some(Err(e)) => {
             run.raised = Some(RaisedError {
                 expected_type: ty.to_string(),
                 expected_phase: phase.to_string(),
+                expected_detail: detail.to_string(),
                 engine_message: e.clone(),
             });
         }
@@ -708,10 +737,55 @@ mod tests {
     }
 
     fn raised(phase: &str, message: &str) -> RaisedError {
+        raised_kind(phase, "*", message)
+    }
+
+    fn raised_kind(phase: &str, detail: &str, message: &str) -> RaisedError {
         RaisedError {
             expected_type: "SyntaxError".into(),
             expected_phase: phase.into(),
+            expected_detail: detail.into(),
             engine_message: message.into(),
+        }
+    }
+
+    #[test]
+    fn an_error_that_names_its_kind_matches_only_that_kind() {
+        let conflict = "query error: parse: VariableTypeConflict: `r` is a node";
+        assert_eq!(error_kind(conflict), Some("VariableTypeConflict"));
+        assert!(error_phase_matches(&raised_kind(
+            "compile time",
+            "VariableTypeConflict",
+            conflict
+        )));
+        assert!(!error_phase_matches(&raised_kind(
+            "compile time",
+            "VariableAlreadyBound",
+            conflict
+        )));
+        assert!(error_phase_matches(&raised_kind(
+            "compile time",
+            "*",
+            conflict
+        )));
+        assert!(!error_phase_matches(&raised_kind(
+            "runtime",
+            "VariableTypeConflict",
+            conflict
+        )));
+        // A message that names no kind matches by phase alone, as before.
+        for plain in [
+            "query error: parse: parse error at token 7: CREATE node requires a label",
+            "query error: plan: unbound variable `foo` in RETURN",
+            "query error: parse: UNION is not supported",
+            "query error: parse: CREATE (a:L): `a` is already bound",
+        ] {
+            assert_eq!(error_kind(plain), None, "{plain}");
+            assert!(error_phase_matches(&raised_kind(
+                "compile time",
+                "UndefinedVariable",
+                plain
+            )));
         }
     }
 
