@@ -572,8 +572,9 @@ REMOVE n.score, n.nickname
   (label removal)`. A node has one label in 0.10.
 - `REMOVE r.prop` on a relationship, or on a name `MATCH` did not bind, is a
   parse error.
-- Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
-  it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
+- Inside an interactive transaction `REMOVE` buffers like `SET`, with or
+  without `RETURN`; the `RETURN` reads the transaction's state with the
+  removal applied.
 
 ### `MATCH … SET n = {…}` / `SET n += {…}`
 
@@ -615,8 +616,8 @@ SET n = {name: 'Alice', score: 1}
   other node `id` is an ordinary property.
 - `RETURN` projects the post-write state. `properties_set` counts the
   properties set plus the properties removed.
-- Inside an interactive transaction the map forms are refused:
-  `not supported in mushroomdb 0.10 inside a transaction`.
+- Inside an interactive transaction the map forms run as they do auto-commit
+  and are buffered until `COMMIT`.
 
 ### MATCH … DELETE (edge)
 
@@ -726,11 +727,11 @@ MERGE (a)-[:LIKES]->(b)
   `MERGE` finds or creates the relationship (and the other end, if that one has a
   label and key) and never creates `a`. A bound end that is null in a row (an
   `OPTIONAL MATCH` that found nothing) is an error, as is `MERGE (a)` alone.
-- In this build it is refused inside an interactive transaction (HTTP `/tx`,
-  Bolt `BEGIN`, and so a driver-managed write transaction such as
-  `session.execute_write`), as the `UNWIND` form is: `not supported in
-  mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE`. Run it as an
-  auto-commit statement (HTTP `/query`, Bolt `RUN` outside `BEGIN`).
+- It runs inside an interactive transaction too (HTTP `/tx`, Bolt `BEGIN`, and
+  so a driver-managed write transaction such as `session.execute_write`), with
+  the same results and counts as auto-commit. It reads the transaction's own
+  earlier writes, and what it writes stays private to the transaction until
+  `COMMIT`.
 
 ### UNWIND … write clauses
 
@@ -805,12 +806,14 @@ MERGE (n:Person {id: r.id})
   such a `RETURN` is refused by name.
 - **Counts.** Without `RETURN` the row is `created` (nodes inserted),
   `properties_set` (properties set, plus those removed that existed), `deleted`
-  (nodes deleted) and `relationships_created` (relationships created).
+  (nodes deleted, plus the relationships a `DETACH DELETE` removed with them,
+  counted as `MATCH … DETACH DELETE` counts them) and `relationships_created` (relationships created).
 - **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
   `ingest` of the same rows.
-- Inside an interactive transaction (and so a Bolt `BEGIN`) it is refused by
-  name: `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE /
-  MERGE / SET / REMOVE / DELETE`. Run it as its own statement.
+- Inside an interactive transaction (and so a Bolt `BEGIN`) it runs as it does
+  auto-commit, reading the transaction's own earlier writes; its writes are
+  buffered until `COMMIT`. Constraints and the other checks a commit makes run
+  at `COMMIT`, and a failure there rejects the whole transaction.
 - Under a role-scoped write the `MATCH` is masked, so a hidden node reads as
   absent and nothing is written to it; create and update scope are checked per
   label as for the single statements.
@@ -1511,8 +1514,6 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | A `MATCH`, `UNWIND` or `WITH` after a write clause of an `UNWIND` statement | `not supported in mushroomdb 0.10: a MATCH, UNWIND or WITH clause after a write clause in the same statement; put the reads first` |
 | `UNWIND … MATCH (a)-[r]->(b) DELETE r` | `not supported in mushroomdb 0.10: DELETE of the relationship `r` after UNWIND; delete nodes, or use MATCH … DELETE` |
 | `UNWIND … SET n += x` where `x` is not a map | `SET n += <map>: the value must be a map, got …` |
-| `UNWIND … <write>` inside a transaction | `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE / MERGE / SET / REMOVE / DELETE` |
-| `MATCH … CREATE` / `MATCH … MERGE` inside a transaction (HTTP `/tx`, Bolt `BEGIN`) | `not supported in mushroomdb 0.10 inside a transaction: MATCH … CREATE / MERGE` |
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN (found …)` |
 | `RETURN *` / `WITH *` with no node, path or value name in scope | `RETURN * / WITH * with no variables in scope` |
@@ -1556,7 +1557,7 @@ unexpected-token parse error or other unspecified result.
 
 | Feature | Status |
 |---|---|
-| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; some write forms are refused inside a transaction in this build: `REMOVE … RETURN`, the `SET` map forms, `UNWIND … <write>` (including `UNWIND … MATCH … CREATE`) and `MATCH … CREATE` / `MATCH … MERGE` — under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; run those as auto-commit statements |
+| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; every write statement runs inside a transaction with the results and counts it gives auto-commit (`MATCH … CREATE` / `MERGE`, `UNWIND … <write>`, the `SET` map forms and `SET` / `REMOVE … RETURN` included), under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; schema statements are refused there |
 | Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, arithmetic expressions (`n.x + 1`, `n.score * 1.5`) and predicates (`n.score > 10`, `NOT n.done`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |

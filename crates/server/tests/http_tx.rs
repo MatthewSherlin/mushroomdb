@@ -629,3 +629,50 @@ async fn a_second_request_while_one_runs_is_busy() {
     // The busy answer changed nothing: the transaction is still ours.
     assert_eq!(s.run(&id, None, "RETURN 1 AS x").await.status, 200);
 }
+
+/// TX-MW (ledger row 144): the driver's everyday write — find two nodes,
+/// connect them — runs inside `/tx` as it does auto-commit.
+#[tokio::test]
+async fn match_then_create_connects_two_nodes_inside_a_transaction() {
+    let s = plain("match-create", limits(100, 30_000)).await;
+    s.db.write()
+        .insert_node(
+            "Person",
+            "other",
+            vec![("id".into(), Value::Str("other".into()))],
+        )
+        .unwrap();
+    let id = s.begin_id(None).await;
+    let created = s
+        .call(
+            "POST",
+            &format!("/tx/{id}/run"),
+            None,
+            Some(json!({
+                "cypher": "MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)",
+                "params": {"a": "seed", "b": "other"},
+            })),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{}", created.body);
+    assert_eq!(
+        created.body["columns"],
+        json!([
+            "created",
+            "properties_set",
+            "deleted",
+            "relationships_created"
+        ])
+    );
+    assert_eq!(created.body["rows"], json!([[0, 0, 0, 1]]));
+    let edge = "MATCH (a)-[:K]->(b) RETURN a.id AS a, b.id AS b";
+    let inside = s.run(&id, None, edge).await;
+    assert_eq!(inside.body["rows"], json!([["seed", "other"]]));
+    assert_eq!(s.query(None, edge).await["rows"], json!([]));
+    let committed = s.post(&id, None, "commit").await;
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    assert_eq!(
+        s.query(None, edge).await["rows"],
+        json!([["seed", "other"]])
+    );
+}

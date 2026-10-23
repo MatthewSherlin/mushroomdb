@@ -551,21 +551,39 @@ fn committed_derived_edges_read_the_same_inside_a_tx_with_writes() {
 }
 
 #[test]
-fn unsupported_write_form_is_refused_and_buffers_nothing() {
-    let dir = tmp("unsupported");
+fn match_set_with_return_runs_inside_a_transaction() {
+    let dir = tmp("set-return");
+    let db = SharedDb::open(&dir).unwrap();
+    db.submit_batch(vec![node("a")]).unwrap();
+    let mut tx = db.begin_transaction();
+    let rs = tx
+        .execute("MATCH (n:P {id: 'a'}) SET n.x = 1 RETURN n.x AS x", &p())
+        .unwrap();
+    assert_eq!(rs.get(0, "x"), Some(&Value::Int(1)));
+    assert_eq!(db.reader().node_info("a").unwrap().props.get("x"), None);
+    tx.commit().unwrap();
+    assert_eq!(
+        db.reader().node_info("a").unwrap().props.get("x"),
+        Some(&Value::Int(1))
+    );
+}
+
+#[test]
+fn a_refused_write_return_buffers_nothing() {
+    let dir = tmp("refused-return");
     let db = SharedDb::open(&dir).unwrap();
     db.submit_batch(vec![node("a")]).unwrap();
     let mut tx = db.begin_transaction();
     let err = tx
-        .execute("MATCH (n:P {id: 'a'}) SET n.x = 1 RETURN n.x AS x", &p())
+        .execute(
+            "MATCH (n:P {id: 'a'}) SET n.x = 1 RETURN [v IN [1, 2] | v] AS xs",
+            &p(),
+        )
         .unwrap_err();
-    match err {
-        GraphError::QueryError { detail } => assert_eq!(
-            detail,
-            "not supported in mushroomdb 0.10 inside a transaction: MATCH … SET … RETURN"
-        ),
-        other => panic!("expected QueryError, got {other:?}"),
-    }
+    assert!(
+        matches!(err, GraphError::QueryError { ref detail } if detail.contains("list comprehension")),
+        "{err:?}"
+    );
     let frames = mushroomdb::wal_commit_count_at(&dir).unwrap();
     let seq = tx.commit().unwrap();
     assert_eq!(

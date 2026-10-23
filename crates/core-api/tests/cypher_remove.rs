@@ -340,29 +340,26 @@ fn remove_inside_a_transaction_buffers_and_commits_atomically() {
 }
 
 #[test]
-fn remove_with_return_inside_a_transaction_is_refused_and_buffers_nothing() {
+fn remove_with_return_runs_inside_a_transaction() {
     let dir = tmp("tx-return");
     let db: SharedDb = SharedDb::open(&dir).unwrap();
     db.submit_batch(vec![node("x")]).unwrap();
     let mut tx = db.begin_transaction();
-    let err = tx
+    let rs = tx
         .execute(
-            "MATCH (n:P) WHERE n.id = 'x' REMOVE n.a RETURN n.b AS b",
+            "MATCH (n:P) WHERE n.id = 'x' REMOVE n.a RETURN n.a AS a, n.b AS b",
             &p(),
         )
-        .unwrap_err();
-    match err {
-        GraphError::QueryError { detail } => assert_eq!(
-            detail,
-            "not supported in mushroomdb 0.10 inside a transaction: MATCH … REMOVE … RETURN"
-        ),
-        other => panic!("expected QueryError, got {other:?}"),
-    }
-    tx.commit().unwrap();
+        .unwrap();
+    assert_eq!(rs.get(0, "a"), None, "the RETURN reads the removal");
+    assert_eq!(rs.get(0, "b"), Some(&Value::Int(2)));
     assert_eq!(
         db.reader().node_info("x").unwrap().props.get("a"),
-        Some(&Value::Int(1))
+        Some(&Value::Int(1)),
+        "not committed yet"
     );
+    tx.commit().unwrap();
+    assert_eq!(db.reader().node_info("x").unwrap().props.get("a"), None);
 }
 
 // ── Keyword stays a name elsewhere ──────────────────────────────────────────

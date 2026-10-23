@@ -210,6 +210,43 @@ fn begin_create_run_commit_makes_the_write_visible() {
     assert_eq!(count(&mut conn, "Pending"), 1, "auto-commit sees it too");
 }
 
+/// TX-MW (ledger row 144): a driver's managed write transaction sends BEGIN,
+/// so "find two nodes, connect them" must run inside it.
+#[test]
+fn begin_match_create_commit_connects_two_nodes() {
+    let (db, _dir) = open_db();
+    let node = |key: &str| BatchOp::InsertNode {
+        label: "Person".into(),
+        key: key.into(),
+        props: vec![("id".into(), Value::Str(key.into()))],
+    };
+    db.submit_batch(vec![node("a"), node("b")]).unwrap();
+    let mut conn = connected(&db);
+    expect_success(conn.handle(begin()));
+    let out = rows(
+        &mut conn,
+        run_with(
+            "MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)",
+            vec![("a", s("a")), ("b", s("b"))],
+        ),
+    );
+    assert_eq!(
+        out,
+        vec![vec![
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(0),
+            PackValue::Int(1)
+        ]]
+    );
+    let edge = "MATCH (x)-[:K]->(y) RETURN x.id, y.id";
+    assert_eq!(rows(&mut conn, run(edge)), vec![vec![s("a"), s("b")]]);
+    let outside = |db: &SharedDb| db.reader().query(edge, &BTreeMap::new()).unwrap().len();
+    assert_eq!(outside(&db), 0, "not committed yet");
+    expect_success(conn.handle(commit()));
+    assert_eq!(outside(&db), 1);
+}
+
 #[test]
 fn rollback_leaves_nothing_behind() {
     let (db, _dir) = open_db();
