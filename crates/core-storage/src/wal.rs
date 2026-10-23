@@ -226,6 +226,34 @@ pub enum WalRecord {
     DisableRangeIndex {
         name: String,
     },
+    // ── Relationship-property variants (appended after range indexes; 28, 29) ─
+    //
+    // A user write to one property of the edge `(etype, src, dst)` — Cypher
+    // `CREATE`/`MERGE` relationship maps, `SET r.p`, `SET r += …`, `SET r = …`,
+    // `REMOVE r.p` (0.10 QL-RP). Absolute, last write wins, like
+    // `SetEdgeCount`: a pre-snapshot frame replayed over a base that already
+    // folded it in lands on the same value. The properties live where a
+    // rule's weights do (the edge-property overlay, snapshot section 5).
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (contract C9).
+    /// Set property `field` (an interned name) of the edge to `value`.
+    /// Discriminant 28.
+    SetEdgePropId {
+        etype: u32,
+        src: u32,
+        dst: u32,
+        field: u32,
+        value: Value,
+    },
+    /// Remove property `field` (an interned name) of the edge; a no-op when
+    /// the edge lacks it. Discriminant 29.
+    RemoveEdgePropId {
+        etype: u32,
+        src: u32,
+        dst: u32,
+        field: u32,
+    },
 }
 
 /// The opt-in declaration: this store records insert-count multiplicity.
@@ -256,9 +284,9 @@ impl WalRecord {
         match self {
             WalRecord::InsertNode { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
             WalRecord::InsertNodeId { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
-            WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
-                value.contains_null()
-            }
+            WalRecord::SetProp { value, .. }
+            | WalRecord::SetPropId { value, .. }
+            | WalRecord::SetEdgePropId { value, .. } => value.contains_null(),
             WalRecord::Batch(inner) => inner.iter().any(WalRecord::carries_null),
             _ => false,
         }
@@ -1099,6 +1127,53 @@ mod tests {
         let (recs, consumed) = decode_all(&bytes);
         assert_eq!(consumed, bytes.len());
         assert_eq!(recs, vec![enable, disable]);
+    }
+
+    /// QL-RP's relationship-property records are discriminants 28 and 29.
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn edge_property_discriminants_pinned() {
+        let set = WalRecord::SetEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+            value: Value::Int(5),
+        };
+        let sp = bincode::serialize(&set).unwrap();
+        assert_eq!(
+            &sp[0..4],
+            &[28, 0, 0, 0],
+            "SetEdgePropId discriminant changed — a variant was inserted before position 28"
+        );
+        let remove = WalRecord::RemoveEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+        };
+        let rp = bincode::serialize(&remove).unwrap();
+        assert_eq!(
+            &rp[0..4],
+            &[29, 0, 0, 0],
+            "RemoveEdgePropId discriminant changed — a variant was inserted before position 29"
+        );
+        let mut bytes = encode_record(&set);
+        bytes.extend(encode_record(&remove));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![set, remove]);
+        // A null edge-property value is never framed.
+        assert!(try_encode_record(&WalRecord::SetEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+            value: Value::Null,
+        })
+        .is_err());
     }
 
     /// The opt-in declaration and a real count share the discriminant and are

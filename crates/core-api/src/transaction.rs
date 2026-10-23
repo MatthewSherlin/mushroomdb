@@ -130,8 +130,8 @@ pub struct Transaction {
     read_write_keys: HashMap<String, u64>,
     /// Identity of the store load `base_snap` came from.
     base_store: StoreId,
-    /// `buffer` as the WAL records the overlay applies.
-    records: Vec<WalRecord>,
+    /// `buffer` as the records the overlay applies.
+    records: Vec<TxRecord>,
     /// `base_snap`'s delta-tail layer with `records` laid over it, updated by
     /// each statement with that statement's records alone; `None` until the
     /// first write.
@@ -154,21 +154,55 @@ enum Outcome {
     Return(Box<Query>, WriteStats),
 }
 
+/// One buffered write as the overlay lays it: a WAL record, or a
+/// relationship-property write named by the edge's type and end keys (its WAL
+/// record names dense ids, which only the commit assigns).
+enum TxRecord {
+    Wal(WalRecord),
+    EdgeProp {
+        edge: (String, String, String),
+        field: String,
+        value: Option<Value>,
+    },
+}
+
+/// Lay one buffered write over the transaction's overlay.
+fn lay(
+    overlay: &mut DeltaLayer,
+    state: &crate::reader::FrozenOverlay,
+    base: &Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+    rec: &TxRecord,
+) -> Result<()> {
+    match rec {
+        TxRecord::Wal(rec) => overlay.apply(state, base, rec),
+        TxRecord::EdgeProp { edge, field, value } => {
+            overlay.write_edge_prop(
+                state,
+                base,
+                (&edge.0, &edge.1, &edge.2),
+                field,
+                value.as_ref(),
+            );
+            Ok(())
+        }
+    }
+}
+
 /// One statement's effect, held until the statement has fully succeeded.
 #[derive(Default)]
 struct Staged {
     ops: Vec<BatchOp>,
-    records: Vec<WalRecord>,
+    records: Vec<TxRecord>,
     keys: HashSet<String>,
 }
 
 impl Staged {
     fn insert_node(&mut self, label: &str, key: &str, props: Vec<(String, Value)>) {
-        self.records.push(WalRecord::InsertNode {
+        self.records.push(TxRecord::Wal(WalRecord::InsertNode {
             label: label.into(),
             key: key.into(),
             props: props.clone(),
-        });
+        }));
         self.ops.push(BatchOp::InsertNode {
             label: label.into(),
             key: key.into(),
@@ -178,11 +212,11 @@ impl Staged {
     }
 
     fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) {
-        self.records.push(WalRecord::InsertEdge {
+        self.records.push(TxRecord::Wal(WalRecord::InsertEdge {
             edge_type: edge_type.into(),
             src_key: src_key.into(),
             dst_key: dst_key.into(),
-        });
+        }));
         self.ops.push(BatchOp::InsertEdge {
             edge_type: edge_type.into(),
             src_key: src_key.into(),
@@ -193,11 +227,11 @@ impl Staged {
     }
 
     fn set_prop(&mut self, key: &str, field: &str, value: Value) {
-        self.records.push(WalRecord::SetProp {
+        self.records.push(TxRecord::Wal(WalRecord::SetProp {
             key: key.into(),
             field: field.into(),
             value: value.clone(),
-        });
+        }));
         self.ops.push(BatchOp::SetProp {
             key: key.into(),
             field: field.into(),
@@ -207,10 +241,10 @@ impl Staged {
     }
 
     fn remove_prop(&mut self, key: &str, field: &str) {
-        self.records.push(WalRecord::RemoveProp {
+        self.records.push(TxRecord::Wal(WalRecord::RemoveProp {
             key: key.into(),
             field: field.into(),
-        });
+        }));
         self.ops.push(BatchOp::RemoveProp {
             key: key.into(),
             field: field.into(),
@@ -219,11 +253,11 @@ impl Staged {
     }
 
     fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) {
-        self.records.push(WalRecord::DeleteEdge {
+        self.records.push(TxRecord::Wal(WalRecord::DeleteEdge {
             edge_type: edge_type.into(),
             src_key: src_key.into(),
             dst_key: dst_key.into(),
-        });
+        }));
         self.ops.push(BatchOp::DeleteEdge {
             edge_type: edge_type.into(),
             src_key: src_key.into(),
@@ -234,9 +268,32 @@ impl Staged {
     }
 
     fn delete_node(&mut self, key: &str) {
-        self.records.push(WalRecord::DeleteNode { key: key.into() });
+        self.records
+            .push(TxRecord::Wal(WalRecord::DeleteNode { key: key.into() }));
         self.ops.push(BatchOp::DeleteNode { key: key.into() });
         self.touch(key);
+    }
+
+    fn edge_prop(&mut self, edge: (String, String, String), field: String, value: Option<Value>) {
+        self.touch(&edge.1);
+        self.touch(&edge.2);
+        let (edge_type, src_key, dst_key) = edge.clone();
+        self.ops.push(match value.clone() {
+            Some(value) => BatchOp::SetEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                field: field.clone(),
+                value,
+            },
+            None => BatchOp::RemoveEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                field: field.clone(),
+            },
+        });
+        self.records.push(TxRecord::EdgeProp { edge, field, value });
     }
 
     fn touch(&mut self, key: &str) {
@@ -462,6 +519,23 @@ impl RowSource for TxRows<'_, '_> {
     fn row_view_owns(&self, field: &str) -> bool {
         self.db.read().row_view_owns(field)
     }
+
+    fn row_edge_props(&self, etype: &str, src: &str, dst: &str) -> BTreeMap<String, Value> {
+        match self.row_edge_ids(etype, src, dst) {
+            Some((et, s, d)) => self.view.edge_props.props_of(et, s, d),
+            None => BTreeMap::new(),
+        }
+    }
+
+    fn row_edge_ids(&self, etype: &str, src: &str, dst: &str) -> Option<(u32, u32, u32)> {
+        let v = self.view;
+        Some((v.sym(etype)?, v.node_id(src)?, v.node_id(dst)?))
+    }
+
+    /// Rules are the store's: the live engine answers.
+    fn row_rule_owning(&self, etype: &str) -> Option<String> {
+        self.db.read().rule_owning_edge_type(etype)
+    }
 }
 
 /// A `MATCH … SET` / `REMOVE` or per-row statement's ops, computed over the
@@ -546,6 +620,19 @@ fn stage_ops(src: &TxRows<'_, '_>, ops: Vec<BatchOp>) -> Result<Staged> {
                 src_key,
                 dst_key,
             } => staged.delete_edge(&edge_type, &src_key, &dst_key),
+            BatchOp::SetEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                field,
+                value,
+            } => staged.edge_prop((edge_type, src_key, dst_key), field, Some(value)),
+            BatchOp::RemoveEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                field,
+            } => staged.edge_prop((edge_type, src_key, dst_key), field, None),
             // No statement form makes these. Listed, not wildcarded, so a new
             // op is a compile error here rather than a runtime surprise.
             BatchOp::CreateRule(_)
@@ -728,7 +815,7 @@ impl Transaction {
 
     /// Lay `records` over the overlay, creating it on the first write. On a
     /// failure the overlay is put back to the accepted buffer alone.
-    fn apply(&mut self, records: &[WalRecord]) -> Result<()> {
+    fn apply(&mut self, records: &[TxRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -739,7 +826,7 @@ impl Transaction {
         let overlay = self.overlay.as_mut().expect("set just above");
         let applied = records
             .iter()
-            .try_for_each(|rec| overlay.apply(state, base, rec));
+            .try_for_each(|rec| lay(overlay, state, base, rec));
         if applied.is_err() {
             self.revert()?;
         }
@@ -757,7 +844,7 @@ impl Transaction {
         let mut overlay = self.fresh_overlay()?;
         let (state, base, _) = self.base_snap.layer_parts()?;
         for rec in &self.records {
-            overlay.apply(state, base, rec)?;
+            lay(&mut overlay, state, base, rec)?;
         }
         self.overlay = Some(overlay);
         Ok(())
@@ -1171,8 +1258,8 @@ impl Transaction {
             } else {
                 Err(GraphError::QueryError {
                     detail: format!(
-                        "SET variable '{var}' does not match a MERGE node variable \
-                         (a relationship takes no SET)"
+                        "SET variable '{var}' does not match a MERGE node or relationship \
+                         variable"
                     ),
                 })
             }

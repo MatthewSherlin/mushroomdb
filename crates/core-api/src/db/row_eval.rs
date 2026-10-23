@@ -59,6 +59,15 @@ pub(crate) trait RowSource {
     ) -> Result<Vec<(String, Value)>>;
     /// Whether a view owns the property `field`.
     fn row_view_owns(&self, field: &str) -> bool;
+    /// Every stored property of the edge `src -[etype]-> dst`; empty when it
+    /// has none or is not there.
+    fn row_edge_props(&self, etype: &str, src: &str, dst: &str) -> BTreeMap<String, Value>;
+    /// The edge's type symbol and end ids in [`Self::row_view`]'s view, when
+    /// its type and both ends are there.
+    fn row_edge_ids(&self, etype: &str, src: &str, dst: &str) -> Option<(u32, u32, u32)>;
+    /// The rule that derives edges of `etype`, if one does: such a type takes
+    /// no user property write.
+    fn row_rule_owning(&self, etype: &str) -> Option<String>;
 }
 
 impl<F: Fs> RowSource for GraphDb<F> {
@@ -138,6 +147,25 @@ impl<F: Fs> RowSource for GraphDb<F> {
     fn row_view_owns(&self, field: &str) -> bool {
         self.view_store.view_for_prop(field).is_some()
     }
+
+    fn row_edge_props(&self, etype: &str, src: &str, dst: &str) -> BTreeMap<String, Value> {
+        match self.row_edge_ids(etype, src, dst) {
+            Some((et, s, d)) => self.edge_props_view().props_of(et, s, d),
+            None => BTreeMap::new(),
+        }
+    }
+
+    fn row_edge_ids(&self, etype: &str, src: &str, dst: &str) -> Option<(u32, u32, u32)> {
+        Some((
+            self.syms.get(etype)?,
+            self.ids.get(src)?,
+            self.ids.get(dst)?,
+        ))
+    }
+
+    fn row_rule_owning(&self, etype: &str) -> Option<String> {
+        self.rule_owning_edge_type(etype)
+    }
 }
 
 /// What the statement has done to one node so far.
@@ -164,12 +192,22 @@ impl NodeState {
     }
 }
 
-type EdgeKey = (String, String, String);
+pub(super) type EdgeKey = (String, String, String);
+
+/// What the statement has done to one relationship's properties so far.
+pub(super) struct EdgeState {
+    /// The properties at this point, once known.
+    props: Option<BTreeMap<String, Value>>,
+    /// Writes made before `props` was loaded: a value, or `None` for a removal.
+    delta: BTreeMap<String, Option<Value>>,
+}
 
 /// The statement's own effects, read back by later rows.
 #[derive(Default)]
 pub(super) struct Overlay {
     pub(super) nodes: HashMap<String, NodeState>,
+    /// Relationship properties the statement wrote (QL-RP).
+    edge_props: HashMap<EdgeKey, EdgeState>,
     edges: HashSet<EdgeKey>,
     /// The edges the statement created, by each endpoint. An entry can name an
     /// edge that is gone from `edges` (its other end was deleted).
@@ -232,6 +270,42 @@ impl Overlay {
         }
     }
 
+    /// A relationship the statement created: its properties are `props` and
+    /// nothing the store held for the pair before.
+    pub(super) fn edge_props_fresh(&mut self, edge: &EdgeKey, props: BTreeMap<String, Value>) {
+        self.edge_props.insert(
+            edge.clone(),
+            EdgeState {
+                props: Some(props),
+                delta: BTreeMap::new(),
+            },
+        );
+    }
+
+    /// Record a relationship-property write: a value, or `None` for a removal.
+    pub(super) fn note_edge_write(&mut self, edge: &EdgeKey, field: &str, value: Option<&Value>) {
+        let state = self
+            .edge_props
+            .entry(edge.clone())
+            .or_insert_with(|| EdgeState {
+                props: None,
+                delta: BTreeMap::new(),
+            });
+        match state.props.as_mut() {
+            Some(props) => match value {
+                Some(v) => {
+                    props.insert(field.to_string(), v.clone());
+                }
+                None => {
+                    props.remove(field);
+                }
+            },
+            None => {
+                state.delta.insert(field.to_string(), value.cloned());
+            }
+        }
+    }
+
     pub(super) fn node_deleted(&mut self, key: &str) {
         for edge in self.touching.remove(key).unwrap_or_default() {
             self.edges.remove(&edge);
@@ -282,6 +356,32 @@ pub(super) fn uw_props<'o, S: RowSource + ?Sized>(
     let delta = std::mem::take(&mut state.delta);
     state.props.get_or_insert_with(|| {
         let mut props = src.row_props(key);
+        for (field, value) in delta {
+            match value {
+                Some(v) => props.insert(field, v),
+                None => props.remove(&field),
+            };
+        }
+        props
+    })
+}
+
+/// The properties of the relationship `edge` at this point of the statement.
+pub(super) fn uw_edge_props<'o, S: RowSource + ?Sized>(
+    src: &S,
+    ov: &'o mut Overlay,
+    edge: &EdgeKey,
+) -> &'o mut BTreeMap<String, Value> {
+    let state = ov
+        .edge_props
+        .entry(edge.clone())
+        .or_insert_with(|| EdgeState {
+            props: None,
+            delta: BTreeMap::new(),
+        });
+    let delta = std::mem::take(&mut state.delta);
+    state.props.get_or_insert_with(|| {
+        let mut props = src.row_edge_props(&edge.0, &edge.1, &edge.2);
         for (field, value) in delta {
             match value {
                 Some(v) => props.insert(field, v),
@@ -393,16 +493,38 @@ fn uw_read_prop<S: RowSource + ?Sized>(
 /// `node_key` answers for a name: `Some(Some(key))` a node, `Some(None)` a
 /// node variable that is null in this row (an `OPTIONAL MATCH` that found
 /// nothing), `None` not a node. `values` are the row's other variables.
+///
+/// `rel_key` answers for a relationship name the same way (QL-RP): a property
+/// of it reads the statement's own writes before the store.
 pub(super) fn uw_eval<S: RowSource + ?Sized>(
     src: &S,
     ov: &mut Overlay,
     operand: &Operand,
     node_key: &dyn Fn(&str) -> Option<Option<String>>,
+    rel_key: &dyn Fn(&str) -> Option<Option<EdgeKey>>,
     values: &[(&str, Value)],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
     let mut stored: Vec<(String, u32)> = Vec::new();
+    let mut rels: Vec<(String, (u32, u32, u32))> = Vec::new();
     let rewritten = map_leaves(operand, &mut |leaf| match leaf {
+        Operand::Prop { var, field } if node_key(var).is_none() => {
+            let edge = rel_key(var)?;
+            Some(Operand::Lit(
+                edge.and_then(|e| uw_edge_props(src, ov, &e).get(field).cloned())
+                    .unwrap_or(Value::Null),
+            ))
+        }
+        Operand::Var(var) if node_key(var).is_none() => {
+            let edge = rel_key(var)?;
+            match edge.and_then(|e| src.row_edge_ids(&e.0, &e.1, &e.2)) {
+                Some(ids) => {
+                    rels.push((var.clone(), ids));
+                    Some(Operand::Var(var.clone()))
+                }
+                None => Some(Operand::Lit(Value::Null)),
+            }
+        }
         Operand::Prop { var, field } => {
             let key = node_key(var)?;
             Some(match key {
@@ -435,6 +557,16 @@ pub(super) fn uw_eval<S: RowSource + ?Sized>(
     for (name, id) in &stored {
         bindings.push((name.as_str(), Binding::Node(*id)));
     }
+    for (name, (etype, src, dst)) in &rels {
+        bindings.push((
+            name.as_str(),
+            Binding::Rel {
+                etype: *etype,
+                src: *src,
+                dst: *dst,
+            },
+        ));
+    }
     src.row_view(|view| eval_operand(view, &rewritten, &Params(params), &bindings))
         .map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
@@ -452,6 +584,20 @@ pub(super) fn reads_node(operand: &Operand, nodes: &[String]) -> bool {
         };
         if nodes.iter().any(|n| n == name) {
             found = true;
+        }
+        None
+    });
+    found
+}
+
+/// Whether `operand` reads a property of a relationship variable in `rels`.
+pub(super) fn reads_rel_prop(operand: &Operand, rels: &[String]) -> bool {
+    let mut found = false;
+    map_leaves(operand, &mut |leaf| {
+        if let Operand::Prop { var, .. } = leaf {
+            if rels.iter().any(|r| r == var) {
+                found = true;
+            }
         }
         None
     });

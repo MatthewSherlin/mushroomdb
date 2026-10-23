@@ -315,8 +315,9 @@ same rules, whose derived edges are made when the rules are created at the end
 (`derived: true` lines are skipped, and counted). A JSONL path of `-` reads
 standard input, and the file streams line by line in batches of 50,000
 (`--batch-size`), one WAL frame each, the same path the CSV import uses. The
-store you export must be the whole of what you want back: indexes, constraints
-and views are not part of an export. An import carrying one of the newer value
+store you export must be the whole of what you want back: indexes, constraints,
+views and relationship properties (Cypher `-[:T {…}]->`, `SET r.p`) are not
+part of an export. An import carrying one of the newer value
 types moves the store to the V11 format, as any write of one does; 0.9.x does
 not open a V11 store.
 

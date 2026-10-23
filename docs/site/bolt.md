@@ -250,12 +250,12 @@ The `SUCCESS` that closes a write statement carries a `stats` map, which drivers
 | `nodes-deleted` | nodes deleted |
 | `relationships-created` | relationships created |
 | `relationships-deleted` | relationships deleted, including those a `DETACH DELETE` removes with their node |
-| `properties-set` | properties set or removed, including those a `CREATE` or a `MERGE` writes with a new node |
+| `properties-set` | properties set or removed, including those a `CREATE` or a `MERGE` writes with a new node or a new relationship |
 | `labels-added` | one for each node created (a node is created with its label) |
 | `indexes-added`, `indexes-removed` | `CREATE INDEX` / `DROP INDEX` that changed the schema |
 | `constraints-added`, `constraints-removed` | `CREATE CONSTRAINT` / `DROP CONSTRAINT` that changed the schema |
 
-A schema statement's summary has query type `s`, a write's `w` and a read's `r`. Only counters that moved are listed; a driver reads a missing one as 0. A statement that changed nothing (a read, a `MERGE` that matched with nothing to set, `IF NOT EXISTS` on an existing index) has no `stats`. Inside a transaction each statement's `SUCCESS` carries that statement's counters. A write without `RETURN` still returns its one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`), as over HTTP; that row keeps its documented meaning, so its `properties_set` does not count the properties a `CREATE` writes with a node.
+A schema statement's summary has query type `s`, a write's `w` and a read's `r`. Only counters that moved are listed; a driver reads a missing one as 0. A statement that changed nothing (a read, a `MERGE` that matched with nothing to set, `IF NOT EXISTS` on an existing index) has no `stats`. Inside a transaction each statement's `SUCCESS` carries that statement's counters. A write without `RETURN` still returns its one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`), as over HTTP; that row keeps its documented meaning, so its `properties_set` does not count the properties a `CREATE` writes with a node or a relationship.
 
 ### RESET while a request is running
 

@@ -1416,6 +1416,7 @@ fn scoped_store(name: &str, create_labels: &[&str]) -> GraphDb {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })

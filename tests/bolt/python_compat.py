@@ -161,16 +161,23 @@ def explicit_tx_commit(ctx: Context) -> None:
     check(record["c"] == 1, f"{record['c']} committed nodes, expected 1")
 
     def link(tx: ManagedTransaction, a: str, b: str) -> None:
-        tx.run("MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)", a=a, b=b).consume()
+        tx.run(
+            "MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K {since: $y}]->(b)", a=a, b=b, y=2019
+        ).consume()
 
-    def linked(tx: ManagedTransaction, a: str) -> list[str]:
-        result = tx.run("MATCH (a {id: $a})-[:K]->(b) RETURN b.id AS id ORDER BY id", a=a)
-        return [record["id"] for record in result]
+    def linked(tx: ManagedTransaction, a: str) -> list[tuple[str, object]]:
+        result = tx.run("MATCH (a {id: $a})-[rel:K]->(b) RETURN b.id AS id, rel ORDER BY id", a=a)
+        return [(record["id"], record["rel"]) for record in result]
 
     with ctx.driver.session() as session:
         session.execute_write(link, "p-auto", "p-tx")
-        ids = session.execute_read(linked, "p-auto")
+        rows = session.execute_read(linked, "p-auto")
+    ids = [id_ for id_, _ in rows]
     check(ids == ["p-tx"], f"managed read saw {ids}, expected ['p-tx']")
+    # QL-RP: a relationship property written from Cypher reads back through the driver.
+    rel = rows[0][1]
+    check(rel.type == "K", f"relationship type {rel.type!r}")
+    check(rel["since"] == 2019, f"relationship properties {dict(rel)}")
 
 
 # 6. Explicit transaction rollback: the node is absent afterwards.

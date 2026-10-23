@@ -248,6 +248,7 @@ fn match_then_create_under_a_role_stays_inside_its_scope() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     })
