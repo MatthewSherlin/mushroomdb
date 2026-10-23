@@ -486,8 +486,25 @@ fn a_read_mode_transaction_refuses_writes_and_still_reads() {
 }
 
 #[test]
-fn a_role_token_cannot_run_statements_in_a_transaction() {
+fn a_role_token_cannot_write_in_a_transaction() {
     let (db, _dir) = open_db();
+    // The role must exist: BEGIN resolves its mask, as HTTP `/tx/begin` does.
+    db.write()
+        .apply_schema(&mushroomdb::Schema {
+            roles: vec![mushroomdb::RoleDef {
+                name: "analyst".into(),
+                keys: vec![],
+                labels: vec!["Role".into()],
+                visible_where: None,
+                namespaces: None,
+                write: Some(mushroomdb::WriteScope {
+                    create_labels: vec!["Role".into()],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
     let mut conn = connected_with(&db, ROLE, Duration::from_millis(100));
     expect_success(conn.handle(begin()));
     let out = conn.handle(run("CREATE (n:Role {id: 'r'})"));

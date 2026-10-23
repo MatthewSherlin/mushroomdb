@@ -23,6 +23,12 @@ metadata:
 data:
   # Non-secret settings only.
   MUSHROOMDB_LOG_FORMAT: json
+  # Bolt, in-cluster only (the `bolt` port on the ClusterIP Service below). Bolt
+  # takes the same token as HTTP. The advertised host is what a routing URI
+  # hands drivers: the Service's in-cluster DNS name. If you expose Bolt outside
+  # the cluster (see the Service), change it to the public name.
+  MUSHROOMDB_BOLT_PORT: "7687"
+  MUSHROOMDB_BOLT_ADVERTISED_HOST: mushroomdb
   # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in a
   # Secret you create, never here:
   # MUSHROOMDB_BACKUP_S3_URL: s3://<bucket>/<prefix>
@@ -58,7 +64,14 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-    # The Bolt port is added by HO-15.
+    # Bolt: ClusterIP, so reachable inside the cluster only. To reach it from
+    # outside, put a TLS-terminating TCP load balancer in front (a Service of
+    # type LoadBalancer on its own, with your cloud's TLS annotation, or serve
+    # TLS yourself with --tls-cert/--tls-key). Never publish Bolt as plaintext
+    # on the internet.
+    - name: bolt
+      port: 7687
+      targetPort: bolt
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -101,7 +114,8 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            # The Bolt port is added by HO-15.
+            - name: bolt
+              containerPort: 7687
           envFrom:
             - configMapRef:
                 name: mushroomdb

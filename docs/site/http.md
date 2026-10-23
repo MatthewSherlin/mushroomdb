@@ -172,8 +172,8 @@ when you revoke an admin key.
 
 **Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
 tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
-`read` key reads under its role and is refused every statement that writes (and every statement in an
-explicit transaction) with `Neo.ClientError.Security.Forbidden`.
+`read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
+statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
 
 `keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
 keys back, so reissue or copy the file deliberately.
@@ -342,7 +342,7 @@ may not see and a key that does not exist are told apart for no one.
 | `GET` | [`/health`](#get-health) | Liveness; with the full-access token, node and edge counts |
 | `GET` | [`/ready`](#get-ready) | Readiness for a container platform; 503 until the store is open |
 | `GET` | [`/stats`](#get-stats) | Node, edge and rule counts |
-| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON |
+| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON or in the Prometheus text format |
 | `POST` | [`/backup`](#post-backup) | A verified copy of the store, taken while it serves |
 | `POST` | [`/query`](#post-query) | Run a Cypher read or write |
 | `POST` | [`/ingest`](#post-ingest) | Insert many nodes of one label |
@@ -449,7 +449,8 @@ The field is absent for every rule that is not building. See
 ### `GET /metrics`
 
 Returns runtime counters and the slow-query log. Requires a full-access token
-(role-bound tokens receive 403, same as `/stats`).
+(role-bound tokens receive 403, same as `/stats`; the same holds for the text
+format below).
 
 ```json
 {
@@ -494,6 +495,66 @@ appended to the in-memory ring buffer (capped at 16 entries).
 `/proc/self/statm` on Linux. On other platforms it is always `null`. The value
 includes shared library mappings and may not match tools like `top` exactly. It
 never causes a panic or blocking I/O.
+
+#### Prometheus text format
+
+Send `Accept: text/plain` (or `application/openmetrics-text`, which is what a
+Prometheus scraper sends first) and `GET /metrics` answers in the Prometheus
+text exposition format, `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+JSON stays the default: no `Accept`, `*/*`, a browser's `text/html,...`, or any
+`Accept` that lists `application/json` returns the JSON above, unchanged.
+
+```text
+# HELP mushroomdb_nodes_live Live (non-tombstoned) nodes.
+# TYPE mushroomdb_nodes_live gauge
+mushroomdb_nodes_live 60
+```
+
+Every metric has `HELP` and `TYPE`, and none has labels, so the series count is
+fixed.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `mushroomdb_nodes_live` | gauge | Live nodes |
+| `mushroomdb_nodes_tombstoned` | gauge | Soft-deleted nodes |
+| `mushroomdb_edges_live` | gauge | Edges (the JSON `edges`) |
+| `mushroomdb_commits_total` | counter | Commit sequence number (the JSON `commit_seq`) |
+| `mushroomdb_wal_size_bytes` | gauge | WAL size on disk; absent when it cannot be read |
+| `mushroomdb_rss_bytes` | gauge | Resident set size; absent on unsupported platforms |
+| `mushroomdb_process_start_time_seconds` | gauge | Server start, Unix seconds (uptime is `time() - this`) |
+| `mushroomdb_slow_queries_total` | counter | Reads that met the slow-query threshold since start |
+| `mushroomdb_http_transactions_open` | gauge | Open `/tx` transactions |
+| `mushroomdb_bolt_connections_open` | gauge | Bolt connections being served now |
+| `mushroomdb_bolt_connections_accepted_total` | counter | Bolt connections admitted since the listener started |
+| `mushroomdb_backup_upload_errors_total` | counter | Failed backup steps since start |
+| `mushroomdb_backup_last_success_timestamp_seconds` | gauge | Unix time all durable data was last shipped; 0 before the first |
+| `mushroomdb_backup_lag_seconds` | gauge | Seconds the oldest unshipped durable WAL byte has waited; 0 when all is shipped |
+| `mushroomdb_backup_healthy` | gauge | 1 while the backup worker reports healthy, else 0 |
+| `mushroomdb_backup_lease_held` | gauge | 1 while this instance holds the bucket lease, 0 while another does or the lease was lost |
+
+The five `mushroomdb_backup_*` series exist only on a server running continuous
+backup (`MUSHROOMDB_BACKUP_S3_URL`); without it they are absent, not zero. The
+two `mushroomdb_bolt_*` series exist only when the Bolt listener is on
+(`--bolt-port`). One process reports one store's metrics. The response carries
+`Vary: Accept`, and `Accept` quality values are not weighed.
+
+A scrape config, with the token as a bearer credential (a full-access token or an
+`admin`-tier key; role tokens and `write`/`read` keys get 403):
+
+```yaml
+scrape_configs:
+  - job_name: mushroomdb
+    metrics_path: /metrics
+    scheme: https   # when the server terminates TLS (--tls-cert/--tls-key) or a proxy does
+    authorization:
+      credentials: "<full-access token>"
+    static_configs:
+      - targets: ["mushroomdb:8080"]
+```
+
+Useful alerts: `mushroomdb_backup_lag_seconds > 300`,
+`mushroomdb_backup_healthy == 0`, and
+`time() - mushroomdb_backup_last_success_timestamp_seconds > 900`.
 
 ### `POST /backup`
 

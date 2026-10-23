@@ -44,6 +44,31 @@ The driver sends the token as the password of basic authentication (the user nam
 
 The listener binds `--addr`'s IP, so the non-loopback rule is HTTP's: a non-loopback `--addr` with no `--token`, `MUSHROOMDB_TOKEN` or `admin` key is refused at startup, before either listener starts.
 
+## Scoped access
+
+A Bolt connection that logs in with a role token, or with a `read` key, sees and changes exactly what the same credential sees and changes through HTTP [`POST /query`](http.md#post-query) and [`/tx`](http.md#transactions): the same rows, the same refusals with the same text, and the same kind of error. The role is applied to every statement on the connection; nothing about it is chosen by the client.
+
+- **Reads.** Every `RUN` reads through the role's visibility: its `keys`, its `labels` with their `visible_where` test, intersected with its `namespaces` binding. See [Masks](masks.md). A node outside it does not appear, in a pattern, a count or an edge's far end. `MATCH (n) RETURN n` for one role and for another, on the same store, return different nodes.
+- **`SHOW INDEXES` and `SHOW CONSTRAINTS`** list only the indexes and constraints on labels that a node the role can see carries, as they do over HTTP.
+- **Auto-commit writes.** A role with a write scope writes through the same scoped write path `/query` uses: a write outside the scope (a label it may not create, a namespace outside its binding) fails with `Forbidden` and the message HTTP gives with its 403, and a pattern naming a node the role cannot see matches nothing. A role with no write scope, and every `read` key, is refused every write (`read-tier key: writes are not permitted` for a key).
+- **Schema statements.** `CREATE` and `DROP` of an index or constraint fail with `Forbidden` for a role.
+- **Explicit transactions.** `BEGIN` resolves the role on the snapshot it freezes. Every statement reads through the role on that snapshot, so a commit that lands after `BEGIN` is not seen. A write fails with `Forbidden`: `role-bound token: writes are not permitted inside a transaction` for a role token, even one with a write scope, and the `read` key text for a key. Use auto-commit to write with a role (ledger row 140, planned for 0.11). `COMMIT` writes nothing and returns the bookmark of the commit the snapshot read. HTTP keeps its transaction open after a refused statement; on Bolt the failure ends the transaction, as the Bolt state machine requires, and the client sends `RESET`.
+- **A role that no longer exists.** The role is resolved for each statement and at each `BEGIN`, not only at `HELLO`. Once the store no longer defines it, the next statement or `BEGIN` fails with `Unauthorized`, as HTTP answers 401. A change to the role's definition applies from the next auto-commit statement or `BEGIN`; an open transaction keeps the role as it was at its `BEGIN`.
+- **Revoking a credential.** A connection authenticates once, at `HELLO`. A key removed from `keys.json` and reloaded with `SIGHUP` keeps working on a Bolt connection already open until it closes, while HTTP refuses it on its next request. Close such connections yourself, or restart. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier). A change to the role a credential names takes effect as described above.
+- **No per-request narrowing.** The `/query` body fields `mask`, `namespace` and `as_of` have no Bolt equivalent. Bolt applies only the credential's own scope.
+
+How HTTP statuses and Bolt failures correspond:
+
+| HTTP | Bolt failure |
+|---|---|
+| 400, 409, 413 | a client error other than a security one (`SyntaxError`, `Request.Invalid`, `ConstraintValidationFailed`) |
+| 401 | `Unauthorized` |
+| 403 | `Forbidden`, with the same message |
+| 500 | a database error |
+| 503 | a transient error, which drivers retry |
+
+A full-access token, an `admin` key and a `write` key are unscoped on both protocols.
+
 ## TLS
 
 Bolt serves the same certificate as HTTP, from `--tls-cert` and `--tls-key` (a build with the `tls` feature; see [Native TLS](deployment.md#native-tls---features-tls)).
@@ -130,9 +155,48 @@ A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `C
 
 Every write statement that runs as an auto-commit `RUN` also runs inside `BEGIN` … `COMMIT`, with the same results and counts: `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`, `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `SET` / `REMOVE … RETURN`. So drivers' managed write transactions (`session.execute_write` and the like), which send `BEGIN`, run them too. Schema statements (`CREATE INDEX`, `CREATE CONSTRAINT` and the rest) are still refused inside a transaction. See [Write statements](query.md#write-statements).
 
-A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those. A `write` or `admin` key from `keys.json` can; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
+A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's or `read` key's transaction reads through its role and cannot write (see [Scoped access](#scoped-access)); use auto-commit to write with a role. A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
+
+## Catalog procedures
+
+`RUN` answers the procedure calls graph browsers and driver tools send to
+discover a store: `CALL db.labels()`, `CALL db.relationshipTypes()`,
+`CALL db.propertyKeys()`, `CALL db.indexes()`, `CALL db.constraints()`,
+`CALL dbms.components()` and `CALL db.schema.visualization()`, with the columns
+named in [Procedures](query.md#procedures-call). `dbms.components()` reports the
+name `mushroomdb`, the engine version, and the edition `open`. A role-bound
+token sees only the labels, relationship types, property keys, indexes and
+constraints of the nodes its role can read, as it does for every other read.
+Calls other than these are an unknown-procedure error.
+
+## Value types
+
+Results and `RUN` parameters use the same mapping in both directions. A value sent as a parameter, stored, and read back arrives as it was sent.
+
+| mushroomdb value | Bolt value | Notes |
+|---|---|---|
+| null, boolean, integer, float, string, list, map | the PackStream type of the same name | |
+| binary | Bytes | Up to 1 MiB as a stored property. |
+| date | Date structure (`0x44`) | Days since 1970-01-01. |
+| local date-time | LocalDateTime structure (`0x64`) | Seconds and nanoseconds. |
+| date-time with a UTC offset | DateTime structure: `0x49` at Bolt 5.0, `0x46` at 4.4 | 5.0 counts seconds in UTC; 4.4 counts seconds in local time. A client must use the form its version uses; the other is refused. The offset is at most ±18:00. |
+| duration | Duration structure (`0x45`) | Months, days, seconds and nanoseconds, kept exactly. |
+
+mushroomdb keeps date-times to the microsecond. A result is sent with nanoseconds = microseconds × 1000. A local date-time or date-time parameter with a nanosecond part that is not a whole number of microseconds is refused, not rounded. A parameter too large for the engine's fields is refused too, for example a date past 32 bits of days, or a duration whose seconds overflow 64 bits of nanoseconds.
+
+These parameters are refused with `Neo.ClientError.Request.Invalid`, and the message names the type:
+
+| Bolt value | Why |
+|---|---|
+| DateTime with a named time zone (`0x69`, `0x66`) | Only a UTC offset is stored, not a zone name. Send the offset form. |
+| Time (`0x54`), LocalTime (`0x74`) | There is no time-of-day type. |
+| Point2D (`0x58`), Point3D (`0x59`) | There is no spatial type. |
+| Node, Relationship, Path | A graph entity is not a parameter value. |
+| any other structure tag | Unknown. |
+
+A temporal structure with the wrong number or type of fields fails the same way, as a malformed request. A refused parameter fails the `RUN` before the statement runs, so nothing is written; `RESET` makes the connection ready again.
 
 ### RESET while a request is running
 

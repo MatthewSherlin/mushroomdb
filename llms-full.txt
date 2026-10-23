@@ -4669,6 +4669,31 @@ The driver sends the token as the password of basic authentication (the user nam
 
 The listener binds `--addr`'s IP, so the non-loopback rule is HTTP's: a non-loopback `--addr` with no `--token`, `MUSHROOMDB_TOKEN` or `admin` key is refused at startup, before either listener starts.
 
+## Scoped access
+
+A Bolt connection that logs in with a role token, or with a `read` key, sees and changes exactly what the same credential sees and changes through HTTP [`POST /query`](http.md#post-query) and [`/tx`](http.md#transactions): the same rows, the same refusals with the same text, and the same kind of error. The role is applied to every statement on the connection; nothing about it is chosen by the client.
+
+- **Reads.** Every `RUN` reads through the role's visibility: its `keys`, its `labels` with their `visible_where` test, intersected with its `namespaces` binding. See [Masks](masks.md). A node outside it does not appear, in a pattern, a count or an edge's far end. `MATCH (n) RETURN n` for one role and for another, on the same store, return different nodes.
+- **`SHOW INDEXES` and `SHOW CONSTRAINTS`** list only the indexes and constraints on labels that a node the role can see carries, as they do over HTTP.
+- **Auto-commit writes.** A role with a write scope writes through the same scoped write path `/query` uses: a write outside the scope (a label it may not create, a namespace outside its binding) fails with `Forbidden` and the message HTTP gives with its 403, and a pattern naming a node the role cannot see matches nothing. A role with no write scope, and every `read` key, is refused every write (`read-tier key: writes are not permitted` for a key).
+- **Schema statements.** `CREATE` and `DROP` of an index or constraint fail with `Forbidden` for a role.
+- **Explicit transactions.** `BEGIN` resolves the role on the snapshot it freezes. Every statement reads through the role on that snapshot, so a commit that lands after `BEGIN` is not seen. A write fails with `Forbidden`: `role-bound token: writes are not permitted inside a transaction` for a role token, even one with a write scope, and the `read` key text for a key. Use auto-commit to write with a role (ledger row 140, planned for 0.11). `COMMIT` writes nothing and returns the bookmark of the commit the snapshot read. HTTP keeps its transaction open after a refused statement; on Bolt the failure ends the transaction, as the Bolt state machine requires, and the client sends `RESET`.
+- **A role that no longer exists.** The role is resolved for each statement and at each `BEGIN`, not only at `HELLO`. Once the store no longer defines it, the next statement or `BEGIN` fails with `Unauthorized`, as HTTP answers 401. A change to the role's definition applies from the next auto-commit statement or `BEGIN`; an open transaction keeps the role as it was at its `BEGIN`.
+- **Revoking a credential.** A connection authenticates once, at `HELLO`. A key removed from `keys.json` and reloaded with `SIGHUP` keeps working on a Bolt connection already open until it closes, while HTTP refuses it on its next request. Close such connections yourself, or restart. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier). A change to the role a credential names takes effect as described above.
+- **No per-request narrowing.** The `/query` body fields `mask`, `namespace` and `as_of` have no Bolt equivalent. Bolt applies only the credential's own scope.
+
+How HTTP statuses and Bolt failures correspond:
+
+| HTTP | Bolt failure |
+|---|---|
+| 400, 409, 413 | a client error other than a security one (`SyntaxError`, `Request.Invalid`, `ConstraintValidationFailed`) |
+| 401 | `Unauthorized` |
+| 403 | `Forbidden`, with the same message |
+| 500 | a database error |
+| 503 | a transient error, which drivers retry |
+
+A full-access token, an `admin` key and a `write` key are unscoped on both protocols.
+
 ## TLS
 
 Bolt serves the same certificate as HTTP, from `--tls-cert` and `--tls-key` (a build with the `tls` feature; see [Native TLS](deployment.md#native-tls---features-tls)).
@@ -4755,9 +4780,48 @@ A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `C
 
 Every write statement that runs as an auto-commit `RUN` also runs inside `BEGIN` … `COMMIT`, with the same results and counts: `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`, `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `SET` / `REMOVE … RETURN`. So drivers' managed write transactions (`session.execute_write` and the like), which send `BEGIN`, run them too. Schema statements (`CREATE INDEX`, `CREATE CONSTRAINT` and the rest) are still refused inside a transaction. See [Write statements](query.md#write-statements).
 
-A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token cannot run statements inside a transaction (they fail with `Forbidden`); use auto-commit for those. A `write` or `admin` key from `keys.json` can; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
+A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's or `read` key's transaction reads through its role and cannot write (see [Scoped access](#scoped-access)); use auto-commit to write with a role. A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
+
+## Catalog procedures
+
+`RUN` answers the procedure calls graph browsers and driver tools send to
+discover a store: `CALL db.labels()`, `CALL db.relationshipTypes()`,
+`CALL db.propertyKeys()`, `CALL db.indexes()`, `CALL db.constraints()`,
+`CALL dbms.components()` and `CALL db.schema.visualization()`, with the columns
+named in [Procedures](query.md#procedures-call). `dbms.components()` reports the
+name `mushroomdb`, the engine version, and the edition `open`. A role-bound
+token sees only the labels, relationship types, property keys, indexes and
+constraints of the nodes its role can read, as it does for every other read.
+Calls other than these are an unknown-procedure error.
+
+## Value types
+
+Results and `RUN` parameters use the same mapping in both directions. A value sent as a parameter, stored, and read back arrives as it was sent.
+
+| mushroomdb value | Bolt value | Notes |
+|---|---|---|
+| null, boolean, integer, float, string, list, map | the PackStream type of the same name | |
+| binary | Bytes | Up to 1 MiB as a stored property. |
+| date | Date structure (`0x44`) | Days since 1970-01-01. |
+| local date-time | LocalDateTime structure (`0x64`) | Seconds and nanoseconds. |
+| date-time with a UTC offset | DateTime structure: `0x49` at Bolt 5.0, `0x46` at 4.4 | 5.0 counts seconds in UTC; 4.4 counts seconds in local time. A client must use the form its version uses; the other is refused. The offset is at most ±18:00. |
+| duration | Duration structure (`0x45`) | Months, days, seconds and nanoseconds, kept exactly. |
+
+mushroomdb keeps date-times to the microsecond. A result is sent with nanoseconds = microseconds × 1000. A local date-time or date-time parameter with a nanosecond part that is not a whole number of microseconds is refused, not rounded. A parameter too large for the engine's fields is refused too, for example a date past 32 bits of days, or a duration whose seconds overflow 64 bits of nanoseconds.
+
+These parameters are refused with `Neo.ClientError.Request.Invalid`, and the message names the type:
+
+| Bolt value | Why |
+|---|---|
+| DateTime with a named time zone (`0x69`, `0x66`) | Only a UTC offset is stored, not a zone name. Send the offset form. |
+| Time (`0x54`), LocalTime (`0x74`) | There is no time-of-day type. |
+| Point2D (`0x58`), Point3D (`0x59`) | There is no spatial type. |
+| Node, Relationship, Path | A graph entity is not a parameter value. |
+| any other structure tag | Unknown. |
+
+A temporal structure with the wrong number or type of fields fails the same way, as a malformed request. A refused parameter fails the `RUN` before the statement runs, so nothing is written; `RESET` makes the connection ready again.
 
 ### RESET while a request is running
 
@@ -5735,6 +5799,47 @@ The full form is `CALL ns.name(args) [YIELD field [AS alias], …] [WHERE …]
 | Procedure | Arguments | Columns |
 |---|---|---|
 | `db.ping()` | none | `success` (always `true`) |
+| `db.labels()` | none | `label` |
+| `db.relationshipTypes()` | none | `relationshipType` |
+| `db.propertyKeys()` | none | `propertyKey` |
+| `db.indexes()` | none | `name`, `type`, `labelsOrTypes`, `properties`, `state` |
+| `db.constraints()` | none | `name`, `type`, `labelsOrTypes`, `properties` |
+| `dbms.components()` | none | `name`, `versions`, `edition` |
+| `db.schema.visualization()` | none | `nodes`, `relationships` |
+
+Every procedure takes no arguments; passing one is the error `<ns>.<name> takes
+no arguments, got <n>`. The catalog procedures list what the caller can see and
+nothing else: a role, a mask or a namespace never learns a label, relationship
+type, property key, index or constraint that only nodes outside its scope
+carry.
+
+- **`db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`** return one
+  column, one row per name, sorted. A label is listed when a visible node has
+  it; a relationship type when it joins two visible nodes; a property key when
+  it is set on a visible node or on a relationship between visible nodes.
+- **`db.indexes()`, `db.constraints()`** return the rows `SHOW INDEXES` and
+  `SHOW CONSTRAINTS` return (see [Schema statements](#schema-statements-ddl)), with
+  the label and property each in a one-element list under `labelsOrTypes` and
+  `properties`, the shape common driver tools read. `type` is the index kind
+  (`range`, `equality`, `fulltext`) or `unique`; `state` is always `online`.
+- **`dbms.components()`** returns one row: `name` is `mushroomdb`, `versions` is
+  a one-element list holding the engine's version, and `edition` is `open`
+  (there is one unrestricted edition, so the column carries no tier name).
+- **`db.schema.visualization()`** returns one row. `nodes` lists one map
+  `{label}` per label; `relationships` lists one map `{type, from, to}` for each
+  type, source label and target label that actually occur together. The
+  maps are plain values, not graph node and relationship values, so a graph
+  browser lists them rather than drawing a schema diagram.
+
+Cost: the procedures read the store once, so they take time in proportion to
+the nodes and relationships the caller can see. A relationship type stops its
+scan at its first edge between visible nodes, and the node scan for property
+keys ends once every key has been found; `db.propertyKeys()` and
+`db.schema.visualization()` still read every relationship. Measured on a
+release build with 100,000 nodes and 100,000 relationships: `db.labels()` about
+0.5 ms, `db.relationshipTypes()` about 0.3 ms, `db.propertyKeys()` and
+`db.schema.visualization()` about 14 ms to 15 ms. The index and constraint
+procedures read the declared schema and are sub-millisecond.
 
 An unknown procedure is the error `unknown procedure: <ns>.<name>`.
 
@@ -6509,8 +6614,8 @@ when you revoke an admin key.
 
 **Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
 tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
-`read` key reads under its role and is refused every statement that writes (and every statement in an
-explicit transaction) with `Neo.ClientError.Security.Forbidden`.
+`read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
+statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
 
 `keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
 keys back, so reissue or copy the file deliberately.
@@ -6679,7 +6784,7 @@ may not see and a key that does not exist are told apart for no one.
 | `GET` | [`/health`](#get-health) | Liveness; with the full-access token, node and edge counts |
 | `GET` | [`/ready`](#get-ready) | Readiness for a container platform; 503 until the store is open |
 | `GET` | [`/stats`](#get-stats) | Node, edge and rule counts |
-| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON |
+| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON or in the Prometheus text format |
 | `POST` | [`/backup`](#post-backup) | A verified copy of the store, taken while it serves |
 | `POST` | [`/query`](#post-query) | Run a Cypher read or write |
 | `POST` | [`/ingest`](#post-ingest) | Insert many nodes of one label |
@@ -6786,7 +6891,8 @@ The field is absent for every rule that is not building. See
 ### `GET /metrics`
 
 Returns runtime counters and the slow-query log. Requires a full-access token
-(role-bound tokens receive 403, same as `/stats`).
+(role-bound tokens receive 403, same as `/stats`; the same holds for the text
+format below).
 
 ```json
 {
@@ -6831,6 +6937,66 @@ appended to the in-memory ring buffer (capped at 16 entries).
 `/proc/self/statm` on Linux. On other platforms it is always `null`. The value
 includes shared library mappings and may not match tools like `top` exactly. It
 never causes a panic or blocking I/O.
+
+#### Prometheus text format
+
+Send `Accept: text/plain` (or `application/openmetrics-text`, which is what a
+Prometheus scraper sends first) and `GET /metrics` answers in the Prometheus
+text exposition format, `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+JSON stays the default: no `Accept`, `*/*`, a browser's `text/html,...`, or any
+`Accept` that lists `application/json` returns the JSON above, unchanged.
+
+```text
+# HELP mushroomdb_nodes_live Live (non-tombstoned) nodes.
+# TYPE mushroomdb_nodes_live gauge
+mushroomdb_nodes_live 60
+```
+
+Every metric has `HELP` and `TYPE`, and none has labels, so the series count is
+fixed.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `mushroomdb_nodes_live` | gauge | Live nodes |
+| `mushroomdb_nodes_tombstoned` | gauge | Soft-deleted nodes |
+| `mushroomdb_edges_live` | gauge | Edges (the JSON `edges`) |
+| `mushroomdb_commits_total` | counter | Commit sequence number (the JSON `commit_seq`) |
+| `mushroomdb_wal_size_bytes` | gauge | WAL size on disk; absent when it cannot be read |
+| `mushroomdb_rss_bytes` | gauge | Resident set size; absent on unsupported platforms |
+| `mushroomdb_process_start_time_seconds` | gauge | Server start, Unix seconds (uptime is `time() - this`) |
+| `mushroomdb_slow_queries_total` | counter | Reads that met the slow-query threshold since start |
+| `mushroomdb_http_transactions_open` | gauge | Open `/tx` transactions |
+| `mushroomdb_bolt_connections_open` | gauge | Bolt connections being served now |
+| `mushroomdb_bolt_connections_accepted_total` | counter | Bolt connections admitted since the listener started |
+| `mushroomdb_backup_upload_errors_total` | counter | Failed backup steps since start |
+| `mushroomdb_backup_last_success_timestamp_seconds` | gauge | Unix time all durable data was last shipped; 0 before the first |
+| `mushroomdb_backup_lag_seconds` | gauge | Seconds the oldest unshipped durable WAL byte has waited; 0 when all is shipped |
+| `mushroomdb_backup_healthy` | gauge | 1 while the backup worker reports healthy, else 0 |
+| `mushroomdb_backup_lease_held` | gauge | 1 while this instance holds the bucket lease, 0 while another does or the lease was lost |
+
+The five `mushroomdb_backup_*` series exist only on a server running continuous
+backup (`MUSHROOMDB_BACKUP_S3_URL`); without it they are absent, not zero. The
+two `mushroomdb_bolt_*` series exist only when the Bolt listener is on
+(`--bolt-port`). One process reports one store's metrics. The response carries
+`Vary: Accept`, and `Accept` quality values are not weighed.
+
+A scrape config, with the token as a bearer credential (a full-access token or an
+`admin`-tier key; role tokens and `write`/`read` keys get 403):
+
+```yaml
+scrape_configs:
+  - job_name: mushroomdb
+    metrics_path: /metrics
+    scheme: https   # when the server terminates TLS (--tls-cert/--tls-key) or a proxy does
+    authorization:
+      credentials: "<full-access token>"
+    static_configs:
+      - targets: ["mushroomdb:8080"]
+```
+
+Useful alerts: `mushroomdb_backup_lag_seconds > 300`,
+`mushroomdb_backup_healthy == 0`, and
+`time() - mushroomdb_backup_last_success_timestamp_seconds > 900`.
 
 ### `POST /backup`
 
@@ -13709,6 +13875,20 @@ mushroomdb serve /data --addr 0.0.0.0:8080 --token "$MUSHROOMDB_TOKEN" \
   --bolt-port 7687 --bolt-advertised-host db.example.com
 ```
 
+### Bolt in the deploy templates
+
+Each template under `deploy/` sets `MUSHROOMDB_BOLT_PORT=7687` only where the platform can carry Bolt without exposing an unencrypted port to the internet. In every case Bolt follows HTTP's authentication rule, so the token the template already requires (`MUSHROOMDB_TOKEN`) is the Bolt credential too. "Routing URI" below means the driver's routing scheme; it connects back to the host and port the server advertises.
+
+| Platform | Bolt | How |
+|---|---|---|
+| Fly | Public, TLS at the edge | A TCP service on 7687 with Fly's `tls` handler (no `http` handler). Fly terminates TLS and forwards plaintext to the server, so use the TLS form of the Bolt scheme. `MUSHROOMDB_BOLT_ADVERTISED_HOST` is set to the placeholder `CHANGE-ME.invalid`, which never resolves: change it to your app's address, or a routing URI fails, rather than handing drivers someone else's host. A shared IPv4 is enough with the `tls` handler. |
+| Docker Compose | This machine only | `127.0.0.1:7687:7687`. To expose it, change the mapping to `7687:7687` and put TLS in front (`--tls-cert`/`--tls-key`, or a TCP proxy that ends TLS). |
+| Kubernetes | In the cluster only | A `bolt` container port and a port on the ClusterIP Service; `MUSHROOMDB_BOLT_ADVERTISED_HOST` is the Service name. To reach it from outside, use a LoadBalancer Service with TLS termination, and set the advertised host to its public name. |
+| Render | Not available | A Render web service exposes only HTTP, so the template does not start Bolt. A private service may carry other ports to your other Render services (unverified). |
+| Railway | Off; dashboard only | Enable Settings, Networking, TCP Proxy with internal port 7687, then set `MUSHROOMDB_BOLT_PORT`, `MUSHROOMDB_BOLT_ADVERTISED_HOST` and `MUSHROOMDB_BOLT_ADVERTISED_PORT` from the domain and port Railway shows. Whether the proxy encrypts is unverified, and no config-as-code setting for it was found, so the template never opens it. |
+
+None of this has been run on a live platform yet.
+
 ---
 
 ## Browser access (CORS)
@@ -14227,6 +14407,15 @@ holds the lease, so the new one is backup-unhealthy until the old one stops. If
 `/ready` followed backup health, the platform would never route traffic to the
 new instance and never stop the old one. Watch backup health in the log (it
 warns while the lease is foreign), not through `/ready`.
+
+## Metrics for Prometheus
+
+`GET /metrics` with `Accept: text/plain` answers in the Prometheus text format,
+including the backup's lag, last-success time and error count. Add a scrape job
+with the server's token as a bearer credential; the metric list and an example
+config are in the [HTTP reference](http.md#prometheus-text-format). Alert on
+`mushroomdb_backup_lag_seconds` rather than on `/ready`, which backup health
+never gates.
 
 ## Loopback-first posture
 

@@ -34,6 +34,17 @@ kill_timeout = 60
   #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
   # Structured logs for the platform log shipper:
   MUSHROOMDB_LOG_FORMAT = "json"
+  # Bolt (docs/site/deployment.md, "Exposing the Bolt port"). The listener is
+  # plaintext inside the machine; Fly's `tls` handler (the [[services]] block
+  # for 7687 below) terminates TLS at the edge, so the public port is
+  # encrypted. Bolt takes the same token as HTTP (MUSHROOMDB_TOKEN above): the
+  # server refuses to start on a non-loopback address without one.
+  MUSHROOMDB_BOLT_PORT = "7687"
+  # What a routing URI hands drivers: this app's public host and port. CHANGE
+  # the host to your `app` name's address (<app>.fly.dev, or your own domain);
+  # the placeholder never resolves, so a routing URI fails until you do.
+  MUSHROOMDB_BOLT_ADVERTISED_HOST = "CHANGE-ME.invalid"
+  MUSHROOMDB_BOLT_ADVERTISED_PORT = "7687"
   # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in
   # `fly secrets set`, never here:
   # MUSHROOMDB_BACKUP_S3_URL = "s3://<bucket>/<prefix>"
@@ -71,7 +82,20 @@ kill_timeout = 60
     method = "get"
     path = "/ready"
 
-# The Bolt port (7687) is added by HO-15; it is intentionally absent here.
+# Bolt: a raw TCP service with Fly's `tls` handler. Fly terminates TLS and
+# forwards plaintext to the server, so clients must use the TLS form of the
+# Bolt scheme (docs/site/deployment.md). No `http` handler: Bolt is not HTTP.
+[[services]]
+  processes = ["app"]
+  protocol = "tcp"
+  internal_port = 7687
+  [[services.ports]]
+    port = 7687
+    handlers = ["tls"]
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 256
+    soft_limit = 200
 
 [[mounts]]
   source = "mushroomdb_data"

@@ -5242,6 +5242,201 @@ async fn metrics_role_token_is_forbidden() {
     );
 }
 
+fn get_accepting(uri: &str, accept: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(axum::http::header::ACCEPT, accept)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A strict reader of the Prometheus text exposition format: every sample
+/// line is `name value`, the name is legal, a HELP and a TYPE line for it came
+/// first, counters end in `_total`, and the value is a number. Returns
+/// name -> (type, value).
+fn parse_exposition(text: &str) -> std::collections::BTreeMap<String, (String, f64)> {
+    let mut helps = std::collections::BTreeSet::new();
+    let mut types = std::collections::BTreeMap::new();
+    let mut samples = std::collections::BTreeMap::new();
+    assert!(text.ends_with('\n'), "exposition must end with a newline");
+    for line in text.lines() {
+        assert!(!line.is_empty(), "no blank lines");
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, help) = rest.split_once(' ').expect("HELP has text");
+            assert!(!help.trim().is_empty(), "{name}: empty HELP");
+            assert!(helps.insert(name.to_string()), "{name}: duplicate HELP");
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let (name, ty) = rest.split_once(' ').expect("TYPE has a type");
+            assert!(helps.contains(name), "{name}: TYPE before HELP");
+            assert!(matches!(ty, "counter" | "gauge"), "{name}: type {ty}");
+            if ty == "counter" {
+                assert!(name.ends_with("_total"), "{name}: counter without _total");
+            }
+            assert!(types.insert(name.to_string(), ty.to_string()).is_none());
+        } else {
+            assert!(!line.starts_with('#'), "unknown comment: {line}");
+            let (name, value) = line.split_once(' ').expect("sample is `name value`");
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    && !name.starts_with(|c: char| c.is_ascii_digit()),
+                "illegal metric name {name}"
+            );
+            let ty = types
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: sample before TYPE"));
+            let v: f64 = value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}: value {value}"));
+            assert!(
+                samples.insert(name.to_string(), (ty.clone(), v)).is_none(),
+                "{name}: duplicate sample"
+            );
+        }
+    }
+    for name in types.keys() {
+        assert!(samples.contains_key(name), "{name}: TYPE without a sample");
+    }
+    samples
+}
+
+/// `Accept: text/plain` gets the Prometheus text format.
+#[tokio::test]
+async fn metrics_prometheus_text_format() {
+    let (app, db) = open("metrics-prom");
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("KNOWS", "alice", "bob").unwrap();
+
+    let (status, body, ctype) = send(app, get_accepting("/metrics", "text/plain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ctype = ctype.expect("content-type");
+    assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains("# TYPE mushroomdb_nodes_live gauge\n"),
+        "{text}"
+    );
+    assert!(text.contains("mushroomdb_commits_total"), "{text}");
+
+    let m = parse_exposition(&text);
+    assert_eq!(m["mushroomdb_nodes_live"], ("gauge".into(), 2.0));
+    assert_eq!(m["mushroomdb_nodes_tombstoned"].1, 0.0);
+    assert_eq!(m["mushroomdb_edges_live"].1, 1.0);
+    assert_eq!(m["mushroomdb_commits_total"].0, "counter");
+    assert!(m["mushroomdb_commits_total"].1 >= 2.0);
+    assert!(m["mushroomdb_wal_size_bytes"].1 > 0.0);
+    assert_eq!(m["mushroomdb_slow_queries_total"].0, "counter");
+    assert_eq!(m["mushroomdb_http_transactions_open"].1, 0.0);
+    let started = m["mushroomdb_process_start_time_seconds"].1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!(
+        started > 1.6e9 && started <= now + 1.0,
+        "start time {started}"
+    );
+    assert!(!m.contains_key("mushroomdb_uptime_seconds"));
+    // No backup configured: no backup series at all.
+    assert!(m.keys().all(|k| !k.contains("backup")), "{m:?}");
+}
+
+/// `mushroomdb_edges_live` counts live edges only: a deleted edge, and the
+/// edges a deleted node took with it, leave the gauge.
+#[tokio::test]
+async fn metrics_edges_live_drops_deleted_edges() {
+    let (app, db) = open("metrics-edges-live");
+    for key in ["a", "b", "c", "d"] {
+        seed_person(&db, key);
+    }
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    db.write().insert_edge("KNOWS", "b", "c").unwrap();
+    db.write().insert_edge("KNOWS", "c", "d").unwrap();
+    db.write().insert_edge("KNOWS", "d", "a").unwrap();
+    assert!(db.write().delete_edge("KNOWS", "a", "b").unwrap());
+    // `c` takes b→c and c→d with it; only d→a is left.
+    db.write().delete_node("c").unwrap();
+
+    let (status, body, _) = send(app, get_accepting("/metrics", "text/plain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let m = parse_exposition(&String::from_utf8(body).unwrap());
+    assert_eq!(m["mushroomdb_edges_live"].1, 1.0);
+    assert_eq!(m["mushroomdb_nodes_live"].1, 3.0);
+    assert_eq!(m["mushroomdb_nodes_tombstoned"].1, 1.0);
+}
+
+/// Prometheus's own Accept header, and OpenMetrics alone, get the text format.
+#[tokio::test]
+async fn metrics_prometheus_scraper_accept_headers() {
+    let (app, _db) = open("metrics-prom-scraper");
+    for accept in [
+        "application/openmetrics-text;version=1.0.0,application/openmetrics-text;version=0.0.1;q=0.75,text/plain;version=0.0.4;q=0.5,*/*;q=0.1",
+        "application/openmetrics-text",
+        "text/plain;version=0.0.4",
+    ] {
+        let (status, body, ctype) =
+            send(app.clone(), get_accepting("/metrics", accept)).await;
+        assert_eq!(status, StatusCode::OK, "{accept}");
+        assert!(ctype.unwrap().starts_with("text/plain"), "{accept}");
+        assert!(String::from_utf8(body).unwrap().contains("# TYPE "), "{accept}");
+    }
+}
+
+/// JSON stays the default and is unchanged, whatever else the caller accepts.
+#[tokio::test]
+async fn metrics_json_is_default_and_unchanged() {
+    let (app, _db) = open("metrics-prom-json");
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("*/*"),
+        Some("text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"),
+        Some("application/json, text/plain, */*"),
+    ] {
+        let req = match accept {
+            Some(a) => get_accepting("/metrics", a),
+            None => get("/metrics"),
+        };
+        let (status, body, ctype) = send(app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{accept:?}");
+        assert!(ctype.unwrap().starts_with("application/json"), "{accept:?}");
+        let v = parse_json(&body);
+        assert!(v["nodes_live"].is_number(), "{accept:?}");
+        assert!(v["uptime_s"].is_number(), "{accept:?}");
+    }
+}
+
+/// The text format is refused to a role token exactly as the JSON is.
+#[tokio::test]
+async fn metrics_prometheus_role_token_is_forbidden() {
+    let db = SharedDb::open(&tmp("metrics-prom-role-403")).unwrap();
+    let app = router_with_role_tokens(
+        db,
+        Some("adm".into()),
+        std::collections::HashMap::from([("viewer".to_string(), "reader".to_string())]),
+    );
+    let mk = |tok: &str| {
+        Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .header(axum::http::header::ACCEPT, "text/plain")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _, _) = send(app.clone(), mk("viewer")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body, _) = send(app, mk("adm")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("mushroomdb_nodes_live"));
+}
+
 /// A store held by another process's write lock is 503 + `Retry-After`, not 400.
 ///
 /// `Busy` is transient and nothing was written, so the response must be one a

@@ -6386,6 +6386,10 @@ mod ql_12;
 mod ql_cx;
 
 #[cfg(test)]
+#[path = "tests/tx_15.rs"]
+mod tx_15;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{

@@ -37,6 +37,9 @@ pub trait ProcCatalog {
     /// The property keys set on the nodes and relationships the view can see,
     /// sorted.
     fn property_keys(&self) -> Vec<String>;
+    /// Every `(type, from-label, to-label)` a relationship the view can see
+    /// actually has, sorted and without repeats.
+    fn relationship_patterns(&self) -> Vec<(String, String, String)>;
     /// The rows `SHOW INDEXES` gives the same caller.
     fn indexes(&self) -> Vec<SchemaRow>;
     /// The rows `SHOW CONSTRAINTS` gives the same caller.
@@ -50,9 +53,8 @@ pub fn call_procedure(
     name: &str,
     args: &[Value],
 ) -> Result<ProcResult, String> {
-    // `db.ping` reads nothing; the catalog procedures (TX-15) read `cat`.
-    let _ = cat;
     match (ns, name) {
+        // `db.ping` reads nothing.
         ("db", "ping") => {
             no_args(ns, name, args)?;
             Ok(ProcResult {
@@ -60,7 +62,115 @@ pub fn call_procedure(
                 rows: vec![vec![Value::Bool(true)]],
             })
         }
+        ("db", "labels") => {
+            no_args(ns, name, args)?;
+            Ok(names("label", cat.labels()))
+        }
+        ("db", "relationshipTypes") => {
+            no_args(ns, name, args)?;
+            Ok(names("relationshipType", cat.relationship_types()))
+        }
+        ("db", "propertyKeys") => {
+            no_args(ns, name, args)?;
+            Ok(names("propertyKey", cat.property_keys()))
+        }
+        ("db", "indexes") => {
+            no_args(ns, name, args)?;
+            Ok(schema_rows(
+                &["name", "type", "labelsOrTypes", "properties", "state"],
+                cat.indexes(),
+            ))
+        }
+        ("db", "constraints") => {
+            no_args(ns, name, args)?;
+            Ok(schema_rows(
+                &["name", "type", "labelsOrTypes", "properties"],
+                cat.constraints(),
+            ))
+        }
+        ("dbms", "components") => {
+            no_args(ns, name, args)?;
+            Ok(ProcResult {
+                columns: strings(&["name", "versions", "edition"]),
+                rows: vec![vec![
+                    text("mushroomdb"),
+                    Value::List(vec![text(env!("CARGO_PKG_VERSION"))]),
+                    // The edition names no vendor tier; `open` says only that
+                    // there is one, unrestricted edition.
+                    text("open"),
+                ]],
+            })
+        }
+        ("db.schema", "visualization") => {
+            no_args(ns, name, args)?;
+            Ok(schema_picture(cat))
+        }
         _ => Err(format!("unknown procedure: {ns}.{name}")),
+    }
+}
+
+fn text(s: &str) -> Value {
+    Value::Str(s.to_string())
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+/// One column of names, one row each.
+fn names(column: &str, values: Vec<String>) -> ProcResult {
+    ProcResult {
+        columns: vec![column.to_string()],
+        rows: values.into_iter().map(|v| vec![Value::Str(v)]).collect(),
+    }
+}
+
+/// The rows of `SHOW INDEXES` / `SHOW CONSTRAINTS` — `name`, `type`, `label`,
+/// `property`, then (indexes only) `state` — with the label and the property
+/// each wrapped in a one-element list, the `labelsOrTypes` / `properties`
+/// shape the procedure's callers read.
+fn schema_rows(columns: &[&str], rows: Vec<SchemaRow>) -> ProcResult {
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .enumerate()
+                .map(|(at, v)| match (at, v) {
+                    (2 | 3, Value::Null) => Value::List(Vec::new()),
+                    (2 | 3, v) => Value::List(vec![v]),
+                    (_, v) => v,
+                })
+                .collect()
+        })
+        .collect();
+    ProcResult {
+        columns: strings(columns),
+        rows,
+    }
+}
+
+/// One row: a node per label the caller sees, a relationship per
+/// `(type, from, to)` it has between them.
+fn schema_picture(cat: &dyn ProcCatalog) -> ProcResult {
+    let nodes = cat
+        .labels()
+        .into_iter()
+        .map(|label| Value::Map(BTreeMap::from([("label".to_string(), Value::Str(label))])))
+        .collect();
+    let relationships = cat
+        .relationship_patterns()
+        .into_iter()
+        .map(|(etype, from, to)| {
+            Value::Map(BTreeMap::from([
+                ("type".to_string(), Value::Str(etype)),
+                ("from".to_string(), Value::Str(from)),
+                ("to".to_string(), Value::Str(to)),
+            ]))
+        })
+        .collect();
+    ProcResult {
+        columns: strings(&["nodes", "relationships"]),
+        rows: vec![vec![Value::List(nodes), Value::List(relationships)]],
     }
 }
 

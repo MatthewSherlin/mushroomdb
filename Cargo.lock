@@ -1545,6 +1545,7 @@ dependencies = [
  "libc",
  "mushroomdb",
  "mushroomdb-arrow",
+ "mushroomdb-bolt",
  "proptest",
  "rand 0.9.5",
  "rcgen",

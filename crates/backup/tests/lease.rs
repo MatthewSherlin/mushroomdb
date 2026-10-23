@@ -375,6 +375,7 @@ async fn a_worker_facing_a_fresh_foreign_lease_uploads_nothing_until_it_expires(
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(data_keys(&store).await.is_empty(), "nothing uploaded");
     assert!(!h.healthy.load(Ordering::Acquire), "backup is not ok");
+    assert!(!h.lease_held.load(Ordering::Acquire), "lease is not held");
     let why = reason(&h);
     assert!(why.contains("the-primary"), "{why}");
     assert_eq!(read_lease(&store).await.unwrap().instance_id, "the-primary");
@@ -391,8 +392,11 @@ async fn a_worker_facing_a_fresh_foreign_lease_uploads_nothing_until_it_expires(
         async move { ok }
     })
     .await;
+    assert!(h.lease_held.load(Ordering::Acquire), "lease is held");
+    let held = std::sync::Arc::clone(&h.lease_held);
     stop(tx, h).await;
     assert!(read_lease(&store).await.is_none(), "released on shutdown");
+    assert!(!held.load(Ordering::Acquire), "not held after release");
 }
 
 /// Two workers started on one bucket: one uploads, the other names it and
