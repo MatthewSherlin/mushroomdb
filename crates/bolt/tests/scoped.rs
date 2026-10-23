@@ -341,3 +341,23 @@ fn an_auto_commit_write_goes_through_the_role_write_scope() {
     let all = ids(&db);
     assert!(!all.iter().any(|id| id == "c2" || id == "c3" || id == "c4"));
 }
+
+#[test]
+fn a_read_mode_begin_for_a_role_still_refuses_with_the_role_text() {
+    let (db, _dir) = store();
+    let mut alpha = connected(&db, ALPHA);
+    let out = alpha.handle(ClientMessage::Other(
+        MessageKind::Begin,
+        vec![PackValue::Map(vec![(
+            "mode".into(),
+            PackValue::String("r".into()),
+        )])],
+    ));
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{out:?}"
+    );
+    assert_eq!(column(&mut alpha, ALL_IDS), ["a1", "a2"]);
+    let err = failure(&mut alpha, run("CREATE (n:Doc {id: 'r1', ns: 'tenant-a'})"));
+    assert_eq!(err, BoltError::Forbidden(TX_ROLE_WRITE_REFUSAL.into()));
+}

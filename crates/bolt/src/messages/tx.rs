@@ -154,7 +154,7 @@ pub struct ScopedTransaction {
 impl ScopedTransaction {
     /// `mask` is the role's, resolved on `snapshot`. `read_tier_key` picks the
     /// refusal text a write gets, as it does over HTTP.
-    pub fn new(snapshot: ReaderSnapshot, mask: NodeMask, read_tier_key: bool) -> Self {
+    pub(crate) fn new(snapshot: ReaderSnapshot, mask: NodeMask, read_tier_key: bool) -> Self {
         Self {
             snapshot,
             mask,

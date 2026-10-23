@@ -32,18 +32,25 @@ const FULL: &str = "parity-full-token";
 const ALPHA: &str = "parity-alpha-token";
 const BETA: &str = "parity-beta-token";
 const RD: &str = "rd-key-0123456789abcdef0123456789abcdef";
+const WR: &str = "wr-key-0123456789abcdef0123456789abcdef";
+/// A role token whose role the store does not define: the state a token is in
+/// once its role is removed. Roles are looked up per statement on both
+/// protocols, never cached at login, so this is the same path as a role
+/// deleted after `HELLO` (the store has no public call that removes a role).
+const GHOST: &str = "parity-ghost-token";
 
-/// Every credential the comparison runs as. The full token is the control: an
-/// unscoped identity must agree too.
-const IDENTITIES: [(&str, &str); 4] = [
+/// Every credential the comparison runs as. The full token and the `write` key
+/// are the controls: an unscoped identity must agree too.
+const IDENTITIES: [(&str, &str); 5] = [
     ("full token", FULL),
+    ("write key", WR),
     ("alpha role token", ALPHA),
     ("beta role token", BETA),
     ("read key bound to alpha", RD),
 ];
 
 fn role_tokens() -> HashMap<String, String> {
-    [(ALPHA, "alpha"), (BETA, "beta")]
+    [(ALPHA, "alpha"), (BETA, "beta"), (GHOST, "ghost")]
         .into_iter()
         .map(|(t, r)| (t.to_string(), r.to_string()))
         .collect()
@@ -51,8 +58,9 @@ fn role_tokens() -> HashMap<String, String> {
 
 fn keys() -> AccessKeys {
     let text = format!(
-        r#"{{"keys":[{{"hash":"{}","tier":"read","role":"alpha"}}]}}"#,
-        mushroomdb::hash_token(RD).unwrap()
+        r#"{{"keys":[{{"hash":"{}","tier":"read","role":"alpha"}},{{"hash":"{}","tier":"write"}}]}}"#,
+        mushroomdb::hash_token(RD).unwrap(),
+        mushroomdb::hash_token(WR).unwrap()
     );
     AccessKeys::from_json(&text).unwrap()
 }
@@ -241,7 +249,7 @@ fn assert_same(label: &str, http: &Outcome, bolt: &Outcome) {
             match hk {
                 Kind::Forbidden => assert_eq!(hm, bm, "{label}: refusal text differs"),
                 Kind::Client => assert!(
-                    bm.contains(hm.as_str()),
+                    !hm.is_empty() && bm.contains(hm.as_str()),
                     "{label}: Bolt {bm:?} does not carry HTTP {hm:?}"
                 ),
                 _ => {}
@@ -539,7 +547,7 @@ async fn auto_commit_reads_and_writes_agree_for_every_identity() {
         );
     }
     // Each role both wrote and was refused; every identity hit a request error.
-    for token in [FULL, ALPHA, BETA, RD] {
+    for token in [FULL, WR, ALPHA, BETA, RD] {
         assert!(seen.contains(&(token, "rows")), "{token}: {seen:?}");
         assert!(seen.contains(&(token, "client")), "{token}: {seen:?}");
     }
@@ -619,13 +627,47 @@ async fn transactions_agree_for_every_identity() {
             "{who}: the stores the two protocols left differ"
         );
     }
-    for token in [FULL, ALPHA, BETA, RD] {
+    for token in [FULL, WR, ALPHA, BETA, RD] {
         assert!(seen.contains(&(token, "rows")), "{token}: {seen:?}");
         assert!(seen.contains(&(token, "client")), "{token}: {seen:?}");
     }
     for token in [ALPHA, BETA, RD] {
         assert!(seen.contains(&(token, "forbidden")), "{token}: {seen:?}");
     }
+}
+
+/// A token whose role is gone logs in on both protocols (neither checks the
+/// role at login) and is then unauthorized for a read, a write and `BEGIN`:
+/// HTTP 401, Bolt `Unauthorized`. Nothing is written.
+#[tokio::test]
+async fn a_vanished_role_is_unauthorized_on_both() {
+    let (http_db, _h) = fixture();
+    let (bolt_db, _b) = fixture();
+    let before = dump(&http_db);
+    let http = Http::new(&http_db, GHOST);
+    let mut bolt = bolt_connection(&bolt_db, GHOST);
+    let unauthorized = |o: &Outcome| {
+        matches!(
+            o,
+            Outcome::Refused {
+                kind: Kind::Unauthorized,
+                ..
+            }
+        )
+    };
+    for statement in [READS[0], WRITES[0], WRITES[4]] {
+        let label = format!("ghost: {}", statement.0);
+        let h = http.query(statement).await;
+        let b = bolt_statement(&mut bolt, statement, false);
+        assert_same(&label, &h, &b);
+        assert!(unauthorized(&h), "{label}: {h:?}");
+    }
+    let h = http.begin().await.expect_err("BEGIN for a vanished role");
+    let b = bolt_begin(&mut bolt).expect_err("BEGIN for a vanished role");
+    assert_same("ghost: BEGIN", &h, &b);
+    assert!(unauthorized(&h), "{h:?}");
+    assert_eq!(dump(&http_db), before);
+    assert_eq!(dump(&bolt_db), before);
 }
 
 /// A credential neither side knows is refused by both, before anything runs.
