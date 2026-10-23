@@ -250,6 +250,7 @@ GROUPS: dict[str, list[str]] = {
     ],
     "Graph algorithms": ["pagerank", "connected_components", "degree_centrality", "communities"],
     "Memory": ["remember", "recall", "upsert_entity", "forget", "schema_report", "identity_clusters"],
+    "Transactions": ["begin_transaction", "transaction"],
 }
 
 
@@ -260,6 +261,13 @@ MEMORY_PROPERTY = "memory"
 DEPRECATED_PREFIX = "Deprecated:"
 #: The one section whose methods live on the accessor, not on `GraphDb`.
 MEMORY_SECTION = "Memory"
+#: The stub class `begin_transaction()` returns; its methods are listed under
+#: the Transactions section, after the two `GraphDb` methods that begin one.
+#: `TransactionContext` is what `transaction()` returns: only `__enter__` and
+#: `__exit__`, which have no entry of their own.
+TRANSACTION_CLASS = "Transaction"
+TRANSACTION_CONTEXT_CLASS = "TransactionContext"
+TRANSACTION_SECTION = "Transactions"
 
 
 def parse_stub(source: str) -> dict:
@@ -272,6 +280,7 @@ def parse_stub(source: str) -> dict:
     classes: (name, docstring, [(field, annotation)], init signature) — the
              value classes in VALUE_CLASSES
     memory_methods: like methods, for the `MemoryAccessor` class (`db.memory`)
+    transaction_methods: like methods, for the `Transaction` class
     deprecated: like methods, for the `GraphDb` aliases whose docstring starts
              with "Deprecated:" — the old top-level names of the memory methods
 
@@ -284,7 +293,7 @@ def parse_stub(source: str) -> dict:
     lines = source.splitlines()
     segment = lambda node: ast.get_source_segment(source, node) or ""
     aliases, errors, methods, classes = [], [], [], []
-    memory_methods, deprecated = [], []
+    memory_methods, deprecated, transaction_methods = [], [], []
     error_names = {"MushroomError"}
     for i, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -297,9 +306,11 @@ def parse_stub(source: str) -> dict:
             if isinstance(after, ast.Expr) and isinstance(after.value, ast.Constant) and isinstance(after.value.value, str):
                 doc = after.value.value.strip()
             aliases.append((node.targets[0].id, segment(node.value), doc))
-        elif isinstance(node, ast.ClassDef) and node.name in ("GraphDb", MEMORY_CLASS):
+        elif isinstance(node, ast.ClassDef) and node.name == TRANSACTION_CONTEXT_CLASS:
+            continue
+        elif isinstance(node, ast.ClassDef) and node.name in ("GraphDb", MEMORY_CLASS, TRANSACTION_CLASS):
             on_memory = node.name == MEMORY_CLASS
-            target = memory_methods if on_memory else methods
+            target = {MEMORY_CLASS: memory_methods, TRANSACTION_CLASS: transaction_methods}.get(node.name, methods)
             for fn in node.body:
                 if isinstance(fn, ast.AsyncFunctionDef):
                     raise Problem(f"the stub declares `async def {fn.name}`, which the Python page has no form for")
@@ -356,6 +367,7 @@ def parse_stub(source: str) -> dict:
         "methods": methods,
         "classes": classes,
         "memory_methods": memory_methods,
+        "transaction_methods": transaction_methods,
         "deprecated": deprecated,
     }
 
@@ -415,13 +427,21 @@ def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROU
                 _, signature, doc = by_name[name]
                 heading = name
             parts.append(f"### `{heading}`\n\n{fence(signature, 'python')}\n\n{escape_html(doc)}".rstrip())
+        if title == TRANSACTION_SECTION:
+            for name, signature, doc in stub.get("transaction_methods", []):
+                parts.append(
+                    f"### `{TRANSACTION_CLASS}.{name}`\n\n{fence(signature, 'python')}\n\n{escape_html(doc)}".rstrip()
+                )
         if title == MEMORY_SECTION and stub.get("deprecated"):
             rows = ["| Old name | Use instead |", "|---|---|"]
             rows += [f"| `{name}` | `{MEMORY_PROPERTY}.{name}` |" for name, _, _ in stub["deprecated"]]
             parts.append(DEPRECATED_INTRO + "\n\n" + "\n".join(rows))
         sections.append("\n\n".join(parts))
     rows = ["| Class | Fields | Raised when |", "|---|---|---|"]
-    for name, _base, doc, fields in stub["errors"]:
+    own_fields = {name: fields for name, _base, _doc, fields in stub["errors"]}
+    for name, base, doc, fields in stub["errors"]:
+        # A subclass of another error carries that error's fields too.
+        fields = own_fields.get(base, []) + fields
         shown = ", ".join(f"`{field}: {annotation}`" for field, annotation in fields) or "—"
         summary = doc.split("\n\n", 1)[0]
         rows.append(f"| `{name}` | {cell(shown)} | {cell(escape_html(summary))} |")

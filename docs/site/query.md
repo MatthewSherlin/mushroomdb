@@ -465,6 +465,12 @@ RETURN AVG(r.score)
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
 
+Each takes a property or a bare variable (`UNWIND [1, 2] AS x RETURN max(x)`).
+`SUM` of integers is an integer (an overflow past 64 bits is an error) and is a
+float once any input is a float; `AVG` is always a float. `MIN` and `MAX` order
+any non-null value, strings included. `SUM`, `AVG`, `MIN` and `MAX` of a node or
+relationship variable are errors.
+
 ### DISTINCT inside an aggregate
 
 `count(DISTINCT x)` and `collect(DISTINCT x)` deduplicate within each group
@@ -1169,6 +1175,62 @@ CALL subquery`.
 `CALL`, `YIELD`, `FOREACH`, `EXISTS` and `LOAD` are not reserved: they still
 name properties, labels and variables (`MATCH (call:Yield) RETURN call.exists`).
 
+## EXPLAIN
+
+`EXPLAIN` in front of a statement returns the plan the engine would run, and
+runs none of it. The result has one column, `plan`, and one row; the value is a
+JSON string:
+
+```cypher
+EXPLAIN MATCH (n:Person) WHERE n.age > 30 RETURN n.name
+```
+
+```text
+[{"op":"IndexRangeScan","var":"n","label":"Person","field":"age","lo":{"value":"Int(30)","inclusive":false},"hi":null,"prefix":null,"order":null,"index":"idx_Person_age"},
+ {"op":"Filter","expr":"…"},
+ {"op":"Project","items":["n.name"]}]
+```
+
+The plan is an array of operators in execution order, each an object with an
+`op` and that operator's fields (`ScanLabel`, `IndexScan`, `IndexRangeScan`,
+`Expand`, `Filter`, `Project`, `Aggregate`, `OrderBy`, `Limit`, and so on). A
+`UNION` lists one `Union` entry per part, each holding that part's plan.
+
+**Which index.** A lookup names the index it reads in an `index` field, so you
+can check that one is used. `IndexScan` and `IndexIntersect` (equality lookups)
+give the equality index, or the range index on the same label and property;
+`IndexRangeScan` gives the range index; a lookup by key (`{id: 'x'}`) says
+`"key"`. `null` means the lookup scans the label because no index is declared.
+The names are the ones `SHOW INDEXES` lists. A `ScanLabel` whose next operator
+is a plain `property <op> literal` filter carries `fused_filter`, the property:
+the scan applies that filter in its own loop when the query is bounded.
+
+**Every statement has a plan, and none runs.** A read, a `UNION`, a `CALL`
+(`ProcedureCall`) and each write form are planned without being executed:
+`EXPLAIN CREATE …` creates nothing and `EXPLAIN MATCH … DETACH DELETE …`
+deletes nothing. A write shows the plan of its `MATCH` part followed by its
+write operators (`Create`, `SetProperty`, `SetProperties`, `RemoveProperty`,
+`DeleteNode`, `DeleteEdge`, `Merge`). A schema statement (`CREATE INDEX …`,
+`DROP CONSTRAINT …`) has a one-operator plan, `Schema`. A statement that does
+not parse or plan is the same error without `EXPLAIN`.
+
+**Where it runs.** `EXPLAIN` is a read, allowed wherever a read is: `query`,
+`query_write`, `query_at`, masked and role-scoped calls, the lock-free reader,
+a transaction (nothing is buffered, so the plan of a write inside a
+transaction changes nothing), HTTP `/query`, Python, TypeScript and the MCP
+`query` tool all return the `plan` column. Over [Bolt](bolt.md#explain) there
+are no records and the plan is in the summary. Under a role, a mask or a
+namespace, the plan names an index only when `SHOW INDEXES` would list it for
+that caller; the plan carries no counts or estimates of the data.
+
+**A diagnostic, not an interface.** The operators and their fields describe the
+engine's current plan and may change between releases. Read the plan; do not
+parse it in code that must keep working.
+
+`PROFILE` is refused: `not supported in mushroomdb 0.10: PROFILE`. It would
+run the query. `EXPLAIN` stays an ordinary name elsewhere
+(`MATCH (explain) RETURN explain`).
+
 ## Unsupported features
 
 These openCypher forms are recognised and refused with an error that names
@@ -1193,6 +1255,7 @@ prefix, the regular-expression operator `lex:`).
 | `RETURN n {.name, .age}` | `not supported in mushroomdb 0.10: map projection (n {.key, …})` |
 | `n.name =~ 'a.*'` | `not supported in mushroomdb 0.10: regular-expression match (=~)` |
 | `LOAD CSV …` | `not supported in mushroomdb 0.10: LOAD CSV` |
+| `PROFILE …` | `not supported in mushroomdb 0.10: PROFILE (it would run the query; EXPLAIN shows the plan without running it)` |
 | `USE db …` | `not supported in mushroomdb 0.10: USE (database selection)` |
 | `allShortestPaths(…)` | `not supported in mushroomdb 0.10: allShortestPaths` |
 
@@ -1339,6 +1402,11 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
+| `elementId(x)` | node or relationship variable | `String` | the element id a Bolt driver reads as `element_id` (`n:<key>` for a node, `r:<type>\|<start>\|<end>` for a relationship). Opaque but stable: match it, do not parse it. Null in → null; any other argument is a named error |
+| `startNode(r)`, `endNode(r)` | relationship variable | node | the relationship's source or destination node; over Bolt a Node, elsewhere its key. Null when that end is hidden by the caller's mask |
+| `nodes(p)` | path | `List` | the path's nodes in walk order; the same as `p.nodes`, so over Bolt a list of Nodes |
+| `relationships(p)` | path | `List` | the path's relationships in walk order, each a `{type, start, end}` map; the same as `p.relationships`, so over Bolt a list of Relationships |
+| `length(p)` | path | `Int` | the number of relationships in the path; the same as `p.length` |
 | `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
 | `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
 | `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
@@ -1543,11 +1611,12 @@ MATCH (n:Person) RETURN key(n) AS id, labels(n) AS kinds
 
 ## Cypher coverage
 
-Tested against the current binary (2026-08-24, release build, maturin develop --release);
-the forms below — node key and label, comma-separated patterns, infix string
-predicates, list subscripts, `DISTINCT` aggregates, `WITH` alias scoping — are covered by the
-workspace test suite. Classification: **Supported** = executes without error; **Named-error** =
-rejected with a clear, actionable message; **Absent** = not implemented (not tested here).
+How much of openCypher this release runs is measured by the openCypher TCK on
+every change: [openCypher conformance](conformance.md) has the pass, fail and
+skip counts by area and by feature file, and the causes of the failures. The
+tables below list forms by hand and are covered by the workspace test suite.
+Classification: **Supported** = executes without error; **Named-error** =
+rejected with a clear, actionable message; **Absent** = not implemented.
 
 ### Supported
 
@@ -1556,9 +1625,8 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
+| `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)` — null in gives null, a wrong type is an error naming the function |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
-| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
-| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
@@ -1604,7 +1672,6 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
 | Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
 | `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props` — evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
@@ -1670,7 +1737,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, id, labels` |
+| Unknown function name | ``execute: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
@@ -1697,6 +1764,15 @@ unexpected-token parse error or other unspecified result.
 |---|
 | Chained comparisons `a < b < c` (a parse error) |
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
+| A node with no label or no string `id` (`CREATE ()`, `CREATE (:A {name: 'x'})`): a parse error or a named error; the label and the key are required |
+| Comma-separated patterns in `CREATE` (`CREATE (a:A {id: 'a'}), (b:B {id: 'b'})`): a parse error; use a chain or two `CREATE` clauses |
+| List predicates `all(…)`, `any(…)`, `none(…)`, `single(…)` (a parse error) |
+| List slices `l[1..3]`, `l[..2]` (a parse error) |
+| Namespaced temporal functions `date.truncate`, `datetime.fromepoch`, `duration.between`, `duration.inMonths`, … (a parse error) |
+| Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
+| Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
+| `OPTIONAL MATCH` followed by a write clause (`OPTIONAL MATCH (n) SET n.x = 1`): a parse error |
+| An unaliased aggregate column is named in upper case (`count(n)` is the column `COUNT(n)`); alias it (`count(n) AS n`) to choose the name |
 
 ---
 

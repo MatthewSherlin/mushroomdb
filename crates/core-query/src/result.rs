@@ -48,6 +48,22 @@ impl EntityKind {
     }
 }
 
+/// The element id of the node `key`: what `elementId(n)` returns and what a
+/// Bolt driver reads as `node.element_id`. Opaque but stable: match it, do not
+/// parse it.
+pub fn node_element_id(key: &str) -> String {
+    format!("n:{key}")
+}
+
+/// The element id of the relationship `start -[rel_type]-> end`: what
+/// `elementId(r)` returns and what a Bolt driver reads as
+/// `relationship.element_id`. Opaque but stable; a `\` or `|` inside a part is
+/// escaped, so two different relationships never share an id.
+pub fn relationship_element_id(rel_type: &str, start: &str, end: &str) -> String {
+    let escape = |part: &str| part.replace('\\', "\\\\").replace('|', "\\|");
+    format!("r:{}|{}|{}", escape(rel_type), escape(start), escape(end))
+}
+
 /// A node as it stood when the query read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeEntity {

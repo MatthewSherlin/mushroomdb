@@ -427,6 +427,49 @@ s = db.stats()
 `namespaces` (v0.6.6) lists every namespace with at least one live node, in name
 order, always including `default` — one entry on a store that has never named one.
 
+## Transactions
+
+Run several statements as one commit, and read your own writes in between, with
+`db.transaction()`:
+
+```python
+with db.transaction() as tx:
+    tx.execute("CREATE (n:Account {id: 'a', balance: 100})")
+    tx.execute("CREATE (n:Account {id: 'b', balance: 0})")
+    rows = tx.execute("MATCH (n:Account) RETURN n.id AS id")  # sees both
+```
+
+The block commits when it ends cleanly and rolls back, re-raising, when it
+raises. `tx.execute(cypher, params=None)` takes what `query_write` takes and
+returns what it returns. Nothing reaches the store — or any other handle —
+until the commit, which is one commit in the history. Without a `with`, use
+`tx = db.begin_transaction()` and finish it yourself with `tx.commit()`, which
+returns the commit number, or `tx.rollback()`; a transaction dropped unfinished
+is a rollback. Using a finished transaction raises `TransactionClosed`.
+
+A transaction reads the store as it was when it began, so a write another
+handle makes meanwhile is not seen. If that write changed a node your
+transaction read or wrote, your commit raises `TransactionConflict` (a
+`CasConflict`) and writes nothing; run the transaction again:
+
+```python
+from mushroomdb import TransactionConflict
+
+for _ in range(3):
+    try:
+        with db.transaction() as tx:
+            tx.execute("MATCH (n:Account {id: 'a'}) SET n.balance = n.balance - 10")
+        break
+    except TransactionConflict:
+        continue
+```
+
+Schema changes (`CREATE INDEX` and the like) are refused inside a transaction.
+A `read_only=True` handle cannot begin one (`ReadOnly`); a `scoped()` handle can,
+but its transaction is read-only. `close()` raises while a transaction is open.
+Many transactions may run at once from different threads, and one transaction
+used from two threads is serialised.
+
 ## Concurrency
 
 **One writer at a time across processes.** The store carries an advisory write
@@ -467,8 +510,9 @@ A commit another process is midway through writing is left alone and picked up
 by the next `refresh()`; a partial write is never an error.
 
 Within one process the handle is guarded by a mutex, so calls from multiple
-threads are serialized and safe. They are not isolated transactions: readers
-can observe intermediate states while a batch is being applied. See
+threads are serialized and safe. Single calls are not isolated transactions: readers
+can observe intermediate states while a batch is being applied; use
+[`db.transaction()`](#transactions) for isolation. See
 [concurrency.md](concurrency.md) for the full cross-process model and
 [durability.md](durability.md) for the WAL and crash-atomicity guarantees.
 

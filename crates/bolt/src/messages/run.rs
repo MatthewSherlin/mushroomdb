@@ -38,8 +38,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mushroomdb::{
-    is_schema_query, is_write_query, with_entity_detail, GraphError, ResultSet, SharedDb,
-    Transaction, Value,
+    explain_plan_value, is_explain_query, is_schema_query, is_write_query, with_entity_detail,
+    GraphError, ResultSet, SharedDb, Transaction, Value,
 };
 
 use super::graph;
@@ -358,7 +358,8 @@ impl QueryService {
         // A statement that changes the schema reports query type `s`.
         let schema = is_write && is_schema_query(&request.query).unwrap_or(false);
         Ok(Box::new(
-            RowCursor::new(result, is_write, Some(format_bookmark(seq))).with_schema(schema),
+            RowCursor::for_statement(&request.query, result, is_write, Some(format_bookmark(seq)))
+                .with_schema(schema),
         ))
     }
 
@@ -464,7 +465,9 @@ impl OpenTransaction for Transaction {
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
         let is_write = is_write_query(cypher).map_err(BoltError::SyntaxError)?;
         let result = Transaction::execute(self, cypher, params)?;
-        Ok(Box::new(RowCursor::new(result, is_write, None)))
+        Ok(Box::new(RowCursor::for_statement(
+            cypher, result, is_write, None,
+        )))
     }
 }
 
@@ -482,6 +485,8 @@ pub struct RowCursor {
     committed: bool,
     /// The statement changed the schema: its query type is `s`, not `w`.
     schema: bool,
+    /// For an `EXPLAIN`: the plan the closing `SUCCESS` carries as `plan`.
+    plan: Option<PackValue>,
 }
 
 impl RowCursor {
@@ -497,6 +502,31 @@ impl RowCursor {
             max_len: MAX_PACK_LEN,
             committed,
             schema: false,
+            plan: None,
+        }
+    }
+
+    /// The cursor for `cypher`'s `result`. An `EXPLAIN` has no records: its
+    /// plan goes in the closing `SUCCESS` as `plan` (`operatorType`, `args`,
+    /// `identifiers`, `children`), where a driver reads `summary.plan`.
+    pub fn for_statement(
+        cypher: &str,
+        result: ResultSet,
+        is_write: bool,
+        bookmark: Option<String>,
+    ) -> Self {
+        let plan = is_explain_query(cypher)
+            .unwrap_or(false)
+            .then(|| explain_plan_value(&result))
+            .flatten()
+            .and_then(|plan| pack_value(&plan, (5, 0), 0).ok());
+        match plan {
+            Some(plan) => {
+                let mut cursor = Self::new(ResultSet::new(Vec::new()), false, bookmark);
+                cursor.plan = Some(plan);
+                cursor
+            }
+            None => Self::new(result, is_write, bookmark),
         }
     }
 
@@ -597,6 +627,9 @@ impl ResultCursor for RowCursor {
         ];
         if let Some(stats) = self.result.stats().and_then(graph::stats_map) {
             meta.push(("stats".to_string(), stats));
+        }
+        if let Some(plan) = &self.plan {
+            meta.push(("plan".to_string(), plan.clone()));
         }
         if let Some(bookmark) = &self.bookmark {
             meta.push(("bookmark".to_string(), PackValue::String(bookmark.clone())));

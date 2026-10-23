@@ -494,6 +494,13 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "test-only SharedDb constructor for injecting a WAL sync function; \
          applies no schema because callers configure the store separately",
     ),
+    (
+        "new",
+        "tck-runner's TempGraph::new: a conformance-test fixture, not a \
+         user-facing store creation path; every TCK scenario assumes an empty \
+         store with no schema, so declaring the memory schema would change \
+         what the scenarios measure",
+    ),
 ];
 
 /// Store-opening calls classified, one per line: `file:line fn class`.

@@ -1,0 +1,4 @@
+https://github.com/opencypher/openCypher/tree/2024.3/tck
+commit 677cbafabb8c3c5eed458fd3b1ec0daec8d67d23
+archive https://github.com/opencypher/openCypher/archive/refs/tags/2024.3.tar.gz
+copied unmodified: LICENSE, NOTICE, tck/features/, tck/graphs/

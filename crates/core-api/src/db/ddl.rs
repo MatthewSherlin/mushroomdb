@@ -188,6 +188,17 @@ impl SchemaListing {
         view: &GraphView<'_>,
         visible: &VisibleSet,
     ) -> ResultSet {
+        let seen = self.visible_labels(view, visible);
+        self.show_where(stmt, |label| seen.contains(label))
+    }
+
+    /// The labels of declared indexes and constraints that a node the caller
+    /// can see carries. `view` is the unmasked state `visible`'s ids index into.
+    pub(crate) fn visible_labels(
+        &self,
+        view: &GraphView<'_>,
+        visible: &VisibleSet,
+    ) -> HashSet<&str> {
         let mut wanted: HashMap<u32, &str> = self
             .indexes
             .iter()
@@ -209,7 +220,26 @@ impl SchemaListing {
                 seen.insert(label);
             }
         }
-        self.show_where(stmt, |label| seen.contains(label))
+        seen
+    }
+
+    /// The name an index on `(label, field)` is listed under: an equality
+    /// index when `equality`, else a range index.
+    pub(crate) fn index_named_for(
+        &self,
+        label: &str,
+        field: &str,
+        equality: bool,
+    ) -> Option<String> {
+        let kind = if equality {
+            IndexKind::Equality
+        } else {
+            IndexKind::Range
+        };
+        self.indexes
+            .iter()
+            .find(|e| e.kind == kind && e.label == label && e.field == field)
+            .map(|e| e.name.clone())
     }
 
     fn show_where(&self, stmt: &DdlStatement, keep: impl Fn(&str) -> bool) -> ResultSet {

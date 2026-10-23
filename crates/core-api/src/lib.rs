@@ -27,8 +27,8 @@ pub use algo::{
 };
 pub use core_query::cypher::with_entity_detail;
 pub use core_query::{
-    CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity, PathEntity, RelationshipEntity, ResultSet,
-    WriteStats,
+    node_element_id, relationship_element_id, CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity,
+    PathEntity, RelationshipEntity, ResultSet, WriteStats,
 };
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
@@ -44,6 +44,7 @@ pub use core_storage::{
 pub use db::{
     ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,
 };
+pub use db::{explain_plan_value, is_explain_query};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
     snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,

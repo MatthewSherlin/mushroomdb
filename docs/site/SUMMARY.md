@@ -19,6 +19,7 @@
 # Cypher reference
 
 - [Query](query.md)
+- [openCypher conformance](conformance.md)
 
 # Drivers and Bolt
 

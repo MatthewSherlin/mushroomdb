@@ -146,8 +146,10 @@ def test_every_locking_helper_drops_the_guard_before_mapping_an_error():
     for name in _LOCK_HELPERS:
         body = _method_body(source, name)
         assert "lock(&self.inner.0)" in body, f"{name}: fixture — this helper takes the lock"
-        assert body.count("drop(guard)") == 1, f"{name}: expected exactly one explicit drop"
-        drop_at = body.index("drop(guard)")
+        # One drop per store arm (plain, shared), so there may be several; the
+        # error is mapped after the last of them.
+        assert body.count("drop(guard)") >= 1, f"{name}: expected an explicit drop"
+        drop_at = body.rindex("drop(guard)")
         maps = [
             i
             for i in range(len(body))

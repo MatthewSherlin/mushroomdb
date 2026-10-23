@@ -510,6 +510,46 @@ async fn query_count_star_format_json_wire_shape() {
     );
 }
 
+/// QL-11: `EXPLAIN` over `/query` is the one-row `plan` column, for a read and
+/// for a write statement, and runs none of it.
+#[tokio::test]
+async fn query_explain_returns_the_plan_and_writes_nothing() {
+    let (app, db) = open("query-explain");
+    seed_person(&db, "p1");
+
+    for cypher in [
+        "EXPLAIN MATCH (t:Person) RETURN t.id",
+        "EXPLAIN CREATE (n:Person {id: 'p9'})",
+    ] {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req("POST", "/query?format=json", json!({ "cypher": cypher })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cypher}");
+        let v = parse_json(&body);
+        assert_eq!(v["columns"], json!(["plan"]), "{cypher}");
+        let plan = v["rows"][0][0].as_str().expect("plan string");
+        let ops: serde_json::Value = serde_json::from_str(plan).expect("plan is JSON");
+        assert!(ops.as_array().is_some_and(|a| !a.is_empty()), "{cypher}");
+    }
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "MATCH (t:Person) RETURN count(t)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parse_json(&body)["rows"],
+        json!([[1]]),
+        "nothing was created"
+    );
+}
+
 /// Binding: bad Cypher is 400 {"error": detail} with a parse:-prefixed detail.
 #[tokio::test]
 async fn query_bad_cypher_is_400_with_parse_prefix() {

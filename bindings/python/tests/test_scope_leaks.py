@@ -563,6 +563,33 @@ def test_context_manager_on_a_scoped_handle(tmp_path):
         db.node_info("vis_a")
 
 
+def test_a_scoped_handles_transactions_read_through_the_scope_and_never_write(store):
+    """`begin_transaction` / `transaction` on a scoped handle: the scope applies to
+    every statement, and a write is refused the same way for a hidden key and an
+    absent one — the transaction is not an existence oracle either."""
+    from mushroomdb import ReadOnly
+
+    _, s = store
+    reads = [
+        "MATCH (n:Person) RETURN n.team AS team, key(n) AS k",
+        "MATCH (a)-[r:LINKS]->(b) RETURN key(a) AS a, key(b) AS b",
+        "MATCH (a)-[r]->(b) RETURN key(a) AS a, type(r) AS t, key(b) AS b",
+        "MATCH (n:Person) WHERE n.bio CONTAINS 'alpha' RETURN n.bio AS bio",
+    ]
+    with s.transaction() as tx:
+        for cypher in reads:
+            rows = tx.execute(cypher)
+            _assert_clean(f"tx.execute({cypher!r})", rows)
+            assert rows == s.query(cypher), cypher
+        refusals = []
+        for key in (HIDDEN[0], ABSENT):
+            with pytest.raises(ReadOnly) as caught:
+                tx.execute("MATCH (n:Person {id: $k}) SET n.team = 'x'", {"k": key})
+            refusals.append((type(caught.value), caught.value.code, str(caught.value)))
+        assert refusals[0] == refusals[1]
+    assert s.begin_transaction().commit() >= 0
+
+
 def test_open_carries_no_scope_and_reads_no_other_store(tmp_path):
     """`open` is a staticmethod: `s.open(p)` is `GraphDb.open(p)`, unscoped.
 
@@ -797,6 +824,8 @@ COVERED = {
     "refresh": "test_refresh_is_permitted_and_names_nothing",
     "scoped": "test_scoped_narrows_and_never_widens",
     "close": "test_close_is_permitted_on_a_scoped_handle",
+    "begin_transaction": "test_a_scoped_handles_transactions_read_through_the_scope_and_never_write",
+    "transaction": "test_a_scoped_handles_transactions_read_through_the_scope_and_never_write",
     "open": "test_open_carries_no_scope_and_reads_no_other_store",
     "restore": "test_restore_is_a_staticmethod_about_other_directories",
     # writes — refused, and the refusal discloses nothing

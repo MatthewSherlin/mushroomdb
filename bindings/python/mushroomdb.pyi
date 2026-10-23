@@ -162,6 +162,21 @@ class CasConflict(MushroomError):
     expected: int
     actual: int
 
+class TransactionConflict(CasConflict):
+    """A commit found that another writer changed a node the transaction read or wrote.
+
+    Nothing was written, so running the transaction again from the start is
+    always safe. It is a `CasConflict` and carries its `key`, `expected` and
+    `actual`.
+    """
+
+    code: str
+
+class TransactionClosed(MushroomError):
+    """The transaction is finished: it was already committed or rolled back."""
+
+    code: str
+
 class MaskedReadOnly(MushroomError):
     """A write statement reached a scoped or masked query path, which is read-only."""
 
@@ -303,6 +318,46 @@ class ValueTooLarge(MushroomError):
     field: str
     size: int
     limit: int
+
+class Transaction:
+    """An open interactive transaction, from `db.begin_transaction()` or `with db.transaction() as tx:`.
+
+    Reads see the store as it was when the transaction began plus the
+    transaction's own writes; nothing reaches the store, or any other handle,
+    until `commit()`. One transaction used from two threads is serialised.
+    Dropping it unfinished is a rollback.
+    """
+
+    def execute(self, cypher: str, params: Params = None) -> list[Row]:
+        """Run one Cypher statement and return its rows, shaped as `query` and `query_write` return them.
+
+        A statement that fails changes nothing and leaves the transaction
+        usable. Schema changes are refused inside a transaction. Raises
+        `TransactionClosed` once the transaction is finished.
+        """
+
+    def commit(self) -> int:
+        """Write the transaction as one commit and return that commit's number.
+
+        A transaction that wrote nothing writes nothing and returns the number
+        of the commit it began on. The transaction is finished afterwards,
+        whether or not this raised. Raises `TransactionConflict` when another
+        writer changed a node it read or wrote.
+        """
+
+    def rollback(self) -> None:
+        """Discard the transaction's changes. Raises `TransactionClosed` if it is already finished."""
+
+class TransactionContext:
+    """What `db.transaction()` returns: begins on entering the block, commits on a clean exit, rolls back and re-raises on an exception."""
+
+    def __enter__(self) -> Transaction: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
 
 class MemoryAccessor:
     """The agent-memory methods of a handle: what `db.memory` returns.
@@ -1564,10 +1619,37 @@ class GraphDb:
         on an interval is cheap. See `docs/site/multiprocess.md`.
         """
 
+    def begin_transaction(self) -> Transaction:
+        """Begin an interactive transaction and return it.
+
+        Reads see the store as it was at this call plus the transaction's own
+        writes; `commit()` writes them as one commit, `rollback()` or dropping
+        the transaction discards them. Prefer `with db.transaction() as tx:`.
+
+        Raises `ReadOnly` on a `read_only=True` handle. A transaction on a
+        `scoped()` handle is read-only: reads go through the scope, writes
+        raise `ReadOnly`, and its commit writes nothing. `close()` raises while
+        a transaction is open.
+        """
+
+    def transaction(self) -> TransactionContext:
+        """Run a block as one transaction: commit on a clean exit, roll back and re-raise on an exception.
+
+        ```python
+        with db.transaction() as tx:
+            tx.execute("CREATE (n:Person {id: 'alice'})")
+        ```
+
+        Calling `tx.commit()` or `tx.rollback()` inside the block ends the
+        transaction early; leaving the block then does nothing more. Refused
+        with `ReadOnly` on a `read_only=True` handle.
+        """
+
     def close(self) -> None:
         """Close the handle and release the store.
 
         A `scoped()` child shares the one store, so either name closes both.
+        Raises `RuntimeError` while a transaction is open on the store.
         """
 
     def __enter__(self) -> GraphDb: ...

@@ -848,6 +848,11 @@ pub struct SharedDb {
     /// for WAL bytes it applied but did not write (see
     /// [`durable_wal_position`](SharedDb::durable_wal_position)).
     vouch: Arc<(std::path::PathBuf, SyncWalFn)>,
+    /// Set when this handle owns the store's cross-process write lock for its
+    /// whole lifetime ([`from_locked`](SharedDb::from_locked)): no other
+    /// process can commit, so it can never be stale and a read skips the
+    /// staleness `stat`s.
+    exclusive: bool,
     /// Captures that went past the published snapshot to the RwLock.
     #[cfg(test)]
     locked_captures: Arc<std::sync::atomic::AtomicU64>,
@@ -872,6 +877,30 @@ impl SharedDb {
             dir.to_path_buf(),
             Arc::new(sync_wal_at),
         ))
+    }
+
+    /// Wrap a plain read-write handle into a shared one, keeping the
+    /// cross-process write lock the handle already holds.
+    ///
+    /// For a binding that opened with [`GraphDb::open`] — and so owns the
+    /// store's lock for the handle's lifetime — and now needs a [`SharedDb`]
+    /// to begin interactive transactions. Nothing is reopened: the loaded
+    /// state moves into the shared handle as it is, and the lock is released
+    /// only when the last clone of the result is dropped, so other openers see
+    /// the same [`GraphError::Busy`] they saw before the wrap.
+    ///
+    /// Fails with [`GraphError::ReadOnly`] for a read-only handle: it has no
+    /// lock to keep and nothing a transaction could commit to.
+    pub fn from_locked(db: GraphDb<RealFs>) -> Result<Self> {
+        if db.is_read_only() {
+            return Err(GraphError::ReadOnly);
+        }
+        let dir = db.store_dir();
+        let mut shared = Self::from_db_and_dir_with_sync(db, dir, Arc::new(sync_wal_at));
+        // Only a handle that holds the lock for its lifetime is exclusive: a
+        // plain read-write handle does, and a read-only one was refused above.
+        shared.exclusive = true;
+        Ok(shared)
     }
 
     /// Open with an injectable WAL sync function.
@@ -951,6 +980,7 @@ impl SharedDb {
             wal_mu,
             durable_wal,
             vouch,
+            exclusive: false,
             #[cfg(test)]
             locked_captures: Arc::default(),
         }
@@ -1018,6 +1048,9 @@ impl SharedDb {
     /// treated as "not stale": a read must not fail because the store might
     /// have moved on.
     fn refresh_if_stale(&self) {
+        if self.exclusive {
+            return;
+        }
         let stale = self
             .inner
             .read()
@@ -1204,7 +1237,7 @@ impl SharedDb {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.inner.try_read() {
             Ok(db) => {
-                if !db.is_stale().unwrap_or(false) {
+                if self.exclusive || !db.is_stale().unwrap_or(false) {
                     return db.reader();
                 }
                 drop(db);
