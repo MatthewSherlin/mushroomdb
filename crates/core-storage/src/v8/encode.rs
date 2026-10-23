@@ -1058,11 +1058,14 @@ fn edge_props_to_data(ep: &EdgeProps) -> EdgePropsData {
 /// Merge an archived base `EdgePropsData` with an in-memory overlay, producing
 /// the `EdgePropsData` for the next snapshot.
 ///
-/// Algorithm:
-/// 1. Emit all base entries whose key `(etype, src, dst)` is NOT tombstoned in
-///    the overlay and NOT superseded by an overlay entry (base entry wins only
-///    when absent from overlay map).
-/// 2. Emit all overlay entries (overlay wins over base for the same key).
+/// Algorithm — the same precedence `EdgePropsView` reads with:
+/// 1. A tombstoned key emits the overlay entry alone (or nothing): the base
+///    is hidden for it.
+/// 2. A key with an overlay entry and no tombstone emits the base fields with
+///    the overlay's laid over them, field by field. Emitting the overlay entry
+///    alone dropped every base field it did not name, which a live read still
+///    showed.
+/// 3. Every other base entry is copied as it is.
 ///
 /// Entries in the result are sorted by (etype, src, dst) ascending.
 fn edge_props_merge_to_data(
@@ -1081,13 +1084,21 @@ fn edge_props_merge_to_data(
 
     let mut entries: Vec<EdgePropEntry> = Vec::new();
 
-    // Base entries not tombstoned and not superseded by overlay.
+    // Base entries not tombstoned; one the overlay also writes is merged
+    // below, with the overlay's fields over its own.
+    let mut merged_base: BTreeMap<(u32, u32, u32), BTreeMap<String, Value>> = BTreeMap::new();
     for entry in base.entries.iter() {
         let et = u32::from(entry.etype);
         let s = u32::from(entry.src);
         let d = u32::from(entry.dst);
         let key = (et, s, d);
-        if tombstoned_keys.contains(&key) || overlay_keys.contains(&key) {
+        if tombstoned_keys.contains(&key) {
+            continue;
+        }
+        if overlay_keys.contains(&key) {
+            let props: BTreeMap<String, Value> =
+                bincode::deserialize(entry.props_blob.as_slice()).unwrap_or_default();
+            merged_base.insert(key, props);
             continue;
         }
         entries.push(EdgePropEntry {
@@ -1098,9 +1109,15 @@ fn edge_props_merge_to_data(
         });
     }
 
-    // Overlay entries (these take priority over any matching base entry).
+    // Overlay entries (their fields take priority over the base's).
     for (et, s, d, props) in overlay.sorted_entries() {
-        let props_blob = bincode::serialize(props).unwrap_or_default();
+        let props_blob = match merged_base.remove(&(et, s, d)) {
+            Some(mut below) => {
+                below.extend(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+                bincode::serialize(&below).unwrap_or_default()
+            }
+            None => bincode::serialize(props).unwrap_or_default(),
+        };
         entries.push(EdgePropEntry {
             etype: et,
             src: s,
@@ -1314,4 +1331,72 @@ pub fn archived_hnsw_to_owned(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod edge_props_merge_tests {
+    use super::{edge_props_merge_to_data, edge_props_to_data};
+    use crate::edge_props::EdgeProps;
+    use crate::types::Value;
+    use std::collections::BTreeMap;
+
+    type Entry = ((u32, u32, u32), BTreeMap<String, Value>);
+
+    fn props_of(data: &crate::v8::layout::EdgePropsData) -> Vec<Entry> {
+        data.entries
+            .iter()
+            .map(|e| {
+                (
+                    (e.etype, e.src, e.dst),
+                    bincode::deserialize(&e.props_blob).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn map(pairs: &[(&str, f64)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::Float(*v)))
+            .collect()
+    }
+
+    /// The merge a snapshot writes reads each key as `EdgePropsView` does:
+    /// a tombstoned key is the overlay entry alone (row 154), an overlay entry
+    /// without one lays its fields over the base's, and an untouched base
+    /// entry is copied.
+    #[test]
+    fn the_merge_reads_each_key_as_the_view_does() {
+        let mut base = EdgeProps::new();
+        base.set(0, 1, 2, "wa", Value::Float(1.0)); // retracted, then claimed
+        base.set(0, 3, 4, "a", Value::Float(1.0)); // partly rewritten
+        base.set(0, 3, 4, "b", Value::Float(1.0));
+        base.set(0, 5, 6, "a", Value::Float(1.0)); // untouched
+        base.set(0, 7, 8, "a", Value::Float(1.0)); // deleted
+        let bytes =
+            rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&edge_props_to_data(&base)).unwrap();
+        let archived =
+            rkyv::access::<crate::v8::layout::ArchivedEdgeProps, rkyv::rancor::Error>(&bytes)
+                .unwrap();
+
+        let mut overlay = EdgeProps::new();
+        overlay.remove_edge(0, 1, 2);
+        overlay.set(0, 1, 2, "wb", Value::Float(1.0));
+        overlay.set(0, 3, 4, "b", Value::Float(2.0));
+        overlay.remove_edge(0, 7, 8);
+
+        let view = crate::v8::seam::EdgePropsView::with_base(&overlay, archived);
+        assert_eq!(view.get(0, 1, 2, "wa"), None);
+        assert_eq!(view.get(0, 1, 2, "wb"), Some(Value::Float(1.0)));
+        assert_eq!(view.get(0, 3, 4, "a"), Some(Value::Float(1.0)));
+
+        assert_eq!(
+            props_of(&edge_props_merge_to_data(archived, &overlay)),
+            vec![
+                ((0, 1, 2), map(&[("wb", 1.0)])),
+                ((0, 3, 4), map(&[("a", 1.0), ("b", 2.0)])),
+                ((0, 5, 6), map(&[("a", 1.0)])),
+            ]
+        );
+    }
 }

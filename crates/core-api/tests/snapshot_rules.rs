@@ -773,3 +773,75 @@ fn chain_round_trip() {
         &[("teamX", "t2")],
     );
 }
+
+fn weighted(name: &str, field: &str, weight: &str) -> RuleDef {
+    RuleDef {
+        name: name.into(),
+        src_label: "P".into(),
+        dst_label: "P".into(),
+        predicate: Predicate::FieldEqual {
+            field: field.into(),
+        },
+        edge_type: "SAME".into(),
+        weight_prop: Some(weight.into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    }
+}
+
+/// Ledger row 154: two weighted rules over one edge type. Rule `ra` owns the
+/// edge (weight `wa`), a snapshot archives `wa`, then `ra` retracts and `rb`
+/// claims the edge (weight `wb`). The retracted rule's archived weight must
+/// not reappear live and then vanish at the next snapshot: the read is the
+/// same live, after a snapshot and after a reopen.
+#[test]
+fn row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot() {
+    let dir = tmp("row154");
+    let mut db = Db::open(&dir).unwrap();
+    let no_params = std::collections::BTreeMap::new();
+    db.create_rule(weighted("ra", "region", "wa")).unwrap();
+    db.query_write("CREATE (:P {id: 'a', region: 'eu', team: 't'})", &no_params)
+        .unwrap();
+    db.query_write("CREATE (:P {id: 'b', region: 'eu', team: 't'})", &no_params)
+        .unwrap();
+    db.create_rule(weighted("rb", "team", "wb")).unwrap();
+    let read = |db: &Db| {
+        let rs = db
+            .query(
+                "MATCH (a:P {id: 'a'})-[r:SAME]->(b:P {id: 'b'}) RETURN r.wa AS wa, r.wb AS wb",
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        let cypher = (0..rs.len())
+            .map(|i| rs.row(i).to_vec())
+            .collect::<Vec<_>>();
+        (
+            db.neighbors("a", "SAME", Direction::Out)
+                .unwrap()
+                .contains(&"b".to_string()),
+            db.get_edge_prop("SAME", "a", "b", "wa"),
+            db.get_edge_prop("SAME", "a", "b", "wb"),
+            cypher,
+        )
+    };
+    assert_eq!(read(&db).1, Some(Value::Float(1.0)), "ra owns the edge");
+    db.snapshot().unwrap();
+    db.query_write("MATCH (n:P {id: 'b'}) SET n.region = 'us'", &no_params)
+        .unwrap();
+    let live = read(&db);
+    assert!(live.0, "rb keeps the edge");
+    assert_eq!(
+        live.1, None,
+        "ra's archived weight is gone with its ownership"
+    );
+    assert_eq!(live.2, Some(Value::Float(1.0)));
+    assert_eq!(live.3, vec![vec![None, Some(Value::Float(1.0))]]);
+    db.snapshot().unwrap();
+    assert_eq!(read(&db), live, "after a snapshot");
+    drop(db);
+    assert_eq!(read(&Db::open(&dir).unwrap()), live, "after a reopen");
+}

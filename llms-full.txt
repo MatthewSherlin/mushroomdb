@@ -2883,7 +2883,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.9.3", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.9.4", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -4887,6 +4887,14 @@ RETURN AVG(r.score)
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
 
+Each also takes a bare variable bound by `UNWIND` or `WITH`
+(`MATCH (o:One) UNWIND [1, 2] AS x RETURN max(x)` is `2`). `MIN` and `MAX`
+read numbers and booleans (`false` before `true`); a null or missing value
+contributes nothing.
+`SUM` of integers is an integer (an overflow past 64 bits is the error
+`sum(): integer overflow`) and is a float once any input is a float; `AVG` is
+always a float.
+
 ### DISTINCT inside an aggregate
 
 `count(DISTINCT x)` and `collect(DISTINCT x)` deduplicate within each group
@@ -5238,7 +5246,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n)-[r:TYPE]->(m)` directed edge | `MATCH (a)-[:KNOWS]->(b) RETURN a` |
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
-| `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
+| `WHERE =, <>, <, >, <=, >=` (numbers, strings, booleans with `false < true`; never across types) | `WHERE n.age > 18` |
 | `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List` |
 | `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
 | `WHERE AND / OR` | `WHERE n.a = 1 AND n.b = 2` |
