@@ -38,11 +38,13 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod call;
 mod ddl;
 pub use ddl::{SchemaError, SchemaErrorKind};
 mod row_eval;
 mod unwind_write;
 
+pub(crate) use call::{call_statement, run_call};
 pub(crate) use ddl::{
     ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
 };
@@ -993,13 +995,35 @@ fn plan_map_write(
     removes
 }
 
-/// Construct the standard write-query result set (columns: created, properties_set, deleted).
+/// Construct the standard write-query result set (columns: created,
+/// properties_set, deleted, relationships_created). `created` counts nodes;
+/// `relationships_created` is last so a reader of the first three by position
+/// is unaffected.
 pub(crate) fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
         "created".into(),
         "properties_set".into(),
         "deleted".into(),
+        "relationships_created".into(),
     ])
+}
+
+/// The one-row write result: nodes created, properties set, deleted, and
+/// relationships created.
+pub(crate) fn write_counts(
+    created: i64,
+    props_set: i64,
+    deleted: i64,
+    relationships_created: i64,
+) -> ResultSet {
+    let mut rs = write_result_set();
+    rs.push_row(vec![
+        Some(Value::Int(created)),
+        Some(Value::Int(props_set)),
+        Some(Value::Int(deleted)),
+        Some(Value::Int(relationships_created)),
+    ]);
+    rs
 }
 
 pub(crate) fn resolve_merge_set_value(
@@ -1448,6 +1472,23 @@ fn eval_set_return_func<F: Fs>(
     args: &[Operand],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
+    if name == core_query::cypher::LABEL_TEST_FN {
+        // `x:Label`: the node's label, or the relationship's captured type.
+        let [Operand::Var(var), Operand::Lit(Value::Str(label))] = args else {
+            return Err(GraphError::QueryError {
+                detail: "a label test (x:Label) needs a node or relationship variable".into(),
+            });
+        };
+        let actual = if rel_vars.iter().any(|r| r == var) {
+            match_rs.get(row, &rel_type_alias(var)).cloned()
+        } else {
+            match match_rs.get(row, var) {
+                Some(Value::Str(key)) => db.node_ref(key).map(|n| Value::Str(n.label().to_owned())),
+                _ => None,
+            }
+        };
+        return Ok(actual.map(|a| Value::Bool(a == Value::Str(label.clone()))));
+    }
     let norm = name.to_ascii_lowercase();
     if norm == "type" {
         if args.len() != 1 {
@@ -11268,6 +11309,19 @@ impl<F: Fs> GraphDb<F> {
                 &authz.mask.visible,
             ));
         }
+        // `CALL` is a read: it sees what the role's mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            return run_call(
+                &call,
+                &self.view_masked(&authz.mask),
+                &self.schema_listing(),
+                params,
+            );
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -11829,6 +11883,15 @@ impl<F: Fs> GraphDb<F> {
             return Ok(self
                 .schema_listing()
                 .show_visible(&stmt, &self.view(), &mask.visible));
+        }
+        // `CALL` sees only what the mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(
+                &call,
+                &self.view_masked(mask),
+                &self.schema_listing(),
+                params,
+            );
         }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -13393,6 +13456,9 @@ impl<F: Fs> GraphDb<F> {
             }
             return Ok(self.schema_listing().show(&stmt));
         }
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -13457,6 +13523,10 @@ impl<F: Fs> GraphDb<F> {
         })?;
         if let Some(stmt) = ddl_statement(&tokens)? {
             return self.exec_ddl(stmt);
+        }
+        // `CALL` is a read; the write entry point answers it as `query` does.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
         }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
@@ -13580,13 +13650,7 @@ impl<F: Fs> GraphDb<F> {
             });
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created as i64)),
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(created as i64, 0, 0, stmt.edges.len() as i64))
     }
 
     fn exec_match_set(
@@ -13783,13 +13847,7 @@ impl<F: Fs> GraphDb<F> {
             return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(props_set as i64)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(0, props_set as i64, 0, 0))
     }
 
     /// `MATCH … [WHERE …] SET n = {…}` and `SET n += {…}`.
@@ -13998,13 +14056,7 @@ impl<F: Fs> GraphDb<F> {
         if let Some(returns) = project_returns {
             return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
         }
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(props_changed)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(0, props_changed, 0, 0))
     }
 
     /// `MATCH … [WHERE …] REMOVE n.f [, …] [RETURN …]`.
@@ -14120,13 +14172,7 @@ impl<F: Fs> GraphDb<F> {
             return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(props_removed)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(0, props_removed, 0, 0))
     }
 
     fn exec_match_delete(
@@ -14227,13 +14273,7 @@ impl<F: Fs> GraphDb<F> {
             other => other,
         })?;
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-            Some(Value::Int(deleted as i64)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(0, 0, deleted as i64, 0))
     }
 
     /// Execute `MATCH … [DETACH] DELETE <node_var> [, …]`.
@@ -14335,13 +14375,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-            Some(Value::Int(nodes_deleted + edges_deleted)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(0, 0, nodes_deleted + edges_deleted, 0))
     }
 
     /// Props the MERGE create arm inserts: the identifying key, plus `ns` when
@@ -14548,6 +14582,7 @@ impl<F: Fs> GraphDb<F> {
             )?)
         };
         let mut created = 0i64;
+        let mut relationships_created = 0i64;
         let mut batch = self.batch();
         if let Some(props) = start_create {
             batch.insert_node(&stmt.label, &start_key, props);
@@ -14561,6 +14596,7 @@ impl<F: Fs> GraphDb<F> {
             &match_sets
         } else {
             batch.insert_edge(&edge.etype, src_key, dst_key);
+            relationships_created = 1;
             &create_sets
         };
         for (key, field, value) in sets {
@@ -14641,13 +14677,7 @@ impl<F: Fs> GraphDb<F> {
             });
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created)),
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(created, 0, 0, relationships_created))
     }
 
     fn exec_merge(
@@ -14775,13 +14805,7 @@ impl<F: Fs> GraphDb<F> {
             });
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created)),
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(created, 0, 0, 0))
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),

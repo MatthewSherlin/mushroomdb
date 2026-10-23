@@ -1790,22 +1790,17 @@ fn params_preflight_catches_missing_param_in_return_funccall() {
 
 // ── Minor gap tests ───────────────────────────────────────────────────────────
 
-/// OPTIONAL MATCH as the first clause (no preceding MATCH) must be rejected
-/// with a named parse error, not a panic.
+/// OPTIONAL MATCH as the first clause (no preceding MATCH) runs against one
+/// row (QL-CX): one row of nulls on an empty store.
 #[test]
-fn optional_match_as_first_clause_is_parse_error() {
+fn optional_match_as_first_clause_gives_one_row_of_nulls() {
     let dir = tmp("optional_first");
     let db = GraphDb::open(&dir).unwrap();
-    let err = db.query("OPTIONAL MATCH (a:Person) RETURN a", &BTreeMap::new());
-    assert!(
-        err.is_err(),
-        "OPTIONAL MATCH without preceding MATCH must fail"
-    );
-    let msg = format!("{:?}", err.unwrap_err());
-    assert!(
-        msg.contains("MATCH") || msg.contains("parse") || msg.contains("expected"),
-        "error must indicate a parse issue: {msg}"
-    );
+    let rs = db
+        .query("OPTIONAL MATCH (a:Person) RETURN a", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "a"), None);
 }
 
 /// size() on a non-string non-list value (Int) propagates null, not an error.

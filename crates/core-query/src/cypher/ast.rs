@@ -322,6 +322,19 @@ pub enum Operand {
     Pred(Box<Expr>),
 }
 
+/// The function a label predicate `x:Label` is parsed to:
+/// `FuncCall { name: LABEL_TEST_FN, args: [Var(x), Lit(Str(Label))] }`. It is
+/// true when `x` is a node with that label or a relationship of that type,
+/// false when it is not, and null when `x` is null. The leading space keeps the
+/// name out of reach of a written function call.
+pub const LABEL_TEST_FN: &str = " hasLabel";
+
+/// The UNWIND alias of the one-row `UNWIND [1] AS …` a statement that begins
+/// with `MATCH … CREATE/MERGE` or with `OPTIONAL MATCH` is read as. The
+/// leading space keeps it out of reach of a written name, and `RETURN *` does
+/// not list it.
+pub const ONE_ROW_VAR: &str = " one row";
+
 /// The column name an operand gets in a RETURN or WITH item that has no
 /// `AS` alias.
 ///
@@ -505,6 +518,56 @@ impl DdlStatement {
             DdlStatement::ShowIndexes | DdlStatement::ShowConstraints
         )
     }
+}
+
+// ─── Procedure call AST ──────────────────────────────────────────────────────
+
+/// `CALL ns.name(args) [YIELD f [AS a], …] [WHERE …] [RETURN …]`: a call of a
+/// built-in procedure, a read statement of its own. Produced by
+/// [`parse_call`](super::parse_call); executed by
+/// [`execute_call`](super::proc::execute_call) on every read entry point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcCallStmt {
+    /// Every part of the dotted name but the last, joined by `.`: `db` in
+    /// `db.ping`, `db.schema` in `db.schema.visualization`.
+    pub ns: String,
+    /// The last part of the dotted name.
+    pub name: String,
+    /// The arguments: any expressions that read no variable (`$param`s and
+    /// literals), evaluated before the call.
+    pub args: Vec<Operand>,
+    /// The `YIELD` items. `None` for no `YIELD`, or `YIELD *`: every column
+    /// the procedure returns, under its own name.
+    pub yields: Option<Vec<YieldItem>>,
+    /// `WHERE` after `YIELD`, over the yielded names.
+    pub where_expr: Option<Expr>,
+    /// The `RETURN` that follows, if any. Without one the statement returns
+    /// the yielded columns.
+    pub ret: Option<CallReturn>,
+}
+
+/// One `field [AS alias]` of a `YIELD`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldItem {
+    pub field: String,
+    pub alias: Option<String>,
+}
+
+impl YieldItem {
+    /// The name the yielded column is bound to.
+    pub fn name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.field)
+    }
+}
+
+/// `RETURN [DISTINCT] items [ORDER BY …] [SKIP n] [LIMIT n]` after a `CALL`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallReturn {
+    pub distinct: bool,
+    pub items: Vec<RetItem>,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
 }
 
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
@@ -776,6 +839,10 @@ pub struct RowMergeNode {
     pub key_field: String,
     pub key: Operand,
     pub ns: Option<Operand>,
+    /// `(v)` naming a node an earlier clause bound (`MATCH (a) MERGE
+    /// (a)-[:T]->(b:L {id: …})`): the MERGE uses that node and never creates
+    /// it. `label` is empty, and `key_field` and `key` are not read.
+    pub bound: bool,
 }
 
 /// The relationship and end node of a per-row `MERGE (a)-[:T]->(b)`.

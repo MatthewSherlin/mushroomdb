@@ -1207,3 +1207,23 @@ fn ddl_is_refused_inside_an_explicit_transaction() {
     );
     assert!(db.read().range_indexes().is_empty());
 }
+
+// ------------------------------------------------------------ CALL (QL-12)
+
+#[test]
+fn run_answers_a_procedure_call() {
+    let (db, _dir) = open_db("call");
+    let mut conn = connected(&db, FULL);
+    let out = conn.handle(run("CALL db.ping() YIELD success AS ok RETURN ok"));
+    let [header] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        get(meta(header), "fields"),
+        Some(&PackValue::List(vec![s("ok")]))
+    );
+    let out = conn.handle(pull(-1));
+    assert_eq!(rows_and_end(&out).0, vec![&vec![PackValue::Bool(true)]]);
+    let out = conn.handle(run("CALL { MATCH (n) RETURN n }"));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Statement.SyntaxError");
+}

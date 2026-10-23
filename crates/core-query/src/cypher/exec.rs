@@ -2,7 +2,7 @@
 
 use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
-    OrderTarget, RetItem, RetVal, UnwindExpr,
+    OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN,
 };
 use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
@@ -2433,6 +2433,33 @@ fn eval_string_predicate(
     }
 }
 
+/// `x:Label`, parsed to `LABEL_TEST_FN(x, 'Label')`: whether the node `x`
+/// has the label, or the relationship `x` the type; null when `x` is null.
+fn label_test(
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    let [Operand::Var(var), Operand::Lit(Value::Str(label))] = args else {
+        return Err("a label test (x:Label) needs a node or relationship variable".to_string());
+    };
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let holds = match row.get(slot).and_then(|c| c.as_ref()) {
+        None | Some(Cell::Scalar(Value::Null)) => return Ok(None),
+        Some(Cell::Node(id)) => view.label_of(*id) == Some(label.as_str()),
+        Some(Cell::Rel(e)) => view.sym_name(e.etype) == Some(label.as_str()),
+        Some(Cell::Scalar(_) | Cell::Path(_)) => {
+            return Err(format!(
+                "{var}:{label}: `{var}` is not a node or a relationship"
+            ))
+        }
+    };
+    Ok(Some(Value::Bool(holds)))
+}
+
 /// Evaluate one of the supported scalar functions.  Unknown function names
 /// produce a named error listing the supported set.  Null propagation:
 /// null in → null out, EXCEPT `coalesce` (which skips nulls).
@@ -2444,6 +2471,9 @@ fn eval_func(
     row: &Row,
     params: &Params,
 ) -> Result<Option<Value>, String> {
+    if name == LABEL_TEST_FN {
+        return label_test(args, view, vars, row);
+    }
     let norm = name.to_ascii_lowercase();
     match norm.as_str() {
         "tolower" => {
@@ -6346,6 +6376,14 @@ mod ql_ru;
 #[cfg(test)]
 #[path = "tests/ql_bx.rs"]
 mod ql_bx;
+
+#[cfg(test)]
+#[path = "tests/ql_12.rs"]
+mod ql_12;
+
+#[cfg(test)]
+#[path = "tests/ql_cx.rs"]
+mod ql_cx;
 
 #[cfg(test)]
 mod tests {

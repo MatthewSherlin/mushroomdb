@@ -104,6 +104,7 @@ fn creates_both_nodes_and_the_edge_when_none_exist() {
     let mut db = GraphDb::open(&tmp("create-all")).unwrap();
     let rs = run(&mut db, MERGE);
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(2)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     assert!(db.has_node("a") && db.has_node("b"));
     assert_eq!(edges(&db, "a"), vec![k("a", "b")]);
     assert_eq!(db.get_prop("a", "id"), Some(Value::Str("a".into())));
@@ -116,6 +117,7 @@ fn creates_only_the_edge_between_existing_nodes() {
     run(&mut db, "CREATE (b:P {id: 'b'})");
     let rs = run(&mut db, MERGE);
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(0)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     assert_eq!(edges(&db, "b"), vec![k("a", "b")]);
 }
 
@@ -125,6 +127,7 @@ fn creates_the_missing_end_when_only_the_start_exists() {
     run(&mut db, "CREATE (a:P {id: 'a', x: 1})");
     let rs = run(&mut db, MERGE);
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(1)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     assert_eq!(
         db.get_prop("a", "x"),
         Some(Value::Int(1)),
@@ -198,6 +201,7 @@ fn a_self_loop_creates_one_node_and_one_edge() {
     let mut db = GraphDb::open(&tmp("loop")).unwrap();
     let rs = run(&mut db, "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'a'})");
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(1)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     assert_eq!(edges(&db, "a"), vec![k("a", "a")]);
     run(&mut db, "MERGE (a:P {id: 'a'})-[:K]->(b:P {id: 'a'})");
     assert_eq!(db.edge_count(), 1);
@@ -499,6 +503,7 @@ fn merge_inside_a_transaction_buffers_is_idempotent_and_commits() {
         .execute(&format!("{MERGE} ON CREATE SET a.n = 1"), &p())
         .unwrap();
     assert_eq!(rs.get(0, "created"), Some(&Value::Int(2)));
+    assert_eq!(rs.get(0, "relationships_created"), Some(&Value::Int(1)));
     // Second run inside the same transaction sees the buffered edge.
     let rs = tx
         .execute(

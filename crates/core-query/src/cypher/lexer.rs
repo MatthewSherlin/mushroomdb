@@ -80,6 +80,11 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             '|' => toks.push(Tok::Pipe),
             ',' => toks.push(Tok::Comma),
             '.' => toks.push(Tok::Dot),
+            '=' if matches!(chars.peek(), Some((_, '~'))) => {
+                return Err(
+                    "not supported in mushroomdb 0.10: regular-expression match (=~)".to_string(),
+                )
+            }
             '=' => toks.push(Tok::Eq),
             '*' => toks.push(Tok::Star),
             '-' => toks.push(Tok::Dash),
