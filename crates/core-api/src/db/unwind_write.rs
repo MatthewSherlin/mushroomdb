@@ -84,6 +84,11 @@ struct Tally {
     props_set: i64,
     deleted: i64,
     relationships_created: i64,
+    /// Of `deleted`, the nodes; the rest are relationships.
+    nodes_deleted: i64,
+    /// Properties the created nodes were written with (not in `props_set`,
+    /// which keeps the write row's documented meaning).
+    created_props: i64,
     /// The keys every `MERGE` looked up, found or created: a transaction
     /// guards its commit with them, as its plain `MERGE` does.
     merge_keys: Vec<String>,
@@ -518,13 +523,24 @@ impl RowPass {
         view: &GraphView<'_>,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        let tally = &self.tally;
+        let stats = WriteStats {
+            nodes_created: tally.created,
+            labels_added: tally.created,
+            nodes_deleted: tally.nodes_deleted,
+            relationships_created: tally.relationships_created,
+            relationships_deleted: tally.deleted - tally.nodes_deleted,
+            properties_set: tally.props_set + tally.created_props,
+            ..WriteStats::default()
+        };
         let Some(query) = self.return_plan else {
             return Ok(write_counts(
-                self.tally.created,
-                self.tally.props_set,
-                self.tally.deleted,
-                self.tally.relationships_created,
-            ));
+                tally.created,
+                tally.props_set,
+                tally.deleted,
+                tally.relationships_created,
+            )
+            .with_stats(stats));
         };
         let ops = plan(&query).map_err(|e| err(format!("plan: {e}")))?;
         // Only the parameters the RETURN names go along: the statement's own
@@ -536,7 +552,9 @@ impl RowPass {
             .map(|(name, v)| (name.clone(), v.clone()))
             .collect();
         with_rows.insert(ROWS_PARAM.to_string(), Value::List(self.captured));
-        execute(view, &ops, &Params(&with_rows)).map_err(|e| err(format!("execute: {e}")))
+        execute(view, &ops, &Params(&with_rows))
+            .map(|rs| finish_result(view, rs).with_stats(stats))
+            .map_err(|e| err(format!("execute: {e}")))
     }
 }
 
@@ -695,7 +713,7 @@ fn uw_write<'v, S: RowSource + ?Sized>(
     match write {
         RowWrite::Create { nodes, edges } => {
             for node in nodes {
-                uw_create_node(node, ctx, env, ov, ops)?;
+                tally.created_props += uw_create_node(node, ctx, env, ov, ops)?;
                 tally.created += 1;
             }
             for edge in edges {
@@ -833,6 +851,7 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 ov.node_deleted(&key);
                 ops.push(BatchOp::DeleteNode { key });
                 tally.deleted += 1;
+                tally.nodes_deleted += 1;
             }
         }
     }
@@ -845,7 +864,7 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
     env: &mut HashMap<&'v str, String>,
     ov: &mut Overlay,
     ops: &mut Vec<BatchOp>,
-) -> Result<()> {
+) -> Result<i64> {
     let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len());
     for (field, operand) in &node.props {
         // A null value is an absent property.
@@ -866,13 +885,14 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
         return Err(GraphError::DuplicateKey { key });
     }
     ov.node_created(&key, &props);
+    let written = props.len() as i64;
     ops.push(BatchOp::InsertNode {
         label: node.label.clone(),
         key: key.clone(),
         props,
     });
     env.insert(node.var.as_str(), key);
-    Ok(())
+    Ok(written)
 }
 
 /// The key a MERGE node pattern names for this row. A bound node's key is
@@ -955,6 +975,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         if !existed {
             let props =
                 src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+            tally.created_props += props.len() as i64;
             ov.node_created(&start_key, &props);
             ops.push(BatchOp::InsertNode {
                 label: merge.start.label.clone(),
@@ -1003,6 +1024,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         start_existed && end_existed && uw_edge_exists(src, ov, &edge.etype, &src_key, &dst_key);
     if !start_existed {
         let props = src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+        tally.created_props += props.len() as i64;
         ov.node_created(&start_key, &props);
         ops.push(BatchOp::InsertNode {
             label: merge.start.label.clone(),
@@ -1013,6 +1035,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     }
     if !end_existed && end_key != start_key {
         let props = src.row_merge_props(&edge.end.key_field, &end_value, end_ns.as_ref())?;
+        tally.created_props += props.len() as i64;
         ov.node_created(&end_key, &props);
         ops.push(BatchOp::InsertNode {
             label: edge.end.label.clone(),

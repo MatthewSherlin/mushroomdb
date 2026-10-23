@@ -30,6 +30,12 @@ pub(super) struct Scope {
     /// Names the parser made up (an anonymous node of a write clause, the
     /// one-row UNWIND alias): in scope, but not listed by `RETURN *`.
     hidden: Vec<String>,
+    /// Variable-length relationship names: bound to a hop count, never
+    /// returned bare, so not listed by `RETURN *`.
+    var_length: Vec<String>,
+    /// Whether `RETURN *` leaves relationship names out: the `RETURN` of a
+    /// `MATCH … SET` / `REMOVE` cannot return a relationship bare.
+    star_skips_rels: bool,
 }
 
 impl Scope {
@@ -52,16 +58,20 @@ impl Scope {
         self.vars.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
     }
 
-    /// The items `RETURN *` / `WITH *` stands for: every node, path and value
-    /// name the query bound that is in scope here, in alphabetical order.
-    /// Relationship variables (single or variable-length) are left out, since
-    /// a relationship is not returned bare in 0.10 (`RETURN r` is an error);
-    /// so are names the parser made up. An error when nothing is left.
+    /// The items `RETURN *` / `WITH *` stands for: every node, relationship,
+    /// path and value name the query bound that is in scope here, in
+    /// alphabetical order. Variable-length relationship variables are left
+    /// out, since they are a hop count and not returned bare; so are names
+    /// the parser made up, and every relationship in the `RETURN` of a
+    /// `MATCH … SET` / `REMOVE`. An error when nothing is left.
     pub(super) fn star_items(&self) -> Result<Vec<RetItem>, String> {
         let mut names: Vec<&String> = self
             .vars
             .iter()
-            .filter(|(name, kind)| *kind != VarKind::Rel && !self.hidden.contains(name))
+            .filter(|(name, kind)| {
+                !(*kind == VarKind::Rel && (self.star_skips_rels || self.var_length.contains(name)))
+                    && !self.hidden.contains(name)
+            })
             .map(|(name, _)| name)
             .collect();
         if names.is_empty() {
@@ -87,6 +97,9 @@ impl Scope {
         for (rel, dest) in &pattern.chain {
             if let Some(var) = &rel.var {
                 self.bind(var, VarKind::Rel);
+                if rel.hops.is_some() && !self.var_length.contains(var) {
+                    self.var_length.push(var.clone());
+                }
             }
             if let Some(var) = &dest.var {
                 self.bind(var, VarKind::Node);
@@ -94,9 +107,13 @@ impl Scope {
         }
     }
 
-    /// The names the MATCH patterns of a statement bind.
+    /// The names the MATCH patterns of a `MATCH … SET` / `REMOVE` bind, for
+    /// its `RETURN`, which cannot return a relationship bare.
     pub(super) fn of_patterns(patterns: &[Pattern]) -> Scope {
-        let mut scope = Scope::default();
+        let mut scope = Scope {
+            star_skips_rels: true,
+            ..Scope::default()
+        };
         scope.bind_clauses(patterns, &[], &[]);
         scope
     }

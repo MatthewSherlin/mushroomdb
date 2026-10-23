@@ -481,8 +481,9 @@ fn columns(db: &GraphDb, q: &str) -> Vec<String> {
         .to_vec()
 }
 
-/// `RETURN *` lists node, path and value names; a relationship is not returned
-/// bare in 0.10 (`RETURN r` is an error), so relationship names are left out.
+/// `RETURN *` lists node, relationship, path and value names; a
+/// variable-length relationship is a hop count, not returned bare, so its name
+/// is left out (TX-NS).
 #[test]
 fn return_star_returns_every_bound_name_alphabetically() {
     let mut db = people("star");
@@ -492,14 +493,14 @@ fn return_star_returns_every_bound_name_alphabetically() {
     );
     assert_eq!(
         columns(&db, "MATCH (p:Person)-[r:K]->(c) RETURN *"),
-        ["c", "p"]
+        ["c", "p", "r"]
     );
     // Anonymous nodes and relationships are not names; a named path is.
     assert_eq!(
         columns(&db, "MATCH path = (z)-[:K]->()<-[]-(:Person) RETURN *"),
         ["path", "z"]
     );
-    // So is a variable-length relationship list.
+    // A variable-length relationship is not.
     assert_eq!(
         columns(&db, "MATCH (x)-[rs:K*1..2]->(y) RETURN *"),
         ["x", "y"]
@@ -508,7 +509,7 @@ fn return_star_returns_every_bound_name_alphabetically() {
     let rs = db
         .query("MATCH (p)-[r:K]->(q) RETURN *, type(r) AS t", &none())
         .unwrap();
-    assert_eq!(rs.columns(), ["p", "q", "t"]);
+    assert_eq!(rs.columns(), ["p", "q", "r", "t"]);
     assert_eq!(rs.get(0, "t"), Some(&s("K")));
     // UNWIND aliases and WITH aliases; the RETURN takes what the WITH keeps.
     assert_eq!(
@@ -587,7 +588,7 @@ fn star_with_nothing_in_scope_is_an_error() {
     for q in [
         "MATCH () RETURN *",
         "MATCH (:Person)-[:K]->() RETURN *",
-        "MATCH ()-[r]->() RETURN *",
+        "MATCH ()-[rs*1..2]->() RETURN *",
         "RETURN *",
     ] {
         let e = detail(db.query(q, &none()).unwrap_err());
@@ -596,6 +597,8 @@ fn star_with_nothing_in_scope_is_an_error() {
             "{q}: {e}"
         );
     }
+    // A fixed relationship is a name the star lists (TX-NS).
+    assert_eq!(columns(&db, "MATCH ()-[r]->() RETURN *"), ["r"]);
     // A star comes first.
     let e = detail(
         db.query("MATCH (p) WITH 1 AS one RETURN one, *", &none())

@@ -25,7 +25,11 @@ pub use algo::{
     AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
     PageRankReport, WccConfig, WccReport,
 };
-pub use core_query::{CmpOp, Dir, Filter, ResultSet};
+pub use core_query::cypher::with_entity_detail;
+pub use core_query::{
+    CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity, PathEntity, RelationshipEntity, ResultSet,
+    WriteStats,
+};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
     default_max_edges, is_keymatch_rooted, AggFn, BuildProgress, Predicate, RuleDef,

@@ -8,7 +8,9 @@ pub mod visible;
 
 pub use core_storage::{v11_display_text, Value};
 pub use filter::{eval_cmp, eval_filter, CmpOp, Filter};
-pub use result::ResultSet;
+pub use result::{
+    Entity, EntityKind, NodeEntity, PathEntity, RelationshipEntity, ResultSet, WriteStats,
+};
 pub use traverse::{expand, neighborhood, Dir, EdgeRef, Neighborhood};
 pub use value_ops::{cmp_optional, cmp_values, values_equal};
 pub use view::GraphView;

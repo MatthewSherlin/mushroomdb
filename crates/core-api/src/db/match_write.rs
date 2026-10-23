@@ -28,12 +28,35 @@ impl MatchWrite {
         src: &S,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        match self.projection {
+        let stats = WriteStats {
+            properties_set: self.props,
+            ..WriteStats::default()
+        };
+        let rs = match self.projection {
             Some((rel_vars, returns)) => {
-                project_set_return_rows(src, &rel_vars, &self.rows, &returns, params)
+                let mut rs = project_set_return_rows(src, &rel_vars, &self.rows, &returns, params)?;
+                // A bare node in the RETURN is a node column, as its MATCH
+                // column was; its details are read from the written state.
+                rs.set_column_kinds(
+                    returns
+                        .iter()
+                        .map(|item| match &item.value {
+                            RetVal::Var(v) => self
+                                .rows
+                                .columns()
+                                .iter()
+                                .position(|c| c == v)
+                                .and_then(|col| self.rows.column_kind(col))
+                                .filter(|kind| *kind == core_query::EntityKind::Node),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+                src.row_view(|view| finish_result(view, rs))
             }
-            None => Ok(write_counts(0, self.props, 0, 0)),
-        }
+            None => write_counts(0, self.props, 0, 0),
+        };
+        Ok(rs.with_stats(stats))
     }
 }
 

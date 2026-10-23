@@ -1683,7 +1683,6 @@ fn compile_pattern(
         let dest_name_for_path = dest_name.clone();
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
-        rel_bound.insert(rel_name.clone());
         let (distinct_from, _) = scope.next_hop(rel)?;
         scope.bound(rel_name.clone(), rel);
         if dest.label.is_some() || !dest.props.is_empty() {
@@ -1756,7 +1755,11 @@ fn compile_pattern(
     for (rel, dest) in &pat.chain {
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
-        rel_bound.insert(rel_name.clone());
+        // Only a variable-length relationship is refused bare: it is bound to
+        // a hop count, not to one relationship.
+        if rel.hops.is_some() {
+            rel_bound.insert(rel_name.clone());
+        }
         let to = name_node(dest, node_anon, bound);
         let (distinct_from, later_hops) = scope.next_hop(rel)?;
         // A variable-length or shortest-path hop's edges travel in a hidden
@@ -2086,10 +2089,13 @@ fn require_bound(var: &str, bound: &BTreeSet<String>, clause: &str) -> Result<()
     }
 }
 
+/// `rel_bound` holds the variable-length relationship variables in scope:
+/// each is bound to a walk's hop count, not to one relationship, so it is not
+/// a value to return or sort by. A fixed relationship variable is (TX-NS).
 fn reject_bare_rel(var: &str, rel_bound: &BTreeSet<String>) -> Result<(), String> {
     if rel_bound.contains(var) {
         Err(format!(
-            "cannot return relationship variable '{var}' bare; return its properties ({var}.field) instead"
+            "cannot return variable-length relationship variable '{var}' bare; return {var}.length, or name the path (p = …) and return p"
         ))
     } else {
         Ok(())
@@ -3192,11 +3198,14 @@ LIMIT 10";
     }
 
     #[test]
-    fn bare_relationship_var_in_return_is_err() {
-        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r", "r");
+    fn bare_relationship_var_in_return_plans_and_a_variable_length_one_is_err() {
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r").expect("a bare relationship returns (TX-NS)");
+        plan_src("MATCH (a)-[r:T]->(b) WITH r RETURN r").expect("and is carried by WITH");
+        let err = assert_plan_err("MATCH (a)-[r:T*1..2]->(b) RETURN r", "r");
         assert!(
-            err.to_ascii_lowercase().contains("relationship"),
-            "expected bare-rel RETURN guidance, got: {err}"
+            err.to_ascii_lowercase()
+                .contains("variable-length relationship"),
+            "expected variable-length RETURN guidance, got: {err}"
         );
     }
 
@@ -3206,10 +3215,11 @@ LIMIT 10";
     }
 
     #[test]
-    fn bare_relationship_var_in_order_by_is_err() {
-        // RETURN r.w is legal; ORDER BY r is a bare rel var (defense, not just
-        // "not in RETURN").
-        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r", "r");
+    fn bare_variable_length_relationship_var_in_order_by_is_err() {
+        // A fixed relationship sorts by its map, as a path does; a
+        // variable-length one is a hop count, refused by name.
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r").expect("sorts by the map");
+        let err = assert_plan_err("MATCH (a)-[r:T*1..2]->(b) RETURN b ORDER BY r", "r");
         assert!(
             err.to_ascii_lowercase().contains("relationship"),
             "expected bare-rel ORDER BY guidance, got: {err}"
