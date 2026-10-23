@@ -2,7 +2,7 @@
 
 ## v0.9.4 — aggregates over variables, integer sums, boolean comparisons and rule weights are right
 
-No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot opens under 0.9.3: no byte layout in the snapshot or the WAL changed. One snapshot section's content can differ from what 0.9.3 would have written for the same store, in the one case row 154 below describes, and 0.9.3 reads it.
+No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot opens under 0.9.3: no byte layout in the snapshot or the WAL changed. The edge-property section of a snapshot is written the same way 0.9.3 writes it in every case a 0.9.x write path can reach, row 154's included.
 
 **Upgrade if your Cypher aggregates a variable, sums integers, or compares booleans, or if you run two weighted rules over one edge type.** Four wrong answers, every one silent, present in every 0.9.x release and fixed on the 0.10 line too. `sum`, `avg`, `min` and `max` of a variable bound by `UNWIND` or `WITH` returned null (row 157). `sum` of integers returned a float and lost exactness above 2^53 (row 158). `WHERE n.flag > false` matched nothing, and `min` / `max` of a boolean returned null (row 160). A rule that lost an edge to another rule could leave its old weight showing on it until the next snapshot (row 154). They show on every surface that runs Cypher or reads an edge property: the CLI, the MCP `query` tool, HTTP, Python, TypeScript and the Rust library.
 
