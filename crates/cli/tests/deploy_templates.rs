@@ -40,14 +40,9 @@ fn deploy_templates_use_ready_where_a_platform_checks_health() {
 }
 
 #[test]
-fn deploy_templates_hold_no_bolt_port_and_no_secret_values() {
+fn deploy_templates_hold_no_secret_values() {
     for name in TEMPLATES {
         let text = template(name);
-        assert!(!text.contains("7687:7687"), "{name} must not publish Bolt");
-        assert!(
-            !text.contains("internal_port = 7687"),
-            "{name} must not expose Bolt"
-        );
         for line in text.lines().filter(|l| l.contains("MUSHROOMDB_TOKEN")) {
             assert!(
                 !line.contains("changeme") && !line.contains("secret123"),
@@ -244,7 +239,6 @@ fn k8s_statefulset(documents: &[serde_json::Value]) -> &serde_json::Value {
 fn k8s_statefulset_is_single_writer_with_ready_and_health_probes() {
     let text = template("k8s/statefulset.yaml");
     assert!(text.contains("SINGLE WRITER - replicas must be 1"));
-    assert!(!text.contains("7687"), "Bolt is added by HO-15");
     let Some(documents) = k8s_documents() else {
         return;
     };
@@ -358,4 +352,97 @@ fn k8s_governing_service_is_headless() {
         .find(|d| d["kind"] == "Service" && d["metadata"]["name"] == governing)
         .expect("governing Service");
     assert_eq!(service["spec"]["clusterIP"], "None");
+}
+
+/// Lines of `text` that are not comments (`#`).
+fn live_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// Bolt is exposed only where the platform can carry it safely (HO-15).
+#[test]
+fn fly_exposes_bolt_only_behind_the_tls_handler() {
+    let text = template("fly/fly.toml");
+    let live = live_lines(&text).join("\n");
+    assert!(live.contains("internal_port = 7687"));
+    assert!(live.contains("MUSHROOMDB_BOLT_PORT = \"7687\""));
+    assert!(live.contains("MUSHROOMDB_BOLT_ADVERTISED_HOST"));
+    assert!(live.contains("MUSHROOMDB_BOLT_ADVERTISED_PORT = \"7687\""));
+    // The public 7687 port carries exactly the `tls` handler, never raw TCP.
+    let block = live
+        .split("internal_port = 7687")
+        .nth(1)
+        .expect("bolt service block");
+    let block = block.split("[[services]]").next().unwrap();
+    assert!(
+        block.contains("port = 7687\n    handlers = [\"tls\"]"),
+        "{block}"
+    );
+    assert!(!block.contains("http"), "Bolt is not HTTP: {block}");
+    assert_eq!(block.matches("handlers").count(), 1);
+}
+
+#[test]
+fn compose_binds_bolt_to_loopback_only() {
+    let text = template("docker-compose/docker-compose.yml");
+    let live = live_lines(&text);
+    assert!(live.iter().any(|l| l.trim() == "- \"127.0.0.1:7687:7687\""));
+    assert!(
+        !live.iter().any(|l| l.trim_start().starts_with("- \"")
+            && l.contains("7687")
+            && !l.contains("127.0.0.1")),
+        "a Bolt port mapping that is not loopback"
+    );
+    assert!(live
+        .iter()
+        .any(|l| l.contains("MUSHROOMDB_BOLT_PORT: \"7687\"")));
+}
+
+#[test]
+fn render_and_railway_do_not_open_bolt() {
+    for name in [
+        "render/render.yaml",
+        "railway/Dockerfile",
+        "railway/railway.json",
+    ] {
+        let text = template(name);
+        assert!(
+            !live_lines(&text)
+                .iter()
+                .any(|l| l.contains("7687") || l.contains("BOLT")),
+            "{name} must not enable Bolt"
+        );
+    }
+    assert!(template("render/render.yaml").contains("NO BOLT"));
+    assert!(template("railway/Dockerfile").contains("Bolt is OFF"));
+}
+
+#[test]
+fn k8s_exposes_bolt_in_cluster_only() {
+    let text = template("k8s/statefulset.yaml");
+    assert!(text.contains("MUSHROOMDB_BOLT_PORT: \"7687\""));
+    let Some(documents) = k8s_documents() else {
+        return;
+    };
+    let container = &k8s_statefulset(&documents)["spec"]["template"]["spec"]["containers"][0];
+    assert!(container["ports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "bolt" && p["containerPort"] == 7687));
+    let service = documents
+        .iter()
+        .find(|d| d["kind"] == "Service" && d["metadata"]["name"] == "mushroomdb")
+        .expect("client Service");
+    assert_eq!(service["spec"]["type"], "ClusterIP");
+    assert!(service["spec"]["ports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "bolt" && p["port"] == 7687));
+    assert!(documents
+        .iter()
+        .all(|d| d["kind"] != "Service" || d["spec"]["type"] != "LoadBalancer"));
 }

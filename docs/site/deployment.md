@@ -113,6 +113,20 @@ mushroomdb serve /data --addr 0.0.0.0:8080 --token "$MUSHROOMDB_TOKEN" \
   --bolt-port 7687 --bolt-advertised-host db.example.com
 ```
 
+### Bolt in the deploy templates
+
+Each template under `deploy/` sets `MUSHROOMDB_BOLT_PORT=7687` only where the platform can carry Bolt without exposing an unencrypted port to the internet. In every case Bolt follows HTTP's authentication rule, so the token the template already requires (`MUSHROOMDB_TOKEN`) is the Bolt credential too. "Routing URI" below means the driver's routing scheme; it connects back to the host and port the server advertises.
+
+| Platform | Bolt | How |
+|---|---|---|
+| Fly | Public, TLS at the edge | A TCP service on 7687 with Fly's `tls` handler (no `http` handler). Fly terminates TLS and forwards plaintext to the server, so use the TLS form of the Bolt scheme. `MUSHROOMDB_BOLT_ADVERTISED_HOST` is set to `mushroomdb.fly.dev`: change it to your app's address, or a routing URI hands drivers the wrong host. A shared IPv4 is enough with the `tls` handler. |
+| Docker Compose | This machine only | `127.0.0.1:7687:7687`. To expose it, change the mapping to `7687:7687` and put TLS in front (`--tls-cert`/`--tls-key`, or a TCP proxy that ends TLS). |
+| Kubernetes | In the cluster only | A `bolt` container port and a port on the ClusterIP Service; `MUSHROOMDB_BOLT_ADVERTISED_HOST` is the Service name. To reach it from outside, use a LoadBalancer Service with TLS termination, and set the advertised host to its public name. |
+| Render | Not available | A Render web service exposes only HTTP, so the template does not start Bolt. A private service may carry other ports to your other Render services (unverified). |
+| Railway | Off; dashboard only | Enable Settings, Networking, TCP Proxy with internal port 7687, then set `MUSHROOMDB_BOLT_PORT`, `MUSHROOMDB_BOLT_ADVERTISED_HOST` and `MUSHROOMDB_BOLT_ADVERTISED_PORT` from the domain and port Railway shows. Whether the proxy encrypts is unverified, and no config-as-code setting for it was found, so the template never opens it. |
+
+None of this has been run on a live platform yet.
+
 ---
 
 ## Browser access (CORS)
