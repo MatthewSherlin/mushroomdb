@@ -387,3 +387,39 @@ fn match_set_return_r_is_a_relationship_and_ddl_is_query_type_s() {
     let (_, meta) = query(&mut conn, "MATCH (n) RETURN n.id");
     assert_eq!(query_type(&meta), Some(s("r")));
 }
+
+/// QL-RP x TX-NS: a relationship's `properties` carry what Cypher wrote on it
+/// (a `CREATE` map, `SET r.p`, `REMOVE r.p`), read back by a plain `MATCH` and
+/// by a write's own `RETURN r`, and the write's counters include the map.
+#[test]
+fn a_relationship_carries_the_properties_cypher_wrote_on_it() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+    let (_, meta) = query(
+        &mut conn,
+        "MATCH (a {id: 'bob'}), (b {id: 'ada'}) CREATE (a)-[:LIKES {since: 2019, via: 'work'}]->(b)",
+    );
+    let counters = stats(&meta).expect("a write carries stats");
+    assert_eq!(
+        map_get(counters, "relationships-created"),
+        Some(&PackValue::Int(1))
+    );
+    assert_eq!(
+        map_get(counters, "properties-set"),
+        Some(&PackValue::Int(2))
+    );
+
+    let (rows, _) = query(&mut conn, "MATCH ()-[r:LIKES]->() RETURN r");
+    let r = structure(&rows[0][0]);
+    assert_eq!(r.fields[3], s("LIKES"));
+    assert_eq!(map_get(&r.fields[4], "since"), Some(&PackValue::Int(2019)));
+    assert_eq!(map_get(&r.fields[4], "via"), Some(&s("work")));
+
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH ()-[r:LIKES]->() SET r.since = 2020 REMOVE r.via RETURN r",
+    );
+    let r = structure(&rows[0][0]);
+    assert_eq!(map_get(&r.fields[4], "since"), Some(&PackValue::Int(2020)));
+    assert_eq!(map_get(&r.fields[4], "via"), None);
+}

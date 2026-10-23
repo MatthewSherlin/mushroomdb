@@ -833,3 +833,79 @@ fn row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot() {
     drop(db);
     assert_eq!(read(&GraphDb::open(&dir).unwrap()), live, "after a reopen");
 }
+
+// ── Write stats (QL-RP x TX-NS) ─────────────────────────────────────────────
+
+/// The driver-facing `WriteStats` count the properties a relationship is
+/// created with, as they count a created node's (TX-NS, row 149), and every
+/// `SET` / `REMOVE` on a relationship; auto-commit and inside a transaction
+/// alike. The one-row write result keeps QL-RP's convention (a pattern map is
+/// not counted in its `properties_set` column).
+#[test]
+fn relationship_property_writes_are_counted_in_write_stats() {
+    use mushroomdb::WriteStats;
+    let statements: [(&str, WriteStats, i64); 5] = [
+        (
+            "CREATE (a:P {id: 'a'})-[:T {w: 1, since: 'x'}]->(b:P {id: 'b'})",
+            WriteStats {
+                nodes_created: 2,
+                labels_added: 2,
+                relationships_created: 1,
+                properties_set: 4,
+                ..WriteStats::default()
+            },
+            0,
+        ),
+        (
+            "MATCH ()-[r:T]->() SET r.w = 2, r.x = 1",
+            WriteStats {
+                properties_set: 2,
+                ..WriteStats::default()
+            },
+            2,
+        ),
+        (
+            "MATCH ()-[r:T]->() REMOVE r.x",
+            WriteStats {
+                properties_set: 1,
+                ..WriteStats::default()
+            },
+            1,
+        ),
+        (
+            "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) MERGE (b)-[r:U {k: 7}]->(a) ON CREATE SET r.n = 1",
+            WriteStats {
+                relationships_created: 1,
+                properties_set: 2,
+                ..WriteStats::default()
+            },
+            1,
+        ),
+        (
+            "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) MERGE (b)-[r:U {k: 7}]->(a) ON MATCH SET r.n = 2",
+            WriteStats {
+                properties_set: 1,
+                ..WriteStats::default()
+            },
+            1,
+        ),
+    ];
+    let mut auto = GraphDb::open(&tmp("stats-auto")).unwrap();
+    for (q, want, row_props) in &statements {
+        let rs = run(&mut auto, q);
+        assert_eq!(rs.stats(), Some(want), "{q}");
+        assert_eq!(count(&rs, "properties_set"), *row_props, "{q}");
+    }
+    let shared = SharedDb::open(&tmp("stats-tx")).unwrap();
+    let mut tx = shared.begin_transaction();
+    for (q, want, row_props) in &statements {
+        let rs = tx.execute(q, &p()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(rs.stats(), Some(want), "tx: {q}");
+        assert_eq!(count(&rs, "properties_set"), *row_props, "tx: {q}");
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        shared.read().get_edge_prop("U", "b", "a", "n"),
+        Some(Value::Int(2))
+    );
+}

@@ -820,7 +820,9 @@ REMOVE r.via
 - The write result's `properties_set` counts relationship properties set and
   removed by `SET`, `REMOVE` and `ON CREATE` / `ON MATCH SET`, as it counts a
   node's; the map of a `CREATE` or `MERGE` pattern is part of the creation and
-  is not counted, as a created node's properties are not.
+  is not counted, as a created node's properties are not. The statement's
+  driver counters (Bolt `properties-set`) do count that map, as they count a
+  created node's properties.
 - A role-scoped write needs the relationship type in the role's
   `update_edge_types` to write a property of an existing relationship, and both
   ends visible. Creating a relationship with its map needs only

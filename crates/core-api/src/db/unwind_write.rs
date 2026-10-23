@@ -121,7 +121,7 @@ struct Tally {
     relationships_created: i64,
     /// Of `deleted`, the nodes; the rest are relationships.
     nodes_deleted: i64,
-    /// Properties the created nodes were written with (not in `props_set`,
+    /// Properties the created nodes and relationships were written with (not in `props_set`,
     /// which keeps the write row's documented meaning).
     created_props: i64,
     /// The keys every `MERGE` looked up, found or created: a transaction
@@ -1394,6 +1394,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         });
         ov.edge_created(&edge.etype, &src_key, &dst_key);
         tally.relationships_created += 1;
+        tally.created_props += rel_props.len() as i64;
         write_fresh_rel_props(&rel, rel_props, ov, ops);
         &merge.on_create
     };
@@ -1581,6 +1582,7 @@ fn uw_create_edge<'v, S: RowSource + ?Sized>(
     ov.edge_created(&edge.etype, &from, &to);
     tally.relationships_created += 1;
     if !existed {
+        tally.created_props += props.len() as i64;
         write_fresh_rel_props(&rel, props, ov, ops);
     }
     if let Some(var) = edge.rel_var.as_deref() {
