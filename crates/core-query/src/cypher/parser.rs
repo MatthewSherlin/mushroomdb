@@ -222,6 +222,41 @@ fn needs_per_row_form(tokens: &[Tok]) -> bool {
     false
 }
 
+/// Whether the plain `CREATE` form expresses `stmt`: every node has a label
+/// and a string `id`, its key. Any other `CREATE` is the per-row form, which
+/// gives a node with no string `id` a generated key (QL-NM).
+fn plain_create_fits(stmt: &WriteStatement) -> bool {
+    let WriteStatement::Create(create) = stmt else {
+        return false;
+    };
+    create.nodes.iter().all(|node| {
+        !node.label.is_empty()
+            && node
+                .props
+                .iter()
+                .any(|(k, v)| k == "id" && matches!(v, Value::Str(_)))
+    })
+}
+
+/// Whether the plain `MERGE` form expresses `stmt`: a key MERGE, every node a
+/// label and one string property. Any other pattern matches by label and
+/// properties, which the per-row form does (QL-NM).
+fn plain_merge_fits(stmt: &WriteStatement) -> bool {
+    let WriteStatement::Merge(merge) = stmt else {
+        return false;
+    };
+    let end_fits = merge
+        .edge
+        .as_ref()
+        .is_none_or(|e| matches!(e.end_key_value, Value::Str(_)));
+    matches!(merge.key_value, Value::Str(_)) && end_fits
+}
+
+/// The plain MERGE parser's refusal of a node pattern that is not a key (no
+/// label, no property, or more than one): the per-row form matches such a
+/// pattern by its label and properties.
+const MERGE_NOT_A_KEY_PATTERN: &str = "not a key pattern";
+
 /// True if the statement writes a relationship's properties, or names a
 /// relationship a `CREATE` makes (QL-RP): a property map or `$parameter`
 /// inside a `-[ … ]-` bracket, a `CREATE … -[r…]-` variable, or a `SET` /
@@ -364,10 +399,23 @@ type PropsParser<'a, V> = fn(&mut Parser<'a>) -> Result<Vec<(String, V)>, String
 /// A parsed MERGE node pattern.
 struct MergeNode<V = Value> {
     var: Option<String>,
+    /// Empty for a pattern with no label (QL-NM).
+    label: String,
+    /// `Some` for a key pattern: a label and exactly one property (or a lone
+    /// `ns`), whose value is the key when it is a string.
+    key: Option<(String, V)>,
+    /// Every property of the pattern but `ns`; for a key pattern, the key.
+    props: Vec<(String, V)>,
+    ns: Option<V>,
+}
+
+/// A key MERGE node of the plain form: a label and one property, the key.
+struct KeyMergeNode {
+    var: Option<String>,
     label: String,
     key_field: String,
-    key_value: V,
-    ns: Option<V>,
+    key_value: Value,
+    ns: Option<Value>,
 }
 
 mod call;
@@ -428,6 +476,18 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err(what)),
         }
+    }
+
+    /// The label after a `:`. An empty backtick-quoted name is refused: the
+    /// empty label is how a node with no label is stored (QL-NM), so no
+    /// pattern may name it.
+    fn label_name(&mut self) -> Result<String, String> {
+        let label = self.ident("expected label identifier after ':'")?;
+        if label.is_empty() {
+            self.pos -= 1;
+            return Err(self.err("a label name cannot be empty"));
+        }
+        Ok(label)
     }
 
     /// `true`, `false` and `null` are literals, so none can name a variable or
@@ -919,7 +979,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         let label = if self.eat(&Tok::Colon) {
-            Some(self.ident("expected label identifier after ':'")?)
+            Some(self.label_name()?)
         } else {
             None
         };
@@ -1969,8 +2029,20 @@ impl<'a> Parser<'a> {
             {
                 self.unwind_write_stmt()
             }
-            Some(Tok::Create) => self.create_stmt(),
-            Some(Tok::Merge) => self.merge_stmt(),
+            Some(Tok::Create) => {
+                let start = self.pos;
+                self.plain_or_per_row(start, Self::create_stmt, plain_create_fits, |e| {
+                    e.contains("CREATE node requires a label")
+                        || e.contains("unexpected tokens after CREATE")
+                })
+            }
+            Some(Tok::Merge) => {
+                let start = self.pos;
+                self.plain_or_per_row(start, Self::merge_stmt, plain_merge_fits, |e| {
+                    e.contains(MERGE_NOT_A_KEY_PATTERN)
+                        || e.contains("unexpected tokens after MERGE")
+                })
+            }
             Some(Tok::Match) => self.match_write_stmt(),
             Some(Tok::Unwind) => self.unwind_write_stmt(),
             _ => Err(self.err(
@@ -1978,6 +2050,29 @@ impl<'a> Parser<'a> {
                  (write statement required)",
             )),
         }
+    }
+
+    /// Parse a statement that opens with `CREATE` or `MERGE` in its plain form
+    /// when that form expresses it (`fits`), and as the per-row form otherwise
+    /// (QL-NM): several patterns or clauses, a node with no label or no string
+    /// `id`, a MERGE pattern that is not a key. A plain-form error stands
+    /// unless `shape` says it only means "not the plain shape"; then the
+    /// per-row form parses the statement.
+    fn plain_or_per_row(
+        &mut self,
+        start: usize,
+        plain: fn(&mut Self) -> Result<WriteStatement, String>,
+        fits: fn(&WriteStatement) -> bool,
+        shape: fn(&str) -> bool,
+    ) -> Result<WriteStatement, String> {
+        match plain(self) {
+            Ok(stmt) if fits(&stmt) => return Ok(stmt),
+            Ok(_) => {}
+            Err(e) if !shape(&e) => return Err(e),
+            Err(_) => {}
+        }
+        self.pos = start;
+        self.unwind_write_stmt()
     }
 
     // ── CREATE ────────────────────────────────────────────────────────────────
@@ -2061,7 +2156,7 @@ impl<'a> Parser<'a> {
         if !self.eat(&Tok::Colon) {
             return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
         }
-        let label = self.ident("expected label identifier after ':'")?;
+        let label = self.label_name()?;
         let props = if self.peek() == Some(&Tok::LBrace) {
             self.literal_props()?
         } else {
@@ -2253,7 +2348,7 @@ impl<'a> Parser<'a> {
 
     /// [`merge_node`](Self::merge_node) with the property values read by
     /// `props`: literals for a plain MERGE, expressions for a per-row one.
-    fn merge_node_with<V>(
+    fn merge_node_with<V: Clone>(
         &mut self,
         open_msg: &str,
         props: PropsParser<'a, V>,
@@ -2272,22 +2367,24 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        if !self.eat(&Tok::Colon) {
-            return Err(self.err("MERGE requires a label (e.g., MERGE (n:Label {key: 'x'}))"));
-        }
-        let label = self.ident("expected label identifier after ':'")?;
+        // No label and no property map are both allowed (QL-NM): such a
+        // pattern matches by what it does name.
+        let label = if self.eat(&Tok::Colon) {
+            self.label_name()?
+        } else {
+            String::new()
+        };
         if matches!(self.peek(), Some(Tok::Param(_))) {
             return Err(refusal(
                 "a $parameter map in a MERGE pattern; name the key and set the rest, \
                  e.g. MERGE (n:Label {id: $p.id}) ON CREATE SET n += $p",
             ));
         }
-        if self.peek() != Some(&Tok::LBrace) {
-            return Err(self.err(
-                "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
-            ));
-        }
-        let props = props(self)?;
+        let props = if self.peek() == Some(&Tok::LBrace) {
+            props(self)?
+        } else {
+            Vec::new()
+        };
         let mut ns = None;
         let mut rest = Vec::new();
         for (k, v) in props {
@@ -2302,29 +2399,43 @@ impl<'a> Parser<'a> {
                 rest.push((k, v));
             }
         }
-        if rest.len() != 1 {
-            // A lone `ns` is the identifying key, not a namespace stamp.
-            if rest.is_empty() {
-                if let Some(v) = ns.take() {
-                    rest.push((NS_PROP.to_string(), v));
-                }
-            }
-            if rest.len() != 1 {
-                return Err(format!(
-                    "MERGE supports exactly one key property (got {}); use CREATE for multi-prop nodes",
-                    rest.len() + usize::from(ns.is_some()),
-                ));
-            }
-        }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
-        let (key_field, key_value) = rest.remove(0);
+        let key = if label.is_empty() {
+            None
+        } else if rest.len() == 1 {
+            Some(rest[0].clone())
+        } else if rest.is_empty() {
+            // A lone `ns` is the identifying key, not a namespace stamp.
+            ns.take().map(|v| {
+                rest.push((NS_PROP.to_string(), v.clone()));
+                (NS_PROP.to_string(), v)
+            })
+        } else {
+            None
+        };
         Ok(MergeNode {
             var,
             label,
-            key_field,
-            key_value,
+            key,
+            props: rest,
             ns,
         })
+    }
+
+    /// A plain MERGE node: a key pattern, or [`MERGE_NOT_A_KEY_PATTERN`].
+    fn plain_merge_key(node: MergeNode) -> Result<KeyMergeNode, String> {
+        match node.key {
+            Some((key_field, key_value)) => Ok(KeyMergeNode {
+                var: node.var,
+                label: node.label,
+                key_field,
+                key_value,
+                ns: node.ns,
+            }),
+            None => Err(format!(
+                "MERGE pattern is {MERGE_NOT_A_KEY_PATTERN}; it matches by label and properties"
+            )),
+        }
     }
 
     /// The `-[:T]->` / `<-[:T]-` of a MERGE pattern: one typed, directed,
@@ -2361,10 +2472,12 @@ impl<'a> Parser<'a> {
 
     fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
         self.expect(&Tok::Merge, "expected MERGE")?;
-        let start = self.merge_node("expected '(' after MERGE")?;
+        let start = Self::plain_merge_key(self.merge_node("expected '(' after MERGE")?)?;
         let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
             let (rel_var, etype, dir) = self.merge_rel()?;
-            let end = self.merge_node("expected '(' to start the MERGE end node")?;
+            let end = Self::plain_merge_key(
+                self.merge_node("expected '(' to start the MERGE end node")?,
+            )?;
             if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
                 return Err(
                     "not supported in mushroomdb 0.10: MERGE with more than one relationship"
@@ -2384,7 +2497,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let MergeNode {
+        let KeyMergeNode {
             var,
             label,
             key_field,
@@ -3704,12 +3817,20 @@ LIMIT 10";
             other => panic!("expected Merge, got {other:?}"),
         }
 
+        // A second property makes the pattern one that matches by label and
+        // properties (QL-NM): the per-row form, which carries every property.
         let toks = crate::cypher::lex("MERGE (n:Doc {id: 'x', name: 'Alice'})").unwrap();
-        let err = parse_write(&toks).expect_err("a non-ns extra property is still refused");
-        assert!(
-            err.contains("one key property") || err.contains("exactly one"),
-            "error must mention the single-key constraint, got: {err}"
-        );
+        match parse_write(&toks).expect("a pattern of several properties parses") {
+            WriteStatement::UnwindWrite(u) => match u.writes.as_slice() {
+                [crate::cypher::ast::RowWrite::Merge(m)] => {
+                    assert!(!m.start.key_pattern);
+                    let names: Vec<&str> = m.start.props.iter().map(|(k, _)| k.as_str()).collect();
+                    assert_eq!(names, ["id", "name"]);
+                }
+                other => panic!("expected one MERGE, got {other:?}"),
+            },
+            other => panic!("expected the per-row form, got {other:?}"),
+        }
     }
 
     #[test]

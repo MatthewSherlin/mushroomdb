@@ -395,13 +395,15 @@ fn a_whole_map_parameter_that_is_not_a_map_is_named() {
     let e = write_err(&db, "CREATE (n:P $props)", &params(&[("props", s("a"))]));
     assert!(e.contains("props"), "{e}");
     assert!(e.contains("map"), "{e}");
-    let e = write_err(
+    assert!(state(&db).0.is_empty());
+    // A map without a string `id` creates its node under a generated key
+    // (QL-NM); it used to be refused.
+    write(
         &db,
         "CREATE (n:P $props)",
         &params(&[("props", map(&[("v", Value::Int(1))]))]),
     );
-    assert!(e.contains("'id'"), "{e}");
-    assert!(state(&db).0.is_empty());
+    assert_eq!(state(&db).0.len(), 1);
 }
 
 #[test]

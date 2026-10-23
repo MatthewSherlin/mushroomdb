@@ -450,10 +450,9 @@ pub fn parse_node_row(
     if id.is_empty() {
         return Err("empty :ID".to_string());
     }
+    // An empty `:LABEL` cell is a node with no label (QL-NM), which is how
+    // `export` writes one.
     let label = &record[schema.label_index];
-    if label.is_empty() {
-        return Err("empty :LABEL".to_string());
-    }
     if label.contains(array_delimiter) || label.contains(';') {
         return Err(format!(
             "`{label}` has more than one label; mushroomdb stores one label per node"
@@ -1048,7 +1047,13 @@ fn parse_node_value(json: serde_json::Value, typed: bool) -> Result<NodeRecord, 
         None => Err(format!("the line has no `{name}`")),
     };
     let key = text_field("key")?;
-    let label = text_field("label")?;
+    // An empty `label` is a node with no label (QL-NM), which is how
+    // `export` writes one.
+    let label = match obj.remove("label") {
+        Some(serde_json::Value::String(s)) => s,
+        Some(_) => return Err("`label` must be a string".to_string()),
+        None => return Err("the line has no `label`".to_string()),
+    };
     let mut props: BTreeMap<String, Value> = BTreeMap::new();
     let reserved = match obj.remove(JSONL_PROPS_FIELD) {
         None => serde_json::Map::new(),
@@ -1566,9 +1571,13 @@ mod tests {
     }
 
     #[test]
-    fn csv_import_empty_label_and_empty_id_are_errors() {
+    fn csv_import_empty_id_is_an_error_and_an_empty_label_is_no_label() {
         let rows = parse_one(":ID,:LABEL\n1,\n,P\n");
-        assert!(rows[0].clone().unwrap_err().contains(":LABEL"));
+        assert_eq!(
+            rows[0].clone().unwrap().0,
+            "",
+            "a node with no label (QL-NM)"
+        );
         assert!(rows[1].clone().unwrap_err().contains(":ID"));
     }
 

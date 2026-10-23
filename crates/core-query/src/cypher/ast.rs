@@ -914,14 +914,24 @@ impl MergeSet {
     }
 }
 
-/// A MERGE node pattern: its single identifying property and optional `ns`.
+/// A MERGE node pattern: a key pattern (a label and one property, whose
+/// value is the key when it is a string), or a pattern matched by its label
+/// and properties (QL-NM).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowMergeNode {
     /// Always set (the parser names an anonymous node).
     pub var: String,
+    /// Empty for a pattern with no label.
     pub label: String,
+    /// The key pattern's property; empty, with `key` null, when the pattern
+    /// is not a key pattern.
     pub key_field: String,
     pub key: Operand,
+    /// Every property of the pattern but `ns` (for a key pattern, the key).
+    /// What a pattern that is not a key MERGE matches on.
+    pub props: Vec<(String, Operand)>,
+    /// Whether this is a key pattern.
+    pub key_pattern: bool,
     pub ns: Option<Operand>,
     /// `(v)` naming a node an earlier clause bound (`MATCH (a) MERGE
     /// (a)-[:T]->(b:L {id: …})`): the MERGE uses that node and never creates

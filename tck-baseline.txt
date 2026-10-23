@@ -6,5 +6,9 @@
 #   cargo run --release -p tck-runner -- --update-baseline
 # A change that adds or edits a skip rule says, beside the new rates, how
 # many scenarios the rule moved: a skip changes the denominator.
-0.6017
-strict 0.5966
+# QL-NM: held two scenarios below the usual 2401 passes. Temporal10 [12]
+# examples 4 and 5 (duration.inSeconds(x(), x()) for localdatetime() and
+# datetime()) pass or fail with the clock: the two calls can read different
+# instants, more often in a debug build.
+0.7217
+strict 0.7157

@@ -1038,3 +1038,63 @@ fn round_trip_cypher_a_name_with_a_line_break_keeps_the_file_one_statement_per_l
         );
     }
 }
+
+/// QL-NM: nodes created with no label and no `id` (generated keys) come back
+/// from every export format with the same keys, labels and properties.
+#[test]
+fn round_trip_keeps_generated_keys_and_unlabelled_nodes() {
+    let dir = tmp("generated");
+    let src = dir.join("src");
+    {
+        let mut db = Db::open(&src).unwrap();
+        for q in [
+            "CREATE ()",
+            "CREATE (:L {name: 'a'})-[:K]->({x: 1}), (:P {id: 'p1'})",
+            "MATCH (p:P), (l:L) CREATE (p)-[:R]->(l)",
+        ] {
+            db.query_write(q, &BTreeMap::new())
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+    }
+    let source = state(&src);
+    assert_eq!(source.nodes.len(), 4);
+    assert_eq!(
+        source
+            .nodes
+            .iter()
+            .filter(|n| mushroomdb::is_generated_key(&n.key))
+            .count(),
+        3
+    );
+    assert_eq!(
+        source.nodes.iter().filter(|n| n.label.is_empty()).count(),
+        2
+    );
+
+    let out = dir.join("jsonl");
+    export(&src, &out, ExportFormat::Jsonl);
+    import(&dir.join("from-jsonl"), &jsonl_inputs(&out), 2);
+    assert_same(&source, &state(&dir.join("from-jsonl")), "jsonl");
+
+    let out = dir.join("csv");
+    export(&src, &out, ExportFormat::Csv);
+    import(&dir.join("from-csv"), &csv_inputs(&out), 2);
+    assert_same(&source, &state(&dir.join("from-csv")), "csv");
+
+    // Cypher writes the key as `id`, so a node without one gains it; every
+    // key and label is kept.
+    let out = dir.join("cypher");
+    export(&src, &out, ExportFormat::Cypher);
+    let statements = cypher_statements(&out);
+    run_statements(&dir.join("from-cypher"), &statements);
+    let mut expected = source;
+    for node in &mut expected.nodes {
+        node.props
+            .entry("id".into())
+            .or_insert_with(|| Value::Str(node.key.clone()));
+    }
+    assert_same(&expected, &state(&dir.join("from-cypher")), "cypher");
+    // Running the file again is harmless.
+    run_statements(&dir.join("from-cypher"), &statements);
+    assert_same(&expected, &state(&dir.join("from-cypher")), "cypher twice");
+}

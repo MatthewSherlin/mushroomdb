@@ -37,7 +37,8 @@
 //!   element ids when that matters. Node and relationship ids are separate
 //!   namespaces.
 //!
-//! **Labels** are the node's one label (0.10 nodes have exactly one).
+//! **Labels** are the node's one label, or none for a node created without
+//! one (0.10 nodes have at most one).
 //!
 //! A path lists each distinct node and relationship once; `indices` walks it
 //! as the Bolt specification defines: for each hop, the relationship's
@@ -122,11 +123,21 @@ fn properties(
     ))
 }
 
+/// A node's labels: its one label, or none for a node stored under the empty
+/// label (a node created with no label).
+fn node_labels(node: &NodeEntity) -> Vec<PackValue> {
+    if node.label.is_empty() {
+        Vec::new()
+    } else {
+        vec![PackValue::String(node.label.clone())]
+    }
+}
+
 fn pack_node(node: &NodeEntity, version: (u8, u8), depth: usize) -> Result<PackValue, BoltError> {
     let element_id = node_element_id(&node.key);
     let mut fields = vec![
         PackValue::Int(i64::from(node.id)),
-        PackValue::List(vec![PackValue::String(node.label.clone())]),
+        PackValue::List(node_labels(node)),
         properties(&node.properties, version, depth + 1)?,
     ];
     if has_element_ids(version) {
@@ -355,6 +366,20 @@ mod tests {
         assert_eq!(f[3], PackValue::String("n:ada".into()));
         let old = pack_entity(&Entity::Node(node("ada")), (4, 4), 1).unwrap();
         assert_eq!(fields(&old).1.len(), 3);
+    }
+
+    #[test]
+    fn a_node_with_no_label_has_an_empty_label_list() {
+        let key = "_:0123456789abcdef0123456789abcdef";
+        let bare = NodeEntity {
+            key: key.into(),
+            label: String::new(),
+            ..node("ada")
+        };
+        let packed = pack_entity(&Entity::Node(bare), (5, 0), 1).unwrap();
+        let (_, f) = fields(&packed);
+        assert_eq!(f[1], PackValue::List(vec![]));
+        assert_eq!(f[3], PackValue::String(format!("n:{key}")));
     }
 
     #[test]

@@ -57,6 +57,8 @@ pub(crate) trait RowSource {
         key_value: &Value,
         named_ns: Option<&Value>,
     ) -> Result<Vec<(String, Value)>>;
+    /// The namespace a MERGE create arm stamps when its pattern names none.
+    fn row_merge_ns(&self) -> Result<Option<Value>>;
     /// Whether a view owns the property `field`.
     fn row_view_owns(&self, field: &str) -> bool;
     /// Every stored property of the edge `src -[etype]-> dst`; empty when it
@@ -144,6 +146,10 @@ impl<F: Fs> RowSource for GraphDb<F> {
         self.merge_create_props(key_field, key_value, named_ns)
     }
 
+    fn row_merge_ns(&self) -> Result<Option<Value>> {
+        Ok(self.merge_create_stamp_ns()?.map(Value::Str))
+    }
+
     fn row_view_owns(&self, field: &str) -> bool {
         self.view_store.view_for_prop(field).is_some()
     }
@@ -179,6 +185,9 @@ pub(super) struct NodeState {
     /// Writes made before `props` was loaded from the store: a value, or
     /// `None` for a removal. Applied over the stored properties when they load.
     pub(super) delta: BTreeMap<String, Option<Value>>,
+    /// The label of a node the statement created (empty for none); `None`
+    /// for a stored node, whose label the store holds.
+    pub(super) label: Option<String>,
 }
 
 impl NodeState {
@@ -188,7 +197,13 @@ impl NodeState {
             created_here: false,
             props: None,
             delta: BTreeMap::new(),
+            label: None,
         }
+    }
+
+    /// The statement wrote the node's properties (so the store's may be stale).
+    pub(super) fn touched(&self) -> bool {
+        self.props.is_some() || !self.delta.is_empty()
     }
 }
 
@@ -215,7 +230,7 @@ pub(super) struct Overlay {
 }
 
 impl Overlay {
-    pub(super) fn node_created(&mut self, key: &str, props: &[(String, Value)]) {
+    pub(super) fn node_created(&mut self, key: &str, label: &str, props: &[(String, Value)]) {
         self.nodes.insert(
             key.to_string(),
             NodeState {
@@ -223,6 +238,7 @@ impl Overlay {
                 created_here: true,
                 props: Some(props.iter().cloned().collect()),
                 delta: BTreeMap::new(),
+                label: Some(label.to_string()),
             },
         );
     }
@@ -317,6 +333,7 @@ impl Overlay {
                 created_here: false,
                 props: None,
                 delta: BTreeMap::new(),
+                label: None,
             },
         );
     }
@@ -333,6 +350,109 @@ impl Overlay {
             .get(key)
             .is_some_and(|edges| edges.iter().any(|e| self.edges.contains(e)))
     }
+}
+
+/// The label of `key` at this point of the statement (empty for none).
+pub(super) fn uw_label<S: RowSource + ?Sized>(src: &S, ov: &Overlay, key: &str) -> Option<String> {
+    match ov.nodes.get(key) {
+        Some(state) if !state.exists => None,
+        Some(NodeState {
+            label: Some(label), ..
+        }) => Some(label.clone()),
+        _ => src.row_label(key),
+    }
+}
+
+/// Whether `props` all hold on `key` at this point of the statement.
+fn uw_props_hold<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &mut Overlay,
+    key: &str,
+    props: &[(String, Value)],
+) -> bool {
+    let have = uw_props(src, ov, key);
+    props
+        .iter()
+        .all(|(f, want)| have.get(f).is_some_and(|got| values_equal(got, want)))
+}
+
+/// The nodes a MERGE pattern that is not a key matches at this point of the
+/// statement (QL-NM): every live node carrying `label` (any node when it is
+/// empty) whose properties equal `props`, the statement's own writes
+/// included. Stored nodes come in dense-id order, then the ones the
+/// statement created or changed, by key. An equality index on the label
+/// answers the scan when one covers a property.
+pub(super) fn uw_pattern_matches<S: RowSource + ?Sized>(
+    src: &S,
+    ov: &mut Overlay,
+    label: &str,
+    props: &[(String, Value)],
+) -> Vec<String> {
+    let stored: Vec<String> = src.row_view(|view| {
+        let indexed = (!label.is_empty())
+            .then(|| {
+                props
+                    .iter()
+                    .find_map(|(f, v)| view.nodes_with_prop(label, f, v))
+            })
+            .flatten();
+        let ids: Vec<u32> = match indexed {
+            Some(ids) => ids,
+            None if label.is_empty() => view.nodes_all(),
+            None => view
+                .nodes_with_label(label)
+                .into_iter()
+                .filter(|&id| view.visible(id))
+                .collect(),
+        };
+        ids.into_iter()
+            .filter(|&id| {
+                props.iter().all(|(f, want)| {
+                    view.prop(id, f)
+                        .is_some_and(|got| values_equal(&got.into_value(), want))
+                })
+            })
+            .filter_map(|id| view.try_key_of(id).map(str::to_string))
+            .collect()
+    });
+    let stored_set: HashSet<&str> = stored.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut recheck: Vec<String> = Vec::new();
+    for key in &stored {
+        match ov.nodes.get(key.as_str()) {
+            Some(state) if !state.exists => {}
+            Some(state) if state.touched() => recheck.push(key.clone()),
+            _ => out.push(key.clone()),
+        }
+    }
+    // Nodes the statement created or changed that the store's scan could not
+    // answer for.
+    let mut extra: Vec<String> = ov
+        .nodes
+        .iter()
+        .filter(|(k, state)| {
+            state.exists
+                && (state.created_here || state.touched())
+                && !stored_set.contains(k.as_str())
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    extra.sort();
+    for key in recheck {
+        if uw_props_hold(src, ov, &key, props) {
+            out.push(key);
+        }
+    }
+    for key in extra {
+        let label_ok = match uw_label(src, ov, &key) {
+            Some(l) => label.is_empty() || l == label,
+            None => false,
+        };
+        if label_ok && uw_props_hold(src, ov, &key, props) {
+            out.push(key);
+        }
+    }
+    out
 }
 
 /// Whether the node `key` exists at this point of the statement.
