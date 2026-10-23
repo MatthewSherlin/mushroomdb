@@ -632,6 +632,15 @@ holds the lease, so the new one is backup-unhealthy until the old one stops. If
 new instance and never stop the old one. Watch backup health in the log (it
 warns while the lease is foreign), not through `/ready`.
 
+## Metrics for Prometheus
+
+`GET /metrics` with `Accept: text/plain` answers in the Prometheus text format,
+including the backup's lag, last-success time and error count. Add a scrape job
+with the server's token as a bearer credential; the metric list and an example
+config are in the [HTTP reference](http.md#prometheus-text-format). Alert on
+`mushroomdb_backup_lag_seconds` rather than on `/ready`, which backup health
+never gates.
+
 ## Loopback-first posture
 
 mushroomdb defaults to `127.0.0.1:8080` and refuses to bind a non-loopback

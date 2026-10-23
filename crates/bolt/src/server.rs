@@ -20,6 +20,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +57,32 @@ const REFUSAL_READ_CAP: usize = 64 * 1024;
 /// descriptors, say), so a persistent failure does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+/// Live connection counters of one listener, shared with whoever reports
+/// them. Clones share the same counters.
+#[derive(Debug, Clone, Default)]
+pub struct BoltStats {
+    /// Connections being served now (refused clients are not counted).
+    pub open: Arc<AtomicU64>,
+    /// Connections admitted since the listener started.
+    pub accepted: Arc<AtomicU64>,
+}
+
+/// Counts one admitted connection as open until dropped, however its task ends.
+struct OpenGuard(Arc<AtomicU64>);
+
+impl OpenGuard {
+    fn new(open: &Arc<AtomicU64>) -> Self {
+        open.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(open))
+    }
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Listener settings.
 #[derive(Debug, Clone)]
 pub struct BoltConfig {
@@ -68,6 +95,8 @@ pub struct BoltConfig {
     /// After the stop signal, how long connections have to close before they
     /// are aborted.
     pub drain_timeout: Duration,
+    /// Counters the listener keeps current; clone one before `serve` to read it.
+    pub stats: BoltStats,
     /// Serve Bolt over TLS with this config. `None` is plaintext.
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -79,6 +108,7 @@ impl Default for BoltConfig {
             connection: ConnectionConfig::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            stats: BoltStats::default(),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -173,12 +203,13 @@ impl BoltListener {
                 run_admitted(socket, admission, db, authenticator, connection).await
             }
         };
-        accept_loop(
+        accept_loop_with_stats(
             self.listener,
             config.max_connections,
             config.drain_timeout,
             shutdown,
             handler,
+            config.stats.clone(),
         )
         .await
     }
@@ -215,12 +246,37 @@ where
 
 /// The accept loop, with the per-socket work supplied by `handler` so the
 /// admission, isolation and drain rules can be tested on their own.
+#[cfg(test)]
 pub(crate) async fn accept_loop<H, F>(
     listener: TcpListener,
     max_connections: usize,
     drain_timeout: Duration,
     shutdown: watch::Receiver<bool>,
     handler: H,
+) -> std::io::Result<()>
+where
+    H: Fn(TcpStream, Admission) -> F,
+    F: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    accept_loop_with_stats(
+        listener,
+        max_connections,
+        drain_timeout,
+        shutdown,
+        handler,
+        BoltStats::default(),
+    )
+    .await
+}
+
+/// [`accept_loop`] that keeps `stats` current.
+pub(crate) async fn accept_loop_with_stats<H, F>(
+    listener: TcpListener,
+    max_connections: usize,
+    drain_timeout: Duration,
+    shutdown: watch::Receiver<bool>,
+    handler: H,
+    stats: BoltStats,
 ) -> std::io::Result<()>
 where
     H: Fn(TcpStream, Admission) -> F,
@@ -248,9 +304,12 @@ where
                 match permits.clone().try_acquire_owned() {
                     Ok(permit) => {
                         accepted += 1;
+                        stats.accepted.store(accepted, Ordering::Release);
+                        let open = OpenGuard::new(&stats.open);
                         let work = handler(socket, Admission::Accepted(accepted));
                         tasks.spawn(async move {
                             let _permit = permit;
+                            let _open = open;
                             work.await
                         });
                     }
@@ -407,6 +466,50 @@ mod tests {
             assert_eq!(read_to_close(addr).await, b"ok");
         }
         assert_eq!(served.load(Ordering::SeqCst), 4);
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stats_count_open_and_accepted_connections() {
+        let (listener, addr) = bound().await;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let stats = BoltStats::default();
+        let handler = |socket: TcpStream, _admission: Admission| async move {
+            let mut socket = socket;
+            let mut buf = [0u8; 1];
+            let _ = socket.read(&mut buf).await;
+            Ok(())
+        };
+        let task = tokio::spawn(accept_loop_with_stats(
+            listener,
+            4,
+            Duration::from_secs(1),
+            stop_rx,
+            handler,
+            stats.clone(),
+        ));
+        let a = TcpStream::connect(addr).await.unwrap();
+        let b = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..100 {
+            if stats.accepted.load(Ordering::Acquire) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(stats.accepted.load(Ordering::Acquire), 2);
+        assert_eq!(stats.open.load(Ordering::Acquire), 2);
+        drop(a);
+        // The handler reads EOF, returns, and the slot is released.
+        for _ in 0..100 {
+            if stats.open.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(stats.open.load(Ordering::Acquire), 1);
+        assert_eq!(stats.accepted.load(Ordering::Acquire), 2);
+        drop(b);
         stop_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
     }
