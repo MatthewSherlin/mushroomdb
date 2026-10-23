@@ -257,6 +257,10 @@ The `SUCCESS` that closes a write statement carries a `stats` map, which drivers
 
 A schema statement's summary has query type `s`, a write's `w` and a read's `r`. Only counters that moved are listed; a driver reads a missing one as 0. A statement that changed nothing (a read, a `MERGE` that matched with nothing to set, `IF NOT EXISTS` on an existing index) has no `stats`. Inside a transaction each statement's `SUCCESS` carries that statement's counters. A write without `RETURN` still returns its one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`), as over HTTP; that row keeps its documented meaning, so its `properties_set` does not count the properties a `CREATE` writes with a node.
 
+### EXPLAIN
+
+`EXPLAIN <statement>` runs nothing. Its `RUN` reply has no `fields`, a `PULL` returns no records, and the closing `SUCCESS` carries the plan as `plan`, where drivers read `summary.plan`. The plan is a map with `operatorType`, `args`, `identifiers` and `children`; the last operator of the statement is the root and each operator's child is the one before it (a `UNION` is a `Union` root with one child per part). `args` holds the operator's fields, including the index a lookup reads (`index`, `null` when it scans). The summary's query type is `r`, a transaction may run it, and a role token may run it, naming only the indexes it could list. See [EXPLAIN](query.md#explain) for the operators; the plan is a diagnostic and its shape may change between releases. `PROFILE` is refused.
+
 ### RESET while a request is running
 
 A `RESET` sent while an earlier request is still running takes effect at the first of these points:

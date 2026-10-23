@@ -1408,3 +1408,113 @@ fn a_role_token_lists_only_its_own_schema_through_the_catalog_procedures() {
     );
     assert_eq!(rows[0][0], s("mushroomdb"));
 }
+
+// ------------------------------------------------------------ EXPLAIN (QL-11)
+
+fn map_get<'a>(map: &'a PackValue, key: &str) -> &'a PackValue {
+    match map {
+        PackValue::Map(entries) => entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("no {key} in {map:?}")),
+        other => panic!("not a map: {other:?}"),
+    }
+}
+
+/// The first child of a plan node.
+fn first_child(node: &PackValue) -> &PackValue {
+    match map_get(node, "children") {
+        PackValue::List(children) => &children[0],
+        other => panic!("children: {other:?}"),
+    }
+}
+
+/// Runs `query` and pulls it: the `RUN` reply, then the records and the end.
+fn explain_over_bolt(
+    conn: &mut Connection,
+    query: &str,
+) -> (Vec<PackValue>, usize, Vec<(String, PackValue)>) {
+    let out = conn.handle(run(query));
+    let [header] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    let PackValue::List(fields) = get(meta(header), "fields").unwrap().clone() else {
+        panic!("fields")
+    };
+    let out = conn.handle(pull(-1));
+    let (rows, end) = rows_and_end(&out);
+    (fields, rows.len(), meta(end).to_vec())
+}
+
+#[test]
+fn explain_returns_no_records_and_the_plan_in_the_summary() {
+    let (db, _dir) = open_db("explain");
+    seed_rows(&db, 3);
+    let mut conn = connected(&db, FULL);
+    let (fields, records, end) =
+        explain_over_bolt(&mut conn, "EXPLAIN MATCH (n:Row) WHERE n.n <> 1 RETURN n.n");
+    assert!(fields.is_empty(), "{fields:?}");
+    assert_eq!(records, 0);
+    assert_eq!(get(&end, "type"), Some(&s("r")));
+    let plan = get(&end, "plan").expect("plan in the summary");
+    assert_eq!(map_get(plan, "operatorType"), &s("Project"));
+    assert!(matches!(map_get(plan, "args"), PackValue::Map(_)));
+    assert!(matches!(map_get(plan, "identifiers"), PackValue::List(_)));
+    let scan = first_child(plan);
+    // Filter is the project's child; the scan is under it.
+    assert_eq!(map_get(scan, "operatorType"), &s("Filter"));
+    let leaf = first_child(scan);
+    assert_eq!(map_get(leaf, "operatorType"), &s("ScanLabel"));
+    assert_eq!(map_get(map_get(leaf, "args"), "label"), &s("Row"));
+    assert_eq!(conn.state().name(), "Ready");
+    // An ordinary statement carries no plan.
+    let (_, _, end) = explain_over_bolt(&mut conn, "MATCH (n) RETURN COUNT(n)");
+    assert!(get(&end, "plan").is_none());
+}
+
+#[test]
+fn explain_over_bolt_never_writes_and_a_role_token_may_ask() {
+    let (db, _dir) = db_with_role("explain-role");
+    let before = db.reader().version;
+    let mut full = connected(&db, FULL);
+    let (_, records, end) = explain_over_bolt(&mut full, "EXPLAIN CREATE (n:Public {id: 'x9'})");
+    assert_eq!(records, 0);
+    assert_eq!(
+        map_get(get(&end, "plan").unwrap(), "operatorType"),
+        &s("Create")
+    );
+    assert_eq!(db.reader().version, before, "no commit");
+    assert_eq!(count_in(&db, "Public"), Value::Int(2));
+    let mut role = connected(&db, ROLE);
+    let (_, records, end) = explain_over_bolt(&mut role, "EXPLAIN MATCH (n:Secret) RETURN n.n");
+    assert_eq!(records, 0);
+    assert!(get(&end, "plan").is_some());
+}
+
+#[test]
+fn explain_in_a_transaction_reports_the_plan_and_buffers_nothing() {
+    let (db, _dir) = open_db("explain-tx");
+    let mut conn = connected(&db, FULL);
+    let out = conn.handle(ClientMessage::Other(
+        MessageKind::Begin,
+        vec![PackValue::Map(vec![])],
+    ));
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{out:?}"
+    );
+    let (fields, records, end) = explain_over_bolt(&mut conn, "EXPLAIN CREATE (n:Made {id: 'm1'})");
+    assert!(fields.is_empty());
+    assert_eq!(records, 0);
+    assert_eq!(
+        map_get(get(&end, "plan").unwrap(), "operatorType"),
+        &s("Create")
+    );
+    let out = conn.handle(ClientMessage::Other(MessageKind::Commit, vec![]));
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(_)]),
+        "{out:?}"
+    );
+    assert_eq!(count_in(&db, "Made"), Value::Int(0));
+}

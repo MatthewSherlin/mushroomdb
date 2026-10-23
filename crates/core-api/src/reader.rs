@@ -29,8 +29,8 @@ use core_storage::{
 };
 
 use crate::db::{
-    call_statement, ddl_statement, run_call, schema_change_on_a_read, EdgeInfo, MaskedEdge,
-    MaskedNodeResult, NodeInfo, SchemaListing, SlowQuerySink, SlowQuerySnapshot,
+    call_statement, ddl_statement, explain_answer, run_call, schema_change_on_a_read, EdgeInfo,
+    MaskedEdge, MaskedNodeResult, NodeInfo, SchemaListing, Seen, SlowQuerySink, SlowQuerySnapshot,
 };
 use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, RoleMaskCache};
@@ -1033,6 +1033,9 @@ impl ReaderSnapshot {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        if let Some(plan) = explain_answer(&tokens, &self.frozen.schema, Seen::All)? {
+            return Ok(plan);
+        }
         if let Some(stmt) = ddl_statement(&tokens)? {
             if !stmt.is_show() {
                 return Err(schema_change_on_a_read());
@@ -1079,6 +1082,13 @@ impl ReaderSnapshot {
             return Err(GraphError::QueryError {
                 detail: "masked queries are read-only".into(),
             });
+        }
+        if let Some(plan) = explain_answer(
+            &tokens,
+            &self.frozen.schema,
+            Seen::Masked(&self.view(None)?, &mask.visible),
+        )? {
+            return Ok(plan);
         }
         if let Some(stmt) = ddl_statement(&tokens)? {
             let view = self.view(None)?;

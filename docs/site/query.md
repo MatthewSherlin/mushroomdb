@@ -1088,6 +1088,62 @@ CALL subquery`.
 `CALL`, `YIELD`, `FOREACH`, `EXISTS` and `LOAD` are not reserved: they still
 name properties, labels and variables (`MATCH (call:Yield) RETURN call.exists`).
 
+## EXPLAIN
+
+`EXPLAIN` in front of a statement returns the plan the engine would run, and
+runs none of it. The result has one column, `plan`, and one row; the value is a
+JSON string:
+
+```cypher
+EXPLAIN MATCH (n:Person) WHERE n.age > 30 RETURN n.name
+```
+
+```text
+[{"op":"IndexRangeScan","var":"n","label":"Person","field":"age","lo":{"value":"Int(30)","inclusive":false},"hi":null,"prefix":null,"order":null,"index":"idx_Person_age"},
+ {"op":"Filter","expr":"…"},
+ {"op":"Project","items":["n.name"]}]
+```
+
+The plan is an array of operators in execution order, each an object with an
+`op` and that operator's fields (`ScanLabel`, `IndexScan`, `IndexRangeScan`,
+`Expand`, `Filter`, `Project`, `Aggregate`, `OrderBy`, `Limit`, and so on). A
+`UNION` lists one `Union` entry per part, each holding that part's plan.
+
+**Which index.** A lookup names the index it reads in an `index` field, so you
+can check that one is used. `IndexScan` and `IndexIntersect` (equality lookups)
+give the equality index, or the range index on the same label and property;
+`IndexRangeScan` gives the range index; a lookup by key (`{id: 'x'}`) says
+`"key"`. `null` means the lookup scans the label because no index is declared.
+The names are the ones `SHOW INDEXES` lists. A `ScanLabel` whose next operator
+is a plain `property <op> literal` filter carries `fused_filter`, the property:
+the scan applies that filter in its own loop when the query is bounded.
+
+**Every statement has a plan, and none runs.** A read, a `UNION`, a `CALL`
+(`ProcedureCall`) and each write form are planned without being executed:
+`EXPLAIN CREATE …` creates nothing and `EXPLAIN MATCH … DETACH DELETE …`
+deletes nothing. A write shows the plan of its `MATCH` part followed by its
+write operators (`Create`, `SetProperty`, `SetProperties`, `RemoveProperty`,
+`DeleteNode`, `DeleteEdge`, `Merge`). A schema statement (`CREATE INDEX …`,
+`DROP CONSTRAINT …`) has a one-operator plan, `Schema`. A statement that does
+not parse or plan is the same error without `EXPLAIN`.
+
+**Where it runs.** `EXPLAIN` is a read, allowed wherever a read is: `query`,
+`query_write`, `query_at`, masked and role-scoped calls, the lock-free reader,
+a transaction (nothing is buffered, so the plan of a write inside a
+transaction changes nothing), HTTP `/query`, Python, TypeScript and the MCP
+`query` tool all return the `plan` column. Over [Bolt](bolt.md#explain) there
+are no records and the plan is in the summary. Under a role, a mask or a
+namespace, the plan names an index only when `SHOW INDEXES` would list it for
+that caller; the plan carries no counts or estimates of the data.
+
+**A diagnostic, not an interface.** The operators and their fields describe the
+engine's current plan and may change between releases. Read the plan; do not
+parse it in code that must keep working.
+
+`PROFILE` is refused: `not supported in mushroomdb 0.10: PROFILE`. It would
+run the query. `EXPLAIN` stays an ordinary name elsewhere
+(`MATCH (explain) RETURN explain`).
+
 ## Unsupported features
 
 These openCypher forms are recognised and refused with an error that names
@@ -1112,6 +1168,7 @@ prefix, the regular-expression operator `lex:`).
 | `RETURN n {.name, .age}` | `not supported in mushroomdb 0.10: map projection (n {.key, …})` |
 | `n.name =~ 'a.*'` | `not supported in mushroomdb 0.10: regular-expression match (=~)` |
 | `LOAD CSV …` | `not supported in mushroomdb 0.10: LOAD CSV` |
+| `PROFILE …` | `not supported in mushroomdb 0.10: PROFILE (it would run the query; EXPLAIN shows the plan without running it)` |
 | `USE db …` | `not supported in mushroomdb 0.10: USE (database selection)` |
 | `allShortestPaths(…)` | `not supported in mushroomdb 0.10: allShortestPaths` |
 

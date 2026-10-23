@@ -596,6 +596,13 @@ impl Transaction {
     /// buffers nothing and leaves the transaction usable.
     pub fn execute(&mut self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
         let tokens = lex(cypher).map_err(query_err("lex"))?;
+        // `EXPLAIN` plans the statement after it: nothing runs, so nothing is
+        // buffered and no key is read.
+        if let Some(plan) =
+            crate::db::explain_answer(&tokens, &self.base_snap.frozen.schema, crate::db::Seen::All)?
+        {
+            return Ok(plan);
+        }
         // The schema is the store's, not the transaction's: a statement that
         // changes it is refused here, and `SHOW` lists it as of BEGIN.
         if let Some(stmt) = crate::db::ddl_statement(&tokens)? {
