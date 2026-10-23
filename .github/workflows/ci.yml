@@ -163,6 +163,58 @@ jobs:
       # rows within 8x one of 5k (linear is ~4x; the old quadratic 9-16x).
       - run: cargo test --release -p mushroomdb --test batch_vs_commits -- bench_create_edges_and_delete_batch_is_linear --ignored --nocapture
 
+  # The official Python and JavaScript Bolt drivers, at pinned versions, run
+  # the twelve scenarios of the 0.10 transactions spec (W3 section 6) against
+  # the release binary: connect, a refused token, auto-commit reads and writes,
+  # explicit and managed transactions, 1000 rows streamed 100 at a time, every
+  # value type, a conflict the driver retries, db.labels() and a role token's
+  # view, the routing scheme through ROUTE, and bookmarks across sessions.
+  # One job, so the binary is built once and the workflow stays at 20
+  # concurrent runs; each driver is its own step, and the second runs even
+  # when the first fails. tests/bolt/run_compat.sh starts the server on
+  # loopback with a token, waits for /ready, and stops it afterwards.
+  bolt-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --release
+      # Exact versions, each named once, in its script (DRIVER_VERSION): a new
+      # driver release must not change this gate without a commit that says
+      # so, and each script refuses to run against any other version. The
+      # scripts print the package spec, so no tracked file spells the
+      # package names (scripts/check-names.py).
+      - name: install the pinned drivers
+        id: drivers
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/bolt-py"
+          "$RUNNER_TEMP/bolt-py/bin/pip" install --quiet \
+            "$(python tests/bolt/python_compat.py --requirement)"
+          npm install --prefix "$RUNNER_TEMP/bolt-js" --no-audit --no-fund \
+            "$(node tests/bolt/js_compat.mjs --requirement)"
+      - name: official Python driver, twelve scenarios
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          "$RUNNER_TEMP/bolt-py/bin/python" tests/bolt/python_compat.py
+      - name: official JavaScript driver, twelve scenarios
+        if: ${{ !cancelled() && steps.drivers.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          NODE_PATH: ${{ runner.temp }}/bolt-js/node_modules
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          node tests/bolt/js_compat.mjs
+
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
   # "format-compat" in CI, not the generic "test" job name.
