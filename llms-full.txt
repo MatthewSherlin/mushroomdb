@@ -6243,7 +6243,7 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `localdatetime([x])` | `String`, `Map` or temporal | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null → null; bad input → an error. Storing a result moves the store to the V11 format |
 | `datetime([x])` | `String`, `Map` or temporal | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00, `+0530` and `+05` read too), a string with no offset is read as UTC; no argument is now. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
 | `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`, any of them fractional) or `duration("P1Y2M3DT4H")`. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
-| `date.truncate(unit, x[, map])`, `localdatetime.truncate(…)`, `datetime.truncate(…)` | `String`, temporal, `Map` | the namespace's type | `x` cut to `unit` (`millennium`, `century`, `decade`, `year`, `weekYear`, `quarter`, `month`, `week`, `day`, and for the date-time types `hour`, `minute`, `second`, `millisecond`, `microsecond`); `map` then sets fields below the unit: `date.truncate('week', d, {dayOfWeek: 2})` |
+| `date.truncate(unit, x[, map])`, `localdatetime.truncate(…)`, `datetime.truncate(…)` | `String`, temporal, `Map` | the namespace's type | `x` cut to `unit` (`millennium`, `century`, `decade`, `year`, `weekYear`, `quarter`, `month`, `week`, `day`, and for the date-time types `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond`); `map` then sets fields below the unit: `date.truncate('week', d, {dayOfWeek: 2})` |
 | `date.statement([tz])`, `.transaction([tz])`, `.realtime([tz])`, the same on `localdatetime` and `datetime` | offset `String` or `{timezone: …}` | the namespace's type | the current instant, as `date()` gives it, on the clock of the offset `tz` (default UTC). Each call reads the clock |
 | `datetime.fromepoch(s, ns)`, `datetime.fromepochmillis(ms)` | `Int` | `DateTime` | the UTC instant `s` seconds plus `ns` nanoseconds, or `ms` milliseconds, after 1970-01-01 |
 | `duration.between(a, b)`, `duration.inMonths(a, b)`, `duration.inDays(a, b)`, `duration.inSeconds(a, b)` | temporal ×2 | `Duration` | from `a` to `b`: whole months, then whole days, then the time (`between`), or all of it in one unit. Two values with offsets compare as instants; otherwise each is read on its own wall clock, a date at midnight |
@@ -6293,7 +6293,9 @@ A map can also start from another value and override fields: `date: x` takes
 Given a `timezone`, a `datetime: x` with an offset keeps its instant
 (`datetime({datetime: x, timezone: '+05:00'})` moves the wall clock), a
 `time: x` with an offset moves its time of day, and a local one keeps its wall
-clock.
+clock. An override that leaves the day invalid for the new month or year is
+an error, not a clamp: `date({date: date('2020-01-31'), month: 2})` fails, as
+does `date({year: 1900, month: 2, day: 29})` (1900 is not a leap year; 2000 is).
 
 Values hold microseconds. A nanosecond field, or a string with more than six
 fraction digits, is truncated to the microsecond toward the earlier instant,

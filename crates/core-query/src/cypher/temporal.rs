@@ -937,10 +937,21 @@ pub fn call_namespaced(
         "duration.between" | "duration.inMonths" | "duration.inDays" | "duration.inSeconds" => {
             between(canonical, a, b).map(Some)
         }
-        _ => {
+        "date.statement"
+        | "date.transaction"
+        | "date.realtime"
+        | "localdatetime.statement"
+        | "localdatetime.transaction"
+        | "localdatetime.realtime"
+        | "datetime.statement"
+        | "datetime.transaction"
+        | "datetime.realtime" => {
             let kind = Kind::of(namespace).unwrap_or(Kind::Date);
             clock(canonical, kind, (n == 1).then_some(a)).map(Some)
         }
+        // `namespaced` lists every name above; a name it does not list is
+        // never dispatched here, and must not read the clock if it is.
+        other => Err(format!("unknown function `{other}`")),
     }
 }
 

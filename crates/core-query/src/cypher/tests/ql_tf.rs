@@ -772,3 +772,89 @@ fn a_dotted_call_is_a_namespaced_function_and_property_access_is_unchanged() {
     let err = eval_err("date.bogus()");
     assert!(err.contains("unknown function `date.bogus`"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Edge cases pinned after review (QL-TF M2, M4, M5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_clock_name_is_an_error_not_a_clock_read() {
+    use crate::cypher::temporal::call_namespaced;
+    for name in ["date.bogus", "datetime.now", "localdatetime.clock"] {
+        let got = call_namespaced(name, [None, None, None], 0);
+        assert!(
+            matches!(&got, Err(e) if e.contains(&format!("unknown function `{name}`"))),
+            "{name}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn a_negative_epoch_with_nanoseconds_counts_forward_from_the_second() {
+    assert_texts(&[
+        (
+            "datetime.fromepoch(-1, 500000000)",
+            "1969-12-31T23:59:59.500000+00:00",
+        ),
+        (
+            "datetime.fromepoch(-2, 999999999)",
+            "1969-12-31T23:59:58.999999+00:00",
+        ),
+        (
+            "datetime.fromepochmillis(-1)",
+            "1969-12-31T23:59:59.999000+00:00",
+        ),
+    ]);
+}
+
+#[test]
+fn an_offset_of_exactly_18_hours_is_accepted_and_one_minute_more_is_not() {
+    assert_texts(&[
+        (
+            "datetime({year: 2024, timezone: '+18:00'})",
+            "2024-01-01T00:00:00+18:00",
+        ),
+        (
+            "datetime({year: 2024, timezone: '-18:00'})",
+            "2024-01-01T00:00:00-18:00",
+        ),
+    ]);
+    for tz in ["+18:01", "-18:01"] {
+        let err = eval_err(&format!("datetime({{year: 2024, timezone: '{tz}'}})"));
+        assert!(
+            err.contains("is not an offset within ±18:00"),
+            "{tz}: {err}"
+        );
+    }
+}
+
+#[test]
+fn leap_years_follow_the_gregorian_century_rule() {
+    // 2000 is a leap year (divisible by 400); 1900 is not (by 100, not 400).
+    assert_texts(&[
+        ("date({year: 2000, month: 2, day: 29})", "2000-02-29"),
+        ("date('2000-02-29')", "2000-02-29"),
+        ("date({year: 1900, month: 2, day: 28})", "1900-02-28"),
+    ]);
+    for expr in [
+        "date({year: 1900, month: 2, day: 29})",
+        "date('1900-02-29')",
+    ] {
+        let err = eval_err(expr);
+        assert!(
+            err.starts_with("date()") || err.contains("date()"),
+            "{expr}: {err}"
+        );
+    }
+}
+
+#[test]
+fn an_override_that_leaves_the_day_invalid_for_the_new_month_is_an_error() {
+    let err = eval_err("date({date: date('2020-01-31'), month: 2})");
+    assert!(err.contains("date()"), "{err}");
+    // The same override on a day every month has is a value.
+    assert_eq!(
+        text("date({date: date('2020-01-28'), month: 2})"),
+        "2020-02-28"
+    );
+}
