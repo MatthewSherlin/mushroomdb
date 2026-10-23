@@ -139,6 +139,27 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 - The reply is `[0, 0, minor, major]`, or four zero bytes when no slot matches.
 - After the handshake, messages travel as chunks: a two-byte big-endian length, then that many bytes, ending with a zero-length chunk.
 
+## Driver compatibility tests
+
+Every pull request and push to `main` runs the official Python driver 6.4.1 and the official JavaScript driver 6.2.0, pinned to those exact versions, against a release build of `mushroomdb serve --bolt-port` (the `bolt-compat` CI job, scripts in `tests/bolt/`). Each driver runs twelve scenarios, written the way an application uses the driver, and each checks the values it gets back:
+
+| # | Scenario | What it checks |
+|---|---|---|
+| 1 | Connect and authenticate | The token logs in; the server reports `MushroomDB/<version>` at Bolt 5.0 |
+| 2 | Refused token | A wrong token fails with `Unauthorized` |
+| 3 | Auto-commit read | `MATCH (n) RETURN count(n)` returns an integer; a label count matches the data |
+| 4 | Auto-commit write | A `CREATE (:Person {id: $id, …})` from parameters, a `MERGE` from parameters that matches and one that creates, read back by a later statement, with the drivers' summary counters |
+| 5 | Transaction commit | `BEGIN`, a write the transaction reads back, `COMMIT`; then a managed write transaction running `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)` and a managed read transaction that sees the edge |
+| 6 | Transaction rollback | A rolled-back write, and a managed transaction whose function throws, both leave nothing behind |
+| 7 | Streaming | 1000 rows of `MATCH (n:Row) RETURN n` pulled 100 at a time |
+| 8 | Value types | Integer, float, string, boolean, null, list, map, date, date-time with an offset, local date-time, duration and bytes come back as sent, as parameters and as stored properties |
+| 9 | Retry | A managed write transaction whose commit conflicts with another client's write gets the transient `DeadlockDetected` error, and the driver's retry commits |
+| 10 | `CALL db.labels()` | The full token sees every label; a role token sees only its role's labels and nodes, and is refused a write |
+| 11 | Routing scheme | The driver asks `ROUTE` and runs its reads and writes on the advertised address |
+| 12 | Bookmarks | A read on a second session, given the first session's bookmark, sees the first session's commit |
+
+Where these drivers meet the server's current limits: a node or relationship inside a map built in the query, inside a list that mixes kinds, or behind a function arrives as its key or its `{type, start, end}` map, not as a Node or Relationship structure (see [Nodes, relationships and paths](#nodes-relationships-and-paths)). No scenario depends on that form.
+
 ## Transactions and bookmarks
 
 `BEGIN`, `COMMIT` and `ROLLBACK` are supported. A transaction reads a snapshot frozen at `BEGIN`, sees its own writes, and commits as one atomic batch; if another writer changed a node the transaction read or wrote, `COMMIT` fails with a transient error and the driver retries from `BEGIN`.
@@ -197,6 +218,44 @@ These parameters are refused with `Neo.ClientError.Request.Invalid`, and the mes
 | any other structure tag | Unknown. |
 
 A temporal structure with the wrong number or type of fields fails the same way, as a malformed request. A refused parameter fails the `RUN` before the statement runs, so nothing is written; `RESET` makes the connection ready again.
+
+### Nodes, relationships and paths
+
+A result column that is a bare node, relationship or path variable (`RETURN n`, `RETURN r`, `RETURN p`, and the same names through `WITH`, `RETURN *` or a grouping key) arrives as a graph structure, so `record["n"]["name"]`, `record["r"].type` and a path's nodes work in a driver:
+
+| Returned | Bolt structure | Fields at Bolt 5.0 | Fields at 4.4 |
+|---|---|---|---|
+| node | Node (`0x4E`) | `id`, `labels`, `properties`, `element_id` | `id`, `labels`, `properties` |
+| relationship | Relationship (`0x52`) | `id`, `start_id`, `end_id`, `type`, `properties`, `element_id`, `start_element_id`, `end_element_id` | the first five |
+| path | Path (`0x50`) | `nodes`, `relationships` (UnboundRelationship `0x72`: `id`, `type`, `properties`, `element_id`), `indices` | the same, without element ids |
+
+- **Labels.** A node has one label, so `labels` is a list of one.
+- **Properties.** Everything the node or relationship stores, as the statement saw it: inside a transaction its own writes, after a write its written state.
+- **Element ids** are derived from the element's identity, so they are the same on every connection and after a restart: a node is `n:<key>` (`n:ada`); a relationship is `r:<type>|<start key>|<end key>` (`r:KNOWS|ada|bob`), with `\` and `|` inside a part escaped by a backslash. The store holds at most one relationship of a type in each direction between two nodes, so these name it. Renaming a node gives it a new key and so a new element id.
+- **Integer ids** all fit in 53 bits, so a JavaScript number holds them exactly. A node's `id` (and a relationship's `start_id` / `end_id`) is the node's dense id in the store: assigned when the node is created, never reused after a delete, and kept across a rename. A relationship's `id` is a 53-bit hash of its element id, the same for the same relationship in every result; two relationships can collide (about one chance in two million among 65,000 relationships), so compare element ids when that matters. Node and relationship ids are separate namespaces.
+- **`id(n)` in a query is the node's key**, not the Bolt integer id, so `MATCH (n) WHERE id(n) = $node_id` with a driver's integer id matches nothing. Match on the key instead (`n.id`, or the element id without its `n:`).
+- **Paths** list each node and relationship once; `indices` walks them as Bolt defines, a negative relationship index meaning the hop goes against the relationship's direction.
+- **Scoped connections.** A role-bound token gets only nodes its role can see, and a relationship only when both its ends are visible, as with every other read (see [Scoped access](#scoped-access)).
+- **Lists.** `collect(n)`, `collect(r)`, `collect(p)`, a list of variables of one kind (`[a, b]`) and a path's `p.nodes` and `p.relationships` arrive as lists of Node, Relationship or Path structures. A node or relationship inside a map built in the query (`{who: n}`), or in a list that mixes kinds or values, stays its key or map.
+
+HTTP, Python and the other surfaces render the same columns as they always have: a node as its key string, a path as a map, and a relationship as the map `{type, start, end}` (see [Query language](query.md#return-of-relationships-and-paths)).
+
+### Write counters
+
+The `SUCCESS` that closes a write statement carries a `stats` map, which drivers read as the result summary's counters (`nodes_created`, `contains_updates` and so on):
+
+| Key | Counts |
+|---|---|
+| `nodes-created` | nodes created |
+| `nodes-deleted` | nodes deleted |
+| `relationships-created` | relationships created |
+| `relationships-deleted` | relationships deleted, including those a `DETACH DELETE` removes with their node |
+| `properties-set` | properties set or removed, including those a `CREATE` or a `MERGE` writes with a new node |
+| `labels-added` | one for each node created (a node is created with its label) |
+| `indexes-added`, `indexes-removed` | `CREATE INDEX` / `DROP INDEX` that changed the schema |
+| `constraints-added`, `constraints-removed` | `CREATE CONSTRAINT` / `DROP CONSTRAINT` that changed the schema |
+
+A schema statement's summary has query type `s`, a write's `w` and a read's `r`. Only counters that moved are listed; a driver reads a missing one as 0. A statement that changed nothing (a read, a `MERGE` that matched with nothing to set, `IF NOT EXISTS` on an existing index) has no `stats`. Inside a transaction each statement's `SUCCESS` carries that statement's counters. A write without `RETURN` still returns its one row of counts (`created`, `properties_set`, `deleted`, `relationships_created`), as over HTTP; that row keeps its documented meaning, so its `properties_set` does not count the properties a `CREATE` writes with a node.
 
 ### RESET while a request is running
 

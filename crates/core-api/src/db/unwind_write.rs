@@ -36,8 +36,8 @@ use super::row_eval::{
 };
 use super::*;
 use core_query::cypher::{
-    ast::OptionalClause, RelDir, RelPat, RowCreateNode, RowMerge, RowMergeNode, RowReturn,
-    RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt,
+    ast::OptionalClause, MergeSet, RelDir, RelPat, RowCreateNode, RowMerge, RowMergeNode,
+    RowReturn, RowWrite, UnwindClause, UnwindExpr, UnwindWriteStmt,
 };
 
 /// The parameter that carries the captured rows to the `RETURN` query.
@@ -84,6 +84,11 @@ struct Tally {
     props_set: i64,
     deleted: i64,
     relationships_created: i64,
+    /// Of `deleted`, the nodes; the rest are relationships.
+    nodes_deleted: i64,
+    /// Properties the created nodes were written with (not in `props_set`,
+    /// which keeps the write row's documented meaning).
+    created_props: i64,
     /// The keys every `MERGE` looked up, found or created: a transaction
     /// guards its commit with them, as its plain `MERGE` does.
     merge_keys: Vec<String>,
@@ -245,6 +250,9 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
                     for (_, op) in &node.props {
                         cols.operand(op, nodes);
                     }
+                    if let Some(op) = &node.props_map {
+                        cols.operand(op, nodes);
+                    }
                 }
                 for edge in edges {
                     note_var(&edge.src_var);
@@ -260,8 +268,11 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Colu
                         merge_operands(end, &mut cols, nodes);
                     }
                 }
-                for sc in merge.on_create.iter().chain(&merge.on_match) {
-                    cols.operand(&sc.value, nodes);
+                for item in merge.on_create.iter().chain(&merge.on_match) {
+                    match item {
+                        MergeSet::Prop(sc) => cols.operand(&sc.value, nodes),
+                        MergeSet::Map { value, .. } => cols.operand(value, nodes),
+                    }
                 }
             }
             RowWrite::Set(sets) => {
@@ -518,13 +529,24 @@ impl RowPass {
         view: &GraphView<'_>,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        let tally = &self.tally;
+        let stats = WriteStats {
+            nodes_created: tally.created,
+            labels_added: tally.created,
+            nodes_deleted: tally.nodes_deleted,
+            relationships_created: tally.relationships_created,
+            relationships_deleted: tally.deleted - tally.nodes_deleted,
+            properties_set: tally.props_set + tally.created_props,
+            ..WriteStats::default()
+        };
         let Some(query) = self.return_plan else {
             return Ok(write_counts(
-                self.tally.created,
-                self.tally.props_set,
-                self.tally.deleted,
-                self.tally.relationships_created,
-            ));
+                tally.created,
+                tally.props_set,
+                tally.deleted,
+                tally.relationships_created,
+            )
+            .with_stats(stats));
         };
         let ops = plan(&query).map_err(|e| err(format!("plan: {e}")))?;
         // Only the parameters the RETURN names go along: the statement's own
@@ -536,7 +558,9 @@ impl RowPass {
             .map(|(name, v)| (name.clone(), v.clone()))
             .collect();
         with_rows.insert(ROWS_PARAM.to_string(), Value::List(self.captured));
-        execute(view, &ops, &Params(&with_rows)).map_err(|e| err(format!("execute: {e}")))
+        execute(view, &ops, &Params(&with_rows))
+            .map(|rs| finish_result(view, rs).with_stats(stats))
+            .map_err(|e| err(format!("execute: {e}")))
     }
 }
 
@@ -563,12 +587,16 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
 
     // Phase 1: the read part, one row per iteration.
     let mut cols = plan_columns(stmt, &used, &rels);
-    read.returns = std::mem::take(&mut cols.items);
-    let ops = plan(&read).map_err(|e| err(format!("plan: {e}")))?;
-    cols.items = read.returns;
-    let rows = src
-        .row_view(|view| execute(view, &ops, &Params(params)))
-        .map_err(|e| err(format!("execute: {e}")))?;
+    let rows = match one_row(src, &read, &cols, params) {
+        Some(rows) => rows?,
+        None => {
+            read.returns = std::mem::take(&mut cols.items);
+            let ops = plan(&read).map_err(|e| err(format!("plan: {e}")))?;
+            cols.items = read.returns;
+            src.row_view(|view| execute(view, &ops, &Params(params)))
+                .map_err(|e| err(format!("execute: {e}")))?
+        }
+    };
 
     // Phase 2: the write clauses, per row.
     let var_cols: Vec<&str> = cols
@@ -656,6 +684,64 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
     })
 }
 
+/// The read part's one row, evaluated directly, when the read part is only
+/// the `UNWIND [1] AS <ONE_ROW_VAR>` a `CREATE` / `MERGE` that opens the
+/// statement is given (`CREATE (:P {id: $id})`): every column is then a
+/// literal or reads only `$parameter`s, so planning and running a query for
+/// it would only add cost. `None` for any other read part, or a column this
+/// cannot evaluate, which then runs through the query engine as usual.
+fn one_row<S: RowSource + ?Sized>(
+    src: &S,
+    read: &Query,
+    cols: &Columns,
+    params: &BTreeMap<String, Value>,
+) -> Option<Result<ResultSet>> {
+    let only_one_row = read.matches.is_empty()
+        && read.optional_clauses.is_empty()
+        && read.where_expr.is_none()
+        && read.post_unwind_where.is_none()
+        && read.stages.is_empty()
+        && matches!(
+            read.unwinds.as_slice(),
+            [UnwindClause { list: UnwindExpr::Lit(items), alias }]
+                if alias == core_query::cypher::ONE_ROW_VAR && items.len() == 1
+        );
+    if !only_one_row {
+        return None;
+    }
+    let columns: Vec<String> = cols
+        .items
+        .iter()
+        .map(|item| match (&item.alias, &item.value) {
+            (Some(alias), _) => Some(alias.clone()),
+            (None, RetVal::Var(v)) => Some(v.clone()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let values = src.row_view(|view| -> Option<Result<Vec<Option<Value>>>> {
+        let mut values = Vec::with_capacity(cols.items.len());
+        for item in &cols.items {
+            let value = match &item.value {
+                RetVal::ScalarExpr(op) => {
+                    match core_query::cypher::eval_operand(view, op, &Params(params), &[]) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(err(format!("execute: {e}")))),
+                    }
+                }
+                RetVal::Var(v) if v == core_query::cypher::ONE_ROW_VAR => Some(Value::Int(1)),
+                _ => return None,
+            };
+            values.push(value);
+        }
+        Some(Ok(values))
+    })?;
+    Some(values.map(|values| {
+        let mut rows = ResultSet::new(columns);
+        rows.push_row(values);
+        rows
+    }))
+}
+
 impl<F: Fs> GraphDb<F> {
     /// Run `UNWIND … <write clauses> [RETURN …]`.
     pub(super) fn exec_unwind_write(
@@ -695,7 +781,7 @@ fn uw_write<'v, S: RowSource + ?Sized>(
     match write {
         RowWrite::Create { nodes, edges } => {
             for node in nodes {
-                uw_create_node(node, ctx, env, ov, ops)?;
+                tally.created_props += uw_create_node(node, ctx, env, ov, ops)?;
                 tally.created += 1;
             }
             for edge in edges {
@@ -746,55 +832,12 @@ fn uw_write<'v, S: RowSource + ?Sized>(
             let Some(key) = env.get(var.as_str()).cloned() else {
                 return Ok(());
             };
-            let entries: MapEntries = match ctx.eval(operand, env, ov)? {
-                Some(Value::Map(m)) => m
-                    .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            k,
-                            if matches!(v, Value::Null) {
-                                None
-                            } else {
-                                Some(v)
-                            },
-                        )
-                    })
-                    .collect(),
-                other => {
-                    return Err(err(format!(
-                        "SET {var} {}= <map>: the value must be a map, got {}",
-                        if *merge { "+" } else { "" },
-                        other.map_or("null".to_string(), |v| format!("{v:?}")),
-                    )))
-                }
+            let set = MapSet {
+                var,
+                merge: *merge,
+                value: operand,
             };
-            let existing = uw_props(src, ov, &key).clone();
-            let writes = plan_map_write(&key, &existing, *merge, &entries, &|field| {
-                src.row_view_owns(field)
-            });
-            for w in writes {
-                match w {
-                    MapWrite::Set { field, value } => {
-                        tally.props_set += 1;
-                        ov.note_set(&key, &field, &value);
-                        ops.push(BatchOp::SetProp {
-                            key: key.clone(),
-                            field,
-                            value,
-                        });
-                    }
-                    MapWrite::Remove { field } => {
-                        if existing.contains_key(&field) {
-                            tally.props_set += 1;
-                        }
-                        ov.note_remove(&key, &field);
-                        ops.push(BatchOp::RemoveProp {
-                            key: key.clone(),
-                            field,
-                        });
-                    }
-                }
-            }
+            uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
         }
         RowWrite::Remove(items) => {
             for (var, field) in items {
@@ -833,10 +876,113 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 ov.node_deleted(&key);
                 ops.push(BatchOp::DeleteNode { key });
                 tally.deleted += 1;
+                tally.nodes_deleted += 1;
             }
         }
     }
     Ok(())
+}
+
+/// A `SET n = <map>` / `SET n += <map>`, as a clause of its own or as an item
+/// of a MERGE's `ON CREATE SET` / `ON MATCH SET`.
+struct MapSet<'a> {
+    var: &'a str,
+    merge: bool,
+    value: &'a Operand,
+}
+
+/// Apply a [`MapSet`] to the node `key`: the value must evaluate to a map; a
+/// null entry removes the key under `+=` and is an absent key under `=` (see
+/// [`plan_map_write`]).
+fn uw_set_map<S: RowSource + ?Sized>(
+    set: &MapSet<'_>,
+    key: String,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let src = ctx.src;
+    let entries: MapEntries = match ctx.eval(set.value, env, ov)? {
+        Some(Value::Map(m)) => m
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    if matches!(v, Value::Null) {
+                        None
+                    } else {
+                        Some(v)
+                    },
+                )
+            })
+            .collect(),
+        other => {
+            return Err(err(format!(
+                "SET {} {}= <map>: the value must be a map, got {}",
+                set.var,
+                if set.merge { "+" } else { "" },
+                other.map_or("null".to_string(), |v| format!("{v:?}")),
+            )))
+        }
+    };
+    let existing = uw_props(src, ov, &key).clone();
+    let writes = plan_map_write(&key, &existing, set.merge, &entries, &|field| {
+        src.row_view_owns(field)
+    });
+    for w in writes {
+        match w {
+            MapWrite::Set { field, value } => {
+                tally.props_set += 1;
+                ov.note_set(&key, &field, &value);
+                ops.push(BatchOp::SetProp {
+                    key: key.clone(),
+                    field,
+                    value,
+                });
+            }
+            MapWrite::Remove { field } => {
+                if existing.contains_key(&field) {
+                    tally.props_set += 1;
+                }
+                ov.note_remove(&key, &field);
+                ops.push(BatchOp::RemoveProp {
+                    key: key.clone(),
+                    field,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The properties `(n:L $props)` writes: the map's entries, a null one left
+/// out. A value that is not a map is an error naming the parameter.
+fn uw_props_map<S: RowSource + ?Sized>(
+    node: &RowCreateNode,
+    operand: &Operand,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<Vec<(String, Value)>> {
+    match ctx.eval(operand, env, ov)? {
+        Some(Value::Map(m)) => Ok(m
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, Value::Null))
+            .collect()),
+        other => {
+            let name = match operand {
+                Operand::Param(name) => format!("the parameter `{name}`"),
+                _ => "the property map".to_string(),
+            };
+            Err(err(format!(
+                "CREATE (:{} …): {name} must be a map of properties, got {}",
+                node.label,
+                other.map_or("null".to_string(), |v| format!("{v:?}")),
+            )))
+        }
+    }
 }
 
 fn uw_create_node<'v, S: RowSource + ?Sized>(
@@ -845,8 +991,11 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
     env: &mut HashMap<&'v str, String>,
     ov: &mut Overlay,
     ops: &mut Vec<BatchOp>,
-) -> Result<()> {
-    let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len());
+) -> Result<i64> {
+    let mut props: Vec<(String, Value)> = match &node.props_map {
+        Some(operand) => uw_props_map(node, operand, ctx, env, ov)?,
+        None => Vec::with_capacity(node.props.len()),
+    };
     for (field, operand) in &node.props {
         // A null value is an absent property.
         if let Some(v) = ctx.eval(operand, env, ov)? {
@@ -866,13 +1015,14 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
         return Err(GraphError::DuplicateKey { key });
     }
     ov.node_created(&key, &props);
+    let written = props.len() as i64;
     ops.push(BatchOp::InsertNode {
         label: node.label.clone(),
         key: key.clone(),
         props,
     });
     env.insert(node.var.as_str(), key);
-    Ok(())
+    Ok(written)
 }
 
 /// The key a MERGE node pattern names for this row. A bound node's key is
@@ -894,6 +1044,10 @@ fn uw_merge_key<S: RowSource + ?Sized>(
     }
     match ctx.eval(&node.key, env, ov)? {
         Some(Value::Str(s)) => Ok((s.clone(), Value::Str(s))),
+        None => Err(err(format!(
+            "MERGE (:{} {{{}: null}}): a MERGE cannot match on a null property value",
+            node.label, node.key_field
+        ))),
         other => Err(err(format!(
             "MERGE key value must be a string (got {:?})",
             other.unwrap_or(Value::Null)
@@ -955,6 +1109,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         if !existed {
             let props =
                 src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+            tally.created_props += props.len() as i64;
             ov.node_created(&start_key, &props);
             ops.push(BatchOp::InsertNode {
                 label: merge.start.label.clone(),
@@ -1003,6 +1158,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         start_existed && end_existed && uw_edge_exists(src, ov, &edge.etype, &src_key, &dst_key);
     if !start_existed {
         let props = src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
+        tally.created_props += props.len() as i64;
         ov.node_created(&start_key, &props);
         ops.push(BatchOp::InsertNode {
             label: merge.start.label.clone(),
@@ -1013,6 +1169,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     }
     if !end_existed && end_key != start_key {
         let props = src.row_merge_props(&edge.end.key_field, &end_value, end_ns.as_ref())?;
+        tally.created_props += props.len() as i64;
         ov.node_created(&end_key, &props);
         ops.push(BatchOp::InsertNode {
             label: edge.end.label.clone(),
@@ -1041,14 +1198,29 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
 /// `ON CREATE SET` / `ON MATCH SET` items of a MERGE; each names a node
 /// the MERGE bound.
 fn uw_merge_sets<S: RowSource + ?Sized>(
-    sets: &[SetClause],
+    sets: &[MergeSet],
     ctx: &RowCtx<'_, S>,
     env: &HashMap<&str, String>,
     ov: &mut Overlay,
     ops: &mut Vec<BatchOp>,
     tally: &mut Tally,
 ) -> Result<()> {
-    for sc in sets {
+    for item in sets {
+        let sc = match item {
+            MergeSet::Prop(sc) => sc,
+            MergeSet::Map { var, merge, value } => {
+                let Some(key) = env.get(var.as_str()).cloned() else {
+                    return Err(err(format!("SET variable '{var}' is not bound")));
+                };
+                let set = MapSet {
+                    var,
+                    merge: *merge,
+                    value,
+                };
+                uw_set_map(&set, key, ctx, env, ov, ops, tally)?;
+                continue;
+            }
+        };
         let Some(v) = ctx.eval(&sc.value, env, ov)? else {
             return Err(err(format!(
                 "SET value for {}.{} evaluated to null",

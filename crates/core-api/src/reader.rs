@@ -1048,8 +1048,9 @@ impl ReaderSnapshot {
         let mut view = self.view(None)?;
         view.prop_index = self.query_index()?;
         let t0 = std::time::Instant::now();
-        let result =
-            execute_union(&view, &union, &Params(params)).map_err(|e| GraphError::QueryError {
+        let result = execute_union(&view, &union, &Params(params))
+            .map(|rs| crate::db::finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
             });
         self.context
@@ -1092,9 +1093,11 @@ impl ReaderSnapshot {
         })?;
         let mut view = self.view(Some(&mask.visible))?;
         view.prop_index = self.query_index()?;
-        execute_union(&view, &union, &Params(params)).map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })
+        execute_union(&view, &union, &Params(params))
+            .map(|rs| crate::db::finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            })
     }
 
     /// The equality index this snapshot's queries use.

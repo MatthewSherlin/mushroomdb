@@ -75,7 +75,7 @@ fn merge_from_a_bound_node_alone_is_an_error() {
 #[test]
 fn star_expands_to_the_names_in_scope_in_alphabetical_order() {
     let q = parse(&lex("MATCH p = (b)-[r]->(a) UNWIND [1] AS x RETURN *").unwrap()).unwrap();
-    assert_eq!(names(&q.returns), ["a", "b", "p", "x"]);
+    assert_eq!(names(&q.returns), ["a", "b", "p", "r", "x"]);
     let q = parse(&lex("MATCH (n), (m) WITH *, n.v AS v RETURN DISTINCT *").unwrap()).unwrap();
     assert_eq!(names(&q.stages[0].items)[..2], ["m", "n"]);
     assert_eq!(q.stages[0].items[2].alias.as_deref(), Some("v"));

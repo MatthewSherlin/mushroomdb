@@ -454,6 +454,9 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // What the statement changed: nothing, under `IF [NOT] EXISTS`, when
+        // the schema already was as asked.
+        let mut stats = WriteStats::default();
         match stmt {
             DdlStatement::CreateIndex {
                 name,
@@ -471,16 +474,20 @@ impl<F: Fs> GraphDb<F> {
                     || (anonymous && self.prop_index.range_index_on(&label, &field).is_some());
                 if !(if_not_exists && exists) {
                     self.enable_range_index(&name, &label, &field)?;
+                    stats.indexes_added = 1;
                 }
             }
             DdlStatement::DropIndex { name, if_exists } => {
                 let listing = self.schema_listing();
                 match listing.indexes_named(&name).as_slice() {
-                    [e] => match e.kind {
-                        IndexKind::Range => self.disable_range_index(&name)?,
-                        IndexKind::Equality => self.disable_index(&e.label, &e.field)?,
-                        IndexKind::Fulltext => self.disable_fulltext(&e.label, &e.field)?,
-                    },
+                    [e] => {
+                        match e.kind {
+                            IndexKind::Range => self.disable_range_index(&name)?,
+                            IndexKind::Equality => self.disable_index(&e.label, &e.field)?,
+                            IndexKind::Fulltext => self.disable_fulltext(&e.label, &e.field)?,
+                        }
+                        stats.indexes_removed = 1;
+                    }
                     [] if if_exists => {}
                     [] => {
                         return Err(GraphError::QueryError {
@@ -515,17 +522,19 @@ impl<F: Fs> GraphDb<F> {
                     .any(|c| c.name == name || (c.label == label && c.field == field));
                 if !(if_not_exists && exists) {
                     self.create_constraint(&name, &label, &field)?;
+                    stats.constraints_added = 1;
                 }
             }
             DdlStatement::DropConstraint { name, if_exists } => {
                 let exists = self.constraints.iter().any(|c| c.name == name);
                 if exists || !if_exists {
                     self.drop_constraint(&name)?;
+                    stats.constraints_removed = 1;
                 }
             }
             // Answered above.
             DdlStatement::ShowIndexes | DdlStatement::ShowConstraints => {}
         }
-        Ok(ResultSet::new(Vec::new()))
+        Ok(ResultSet::new(Vec::new()).with_stats(stats))
     }
 }

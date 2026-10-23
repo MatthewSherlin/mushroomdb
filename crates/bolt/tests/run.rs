@@ -423,6 +423,61 @@ fn run_parameters_reach_the_query() {
     assert_eq!(rows_and_end(&out).0, vec![&vec![PackValue::Int(7)]]);
 }
 
+/// QL-PM: the everyday driver write — a CREATE or MERGE whose property map
+/// holds parameters — runs auto-commit over RUN.
+#[test]
+fn run_parameters_reach_a_create_and_a_merge_property_map() {
+    let (db, _dir) = open_db("pm");
+    let mut conn = connected(&db, FULL);
+    let run_with = |query: &str, params: Vec<(String, PackValue)>| {
+        ClientMessage::Other(
+            MessageKind::Run,
+            vec![s(query), PackValue::Map(params), PackValue::Map(vec![])],
+        )
+    };
+    for (query, params) in [
+        (
+            "CREATE (:Made {id: $id, n: $n})",
+            vec![("id".into(), s("m1")), ("n".into(), PackValue::Int(1))],
+        ),
+        (
+            "CREATE (n:Made $props)",
+            vec![(
+                "props".into(),
+                PackValue::Map(vec![
+                    ("id".into(), s("m2")),
+                    ("n".into(), PackValue::Int(2)),
+                ]),
+            )],
+        ),
+        (
+            "MERGE (n:Made {id: $id}) ON MATCH SET n.n = n.n + $d",
+            vec![("id".into(), s("m1")), ("d".into(), PackValue::Int(10))],
+        ),
+    ] {
+        let out = conn.handle(run_with(query, params));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{query}: {out:?}"
+        );
+        let out = conn.handle(pull(-1));
+        assert!(
+            matches!(out.last(), Some(ServerMessage::Success(_))),
+            "{query}: {out:?}"
+        );
+    }
+    let seen = db
+        .reader()
+        .query(
+            "MATCH (n:Made) RETURN n.id AS id, n.n AS n ORDER BY id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.get(0, "n"), Some(&Value::Int(11)));
+    assert_eq!(seen.get(1, "n"), Some(&Value::Int(2)));
+}
+
 #[test]
 fn a_null_parameter_does_not_stop_other_parameters_working() {
     let (db, _dir) = open_db("nullparam");

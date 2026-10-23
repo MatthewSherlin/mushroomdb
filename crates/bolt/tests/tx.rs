@@ -247,6 +247,43 @@ fn begin_match_create_commit_connects_two_nodes() {
     assert_eq!(outside(&db), 1);
 }
 
+/// QL-PM: parameters in CREATE and MERGE property maps inside BEGIN … COMMIT.
+#[test]
+fn begin_create_and_merge_with_parameters_commit() {
+    let (db, _dir) = open_db();
+    let mut conn = connected(&db);
+    expect_success(conn.handle(begin()));
+    rows(
+        &mut conn,
+        run_with(
+            "CREATE (:Pending {id: $id, n: $n})",
+            vec![("id", s("p1")), ("n", PackValue::Int(1))],
+        ),
+    );
+    rows(
+        &mut conn,
+        run_with(
+            "MERGE (n:Pending {id: $id}) ON CREATE SET n += $props",
+            vec![
+                ("id", s("p2")),
+                ("props", map(vec![("n", PackValue::Int(2))])),
+            ],
+        ),
+    );
+    assert_eq!(count(&mut conn, "Pending"), 2, "sees its own writes");
+    assert_eq!(count_outside(&db, "Pending"), Value::Int(0));
+    expect_success(conn.handle(commit()));
+    assert_eq!(count_outside(&db, "Pending"), Value::Int(2));
+    let n = db
+        .reader()
+        .query(
+            "MATCH (n:Pending {id: 'p2'}) RETURN n.n AS n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(n.get(0, "n"), Some(&Value::Int(2)));
+}
+
 #[test]
 fn rollback_leaves_nothing_behind() {
     let (db, _dir) = open_db();

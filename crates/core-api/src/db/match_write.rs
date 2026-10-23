@@ -28,12 +28,40 @@ impl MatchWrite {
         src: &S,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        match self.projection {
+        let stats = WriteStats {
+            properties_set: self.props,
+            ..WriteStats::default()
+        };
+        let rs = match self.projection {
             Some((rel_vars, returns)) => {
-                project_set_return_rows(src, &rel_vars, &self.rows, &returns, params)
+                let mut rs = project_set_return_rows(src, &rel_vars, &self.rows, &returns, params)?;
+                // A bare node in the RETURN is a node column, as its MATCH
+                // column was; its details are read from the written state.
+                rs.set_column_kinds(
+                    returns
+                        .iter()
+                        .map(|item| match &item.value {
+                            RetVal::Var(v) => {
+                                let col_name = if rel_vars.contains(v) {
+                                    rel_value_alias(v)
+                                } else {
+                                    v.clone()
+                                };
+                                self.rows
+                                    .columns()
+                                    .iter()
+                                    .position(|c| *c == col_name)
+                                    .and_then(|col| self.rows.column_kind(col))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                );
+                src.row_view(|view| finish_result(view, rs))
             }
-            None => Ok(write_counts(0, self.props, 0, 0)),
-        }
+            None => write_counts(0, self.props, 0, 0),
+        };
+        Ok(rs.with_stats(stats))
     }
 }
 
@@ -118,16 +146,8 @@ pub(crate) fn match_set_ops<S: RowSource + ?Sized>(
             alias: Some(col.clone()),
         });
     }
-    // Capture relationship types while r is bound; SET does not change them.
-    for r in &rel_vars {
-        set_returns.push(RetItem {
-            value: RetVal::FuncCall {
-                name: "type".into(),
-                args: vec![Operand::Var(r.clone())],
-            },
-            alias: Some(rel_type_alias(r)),
-        });
-    }
+    // Capture each relationship while r is bound; SET does not change it.
+    set_returns.extend(rel_capture_items(&rel_vars));
 
     let read_q = Query {
         matches: stmt.matches.clone(),
@@ -275,15 +295,7 @@ pub(crate) fn match_set_map_ops<S: RowSource + ?Sized>(
             alias: Some("__sv_param".into()),
         });
     }
-    for r in &rel_vars {
-        match_returns.push(RetItem {
-            value: RetVal::FuncCall {
-                name: "type".into(),
-                args: vec![Operand::Var(r.clone())],
-            },
-            alias: Some(rel_type_alias(r)),
-        });
-    }
+    match_returns.extend(rel_capture_items(&rel_vars));
     let read_q = Query {
         matches: stmt.matches.clone(),
         optional_clauses: vec![],
@@ -462,16 +474,8 @@ pub(crate) fn match_remove_ops<S: RowSource + ?Sized>(
             alias: None,
         })
         .collect();
-    // Capture relationship types while r is bound, as SET does.
-    for r in &rel_vars {
-        match_returns.push(RetItem {
-            value: RetVal::FuncCall {
-                name: "type".into(),
-                args: vec![Operand::Var(r.clone())],
-            },
-            alias: Some(rel_type_alias(r)),
-        });
-    }
+    // Capture each relationship while r is bound, as SET does.
+    match_returns.extend(rel_capture_items(&rel_vars));
     let read_q = Query {
         matches: stmt.matches.clone(),
         optional_clauses: vec![],
@@ -529,4 +533,28 @@ pub(crate) fn match_remove_ops<S: RowSource + ?Sized>(
         projection: project_returns.map(|returns| (rel_vars, returns)),
         rows: match_rs,
     })
+}
+
+/// The read-part columns that capture each relationship variable while it is
+/// bound: its type (for `type(r)`) and the relationship itself (for a bare
+/// `RETURN r`, rendered as its `{type, start, end}` map).
+fn rel_capture_items(rel_vars: &[String]) -> Vec<RetItem> {
+    rel_vars
+        .iter()
+        .flat_map(|r| {
+            [
+                RetItem {
+                    value: RetVal::FuncCall {
+                        name: "type".into(),
+                        args: vec![Operand::Var(r.clone())],
+                    },
+                    alias: Some(rel_type_alias(r)),
+                },
+                RetItem {
+                    value: RetVal::Var(r.clone()),
+                    alias: Some(rel_value_alias(r)),
+                },
+            ]
+        })
+        .collect()
 }

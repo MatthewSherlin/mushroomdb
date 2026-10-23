@@ -5,9 +5,9 @@
 
 use super::Parser;
 use crate::cypher::ast::{
-    CreateEdge, OptionalClause, Pattern, RetItem, RetVal, RowCreateNode, RowMerge, RowMergeEdge,
-    RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt,
-    WithStage, WriteStatement, ONE_ROW_VAR,
+    CreateEdge, MergeSet, OptionalClause, Pattern, RetItem, RetVal, RowCreateNode, RowMerge,
+    RowMergeEdge, RowMergeNode, RowReturn, RowWrite, SetClause, UnwindClause, UnwindExpr,
+    UnwindWriteStmt, WithStage, WriteStatement, ONE_ROW_VAR,
 };
 use crate::cypher::{Operand, Query, Tok};
 use core_storage::Value;
@@ -30,6 +30,9 @@ pub(super) struct Scope {
     /// Names the parser made up (an anonymous node of a write clause, the
     /// one-row UNWIND alias): in scope, but not listed by `RETURN *`.
     hidden: Vec<String>,
+    /// Variable-length relationship names: bound to a hop count, never
+    /// returned bare, so not listed by `RETURN *`.
+    var_length: Vec<String>,
 }
 
 impl Scope {
@@ -52,16 +55,19 @@ impl Scope {
         self.vars.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
     }
 
-    /// The items `RETURN *` / `WITH *` stands for: every node, path and value
-    /// name the query bound that is in scope here, in alphabetical order.
-    /// Relationship variables (single or variable-length) are left out, since
-    /// a relationship is not returned bare in 0.10 (`RETURN r` is an error);
-    /// so are names the parser made up. An error when nothing is left.
+    /// The items `RETURN *` / `WITH *` stands for: every node, relationship,
+    /// path and value name the query bound that is in scope here, in
+    /// alphabetical order. Variable-length relationship variables are left
+    /// out, since they are a hop count and not returned bare; so are names
+    /// the parser made up. An error when nothing is left.
     pub(super) fn star_items(&self) -> Result<Vec<RetItem>, String> {
         let mut names: Vec<&String> = self
             .vars
             .iter()
-            .filter(|(name, kind)| *kind != VarKind::Rel && !self.hidden.contains(name))
+            .filter(|(name, kind)| {
+                let var_length = *kind == VarKind::Rel && self.var_length.contains(name);
+                !var_length && !self.hidden.contains(name)
+            })
             .map(|(name, _)| name)
             .collect();
         if names.is_empty() {
@@ -87,6 +93,9 @@ impl Scope {
         for (rel, dest) in &pattern.chain {
             if let Some(var) = &rel.var {
                 self.bind(var, VarKind::Rel);
+                if rel.hops.is_some() && !self.var_length.contains(var) {
+                    self.var_length.push(var.clone());
+                }
             }
             if let Some(var) = &dest.var {
                 self.bind(var, VarKind::Node);
@@ -453,10 +462,16 @@ impl<'a> Parser<'a> {
             return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
         }
         let label = self.ident("expected label identifier after ':'")?;
-        let props = if self.peek() == Some(&Tok::LBrace) {
-            self.row_props()?
-        } else {
-            Vec::new()
+        let mut props_map = None;
+        let props = match self.peek() {
+            Some(Tok::LBrace) => self.row_props()?,
+            // `(n:L $props)`: the whole map is the parameter.
+            Some(Tok::Param(name)) => {
+                props_map = Some(Operand::Param(name.clone()));
+                self.pos += 1;
+                Vec::new()
+            }
+            _ => Vec::new(),
         };
         self.expect(&Tok::RParen, "expected ')' to close CREATE node pattern")?;
         let var = match var {
@@ -480,6 +495,7 @@ impl<'a> Parser<'a> {
             var: var.clone(),
             label,
             props,
+            props_map,
         });
         Ok(var)
     }
@@ -536,22 +552,21 @@ impl<'a> Parser<'a> {
         while self.eat_ident_kw("on") {
             if self.eat(&Tok::Create) {
                 self.expect(&Tok::Set, "expected SET after ON CREATE")?;
-                on_create.extend(self.merge_set_clauses_with(true)?);
+                on_create.extend(self.row_merge_sets()?);
             } else if self.eat(&Tok::Match) {
                 self.expect(&Tok::Set, "expected SET after ON MATCH")?;
-                on_match.extend(self.merge_set_clauses_with(true)?);
+                on_match.extend(self.row_merge_sets()?);
             } else {
                 return Err(self.err("expected CREATE or MATCH after ON"));
             }
         }
-        for sc in on_create.iter().chain(&on_match) {
-            let names_a_node =
-                sc.var == start.var || edge.as_ref().is_some_and(|e| e.end.var == sc.var);
+        for item in on_create.iter().chain(&on_match) {
+            let var = item.var();
+            let names_a_node = var == start.var || edge.as_ref().is_some_and(|e| e.end.var == var);
             if !names_a_node {
                 return Err(format!(
-                    "SET variable '{}' does not match a MERGE node variable \
-                     (a relationship takes no SET)",
-                    sc.var
+                    "SET variable '{var}' does not match a MERGE node variable \
+                     (a relationship takes no SET)"
                 ));
             }
         }
@@ -561,6 +576,31 @@ impl<'a> Parser<'a> {
             on_create,
             on_match,
         })))
+    }
+
+    /// The items after a per-row MERGE's `ON CREATE SET` / `ON MATCH SET`:
+    /// `n.f = expr`, `n = <map>` and `n += <map>`, in any mix.
+    fn row_merge_sets(&mut self) -> Result<Vec<MergeSet>, String> {
+        let mut items = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::Ident(_)))
+                && matches!(
+                    (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+                    (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+                )
+            {
+                let var = self.ident("expected variable after SET")?;
+                let merge = self.eat(&Tok::Plus);
+                self.expect(&Tok::Eq, "expected '=' in SET clause")?;
+                let value = self.value_expr()?;
+                items.push(MergeSet::Map { var, merge, value });
+            } else {
+                items.push(MergeSet::Prop(self.set_clause_with(true)?));
+            }
+            if !self.eat(&Tok::Comma) {
+                return Ok(items);
+            }
+        }
     }
 
     /// `(v)` at the cursor, where `v` is a node an earlier clause bound: a MERGE

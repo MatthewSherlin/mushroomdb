@@ -76,20 +76,25 @@ fn a_parameter_right_side_parses_and_other_right_sides_are_refused_by_name() {
     assert!(parse("MATCH (n) SET n = $props, n.a = 1").is_err());
 }
 
+/// QL-PM: a MERGE takes the map forms in `ON CREATE SET` / `ON MATCH SET`,
+/// as the per-row form.
 #[test]
-fn merge_set_with_a_map_is_refused_by_name() {
+fn merge_set_with_a_map_is_the_per_row_form() {
     for q in [
         "MERGE (n:L {id: 'x'}) ON CREATE SET n = {a: 1}",
         "MERGE (n:L {id: 'x'}) ON MATCH SET n += $p",
         "MERGE (n:L {id: 'x'}) ON CREATE SET n.a = 1, n = {b: 2}",
     ] {
-        assert_eq!(
-            parse(q).unwrap_err(),
-            "not supported in mushroomdb 0.10: MERGE … SET with a map",
-            "{q}"
+        assert!(
+            matches!(parse(q), Ok(WriteStatement::UnwindWrite(_))),
+            "{q}: {:?}",
+            parse(q)
         );
     }
-    assert!(parse("MERGE (n:L {id: 'x'}) ON CREATE SET n.a = 1").is_ok());
+    assert!(matches!(
+        parse("MERGE (n:L {id: 'x'}) ON CREATE SET n.a = 1"),
+        Ok(WriteStatement::Merge(_))
+    ));
 }
 
 #[test]

@@ -7,6 +7,7 @@
 //! refuses anything the wire format cannot carry rather than emit a corrupt
 //! frame.
 
+pub mod graph;
 pub mod hello;
 pub mod reset;
 pub mod route;

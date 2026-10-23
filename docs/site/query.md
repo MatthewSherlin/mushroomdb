@@ -243,7 +243,8 @@ RETURN p.nodes
 ```
 
 A path is a **map** with three fields, so it comes back the same way on every
-surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
+surface (Rust, HTTP JSON, Python, TypeScript, Arrow) as any other map; Bolt
+sends it as a Path structure (see [Return of relationships and paths](#return-of-relationships-and-paths)):
 
 | Field | Value |
 |---|---|
@@ -271,6 +272,39 @@ separate limit that is not lifted here.
 - **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
 - Relationship properties are not part of a path; match the relationship with
   its own variable to read them.
+
+---
+
+## Return of relationships and paths
+
+A fixed relationship variable can be returned bare, carried by `WITH`, used as a
+grouping key and sorted by, like a node or a path:
+
+```cypher
+MATCH (a:Person {id: 'ada'})-[r:KNOWS]->(b) RETURN r, b.name
+MATCH (a)-[r:KNOWS]->(b) WITH r, count(*) AS n RETURN r, n
+```
+
+A returned relationship is the map `{type, start, end}`, with the keys of the
+nodes at its stored start and end, the same map a path lists in its
+`relationships`; `ORDER BY r` sorts by that map. A node is still returned as its
+key and a path as its map, so `RETURN n` reads exactly as before on HTTP, in
+Python and in Rust.
+
+Over Bolt the three are graph structures: a node is a Node with its label and
+properties, a relationship a Relationship with its type, ends and properties,
+and a path a Path of both. See [Nodes, relationships and paths](bolt.md#nodes-relationships-and-paths).
+In Rust, a `ResultSet` says which columns are bare nodes, relationships and
+paths (`column_kind`), and a query run inside `mushroomdb::with_entity_detail`
+carries the node, relationship or path behind each of their cells (`entity`).
+
+- A **variable-length** relationship variable (`[rs:T*1..3]`) is still refused
+  bare: it is bound to a hop count, not to one relationship. Return
+  `rs.length`, or name the path (`p = …`) and return `p`.
+- A relationship is a value like the others in a list: `collect(r)`,
+  `collect(DISTINCT r)` and `[r, s]` are lists of its maps.
+- The `RETURN` of every write statement can return a relationship bare,
+  `MATCH … SET` and `MATCH … REMOVE` included.
 
 ---
 
@@ -360,8 +394,8 @@ joins against that set — use `WHERE` to correlate.
 
 ## RETURN * and WITH *
 
-`*` stands for every name in scope: the node, path and value variables the
-earlier clauses bound, in byte (code-point) order of name, so uppercase names
+`*` stands for every name in scope: the node, relationship, path and value
+variables the earlier clauses bound, in byte (code-point) order of name, so uppercase names
 come before lowercase ones (`Zed`, `alpha`). Further items may follow
 it.
 
@@ -371,10 +405,10 @@ MATCH (p:Person) WITH *, p.age * 2 AS double RETURN p.id, double
 MATCH (p:Person) UNWIND p.tags AS t RETURN DISTINCT *
 ```
 
-The first returns the columns `c` and `p`. Relationship variables, single or
-variable-length (`r`, `[rs*1..3]`), are left out, because a relationship is not
-returned bare (`RETURN r` is a named error); name what you need beside the
-star (`RETURN *, type(r) AS t`). Anonymous nodes and relationships are not
+The first returns the columns `c`, `p` and `r`. A variable-length
+relationship variable (`[rs*1..3]`) is left out, because it is a hop count and
+not returned bare; name what you need beside the star (`RETURN *, rs.length AS
+hops`). Anonymous nodes and relationships are not
 names. A `WITH` replaces what is in scope, so `WITH a RETURN *` returns `a`.
 With nothing left the star is an error, `RETURN * / WITH * with no variables in
 scope`. `RETURN *` works in the `RETURN` of a write statement (the matched and
@@ -518,6 +552,12 @@ Write results are always one row with four columns:
 | `deleted` | nodes and relationships deleted |
 | `relationships_created` | relationships created (new in 0.10; last, so the first three keep their positions) |
 
+Every write's result, with or without `RETURN`, also carries finer counters
+(`ResultSet::stats` in Rust; the `stats` of a Bolt `SUCCESS`): nodes and
+relationships created and deleted counted apart, properties set including those
+a `CREATE` or a `MERGE` writes with a new node, labels added, and indexes and
+constraints added and removed. See [Write counters](bolt.md#write-counters).
+
 ### CREATE
 
 ```cypher
@@ -530,6 +570,19 @@ CREATE (n:Person {id: 'alice', score: 1})
   ```cypher
   CREATE (a:Org {id: 'acme'})-[:MEMBER]->(b:Person {id: 'bob'})
   ```
+- A property value is any expression: a literal, a `$parameter`, a map entry
+  of one (`$p.id`), a list or map built from them, arithmetic, a function call
+  (`CREATE (:Person {id: $id, name: toUpper($name), tags: [$tag, 'new']})`).
+  The node stores the value, typed parameters (`Date`, `DateTime`, …) as their
+  type; a parameter whose value is null leaves that property out, and a
+  missing parameter is an error naming it.
+- `CREATE (n:Person $props)` takes the whole property map from a parameter. A
+  null value in the map is left out; a parameter that is not a map is an error
+  naming it, and the map must hold a string `id`.
+- A statement whose map reads a `$parameter` runs as the per-row form
+  ([UNWIND … write](#unwind--write-clauses)) over one row, so it meets the
+  same checks and stores what the same statement with the values written as
+  literals stores. A literal `null` value (`{p: null}`) is a parse error.
 
 ### MATCH … SET
 
@@ -607,9 +660,8 @@ SET n = {name: 'Alice', score: 1}
   removes the key under `+=`. A parameter that is not a map is an error naming
   it, before anything is written. `SET n = m` (a variable) is refused
   (`not supported in mushroomdb 0.10`), as is mixing the map form with
-  `SET n.prop = …` in one clause, and `MERGE … ON CREATE/ON MATCH SET n = {…}`
-  (`not supported in mushroomdb 0.10: MERGE … SET with a map`). `n` must be a
-  node.
+  `SET n.prop = …` in one clause. `n` must be a node. A `MERGE` takes the map
+  forms in `ON CREATE SET` / `ON MATCH SET` (see [MERGE](#merge)).
 - `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms, and as
   every other write path: on a node whose `id` equals its key, restating the key
   is accepted and anything else is an error pointing at `rename_node`; on any
@@ -663,8 +715,18 @@ MERGE (n:Person {id: 'alice'})
 - A role bound to exactly one namespace stamps that namespace when the
   pattern does not name `ns`. A role bound to two or more must name one.
 - `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
-  insert-or-skip. Both may appear on one MERGE.
-- Other extra properties are not supported.
+  insert-or-skip. Both may appear on one MERGE. Their items are `n.prop = …`,
+  `n += <map>` and `n = <map>`, in any mix, with the semantics of
+  `SET n += …` and `SET n = …` after `MATCH`: `MERGE (n:Person {id: $id}) ON CREATE SET n
+  += $props` creates the node with the parameter's properties, and under `ON
+  MATCH SET n += $props` a null value removes that key.
+- The key (and `ns`) may be any expression, `$parameter`s included
+  (`MERGE (n:Person {id: $id})`); the MERGE matches on the value exactly as it
+  does on the same literal. A key that evaluates to null is an error, as is a
+  key that is not a string.
+- Other extra properties are not supported, and neither is a parameter map in
+  the pattern (`MERGE (n:Person $props)`, refused by name): name the key and set
+  the rest, `MERGE (n:Person {id: $props.id}) ON CREATE SET n += $props`.
 
 #### MERGE with a relationship
 
@@ -759,7 +821,9 @@ MERGE (n:Person {id: r.id})
 - **Clauses.** After the read part: `CREATE` (a node, a chain, comma-separated
   patterns, or `(a)` naming a node an earlier clause bound), `MERGE` (a node, or
   a node-relationship-node pattern whose ends may be `(a)` nodes an earlier
-  clause bound, with `ON CREATE SET` / `ON MATCH SET`),
+  clause bound, with `ON CREATE SET` / `ON MATCH SET`, whose items may be the
+  map forms `n += <map>` / `n = <map>`), `CREATE (n:L $props)` (the whole map
+  from a parameter),
   `SET n.f = expr [, …]`, `SET n = <map>` and `SET n += <map>` (the map is a
   literal, a `$parameter`, a row or any expression that evaluates to a map),
   `REMOVE n.f`, `DELETE n` and `DETACH DELETE n`, then an optional `RETURN`. A
@@ -791,7 +855,7 @@ MERGE (n:Person {id: r.id})
 - **Null.** A property whose value is null in `CREATE` is left out, so a sparse
   row creates a node without it. `SET n.f = <null>` is an error, as for a single
   `SET`; in a map, a null entry removes the property under `+=` and is an absent
-  key under `=`. A `MERGE` key must be a string.
+  key under `=`. A `MERGE` key must be a string; a null key is an error.
 - **`RETURN`.** One row for each row the writes ran for, in order, after the
   commit. The read part is not run again: each row keeps the nodes and values it
   wrote with, and `RETURN` reads their properties from the committed state, so a
@@ -1278,8 +1342,8 @@ A comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IS NULL`, `IS NOT NULL`, `IN`,
 expression position, not only in `WHERE`: `RETURN` and `WITH` items, `ORDER BY`
 keys, list and map elements, a list comprehension's filter and projection, a
 `reduce` body, function arguments, `CASE` branches, `SET` values, `CREATE` and
-`MERGE` property values (in a plain `CREATE` / `MERGE` the value reads no variable,
-property or `$param`, and is evaluated before the write), and an `UNWIND` source.
+`MERGE` property values (`$param`s included; a variable or property only when
+a clause before the `CREATE` / `MERGE` binds it), and an `UNWIND` source.
 
 ```cypher
 MATCH (n:Person) RETURN n.name, n.age >= 18 AS adult
@@ -1431,6 +1495,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
 | `$param` in WHERE | `WHERE n.age > $min` |
 | `$param` in SET | `SET n.score = $val` |
+| `$param.field` (a map parameter's entry) | `WHERE n.id = $p.id`, `CREATE (:P {id: $p.id})` — `$p['id']` too; an absent key is null |
 | `COUNT(*)`, `COUNT(var)`, `SUM`, `AVG`, `MIN`, `MAX` (single) | `RETURN COUNT(*), SUM(n.score)` |
 | Grouped aggregation (single or multiple keys, multiple aggs) | `RETURN n.city, COUNT(*) AS c ORDER BY c DESC` |
 | `WITH` projection + aliasing | `WITH n.name AS nm RETURN nm` |
@@ -1459,7 +1524,8 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
 | Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression that reads no variable, property or `$param` (`{flag: 1 > 0, n: 2 + 3}`); it is evaluated before the write, and a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A value that evaluates to null is a named error |
+| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
+| `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props` — evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
@@ -1502,7 +1568,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
+| Bare `RETURN rs` for a variable-length relationship variable | `cannot return variable-length relationship variable '…' bare; return ….length, or name the path (p = …) and return p` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
 | `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |

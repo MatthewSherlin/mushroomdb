@@ -676,3 +676,45 @@ async fn match_then_create_connects_two_nodes_inside_a_transaction() {
         json!([["seed", "other"]])
     );
 }
+
+/// QL-PM: a CREATE or MERGE whose property map holds parameters runs over
+/// `/query` (auto-commit) and inside `/tx`, typed parameters included.
+#[tokio::test]
+async fn create_and_merge_take_parameters_in_their_property_maps() {
+    let s = plain("pm", limits(100, 30_000)).await;
+    let created = s
+        .call(
+            "POST",
+            "/query?format=json",
+            None,
+            Some(json!({
+                "cypher": "CREATE (n:Person {id: $id, born: $born}) RETURN n.id AS id",
+                "params": {"id": "ann", "born": {"$date": "2024-01-15"}},
+            })),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{}", created.body);
+    assert_eq!(created.body["rows"], json!([["ann"]]));
+    let id = s.begin_id(None).await;
+    let merged = s
+        .call(
+            "POST",
+            &format!("/tx/{id}/run"),
+            None,
+            Some(json!({
+                "cypher": "MERGE (n:Person {id: $id}) ON CREATE SET n += $props",
+                "params": {"id": "bob", "props": {"age": 41}},
+            })),
+        )
+        .await;
+    assert_eq!(merged.status, 200, "{}", merged.body);
+    let committed = s.post(&id, None, "commit").await;
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    let people = "MATCH (n:Person) WHERE n.id <> 'seed' \
+                  RETURN n.id AS id, n.age AS age, n.born = date('2024-01-15') AS born \
+                  ORDER BY id";
+    assert_eq!(
+        s.query(None, people).await["rows"],
+        json!([["ann", null, true], ["bob", 41, null]])
+    );
+}

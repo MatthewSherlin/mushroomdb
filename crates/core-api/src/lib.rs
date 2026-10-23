@@ -25,7 +25,11 @@ pub use algo::{
     AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
     PageRankReport, WccConfig, WccReport,
 };
-pub use core_query::{CmpOp, Dir, Filter, ResultSet};
+pub use core_query::cypher::with_entity_detail;
+pub use core_query::{
+    CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity, PathEntity, RelationshipEntity, ResultSet,
+    WriteStats,
+};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
     default_max_edges, is_keymatch_rooted, AggFn, BuildProgress, Predicate, RuleDef,
@@ -126,6 +130,13 @@ pub fn verify_snapshot(dir: &std::path::Path) -> crate::Result<Vec<SectionVerify
 pub fn is_write_query(cypher: &str) -> std::result::Result<bool, String> {
     let toks = core_query::cypher::lex(cypher).map_err(|e| format!("lex: {e}"))?;
     Ok(core_query::cypher::is_write_tokens(&toks))
+}
+
+/// Whether `cypher` is a schema statement (`CREATE INDEX`, `DROP CONSTRAINT`,
+/// `SHOW INDEXES`, …).
+pub fn is_schema_query(cypher: &str) -> std::result::Result<bool, String> {
+    let toks = core_query::cypher::lex(cypher).map_err(|e| format!("lex: {e}"))?;
+    Ok(core_query::cypher::is_ddl_tokens(&toks))
 }
 
 /// Return the number of valid frames in the live WAL of the database at `dir`.
