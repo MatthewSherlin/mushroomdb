@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod entity;
 pub mod exec;
+pub mod explain;
 pub mod lexer;
 pub mod parser;
 pub mod plan;
@@ -20,6 +21,10 @@ pub use entity::{
     attach_entities, attach_requested_entities, entity_detail_requested, with_entity_detail,
 };
 pub use exec::{eval_operand, execute, execute_union, Binding, Params};
+pub use explain::{
+    explain_plan, explain_plan_with, explain_prefix, explain_statement, ExplainPrefix, IndexNames,
+    NoIndexes, PROFILE_REFUSAL,
+};
 pub use lexer::{lex, Tok};
 pub use parser::{
     is_call_tokens, is_ddl_tokens, is_write_tokens, parse, parse_call, parse_ddl, parse_read,

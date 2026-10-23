@@ -6560,6 +6560,10 @@ mod ql_bx;
 mod ql_12;
 
 #[cfg(test)]
+#[path = "tests/ql_11.rs"]
+mod ql_11;
+
+#[cfg(test)]
 #[path = "tests/ql_cx.rs"]
 mod ql_cx;
 

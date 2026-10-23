@@ -40,6 +40,7 @@ const NS_DEFAULT_IDX: u32 = 0;
 
 mod call;
 mod ddl;
+mod explain;
 pub use ddl::{SchemaError, SchemaErrorKind};
 mod match_write;
 mod row_eval;
@@ -52,6 +53,8 @@ pub(crate) use call::{call_statement, run_call};
 pub(crate) use ddl::{
     ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
 };
+pub(crate) use explain::{explain_answer, Seen};
+pub use explain::{explain_plan_value, is_explain_query};
 
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
@@ -11557,6 +11560,22 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` runs nothing: it plans the statement for any role, naming
+        // only the indexes the role could list.
+        {
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            let view = self.view();
+            if let Some(plan) = explain_answer(
+                &tokens,
+                &self.schema_listing(),
+                Seen::Masked(&view, &authz.mask.visible),
+            )? {
+                return Ok(plan);
+            }
+        }
         // A role's write scope names labels and edge types; the schema is
         // outside every scope, so a role never changes it. `SHOW` is a read.
         if let Some(stmt) = ddl_statement(&tokens)? {
@@ -12180,6 +12199,14 @@ impl<F: Fs> GraphDb<F> {
         })?;
         if is_write_tokens(&tokens) {
             return Err(GraphError::MaskedReadOnly);
+        }
+        // `EXPLAIN` names only the indexes the mask lets the caller see.
+        if let Some(plan) = explain_answer(
+            &tokens,
+            &self.schema_listing(),
+            Seen::Masked(&self.view(), &mask.visible),
+        )? {
+            return Ok(plan);
         }
         // `SHOW …` lists only the labels the mask lets the caller see.
         if let Some(stmt) = ddl_statement(&tokens)? {
@@ -13753,6 +13780,10 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` is a read of the plan alone: nothing runs.
+        if let Some(plan) = explain_answer(&tokens, &self.schema_listing(), Seen::All)? {
+            return Ok(plan);
+        }
         // `SHOW INDEXES` / `SHOW CONSTRAINTS` are reads; a statement that
         // changes the schema is a write, and this entry point does not write.
         if let Some(stmt) = ddl_statement(&tokens)? {
@@ -13827,6 +13858,10 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` plans the statement after it and runs none of it.
+        if let Some(plan) = explain_answer(&tokens, &self.schema_listing(), Seen::All)? {
+            return Ok(plan);
+        }
         if let Some(stmt) = ddl_statement(&tokens)? {
             return self.exec_ddl(stmt);
         }

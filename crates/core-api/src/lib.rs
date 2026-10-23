@@ -44,6 +44,7 @@ pub use core_storage::{
 pub use db::{
     ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,
 };
+pub use db::{explain_plan_value, is_explain_query};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
     snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,
