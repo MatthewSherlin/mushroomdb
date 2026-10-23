@@ -568,8 +568,9 @@ mod tests {
 
     /// The column handle answers what `get()` answers for every node and
     /// field: base values, overlay overwrites, overlay tombstones, a layer's
-    /// writes and removals, typed and `Mixed` base columns, cached or not
-    /// (ledger row 139: the handle read the overlay alone).
+    /// writes and removals, typed (`Vector` included) and `Mixed` base
+    /// columns, cached or not (ledger row 139: the handle read the overlay
+    /// alone).
     #[test]
     fn the_column_handle_reads_what_get_reads() {
         use crate::v8::layout::{ColumnData, ColumnsData, FieldEntry};
@@ -594,6 +595,15 @@ mod tests {
                     name: "x".to_string(),
                     col: ColumnData::Mixed(bincode::serialize(&mixed).unwrap()),
                 },
+                FieldEntry {
+                    name: "v".to_string(),
+                    // Dim 2; nodes 0 and 3 present.
+                    col: ColumnData::Vector {
+                        dim: 2,
+                        data: vec![0.5, 1.5, 0.0, 0.0, 0.0, 0.0, 2.5, 3.5],
+                        present: vec![0b1001],
+                    },
+                },
             ],
         };
         let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&base).expect("rkyv encode");
@@ -606,6 +616,7 @@ mod tests {
         overlay.record_prop_tombstone(2, "n");
         overlay.record_prop_tombstone(3, "x");
         overlay.set(4, "x", Value::Bool(true));
+        overlay.record_prop_tombstone(3, "v");
         let mut layer = PropLayer::new();
         layer.set(3, "n", Value::Int(33));
         layer.remove(0, "x");
@@ -618,7 +629,7 @@ mod tests {
             ColumnsView::owned(&overlay).with_layer(&layer),
         ];
         for (v, view) in views.iter().enumerate() {
-            for field in ["n", "x", "absent"] {
+            for field in ["n", "x", "v", "absent"] {
                 let col = view.column(field);
                 for id in 0..6u32 {
                     let want = view.get(id, field).map(ValueRef::into_value);
@@ -635,6 +646,24 @@ mod tests {
             Some(Value::Int(10))
         );
         assert_eq!(views[0].column("n").get(2).map(ValueRef::into_value), None);
+        assert_eq!(
+            views[0].column("v").get(0).map(ValueRef::into_value),
+            Some(Value::List(vec![Value::Float(0.5), Value::Float(1.5)]))
+        );
+        assert_eq!(views[0].column("v").get(3).map(ValueRef::into_value), None);
+        // `view_column` (the 0.9.3 name) is the same handle.
+        for (v, view) in views.iter().enumerate() {
+            for field in ["n", "x", "v", "absent"] {
+                let (alias, col) = (view.view_column(field), view.column(field));
+                for id in 0..6u32 {
+                    assert_eq!(
+                        alias.get(id).map(ValueRef::into_value),
+                        col.get(id).map(ValueRef::into_value),
+                        "view {v}, `{field}` of node {id}"
+                    );
+                }
+            }
+        }
     }
 
     fn tiny_meta() -> V8Meta {
@@ -1492,6 +1521,14 @@ impl<'a> ColumnsView<'a> {
             overlay: self.overlay.column(field),
             base,
         }
+    }
+
+    /// The same handle as [`Self::column`], under the name `mushroomdb-storage`
+    /// 0.9.3 published it by (0.9.3 kept an overlay-only `column` and added
+    /// this one for the fix of ledger row 139).
+    #[inline]
+    pub fn view_column<'f>(&'f self, field: &'f str) -> ViewColumn<'f> {
+        self.column(field)
     }
 }
 
