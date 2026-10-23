@@ -16,7 +16,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use core_query::cypher::{execute_union, is_write_tokens, lex, parse_read, Params};
+use core_query::cypher::{
+    execute_planned_union, is_write_tokens, lex, parse_read, plan_union, Params,
+};
 use core_query::{expand, neighborhood, Dir, GraphView, ResultSet};
 use core_storage::property_index::PropertyIndex;
 use core_storage::v8::seam::{ArchivedNeighbor, DerivedBits};
@@ -1048,10 +1050,13 @@ impl ReaderSnapshot {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         let mut view = self.view(None)?;
         view.prop_index = self.query_index()?;
         let t0 = std::time::Instant::now();
-        let result = execute_union(&view, &union, &Params(params))
+        let result = execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| crate::db::finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
@@ -1099,9 +1104,12 @@ impl ReaderSnapshot {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         let mut view = self.view(Some(&mask.visible))?;
         view.prop_index = self.query_index()?;
-        execute_union(&view, &union, &Params(params))
+        execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| crate::db::finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),

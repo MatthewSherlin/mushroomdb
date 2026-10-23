@@ -105,6 +105,7 @@ Reference:
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
 - [Running several processes against one store](multiprocess.md)
+- [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)
 - [Testing](testing.md)
 

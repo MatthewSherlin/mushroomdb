@@ -662,6 +662,22 @@ pub(super) fn map_leaves(
                 map: Box::new(map_leaves(map, &mut inner)),
             }
         }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            let list = Box::new(map_leaves(list, leaf));
+            let locals = [var];
+            let mut inner = shadowing(&locals, leaf);
+            Operand::ListPredicate {
+                kind: *kind,
+                var: var.clone(),
+                list,
+                pred: Box::new(map_expr(pred, &mut inner)),
+            }
+        }
         Operand::Reduce {
             acc_var,
             init,

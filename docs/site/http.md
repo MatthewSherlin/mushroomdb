@@ -175,8 +175,9 @@ tiers: an `admin` or `write` key reads and writes, including inside an explicit 
 `read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
 statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
 
-`keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
-keys back, so reissue or copy the file deliberately.
+`keys.json` is not part of `POST /backup` or `mushroomdb backup`, so a restore from one of those does not bring
+keys back: reissue or copy the file deliberately. The continuous S3 backup does carry it (hashes only), and
+`restore --from` and restore on boot bring it back.
 
 ## Write scopes for role-bound tokens
 
@@ -579,7 +580,7 @@ The server holds the read lock for the **full duration** of the operation: file 
 plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
-The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+The server copies: `snapshot.bin`, `snapshot.bin.bak` when there is one, `wal.bin`, all `wal.<N>.archive` files,
 `wal.floor`, `wal.genesis`, `roles.json`, `commit_times.bin` and, when there is one, `snapshot.intent`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 

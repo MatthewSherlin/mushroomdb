@@ -79,8 +79,12 @@ fn deploy_templates_show_backup_and_restore_on_boot_commented_out() {
             "{name} does not say what restore on boot does"
         );
         assert!(
-            text.contains("TODO(HO-14/HO-15)"),
-            "{name} lacks the placeholder"
+            text.contains("Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set"),
+            "{name} does not say how backup is turned on"
+        );
+        assert!(
+            !text.contains("TODO(HO-14/HO-15)"),
+            "{name} keeps a stale TODO"
         );
     }
     assert!(!template("railway/railway.json").contains("MUSHROOMDB_"));
@@ -295,7 +299,7 @@ fn k8s_token_comes_from_an_external_required_secret_and_no_secret_object_ships()
     let text = template("k8s/statefulset.yaml");
     assert!(!text.contains("<set-me>"), "no placeholder token value");
     assert!(!text.contains("stringData"));
-    assert!(text.contains("TODO(HO-14/HO-15)"));
+    assert!(text.contains("Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set"));
     let Some(documents) = k8s_documents() else {
         return;
     };
@@ -447,4 +451,96 @@ fn k8s_exposes_bolt_in_cluster_only() {
     assert!(documents
         .iter()
         .all(|d| d["kind"] != "Service" || d["spec"]["type"] != "LoadBalancer"));
+}
+
+fn repo_file(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The self-host guide exists, links the reference pages, and names every
+/// variable and flag it teaches as the code reads it: each name is checked in
+/// the source that reads it first, so a rename there breaks this test instead
+/// of leaving the guide wrong.
+#[test]
+fn selfhost_guide_exists() {
+    let guide = repo_file("docs/site/self-host.md");
+    let backup_source = repo_file("crates/backup/src/store.rs");
+    let cli_source = repo_file("crates/cli/src/lib.rs");
+    let summary = repo_file("docs/site/SUMMARY.md");
+    assert!(
+        summary.contains("(self-host.md)"),
+        "SUMMARY.md must link the guide"
+    );
+    assert!(
+        guide.contains("single-writer"),
+        "the guide states the single-writer rule"
+    );
+    assert!(
+        guide.contains("/ready"),
+        "the guide covers the /ready probe"
+    );
+    for page in ["service.md", "deployment.md", "http.md", "limits.md"] {
+        assert!(
+            guide.contains(&format!("({page}")),
+            "the guide links {page}"
+        );
+    }
+
+    for variable in [
+        "MUSHROOMDB_BACKUP_S3_URL",
+        "MUSHROOMDB_BACKUP_WAL_INTERVAL_MS",
+        "MUSHROOMDB_BACKUP_MANIFEST_INTERVAL_S",
+        "MUSHROOMDB_BACKUP_RETAIN_N",
+        "MUSHROOMDB_BACKUP_SSE",
+        "MUSHROOMDB_BACKUP_LEASE_TTL",
+        "MUSHROOMDB_BACKUP_LEASE_CONDITIONAL",
+        "MUSHROOMDB_BACKUP_OP_TIMEOUT_MS",
+        "MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS",
+    ] {
+        assert!(
+            backup_source.contains(variable),
+            "{variable} is not read by the backup crate"
+        );
+        assert!(guide.contains(variable), "the guide must name {variable}");
+    }
+    for variable in [
+        "MUSHROOMDB_RESTORE_FROM_S3",
+        "MUSHROOMDB_CORS_ORIGINS",
+        "MUSHROOMDB_LOG_FORMAT",
+        "MUSHROOMDB_BOLT_PORT",
+        "MUSHROOMDB_TOKEN",
+    ] {
+        let in_code = ["crates/cli/src", "crates/server/src"].iter().any(|dir| {
+            std::fs::read_dir(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(dir),
+            )
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .any(|text| text.contains(&format!("\"{variable}\"")))
+        });
+        assert!(
+            in_code,
+            "{variable} is not read by the cli or server source"
+        );
+        assert!(guide.contains(variable), "the guide must name {variable}");
+    }
+    for flag in [
+        "--snapshot-every",
+        "--shutdown-timeout-secs",
+        "--restore-from",
+        "--tls-cert",
+        "--tls-key",
+        "--bolt-port",
+        "--tx-max",
+        "--bolt-max-connections",
+    ] {
+        assert!(cli_source.contains(flag), "{flag} is not a serve flag");
+        assert!(guide.contains(flag), "the guide must name {flag}");
+    }
 }

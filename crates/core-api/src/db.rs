@@ -6,9 +6,9 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::{ret_val_label, ArithOp};
 use core_query::cypher::{
-    execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
-    plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
-    RetVal, WriteStatement,
+    execute, execute_planned_union, is_subscribable, is_write_tokens, lex, parse, parse_read,
+    parse_write, plan, plan_union, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
+    PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{
     eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet, WriteStats,
@@ -1118,7 +1118,9 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
                 operand_node_vars(value, out);
             }
         }
-        Operand::ListComprehension { list, .. } => operand_node_vars(list, out),
+        Operand::ListComprehension { list, .. } | Operand::ListPredicate { list, .. } => {
+            operand_node_vars(list, out)
+        }
         Operand::Reduce { init, list, .. } => {
             operand_node_vars(init, out);
             operand_node_vars(list, out);
@@ -1229,6 +1231,11 @@ const COMPREHENSION_IN_WRITE_RETURN: &str =
     "a list comprehension is not supported in the RETURN of a write statement; \
      compute it in a read query, or RETURN the list and filter it afterwards";
 
+/// The refusal for a list predicate in a write statement's RETURN.
+const LIST_PREDICATE_IN_WRITE_RETURN: &str =
+    "a list predicate is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and test it afterwards";
+
 /// The refusal for `reduce()` in a write statement's RETURN.
 const REDUCE_IN_WRITE_RETURN: &str =
     "reduce() is not supported in the RETURN of a write statement; \
@@ -1256,6 +1263,7 @@ fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
     match op {
         Operand::ListComprehension { .. } => Some(COMPREHENSION_IN_WRITE_RETURN),
         Operand::Reduce { .. } => Some(REDUCE_IN_WRITE_RETURN),
+        Operand::ListPredicate { .. } => Some(LIST_PREDICATE_IN_WRITE_RETURN),
         Operand::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
         Operand::BinArith { left, right, .. } => {
             operand_write_return_refusal(left).or_else(|| operand_write_return_refusal(right))
@@ -1351,7 +1359,14 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         Operand::Index { base, index } => {
             let base_val = eval_set_return_operand(db, match_rs, row, rel_vars, base, params)?;
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
-            Ok(core_query::value_ops::index_list(base_val, idx_val))
+            // A variable here is a matched node or relationship; a subscript
+            // of one reads nothing, as in a read query. Any other base is
+            // held to the read query's type errors (QL-VE).
+            if matches!(base.as_ref(), Operand::Var(_)) {
+                return Ok(core_query::value_ops::index_list(base_val, idx_val));
+            }
+            core_query::value_ops::index_value(base_val, idx_val)
+                .map_err(|detail| GraphError::QueryError { detail })
         }
         // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
@@ -1369,6 +1384,9 @@ fn eval_set_return_operand<S: RowSource + ?Sized>(
         }),
         Operand::Reduce { .. } => Err(GraphError::QueryError {
             detail: REDUCE_IN_WRITE_RETURN.into(),
+        }),
+        Operand::ListPredicate { .. } => Err(GraphError::QueryError {
+            detail: LIST_PREDICATE_IN_WRITE_RETURN.into(),
         }),
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
@@ -12231,10 +12249,13 @@ impl<F: Fs> GraphDb<F> {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         // Each UNION part executes against the same masked view, so the mask
         // applies uniformly across the chain.
         let view = self.view_masked(mask);
-        execute_union(&view, &union, &Params(params))
+        execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
@@ -13804,8 +13825,11 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("parse: {e}"),
         })?;
         let t0 = std::time::Instant::now();
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         let view = self.view();
-        let result = execute_union(&view, &union, &Params(params))
+        let result = execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
             .map(|rs| finish_result(&view, rs))
             .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),

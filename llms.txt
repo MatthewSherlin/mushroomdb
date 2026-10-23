@@ -322,7 +322,7 @@ CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, MERGE (ON CREATE SET
 variable-length paths (*min..max, max 10), shortestPath, CASE … WHEN … THEN … ELSE … END,
 UNION and UNION ALL, comma-separated patterns in one MATCH (`MATCH (t)-[:A]->(c), (t)-[:B]->(c)`
 is the intersection of both), relationship type alternation (`(a)-[:A|:B]->(b)`), list subscripts
-(`n.location[0]`, `[-1]`; out of range, a non-list base and a non-integer index are all null),
+(`n.location[0]`, `[-1]`; out of range is null, a non-list base or a non-integer index is a type error),
 aggregations (COUNT/SUM/AVG/MIN/MAX/collect, grouped, with DISTINCT — `count(DISTINCT r)` on a
 relationship counts distinct edges), query parameters ($name), and scalar functions (toLower,
 toUpper, size, coalesce, type(r), abs, round, textMatches, contains, startsWith, endsWith,

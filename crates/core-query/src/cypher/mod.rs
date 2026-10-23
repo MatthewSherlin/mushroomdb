@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod check;
 pub mod entity;
 pub mod exec;
 pub mod explain;
@@ -20,7 +21,9 @@ pub use ast::{
 pub use entity::{
     attach_entities, attach_requested_entities, entity_detail_requested, with_entity_detail,
 };
-pub use exec::{eval_operand, execute, execute_union, Binding, Params};
+pub use exec::{
+    eval_operand, execute, execute_planned_union, execute_union, plan_union, Binding, Params,
+};
 pub use explain::{
     explain_plan, explain_plan_with, explain_prefix, explain_statement, ExplainPrefix, IndexNames,
     NoIndexes, PROFILE_REFUSAL,

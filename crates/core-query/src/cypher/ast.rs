@@ -227,6 +227,26 @@ pub enum Expr {
     },
 }
 
+/// Which quantifier a `ListPredicate` applies. Over the predicate's
+/// per-element answers (true, false or null):
+///
+/// - `All`: false if any is false, else null if any is null, else true
+///   (true over an empty list).
+/// - `Any`: true if any is true, else null if any is null, else false.
+/// - `None`: false if any is true, else null if any is null, else true.
+/// - `Single`: false if more than one is true, else null if any is null,
+///   else true exactly when one is true (false over an empty list).
+///
+/// These are the openCypher TCK's quantifier tables (Quantifier1-4,
+/// "lists containing nulls").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredKind {
+    All,
+    Any,
+    None,
+    Single,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Prop {
@@ -262,9 +282,10 @@ pub enum Operand {
     /// Evaluates `base`: a `Value::List` gives the element at an integer
     /// `index`, where a negative index counts from the end (openCypher
     /// §3.4.4); a `Value::Map` gives the entry at a string `index`. An
-    /// out-of-range index, an absent key, any other base, or an index of the
-    /// wrong type all evaluate to null rather than erroring, so a subscript
-    /// behaves like a missing property.
+    /// out-of-range index, an absent key, or a null base or index evaluate
+    /// to null. Any other base, or an index of the wrong type, is a type
+    /// error (QL-VE); a node, relationship or path variable as the base reads
+    /// nothing.
     Index {
         base: Box<Operand>,
         index: Box<Operand>,
@@ -287,6 +308,17 @@ pub enum Operand {
         list: Box<Operand>,
         filter: Option<Box<Expr>>,
         map: Box<Operand>,
+    },
+    /// `all|any|none|single(x IN list WHERE pred)`.
+    ///
+    /// `var` is bound to each element of `list` inside `pred` only and shadows
+    /// an outer variable of the same name there. Evaluates to true, false or
+    /// null (see `ListPredKind`); a null or non-list `list` yields null.
+    ListPredicate {
+        kind: ListPredKind,
+        var: String,
+        list: Box<Operand>,
+        pred: Box<Expr>,
     },
     /// `reduce(acc = init, x IN list | body)`.
     ///
@@ -370,6 +402,7 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::MapLit(_) => "<map>".to_string(),
         Operand::ListComprehension { .. } => "<listcomp>".to_string(),
         Operand::Reduce { .. } => "<reduce>".to_string(),
+        Operand::ListPredicate { .. } => "<listpred>".to_string(),
         Operand::Pred(_) => "<pred>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))

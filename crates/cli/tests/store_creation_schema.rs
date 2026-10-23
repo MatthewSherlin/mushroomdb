@@ -433,6 +433,8 @@ const OPENS: [&str; 3] = ["GraphDb::open", "SharedDb::open", "CoreDb::open"];
 /// either a general-purpose command whose documented behaviour is to operate on
 /// whatever store it is pointed at, or an internal implementation that the CLI
 /// and bindings share. A name here that no longer exists fails the census.
+/// An entry `<file>::<fn>` (a workspace-relative path) allows only that file's
+/// function of that name; a bare name allows the function in every file.
 const ALLOWLIST: &[(&str, &str)] = &[
     (
         "run_query",
@@ -495,13 +497,22 @@ const ALLOWLIST: &[(&str, &str)] = &[
          applies no schema because callers configure the store separately",
     ),
     (
-        "new",
+        "crates/tck-runner/src/runner.rs::new",
         "tck-runner's TempGraph::new: a conformance-test fixture, not a \
          user-facing store creation path; every TCK scenario assumes an empty \
          store with no schema, so declaring the memory schema would change \
          what the scenarios measure",
     ),
 ];
+
+/// Whether ALLOWLIST `entry` covers `function` in the file `rel`: a
+/// `<file>::<fn>` entry only in that file, a bare name in any.
+fn allows(entry: &str, rel: &str, function: &str) -> bool {
+    match entry.rsplit_once("::") {
+        Some((file, name)) => file == rel && name == function,
+        None => entry == function,
+    }
+}
 
 /// Store-opening calls classified, one per line: `file:line fn class`.
 struct Site {
@@ -669,7 +680,7 @@ fn census() -> (Vec<Site>, Vec<String>) {
                     "read-only"
                 } else if applies {
                     "applies a schema"
-                } else if ALLOWLIST.iter().any(|(f, _)| *f == function) {
+                } else if ALLOWLIST.iter().any(|(f, _)| allows(f, &rel, &function)) {
                     "allowlisted"
                 } else {
                     "OFFENDER"
@@ -739,13 +750,28 @@ fn every_store_creating_call_site_applies_a_schema() {
     );
     for (name, reason) in ALLOWLIST {
         assert!(!reason.is_empty(), "{name} has no reason");
+        let bare = name.rsplit("::").next().unwrap_or(name);
         assert!(
-            functions.iter().any(|f| f == name),
+            functions.iter().any(|f| f == bare),
             "ALLOWLIST names {name}, which no longer exists"
         );
         assert!(
-            sites.iter().any(|s| s.function == *name),
+            sites.iter().any(|s| {
+                let file = s.at.rsplit_once(':').map_or(s.at.as_str(), |(f, _)| f);
+                allows(name, file, &s.function)
+            }),
             "ALLOWLIST names {name}, which no longer opens a store"
         );
     }
+}
+
+/// A path-qualified entry allows its own file's function only: allowlisting
+/// the TCK runner's `new` must not exempt every store-opening `new`.
+#[test]
+fn a_path_qualified_allowlist_entry_covers_only_its_file() {
+    let entry = "crates/tck-runner/src/runner.rs::new";
+    assert!(allows(entry, "crates/tck-runner/src/runner.rs", "new"));
+    assert!(!allows(entry, "crates/cli/src/main.rs", "new"));
+    assert!(!allows(entry, "crates/tck-runner/src/runner.rs", "open"));
+    assert!(allows("run_query", "crates/cli/src/query.rs", "run_query"));
 }

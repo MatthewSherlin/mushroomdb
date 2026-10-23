@@ -415,7 +415,21 @@ impl<'a> Parser<'a> {
         let mut nodes: Vec<RowCreateNode> = Vec::new();
         let mut edges: Vec<CreateEdge> = Vec::new();
         loop {
+            let created_before = nodes.len();
             let mut prev = self.row_create_node(scope, anonymous, &mut nodes)?;
+            // `CREATE (a)` alone, with `a` bound, would create nothing: only
+            // an end of a new relationship may name a bound node.
+            if nodes.len() == created_before
+                && !matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt))
+            {
+                return Err(crate::cypher::check::refuse(
+                    crate::cypher::check::VARIABLE_ALREADY_BOUND,
+                    format!(
+                        "CREATE ({prev}): `{prev}` is already bound; CREATE makes new nodes, \
+                         so name a new one or use the bound one as an end of a new relationship"
+                    ),
+                ));
+            }
             while matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
                 let rel = self.row_create_rel()?;
                 let next = self.row_create_node(scope, anonymous, &mut nodes)?;

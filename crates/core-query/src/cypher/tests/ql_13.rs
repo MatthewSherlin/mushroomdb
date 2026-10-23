@@ -86,8 +86,8 @@ fn no_argument_is_the_current_instant() {
         eval("localdatetime()"),
         Some(Value::LocalDateTime(_))
     ));
-    // A duration has no "now".
-    assert_eq!(eval("duration()"), None);
+    // A duration has no "now": it needs its argument (QL-TF: an error, not null).
+    assert!(eval_err("duration()").contains("duration() requires"));
 }
 
 #[test]
@@ -106,8 +106,10 @@ fn conversions_between_temporal_types() {
     );
 }
 
+/// QL-TF: an input that cannot be read is an error naming the function, not
+/// null (QL-13 gave null).
 #[test]
-fn invalid_input_is_null_not_an_error() {
+fn invalid_input_is_an_error_not_null() {
     for q in [
         "date(\"not-a-date\")",
         "date(\"2024-02-30\")",
@@ -123,24 +125,27 @@ fn invalid_input_is_null_not_an_error() {
         "date({year: 2024, bogus: 1})",
         "date({year: \"2024\"})",
         "duration({bogus: 1})",
-        "duration({days: 1.5})",
         "duration({days: \"3\"})",
         "duration({days: 3000000000})",
         "localdatetime({year: 2024, hour: 24})",
     ] {
-        assert_eq!(eval(q), None, "{q}");
+        let err = eval_err(q);
+        let f = &q[..q.find('(').unwrap()];
+        assert!(err.contains(&format!("{f}()")), "{q}: {err}");
     }
 }
 
+/// Null in, null out; a wrong type is an error naming the function (QL-TF).
 #[test]
-fn null_and_wrong_type_arguments_are_null() {
+fn null_arguments_are_null_and_wrong_types_are_errors() {
     for f in ["date", "datetime", "localdatetime", "duration"] {
         assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
-        assert_eq!(eval(&format!("{f}(42)")), None, "{f}(42)");
-        assert_eq!(eval(&format!("{f}(true)")), None, "{f}(true)");
-        assert_eq!(eval(&format!("{f}($l)")), None, "{f}($l)");
+        for arg in ["42", "true", "$l"] {
+            let err = eval_err(&format!("{f}({arg})"));
+            assert!(err.contains(&format!("{f}() expects")), "{f}({arg}): {err}");
+        }
     }
-    assert_eq!(eval("duration(date(\"2024-01-01\"))"), None);
+    assert!(eval_err("duration(date(\"2024-01-01\"))").contains("duration() expects"));
 }
 
 #[test]
@@ -210,8 +215,8 @@ fn comparison_and_equality() {
     assert!(holds("duration({days: 1}) = duration({days: 1})"));
     assert!(!holds("duration({days: 1}) < duration({days: 2})"));
     // Null on either side drops the row.
-    assert!(!holds("date(\"nope\") < date(\"2024-01-01\")"));
-    assert!(!holds("date(\"2024-01-01\") <> date(\"nope\")"));
+    assert!(!holds("date(null) < date(\"2024-01-01\")"));
+    assert!(!holds("date(\"2024-01-01\") <> date(null)"));
 }
 
 #[test]
@@ -321,7 +326,7 @@ fn arithmetic_with_durations() {
 #[test]
 fn arithmetic_null_and_range() {
     assert_eq!(eval("date(\"2024-01-01\") + n.nope"), None);
-    assert_eq!(eval("date(\"nope\") + duration({days: 1})"), None);
+    assert_eq!(eval("date(null) + duration({days: 1})"), None);
     // Out of range is null, not a panic.
     assert_eq!(
         eval("date(\"2024-01-01\") + duration({years: 100000000})"),
@@ -351,11 +356,13 @@ fn to_string_is_the_iso_text() {
         eval("toString(duration({days: 3, hours: 2}))"),
         Some(Value::Str("P3DT2H".into()))
     );
-    assert_eq!(eval("toString(date(\"nope\"))"), None);
+    assert_eq!(eval("toString(date(null))"), None);
 }
 
+/// QL-TF: out of range is an error naming the function (QL-13 gave null);
+/// never a panic or a wrap.
 #[test]
-fn extreme_years_and_fields_are_null_not_a_panic_or_a_wrap() {
+fn extreme_years_and_fields_are_errors_not_a_panic_or_a_wrap() {
     for q in [
         "date({year: 9223372036854775807})",
         "date({year: -9223372036854775807})",
@@ -389,7 +396,9 @@ fn extreme_years_and_fields_are_null_not_a_panic_or_a_wrap() {
         "localdatetime({year: -290308})",
         "datetime({year: 294248})",
     ] {
-        assert_eq!(eval(q), None, "{q}");
+        let err = eval_err(q);
+        let f = &q[..q.find('(').unwrap()];
+        assert!(err.contains(&format!("{f}()")), "{q}: {err}");
     }
 }
 

@@ -92,8 +92,10 @@ fn setting_a_temporal_value_stores_it_and_moves_the_store_to_v11() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// QL-TF: an unreadable date is an error naming the function (QL-13 gave
+/// null, which SET refused as "evaluated to null"); nothing is written.
 #[test]
-fn an_invalid_date_in_set_is_the_evaluated_to_null_refusal() {
+fn an_invalid_date_in_set_is_an_error_naming_the_function() {
     let dir = tmp("null");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("T", "a", vec![("x".into(), Value::Int(1))])
@@ -101,6 +103,14 @@ fn an_invalid_date_in_set_is_the_evaluated_to_null_refusal() {
     let err = db
         .query_write("MATCH (n:T) SET n.d = date('nope')", &no_params())
         .unwrap_err();
-    assert!(err.to_string().contains("evaluated to null"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("date(): cannot read 'nope' as a Date"),
+        "{err}"
+    );
+    let rs = db
+        .query("MATCH (n:T) RETURN n.d AS d", &no_params())
+        .unwrap();
+    assert_eq!(rs.get(0, "d"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }

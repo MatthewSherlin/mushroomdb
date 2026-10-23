@@ -253,7 +253,6 @@ fn the_refused_words_still_name_things_where_they_parse() {
         "MATCH (call {name: 'a'}) RETURN call",
         "MATCH (foreach) RETURN foreach.exists AS yield",
         "MATCH (n:Call) WHERE n.call = 1 AND n.yield = 2 RETURN n.exists",
-        "MATCH (n) RETURN exists(n.name) AS e, count(n) AS c",
         "MATCH (n) WHERE (n.x) - 1 > 0 RETURN n",
         "MATCH (n) WHERE (n.x) < -1 RETURN n",
         "UNWIND [{call: 1, yield: 2}] AS load RETURN load.call, load.yield",
@@ -265,6 +264,14 @@ fn the_refused_words_still_name_things_where_they_parse() {
         assert!(!is_call_tokens(&toks), "{q}");
         assert!(parse_read(&toks).is_ok(), "{q}: {:?}", parse_read(&toks));
     }
+    // `exists(…)` is read as a call of a function named `exists`, not refused
+    // as a form; since QL-VE an unknown function is refused at compile time.
+    let err = parse_read(&lex("MATCH (n) RETURN exists(n.name) AS e, count(n) AS c").unwrap())
+        .expect_err("exists() is not a function");
+    assert!(
+        err.starts_with("UnknownFunction: unknown function `exists`"),
+        "{err}"
+    );
 }
 
 // ── Parsing CALL ────────────────────────────────────────────────────────────

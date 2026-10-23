@@ -236,6 +236,7 @@ Reference:
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
 - [Running several processes against one store](multiprocess.md)
+- [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)
 - [Testing](testing.md)
 
@@ -3680,7 +3681,7 @@ These reach the store directly. In the listing a client receives, each descripti
 
 ### `query`
 
-Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.
+Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range or the list is null, and an error when the property is not a list or map or the index is not an integer.
 
 | Argument | Type | Required | What it is |
 |---|---|---|---|
@@ -6311,11 +6312,15 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `nodes(p)` | path | `List` | the path's nodes in walk order; the same as `p.nodes`, so over Bolt a list of Nodes |
 | `relationships(p)` | path | `List` | the path's relationships in walk order, each a `{type, start, end}` map; the same as `p.relationships`, so over Bolt a list of Relationships |
 | `length(p)` | path | `Int` | the number of relationships in the path; the same as `p.length` |
-| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. Storing a result moves the store to the V11 format |
-| `time(…)`, `localtime(…)` | | | error: `not supported in mushroomdb 0.10: time types` |
+| `date([x])` | `String`, `Map` or temporal | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null → null; unreadable, out-of-range or wrong-type input → an error naming the function. Storing a result moves the store to the V11 format |
+| `localdatetime([x])` | `String`, `Map` or temporal | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `datetime([x])` | `String`, `Map` or temporal | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00, `+0530` and `+05` read too), a string with no offset is read as UTC; no argument is now. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`, any of them fractional) or `duration("P1Y2M3DT4H")`. Null → null; bad input → an error. Storing a result moves the store to the V11 format |
+| `date.truncate(unit, x[, map])`, `localdatetime.truncate(…)`, `datetime.truncate(…)` | `String`, temporal, `Map` | the namespace's type | `x` cut to `unit` (`millennium`, `century`, `decade`, `year`, `weekYear`, `quarter`, `month`, `week`, `day`, and for the date-time types `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond`); `map` then sets fields below the unit: `date.truncate('week', d, {dayOfWeek: 2})` |
+| `date.statement([tz])`, `.transaction([tz])`, `.realtime([tz])`, the same on `localdatetime` and `datetime` | offset `String` or `{timezone: …}` | the namespace's type | the current instant, as `date()` gives it, on the clock of the offset `tz` (default UTC). Each call reads the clock |
+| `datetime.fromepoch(s, ns)`, `datetime.fromepochmillis(ms)` | `Int` | `DateTime` | the UTC instant `s` seconds plus `ns` nanoseconds, or `ms` milliseconds, after 1970-01-01 |
+| `duration.between(a, b)`, `duration.inMonths(a, b)`, `duration.inDays(a, b)`, `duration.inSeconds(a, b)` | temporal ×2 | `Duration` | from `a` to `b`: whole months, then whole days, then the time (`between`), or all of it in one unit. Two values with offsets compare as instants; otherwise each is read on its own wall clock, a date at midnight |
+| `time(…)`, `localtime(…)`, and the `time.` and `localtime.` functions | | | error: `not supported in mushroomdb 0.10: time types` |
 
 ### Temporal values
 
@@ -6331,15 +6336,46 @@ days.
 the duration's time part. Durations add, subtract, and scale with `*` and `/` by
 a number. An out-of-range result is null.
 
+A constructor gives a value or an error that names the function, never null for
+a bad input: an unreadable string, an unknown, conflicting or out-of-range map
+field, and an argument of the wrong type are errors. A null argument, or a null
+map field (`date({year: n.y})` with no `y`), gives null.
+
 Strings must be the extended ISO 8601 form the types print: `datetime` needs a
-time (`datetime("2024-03-15")` is null) and `date` takes no time
-(`date("2024-03-15T10:00:00")` is null; convert with `date(datetime(…))`).
-Compact forms (`20240315`) and named time zones (`[Europe/Paris]`, or a `timezone`
-key in a map) are not supported and give null. A map constructor takes
-`year` (required), `month`, `day`, and, for `localdatetime` and `datetime`,
-`hour`, `minute`, `second`, `millisecond`, `microsecond` and `nanosecond`, all
-integers; a `datetime` map is read as UTC. Years outside about ±5.88 million for
-`Date`, and ±292 thousand for date-times, give null.
+time (`datetime("2024-03-15")` is an error) and `date` takes no time
+(`date("2024-03-15T10:00:00")` is an error; convert with `date(datetime(…))`).
+Compact forms (`20240315`), week and ordinal date strings (`2015-W30-2`,
+`2015-202`) and fractional duration strings other than seconds (`P1.5D`) are
+not read and are errors.
+
+A map constructor names its date in one of four ways, with `year` required:
+`month` and `day`; `week` and `dayOfWeek` (ISO weeks, so `year` is the
+week-year: `{year: 1817, week: 1}` is 1816-12-30); `quarter` and
+`dayOfQuarter`; or `ordinalDay`. A field needs the one above it (`day` needs
+`month`, `minute` needs `hour`); omitted fields default to the first day and to
+midnight. `localdatetime` and `datetime` add `hour`, `minute`, `second`,
+`millisecond`, `microsecond` and `nanosecond`; the sub-second fields are parts of
+one fraction (`{millisecond: 123, microsecond: 456}` is `.123456`, and
+`microsecond: 645876` alone is `.645876`). `datetime` also takes `timezone`, an
+offset string (`'+01:00'`, `'Z'`), and `epochSeconds` or `epochMillis` in place
+of the date and time fields; with no `timezone` it is UTC.
+
+A map can also start from another value and override fields: `date: x` takes
+`x`'s date, `time: x` its time of day (and offset), `datetime: x` both:
+`date({date: d, day: 1})`, `localdatetime({date: d, time: t, second: 0})`.
+Given a `timezone`, a `datetime: x` with an offset keeps its instant
+(`datetime({datetime: x, timezone: '+05:00'})` moves the wall clock), a
+`time: x` with an offset moves its time of day, and a local one keeps its wall
+clock. An override that leaves the day invalid for the new month or year is
+an error, not a clamp: `date({date: date('2020-01-31'), month: 2})` fails, as
+does `date({year: 1900, month: 2, day: 29})` (1900 is not a leap year; 2000 is).
+
+Values hold microseconds. A nanosecond field, or a string with more than six
+fraction digits, is truncated to the microsecond toward the earlier instant,
+never rounded; durations keep nanoseconds. Named time zones
+(`'Europe/Paris'`, `[Europe/Paris]`) fail with
+`not supported in mushroomdb 0.10: named time zones`. Years outside about ±5.88
+million for `Date`, and ±292 thousand for date-times, are an error.
 
 A temporal value can be stored: `SET n.d = date("2024-01-01")` writes a `Date`.
 The first such write moves the store to the V11 snapshot format, which 0.9.x
@@ -6419,11 +6455,12 @@ for nested literals).
 As a value a predicate is three-valued: true, false or null. A comparison or `IN`
 with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
 `NOT null` is null; `null AND false` is false and `null OR true` is true;
-`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Only numbers,
-strings, temporal values of one type, and binary values order; any other pair
-compares as null under `<`, `<=`, `>` and `>=`, so `1 < 'a'`, `false < true` and
-`[1] < [2]` are all null (booleans and lists do not order). Values of different
-types are unequal (`1 = 'a'` is false).
+`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Numbers,
+strings, booleans (`false` before `true`), temporal values of one type, and binary
+values order; any other pair compares as null under `<`, `<=`, `>` and `>=`, so
+`1 < 'a'`, `true < 1` and `[1] < [2]` are all null (lists do not order), while
+`false < true` is true. Values of different types are unequal (`1 = 'a'` is
+false).
 
 A non-boolean operand of `NOT`, `AND`, `OR` or `XOR`, or a whole `WHERE` that is a
 bare value (`WHERE n.flag`), reads as true unless it is empty or zero (a non-empty
@@ -6494,10 +6531,16 @@ MATCH (n:Place) RETURN n.location[0] AS lat, n.location[1] AS lon
 MATCH (n:Place) WHERE n.tags[-1] = 'primary' RETURN key(n)
 ```
 
-Out of range, a non-list base and a non-integer index all evaluate to `null` —
-never an error, and never a match. An unaliased subscript names its own column
+An index out of range, an absent map key, and a null base or index evaluate to
+`null`. A base that is not a list or a map (`'abc'[0]`, `123[0]`), a list index
+that is not an integer (`[1, 2][true]`, `[1, 2][1.5]`) and a map key that is not a
+string (`{a: 1}[0]`) are type errors: `a string cannot be indexed; only a list or a
+map can`, `list index must be an integer, got …`, `map key must be a string, got …`.
+Before QL-VE they were null. A subscript of a node, relationship or path variable
+reads nothing (null). An unaliased subscript names its own column
 (`n.location[0]`), so two subscripts of one list are two distinct columns. A
-write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does.
+write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does,
+except that a subscript of a variable there reads nothing rather than raising.
 
 ### Examples
 
@@ -6532,7 +6575,7 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)` — null in gives null, a wrong type is an error naming the function |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
-| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
+| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range → null; a non-list base or a non-integer index is a type error |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
 | `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
 | Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d` — projects with or without a HAVING clause |
@@ -6598,10 +6641,12 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | List and map literals | `RETURN [1, n.x, 'a'] AS l, {a: 1, b: [2, 3]} AS m` — elements and values are any expression; `` {`c d`: 1} `` quotes a key. A map's keys come back sorted, not in written order: `keys({b: 1, a: 2})` is `['a', 'b']` |
 | Null inside a list or map | `RETURN [1, null] AS l`, `[n.x, n.missing]`, `{a: null}` — the element stays null in every output (Rust `Value::Null`, JSON `null`, Python `None`, TS `null`, Arrow text `[1, null]`). `size([null]) = 1`, `head([null, 1])` is null, `keys({a: null})` is `['a']`. Equality is three-valued: `[1, null] = [1, null]` is null (the row is dropped), `[1, null] = [2, null]` is false. A stored property cannot hold one (see Named-error) |
 | List comprehensions | `RETURN [x IN n.tags WHERE x <> 'old' \| x] AS active`, `[x IN [1, 2, 3] \| x * 10]`, `[x IN n.scores WHERE x > 0]` — `WHERE` and `\| expr` are each optional (no `\| expr` keeps the element). Usable in `WHERE`, `RETURN`, `ORDER BY`, `UNWIND` and as a function argument, and they nest. The variable exists only inside the comprehension and shadows an outer variable of the same name there. A null list (or a non-list) gives null; a null element is a real element, so it passes through `\| expr`, and a `WHERE` that is null drops it. Not supported in the `RETURN` of a write statement (see Named-error) |
+| List predicates | `WHERE all(x IN n.scores WHERE x > 0)`, `RETURN any(t IN n.tags WHERE t = 'new') AS fresh`, `none(…)`, `single(…)` — `all|any|none|single(x IN list WHERE predicate)`, the `WHERE` required. Usable anywhere an expression is, and they nest with each other and with comprehensions. The variable exists only inside the predicate and shadows an outer variable of the same name there. Three-valued, over the predicate's answer for each element: `all` is false if any answer is false, else null if any is null, else true (true on an empty list); `any` is true if any answer is true, else null if any is null, else false; `none` is false if any answer is true, else null if any is null, else true; `single` is false if more than one answer is true, else null if any is null, else true exactly when one answer is true (false on an empty list). A null list (or a non-list) gives null. In a `WHERE`, a null answer drops the row. Not supported in the `RETURN` of a write statement (see Named-error) |
 | `reduce()` | `RETURN reduce(total = 0, x IN n.scores \| total + x) AS sum`, `reduce(s = '', w IN n.words \| s + w)` — `reduce(acc = init, x IN list \| expr)`. `init` and `list` are read in the enclosing scope; `acc` and `x` exist only inside `expr` and shadow outer names there. An empty list gives `init`; a null list (or a non-list) gives null; a null `expr` value makes the accumulator null for the next step. Usable anywhere an expression is, and it nests with itself and with list comprehensions. Not supported in the `RETURN` of a write statement (see Named-error) |
 | Query without `MATCH` | `RETURN 1 + 1 AS x`, `UNWIND [1, 2, 3] AS x RETURN x`, `WITH 1 AS a RETURN a` — reads no graph and runs against one empty row; `UNWIND [] AS x` gives no rows |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
+| Temporal constructors and namespaced temporal functions | `RETURN date({year: 1984, week: 10, dayOfWeek: 3}) AS d`, `datetime({date: d, hour: 12, timezone: '+01:00'})`, `date.truncate('month', n.at)`, `duration.between(a.since, b.since)`, `datetime.fromepochmillis(n.ms)` — see [Temporal values](#temporal-values); a bad input is an error, never null |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
 | `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
@@ -6613,6 +6658,51 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
 | `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok` — a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
+
+### Compile-time checks
+
+After a statement parses, and before it is planned or reads a row, a check refuses
+what openCypher defines as an error whatever the data. The error is a `parse:`
+error whose message opens with the openCypher error kind and names the variable
+or function: ``parse: VariableTypeConflict: `r` is a relationship and cannot be
+used as a node``. A name whose kind is known only when a row is read (an `UNWIND`
+alias, a `$param`, a function's result) is never refused for its kind.
+
+| Kind | Refused | Example |
+|---|---|---|
+| `VariableTypeConflict` | A name bound as a node, relationship, path or literal value, then used in a pattern as another of these, in one `MATCH` or a later one | `MATCH ()-[r]-() MATCH (r)`, `MATCH (r)-[r]-()`, `MATCH r = ()-[]-(), (r)`, `WITH 123 AS n MATCH (n)` |
+| `VariableAlreadyBound` | A path name that is already bound, or that names a part of its own pattern; a `CREATE` of a bound node alone | `MATCH (p) MATCH p = ()-[]-()`, `MATCH p = (p)-[]-()`, `MATCH (a) CREATE (a)` |
+| `InvalidAggregation` | An aggregate in a `WHERE`, or in an `ORDER BY` whose projection does not aggregate | `MATCH (a) WHERE count(a) > 10`, `WITH n.x AS x ORDER BY max(n.y)` |
+| `NoExpressionAlias` | An aggregate in `WITH` with no `AS` (an unaliased scalar still names itself) | `WITH a, count(*)` |
+| `ColumnNameConflict` | Two `WITH` items with one name | `WITH 1 AS a, 2 AS a` |
+| `InvalidClauseComposition` | `UNION` and `UNION ALL` in one query | `RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a` |
+| `DifferentColumnsInUnion` | `UNION` parts whose columns (aliases, variables, `var.field`) differ | `RETURN 1 AS a UNION RETURN 2 AS b` |
+| `UnknownFunction` | A call of a function that does not exist, even where no row would reach it | `MATCH (a) RETURN foo(a)` |
+| `InvalidArgumentType` | `type()` of a node or path; `length()` of a node or relationship; `size()` of a path; `properties()` of a literal number, string, boolean or list; `IN` a literal that is not a list; a property of a literal number, string, boolean or list; a path property other than `length`, `nodes`, `relationships` | `MATCH (n) RETURN type(n)`, `RETURN properties(1)`, `RETURN 1 IN 123`, `WITH 123 AS x RETURN x.num`, `MATCH p = ()-[*]->() WHERE p.name = 'a'` |
+
+Planning reads no row either: its errors (an unbound variable, a duplicate
+`RETURN` column, `ORDER BY` a column a `DISTINCT` projection drops) are `plan:`
+errors on every read entry point.
+
+Type errors at run time, where the value is known only then: a subscript of the
+wrong type (see [List subscripts](#list-subscripts)); `range()` with an argument
+that is not an integer (``range() expects integer arguments, got a string``); and
+`properties()` of a value that is not a node, relationship, map or null
+(``properties() expects a node, a relationship or a map, got an integer``). Each
+was null before QL-VE; a null argument is still null.
+
+`range()` takes integers only, so a float bound is an error even when it is whole
+(`range(0, 3.0)`; a driver that sends numbers as floats must send integers), while
+a list subscript reads a whole float index as an integer (`[1, 2, 3][1.0]` is `2`).
+A write statement's `RETURN` reads a subscript of any variable leniently (null),
+where a read query raises for a variable holding a value that is not a list or map.
+
+Not checked at compile time (refused, if at all, when a row reaches them): an
+`ORDER BY` expression when the projection aggregates, and a relationship's
+property map in a pattern (`-[r:T {w: foo()}]->`).
+
+Kept as before, under the boolean coercion above: a node or relationship as a
+`WHERE` predicate reads as true.
 
 ### Named-error
 
@@ -6636,12 +6726,15 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN (found …)` |
 | `RETURN *` / `WITH *` with no node, path or value name in scope | `RETURN * / WITH * with no variables in scope` |
 | `RETURN *` after a `CALL` with no `YIELD` list | `RETURN * after CALL needs a YIELD list; name the columns with YIELD` |
+| A temporal constructor or function given a bad input (`date({year: 2024, month: 13})`, `date('nope')`, `date(42)`) | ``date(): `month` 13 is outside 1..=12``, `date(): cannot read 'nope' as a Date`, `date() expects a string, a map or a temporal value, got an integer` |
+| A named time zone (`datetime({year: 2024, timezone: 'Europe/Paris'})`) | `not supported in mushroomdb 0.10: named time zones` |
 | A label test on a value (`UNWIND [1] AS x RETURN x:L`) | ``x:L: `x` is not a node or a relationship`` |
 | Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
 | List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
+| List predicate in the `RETURN` of a write statement | `a list predicate is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and test it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | ``execute: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — the message lists every scalar function |
+| Unknown function name | ``parse: UnknownFunction: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — refused at compile time (see [Compile-time checks](#compile-time-checks)); the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
@@ -6670,9 +6763,7 @@ unexpected-token parse error or other unspecified result.
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
 | A node with no label or no string `id` (`CREATE ()`, `CREATE (:A {name: 'x'})`): a parse error or a named error; the label and the key are required |
 | Comma-separated patterns in `CREATE` (`CREATE (a:A {id: 'a'}), (b:B {id: 'b'})`): a parse error; use a chain or two `CREATE` clauses |
-| List predicates `all(…)`, `any(…)`, `none(…)`, `single(…)` (a parse error) |
 | List slices `l[1..3]`, `l[..2]` (a parse error) |
-| Namespaced temporal functions `date.truncate`, `datetime.fromepoch`, `duration.between`, `duration.inMonths`, … (a parse error) |
 | Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
 | Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
 | `OPTIONAL MATCH` followed by a write clause (`OPTIONAL MATCH (n) SET n.x = 1`): a parse error |
@@ -6904,8 +6995,9 @@ tiers: an `admin` or `write` key reads and writes, including inside an explicit 
 `read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
 statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
 
-`keys.json` is not part of `POST /backup` and is not copied by any backup: a restore does not bring
-keys back, so reissue or copy the file deliberately.
+`keys.json` is not part of `POST /backup` or `mushroomdb backup`, so a restore from one of those does not bring
+keys back: reissue or copy the file deliberately. The continuous S3 backup does carry it (hashes only), and
+`restore --from` and restore on boot bring it back.
 
 ## Write scopes for role-bound tokens
 
@@ -7308,7 +7400,7 @@ The server holds the read lock for the **full duration** of the operation: file 
 plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
-The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+The server copies: `snapshot.bin`, `snapshot.bin.bak` when there is one, `wal.bin`, all `wal.<N>.archive` files,
 `wal.floor`, `wal.genesis`, `roles.json`, `commit_times.bin` and, when there is one, `snapshot.intent`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
@@ -13887,6 +13979,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
 | `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a store without it cannot resolve a date to a commit until new commits build a fresh one |
 | `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent, which is its usual state — content that names the snapshot and the WAL on disk marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot; any other content is left over and is emptied at the next write |
+| `keys.json` | access-key hashes, created private (mode 0600); never tokens | every access key — reissue them. `mushroomdb backup` and `POST /backup` do not copy it; the continuous S3 backup does |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -14733,8 +14826,9 @@ window that time plus the store's open time, with a margin:
   machine marked unhealthy until `/ready` answers. What Fly does with such a
   machine is confirmed at the release gate's Fly deploy.
 - **Railway:** `healthcheckTimeout` in `railway.json` (120 s in the template).
-- **Kubernetes:** a `startupProbe` on `/ready` whose `failureThreshold` times
-  `periodSeconds` covers the restore.
+- **Kubernetes:** the template's `startupProbe` (on `/health`; the server binds
+  its port only after a restore on boot, so neither endpoint answers before
+  then) needs a `failureThreshold` times `periodSeconds` that covers the restore.
 - **Docker Compose:** the healthcheck's `start_period`, if you add one.
 - **Render:** the deploy waits for `/ready`. A restore longer than Render's
   wait fails the deploy, so measure it first.
@@ -14797,7 +14891,7 @@ amount.
 | --- | --- | --- | --- |
 | Fly.io | `kill_timeout`, integer seconds, top level of `fly.toml` | 5 s, maximum 300 s | `60` |
 | Docker Compose | `stop_grace_period` | 10 s | `60s` |
-| Kubernetes | `terminationGracePeriodSeconds` | 30 | set it to at least `60` in your manifest |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 | `120` |
 | Render, with a persistent disk | none: the shutdown delay of a service with a disk cannot be customized | 30 s, fixed | `serve` is started with `--shutdown-timeout-secs 25` so it finishes inside the window |
 | Render, without a disk | `maxShutdownDelaySeconds`, 1 to 300 | 30 s | not used by the template |
 | Railway | `deploy.drainingSeconds` in `railway.json`, or the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` variable | unverified (not stated in its docs) | `60` |
@@ -14838,6 +14932,365 @@ address without a token. This is intentional: the DB has no network stack of
 its own and should be shielded by the OS network boundary whenever possible.
 See [SECURITY.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/SECURITY.md) for the full threat model and
 vulnerability reporting process.
+
+---
+
+## docs/site/self-host.md
+
+# Self-hosting guide
+
+This page is the path from a first deploy to a store you can lose a machine
+under: put it on a volume, secure it, back it up to a bucket, restore it, watch
+it, and know where it stops. Each step says what to do and links the page that
+holds the detail. The reference pages stay the source of truth; where this page
+and one of them differ, that page is right and this one is a bug.
+
+---
+
+## 1. Overview
+
+`mushroomdb serve` is one process holding one store directory. The graph is in
+RAM and on that directory, and nowhere else, so everything below is about the
+directory: keep it on a volume, copy it somewhere, and be able to put it back.
+
+**One writer.** mushroomdb is single-writer (the `single-writer` rule in
+[Concurrency](concurrency.md)). Run exactly one `serve` per store directory
+and one per backup prefix. Every template under `deploy/` pins one replica
+and says so; none of them can be scaled out. Two servers on one volume fail to
+take the write lock, and two on one bucket prefix are caught by the lease in
+step 7, which is advisory.
+
+| Step | Do | Reference |
+|---|---|---|
+| 2 | Pick a platform and deploy | [Platform notes](#platform-notes), `deploy/` |
+| 3 | Mount the store directory on a volume | [Running as a service](service.md) |
+| 4 | Put TLS in front, set CORS | [Deployment](deployment.md) |
+| 5 | Issue access keys | [HTTP API](http.md#access-keys-and-the-write-tier) |
+| 6 | Wire the probes and the shutdown window | [Deployment](deployment.md#stopping-cleanly-and-the-grace-period) |
+| 7 | Back up to a bucket | [Deployment](deployment.md#one-writer-per-backup-bucket-the-lease) |
+| 8 | Restore, to the latest or a point in time | [Deployment](deployment.md#restoring-from-the-backup) |
+| 9 | Restore on boot | [Deployment](deployment.md#restoring-on-boot) |
+| 10 | Metrics and logs | [HTTP API](http.md#prometheus-text-format) |
+| 11 | Size it | [Known limits](limits.md) |
+
+## 2. Requirements
+
+- A host or platform that runs the container image, `ghcr.io/matthewsherlin/mushroomdb`
+  (the templates use `:latest`; pin a version tag for anything you keep). The
+  image runs as uid 65532, not root, and has no shell.
+- One persistent volume for the store directory, mounted at `/data`.
+- For backup: an S3-compatible bucket and its credentials (an `s3://`, `r2://` or
+  `minio://` URL).
+- A token. `serve` refuses a non-loopback `--addr` without `--token`,
+  `MUSHROOMDB_TOKEN` or an `admin` access key, and refuses the placeholder
+  `<set-me>`.
+
+## 3. The volume
+
+Mount the store directory on storage that outlives the process. A container
+that writes its store to its own filesystem starts empty on every restart,
+and nothing reports that as an error; see
+[What a restart without a volume costs](service.md#5-what-a-restart-without-a-volume-costs).
+Every file the directory holds, and what losing each costs, is in
+[The volume](service.md#1-the-volume).
+
+Two things to do once:
+
+- **Ownership.** A new Fly or Render volume is owned by root, and the non-root
+  image cannot write it: `serve` exits naming `/data/LOCK`. The per-platform fix
+  is in [Volume ownership on managed platforms](deployment.md#volume-ownership-on-managed-platforms).
+- **A snapshot interval.** The templates pass `--snapshot-every 300`. It bounds
+  how much WAL a hard crash leaves to replay, and nothing else; see
+  [The snapshot interval](service.md#2-the-snapshot-interval). Automatic
+  snapshots keep every archive, so disk grows by one `wal.<N>.archive` per
+  snapshot that had WAL to fold.
+
+## 4. TLS and CORS
+
+**TLS.** The recommended path is a reverse proxy that ends TLS in front of a
+server bound to loopback, or to the platform's private network: nginx and Caddy
+examples are in
+[Terminating TLS at a reverse proxy](deployment.md#terminating-tls-at-a-reverse-proxy-recommended).
+Fly, Render and Railway end TLS at their edge. Without a proxy, a binary built
+with `--features tls` serves TLS itself:
+
+```text
+mushroomdb serve /data --addr 0.0.0.0:8443 --token "$MUSHROOMDB_TOKEN" \
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+`--tls-cert` and `--tls-key` go together, and a binary built without the
+feature refuses them. Getting and renewing the certificate (ACME) is not
+mushroomdb's job; the proxy or the platform does it. See
+[Native TLS](deployment.md#native-tls---features-tls).
+
+**Bolt.** `--bolt-port` (or `MUSHROOMDB_BOLT_PORT`) serves Bolt too, on the same
+credentials. A reverse proxy for HTTP does not carry it. Which platforms can
+expose it, and how, is in
+[Exposing the Bolt port](deployment.md#exposing-the-bolt-port) and
+[Bolt protocol](bolt.md).
+
+**CORS.** A page on another origin can call the API only if
+`MUSHROOMDB_CORS_ORIGINS` names it. Unset means no CORS headers. The accepted
+forms, `*`, and what it does not cover (`/watch`) are in
+[Browser access (CORS)](deployment.md#browser-access-cors).
+
+## 5. Access keys
+
+`MUSHROOMDB_TOKEN` is one all-powerful token. For an application, issue a
+narrower key:
+
+```text
+mushroomdb keys add /data app --tier write
+mushroomdb keys add /data tenant --tier read --role tenant_a
+```
+
+The token is printed once; the store keeps only its hash, in `keys.json`. A
+running server reloads the file on `SIGHUP`. What each tier (`admin`, `write`,
+`read`) may call, the file's strict checks, and what a reload does not reach are
+in [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
+`keys add` runs against the directory, so on a platform with a volume you run it
+where the volume is mounted.
+
+An `admin` key also satisfies the non-loopback token rule. `/metrics` and
+`/backup` need the full token or an `admin` key.
+
+## 6. Probes and the shutdown window
+
+| Endpoint | Answers | Use it for |
+|---|---|---|
+| `GET /health` | 200 while the process is alive; no token | liveness |
+| `GET /ready` | 503 until the store is open, then 200; no token | readiness and platform health checks |
+
+See [`GET /health`](http.md#get-health) and [`GET /ready`](http.md#get-ready).
+Backup health never gates `/ready`: a rolling deploy starts the new instance
+while the old one still holds the lease, and a probe that followed backup health
+would never let traffic through. Watch backup health in metrics instead (step 10).
+
+**The start window.** The port is bound only once the store is open, and, with
+restore on boot, restored. A probe that runs out before that kills a start
+that was working. Give it time for a WAL replay or a restore plus the open:
+
+| Platform | Setting | In the template |
+|---|---|---|
+| Fly | `grace_period` on the `/ready` check; Fly's maximum is 60 s | `60s` |
+| Railway | `healthcheckTimeout` | `120` |
+| Kubernetes | a `startupProbe` | five minutes |
+| Compose | the healthcheck's `start_period`, if you add one | none |
+| Render | the deploy waits for `/ready` | none to set |
+
+**The stop window.** On SIGTERM `serve` drains, writes a shutdown snapshot,
+flushes the backup and deletes its lease, all inside `--shutdown-timeout-secs`
+(default 55). The platform's stop timeout must be longer, or it kills the
+sequence and leaves the lease for the next start to wait out. Nothing
+acknowledged is lost either way. The templates use 60 s on Fly, Compose and
+Railway, 120 s on Kubernetes, and, because Render fixes the window at 30 s for a
+service with a disk, `--shutdown-timeout-secs 25` there. The phases and the
+arithmetic are in
+[Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
+
+## 7. Backup to a bucket
+
+Continuous backup is on when `MUSHROOMDB_BACKUP_S3_URL` is set. Credentials and
+the endpoint come from the standard `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (default `us-east-1`) and
+`AWS_ENDPOINT_URL` variables; `r2://` and `minio://` need the endpoint. Put the
+credentials in the platform's secret store, never in a template.
+
+```text
+MUSHROOMDB_BACKUP_S3_URL=s3://my-bucket/prefix
+```
+
+A set but malformed value stops `serve` at start; a backup you asked for is
+never silently turned off. The settings, with the defaults the code uses:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MUSHROOMDB_BACKUP_S3_URL` | unset (backup off) | `s3://`, `r2://` or `minio://` `bucket/prefix` |
+| `MUSHROOMDB_BACKUP_WAL_INTERVAL_MS` | `1000` | How often new WAL bytes ship; at least 1 |
+| `MUSHROOMDB_BACKUP_MANIFEST_INTERVAL_S` | `60` | How often a restore point is written while segments accumulate between snapshots |
+| `MUSHROOMDB_BACKUP_RETAIN_N` | `7` | Restore points kept; `0` keeps every one |
+| `MUSHROOMDB_BACKUP_SSE` | unset | Server-side encryption: `AES256`, `aws:kms` or `aws:kms:dsse`; unset uses the bucket's default |
+| `MUSHROOMDB_BACKUP_LEASE_TTL` | `30` | Lease lifetime in seconds; see below |
+| `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL` | `on` | `off` for a service that rejects conditional PUT headers |
+| `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS` | `10000` | Deadline on each object-store request |
+| `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS` | `10000` | Longest the final flush may take |
+
+**What "backed up" means.** A commit is locally durable once it is fsynced to
+`wal.bin`. It is off-box durable once the WAL segment holding it has uploaded.
+The worst-case loss on losing the machine is therefore about the WAL interval
+plus the upload time, whatever `--snapshot-every` says. The lag is
+`mushroomdb_backup_lag_seconds`: the age of the oldest durable byte not yet
+shipped. The worker never blocks writes; it reads fsynced bytes only, and
+reports failure through metrics and the log.
+
+**Cost.** Each interval with new writes is one object PUT, none while idle.
+`snapshot.bin` uploads only when a snapshot is written, an archive uploads once,
+and each cycle adds a small manifest PUT and a LIST. Raising the WAL interval
+cuts the request count and lengthens the loss window by the same amount. Retention
+deletes what no kept restore point names.
+
+**What a backup holds.** `snapshot.bin`, the archives, the WAL segments and the
+small side files, including `roles.json` and `keys.json` (key hashes, never
+tokens), so a restore brings roles and keys back. The bucket therefore holds
+those hashes: give it the access you would give the volume. `mushroomdb backup`
+and `POST /backup` are the local copies, take a directory, and do not carry
+`keys.json`; see [Backup](service.md#3-backup).
+
+**The lease.** Before it uploads anything, the worker takes a lease on the
+prefix, one object named `LEASE`, and renews it every third of the TTL. A second
+instance on the same prefix finds it fresh, uploads nothing, reports unhealthy
+naming the holder, and keeps serving from its own disk. A clean stop deletes the
+lease so a successor starts at once; a killed holder leaves it to expire, at most
+40 s at the default.
+
+**The lease is advisory, not a distributed lock.** It catches the usual mistake
+of two machines on one bucket. On a service that honours conditional PUTs (AWS
+S3, R2, MinIO) the bucket also refuses a stale writer's overwrites, and the worst
+outcome is an orphaned object. With `MUSHROOMDB_BACKUP_LEASE_CONDITIONAL=off`
+two instances starting together can both upload until the next renewal, and a
+restore point can then fail to verify. It is no substitute for running one
+instance. The full account is in
+[One writer per backup bucket](deployment.md#one-writer-per-backup-bucket-the-lease).
+
+**One store per prefix.** A restored store is a new lineage and the worker
+refuses to back it up to the prefix it came from; give it a new prefix. The one
+exception is restore on boot (step 9).
+
+## 8. Restore
+
+```text
+mushroomdb restore --from s3://my-bucket/prefix --into ./restored
+```
+
+This restores the newest restore point, plus the WAL segments uploaded after it
+up to the last contiguous one. `--into` must not exist or must be empty. Every
+object is checked against its manifest before anything is written there, and the
+store appears all at once or not at all.
+
+**Point in time.** `--at` takes a commit number or an RFC 3339 instant:
+
+```text
+mushroomdb restore --from s3://my-bucket/prefix --at 2026-10-01T12:00:00Z --into ./restored
+```
+
+`--at 75` is the store right after commit 75, numbered as `asof --commit` counts.
+An instant resolves through the backup's recorded commit times, and one past the
+newest recorded time is refused when later commits have none; restore by commit
+number instead. A point is out of reach below the oldest commit the backup holds
+or once archive retention cut the history it needs. Details, and what a killed
+restore leaves behind, are in
+[Restoring from the backup](deployment.md#restoring-from-the-backup).
+
+Start `serve` on the restored directory like any store. Rehearse this before you
+need it: restore into a scratch directory and time it from the region you would
+restore in. The time sets the start window in step 6.
+
+For a plain directory backup taken with `POST /backup`, the matching restore is
+`serve --restore-from <dir>` on an empty store directory; see
+[Restore](service.md#4-restore).
+
+## 9. Restore on boot
+
+```text
+MUSHROOMDB_RESTORE_FROM_S3=s3://my-bucket/prefix
+```
+
+Set beside `MUSHROOMDB_BACKUP_S3_URL`, usually to the same prefix. When the data
+directory holds no store, `serve` restores the prefix's newest restore point
+before it opens the store and before it binds the port, so a replaced machine or
+a new volume comes back with its data.
+
+| Data directory | Prefix | `serve` does |
+|---|---|---|
+| Holds a store | not contacted | serves the store |
+| Empty | has a backup | restores it, then serves |
+| Empty | holds no backup | warns, starts empty: a first deploy |
+| Empty | backup that cannot be restored | exits 1, serves nothing, tries again next start |
+
+Rules worth knowing before you leave it in a template:
+
+- It never overwrites a store. It cannot be combined with `--restore-from` or
+  `--demo-if-empty`; `serve` refuses the pair.
+- It takes the bucket lease first. If another instance holds a fresh lease,
+  `serve` exits 1 naming it and writes nothing.
+- The restored store continues the same prefix as a new lineage, with a
+  `backup.parent` record, and the parent's restore points stay as they were.
+- A large restore delays readiness, so size the start window to it (step 6). A
+  start window that runs out loses nothing; the next start restores again.
+
+The full rules, including the install marker a crash leaves, are in
+[Restoring on boot](deployment.md#restoring-on-boot).
+
+## 10. Metrics and logs
+
+**Prometheus.** `GET /metrics` with `Accept: text/plain` answers in the Prometheus
+text format; without it, JSON. It needs the full token or an `admin` key. A scrape
+job with the token as a bearer credential, the metric list and example alerts are
+in [Prometheus text format](http.md#prometheus-text-format). The three to alert
+on are `mushroomdb_backup_lag_seconds`, `mushroomdb_backup_healthy` and
+`mushroomdb_backup_last_success_timestamp_seconds`. The `mushroomdb_backup_*`
+series exist only with backup on.
+
+**Logs.** `MUSHROOMDB_LOG_FORMAT=json` writes one JSON object per line on stderr,
+for a log shipper; unset or `text` keeps text. The templates for Fly, Render and
+Compose set `json`. `MUSHROOMDB_LOG` takes the usual filter, such as
+`server=debug`, for a line per request while you debug. The default is quiet: 5xx,
+requests slower than 5 s and 4xx are logged, and every response carries an
+`x-request-id` to find them by. The query string is never logged. See
+[Stopping it, and what it writes to the log](service.md#7-stopping-it-and-what-it-writes-to-the-log).
+
+## 11. Sizing and limits
+
+There is no measured formula from node count to RAM in this repository, so this
+page does not give one. What is measured, on the build and machine named in each
+case, is in [Known limits](limits.md): a run of 1,000,000 nodes in the memory
+shape (entities with text, about 1.6 edges per node, one rule) peaked at
+2.65 GiB and opened in 1.18 s from a snapshot and 11.3 s from the WAL; a run of
+100,000 nodes with about 10 million derived edges needed 8.09 GiB to replay the
+WAL without a snapshot. Memory depends on edges and rules as much as nodes, so
+measure your own data: load a copy and read `rss_bytes` from `GET /metrics` (JSON) or
+`mushroomdb_rss_bytes` from its text form. A snapshot is memory-mapped, so a store
+reopens far faster from one than from its WAL.
+
+Set the platform's memory limit above the peak you measure, with room for the
+shutdown snapshot. The Kubernetes template asks for 512Mi and limits 1Gi, which is
+a placeholder to change.
+
+Limits that shape a deployment:
+
+- One writer per store; no read replicas. Scale up, not out.
+- HTTP transactions and Bolt connections are bounded: `--tx-max` (100),
+  `--tx-timeout-secs` (30), `--tx-max-lifetime-secs` (300) and
+  `--bolt-max-connections` (256). See [Transactions](http.md#transactions) and
+  [`serve`](cli.md#serve).
+- Peer writes by another process fire no subscriber events; the rest are in
+  [Known limits](limits.md).
+
+## Platform notes
+
+Each template under `deploy/` is a starting point, not a tested deployment: none
+has run on a live platform yet, and the pages that describe them say so.
+
+| Platform | Template | What to know |
+|---|---|---|
+| Fly | `deploy/fly/fly.toml` | One machine and one volume `mushroomdb_data`; chown the volume once; `kill_timeout = 60`; `/ready` check with a 60 s grace; Bolt public behind Fly's `tls` handler, with `MUSHROOMDB_BOLT_ADVERTISED_HOST` to change |
+| Render | `deploy/render/render.yaml` | A disk fixes the stop window at 30 s, so `--shutdown-timeout-secs 25`; the disk mounts root-owned, so use the wrapper image; HTTP only, no Bolt |
+| Railway | `deploy/railway/railway.json` | `RAILWAY_RUN_UID=0` for the volume; `healthcheckTimeout` 120; `drainingSeconds` 60; Bolt is a dashboard setting |
+| Docker Compose | `deploy/docker-compose/docker-compose.yml` | A named volume needs no chown; `stop_grace_period: 60s`; bundled MinIO for development only; Bolt bound to `127.0.0.1` |
+| Kubernetes | `deploy/k8s/statefulset.yaml` | One-replica StatefulSet; create the token Secret first; `fsGroup: 65532`; `/ready` and `/health` probes; Bolt in-cluster only |
+
+Backup and restore-on-boot are in each template as commented-out lines for you to
+turn on; the `AWS_*` credentials go in the platform's secret store. The
+per-platform recipes, the Kubernetes steps and what CI checks of the templates are
+in [Deployment](deployment.md).
+
+## See also
+
+- [Running as a service](service.md): the volume, snapshots, local backup and restore
+- [Deployment](deployment.md): TLS, CORS, Bolt, the lease, restore, shutdown
+- [HTTP API](http.md): probes, access keys, metrics
+- [Known limits](limits.md): what was measured and what was not
 
 ---
 
@@ -14954,7 +15407,7 @@ What mushroomdb does not do, or does only up to a point. Each row says what was 
 | Limitation | Detail |
 |---|---|
 | Memory-first | The working graph lives in RAM. **Measured to 100,000 nodes and about 10 million derived edges**, on a 24 GiB machine, across two builds: on v0.1.1 (2026-08-24), 4.72 GiB peak while building it and 8.09 GiB to replay the WAL with no snapshot; on v0.2 (2026-08-28), 0.02 s at 31–41 MiB to reopen from a snapshot, which is memory-mapped rather than loaded. None of these was re-measured on the current build. Ten million nodes was the original design intent and is not a measurement. A memory-shaped run on 0.8.0 (entities with text, the memory schema, about 1.6 edges per node and one rule) reached **1,000,000 nodes at 2.65 GiB peak**, opening in 1.18 s from a snapshot and 11.3 s from the WAL, with `recall` at 66 ms p50; its one rule tripped its 1,000,000-edge budget, so that run says nothing about ten million derived edges at that size. In the 100,000-node run each rule was capped at 1,000,000 derived edges. See [`dogfood/results/scale-memory-1m.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-memory-1m.md). See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
-| Single writer, no interactive transactions | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Multi-statement `BEGIN`/`COMMIT` is not supported, and there are no cross-process transactions. |
+| Single writer; interactive transactions are snapshot-isolated and in memory | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Interactive transactions (HTTP `/tx/*`, Bolt `BEGIN`/`COMMIT`) group statements into one atomic commit under snapshot isolation, but live in the server's memory and are rolled back by a restart; see [Transactions](http.md#transactions). There are no cross-process transactions. |
 | Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a snapshot (measured on V8; the format is V9 now, V10 with multiplicity) vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
