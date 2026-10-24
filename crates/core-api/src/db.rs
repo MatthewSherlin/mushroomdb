@@ -13909,6 +13909,8 @@ impl<F: Fs> GraphDb<F> {
         stmt: WriteStatement,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // One instant for every clock call in the statement, per row included.
+        let _clock = core_query::cypher::StatementClock::enter();
         match stmt {
             WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),

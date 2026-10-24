@@ -196,22 +196,154 @@ pub fn construct(norm: &str, arg: Option<Value>) -> Fallible<Option<Value>> {
         return Err(format!("unknown function `{norm}`"));
     };
     match arg {
-        None => now(kind, 0).map(Some),
+        None => now(kind, 0, Scope::Statement).map(Some),
         Some(v) => temporal_from(kind, norm, v),
     }
 }
 
-fn now_micros() -> i64 {
+// ---------------------------------------------------------------------------
+// The clock: one instant per statement, one per transaction
+// ---------------------------------------------------------------------------
+
+/// Which instant a clock call reads. `date()`, `datetime()`, `localdatetime()`
+/// and the `.statement()` forms read [`Scope::Statement`]; `.transaction()`
+/// reads [`Scope::Transaction`]; `.realtime()` reads the clock itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Statement,
+    Transaction,
+    Realtime,
+}
+
+#[derive(Default)]
+struct ClockState {
+    /// Nesting depth of [`StatementClock`] guards on this thread.
+    depth: usize,
+    /// The statement's instant, read on its first use.
+    statement: Option<i64>,
+    /// The enclosing transaction's instant, set by [`TransactionClock`].
+    transaction: Option<i64>,
+    /// A test's clock, in place of the system's.
+    source: Option<Box<dyn FnMut() -> i64>>,
+}
+
+thread_local! {
+    static CLOCK: std::cell::RefCell<ClockState> = std::cell::RefCell::new(ClockState::default());
+}
+
+/// Holds one instant for every non-realtime clock call made while it lives.
+/// Take one at the top of every statement; a guard taken inside another (a
+/// write statement running its read part) joins the outer statement's instant.
+/// Outside any guard each call reads the clock, as a library caller of the
+/// evaluator expects.
+pub struct StatementClock {
+    outermost: bool,
+}
+
+impl StatementClock {
+    pub fn enter() -> Self {
+        let outermost = CLOCK.with(|c| {
+            let mut c = c.borrow_mut();
+            c.depth += 1;
+            c.depth == 1
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for StatementClock {
+    fn drop(&mut self) {
+        CLOCK.with(|c| {
+            let mut c = c.borrow_mut();
+            c.depth -= 1;
+            if self.outermost {
+                c.statement = None;
+            }
+        });
+    }
+}
+
+/// Makes `instant` (microseconds since the epoch, from [`clock_micros`] at
+/// BEGIN) the instant `.transaction()` returns while it lives.
+pub struct TransactionClock {
+    previous: Option<i64>,
+}
+
+impl TransactionClock {
+    pub fn enter(instant: i64) -> Self {
+        let previous = CLOCK.with(|c| c.borrow_mut().transaction.replace(instant));
+        Self { previous }
+    }
+}
+
+impl Drop for TransactionClock {
+    fn drop(&mut self) {
+        CLOCK.with(|c| c.borrow_mut().transaction = self.previous);
+    }
+}
+
+/// The clock now, in microseconds since the epoch: what BEGIN records as a
+/// transaction's instant.
+pub fn clock_micros() -> i64 {
+    CLOCK.with(|c| match c.borrow_mut().source.as_mut() {
+        Some(source) => source(),
+        None => system_micros(),
+    })
+}
+
+/// Run `body` with `source` as this thread's clock. For tests: it makes the
+/// instants deterministic without a sleep.
+#[doc(hidden)]
+pub fn with_test_clock<R>(source: impl FnMut() -> i64 + 'static, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnMut() -> i64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLOCK.with(|c| c.borrow_mut().source = self.0.take());
+        }
+    }
+    let previous = CLOCK.with(|c| c.borrow_mut().source.replace(Box::new(source)));
+    let _restore = Restore(previous);
+    body()
+}
+
+fn system_micros() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
         Err(e) => -i64::try_from(e.duration().as_micros()).unwrap_or(i64::MAX),
     }
 }
 
-/// The current instant as `kind`, on the clock of `offset_seconds`.
-fn now(kind: Kind, offset_seconds: i32) -> Fallible<Value> {
+/// The instant `scope` names. Inside a statement the first read fixes it.
+fn instant(scope: Scope) -> i64 {
+    match scope {
+        Scope::Realtime => clock_micros(),
+        Scope::Statement => {
+            let held = CLOCK.with(|c| {
+                let c = c.borrow();
+                (c.depth > 0).then_some(c.statement)
+            });
+            match held {
+                None => clock_micros(),
+                Some(Some(t)) => t,
+                Some(None) => {
+                    let t = clock_micros();
+                    CLOCK.with(|c| c.borrow_mut().statement = Some(t));
+                    t
+                }
+            }
+        }
+        // A statement outside a transaction is its own transaction.
+        Scope::Transaction => match CLOCK.with(|c| c.borrow().transaction) {
+            Some(t) => t,
+            None => instant(Scope::Statement),
+        },
+    }
+}
+
+/// The instant `scope` names, as `kind`, on the clock of `offset_seconds`.
+fn now(kind: Kind, offset_seconds: i32, scope: Scope) -> Fallible<Value> {
     let local =
-        i128::from(now_micros()) + i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND);
+        i128::from(instant(scope)) + i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND);
     Parts::local(local, Some(offset_seconds)).into_value(kind, kind_fn(kind))
 }
 
@@ -427,7 +559,7 @@ fn from_map(
             if matches!(tz, Value::Null) {
                 return Ok(None);
             }
-            return now(kind, parse_timezone(fname, tz)?).map(Some);
+            return now(kind, parse_timezone(fname, tz)?, Scope::Statement).map(Some);
         }
     }
     if let Some(key) = m.keys().find(|k| !takes_field(kind, k, truncating)) {
@@ -947,7 +1079,12 @@ pub fn call_namespaced(
         | "datetime.transaction"
         | "datetime.realtime" => {
             let kind = Kind::of(namespace).unwrap_or(Kind::Date);
-            clock(canonical, kind, (n == 1).then_some(a)).map(Some)
+            let scope = match canonical.rsplit('.').next() {
+                Some("transaction") => Scope::Transaction,
+                Some("realtime") => Scope::Realtime,
+                _ => Scope::Statement,
+            };
+            clock(canonical, kind, scope, (n == 1).then_some(a)).map(Some)
         }
         // `namespaced` lists every name above; a name it does not list is
         // never dispatched here, and must not read the clock if it is.
@@ -956,8 +1093,9 @@ pub fn call_namespaced(
 }
 
 /// `<type>.statement/transaction/realtime([timezone])`: the current instant,
-/// as `<type>()` gives it (QL-13's clock), on the clock of `timezone`.
-fn clock(fname: &str, kind: Kind, arg: Option<Value>) -> Fallible<Value> {
+/// as `<type>()` gives it, on the clock of `timezone`: the statement's instant,
+/// the transaction's, or (`realtime`) the clock itself.
+fn clock(fname: &str, kind: Kind, scope: Scope, arg: Option<Value>) -> Fallible<Value> {
     let offset = match arg {
         None => 0,
         Some(Value::Map(m)) if m.len() == 1 && m.contains_key("timezone") => {
@@ -971,7 +1109,7 @@ fn clock(fname: &str, kind: Kind, arg: Option<Value>) -> Fallible<Value> {
             ))
         }
     };
-    now(kind, offset)
+    now(kind, offset, scope)
 }
 
 /// `datetime.fromepoch(seconds, nanoseconds)` (`nanos_per_unit` 10^9) and

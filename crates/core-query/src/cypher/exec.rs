@@ -497,6 +497,7 @@ fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
 /// [`entity`](crate::cypher::entity)); no entity details are attached here.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     use crate::cypher::plan::row_bound;
+    let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut rs = execute_inner(view, plan, params, row_bound(plan))?;
     rs.set_column_kinds(output_kinds(plan));
     Ok(rs)
@@ -530,6 +531,8 @@ pub fn execute_planned_union(
     all_flags: &[bool],
     params: &Params,
 ) -> Result<ResultSet, String> {
+    // Every part of a `UNION` is one statement, so one instant.
+    let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut acc: Option<ResultSet> = None;
     for (i, ops) in plans.iter().enumerate() {
         let rs = execute(view, ops, params)?;
@@ -6738,6 +6741,10 @@ mod ql_04;
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]
 mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_cl.rs"]
+mod ql_cl;
 
 #[cfg(test)]
 #[path = "tests/ql_tf.rs"]

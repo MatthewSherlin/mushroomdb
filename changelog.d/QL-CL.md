@@ -1,0 +1,2 @@
+### Fixed
+- **The clock functions return one instant per statement.** `date()`, `datetime()`, `localdatetime()` and their `.statement()` forms now return the same instant for the whole statement, on every row and in every clause (`datetime() = datetime()` is true; `SET n.t = datetime()` over a thousand rows writes one value), and `.transaction()` returns the instant the transaction began, the same in each of its statements. `.realtime()` still reads the clock on every call. Before, every call read the clock, so two calls in one statement could differ. (QL-CL, defect row 161)

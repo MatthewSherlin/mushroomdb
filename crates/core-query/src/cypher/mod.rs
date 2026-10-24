@@ -9,6 +9,7 @@ pub mod plan;
 pub mod predicate;
 pub mod proc;
 mod temporal;
+pub use temporal::{clock_micros, with_test_clock, StatementClock, TransactionClock};
 
 pub use ast::{
     operand_label, ret_val_label, AggArg, AggFunc, CallReturn, CreateEdge, CreateNode, CreateStmt,

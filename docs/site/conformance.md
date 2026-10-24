@@ -3,7 +3,7 @@
 mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every change. The TCK is a suite of scenarios, each a query with the result, error or graph change it must give. This page is generated from one run: every number on it is a count of scenarios.
 
 - TCK version: `2024.3`, vendored unmodified in `vendor/opencypher-tck/`.
-- Generated: 2026-10-23 by `cargo run --release -p tck-runner -- --report docs/site/conformance.md`.
+- Generated: 2026-10-24 by `cargo run --release -p tck-runner -- --report docs/site/conformance.md`.
 - The pass rate is passed / (passed + failed). Skipped scenarios are in neither: a scenario is skipped only when it uses a feature this release deliberately does not have (listed under [Skipped scenarios](#skipped-scenarios)).
 - CI fails when the pass rate falls below `tck-baseline.txt`; the baseline is raised by an ordinary change when the rate rises.
 - The Cypher this release supports is documented in [Cypher Query Reference](query.md).
