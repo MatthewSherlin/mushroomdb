@@ -1141,7 +1141,8 @@ rolls back every open one.
   is rolled back. Every `run` restarts the clock; `GET /tx/{id}` does not. The owner of an expired id
   hears `410` (`transaction expired: idle too long, rolled back`) for a while afterwards, then `404`.
 - **Lifetime.** A transaction is rolled back `MUSHROOMDB_TX_MAX_LIFETIME_SECS` seconds after `begin`
-  (default 300) however often it is used, even while a statement is running on it. `expires_at` is the
+  (default 300) however often it is used, even while a statement is running on it. Its owner then hears
+  `410` with `transaction expired: open longer than its maximum lifetime, rolled back`. `expires_at` is the
   nearer of the idle deadline and this one. A transaction holds its snapshot and every write it has
   buffered in memory (up to a request body, 64 MiB, per statement), so keep them short; the open limit
   and the lifetime bound the total, not the size of one.

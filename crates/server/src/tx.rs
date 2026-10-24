@@ -186,6 +186,16 @@ struct Slot {
 struct Tombstone {
     owner: String,
     expired_at: Instant,
+    why: Expiry,
+}
+
+/// Which limit rolled a transaction back; the 410 says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// Idle for the idle timeout.
+    Idle,
+    /// Open for the maximum lifetime, however busy.
+    Lifetime,
 }
 
 #[derive(Default)]
@@ -206,8 +216,8 @@ struct Inner {
 pub(crate) enum TxError {
     /// No such transaction, or not the caller's.
     NotFound,
-    /// The idle timeout rolled it back.
-    Expired,
+    /// The idle timeout or the lifetime rolled it back.
+    Expired(Expiry),
     /// Another request has it checked out.
     Busy,
     /// The server is shutting down.
@@ -220,9 +230,14 @@ impl IntoResponse for TxError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "unknown transaction".to_string()),
-            Self::Expired => (
+            Self::Expired(Expiry::Idle) => (
                 StatusCode::GONE,
                 "transaction expired: idle too long, rolled back".to_string(),
+            ),
+            Self::Expired(Expiry::Lifetime) => (
+                StatusCode::GONE,
+                "transaction expired: open longer than its maximum lifetime, rolled back"
+                    .to_string(),
             ),
             Self::Busy => (StatusCode::CONFLICT, "transaction busy".to_string()),
             Self::Closed => (
@@ -350,10 +365,11 @@ impl TxStore {
         if slot.deadline <= now {
             // Expired before the reaper got to it: it is rolled back now.
             slot.body = Some(body);
+            let why = self.expiry(slot, now);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
-            return Err(TxError::Expired);
+            return Err(TxError::Expired(why));
         }
         Ok(body)
     }
@@ -370,7 +386,7 @@ impl TxStore {
             drop((slot, body));
             return Err(TxError::Closed);
         }
-        let was_expired = state.expired.contains_key(id);
+        let was_expired = state.expired.get(id).map(|t| t.why);
         match state.open.get_mut(id) {
             Some(slot) => {
                 let (deadline, deadline_wall) = self.next_deadline(now, slot.born);
@@ -381,8 +397,7 @@ impl TxStore {
                 Ok(())
             }
             // Removed while the statement ran: past its lifetime.
-            None if was_expired => Err(TxError::Expired),
-            None => Err(TxError::NotFound),
+            None => Err(was_expired.map_or(TxError::NotFound, TxError::Expired)),
         }
     }
 
@@ -403,10 +418,11 @@ impl TxStore {
             return Err(TxError::NotFound);
         }
         if slot.body.is_some() && slot.deadline <= now {
+            let why = self.expiry(slot, now);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
-            return Err(TxError::Expired);
+            return Err(TxError::Expired(why));
         }
         Ok((slot.deadline_wall, slot.op_count))
     }
@@ -457,7 +473,7 @@ impl TxStore {
     /// expired, 404 to anyone else.
     fn missing(state: &Registry, id: &str, owner: &str) -> TxError {
         match state.expired.get(id) {
-            Some(t) if same_owner(&t.owner, owner) => TxError::Expired,
+            Some(t) if same_owner(&t.owner, owner) => TxError::Expired(t.why),
             _ => TxError::NotFound,
         }
     }
@@ -466,11 +482,22 @@ impl TxStore {
     /// it (the rollback) after releasing the lock.
     fn expire(&self, state: &mut Registry, id: &str, now: Instant) -> Option<Slot> {
         let slot = state.open.remove(id)?;
-        self.remember(state, id, &slot.owner, now);
+        let why = self.expiry(&slot, now);
+        self.remember(state, id, &slot.owner, now, why);
         Some(slot)
     }
 
-    fn remember(&self, state: &mut Registry, id: &str, owner: &str, now: Instant) {
+    /// Which limit a slot that is due at `now` ran into: the lifetime when it
+    /// has passed, else the idle timeout.
+    fn expiry(&self, slot: &Slot, now: Instant) -> Expiry {
+        if slot.born + self.inner.limits.max_lifetime <= now {
+            Expiry::Lifetime
+        } else {
+            Expiry::Idle
+        }
+    }
+
+    fn remember(&self, state: &mut Registry, id: &str, owner: &str, now: Instant, why: Expiry) {
         if state.expired.len() >= MAX_TOMBSTONES {
             let oldest = state
                 .expired
@@ -486,6 +513,7 @@ impl TxStore {
             Tombstone {
                 owner: owner.to_string(),
                 expired_at: now,
+                why,
             },
         );
     }
@@ -892,7 +920,10 @@ mod tests {
         assert_eq!(s.reap(Instant::now()), 0);
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(1)), 1);
         assert_eq!(s.open_count(), 0);
-        assert_eq!(s.checkout(&id, "alice").err(), Some(TxError::Expired));
+        assert_eq!(
+            s.checkout(&id, "alice").err(),
+            Some(TxError::Expired(Expiry::Idle))
+        );
         assert_eq!(s.checkout(&id, "mallory").err(), Some(TxError::NotFound));
     }
 
@@ -951,7 +982,10 @@ mod tests {
         s.checkin(&id, held, true).unwrap();
         // Past the lifetime it goes, even though it was just used.
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(101)), 1);
-        assert_eq!(s.checkout(&id, "a").err(), Some(TxError::Expired));
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
     }
 
     #[test]

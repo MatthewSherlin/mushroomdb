@@ -89,16 +89,13 @@ list the schema as it was at `BEGIN`.
 
 | What happened | Rust | Python | TypeScript | HTTP | Bolt | Retry? |
 |---|---|---|---|---|---|---|
-| Another writer changed a node the transaction read or wrote | `GraphError::CasConflict` | `TransactionConflict` | `TransactionConflictError`, `code` `"conflict"` | `409`, `"code": "conflict"` | `DeadlockDetected` (transient) | Yes, the whole transaction from `BEGIN` |
-| A unique constraint refuses the commit | `GraphError::ConstraintViolation` | `ConstraintViolation` | `TransactionConflictError`, `code` `"constraint"` | `409`, `"code": "constraint"` | `ConstraintValidationFailed` (client error) | No: it fails again until the clashing value changes |
+| Another writer changed a node the transaction read or wrote | `GraphError::CasConflict` | `TransactionConflict` | `TransactionConflictError` | `409`, `"code": "conflict"` | `DeadlockDetected` (transient) | Yes, the whole transaction from `BEGIN` |
+| A unique constraint refuses the commit | `GraphError::ConstraintViolation` | `ConstraintViolation` | `ConstraintViolationError` | `409`, `"code": "constraint"` | `ConstraintValidationFailed` (client error) | No: it fails again until the clashing value changes |
 | A second request while one is running on the same transaction | | | `MushroomError`, `code` `"busy"` | `409`, `"code": "busy"` | | Yes, the request, once the first returns |
 | The transaction timed out or the server restarted | | | `TransactionExpiredError` | `410`, then `404` | `TransactionTimedOut` | Yes, from `BEGIN` |
 | A schema statement inside the transaction | `GraphError::QueryError` | `QueryError` | `MushroomError`, status 400 | `400` | `SyntaxError` | No: run it outside the transaction |
 
 A failed commit has written nothing, and the transaction is over either way.
-
-The TypeScript client throws `TransactionConflictError` for a constraint refusal too. Check `err.code`
-before retrying: retry on `"conflict"`, not on `"constraint"`.
 
 ## Rust
 
@@ -216,9 +213,9 @@ The server holds open transactions in memory and bounds them:
 | Transactions open at once (`503` with `Retry-After: 1` beyond it) | `--tx-max` | `MUSHROOMDB_TX_MAX` | 100 |
 
 A flag wins over its variable. These limits apply to HTTP transactions; Bolt has its own idle limit
-(see [Bolt](#bolt)). An expired transaction answers its owner `410` with
-`transaction expired: idle too long, rolled back`, for a while, then `404`; the message is the same
-when the lifetime, not the idle time, ran out. When the server is told to stop, it rolls back every
+(see [Bolt](#bolt)). An expired transaction answers its owner `410` for a while, then `404`. The
+message says which limit ended it: `transaction expired: idle too long, rolled back`, or
+`transaction expired: open longer than its maximum lifetime, rolled back`. When the server is told to stop, it rolls back every
 open transaction at the start of the drain and answers `POST /tx/begin` with `503`.
 
 ## TypeScript
@@ -246,10 +243,12 @@ try {
 try {
   const commitNumber = await tx.commit();
 } catch (err) {
-  if (err instanceof TransactionConflictError && err.code === 'conflict') {
+  if (err instanceof TransactionConflictError) {
     // a node it read or wrote changed after begin: nothing was written,
     // so the whole unit of work can run again
   }
+  // A ConstraintViolationError (a unique constraint refused the writes) is not
+  // worth retrying: the same writes are refused again.
   throw err;
 }
 ```

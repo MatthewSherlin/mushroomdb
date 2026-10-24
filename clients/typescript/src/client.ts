@@ -13,6 +13,7 @@
  */
 
 import {
+  ConstraintViolationError,
   MushroomError,
   TransactionConflictError,
   TransactionExpiredError,
@@ -106,7 +107,12 @@ export type {
   WccConfig,
   WccReport,
 } from "./types.js";
-export { MushroomError, TransactionConflictError, TransactionExpiredError };
+export {
+  ConstraintViolationError,
+  MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
+};
 export type { TxBeginResponse, TxCommitResponse };
 
 /** Optional constructor flags for {@link MushroomClient}. */
@@ -221,6 +227,7 @@ export class TxHandle {
    * refuses all further use.
    *
    * @throws {@link TransactionConflictError} when a node the transaction read or wrote changed since begin.
+   * @throws {@link ConstraintViolationError} when a unique constraint refuses the writes; not retryable.
    * @throws {@link TransactionExpiredError} when the transaction expired before the commit.
    */
   async commit(): Promise<number> {
@@ -233,6 +240,7 @@ export class TxHandle {
     } catch (err) {
       if (
         err instanceof TransactionConflictError ||
+        err instanceof ConstraintViolationError ||
         err instanceof TransactionExpiredError
       ) {
         // The server ended the transaction.
@@ -377,6 +385,9 @@ export class MushroomClient {
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
       const code: string | undefined =
         typeof body?.code === "string" ? body.code : undefined;
+      if (resp.status === 409 && code === "constraint") {
+        throw new ConstraintViolationError(detail, resp.status, code);
+      }
       throw new MushroomError(detail, resp.status, code);
     }
     return body as T;
@@ -1000,7 +1011,8 @@ export class MushroomClient {
 
   /**
    * Run one request against a transaction route and map its failures: HTTP 409
-   * becomes {@link TransactionConflictError}. 404 and 410 become
+   * becomes {@link TransactionConflictError}, except `busy` (a plain
+   * {@link MushroomError}) and `constraint` (a {@link ConstraintViolationError}). 404 and 410 become
    * {@link TransactionExpiredError} on `/run`, `/commit` and `/rollback`
    * (`expiredOnMissing`); on `/tx/begin` they mean the server has no
    * transaction routes.
@@ -1016,9 +1028,10 @@ export class MushroomClient {
       if (err instanceof MushroomError) {
         // `busy` is a request that raced another on the same transaction:
         // nothing is wrong with the transaction, so it is not a conflict and
-        // the handle stays open. Any other 409 (`conflict`, or no code from an
-        // older server) is a commit conflict.
-        if (err.status === 409 && err.code !== "busy") {
+        // the handle stays open. `constraint` is already a
+        // ConstraintViolationError: a retry cannot fix it. Any other 409
+        // (`conflict`, or no code from an older server) is a commit conflict.
+        if (err.status === 409 && err.code !== "busy" && err.code !== "constraint") {
           throw new TransactionConflictError(err.detail, err.status, err.code);
         }
         if (expiredOnMissing && (err.status === 404 || err.status === 410)) {

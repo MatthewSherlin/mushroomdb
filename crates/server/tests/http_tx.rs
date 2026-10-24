@@ -315,6 +315,10 @@ async fn an_idle_transaction_expires_with_410_and_is_reaped() {
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let r = s.run(&id, None, "RETURN 1 AS x").await;
     assert_eq!(r.status, 410, "{}", r.body);
+    assert_eq!(
+        r.body["error"],
+        json!("transaction expired: idle too long, rolled back")
+    );
     assert_eq!(s.post(&id, None, "commit").await.status, 410);
     // Rolled back, not committed.
     let after = s
@@ -328,6 +332,43 @@ async fn an_idle_transaction_expires_with_410_and_is_reaped() {
         s.run(&"0".repeat(32), None, "RETURN 1 AS x").await.status,
         404
     );
+}
+
+#[tokio::test]
+async fn a_transaction_past_its_lifetime_expires_with_a_410_that_says_so() {
+    // Kept busy, so the idle timeout never fires; the lifetime does.
+    let s = plain(
+        "lifetime",
+        TxLimits {
+            max_open: 100,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_millis(600),
+        },
+    )
+    .await;
+    let id = s.begin_id(None).await;
+    s.run(&id, None, "CREATE (n:Person {id: 'long'})").await;
+    let mut last = None;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = s.run(&id, None, "RETURN 1 AS x").await;
+        if r.status != 200 {
+            last = Some(r);
+            break;
+        }
+    }
+    let r = last.expect("the lifetime must end the transaction");
+    assert_eq!(r.status, 410, "{}", r.body);
+    let lifetime = json!("transaction expired: open longer than its maximum lifetime, rolled back");
+    assert_eq!(r.body["error"], lifetime);
+    // The tombstone keeps the reason for later requests.
+    let c = s.post(&id, None, "commit").await;
+    assert_eq!(c.status, 410);
+    assert_eq!(c.body["error"], lifetime);
+    let after = s
+        .query(None, "MATCH (n:Person {id: 'long'}) RETURN n.id AS id")
+        .await;
+    assert_eq!(after["rows"], json!([]));
 }
 
 #[tokio::test]
