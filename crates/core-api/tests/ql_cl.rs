@@ -175,3 +175,79 @@ fn transaction_writes_share_the_begin_instant() {
         assert_eq!(distinct(column(&rs, "s")).len(), 2);
     });
 }
+
+/// Whether column `name` of the first row is `true`.
+fn first_is_true(rs: &ResultSet, name: &str) -> bool {
+    rs.get(0, name) == Some(&Value::Bool(true))
+}
+
+/// The instants one statement stored or returned, as a count.
+fn distinct_count(db: &GraphDb, query: &str, column_name: &str) -> usize {
+    let rs = db.query(query, &p()).unwrap();
+    distinct(column(&rs, column_name)).len()
+}
+
+#[test]
+fn a_literal_property_map_reads_the_clock_with_the_rest_of_the_statement() {
+    // A constant property map is folded when the statement is parsed.
+    let mut db = GraphDb::open(&tmp("fold")).unwrap();
+    with_test_clock(ticking(), || {
+        let rs = db
+            .query_write(
+                "CREATE (n:K {id: 'x', a: datetime(), b: datetime()}) RETURN n.a = n.b AS ab, n.a = datetime() AS ad",
+                &p(),
+            )
+            .unwrap();
+        assert!(first_is_true(&rs, "ab"), "{rs:?}");
+        assert!(first_is_true(&rs, "ad"), "{rs:?}");
+        let rs = db
+            .query_write(
+                "CREATE (n:U {id: 'y', t: datetime()}) RETURN n.t = datetime() AS same",
+                &p(),
+            )
+            .unwrap();
+        assert!(first_is_true(&rs, "same"), "{rs:?}");
+    });
+}
+
+#[test]
+fn every_write_shape_reads_one_instant() {
+    let mut db = GraphDb::open(&tmp("shapes")).unwrap();
+    with_test_clock(ticking(), || {
+        let rs = db
+            .query_write(
+                "UNWIND range(1, 5) AS i CREATE (n:R {id: toString(i)}) SET n.t = datetime() RETURN n.t = datetime() AS same",
+                &p(),
+            )
+            .unwrap();
+        assert!((0..rs.len()).all(|i| rs.get(i, "same") == Some(&Value::Bool(true))));
+        let rs = db
+            .query_write(
+                "UNWIND range(1, 5) AS i MERGE (n:S {id: 's' + toString(i)}) SET n.t = datetime() RETURN n.t = datetime() AS same",
+                &p(),
+            )
+            .unwrap();
+        assert!((0..rs.len()).all(|i| rs.get(i, "same") == Some(&Value::Bool(true))));
+        // The per-row overlay: each row's SET reads the row's own property.
+        db.query_write(
+            "UNWIND range(1, 5) AS i CREATE (n:G {id: 'g' + toString(i), a: 1}) SET n.t = datetime() + duration({days: n.a})",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(distinct_count(&db, "MATCH (n:G) RETURN n.t AS t", "t"), 1);
+    });
+}
+
+#[test]
+fn a_query_with_a_constant_property_pattern_reads_one_instant() {
+    let db = GraphDb::open(&tmp("readfold")).unwrap();
+    with_test_clock(ticking(), || {
+        let rs = db
+            .query(
+                "UNWIND [1] AS x RETURN datetime() = datetime() AS ab, datetime() = datetime.statement() AS ad",
+                &p(),
+            )
+            .unwrap();
+        assert!(first_is_true(&rs, "ab") && first_is_true(&rs, "ad"));
+    });
+}

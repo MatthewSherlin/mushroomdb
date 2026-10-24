@@ -7808,6 +7808,9 @@ impl<F: Fs> GraphDb<F> {
         if self.subscriptions.is_empty() && self.query_subscriptions.is_empty() {
             return;
         }
+        // A subscription's query is a statement of its own, whichever commit
+        // path (direct or group-commit drain) delivers the event.
+        let _clock = core_query::cypher::StatementClock::fresh();
 
         if !self.subscriptions.is_empty() {
             // Build write events from the WAL record.
@@ -11543,6 +11546,8 @@ impl<F: Fs> GraphDb<F> {
         cypher: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         // Resolve scope (fails fast if role has no write scope).
         // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
         let scope =
@@ -12216,6 +12221,8 @@ impl<F: Fs> GraphDb<F> {
         params: &std::collections::BTreeMap<String, Value>,
         mask: &crate::mask::NodeMask,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         // Reject write statements up front.
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
@@ -13803,6 +13810,8 @@ impl<F: Fs> GraphDb<F> {
     /// Every pipeline `Err(String)` becomes `GraphError::QueryError` with a
     /// stage prefix (`lex:` / `parse:` / `plan:` / `execute:`).
     pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
@@ -13884,6 +13893,8 @@ impl<F: Fs> GraphDb<F> {
         cypher: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;

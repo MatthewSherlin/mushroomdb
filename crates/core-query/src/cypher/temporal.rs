@@ -231,23 +231,51 @@ thread_local! {
     static CLOCK: std::cell::RefCell<ClockState> = std::cell::RefCell::new(ClockState::default());
 }
 
-/// Holds one instant for every non-realtime clock call made while it lives.
+/// Holds one instant, read when it is taken, for every non-realtime clock
+/// call made while it lives.
 /// Take one at the top of every statement; a guard taken inside another (a
 /// write statement running its read part) joins the outer statement's instant.
 /// Outside any guard each call reads the clock, as a library caller of the
 /// evaluator expects.
 pub struct StatementClock {
     outermost: bool,
+    /// For [`StatementClock::fresh`]: the instant of the statement it
+    /// interrupted, put back on drop.
+    interrupted: Option<Option<i64>>,
 }
 
 impl StatementClock {
+    /// Join the statement in progress on this thread, or begin one: the
+    /// instant is read here, at the start of the statement.
     pub fn enter() -> Self {
         let outermost = CLOCK.with(|c| {
             let mut c = c.borrow_mut();
             c.depth += 1;
             c.depth == 1
         });
-        Self { outermost }
+        if outermost {
+            let now = clock_micros();
+            CLOCK.with(|c| c.borrow_mut().statement = Some(now));
+        }
+        Self {
+            outermost,
+            interrupted: None,
+        }
+    }
+
+    /// Begin a statement of its own even inside another: for work that runs
+    /// beside a statement (a subscription's query) and is not part of it.
+    pub fn fresh() -> Self {
+        let now = clock_micros();
+        let interrupted = CLOCK.with(|c| {
+            let mut c = c.borrow_mut();
+            c.depth += 1;
+            c.statement.replace(now)
+        });
+        Self {
+            outermost: false,
+            interrupted: Some(interrupted),
+        }
     }
 }
 
@@ -256,7 +284,9 @@ impl Drop for StatementClock {
         CLOCK.with(|c| {
             let mut c = c.borrow_mut();
             c.depth -= 1;
-            if self.outermost {
+            if let Some(previous) = self.interrupted {
+                c.statement = previous;
+            } else if self.outermost {
                 c.statement = None;
             }
         });
@@ -285,14 +315,26 @@ impl Drop for TransactionClock {
 /// The clock now, in microseconds since the epoch: what BEGIN records as a
 /// transaction's instant.
 pub fn clock_micros() -> i64 {
-    CLOCK.with(|c| match c.borrow_mut().source.as_mut() {
-        Some(source) => source(),
+    // The source is taken out while it runs, so it may touch the clock itself.
+    let taken = CLOCK.with(|c| c.borrow_mut().source.take());
+    match taken {
         None => system_micros(),
-    })
+        Some(mut source) => {
+            let now = source();
+            CLOCK.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.source.is_none() {
+                    c.source = Some(source);
+                }
+            });
+            now
+        }
+    }
 }
 
 /// Run `body` with `source` as this thread's clock. For tests: it makes the
-/// instants deterministic without a sleep.
+/// instants deterministic without a sleep. `source` may itself read the clock
+/// (that read sees the system clock).
 #[doc(hidden)]
 pub fn with_test_clock<R>(source: impl FnMut() -> i64 + 'static, body: impl FnOnce() -> R) -> R {
     struct Restore(Option<Box<dyn FnMut() -> i64>>);
@@ -313,25 +355,16 @@ fn system_micros() -> i64 {
     }
 }
 
-/// The instant `scope` names. Inside a statement the first read fixes it.
+/// The instant `scope` names.
 fn instant(scope: Scope) -> i64 {
     match scope {
         Scope::Realtime => clock_micros(),
-        Scope::Statement => {
-            let held = CLOCK.with(|c| {
-                let c = c.borrow();
-                (c.depth > 0).then_some(c.statement)
-            });
-            match held {
-                None => clock_micros(),
-                Some(Some(t)) => t,
-                Some(None) => {
-                    let t = clock_micros();
-                    CLOCK.with(|c| c.borrow_mut().statement = Some(t));
-                    t
-                }
-            }
-        }
+        // Inside a statement the instant was read when it began; outside
+        // one (a library caller) each call reads the clock.
+        Scope::Statement => match CLOCK.with(|c| c.borrow().statement) {
+            Some(t) => t,
+            None => clock_micros(),
+        },
         // A statement outside a transaction is its own transaction.
         Scope::Transaction => match CLOCK.with(|c| c.borrow().transaction) {
             Some(t) => t,

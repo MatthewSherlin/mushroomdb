@@ -169,6 +169,8 @@ pub(crate) enum TxBody {
         mask: NodeMask,
         /// A `read`-tier key, whose refusal text differs from a role token's.
         read_tier_key: bool,
+        /// The clock at BEGIN: what `.transaction()` reads in each statement.
+        clock_micros: i64,
     },
 }
 
@@ -612,6 +614,7 @@ async fn begin(
                 snapshot,
                 mask,
                 read_tier_key: read_only_key.is_some(),
+                clock_micros: mushroomdb::clock_micros(),
             }
         }
         // `Anonymous` reaches only `/health`; refuse it here all the same.
@@ -676,6 +679,7 @@ fn execute(
             snapshot,
             mask,
             read_tier_key,
+            clock_micros,
         } => {
             if is_write_query(cypher).map_err(RunError::Bad)? {
                 return Err(RunError::Refused(if *read_tier_key {
@@ -685,7 +689,7 @@ fn execute(
                 }));
             }
             snapshot
-                .query_masked(cypher, params, mask)
+                .query_masked_in_transaction(cypher, params, mask, *clock_micros)
                 .map_err(|e| match e {
                     GraphError::MaskedReadOnly => {
                         RunError::Bad("masked queries are read-only".into())
@@ -831,6 +835,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = SharedDb::open(dir.path()).unwrap();
         (TxBody::Full(Box::new(db.begin_transaction())), dir)
+    }
+
+    /// QL-CL (row 161): a role-scoped transaction holds the instant it began
+    /// at for `.transaction()`, in every statement.
+    #[test]
+    fn a_scoped_transaction_reads_one_transaction_instant() {
+        const BEGAN: i64 = 1_700_000_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut body = TxBody::Scoped {
+            snapshot: db.reader(),
+            mask: mushroomdb::NodeMask::from_ids([]),
+            read_tier_key: false,
+            clock_micros: BEGAN,
+        };
+        let q = "RETURN datetime.transaction() = datetime.fromepoch(1700000000, 0) AS began, \
+                 datetime.statement() = datetime.fromepoch(1700000000, 0) AS stmt";
+        for _ in 0..2 {
+            let Ok(rs) = execute(&mut body, q, &BTreeMap::new()) else {
+                panic!("the statement failed")
+            };
+            assert_eq!(rs.get(0, "began"), Some(&mushroomdb::Value::Bool(true)));
+            // The statement's own instant is the clock's, not BEGIN's.
+            assert_eq!(rs.get(0, "stmt"), Some(&mushroomdb::Value::Bool(false)));
+        }
     }
 
     #[test]
