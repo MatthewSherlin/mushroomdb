@@ -1,10 +1,10 @@
 # Bolt protocol
 
-`mushroomdb serve` can listen for Bolt beside HTTP, so the official graph-database drivers can connect without a configuration change. This page covers how to turn the listener on, how clients authenticate, TLS, the routing table, and the version negotiation and its audit.
+`mushroomdb serve` can listen for Bolt beside HTTP, so the official graph-database drivers can connect without a configuration change. This page covers how to turn the listener on, how clients authenticate, TLS, the routing table, the version negotiation and its audit, value types, and what is not available over Bolt. For what a transaction guarantees, on Bolt and every other surface, see [Transactions](transactions.md).
 
 ## Turning the listener on
 
-The listener is off unless you give it a port:
+The listener is off unless you give it a port. 7687 is the port drivers use when a URI names none:
 
 ```text
 mushroomdb serve ./db --bolt-port 7687
@@ -111,13 +111,13 @@ The server picks the first client slot, in the client's order, that accepts one 
 
 Audited 2026-10-20 from each driver's handshake source on its default branch. "Latest version" is the newest release at that date.
 
-| Driver | Latest version | Minimum offered | Maximum offered | Sends `0x000001FF` |
-|---|---|---|---|---|
-| Official Python driver | 6.4.1 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot |
-| Official JavaScript driver | 6.2.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot |
-| Official Java driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot |
-| Official Go driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot |
-| Official .NET driver | 6.4.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot |
+| Driver | Latest version | Minimum offered | Maximum offered | Sends `0x000001FF` | Negotiated with this server |
+|---|---|---|---|---|---|
+| Official Python driver | 6.4.1 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
+| Official JavaScript driver | 6.2.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
+| Official Java driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
+| Official Go driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
+| Official .NET driver | 6.4.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
 
 All five send the same four slots, in this order:
 
@@ -130,7 +130,7 @@ All five send the same four slots, in this order:
 
 ## Why 5.0 and 4.4
 
-Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that speaks only those two versions connects to all five. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
+Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that speaks only those two versions connects to all five. Slot 1 is skipped and slot 2 holds 5.0, so each of them negotiates 5.0; a client whose offer holds 4.4 and not 5.0 gets 4.4. Only the Python and JavaScript drivers are run against the server in CI (see [Driver compatibility tests](#driver-compatibility-tests)); the Java, Go and .NET rows come from the handshake audit alone. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
 
 ## How the handshake is matched
 
@@ -162,7 +162,7 @@ Where these drivers meet the server's current limits: a node or relationship ins
 
 ## Transactions and bookmarks
 
-`BEGIN`, `COMMIT` and `ROLLBACK` are supported. A transaction reads a snapshot frozen at `BEGIN`, sees its own writes, and commits as one atomic batch; if another writer changed a node the transaction read or wrote, `COMMIT` fails with a transient error and the driver retries from `BEGIN`.
+`BEGIN`, `COMMIT` and `ROLLBACK` are supported. A transaction reads a snapshot frozen at `BEGIN`, sees its own writes, and commits as one atomic batch; if another writer changed a node the transaction read or wrote, `COMMIT` fails with the transient `DeadlockDetected` and the driver retries from `BEGIN`. A commit a unique constraint refuses fails with `ConstraintValidationFailed`, a client error that is not retried: the same writes fail again until the clashing value changes. The isolation model, its limits (write skew included) and the rule that derived relationships appear only at commit are in [Transactions](transactions.md); they are the same on every surface.
 
 | `BEGIN` field | Behaviour |
 |---|---|
@@ -177,6 +177,8 @@ A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `C
 Every write statement that runs as an auto-commit `RUN` also runs inside `BEGIN` … `COMMIT`, with the same results and counts: `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`, `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `SET` / `REMOVE … RETURN`. So drivers' managed write transactions (`session.execute_write` and the like), which send `BEGIN`, run them too. Schema statements (`CREATE INDEX`, `CREATE CONSTRAINT` and the rest) are still refused inside a transaction. See [Write statements](query.md#write-statements).
 
 A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's or `read` key's transaction reads through its role and cannot write (see [Scoped access](#scoped-access)); use auto-commit to write with a role. A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
+
+A transaction idle for `--bolt-tx-timeout-secs` (30 seconds by default) is rolled back, and the next request fails with `TransactionTimedOut`. An open result idle as long is closed. There is no lifetime limit on a Bolt transaction and no cap on open ones beyond `--bolt-max-connections`, since a connection holds at most one. Every open transaction is in the server's memory: a restart rolls it back and nothing of it is written.
 
 A Bolt null parameter is a null: `WHERE $p IS NULL` is true for it. (The HTTP route currently leaves a JSON null parameter out, so the same statement fails there with a missing-parameter error.)
 
@@ -271,3 +273,20 @@ A `RESET` sent while an earlier request is still running takes effect at the fir
 
 The `RESET` is answered `SUCCESS` after every earlier request has been answered, and the connection is then ready; an open transaction is rolled back. A client that disconnects during a request has its transaction rolled back.
 
+## Not available over Bolt
+
+Bolt carries Cypher statements and the catalog procedures above. These are HTTP or embedded only:
+
+- **Time travel.** There is no `as_of` on a Bolt statement; every statement reads the current store (or
+  the transaction's snapshot). Use HTTP [`POST /query`](http.md#post-query) with `as_of`, or the
+  embedded `open_at`; see [Time travel](timetravel.md).
+- **Per-request narrowing.** `mask` and `namespace` have no Bolt form; a connection reads with its
+  credential's scope only (see [Scoped access](#scoped-access)).
+- **Operations with no Cypher statement**: backups, rules (`POST /rules`), rule suggestion, `explain`
+  of an association, node and relationship history, the algorithm routes, live streams (`/watch`,
+  `/subscribe`) and the service routes (`/health`, `/ready`, `/stats`, `/metrics`). See the
+  [HTTP API](http.md).
+- **Writes in a role-scoped transaction.** A role token's or `read` key's transaction is read-only
+  (ledger row 140, planned for 0.11); write with a role through auto-commit `RUN`.
+- **Schema statements inside a transaction**, `PROFILE`, impersonation (`imp_user`), Bolt 5.1 and later
+  (`LOGON` / `LOGOFF`), and the Time, LocalTime, Point and named-time-zone value types.

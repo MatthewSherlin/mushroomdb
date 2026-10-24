@@ -23,12 +23,12 @@
 
 # Drivers and Bolt
 
-- [Drivers and Bolt (placeholder)](drivers-bolt.md)
+- [Drivers and Bolt](drivers-bolt.md)
 - [Bolt protocol](bolt.md)
 
 # Transactions
 
-- [Transactions (placeholder)](transactions.md)
+- [Transactions](transactions.md)
 
 # Indexes and constraints
 

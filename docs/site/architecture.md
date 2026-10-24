@@ -39,4 +39,3 @@ What is not built yet:
 | Medium | A measured run at 1,000,000 nodes; persisting the full-text index in the snapshot, so opening a store does not rebuild it |
 | Medium | v1.0 format stability (snapshot + WAL semver guarantee) |
 | Low | `CASE` in a write-statement `RETURN`; subqueries; napi-rs; WASM |
-| Low | Multi-statement `BEGIN/COMMIT` interactive transactions |
