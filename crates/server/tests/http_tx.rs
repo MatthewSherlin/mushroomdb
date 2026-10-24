@@ -718,3 +718,34 @@ async fn create_and_merge_take_parameters_in_their_property_maps() {
         json!([["ann", null, true], ["bob", 41, null]])
     );
 }
+
+/// 0.10 TX-21: a unique-constraint clash found at COMMIT is a 409 naming the
+/// constraint, not a 500, and the transaction's writes do not land.
+#[tokio::test]
+async fn a_constraint_violation_at_commit_is_a_409_naming_the_constraint() {
+    let s = plain("constraint-at-commit", limits(100, 30_000)).await;
+    s.db.write()
+        .create_constraint("uniq_name", "Person", "name")
+        .unwrap();
+    s.query(None, "CREATE (n:Person {id: 'holder', name: 'taken'})")
+        .await;
+    let id = s.begin_id(None).await;
+    let r = s
+        .run(&id, None, "CREATE (n:Person {id: 'dup', name: 'taken'})")
+        .await;
+    assert_eq!(
+        r.status, 200,
+        "the clash is not judged while buffered: {}",
+        r.body
+    );
+    let c = s.post(&id, None, "commit").await;
+    assert_eq!(c.status, 409, "{}", c.body);
+    let msg = c.body["error"].as_str().unwrap();
+    assert!(msg.contains("uniq_name") && msg.contains("name"), "{msg}");
+    // The transaction ended with the refusal, and nothing of it is visible.
+    assert_eq!(s.post(&id, None, "rollback").await.status, 404);
+    let v = s
+        .query(None, "MATCH (n:Person {name: 'taken'}) RETURN n.id AS id")
+        .await;
+    assert_eq!(v["rows"], json!([["holder"]]));
+}
