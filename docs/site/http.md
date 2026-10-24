@@ -1152,7 +1152,7 @@ rolls back every open one.
   positive integer.
 - **One request at a time.** A second request on a transaction while another is still running on it
   is `409` with `{"error": "transaction busy", "code": "busy"}`. A commit conflict is `409` with
-  `"code": "conflict"`. A request the client abandons (it hung up, or the 120 s deadline hit) does not
+  `"code": "conflict"`. A commit that a unique constraint refuses is `409` with `"code": "constraint"` (on any write route, not only `/tx/*`). A request the client abandons (it hung up, or the 120 s deadline hit) does not
   strand the transaction: the statement finishes and the transaction is usable again. Statements never interleave. Retry once the first
   returns.
 - **Shutdown.** When the server is told to stop, it rolls back every open transaction at the start of
@@ -1170,8 +1170,9 @@ rolls back every open one.
   transaction, with a `400` that says so. `SHOW` is allowed.
 
 The routes take no request body except `run`. The status codes: `404` unknown or not yours, `410`
-expired, `409` commit conflict or busy, `503` limit or shutdown. A `409` from a commit is transient:
-nothing was written, and the whole transaction can be retried from `begin`.
+expired, `409` commit conflict or busy, `503` limit or shutdown. A `409` with `"code": "conflict"` from a
+commit is transient: nothing was written, and the whole transaction can be retried from `begin`. One with
+`"code": "constraint"` is not: the same writes will be refused again until the clashing value changes.
 
 ### `POST /tx/begin`
 

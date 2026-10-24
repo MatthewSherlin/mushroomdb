@@ -742,6 +742,7 @@ async fn a_constraint_violation_at_commit_is_a_409_naming_the_constraint() {
     assert_eq!(c.status, 409, "{}", c.body);
     let msg = c.body["error"].as_str().unwrap();
     assert!(msg.contains("uniq_name") && msg.contains("name"), "{msg}");
+    assert_eq!(c.body["code"], json!("constraint"));
     // The transaction ended with the refusal, and nothing of it is visible.
     assert_eq!(s.post(&id, None, "rollback").await.status, 404);
     let v = s

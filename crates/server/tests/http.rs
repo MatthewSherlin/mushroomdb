@@ -7083,6 +7083,7 @@ async fn assert_constraint_refused(name: &str, method: &str, uri: &str, body: Js
         parse_json(&resp)["error"].as_str().unwrap(),
         CONSTRAINT_VIOLATION
     );
+    assert_eq!(parse_json(&resp)["code"], "constraint");
     assert_eq!(
         wal_bytes(&dir),
         before,

@@ -6,7 +6,8 @@
 //! transaction's buffered statements are not judged when they are buffered —
 //! the commit is — a refused commit leaves no WAL bytes and nothing visible,
 //! racing writers on one value produce exactly one winner, and reopening a
-//! store never re-judges what it already committed.
+//! store keeps the constraint binding (grandfathered duplicates, which replay
+//! must not refuse, are held in `constraints.rs`).
 
 use mushroomdb::{BatchOp, GraphError, RealFs, SharedDb, Value};
 use std::collections::BTreeMap;
@@ -251,7 +252,7 @@ fn racing_transactions_on_distinct_values_all_commit() {
 }
 
 #[test]
-fn replay_never_re_judges_committed_data() {
+fn reopen_and_snapshot_keep_the_constraint_binding() {
     let (dir, db) = constrained("replay");
     let mut tx = db.begin_transaction();
     tx.execute("CREATE (n:User {id: 'alice', email: 'a@x'})", &p())
