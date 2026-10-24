@@ -57,6 +57,9 @@ pub(crate) trait RowSource {
         key_value: &Value,
         named_ns: Option<&Value>,
     ) -> Result<Vec<(String, Value)>>;
+    /// Scope-before-lookup for a MERGE pattern of `label`: `Err` when a
+    /// role-scoped write may neither create nor update that label.
+    fn row_merge_scope(&self, label: &str) -> Result<()>;
     /// The namespace a MERGE create arm stamps when its pattern names none.
     fn row_merge_ns(&self) -> Result<Option<Value>>;
     /// Whether a view owns the property `field`.
@@ -144,6 +147,10 @@ impl<F: Fs> RowSource for GraphDb<F> {
         named_ns: Option<&Value>,
     ) -> Result<Vec<(String, Value)>> {
         self.merge_create_props(key_field, key_value, named_ns)
+    }
+
+    fn row_merge_scope(&self, label: &str) -> Result<()> {
+        self.merge_label_scope(label)
     }
 
     fn row_merge_ns(&self) -> Result<Option<Value>> {

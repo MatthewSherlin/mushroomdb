@@ -1563,6 +1563,11 @@ fn uw_merge_candidates<S: RowSource + ?Sized>(
             props,
             id_key: Some(key),
         } => {
+            // The key MERGE's own lookup: scope before lookup, through the
+            // role's mask, a hidden node never reported as there (QL-NM C1).
+            if !uw_merge_existed(src, ov, &node.label, key)? {
+                return Ok(Vec::new());
+            }
             let label_ok = match uw_label(src, ov, key) {
                 Some(l) => node.label.is_empty() || l == node.label,
                 None => false,
@@ -1581,7 +1586,11 @@ fn uw_merge_candidates<S: RowSource + ?Sized>(
         MergeEnd::Pattern {
             props,
             id_key: None,
-        } => Ok(uw_pattern_matches(src, ov, &node.label, props)),
+        } => {
+            // Scope before lookup; the scan itself reads the role's view.
+            src.row_merge_scope(&node.label)?;
+            Ok(uw_pattern_matches(src, ov, &node.label, props))
+        }
     }
 }
 

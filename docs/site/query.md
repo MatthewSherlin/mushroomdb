@@ -774,8 +774,18 @@ MERGE (n:Person {id: 'alice'})
   MATCH SET n += $props` a null value removes that key.
 - The key (and `ns`) may be any expression, `$parameter`s included
   (`MERGE (n:Person {id: $id})`); the MERGE matches on the value exactly as it
-  does on the same literal. A key that evaluates to null is an error, as is a
-  key that is not a string.
+  does on the same literal. A key that evaluates to null is an error; one that
+  is not a string makes the pattern one that matches by its properties.
+- A role-scoped MERGE checks the pattern's label against the role's create and
+  update scope before it looks at any node, and looks through the role's view:
+  a node the role cannot see is never bound, and its key answers as the key
+  MERGE of that key does.
+- Inside a transaction, a MERGE that matches by properties and finds nothing
+  cannot see a matching node another transaction commits meanwhile; both may
+  create one. A key MERGE has no such gap (two creates of one key conflict).
+- In a bulk `UNWIND … MERGE` of a pattern that is not a key, each row scans the
+  label (every node, with no label), unless an equality index covers one of the
+  pattern's properties: index the property, or MERGE on `{id: …}`.
 - A parameter map in the pattern (`MERGE (n:Person $props)`) is refused by
   name: name the key and set the rest, `MERGE (n:Person {id: $props.id}) ON
   CREATE SET n += $props`.

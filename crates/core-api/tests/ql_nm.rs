@@ -623,3 +623,74 @@ fn a_scoped_role_neither_sees_nor_creates_an_unlabelled_node() {
         .expect("a labelled node without an id is created under the role's label");
     assert_eq!(count(&db, "MATCH (n) RETURN count(n) AS c"), 3);
 }
+
+/// Review C1: a MERGE pattern naming a hidden node's `id` beside other
+/// properties answers as it does when the key is absent (or as the key MERGE
+/// of that key does), so a role learns nothing about the hidden node.
+#[test]
+fn a_pattern_merge_never_reveals_a_hidden_node() {
+    fn scoped(name: &str, secret: bool) -> GraphDb {
+        let mut db = GraphDb::open(&tmp(name)).unwrap();
+        db.apply_schema(&Schema {
+            fulltext: vec![],
+            indexes: vec![],
+            rules: vec![],
+            views: vec![],
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                keys: vec![],
+                labels: vec!["P".into()],
+                visible_where: None,
+                namespaces: None,
+                write: Some(WriteScope {
+                    create_labels: vec!["P".into()],
+                    update_labels: vec!["P".into()],
+                    delete_labels: vec![],
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                    update_edge_types: vec![],
+                }),
+            }],
+        })
+        .unwrap();
+        if secret {
+            run(&mut db, "CREATE (:Q {id: 'secret', name: 'x'})");
+        }
+        db
+    }
+    let answer = |db: &mut GraphDb, q: &str| match db.query_write_authz("writer", q, &p()) {
+        Ok(rs) => format!("ok {:?}", rows(&rs)),
+        Err(e) => format!("err {e:?}"),
+    };
+    for (i, (probe, reference)) in [
+        (
+            "MERGE (n {id: 'secret', name: 'x'}) RETURN n.name",
+            "MERGE (n {id: 'secret', name: 'x'}) RETURN n.name",
+        ),
+        (
+            "MERGE (n:Q {id: 'secret', name: 'x'})",
+            "MERGE (n:Q {id: 'secret', name: 'x'})",
+        ),
+        ("MERGE (n {name: 'x'})", "MERGE (n {name: 'x'})"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hidden = answer(&mut scoped(&format!("c1-h{i}"), true), probe);
+        let absent = answer(&mut scoped(&format!("c1-a{i}"), false), reference);
+        assert_eq!(hidden, absent, "{probe}");
+        assert!(hidden.contains("RoleWriteDenied"), "{probe}: {hidden}");
+    }
+    // In the role's own label, the pattern answers as the key MERGE of the
+    // same hidden key does: refused, never "exists".
+    let mut db = scoped("c1-p", true);
+    let pattern = answer(&mut db, "MERGE (n:P {id: 'secret', name: 'zz'})");
+    let key = answer(&mut db, "MERGE (n:P {id: 'secret'})");
+    assert_eq!(pattern, key);
+    assert!(!pattern.contains("exists"), "{pattern}");
+    assert_eq!(
+        db.node_info("secret").unwrap().label,
+        "Q",
+        "nothing written"
+    );
+}

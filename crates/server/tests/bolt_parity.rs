@@ -708,3 +708,58 @@ async fn an_unknown_credential_is_refused_by_both() {
         "{out:?}"
     );
 }
+
+/// QL-NM review C1: a MERGE pattern that names a hidden node's `id` beside
+/// other properties answers, over HTTP and Bolt alike, exactly as it does
+/// when the key does not exist, or as the key MERGE of that key does. It
+/// never binds the hidden node or says that it exists.
+#[tokio::test]
+async fn a_pattern_merge_never_reveals_a_hidden_node() {
+    // (probe on the hidden `s1`, the same probe on an absent key or the key
+    // MERGE it must answer like)
+    let pairs: [(Statement, Statement); 4] = [
+        (
+            ("MERGE (n {id: 's1', name: 'x'}) RETURN n.name", None),
+            ("MERGE (n {id: 'zz', name: 'x'}) RETURN n.name", None),
+        ),
+        (
+            ("MERGE (n:Secret {id: 's1', name: 'x'})", None),
+            ("MERGE (n:Secret {id: 'zz', name: 'x'})", None),
+        ),
+        (
+            ("MERGE (n {name: 'x'})", None),
+            ("MERGE (n {name: 'x'})", None),
+        ),
+        (
+            ("MERGE (n:Doc {id: 's1', name: 'zz'})", None),
+            ("MERGE (n:Doc {id: 's1'})", None),
+        ),
+    ];
+    for (probe, reference) in pairs {
+        let mut answers = Vec::new();
+        for statement in [probe, reference] {
+            let (http_db, _h) = fixture();
+            let (bolt_db, _b) = fixture();
+            let h = Http::new(&http_db, ALPHA).query(statement).await;
+            let b = bolt_statement(&mut bolt_connection(&bolt_db, ALPHA), statement, false);
+            assert_same(statement.0, &h, &b);
+            if let Outcome::Refused { message, .. } = &h {
+                assert!(!message.contains("exists"), "{}: {message}", statement.0);
+            }
+            answers.push(h);
+        }
+        assert_eq!(answers[0], answers[1], "{} vs {}", probe.0, reference.0);
+        assert!(
+            matches!(
+                answers[0],
+                Outcome::Refused {
+                    kind: Kind::Forbidden,
+                    ..
+                }
+            ),
+            "{}: {:?}",
+            probe.0,
+            answers[0]
+        );
+    }
+}
