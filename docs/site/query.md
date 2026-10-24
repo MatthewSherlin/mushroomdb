@@ -778,8 +778,12 @@ MERGE (n:Person {id: 'alice'})
   is not a string makes the pattern one that matches by its properties.
 - A role-scoped MERGE checks the pattern's label against the role's create and
   update scope before it looks at any node, and looks through the role's view:
-  a node the role cannot see is never bound, and its key answers as the key
-  MERGE of that key does.
+  a node the role cannot see is never bound. A label outside the role's scope
+  is refused before any lookup, so a hidden key and an absent key get the same
+  answer. In a label the role may create, a MERGE naming a hidden node's `id` is
+  refused with `role-bound token: target node not visible`, where an absent key
+  would be created: the key-existence signal every create-scoped write already
+  gives (see the accepted structural disclosure under [Threat model](http.md#threat-model)).
 - Inside a transaction, a MERGE that matches by properties and finds nothing
   cannot see a matching node another transaction commits meanwhile; both may
   create one. A key MERGE has no such gap (two creates of one key conflict).

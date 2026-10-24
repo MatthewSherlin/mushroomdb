@@ -1078,7 +1078,17 @@ fn round_trip_keeps_generated_keys_and_unlabelled_nodes() {
 
     let out = dir.join("csv");
     export(&src, &out, ExportFormat::Csv);
-    import(&dir.join("from-csv"), &csv_inputs(&out), 2);
+    let report = run_import_inputs(
+        &dir.join("from-csv"),
+        &csv_inputs(&out),
+        &ImportOptions {
+            batch_size: 2,
+            ..ImportOptions::default()
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.unlabelled_nodes, 2, "the import counts them");
     assert_same(&source, &state(&dir.join("from-csv")), "csv");
 
     // Cypher writes the key as `id`, so a node without one gains it; every

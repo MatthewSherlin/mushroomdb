@@ -1343,8 +1343,11 @@ fn uw_merge_existed<S: RowSource + ?Sized>(
 
 /// A MERGE whose every node is bound or a key pattern with a string key: each
 /// node is found or created by its key, then the relationship by its ends.
+#[allow(clippy::too_many_arguments)]
 fn uw_key_merge<'v, S: RowSource + ?Sized>(
     merge: &'v RowMerge,
+    start: &MergeEnd,
+    end: Option<&MergeEnd>,
     ctx: &RowCtx<'_, S>,
     env: &mut HashMap<&'v str, String>,
     ov: &mut Overlay,
@@ -1352,7 +1355,7 @@ fn uw_key_merge<'v, S: RowSource + ?Sized>(
     tally: &mut Tally,
 ) -> Result<()> {
     let src = ctx.src;
-    let (start_key, start_value) = uw_merge_key(&merge.start, ctx, env, ov)?;
+    let (start_key, start_value) = uw_end_key(&merge.start, start, ctx, env, ov)?;
     tally.merge_keys.push(start_key.clone());
     let start_ns = match &merge.start.ns {
         Some(op) => ctx.eval(op, env, ov)?,
@@ -1383,7 +1386,8 @@ fn uw_key_merge<'v, S: RowSource + ?Sized>(
         return Ok(());
     };
 
-    let (end_key, end_value) = uw_merge_key(&edge.end, ctx, env, ov)?;
+    let end = end.unwrap_or(&MergeEnd::Bound);
+    let (end_key, end_value) = uw_end_key(&edge.end, end, ctx, env, ov)?;
     tally.merge_keys.push(end_key.clone());
     let end_ns = match &edge.end.ns {
         Some(op) => ctx.eval(op, env, ov)?,
@@ -1480,12 +1484,28 @@ fn uw_key_merge<'v, S: RowSource + ?Sized>(
     uw_merge_sets(sets, ctx, env, ov, ops, tally)
 }
 
+/// The key of a bound or keyed MERGE end: the one [`uw_merge_end`] already
+/// evaluated, or the bound node's.
+fn uw_end_key<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    end: &MergeEnd,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<(String, Value)> {
+    match end {
+        MergeEnd::Key(k) => Ok((k.clone(), Value::Str(k.clone()))),
+        _ => uw_merge_key(node, ctx, env, ov),
+    }
+}
+
 /// One node of a MERGE as this row resolves it (QL-NM).
 enum MergeEnd {
     /// A node an earlier clause bound.
     Bound,
-    /// A key pattern whose value is a string: found or created by that key.
-    Key,
+    /// A key pattern whose value is a string, the key: found or created by
+    /// it. Evaluated once, here.
+    Key(String),
     /// Any other pattern: matched by its label and properties.
     Pattern {
         /// What the node must carry (`ns` included when the pattern names
@@ -1518,7 +1538,7 @@ fn uw_merge_end<S: RowSource + ?Sized>(
     let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len() + 1);
     if node.key_pattern {
         match ctx.eval(&node.key, env, ov)? {
-            Some(Value::Str(_)) => return Ok(MergeEnd::Key),
+            Some(Value::Str(k)) => return Ok(MergeEnd::Key(k)),
             None => return Err(null(&node.key_field)),
             Some(v) => props.push((node.key_field.clone(), v)),
         }
@@ -1554,8 +1574,8 @@ fn uw_merge_candidates<S: RowSource + ?Sized>(
 ) -> Result<Vec<String>> {
     let src = ctx.src;
     match end {
-        MergeEnd::Bound | MergeEnd::Key => {
-            let (key, _) = uw_merge_key(node, ctx, env, ov)?;
+        MergeEnd::Bound | MergeEnd::Key(_) => {
+            let (key, _) = uw_end_key(node, end, ctx, env, ov)?;
             let existed = uw_merge_node_existed(src, ov, node, &key)?;
             Ok(if existed { vec![key] } else { Vec::new() })
         }
@@ -1609,8 +1629,8 @@ fn uw_merge_create<S: RowSource + ?Sized>(
     let src = ctx.src;
     let (key, mut props) = match end {
         MergeEnd::Bound => return Ok(uw_merge_key(node, ctx, env, ov)?.0),
-        MergeEnd::Key => {
-            let (key, value) = uw_merge_key(node, ctx, env, ov)?;
+        MergeEnd::Key(_) => {
+            let (key, value) = uw_end_key(node, end, ctx, env, ov)?;
             let ns = match &node.ns {
                 Some(op) => ctx.eval(op, env, ov)?,
                 None => None,
@@ -1680,7 +1700,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     };
     let is_pattern = |e: &MergeEnd| matches!(e, MergeEnd::Pattern { .. });
     if !is_pattern(&start) && !end.as_ref().is_some_and(is_pattern) {
-        uw_key_merge(merge, ctx, &mut env, ov, ops, tally)?;
+        uw_key_merge(merge, &start, end.as_ref(), ctx, &mut env, ov, ops, tally)?;
         return Ok(vec![env]);
     }
     let src = ctx.src;

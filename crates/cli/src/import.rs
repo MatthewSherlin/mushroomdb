@@ -92,6 +92,9 @@ pub struct ImportReport {
     /// the rule that makes it and is made again when the rule is created, so it
     /// is not inserted.
     pub derived_edges_skipped: usize,
+    /// CSV node rows with an empty `:LABEL` cell, queued as nodes with no
+    /// label (QL-NM). Reported so a forgotten label does not pass unseen.
+    pub unlabelled_nodes: usize,
 }
 
 /// One committed batch, reported to the callback of [`run_import_with_progress`].
@@ -693,6 +696,7 @@ fn import_nodes(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliEr
             run.bad_row(&file, line, &reason)?;
             continue;
         }
+        run.report.unlabelled_nodes += usize::from(label.is_empty());
         if schema.key_stored {
             batch.entry(label).or_default().push(row);
         } else {
@@ -1436,6 +1440,12 @@ pub fn format_import(report: &ImportReport) -> String {
     if report.rows_skipped > 0 {
         out.push_str(&format!(", skipped {} bad rows", report.rows_skipped));
     }
+    if report.unlabelled_nodes > 0 {
+        out.push_str(&format!(
+            ", {} nodes with no label (an empty :LABEL cell)",
+            report.unlabelled_nodes
+        ));
+    }
     out.push('\n');
     out
 }
@@ -1568,6 +1578,21 @@ mod tests {
         let rows = parse_one(":ID,:LABEL\n1,Person;Employee\n");
         let e = rows[0].clone().unwrap_err();
         assert!(e.contains("more than one label"), "{e}");
+    }
+
+    #[test]
+    fn the_summary_names_the_nodes_with_no_label() {
+        let report = ImportReport {
+            nodes_inserted: 3,
+            unlabelled_nodes: 2,
+            ..ImportReport::default()
+        };
+        let text = format_import(&report);
+        assert!(
+            text.contains("2 nodes with no label (an empty :LABEL cell)"),
+            "{text}"
+        );
+        assert!(!format_import(&ImportReport::default()).contains("no label"));
     }
 
     #[test]
