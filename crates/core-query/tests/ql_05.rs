@@ -71,3 +71,26 @@ fn is_write_tokens_sees_remove_only_in_clause_position() {
         "MATCH (n) WITH n AS remove WHERE remove.x = 1 RETURN remove"
     ));
 }
+
+#[test]
+fn a_write_after_optional_match_is_a_write_statement() {
+    use core_query::cypher::parse;
+    for q in [
+        "OPTIONAL MATCH (n:X) SET n.a = 1",
+        "OPTIONAL MATCH (n:X) DELETE n",
+        "OPTIONAL MATCH (n:X) DETACH DELETE n",
+        "OPTIONAL MATCH (n:X) REMOVE n.a",
+        "OPTIONAL MATCH (n:X) SET n += {a: 1}",
+        "MATCH (m) OPTIONAL MATCH (m)-[:R]->(n) SET n.a = 1",
+    ] {
+        let tokens = lex(q).unwrap();
+        assert!(is_write_tokens(&tokens), "{q}");
+        let stmt = parse_write(&tokens).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(matches!(stmt, WriteStatement::UnwindWrite(_)), "{q}");
+    }
+    // Still a read.
+    assert!(!is_write_tokens(
+        &lex("OPTIONAL MATCH (n:X) RETURN n").unwrap()
+    ));
+    assert!(parse(&lex("OPTIONAL MATCH (n:X) RETURN n").unwrap()).is_ok());
+}

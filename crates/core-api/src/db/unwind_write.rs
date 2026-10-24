@@ -352,8 +352,8 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, captures: &[RelCapture]) -> 
                     note_var(var);
                 }
             }
-            RowWrite::Delete { vars, .. } => {
-                for var in vars {
+            RowWrite::Delete { vars, rels, .. } => {
+                for var in vars.iter().chain(rels) {
                     note_var(var);
                 }
             }
@@ -491,7 +491,7 @@ fn names_in_writes(writes: &[RowWrite]) -> HashSet<String> {
                 operands.push(value);
             }
             RowWrite::Remove(items) => names.extend(items.iter().map(|(v, _)| v.clone())),
-            RowWrite::Delete { vars, .. } => names.extend(vars.iter().cloned()),
+            RowWrite::Delete { vars, rels, .. } => names.extend(vars.iter().chain(rels).cloned()),
         }
     }
     for op in operands {
@@ -1037,7 +1037,15 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 });
             }
         }
-        RowWrite::Delete { vars, detach } => {
+        RowWrite::Delete { vars, rels, detach } => {
+            // A null relationship (OPTIONAL MATCH) is skipped; this form does
+            // not delete one that is there.
+            if let Some(var) = rels.iter().find(|var| env.contains_key(var.as_str())) {
+                return Err(err(format!(
+                    "not supported in mushroomdb 0.10: DELETE of the relationship `{var}` in a \
+                     statement with OPTIONAL MATCH; use MATCH … DELETE"
+                )));
+            }
             for var in vars {
                 let Some(key) = env.get(var.as_str()).cloned() else {
                     continue;
@@ -1555,9 +1563,12 @@ fn uw_create_edge<'v, S: RowSource + ?Sized>(
     tally: &mut Tally,
 ) -> Result<()> {
     let end = |var: &str, side: &str| -> Result<String> {
-        env.get(var)
-            .cloned()
-            .ok_or_else(|| err(format!("CREATE edge {side} variable '{var}' is not bound")))
+        env.get(var).cloned().ok_or_else(|| {
+            err(format!(
+                "CREATE edge {side} variable '{var}' is null in this row (an OPTIONAL MATCH \
+                     found nothing), so there is no node to create a relationship with"
+            ))
+        })
     };
     let from = end(&edge.src_var, "src")?;
     let to = end(&edge.dst_var, "dst")?;

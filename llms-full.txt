@@ -6196,6 +6196,26 @@ RETURN n, n.name
 returns one row, `null, null`. Clauses may follow it as they follow an `UNWIND`
 (`MATCH`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, `WHERE`).
 
+### A write after OPTIONAL MATCH
+
+`SET`, `REMOVE` and `DELETE` may follow an `OPTIONAL MATCH`, with or without a
+`MATCH` before it, in an auto-commit statement and inside a transaction. A row
+where the optional node is null is skipped, as openCypher's "ignore null when
+setting, removing or deleting" scenarios require, and a counter counts only what
+was written:
+
+```cypher
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:MANAGES]->(e)
+SET e.reviewed = true
+```
+
+sets `reviewed` on each managed `e` and does nothing for a `p` who manages no one.
+`DELETE r` on a null relationship is skipped too; on a relationship that is
+there it is an error (`DELETE of the relationship`), as it is after `UNWIND`.
+A `CREATE` or `MERGE` of a relationship from a null node is an error
+(`… is null in this row`) and the statement writes nothing.
+
 ### WHERE inside OPTIONAL MATCH
 
 A `WHERE` clause inside an `OPTIONAL MATCH` filters the optional candidates,
@@ -6766,7 +6786,6 @@ unexpected-token parse error or other unspecified result.
 | List slices `l[1..3]`, `l[..2]` (a parse error) |
 | Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
 | Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
-| `OPTIONAL MATCH` followed by a write clause (`OPTIONAL MATCH (n) SET n.x = 1`): a parse error |
 | An unaliased aggregate column is named in upper case (`count(n)` is the column `COUNT(n)`); alias it (`count(n) AS n`) to choose the name |
 
 ---

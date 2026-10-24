@@ -3,7 +3,7 @@
 mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every change. The TCK is a suite of scenarios, each a query with the result, error or graph change it must give. This page is generated from one run: every number on it is a count of scenarios.
 
 - TCK version: `2024.3`, vendored unmodified in `vendor/opencypher-tck/`.
-- Generated: 2026-10-23 by `cargo run --release -p tck-runner -- --report docs/site/conformance.md`.
+- Generated: 2026-10-24 by `cargo run --release -p tck-runner -- --report docs/site/conformance.md`.
 - The pass rate is passed / (passed + failed). Skipped scenarios are in neither: a scenario is skipped only when it uses a feature this release deliberately does not have (listed under [Skipped scenarios](#skipped-scenarios)).
 - CI fails when the pass rate falls below `tck-baseline.txt`; the baseline is raised by an ordinary change when the rate rises.
 - The Cypher this release supports is documented in [Cypher Query Reference](query.md).
@@ -12,21 +12,21 @@ mushroomdb runs the openCypher Technology Compatibility Kit (TCK) against every 
 
 | | Scenarios |
 |---|---|
-| Passed | 2002 |
-| Failed | 1322 |
+| Passed | 2006 |
+| Failed | 1318 |
 | Skipped | 573 |
 | Total | 3897 |
-| Pass rate | 60.2% (`0.6023`) |
+| Pass rate | 60.3% (`0.6035`) |
 
 A scenario that expects an error passes on any error, so the pass rate counts two kinds of pass. The strict rate counts only the passes that checked a result, plus the error passes whose error came from the phase the TCK names (compile time: the lexer, parser or planner; runtime: execution) and, when the engine's error names its openCypher kind (`VariableTypeConflict: …`), is that kind. CI holds both rates to `tck-baseline.txt`.
 
 | Pass | Scenarios |
 |---|---|
-| Checked a result or side effects | 1523 |
+| Checked a result or side effects | 1527 |
 | Raised an error the TCK expects | 479 |
 | … in the phase (and of the kind) the TCK names | 462 |
 | … in another phase or of another kind (any error accepted) | 17 |
-| Strict pass rate | 59.7% (`0.5972`) |
+| Strict pass rate | 59.8% (`0.5984`) |
 
 ## By area
 
@@ -34,15 +34,15 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 |---|---|---|---|---|
 | `clauses/call` | 2 | 0 | 50 | 100.0% |
 | `clauses/create` | 15 | 61 | 2 | 19.7% |
-| `clauses/delete` | 3 | 38 | 0 | 7.3% |
+| `clauses/delete` | 5 | 36 | 0 | 12.2% |
 | `clauses/match` | 242 | 134 | 5 | 64.4% |
 | `clauses/match-where` | 2 | 31 | 1 | 6.1% |
 | `clauses/merge` | 13 | 61 | 1 | 17.6% |
-| `clauses/remove` | 0 | 31 | 2 | 0.0% |
+| `clauses/remove` | 1 | 30 | 2 | 3.2% |
 | `clauses/return` | 9 | 54 | 0 | 14.3% |
 | `clauses/return-orderby` | 13 | 22 | 0 | 37.1% |
 | `clauses/return-skip-limit` | 9 | 22 | 0 | 29.0% |
-| `clauses/set` | 2 | 46 | 5 | 4.2% |
+| `clauses/set` | 5 | 43 | 5 | 10.4% |
 | `clauses/union` | 10 | 2 | 0 | 83.3% |
 | `clauses/unwind` | 11 | 3 | 0 | 78.6% |
 | `clauses/with` | 4 | 25 | 0 | 13.8% |
@@ -65,7 +65,7 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 | `expressions/precedence` | 52 | 69 | 0 | 43.0% |
 | `expressions/quantifier` | 596 | 8 | 0 | 98.7% |
 | `expressions/string` | 2 | 30 | 0 | 6.2% |
-| `expressions/temporal` | 506 | 85 | 413 | 85.6% |
+| `expressions/temporal` | 504 | 87 | 413 | 85.3% |
 | `expressions/typeConversion` | 21 | 26 | 0 | 44.7% |
 | `useCases/countingSubgraphMatches` | 0 | 11 | 0 | 0.0% |
 | `useCases/triadicSelection` | 0 | 19 | 0 | 0.0% |
@@ -88,12 +88,12 @@ Each failing scenario is counted once, under the first step that failed.
 | Kind | Scenarios |
 |---|---|
 | setup: parser gap | 733 |
-| parser gap | 238 |
+| parser gap | 228 |
 | setup: runtime error | 124 |
 | ruled deviation | 111 |
 | runtime error (semantics difference) | 62 |
-| semantics difference | 50 |
-| named unsupported feature | 3 |
+| semantics difference | 54 |
+| named unsupported feature | 5 |
 | setup: named unsupported feature | 1 |
 
 | Cause | Kind | Scenarios | First scenario |
@@ -110,7 +110,7 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: parse: unexpected tokens after UNION query (found Ident(…)) | parser gap | 27 | expressions/literals/Literals3.feature: [1] Return a short positive hexadecimal integer |
 | unexpected error: parse: CREATE node requires a label (found LBrace) | parser gap | 24 | clauses/create/Create1.feature: [7] Create a single node with a property |
 | setup failed: lex: illegal character … at position # | setup: parser gap | 19 | useCases/triadicSelection/TriadicSelection1.feature: [1] Handling triadic friend of a friend |
-| wrong result: values differ | semantics difference | 16 | clauses/with-orderBy/WithOrderBy1.feature: [9] Sort lists in ascending order |
+| wrong result: values differ | semantics difference | 18 | clauses/with-orderBy/WithOrderBy1.feature: [9] Sort lists in ascending order |
 | unexpected error: parse: CREATE node requires a label (found RParen) | parser gap | 15 | clauses/create/Create1.feature: [1] Create a single node |
 | unexpected error: parse: expected … to close a list subscript (found Dot) | parser gap | 13 | expressions/list/List2.feature: [1] List slice |
 | unexpected error: CREATE/MERGE node requires a string `id` property (the node key) | runtime error (semantics difference) | 12 | clauses/create/Create1.feature: [3] Create a single node with a label |
@@ -126,18 +126,18 @@ Each failing scenario is counted once, under the first step that failed.
 | unexpected error: plan: duplicate RETURN column … | runtime error (semantics difference) | 6 | expressions/temporal/Temporal7.feature: [1] Should compare dates (example 1) |
 | unexpected error: execute: duration(): cannot read … as a Duration | runtime error (semantics difference) | 5 | expressions/temporal/Temporal2.feature: [7] Should parse duration from string (example 2) |
 | setup failed: parse: CREATE node requires a label (found end of input) | setup: parser gap | 4 | clauses/return/Return4.feature: [8] Support column renaming for aggregations |
-| unexpected error: parse: expected RETURN (found Ident(…)) | parser gap | 4 | clauses/remove/Remove1.feature: [5] Ignore null when removing property from a node |
-| unexpected error: parse: expected RETURN (found Set) | parser gap | 4 | clauses/set/Set1.feature: [8] Ignore null when setting property |
 | unexpected error: parse: expected … or … in a list literal (found Ident(…)) | parser gap | 4 | expressions/literals/Literals7.feature: [5] Return a list containing a hexadecimal integer |
+| a write without RETURN returns its counter row (the TCK expects no rows) | semantics difference | 3 | clauses/delete/Delete1.feature: [4] Delete on null node |
 | setup failed: parse: CREATE (a): … is not a node bound by an earlier clause; a new node needs a label, e.g. (a:Label {id: …}… | setup: parser gap | 3 | clauses/remove/Remove1.feature: [3] Remove a single relationship property |
 | unexpected error: execute: unbound variable … | runtime error (semantics difference) | 3 | expressions/graph/Graph9.feature: [3] `properties()` on null |
 | unexpected error: parse: MERGE requires a property map with exactly one key (found RParen) | parser gap | 3 | clauses/merge/Merge1.feature: [2] Merge node with label |
 | unexpected error: parse: collect() is only supported as a top-level RETURN/WITH aggregate | parser gap | 3 | clauses/return/Return6.feature: [6] Handle aggregates inside non-aggregate expressions |
-| unexpected error: parse: expected RETURN (found Delete) | parser gap | 3 | clauses/delete/Delete1.feature: [4] Delete on null node |
 | unexpected error: parse: expected field name after … (found Dot) | parser gap | 3 | expressions/list/List2.feature: [9] List slice with null range (example 1) |
 | unexpected error: parse: unary minus only applies to numeric literals (found LParen) | parser gap | 3 | expressions/precedence/Precedence2.feature: [4] Numeric unary negative takes precedence over exponentiation |
 | unexpected error: refused as not supported: a MATCH, UNWIND or WITH clause after a write clause in the same statement | named unsupported feature | 3 | clauses/create/Create6.feature: [5] Filtering after creating nodes affects the result set but not the side effects |
 | unexpected error: parse: CASE requires at least one WHEN ... THEN branch (found Dash) | parser gap | 2 | expressions/conditional/Conditional2.feature: [1] Simple cases over integers (example 1) |
+| unexpected error: parse: MERGE requires a label (found LBrace) | parser gap | 2 | clauses/merge/Merge5.feature: [10] Merge should bind a path |
+| unexpected error: parse: MERGE requires a label (found RParen) | parser gap | 2 | clauses/merge/Merge1.feature: [1] Merge node when no nodes exist |
 
 ### Scenarios that ran and failed one check
 
@@ -147,9 +147,9 @@ A scenario whose query ran is checked to the end even after a check fails. These
 |---|---|
 | ruled deviation: 0.10 keeps boolean coercion (AND/OR/XOR/NOT accept non-booleans) | 110 |
 | wrong result: column names differ | 27 |
-| wrong result: values differ | 16 |
+| wrong result: values differ | 18 |
+| a write without RETURN returns its counter row (the TCK expects no rows) | 3 |
 | wrong result: row order differs | 2 |
-| a write without RETURN returns its counter row (the TCK expects no rows) | 1 |
 | ruled deviation: 0.10 keeps boolean coercion (a node as a WHERE predicate reads as true) | 1 |
 | wrong result: row count differs | 1 |
 
@@ -184,7 +184,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `date.statement` | yes | 1 / 1 | 0 |
 | `date.transaction` | yes | 1 / 1 | 0 |
 | `date.truncate` | yes | 51 / 51 | 0 |
-| `datetime` | yes | 224 / 251 | 169 |
+| `datetime` | yes | 223 / 251 | 169 |
 | `datetime.fromepoch` | yes | 1 / 1 | 0 |
 | `datetime.fromepochmillis` | yes | 1 / 1 | 0 |
 | `datetime.realtime` | yes | 1 / 1 | 0 |
@@ -195,7 +195,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `duration.between` | yes | 10 / 15 | 18 |
 | `duration.indays` | yes | 10 / 10 | 12 |
 | `duration.inmonths` | yes | 15 / 15 | 12 |
-| `duration.inseconds` | yes | 14 / 15 | 34 |
+| `duration.inseconds` | yes | 12 / 15 | 34 |
 | `endnode` | yes | 0 / 1 | 0 |
 | `foo` | no | 1 / 1 | 0 |
 | `head` | yes | 1 / 5 | 0 |
@@ -203,7 +203,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `labels` | yes | 0 / 12 | 10 |
 | `last` | yes | 0 / 1 | 0 |
 | `length` | yes | 2 / 8 | 0 |
-| `localdatetime` | yes | 202 / 234 | 96 |
+| `localdatetime` | yes | 201 / 234 | 96 |
 | `localdatetime.realtime` | yes | 1 / 1 | 0 |
 | `localdatetime.statement` | yes | 1 / 1 | 0 |
 | `localdatetime.transaction` | yes | 1 / 1 | 0 |
@@ -259,8 +259,8 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `clauses/create/Create4.feature` | 0 | 2 | 0 |
 | `clauses/create/Create5.feature` | 0 | 5 | 0 |
 | `clauses/create/Create6.feature` | 0 | 14 | 0 |
-| `clauses/delete/Delete1.feature` | 1 | 7 | 0 |
-| `clauses/delete/Delete2.feature` | 0 | 5 | 0 |
+| `clauses/delete/Delete1.feature` | 2 | 6 | 0 |
+| `clauses/delete/Delete2.feature` | 1 | 4 | 0 |
 | `clauses/delete/Delete3.feature` | 0 | 2 | 0 |
 | `clauses/delete/Delete4.feature` | 0 | 3 | 0 |
 | `clauses/delete/Delete5.feature` | 2 | 7 | 0 |
@@ -289,7 +289,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `clauses/merge/Merge7.feature` | 0 | 5 | 0 |
 | `clauses/merge/Merge8.feature` | 0 | 1 | 0 |
 | `clauses/merge/Merge9.feature` | 0 | 4 | 0 |
-| `clauses/remove/Remove1.feature` | 0 | 7 | 0 |
+| `clauses/remove/Remove1.feature` | 1 | 6 | 0 |
 | `clauses/remove/Remove2.feature` | 0 | 3 | 2 |
 | `clauses/remove/Remove3.feature` | 0 | 21 | 0 |
 | `clauses/return-orderby/ReturnOrderBy1.feature` | 8 | 4 | 0 |
@@ -309,11 +309,11 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `clauses/return/Return6.feature` | 4 | 17 | 0 |
 | `clauses/return/Return7.feature` | 1 | 1 | 0 |
 | `clauses/return/Return8.feature` | 0 | 1 | 0 |
-| `clauses/set/Set1.feature` | 2 | 9 | 0 |
+| `clauses/set/Set1.feature` | 3 | 8 | 0 |
 | `clauses/set/Set2.feature` | 0 | 3 | 0 |
 | `clauses/set/Set3.feature` | 0 | 3 | 5 |
-| `clauses/set/Set4.feature` | 0 | 5 | 0 |
-| `clauses/set/Set5.feature` | 0 | 5 | 0 |
+| `clauses/set/Set4.feature` | 1 | 4 | 0 |
+| `clauses/set/Set5.feature` | 1 | 4 | 0 |
 | `clauses/set/Set6.feature` | 0 | 21 | 0 |
 | `clauses/union/Union1.feature` | 4 | 1 | 0 |
 | `clauses/union/Union2.feature` | 4 | 1 | 0 |
@@ -424,7 +424,7 @@ Every function a TCK query calls. Supported means the engine knows the name (a c
 | `expressions/string/String8.feature` | 0 | 9 | 0 |
 | `expressions/string/String9.feature` | 0 | 9 | 0 |
 | `expressions/temporal/Temporal1.feature` | 154 | 0 | 53 |
-| `expressions/temporal/Temporal10.feature` | 49 | 6 | 76 |
+| `expressions/temporal/Temporal10.feature` | 47 | 8 | 76 |
 | `expressions/temporal/Temporal2.feature` | 5 | 28 | 20 |
 | `expressions/temporal/Temporal3.feature` | 74 | 0 | 109 |
 | `expressions/temporal/Temporal4.feature` | 13 | 12 | 14 |
