@@ -24,8 +24,8 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 use tck_runner::report::{
-    conformance_page, engine_function_names, engine_knows_function, failure_groups, function_page,
-    function_table,
+    conformance_page, engine_function_names, engine_implements_function, engine_knows_function,
+    failure_groups, function_page, function_table,
 };
 use tck_runner::value::from_cell;
 use tck_runner::{
@@ -140,7 +140,7 @@ fn main() -> ExitCode {
         let page = function_page(
             &scenarios,
             &outcomes,
-            engine_knows_function,
+            engine_implements_function,
             &engine_function_names(),
         );
         if let Err(e) = std::fs::write(path, page) {
