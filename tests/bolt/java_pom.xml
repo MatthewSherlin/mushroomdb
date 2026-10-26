@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Scratch-only manifest for the Java driver check (tests/bolt/extra_driver.sh
+     fills the placeholders). Not part of the product's build. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>compat</groupId>
+  <artifactId>compat-check</artifactId>
+  <version>0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.@VENDOR@.driver</groupId>
+      <artifactId>@VENDOR@-java-driver</artifactId>
+      <version>@JAVA_VERSION@</version>
+    </dependency>
+  </dependencies>
+</project>
