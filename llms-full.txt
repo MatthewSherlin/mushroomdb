@@ -5666,7 +5666,9 @@ MERGE (n:Person {id: 'alice'})
   would. A pattern of a label and one string property keys the new node by the
   value when no node holds that key (`MERGE (:Person {name: 'Ada'})` creates the
   node `Ada`, as 0.9 did); when a node holds it, visible or not, the key is
-  generated instead. Any other pattern gets a generated key unless it holds a
+  generated instead, as it is for an empty value or one beginning `_:`. The
+  node then holds that key, so a later `CREATE (:Any {id: 'Ada'})` under any
+  label is a `DuplicateKey`. Any other pattern gets a generated key unless it holds a
   string `id`. A string `id` in such a pattern selects by key, as in `MATCH`;
   when that node exists but does not match the rest of the pattern, the MERGE is
   an error, since a key names one node. A null property value is an error.
@@ -5699,9 +5701,11 @@ MERGE (n:Person {id: 'alice'})
 - Inside a transaction, a MERGE guards its commit with the nodes it matched and
   the key it created: a concurrent change to a matched node, or a second create
   of the same key (a key MERGE, or a property MERGE keyed by its value), is a
-  conflict. A property MERGE that found nothing and created a generated key
-  cannot see a matching node another transaction commits meanwhile; both may
-  create one.
+  conflict. A property MERGE that found nothing cannot see a matching node
+  another transaction creates meanwhile under another key: whether the MERGE
+  keyed its node by the value or generated one, a concurrent `CREATE (:Person
+  {name: 'Ada'})` and the MERGE both commit. A unique constraint on the property
+  (`CREATE CONSTRAINT … REQUIRE n.name IS UNIQUE`) is the guard.
 - A parameter map in the pattern (`MERGE (n:Person $props)`) is refused by
   name: name the key and set the rest, `MERGE (n:Person {id: $props.id}) ON
   CREATE SET n += $props`.

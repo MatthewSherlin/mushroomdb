@@ -893,3 +893,56 @@ fn concurrent_single_property_merges_conflict_on_the_value_key() {
         "the matched node changed under the MERGE"
     );
 }
+
+/// Review R3-M2: an empty value or one shaped like a generated key is never
+/// taken as a property MERGE's key; the node's key is generated.
+#[test]
+fn a_property_merge_never_keys_by_an_empty_or_generated_looking_value() {
+    let mut db = GraphDb::open(&tmp("value-key-skip")).unwrap();
+    for v in ["", "_:0123456789abcdef0123456789abcdef", "_:x"] {
+        let q = format!("MERGE (n:P {{name: '{v}'}}) RETURN key(n) AS k");
+        let rs = run(&mut db, &q);
+        let k = text(rs.get(0, "k"));
+        assert!(is_generated(&k), "{v:?} gave the key {k:?}");
+        assert_ne!(k, v);
+    }
+    assert!(db.node_info("").is_none());
+    // An ordinary value still becomes the key, so a later CREATE of that id
+    // under any label is a duplicate.
+    run(&mut db, "MERGE (:P {name: 'v'})");
+    assert!(matches!(
+        db.query_write("CREATE (:Q {id: 'v'})", &p()),
+        Err(GraphError::DuplicateKey { .. })
+    ));
+}
+
+/// Review R3-M1: a property MERGE cannot see a concurrent CREATE of a
+/// matching node under another key; a unique constraint on the property is
+/// the guard that refuses the second commit.
+#[test]
+fn a_unique_constraint_guards_a_property_merge_against_a_concurrent_create() {
+    let db = SharedDb::open(&tmp("tx-unique")).unwrap();
+    db.write()
+        .query_write(
+            "CREATE CONSTRAINT p_name FOR (n:P) REQUIRE n.name IS UNIQUE",
+            &p(),
+        )
+        .unwrap();
+    let mut a = db.begin_transaction();
+    let mut b = db.begin_transaction();
+    a.execute("MERGE (:P {name: 'x'})", &p()).unwrap();
+    b.execute("CREATE (:P {id: 'other', name: 'x'})", &p())
+        .unwrap();
+    b.commit().unwrap();
+    assert!(
+        a.commit().is_err(),
+        "the constraint refuses the second node"
+    );
+    assert_eq!(
+        db.read()
+            .query("MATCH (n:P {name: 'x'}) RETURN count(n) AS c", &p())
+            .unwrap()
+            .get(0, "c"),
+        Some(&Value::Int(1))
+    );
+}

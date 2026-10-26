@@ -1278,7 +1278,13 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
 fn value_key<'p>(node: &RowMergeNode, props: &'p [(String, Value)]) -> Option<&'p str> {
     let mut named = props.iter().filter(|(f, _)| f != NS_PROP);
     match (named.next(), named.next()) {
-        (Some((_, Value::Str(v))), None) if !node.label.is_empty() => Some(v.as_str()),
+        // The empty string and a value shaped like a generated key are not
+        // used as keys: the node gets a generated one.
+        (Some((_, Value::Str(v))), None)
+            if !node.label.is_empty() && !v.is_empty() && !v.starts_with(GENERATED_KEY_PREFIX) =>
+        {
+            Some(v.as_str())
+        }
         _ => None,
     }
 }
