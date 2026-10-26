@@ -7,13 +7,14 @@ where a missing pyarrow, pandas or polars fails.
 from __future__ import annotations
 
 import importlib
+import datetime
 import json
 import os
 import sys
 
 import pytest
 
-from mushroomdb import GraphDb
+from mushroomdb import Duration, GraphDb
 
 
 
@@ -119,3 +120,70 @@ def test_missing_pyarrow_names_the_install_command(db, monkeypatch):
     monkeypatch.setitem(sys.modules, "pyarrow", None)
     with pytest.raises(ImportError, match="pip install pyarrow"):
         db.to_arrow_tables()
+
+
+def _typed_node(db):
+    tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    db.insert_node(
+        "T",
+        "typed",
+        {
+            "big": 2**62 + 1,
+            "float": 1.5,
+            "nan": float("nan"),
+            "inf": float("inf"),
+            "ninf": float("-inf"),
+            "flag": True,
+            "text": "hi",
+            "list": [1, "a", [2.5]],
+            "map": {"k": [1]},
+            "date": datetime.date(2024, 1, 15),
+            "ldt": datetime.datetime(2024, 1, 15, 12, 34, 56, 789012),
+            "dt": datetime.datetime(2024, 1, 15, 12, 34, 56, 789012, tzinfo=tz),
+            "dur": Duration(14, 3, 4_000_000_000),
+            "bin": b"\x00\xff",
+        },
+    )
+
+
+def test_properties_is_valid_json_with_the_http_form_for_every_value_type(db):
+    _typed_node(db)
+    rows = {r["key"]: r for r in db.to_arrow_tables()["nodes"].to_pylist()}
+    text = rows["typed"]["properties"]
+    props = json.loads(text, parse_constant=lambda c: pytest.fail(f"non-JSON constant {c}"))
+    assert props["big"] == 2**62 + 1
+    assert props["float"] == 1.5
+    assert props["nan"] is None and props["inf"] is None and props["ninf"] is None
+    assert props["flag"] is True and props["text"] == "hi"
+    assert props["list"] == [1, "a", [2.5]]
+    assert props["map"] == {"k": [1]}
+    assert props["date"] == {"$date": "2024-01-15"}
+    assert props["ldt"] == {"$ldt": "2024-01-15T12:34:56.789012"}
+    assert props["dt"] == {"$dt": "2024-01-15T12:34:56.789012+05:30"}
+    assert props["dur"] == {"$dur": "P1Y2M3DT4S"}
+    assert props["bin"] == {"$binary": "AP8="}
+    assert list(props) == sorted(props)
+
+
+def test_properties_column_decodes_in_polars(db):
+    pl = _optional("polars")
+    _typed_node(db)
+    nodes = pl.from_arrow(db.to_arrow_tables()["nodes"])
+    dtype = pl.Struct({"big": pl.Int64, "flag": pl.Boolean, "text": pl.String})
+    typed = nodes.filter(pl.col("key") == "typed")
+    decoded = typed.select(pl.col("properties").str.json_decode(dtype)).row(0)[0]
+    assert decoded == {"big": 2**62 + 1, "flag": True, "text": "hi"}
+
+
+def test_properties_agree_with_what_the_query_surface_holds(db):
+    _typed_node(db)
+    [row] = db.query("MATCH (n:T) RETURN n.big AS big")
+    props = {r["key"]: json.loads(r["properties"]) for r in db.to_arrow_tables()["nodes"].to_pylist()}
+    assert props["typed"]["big"] == row["big"]
+
+
+def test_a_date_outside_pythons_range_does_not_abort_the_export(db):
+    db.query_write("CREATE (n:D {id: 'far', v: date('+12000-01-01')})")
+    rows = {r["key"]: r for r in db.to_arrow_tables()["nodes"].to_pylist()}
+    assert json.loads(rows["far"]["properties"])["v"] == {"$date": "+012000-01-01"}
+    assert set(rows) == {"ada", "bob", "far"}

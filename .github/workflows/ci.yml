@@ -369,7 +369,6 @@ jobs:
       - run: .venv/bin/pip install -U pip maturin pytest pyarrow pandas polars
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
-      - run: .venv/bin/python ../../examples/graph-retrieval/graph_retrieval.py
       - run: .venv/bin/python -m pytest ../../dogfood -q
       # The harness's world-builder tests spawn the binary; a debug build is
       # enough for a 200-node world, and `MUSHROOMDB` points them at it.

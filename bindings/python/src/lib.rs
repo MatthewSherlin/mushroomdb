@@ -1196,7 +1196,9 @@ impl GraphDb {
     /// The whole graph as two `pyarrow.Table`s, `{"nodes": ..., "edges": ...}`.
     ///
     /// `nodes` has columns `key`, `label`, `properties` (string, a JSON object
-    /// with sorted keys; a date, time or binary value is written as its text),
+    /// with sorted keys, each value written as the HTTP API writes it: a
+    /// non-finite float is `null`, a date, time, duration or binary value is a
+    /// tagged object such as `{"$date": "2024-01-15"}`),
     /// sorted by key. `edges` has `source`, `type`, `target`, `derived`
     /// (bool), `rule` (string, null for a manual edge) and `weight` (float,
     /// null unless the creating rule declares a numeric `weight_prop`), sorted
@@ -1221,24 +1223,17 @@ impl GraphDb {
         })?;
         let (nodes, edges) =
             self.with_ref(|db| Ok((db.all_nodes_for_export(), db.all_edges_for_export())))?;
-        let json = PyModule::import(py, "json")?;
-        let dumps_kwargs = PyDict::new(py);
-        dumps_kwargs.set_item("sort_keys", true)?;
-        dumps_kwargs.set_item("default", PyModule::import(py, "builtins")?.getattr("str")?)?;
-
         let node_rows = PyList::empty(py);
         for node in &nodes {
-            let props = PyDict::new(py);
-            for (field, value) in &node.props {
-                props.set_item(field, value_to_py(py, value)?)?;
-            }
+            let props: serde_json::Map<String, serde_json::Value> = node
+                .props
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
             let row = PyDict::new(py);
             row.set_item("key", &node.key)?;
             row.set_item("label", &node.label)?;
-            row.set_item(
-                "properties",
-                json.call_method("dumps", (props,), Some(&dumps_kwargs))?,
-            )?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
             node_rows.append(row)?;
         }
         let edge_rows = PyList::empty(py);
@@ -4078,6 +4073,33 @@ fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>
         rows.push(dict.unbind());
     }
     Ok(rows)
+}
+
+/// A value as the HTTP API writes it (`crates/server/src/json.rs`), so the two
+/// surfaces agree: scalars untagged, a non-finite float as `null`, and a
+/// temporal, duration or binary value as the tagged object `tagged_json`
+/// writes (`{"$date": "2024-01-15"}`). Never produces invalid JSON, and never
+/// goes through a Python `datetime`, so no engine value can abort an export.
+fn value_to_http_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as Js;
+    match v {
+        Value::Int(i) => Js::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Js::Null, Js::Number),
+        Value::Str(s) => Js::String(s.clone()),
+        Value::Bool(b) => Js::Bool(*b),
+        Value::List(xs) => Js::Array(xs.iter().map(value_to_http_json).collect()),
+        Value::Map(m) => Js::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), value_to_http_json(v)))
+                .collect(),
+        ),
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => core_api::tagged_json(v).ok().flatten().unwrap_or(Js::Null),
+        Value::Null => Js::Null,
+    }
 }
 
 fn arrow_schema<'py>(

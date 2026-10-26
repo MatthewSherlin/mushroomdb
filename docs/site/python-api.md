@@ -693,8 +693,9 @@ def to_arrow_tables(self) -> dict[str, Any]
 The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
 
 `nodes` has columns `key`, `label`, `properties` (string: a JSON
-object with sorted keys; a date, time or binary value is written as its
-text), sorted by key. `edges` has `source`, `type`, `target`,
+object with sorted keys, each value written as the HTTP API writes it: a
+non-finite float is `null`, a date, time, duration or binary value is a
+tagged object such as `{"$date": "2024-01-15"}`), sorted by key. `edges` has `source`, `type`, `target`,
 `derived` (bool), `rule` (string, null for a manual edge) and `weight`
 (float, null unless the creating rule declares a numeric
 `weight_prop`), sorted by `(type, source, target)`. An empty store

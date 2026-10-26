@@ -24,7 +24,7 @@ The columns are fixed, so a script written against one store reads any other.
 |---|---|---|---|
 | `nodes` | `key` | string | The node key. Rows are sorted by it. |
 | `nodes` | `label` | string | The node's label. |
-| `nodes` | `properties` | string | A JSON object of the node's properties, keys sorted. A date, time or binary value is written as its text. |
+| `nodes` | `properties` | string | A JSON object of the node's properties, keys sorted, always valid JSON. Each value is written as the HTTP API writes it; see below. |
 | `edges` | `source` | string | Key of the node the edge leaves. |
 | `edges` | `type` | string | The edge type. |
 | `edges` | `target` | string | Key of the node the edge enters. |
@@ -34,7 +34,30 @@ The columns are fixed, so a script written against one store reads any other.
 
 Edges are sorted by `(type, source, target)`. An empty store gives empty tables with the same columns.
 
-Properties are one JSON column because different labels carry different properties. To read one back into a column, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))` or polars `str.json_decode`.
+Properties are one JSON column because different labels carry different properties. To read them into columns, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))`, or polars `str.json_decode(dtype)` with a `pl.Struct` naming the properties you want.
+
+### Property value forms
+
+The forms match what the HTTP API returns for the same value, so the two surfaces agree.
+
+| Engine value | JSON in `properties` |
+|---|---|
+| Integer | A JSON number, exact up to 64 bits. Parse it as a 64-bit integer: a double-based parser loses digits above 2^53. |
+| Float | A JSON number. NaN, Infinity and -Infinity are `null`, never `NaN`. |
+| Boolean, string | `true` / `false`, a JSON string. |
+| List, map | A JSON array, a JSON object, with these same forms inside. |
+| Null inside a list or map | `null` |
+| Date | `{"$date": "2024-01-15"}` |
+| Local date-time | `{"$ldt": "2024-01-15T12:34:56.789012"}` |
+| Date-time with offset | `{"$dt": "2024-01-15T12:34:56.789012+05:30"}` |
+| Duration | `{"$dur": "P1Y2M3DT4S"}`, ISO 8601 |
+| Binary | `{"$binary": "AP8="}`, base64 |
+
+A date outside Python's `datetime` range (year above 9999) still exports, as its text form.
+
+### Namespaces and scope
+
+The namespace a node lives in is a property: it appears in `properties` as `ns`. An unscoped handle exports every namespace, the same as an unscoped `db.query`, and ignores roles and masks. A handle from `scoped()` refuses the call.
 
 ## Limits
 
