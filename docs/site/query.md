@@ -747,23 +747,31 @@ edges (openCypher semantics).  If any edges remain the executor returns:
 MERGE (n:Person {id: 'alice'})
 ```
 
-- **A key MERGE** (a label and one property whose value is a string) finds or
-  creates the node whose key is that value, whatever the property is called.
-  An optional `ns` names the namespace the create arm writes into (`MERGE
-  (n:Doc {id: 'x', ns: 'tenant-a'})`).
-- **Any other pattern matches by its label and properties**, as openCypher's
-  MERGE does: no label (`MERGE (n {name: 'a'})`), no property (`MERGE (n:Tag)`),
-  several properties, or a value that is not a string (`MERGE (n:Item {num:
+- **A key MERGE** is a label and `id` alone, with a string value: it finds or
+  creates the node whose key is that value. An optional `ns` names the
+  namespace the create arm writes into (`MERGE (n:Doc {id: 'x', ns:
+  'tenant-a'})`).
+- **Every other pattern matches by its label and properties**, as openCypher's
+  MERGE does. That covers any other single property (`MERGE (n:Person {name:
+  'Ada'})`), no label (`MERGE (n {name: 'a'})`), no property (`MERGE (n:Tag)`),
+  several properties, and a value that is not a string (`MERGE (n:Item {num:
   42})`). It matches every node carrying the label (any node when there is
   none) whose properties equal the pattern's, the statement's own writes
   included, and binds each: the clauses after it, its `ON MATCH SET` included,
   run once per match. When nothing matches it creates the node as `CREATE`
-  would, with a generated key unless the pattern holds a string `id`. A string
-  `id` in such a pattern selects by key, as in `MATCH`; when that node exists
-  but does not match the rest of the pattern, the MERGE is an error, since a
-  key names one node. A null property value is an error. Without an equality
-  index on one of the pattern's properties, the match scans the label (or every
-  node).
+  would. A pattern of a label and one string property keys the new node by the
+  value when no node holds that key (`MERGE (:Person {name: 'Ada'})` creates the
+  node `Ada`, as 0.9 did); when a node holds it, visible or not, the key is
+  generated instead. Any other pattern gets a generated key unless it holds a
+  string `id`. A string `id` in such a pattern selects by key, as in `MATCH`;
+  when that node exists but does not match the rest of the pattern, the MERGE is
+  an error, since a key names one node. A null property value is an error.
+- **Cost.** A key MERGE is one key lookup. A property MERGE reads an index on
+  the label and one of the pattern's properties when one exists (`CREATE INDEX
+  FOR (n:Person) ON (n.name)`, or an equality index), and otherwise scans every
+  node of the label (every node, with no label). The scan is per row, so `UNWIND $rows AS r MERGE
+  (n:Person {name: r.name})` over N rows into a label of M nodes costs N × M
+  property reads: index the property, or MERGE on `{id: …}`.
 - A role bound to exactly one namespace stamps that namespace when the
   pattern does not name `ns`. A role bound to two or more must name one.
 - `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
@@ -784,12 +792,12 @@ MERGE (n:Person {id: 'alice'})
   refused with `role-bound token: target node not visible`, where an absent key
   would be created: the key-existence signal every create-scoped write already
   gives (see the accepted structural disclosure under [Threat model](http.md#threat-model)).
-- Inside a transaction, a MERGE that matches by properties and finds nothing
+- Inside a transaction, a MERGE guards its commit with the nodes it matched and
+  the key it created: a concurrent change to a matched node, or a second create
+  of the same key (a key MERGE, or a property MERGE keyed by its value), is a
+  conflict. A property MERGE that found nothing and created a generated key
   cannot see a matching node another transaction commits meanwhile; both may
-  create one. A key MERGE has no such gap (two creates of one key conflict).
-- In a bulk `UNWIND … MERGE` of a pattern that is not a key, each row scans the
-  label (every node, with no label), unless an equality index covers one of the
-  pattern's properties: index the property, or MERGE on `{id: …}`.
+  create one.
 - A parameter map in the pattern (`MERGE (n:Person $props)`) is refused by
   name: name the key and set the rest, `MERGE (n:Person {id: $props.id}) ON
   CREATE SET n += $props`.

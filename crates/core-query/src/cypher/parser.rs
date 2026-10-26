@@ -244,7 +244,7 @@ fn plain_create_fits(stmt: &WriteStatement) -> bool {
 }
 
 /// Whether the plain `MERGE` form expresses `stmt`: a key MERGE, every node a
-/// label and one string property. Any other pattern matches by label and
+/// label and a string `id` alone. Any other pattern matches by label and
 /// properties, which the per-row form does (QL-NM).
 fn plain_merge_fits(stmt: &WriteStatement) -> bool {
     let WriteStatement::Merge(merge) = stmt else {
@@ -401,15 +401,16 @@ struct MergeNode<V = Value> {
     var: Option<String>,
     /// Empty for a pattern with no label (QL-NM).
     label: String,
-    /// `Some` for a key pattern: a label and exactly one property (or a lone
-    /// `ns`), whose value is the key when it is a string.
+    /// `Some` for a key pattern: a label and `id` alone (or a lone `ns`),
+    /// whose value is the key when it is a string.
     key: Option<(String, V)>,
     /// Every property of the pattern but `ns`; for a key pattern, the key.
     props: Vec<(String, V)>,
     ns: Option<V>,
 }
 
-/// A key MERGE node of the plain form: a label and one property, the key.
+/// A key MERGE node of the plain form: a label and `id` (or a lone `ns`),
+/// the key.
 struct KeyMergeNode {
     var: Option<String>,
     label: String,
@@ -2403,9 +2404,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+        // Only `id` is a key lookup (QL-NM, owner decision 2026-10-26): any
+        // other property, alone or not, matches by label and property.
         let key = if label.is_empty() {
             None
-        } else if rest.len() == 1 {
+        } else if rest.len() == 1 && rest[0].0 == "id" {
             Some(rest[0].clone())
         } else if rest.is_empty() {
             // A lone `ns` is the identifying key, not a namespace stamp.

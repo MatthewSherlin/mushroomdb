@@ -914,8 +914,8 @@ impl MergeSet {
     }
 }
 
-/// A MERGE node pattern: a key pattern (a label and one property, whose
-/// value is the key when it is a string), or a pattern matched by its label
+/// A MERGE node pattern: a key pattern (a label and `id` alone, whose value
+/// is the key when it is a string), or a pattern matched by its label
 /// and properties (QL-NM).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowMergeNode {

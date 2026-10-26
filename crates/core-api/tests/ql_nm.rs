@@ -426,14 +426,180 @@ fn merge_with_a_string_id_and_more_properties_uses_the_key() {
     );
 }
 
+/// Owner decision (QL-NM round 3): only `id` is a key lookup. A label and
+/// any other single property match by label and property; a created node
+/// takes the value as its key when it is a string and that key is free.
 #[test]
-fn a_key_merge_is_unchanged() {
-    let mut db = GraphDb::open(&tmp("merge-key")).unwrap();
-    run(&mut db, "MERGE (:P {name: 'nk'})");
-    let nk = db
-        .node_info("nk")
-        .expect("a label and one string property: the value is the key");
-    assert_eq!(nk.props.get("name"), Some(&s("nk")));
+fn merge_on_a_single_property_matches_the_property_not_the_key() {
+    let mut db = GraphDb::open(&tmp("merge-prop")).unwrap();
+    // Fresh: the node is created, keyed by the value (the 0.9 key).
+    let st = stats(&run(&mut db, "MERGE (:P {name: 'nk'})"));
+    assert_eq!(st.nodes_created, 1);
+    assert_eq!(
+        db.node_info("nk").unwrap().props.get("name"),
+        Some(&s("nk"))
+    );
+    assert_eq!(
+        stats(&run(&mut db, "MERGE (:P {name: 'nk'})")).nodes_created,
+        0
+    );
+    // A node with that property under another key is matched, not duplicated.
+    run(&mut db, "CREATE (:P {id: 'p1', name: 'B'})");
+    let st = stats(&run(&mut db, "MERGE (n:P {name: 'B'})"));
+    assert_eq!(st.nodes_created, 0, "matched by the property");
+    // A generated-key node with the property is matched too.
+    run(&mut db, "CREATE (:P {name: 'A'})");
+    assert_eq!(
+        stats(&run(&mut db, "MERGE (:P {name: 'A'})")).nodes_created,
+        0
+    );
+    // A node keyed by the value whose property differs is not a match.
+    run(&mut db, "CREATE (:P {id: 'C', name: 'other'})");
+    let rs = run(&mut db, "MERGE (n:P {name: 'C'}) RETURN key(n) AS k");
+    let k = text(rs.get(0, "k"));
+    assert!(
+        is_generated(&k),
+        "`C` is taken, so the new node's key is generated: {k}"
+    );
+    // A different label with the same value is a second node.
+    run(&mut db, "CREATE (:Q {id: 'D'})");
+    let rs = run(
+        &mut db,
+        "MERGE (n:P {name: 'D'}) RETURN key(n) AS k, labels(n) AS l",
+    );
+    assert_eq!(rs.get(0, "l"), Some(&Value::List(vec![s("P")])));
+    assert!(is_generated(&text(rs.get(0, "k"))));
+    assert_eq!(
+        db.node_info("D").unwrap().label,
+        "Q",
+        "the Q node is untouched"
+    );
+    // A non-string value: matched by the property, created with a generated key.
+    let rs = run(&mut db, "MERGE (n:P {num: 7}) RETURN key(n) AS k");
+    assert!(is_generated(&text(rs.get(0, "k"))));
+    assert_eq!(
+        stats(&run(&mut db, "MERGE (n:P {num: 7})")).nodes_created,
+        0
+    );
+    // Several matches: every one is bound.
+    run(&mut db, "CREATE (:R {v: 'x'}), (:R {v: 'x'})");
+    let rs = run(&mut db, "MERGE (n:R {v: 'x'}) RETURN count(*) AS c");
+    assert_eq!(int(&rs, "c"), 2);
+    // `id` is still the key lookup.
+    run(&mut db, "CREATE (:P {id: 'k1', name: 'zz'})");
+    assert_eq!(
+        stats(&run(&mut db, "MERGE (n:P {id: 'k1'})")).nodes_created,
+        0
+    );
+}
+
+/// The same MERGE statements with and without an equality index on the
+/// property give the same graph.
+#[test]
+fn merge_on_a_property_gives_the_same_answer_with_and_without_an_index() {
+    let script = [
+        "CREATE (:P {id: 'p1', name: 'B'}), (:P {name: 'A'}), (:Q {name: 'A'})",
+        "UNWIND ['A', 'B', 'C', 'C', 'A'] AS x MERGE (n:P {name: x}) ON MATCH SET n.hits = coalesce(n.hits, 0) + 1",
+        "MERGE (n:P {name: 'B'}) ON MATCH SET n.seen = true",
+    ];
+    // 0: no index, 1: an equality index, 2: a range index.
+    let shape = |index: u8| {
+        let mut db = GraphDb::open(&tmp(&format!("idx-{index}"))).unwrap();
+        match index {
+            1 => db.enable_index("P", "name").unwrap(),
+            2 => {
+                run(&mut db, "CREATE INDEX FOR (n:P) ON (n.name)");
+            }
+            _ => {}
+        }
+        for q in script {
+            run(&mut db, q);
+        }
+        rows(&read(&db, SHAPE))
+    };
+    let plain = shape(0);
+    assert_eq!(plain, shape(1), "equality index");
+    assert_eq!(plain, shape(2), "range index");
+    assert_eq!(plain.len(), 4, "A, B and C under P, A under Q: {plain:?}");
+}
+
+/// A store whose nodes were made by 0.9's `MERGE (:P {name: …})` (key ==
+/// value, the property stored) still merges onto them.
+#[test]
+fn a_store_merged_by_name_in_0_9_still_merges_onto_its_nodes() {
+    let mut db = GraphDb::open(&tmp("merge-09")).unwrap();
+    for k in ["ada", "bob"] {
+        db.insert_node("P", k, vec![("name".into(), s(k))]).unwrap();
+    }
+    let st = stats(&run(
+        &mut db,
+        "UNWIND ['ada', 'bob', 'cy'] AS x MERGE (:P {name: x})",
+    ));
+    assert_eq!(st.nodes_created, 1);
+    assert_eq!(db.node_count(), 3);
+    assert_eq!(
+        db.node_info("cy").unwrap().label,
+        "P",
+        "a new one keyed as 0.9 would"
+    );
+}
+
+/// A role-scoped MERGE on a single property: scope first, through the mask;
+/// a hidden node with the property is not bound, and a hidden occupant of
+/// the value's key is not revealed (the new node falls back to a generated
+/// key).
+#[test]
+fn a_role_scoped_single_property_merge_sees_only_its_view() {
+    fn scoped(name: &str) -> GraphDb {
+        let mut db = GraphDb::open(&tmp(name)).unwrap();
+        db.apply_schema(&Schema {
+            fulltext: vec![],
+            indexes: vec![],
+            rules: vec![],
+            views: vec![],
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                keys: vec![],
+                labels: vec!["P".into()],
+                visible_where: None,
+                namespaces: None,
+                write: Some(WriteScope {
+                    create_labels: vec!["P".into()],
+                    update_labels: vec!["P".into()],
+                    delete_labels: vec![],
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                    update_edge_types: vec![],
+                }),
+            }],
+        })
+        .unwrap();
+        run(&mut db, "CREATE (:Q {id: 'secret', name: 'secret'})");
+        db
+    }
+    let mut db = scoped("role-prop");
+    let e = db
+        .query_write_authz("writer", "MERGE (n:Q {name: 'secret'})", &p())
+        .unwrap_err();
+    assert!(matches!(e, GraphError::RoleWriteDenied { .. }), "{e:?}");
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:P {name: 'secret'}) RETURN n.name AS name",
+            &p(),
+        )
+        .unwrap();
+    assert_eq!(rs.get(0, "name"), Some(&s("secret")));
+    assert_eq!(
+        db.node_info("secret").unwrap().label,
+        "Q",
+        "the hidden node is untouched"
+    );
+    assert_eq!(
+        db.node_count(),
+        2,
+        "a new P node, keyed apart from the hidden one"
+    );
 }
 
 // ── Durability: replay, snapshot, open_at, transactions, readers, backup ────
@@ -692,5 +858,38 @@ fn a_pattern_merge_never_reveals_a_hidden_node() {
         db.node_info("secret").unwrap().label,
         "Q",
         "nothing written"
+    );
+}
+
+/// In a transaction, a single-property MERGE that creates its node under the
+/// value's key guards the commit with that key: two transactions that both
+/// create it conflict instead of making two nodes. One that matched guards
+/// the node it matched.
+#[test]
+fn concurrent_single_property_merges_conflict_on_the_value_key() {
+    let db = SharedDb::open(&tmp("tx-prop")).unwrap();
+    let mut a = db.begin_transaction();
+    let mut b = db.begin_transaction();
+    a.execute("MERGE (:P {name: 'x'})", &p()).unwrap();
+    b.execute("MERGE (:P {name: 'x'})", &p()).unwrap();
+    a.commit().unwrap();
+    assert!(b.commit().is_err(), "the second create of `x` conflicts");
+    assert_eq!(
+        db.read()
+            .query("MATCH (n:P {name: 'x'}) RETURN count(n) AS c", &p())
+            .unwrap()
+            .get(0, "c"),
+        Some(&Value::Int(1))
+    );
+    let mut c = db.begin_transaction();
+    let mut d = db.begin_transaction();
+    c.execute("MERGE (n:P {name: 'x'}) ON MATCH SET n.c = 1", &p())
+        .unwrap();
+    d.execute("MATCH (n:P {name: 'x'}) SET n.d = 1", &p())
+        .unwrap();
+    d.commit().unwrap();
+    assert!(
+        c.commit().is_err(),
+        "the matched node changed under the MERGE"
     );
 }

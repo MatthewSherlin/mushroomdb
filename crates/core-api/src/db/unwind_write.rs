@@ -1271,6 +1271,18 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
     Ok(written)
 }
 
+/// The key a node created by a MERGE on a label and one string property
+/// takes when that key is free: the value, as 0.9's MERGE keyed it. A key
+/// any node holds, visible or hidden, falls back to a generated key without
+/// saying why.
+fn value_key<'p>(node: &RowMergeNode, props: &'p [(String, Value)]) -> Option<&'p str> {
+    let mut named = props.iter().filter(|(f, _)| f != NS_PROP);
+    match (named.next(), named.next()) {
+        (Some((_, Value::Str(v))), None) if !node.label.is_empty() => Some(v.as_str()),
+        _ => None,
+    }
+}
+
 /// A generated key that no node holds at this point of the statement, and
 /// that the statement has not used for a node it created or deleted.
 fn fresh_key<S: RowSource + ?Sized>(src: &S, ov: &Overlay) -> String {
@@ -1648,7 +1660,10 @@ fn uw_merge_create<S: RowSource + ?Sized>(
                     )))
                 }
                 Some(k) => k.clone(),
-                None => fresh_key(src, ov),
+                None => value_key(node, props)
+                    .filter(|k| !ov.nodes.contains_key(*k) && !src.row_exists(k))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fresh_key(src, ov)),
             };
             (key, props.clone())
         }
