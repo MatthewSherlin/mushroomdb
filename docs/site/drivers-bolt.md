@@ -11,7 +11,12 @@ limits and wire details, see [Bolt protocol](bolt.md).
 |---|---|
 | Official Python driver 6.4.1 | Twelve application scenarios, against a release build, on every pull request and push to `main` |
 | Official JavaScript driver 6.2.0 | The same twelve scenarios, in the same CI job |
-| Official Java, Go and .NET drivers | Their handshake source was audited; they are not run in CI |
+| Official Java driver 6.3.0 | Connect, integer read and explicit-transaction commit/read-back in best-effort CI |
+| Official Go driver 6.3.0 | The same three checks, in a separate best-effort step |
+| Official .NET driver 6.4.0 | The same three checks, in a separate best-effort step |
+
+The best-effort steps report each language's result separately and do not block a merge. They run
+the three checks above, rather than the twelve-scenario Python and JavaScript suite.
 
 The scenarios and the audit are in [Driver compatibility tests](bolt.md#driver-compatibility-tests)
 and [Driver compatibility matrix](bolt.md#driver-compatibility-matrix).

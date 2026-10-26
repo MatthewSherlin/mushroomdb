@@ -130,7 +130,7 @@ All five send the same four slots, in this order:
 
 ## Why 5.0 and 4.4
 
-Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that speaks only those two versions connects to all five. Slot 1 is skipped and slot 2 holds 5.0, so each of them negotiates 5.0; a client whose offer holds 4.4 and not 5.0 gets 4.4. Only the Python and JavaScript drivers are run against the server in CI (see [Driver compatibility tests](#driver-compatibility-tests)); the Java, Go and .NET rows come from the handshake audit alone. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
+Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that speaks only those two versions connects to all five. Slot 1 is skipped and slot 2 holds 5.0, so each of them negotiates 5.0; a client whose offer holds 4.4 and not 5.0 gets 4.4. Python and JavaScript run the twelve-scenario suite in CI; Java, Go and .NET have smaller best-effort checks (see [Driver compatibility tests](#driver-compatibility-tests)). The handshake version ranges in the matrix come from the source audit. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
 
 ## How the handshake is matched
 
@@ -157,6 +157,8 @@ Every pull request and push to `main` runs the official Python driver 6.4.1 and 
 | 10 | `CALL db.labels()` | The full token sees every label; a role token sees only its role's labels and nodes, and is refused a write |
 | 11 | Routing scheme | The driver asks `ROUTE` and runs its reads and writes on the advertised address |
 | 12 | Bookmarks | A read on a second session, given the first session's bookmark, sees the first session's commit |
+
+The separate `bolt-drivers-best-effort` job runs Java 6.3.0, Go 6.3.0 and .NET 6.4.0 through three checks each: connect and authenticate, read an integer count, and commit an explicit transaction whose write is read back. Each language has its own step and summary result, so a failed check does not hide the other languages. These steps do not block a merge and do not cover the full twelve-scenario suite above.
 
 Where these drivers meet the server's current limits: a node or relationship inside a map built in the query, inside a list that mixes kinds, or behind a function arrives as its key or its `{type, start, end}` map, not as a Node or Relationship structure (see [Nodes, relationships and paths](#nodes-relationships-and-paths)). No scenario depends on that form.
 
