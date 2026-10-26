@@ -39,6 +39,7 @@ SITE_DOCS=(
     mcp-tools.md
     association-bench.md
     ingest-git.md
+    arrow.md
     bolt.md
     drivers-bolt.md
     get-started-bolt.md

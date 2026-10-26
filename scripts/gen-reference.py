@@ -234,6 +234,7 @@ GROUPS: dict[str, list[str]] = {
     "Querying": [
         "query", "query_with_params", "query_write", "query_at", "neighbors", "node_info",
         "node_edges", "get_edge_prop", "degree", "degrees", "stats", "roles",
+        "to_arrow_tables",
     ],
     "Rules": [
         "create_rule", "rules", "delete_rule", "rebuild_rule", "suggest_rules", "explain", "has_vector_rule",

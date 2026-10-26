@@ -440,7 +440,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -U pip maturin pytest
+      - run: .venv/bin/pip install -U pip maturin pytest pyarrow pandas polars
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
       - run: .venv/bin/python -m pytest ../../dogfood -q
