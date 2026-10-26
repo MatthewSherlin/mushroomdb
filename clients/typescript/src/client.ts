@@ -13,6 +13,7 @@
  */
 
 import {
+  ConstraintViolationError,
   MushroomError,
   TransactionConflictError,
   TransactionExpiredError,
@@ -106,7 +107,12 @@ export type {
   WccConfig,
   WccReport,
 } from "./types.js";
-export { MushroomError, TransactionConflictError, TransactionExpiredError };
+export {
+  ConstraintViolationError,
+  MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
+};
 export type { TxBeginResponse, TxCommitResponse };
 
 /** Optional constructor flags for {@link MushroomClient}. */
@@ -218,9 +224,11 @@ export class TxHandle {
    *
    * A second `commit()` while one is in flight throws without a request. If the
    * request fails at the network level the outcome is unknown and the handle
-   * refuses all further use.
+   * refuses all further use. After any other error the handle mirrors the
+   * server: it stays usable only if the server still holds the transaction.
    *
    * @throws {@link TransactionConflictError} when a node the transaction read or wrote changed since begin.
+   * @throws {@link ConstraintViolationError} when a unique constraint refuses the writes; not retryable.
    * @throws {@link TransactionExpiredError} when the transaction expired before the commit.
    */
   async commit(): Promise<number> {
@@ -233,17 +241,39 @@ export class TxHandle {
     } catch (err) {
       if (
         err instanceof TransactionConflictError ||
+        err instanceof ConstraintViolationError ||
         err instanceof TransactionExpiredError
       ) {
         // The server ended the transaction.
         this.state = "finished";
-      } else if (err instanceof MushroomError) {
-        // The server answered with an error; the commit did not apply.
+      } else if (err instanceof MushroomError && err.code === "busy") {
+        // Another request held the transaction; the commit never started.
         this.state = "open";
+      } else if (err instanceof MushroomError) {
+        // Any other answer: the server may have consumed the transaction (a
+        // commit that reached the engine ends it whatever the outcome) or not
+        // (refused before it, e.g. 401 or load shedding). Ask it.
+        this.state = await this.probeAfterFailedCommit();
       } else {
         this.state = "unknown";
       }
       throw err;
+    }
+  }
+
+  /**
+   * The handle's state after a commit the server answered with an error other
+   * than a conflict, a constraint refusal, an expiry or `busy`, read from
+   * `GET /tx/{tx_id}` (which does not restart the idle timer): still listed is
+   * `open`, gone (404/410) is `finished`, and anything else, a commit still
+   * running included, is `unknown`.
+   */
+  private async probeAfterFailedCommit(): Promise<"open" | "finished" | "unknown"> {
+    try {
+      await this.call<unknown>("", { method: "GET" });
+      return "open";
+    } catch (probeErr) {
+      return probeErr instanceof TransactionExpiredError ? "finished" : "unknown";
     }
   }
 
@@ -377,6 +407,9 @@ export class MushroomClient {
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
       const code: string | undefined =
         typeof body?.code === "string" ? body.code : undefined;
+      if (resp.status === 409 && code === "constraint") {
+        throw new ConstraintViolationError(detail, resp.status, code);
+      }
       throw new MushroomError(detail, resp.status, code);
     }
     return body as T;
@@ -1000,7 +1033,8 @@ export class MushroomClient {
 
   /**
    * Run one request against a transaction route and map its failures: HTTP 409
-   * becomes {@link TransactionConflictError}. 404 and 410 become
+   * becomes {@link TransactionConflictError}, except `busy` (a plain
+   * {@link MushroomError}) and `constraint` (a {@link ConstraintViolationError}). 404 and 410 become
    * {@link TransactionExpiredError} on `/run`, `/commit` and `/rollback`
    * (`expiredOnMissing`); on `/tx/begin` they mean the server has no
    * transaction routes.
@@ -1016,9 +1050,10 @@ export class MushroomClient {
       if (err instanceof MushroomError) {
         // `busy` is a request that raced another on the same transaction:
         // nothing is wrong with the transaction, so it is not a conflict and
-        // the handle stays open. Any other 409 (`conflict`, or no code from an
-        // older server) is a commit conflict.
-        if (err.status === 409 && err.code !== "busy") {
+        // the handle stays open. `constraint` is already a
+        // ConstraintViolationError: a retry cannot fix it. Any other 409
+        // (`conflict`, or no code from an older server) is a commit conflict.
+        if (err.status === 409 && err.code !== "busy" && err.code !== "constraint") {
           throw new TransactionConflictError(err.detail, err.status, err.code);
         }
         if (expiredOnMissing && (err.status === 404 || err.status === 410)) {

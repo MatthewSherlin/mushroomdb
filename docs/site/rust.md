@@ -144,8 +144,8 @@ entire batch is rejected: no WAL bytes written, no in-memory state changes.
 
 **Crash atomicity, not isolation:** on WAL replay after a crash, a torn
 `Batch` frame applies none of its ops. However, while applying a committed
-batch in memory, concurrent readers may observe intermediate states. There is
-no interactive transaction isolation in v1.
+batch in memory, concurrent readers may observe intermediate states. For
+isolation, use an interactive transaction; see [Transactions](transactions.md).
 
 The following ops are supported inside `write_batch`:
 

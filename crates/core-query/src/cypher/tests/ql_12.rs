@@ -410,9 +410,13 @@ fn on_match_is_not_a_match_clause() {
     ] {
         assert!(parse_write(&lex(q).unwrap()).is_ok(), "{q}");
     }
-    // A failure after ON MATCH is not read as a MATCH … CREATE statement.
-    let err = statement_err("MERGE (a:P {id: 'a'}) ON MATCH SET a.n = 1 CREATE (b:P {id: 'q'})");
-    assert!(err.contains("unexpected tokens after MERGE"), "{err}");
+    // A clause after ON MATCH SET is the next write clause of the statement
+    // (QL-NM: MERGE then CREATE), not the start of a MATCH … CREATE.
+    let q = "MERGE (a:P {id: 'a'}) ON MATCH SET a.n = 1 CREATE (b:P {id: 'q'})";
+    match parse_write(&lex(q).unwrap()) {
+        Ok(crate::cypher::WriteStatement::UnwindWrite(u)) => assert_eq!(u.writes.len(), 2, "{q}"),
+        other => panic!("{q}: {other:?}"),
+    }
 }
 
 #[test]

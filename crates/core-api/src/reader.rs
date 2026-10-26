@@ -1032,6 +1032,8 @@ impl ReaderSnapshot {
     /// (`lex:` / `parse:` / `execute:`), the same slow-query report into the
     /// originating handle's ring, and equality lookups served from an index.
     pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
@@ -1067,6 +1069,20 @@ impl ReaderSnapshot {
         result
     }
 
+    /// [`query_masked`](Self::query_masked) as one statement of a transaction
+    /// that began at `transaction_micros` ([`clock_micros`](crate::clock_micros)
+    /// at BEGIN): `.transaction()` reads that instant.
+    pub fn query_masked_in_transaction(
+        &self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+        mask: &NodeMask,
+        transaction_micros: i64,
+    ) -> Result<ResultSet> {
+        let _transaction = core_query::cypher::TransactionClock::enter(transaction_micros);
+        self.query_masked(cypher, params, mask)
+    }
+
     /// Execute a read-only Cypher query with a node visibility mask.
     ///
     /// The snapshot twin of [`GraphDb::query_masked`](crate::GraphDb::query_masked),
@@ -1080,6 +1096,8 @@ impl ReaderSnapshot {
         params: &BTreeMap<String, Value>,
         mask: &NodeMask,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;

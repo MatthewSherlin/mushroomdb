@@ -476,3 +476,16 @@ def test_the_gil_is_released_while_a_statement_runs(db):
     # A thread that held the GIL for the whole statement would tick ~0 times.
     assert during > 20, f"{during} ticks in {elapsed:.2f}s"
     tx.rollback()
+
+
+def test_a_scoped_transaction_holds_one_transaction_instant(db):
+    # QL-CL (row 161): `.transaction()` is the instant BEGIN ran, the same in
+    # every statement; `.statement()` is each statement's own, never earlier.
+    db.insert_node("P", "mine", {"id": "mine"}, namespace="a")
+    scoped = db.scoped(namespace="a")
+    q = "RETURN datetime.transaction() AS t, datetime.statement() AS s"
+    with scoped.transaction() as tx:
+        first = tx.execute(q)[0]
+        second = tx.execute(q)[0]
+    assert first["t"] == second["t"]
+    assert first["t"] <= first["s"] <= second["s"]

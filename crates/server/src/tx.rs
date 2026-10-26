@@ -169,6 +169,8 @@ pub(crate) enum TxBody {
         mask: NodeMask,
         /// A `read`-tier key, whose refusal text differs from a role token's.
         read_tier_key: bool,
+        /// The clock at BEGIN: what `.transaction()` reads in each statement.
+        clock_micros: i64,
     },
 }
 
@@ -186,6 +188,16 @@ struct Slot {
 struct Tombstone {
     owner: String,
     expired_at: Instant,
+    why: Expiry,
+}
+
+/// Which limit rolled a transaction back; the 410 says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// Idle for the idle timeout.
+    Idle,
+    /// Open for the maximum lifetime, however busy.
+    Lifetime,
 }
 
 #[derive(Default)]
@@ -206,8 +218,8 @@ struct Inner {
 pub(crate) enum TxError {
     /// No such transaction, or not the caller's.
     NotFound,
-    /// The idle timeout rolled it back.
-    Expired,
+    /// The idle timeout or the lifetime rolled it back.
+    Expired(Expiry),
     /// Another request has it checked out.
     Busy,
     /// The server is shutting down.
@@ -220,9 +232,14 @@ impl IntoResponse for TxError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "unknown transaction".to_string()),
-            Self::Expired => (
+            Self::Expired(Expiry::Idle) => (
                 StatusCode::GONE,
                 "transaction expired: idle too long, rolled back".to_string(),
+            ),
+            Self::Expired(Expiry::Lifetime) => (
+                StatusCode::GONE,
+                "transaction expired: open longer than its maximum lifetime, rolled back"
+                    .to_string(),
             ),
             Self::Busy => (StatusCode::CONFLICT, "transaction busy".to_string()),
             Self::Closed => (
@@ -350,10 +367,11 @@ impl TxStore {
         if slot.deadline <= now {
             // Expired before the reaper got to it: it is rolled back now.
             slot.body = Some(body);
+            let why = self.expiry(slot);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
-            return Err(TxError::Expired);
+            return Err(TxError::Expired(why));
         }
         Ok(body)
     }
@@ -370,7 +388,7 @@ impl TxStore {
             drop((slot, body));
             return Err(TxError::Closed);
         }
-        let was_expired = state.expired.contains_key(id);
+        let was_expired = state.expired.get(id).map(|t| t.why);
         match state.open.get_mut(id) {
             Some(slot) => {
                 let (deadline, deadline_wall) = self.next_deadline(now, slot.born);
@@ -381,8 +399,7 @@ impl TxStore {
                 Ok(())
             }
             // Removed while the statement ran: past its lifetime.
-            None if was_expired => Err(TxError::Expired),
-            None => Err(TxError::NotFound),
+            None => Err(was_expired.map_or(TxError::NotFound, TxError::Expired)),
         }
     }
 
@@ -392,7 +409,9 @@ impl TxStore {
         drop(slot);
     }
 
-    /// What `GET /tx/{id}` reports. Does not restart the idle timer.
+    /// What `GET /tx/{id}` reports. Does not restart the idle timer. While a
+    /// request has the transaction checked out it is [`TxError::Busy`], as
+    /// every other request on it is.
     pub(crate) fn info(&self, id: &str, owner: &str) -> Result<(SystemTime, usize), TxError> {
         let now = Instant::now();
         let mut state = lock(&self.inner.state);
@@ -402,11 +421,17 @@ impl TxStore {
         if !same_owner(&slot.owner, owner) {
             return Err(TxError::NotFound);
         }
-        if slot.body.is_some() && slot.deadline <= now {
+        // A request holds it: a statement or a commit is running, and the
+        // caller cannot yet know whether the transaction will still be there.
+        if slot.body.is_none() {
+            return Err(TxError::Busy);
+        }
+        if slot.deadline <= now {
+            let why = self.expiry(slot);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
-            return Err(TxError::Expired);
+            return Err(TxError::Expired(why));
         }
         Ok((slot.deadline_wall, slot.op_count))
     }
@@ -457,7 +482,7 @@ impl TxStore {
     /// expired, 404 to anyone else.
     fn missing(state: &Registry, id: &str, owner: &str) -> TxError {
         match state.expired.get(id) {
-            Some(t) if same_owner(&t.owner, owner) => TxError::Expired,
+            Some(t) if same_owner(&t.owner, owner) => TxError::Expired(t.why),
             _ => TxError::NotFound,
         }
     }
@@ -466,11 +491,25 @@ impl TxStore {
     /// it (the rollback) after releasing the lock.
     fn expire(&self, state: &mut Registry, id: &str, now: Instant) -> Option<Slot> {
         let slot = state.open.remove(id)?;
-        self.remember(state, id, &slot.owner, now);
+        let why = self.expiry(&slot);
+        self.remember(state, id, &slot.owner, now, why);
         Some(slot)
     }
 
-    fn remember(&self, state: &mut Registry, id: &str, owner: &str, now: Instant) {
+    /// Which limit a due slot ran into first, whenever it is noticed. A slot a
+    /// request holds has no idle deadline, so only the lifetime can end it.
+    /// Otherwise `deadline` is the nearer of the idle deadline and the
+    /// lifetime ([`Self::next_deadline`]): equal to the lifetime when that is
+    /// the nearer one, earlier when the idle deadline is.
+    fn expiry(&self, slot: &Slot) -> Expiry {
+        if slot.body.is_none() || slot.deadline >= slot.born + self.inner.limits.max_lifetime {
+            Expiry::Lifetime
+        } else {
+            Expiry::Idle
+        }
+    }
+
+    fn remember(&self, state: &mut Registry, id: &str, owner: &str, now: Instant, why: Expiry) {
         if state.expired.len() >= MAX_TOMBSTONES {
             let oldest = state
                 .expired
@@ -486,6 +525,7 @@ impl TxStore {
             Tombstone {
                 owner: owner.to_string(),
                 expired_at: now,
+                why,
             },
         );
     }
@@ -612,6 +652,7 @@ async fn begin(
                 snapshot,
                 mask,
                 read_tier_key: read_only_key.is_some(),
+                clock_micros: mushroomdb::clock_micros(),
             }
         }
         // `Anonymous` reaches only `/health`; refuse it here all the same.
@@ -676,6 +717,7 @@ fn execute(
             snapshot,
             mask,
             read_tier_key,
+            clock_micros,
         } => {
             if is_write_query(cypher).map_err(RunError::Bad)? {
                 return Err(RunError::Refused(if *read_tier_key {
@@ -685,7 +727,7 @@ fn execute(
                 }));
             }
             snapshot
-                .query_masked(cypher, params, mask)
+                .query_masked_in_transaction(cypher, params, mask, *clock_micros)
                 .map_err(|e| match e {
                     GraphError::MaskedReadOnly => {
                         RunError::Bad("masked queries are read-only".into())
@@ -833,6 +875,31 @@ mod tests {
         (TxBody::Full(Box::new(db.begin_transaction())), dir)
     }
 
+    /// QL-CL (row 161): a role-scoped transaction holds the instant it began
+    /// at for `.transaction()`, in every statement.
+    #[test]
+    fn a_scoped_transaction_reads_one_transaction_instant() {
+        const BEGAN: i64 = 1_700_000_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut body = TxBody::Scoped {
+            snapshot: db.reader(),
+            mask: mushroomdb::NodeMask::from_ids([]),
+            read_tier_key: false,
+            clock_micros: BEGAN,
+        };
+        let q = "RETURN datetime.transaction() = datetime.fromepoch(1700000000, 0) AS began, \
+                 datetime.statement() = datetime.fromepoch(1700000000, 0) AS stmt";
+        for _ in 0..2 {
+            let Ok(rs) = execute(&mut body, q, &BTreeMap::new()) else {
+                panic!("the statement failed")
+            };
+            assert_eq!(rs.get(0, "began"), Some(&mushroomdb::Value::Bool(true)));
+            // The statement's own instant is the clock's, not BEGIN's.
+            assert_eq!(rs.get(0, "stmt"), Some(&mushroomdb::Value::Bool(false)));
+        }
+    }
+
     #[test]
     fn limits_default_and_parse() {
         assert_eq!(TxLimits::from_values(None, None, None), TxLimits::default());
@@ -892,7 +959,10 @@ mod tests {
         assert_eq!(s.reap(Instant::now()), 0);
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(1)), 1);
         assert_eq!(s.open_count(), 0);
-        assert_eq!(s.checkout(&id, "alice").err(), Some(TxError::Expired));
+        assert_eq!(
+            s.checkout(&id, "alice").err(),
+            Some(TxError::Expired(Expiry::Idle))
+        );
         assert_eq!(s.checkout(&id, "mallory").err(), Some(TxError::NotFound));
     }
 
@@ -905,6 +975,25 @@ mod tests {
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(1)), 0);
         s.checkin(&id, held, true).unwrap();
         assert_eq!(s.info(&id, "alice").unwrap().1, 1);
+    }
+
+    #[test]
+    fn info_is_busy_while_a_request_holds_the_transaction() {
+        let s = store(10, 60_000);
+        let (b, _dir) = body();
+        let (id, _) = s.begin("alice".into(), b).unwrap();
+        let held = s.checkout(&id, "alice").unwrap();
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::Busy));
+        // Ownership is checked first: a stranger still hears 404.
+        assert_eq!(s.info(&id, "mallory").err(), Some(TxError::NotFound));
+        s.checkin(&id, held, true).unwrap();
+        assert_eq!(s.info(&id, "alice").unwrap().1, 1);
+        // A commit consumes it: busy while it runs, gone after.
+        let held = s.checkout(&id, "alice").unwrap();
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::Busy));
+        s.finish(&id);
+        drop(held);
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::NotFound));
     }
 
     #[test]
@@ -949,9 +1038,50 @@ mod tests {
         assert!(expires <= SystemTime::now() + Duration::from_secs(61));
         let held = s.checkout(&id, "a").unwrap();
         s.checkin(&id, held, true).unwrap();
-        // Past the lifetime it goes, even though it was just used.
+        // Past the lifetime it goes, even while a request is using it.
+        let held = s.checkout(&id, "a").unwrap();
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(101)), 1);
-        assert_eq!(s.checkout(&id, "a").err(), Some(TxError::Expired));
+        assert_eq!(
+            s.checkin(&id, held, true).err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
+    }
+
+    #[test]
+    fn an_idle_expiry_noticed_after_the_lifetime_is_still_idle() {
+        let s = TxStore::new(TxLimits {
+            max_open: 10,
+            idle_timeout: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(100),
+        });
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        // Idle from 10 s; the reap that notices it runs only at 150 s.
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(150)), 1);
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Idle))
+        );
+    }
+
+    #[test]
+    fn a_lifetime_expiry_is_lifetime_when_the_idle_deadline_lies_beyond_it() {
+        let s = TxStore::new(TxLimits {
+            max_open: 10,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_secs(30),
+        });
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(31)), 1);
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
     }
 
     #[test]

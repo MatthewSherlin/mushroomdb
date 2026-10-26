@@ -1259,6 +1259,13 @@ fn restore_on_boot_holds_the_lease_through_a_slow_open() {
     let mut first = s3.serve(&src, &prefix);
     let addr = listening_addr(&mut first);
     create_node(&addr, "a");
+    // HTTP readiness does not wait for the backup lease. Establish the source
+    // backup before shutdown can cancel its initial lease acquisition.
+    rt.block_on(wait_for_object(
+        store.as_ref(),
+        &format!("{prefix}/LATEST"),
+        Duration::from_secs(5),
+    ));
     terminate(&mut first);
     let parent_latest = rt.block_on(wait_for_object(
         store.as_ref(),
@@ -1306,6 +1313,10 @@ fn restore_on_boot_holds_the_lease_through_a_slow_open() {
     }
     assert!(!seen.is_empty(), "the boot never took the lease");
     let addr = listening_addr(&mut child);
+    let (status, body) = http(&addr, "GET", "/node/a", "");
+    assert_eq!(status, 200, "the source node was restored: {body}");
+    let restored: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(restored["key"], "a");
     create_node(&addr, "after");
     let shipped = std::time::Instant::now();
     loop {

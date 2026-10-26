@@ -1,0 +1,1 @@
+- **Backup shutdown:** finish an in-flight lease acquisition and the final backup within one flush grace, and release an own lease even when acquisition was canceled before its handle was returned. Conditional-write checks, foreign-owner protection and existing shutdown bounds remain in force.

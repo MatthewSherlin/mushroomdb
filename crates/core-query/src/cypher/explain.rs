@@ -793,10 +793,13 @@ fn row_write_op(w: &RowWrite) -> J {
             ],
         ),
         RowWrite::Remove(removals) => remove_op(removals),
-        RowWrite::Delete { vars, detach } => op(
-            "DeleteNode",
-            vec![("vars", J::strs(vars)), ("detach", J::Bool(*detach))],
-        ),
+        RowWrite::Delete { vars, rels, detach } => {
+            let mut fields = vec![("vars", J::strs(vars)), ("detach", J::Bool(*detach))];
+            if !rels.is_empty() {
+                fields.push(("relationships", J::strs(rels)));
+            }
+            op("DeleteNode", fields)
+        }
     }
 }
 

@@ -875,7 +875,7 @@ export class MushroomError extends Error {
     public readonly detail: string,
     /** HTTP status of the response that caused the error, when there was one. */
     public readonly status?: number,
-    /** The server's machine-readable `code` for the error, when it sent one (`conflict`, `busy`). */
+    /** The server's machine-readable `code` for the error, when it sent one (`conflict`, `busy`, `constraint`). */
     public readonly code?: string,
   ) {
     super(detail);
@@ -893,6 +893,20 @@ export class TransactionConflictError extends MushroomError {
   constructor(detail: string, status?: number, code?: string) {
     super(detail, status, code);
     this.name = "TransactionConflictError";
+  }
+}
+
+/**
+ * A write was refused by a unique constraint (HTTP 409 with `code`
+ * `"constraint"`): it would give two live nodes the same value. Nothing was
+ * written. Thrown by any write, including a transaction's commit, which ends
+ * the transaction. Unlike {@link TransactionConflictError}, retrying the same
+ * writes fails again until the clashing value changes.
+ */
+export class ConstraintViolationError extends MushroomError {
+  constructor(detail: string, status?: number, code?: string) {
+    super(detail, status, code);
+    this.name = "ConstraintViolationError";
   }
 }
 

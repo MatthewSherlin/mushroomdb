@@ -55,7 +55,7 @@ roadmap, is in [Architecture](architecture.md).
 ## Status
 
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
-writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
+writer; multi-statement transactions are snapshot-isolated. Toolchain pinned to Rust 1.92.0.
 
 The current release is on the [releases page](https://github.com/MatthewSherlin/mushroomdb/releases).
 
@@ -64,8 +64,8 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 ## Pages in this section
 
 - [Get started](get-started.md) — pick a language: [Rust](get-started-rust.md), [Python](get-started-python.md), [TypeScript](get-started-typescript.md), [Docker](get-started-docker.md), or [an existing Cypher app over Bolt](get-started-bolt.md)
-- [Drivers and Bolt](drivers-bolt.md) — placeholder until the Bolt server lands
-- [Transactions](transactions.md) — placeholder until transactions land
+- [Drivers and Bolt](drivers-bolt.md) — connect the official graph-database drivers over Bolt, and which of their features work
+- [Transactions](transactions.md) — several statements as one atomic commit, under snapshot isolation, from every surface
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
 - [Rules](rules.md) — all six predicate kinds with examples
@@ -94,6 +94,7 @@ Reference:
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
 - [Cypher Query Reference](query.md)
 - [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
+- [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it
 - [Bolt protocol](bolt.md) — the versions the server negotiates and the driver audit behind them
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)

@@ -32,7 +32,7 @@
 
 use super::row_eval::{
     reads_node, reads_rel_prop, uw_edge_exists, uw_edge_props, uw_edges_removed, uw_eval,
-    uw_exists, uw_has_edges, uw_props, EdgeKey, Overlay, RowSource,
+    uw_exists, uw_has_edges, uw_label, uw_pattern_matches, uw_props, EdgeKey, Overlay, RowSource,
 };
 use super::*;
 use core_query::cypher::{
@@ -121,6 +121,8 @@ struct Tally {
     relationships_created: i64,
     /// Of `deleted`, the nodes; the rest are relationships.
     nodes_deleted: i64,
+    /// Labels the created nodes carry: a node created with no label adds none.
+    labels_added: i64,
     /// Properties the created nodes and relationships were written with (not in `props_set`,
     /// which keeps the write row's documented meaning).
     created_props: i64,
@@ -352,8 +354,8 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, captures: &[RelCapture]) -> 
                     note_var(var);
                 }
             }
-            RowWrite::Delete { vars, .. } => {
-                for var in vars {
+            RowWrite::Delete { vars, rels, .. } => {
+                for var in vars.iter().chain(rels) {
                     note_var(var);
                 }
             }
@@ -417,7 +419,13 @@ fn plan_columns(stmt: &UnwindWriteStmt, used: &str, captures: &[RelCapture]) -> 
 }
 
 fn merge_operands(node: &RowMergeNode, cols: &mut Columns, nodes: &[String], rels: &[String]) {
-    cols.operand(&node.key, nodes, rels);
+    if node.key_pattern {
+        cols.operand(&node.key, nodes, rels);
+    } else {
+        for (_, op) in &node.props {
+            cols.operand(op, nodes, rels);
+        }
+    }
     if let Some(ns) = &node.ns {
         cols.operand(ns, nodes, rels);
     }
@@ -491,7 +499,7 @@ fn names_in_writes(writes: &[RowWrite]) -> HashSet<String> {
                 operands.push(value);
             }
             RowWrite::Remove(items) => names.extend(items.iter().map(|(v, _)| v.clone())),
-            RowWrite::Delete { vars, .. } => names.extend(vars.iter().cloned()),
+            RowWrite::Delete { vars, rels, .. } => names.extend(vars.iter().chain(rels).cloned()),
         }
     }
     for op in operands {
@@ -702,7 +710,7 @@ impl RowPass {
         let tally = &self.tally;
         let stats = WriteStats {
             nodes_created: tally.created,
-            labels_added: tally.created,
+            labels_added: tally.labels_added,
             nodes_deleted: tally.nodes_deleted,
             relationships_created: tally.relationships_created,
             relationships_deleted: tally.deleted - tally.nodes_deleted,
@@ -819,10 +827,22 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
             values,
             params,
         };
-        for write in &stmt.writes {
-            uw_write(write, &ctx, &mut env, &mut ov, &mut ops, &mut tally)?;
+        let mut leaves: Vec<HashMap<&str, String>> = Vec::new();
+        run_writes(
+            &stmt.writes,
+            &ctx,
+            env,
+            &mut ov,
+            &mut ops,
+            &mut tally,
+            &mut leaves,
+        )?;
+        if !capture {
+            continue;
         }
-        if capture {
+        // One captured row per environment the writes ended with: a MERGE
+        // that matched several nodes gives the row several.
+        for env in &leaves {
             // Only what the RETURN names: a bare `count(*)` captures an
             // empty row.
             let mut entry: BTreeMap<String, Value> = BTreeMap::new();
@@ -831,7 +851,7 @@ pub(crate) fn unwind_rows<S: RowSource + ?Sized>(
                     entry.insert((*name).to_string(), v.clone());
                 }
             }
-            for (name, key) in &env {
+            for (name, key) in env.iter() {
                 if names_used(&used, name) && !rel_vars.contains(name) {
                     entry.insert((*name).to_string(), Value::Str(key.clone()));
                 }
@@ -905,6 +925,9 @@ fn one_row<S: RowSource + ?Sized>(
         let mut values = Vec::with_capacity(cols.items.len());
         for item in &cols.items {
             let value = match &item.value {
+                // A value naming a variable has nothing here to read it from:
+                // the query engine plans it, and refuses an unbound name.
+                RetVal::ScalarExpr(op) if reads_a_variable(op) => return None,
                 RetVal::ScalarExpr(op) => {
                     match core_query::cypher::eval_operand(view, op, &Params(params), &[]) {
                         Ok(v) => v,
@@ -923,6 +946,16 @@ fn one_row<S: RowSource + ?Sized>(
         rows.push_row(values);
         rows
     }))
+}
+
+/// Whether `op` reads a variable or a variable's property anywhere.
+fn reads_a_variable(op: &Operand) -> bool {
+    let mut found = false;
+    super::row_eval::map_leaves(op, &mut |_| {
+        found = true;
+        None
+    });
+    found
 }
 
 impl<F: Fs> GraphDb<F> {
@@ -951,7 +984,37 @@ impl<F: Fs> GraphDb<F> {
     }
 }
 
-/// One write clause for one row.
+/// The write clauses `writes` for one row, from `env`. A MERGE that binds
+/// several nodes runs the clauses after it once for each; every environment
+/// the clauses end with is pushed onto `leaves`.
+fn run_writes<'v, S: RowSource + ?Sized>(
+    writes: &'v [RowWrite],
+    ctx: &RowCtx<'_, S>,
+    mut env: HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+    leaves: &mut Vec<HashMap<&'v str, String>>,
+) -> Result<()> {
+    for (i, write) in writes.iter().enumerate() {
+        if let RowWrite::Merge(merge) = write {
+            let mut branches = uw_merge(merge, ctx, env, ov, ops, tally)?;
+            if branches.len() == 1 {
+                env = branches.swap_remove(0);
+                continue;
+            }
+            for branch in branches {
+                run_writes(&writes[i + 1..], ctx, branch, ov, ops, tally, leaves)?;
+            }
+            return Ok(());
+        }
+        uw_write(write, ctx, &mut env, ov, ops, tally)?;
+    }
+    leaves.push(env);
+    Ok(())
+}
+
+/// One write clause other than MERGE for one row.
 fn uw_write<'v, S: RowSource + ?Sized>(
     write: &'v RowWrite,
     ctx: &RowCtx<'_, S>,
@@ -966,13 +1029,16 @@ fn uw_write<'v, S: RowSource + ?Sized>(
             for node in nodes {
                 tally.created_props += uw_create_node(node, ctx, env, ov, ops)?;
                 tally.created += 1;
+                tally.labels_added += i64::from(!node.label.is_empty());
             }
             for edge in edges {
                 uw_create_edge(edge, ctx, env, ov, ops, tally)?;
             }
         }
-        RowWrite::Merge(merge) => {
-            uw_merge(merge, ctx, env, ov, ops, tally)?;
+        RowWrite::Merge(_) => {
+            return Err(err(
+                "internal: a MERGE is run by run_writes, which binds each match".to_string(),
+            ));
         }
         RowWrite::Set(sets) => {
             for sc in sets {
@@ -1037,7 +1103,15 @@ fn uw_write<'v, S: RowSource + ?Sized>(
                 });
             }
         }
-        RowWrite::Delete { vars, detach } => {
+        RowWrite::Delete { vars, rels, detach } => {
+            // A null relationship (OPTIONAL MATCH) is skipped; this form does
+            // not delete one that is there.
+            if let Some(var) = rels.iter().find(|var| env.contains_key(var.as_str())) {
+                return Err(err(format!(
+                    "not supported in mushroomdb 0.10: DELETE of the relationship `{var}` in a \
+                     statement with OPTIONAL MATCH; use MATCH … DELETE"
+                )));
+            }
             for var in vars {
                 let Some(key) = env.get(var.as_str()).cloned() else {
                     continue;
@@ -1185,19 +1259,16 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
             props.push((field.clone(), v));
         }
     }
+    // A string `id` is the key, as it always was; without one the node gets
+    // a generated key (QL-NM).
     let key = match props.iter().find(|(f, _)| f == "id") {
         Some((_, Value::Str(s))) => s.clone(),
-        _ => {
-            return Err(err(format!(
-                "CREATE node ({}:{}) requires a string 'id' property",
-                node.var, node.label
-            )))
-        }
+        _ => fresh_key(ctx.src, ov),
     };
     if uw_exists(ctx.src, ov, &key) {
         return Err(GraphError::DuplicateKey { key });
     }
-    ov.node_created(&key, &props);
+    ov.node_created(&key, &node.label, &props);
     let written = props.len() as i64;
     ops.push(BatchOp::InsertNode {
         label: node.label.clone(),
@@ -1206,6 +1277,30 @@ fn uw_create_node<'v, S: RowSource + ?Sized>(
     });
     env.insert(node.var.as_str(), key);
     Ok(written)
+}
+
+/// The key a node created by a MERGE on a label and one string property
+/// takes when that key is free: the value, as 0.9's MERGE keyed it. A key
+/// any node holds, visible or hidden, falls back to a generated key without
+/// saying why.
+fn value_key<'p>(node: &RowMergeNode, props: &'p [(String, Value)]) -> Option<&'p str> {
+    let mut named = props.iter().filter(|(f, _)| f != NS_PROP);
+    match (named.next(), named.next()) {
+        // The empty string and a value shaped like a generated key are not
+        // used as keys: the node gets a generated one.
+        (Some((_, Value::Str(v))), None)
+            if !node.label.is_empty() && !v.is_empty() && !v.starts_with(GENERATED_KEY_PREFIX) =>
+        {
+            Some(v.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// A generated key that no node holds at this point of the statement, and
+/// that the statement has not used for a node it created or deleted.
+fn fresh_key<S: RowSource + ?Sized>(src: &S, ov: &Overlay) -> String {
+    generate_node_key(|k| ov.nodes.contains_key(k) || src.row_exists(k))
 }
 
 /// The key a MERGE node pattern names for this row. A bound node's key is
@@ -1272,8 +1367,13 @@ fn uw_merge_existed<S: RowSource + ?Sized>(
     }
 }
 
-fn uw_merge<'v, S: RowSource + ?Sized>(
+/// A MERGE whose every node is bound or a key pattern with a string key: each
+/// node is found or created by its key, then the relationship by its ends.
+#[allow(clippy::too_many_arguments)]
+fn uw_key_merge<'v, S: RowSource + ?Sized>(
     merge: &'v RowMerge,
+    start: &MergeEnd,
+    end: Option<&MergeEnd>,
     ctx: &RowCtx<'_, S>,
     env: &mut HashMap<&'v str, String>,
     ov: &mut Overlay,
@@ -1281,7 +1381,7 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     tally: &mut Tally,
 ) -> Result<()> {
     let src = ctx.src;
-    let (start_key, start_value) = uw_merge_key(&merge.start, ctx, env, ov)?;
+    let (start_key, start_value) = uw_end_key(&merge.start, start, ctx, env, ov)?;
     tally.merge_keys.push(start_key.clone());
     let start_ns = match &merge.start.ns {
         Some(op) => ctx.eval(op, env, ov)?,
@@ -1293,13 +1393,14 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
             let props =
                 src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
             tally.created_props += props.len() as i64;
-            ov.node_created(&start_key, &props);
+            ov.node_created(&start_key, &merge.start.label, &props);
             ops.push(BatchOp::InsertNode {
                 label: merge.start.label.clone(),
                 key: start_key.clone(),
                 props,
             });
             tally.created += 1;
+            tally.labels_added += 1;
         }
         let sets = if existed {
             &merge.on_match
@@ -1311,7 +1412,8 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         return Ok(());
     };
 
-    let (end_key, end_value) = uw_merge_key(&edge.end, ctx, env, ov)?;
+    let end = end.unwrap_or(&MergeEnd::Bound);
+    let (end_key, end_value) = uw_end_key(&edge.end, end, ctx, env, ov)?;
     tally.merge_keys.push(end_key.clone());
     let end_ns = match &edge.end.ns {
         Some(op) => ctx.eval(op, env, ov)?,
@@ -1365,24 +1467,26 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
     if !start_existed {
         let props = src.row_merge_props(&merge.start.key_field, &start_value, start_ns.as_ref())?;
         tally.created_props += props.len() as i64;
-        ov.node_created(&start_key, &props);
+        ov.node_created(&start_key, &merge.start.label, &props);
         ops.push(BatchOp::InsertNode {
             label: merge.start.label.clone(),
             key: start_key.clone(),
             props,
         });
         tally.created += 1;
+        tally.labels_added += 1;
     }
     if !end_existed && end_key != start_key {
         let props = src.row_merge_props(&edge.end.key_field, &end_value, end_ns.as_ref())?;
         tally.created_props += props.len() as i64;
-        ov.node_created(&end_key, &props);
+        ov.node_created(&end_key, &edge.end.label, &props);
         ops.push(BatchOp::InsertNode {
             label: edge.end.label.clone(),
             key: end_key.clone(),
             props,
         });
         tally.created += 1;
+        tally.labels_added += 1;
     }
     let sets = if edge_existed {
         &merge.on_match
@@ -1404,6 +1508,338 @@ fn uw_merge<'v, S: RowSource + ?Sized>(
         env.insert(var, rel_binding(&rel));
     }
     uw_merge_sets(sets, ctx, env, ov, ops, tally)
+}
+
+/// The key of a bound or keyed MERGE end: the one [`uw_merge_end`] already
+/// evaluated, or the bound node's.
+fn uw_end_key<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    end: &MergeEnd,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<(String, Value)> {
+    match end {
+        MergeEnd::Key(k) => Ok((k.clone(), Value::Str(k.clone()))),
+        _ => uw_merge_key(node, ctx, env, ov),
+    }
+}
+
+/// One node of a MERGE as this row resolves it (QL-NM).
+enum MergeEnd {
+    /// A node an earlier clause bound.
+    Bound,
+    /// A key pattern whose value is a string, the key: found or created by
+    /// it. Evaluated once, here.
+    Key(String),
+    /// Any other pattern: matched by its label and properties.
+    Pattern {
+        /// What the node must carry (`ns` included when the pattern names
+        /// it), and what a created node is written with.
+        props: Vec<(String, Value)>,
+        /// A string `id` in the pattern: the key selector, as in `MATCH`.
+        id_key: Option<String>,
+    },
+}
+
+/// How the row resolves `node`. A key pattern whose value is not a string is
+/// a pattern; a null property value is an error, as it is for a key.
+fn uw_merge_end<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<MergeEnd> {
+    if node.bound {
+        return Ok(MergeEnd::Bound);
+    }
+    let null = |field: &str| {
+        err(format!(
+            "MERGE ({}{}{} {{{field}: null}}): a MERGE cannot match on a null property value",
+            node.var,
+            if node.label.is_empty() { "" } else { ":" },
+            node.label
+        ))
+    };
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(node.props.len() + 1);
+    if node.key_pattern {
+        match ctx.eval(&node.key, env, ov)? {
+            Some(Value::Str(k)) => return Ok(MergeEnd::Key(k)),
+            None => return Err(null(&node.key_field)),
+            Some(v) => props.push((node.key_field.clone(), v)),
+        }
+    } else {
+        for (field, operand) in &node.props {
+            match ctx.eval(operand, env, ov)? {
+                Some(v) => props.push((field.clone(), v)),
+                None => return Err(null(field)),
+            }
+        }
+    }
+    if let Some(op) = &node.ns {
+        match ctx.eval(op, env, ov)? {
+            Some(v) => props.push((NS_PROP.to_string(), v)),
+            None => return Err(null(NS_PROP)),
+        }
+    }
+    let id_key = props.iter().find_map(|(f, v)| match (f.as_str(), v) {
+        ("id", Value::Str(k)) => Some(k.clone()),
+        _ => None,
+    });
+    Ok(MergeEnd::Pattern { props, id_key })
+}
+
+/// The nodes `end` stands for at this point of the statement: the bound
+/// node, the key's node when it exists, or every node the pattern matches.
+fn uw_merge_candidates<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    end: &MergeEnd,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+) -> Result<Vec<String>> {
+    let src = ctx.src;
+    match end {
+        MergeEnd::Bound | MergeEnd::Key(_) => {
+            let (key, _) = uw_end_key(node, end, ctx, env, ov)?;
+            let existed = uw_merge_node_existed(src, ov, node, &key)?;
+            Ok(if existed { vec![key] } else { Vec::new() })
+        }
+        MergeEnd::Pattern {
+            props,
+            id_key: Some(key),
+        } => {
+            // The key MERGE's own lookup: scope before lookup, through the
+            // role's mask, a hidden node never reported as there (QL-NM C1).
+            if !uw_merge_existed(src, ov, &node.label, key)? {
+                return Ok(Vec::new());
+            }
+            let label_ok = match uw_label(src, ov, key) {
+                Some(l) => node.label.is_empty() || l == node.label,
+                None => false,
+            };
+            let holds = label_ok && {
+                let have = uw_props(src, ov, key);
+                props.iter().all(|(f, want)| {
+                    f == "id"
+                        || have
+                            .get(f)
+                            .is_some_and(|got| core_query::values_equal(got, want))
+                })
+            };
+            Ok(if holds { vec![key.clone()] } else { Vec::new() })
+        }
+        MergeEnd::Pattern {
+            props,
+            id_key: None,
+        } => {
+            // Scope before lookup; the scan itself reads the role's view.
+            src.row_merge_scope(&node.label)?;
+            Ok(uw_pattern_matches(src, ov, &node.label, props))
+        }
+    }
+}
+
+/// Create the node a MERGE did not find. A key pattern creates its key, as a
+/// key MERGE always has; a pattern creates a node with its label and
+/// properties, keyed by its string `id` or by a generated key.
+fn uw_merge_create<S: RowSource + ?Sized>(
+    node: &RowMergeNode,
+    end: &MergeEnd,
+    ctx: &RowCtx<'_, S>,
+    env: &HashMap<&str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<String> {
+    let src = ctx.src;
+    let (key, mut props) = match end {
+        MergeEnd::Bound => return Ok(uw_merge_key(node, ctx, env, ov)?.0),
+        MergeEnd::Key(_) => {
+            let (key, value) = uw_end_key(node, end, ctx, env, ov)?;
+            let ns = match &node.ns {
+                Some(op) => ctx.eval(op, env, ov)?,
+                None => None,
+            };
+            let props = src.row_merge_props(&node.key_field, &value, ns.as_ref())?;
+            (key, props)
+        }
+        MergeEnd::Pattern { props, id_key } => {
+            let key = match id_key {
+                Some(k) if uw_exists(src, ov, k) => {
+                    return Err(err(format!(
+                        "MERGE ({}): the node `{k}` exists but does not match the pattern; \
+                         a key names one node, so the MERGE cannot create another",
+                        node.var
+                    )))
+                }
+                Some(k) => k.clone(),
+                None => value_key(node, props)
+                    .filter(|k| !ov.nodes.contains_key(*k) && !src.row_exists(k))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fresh_key(src, ov)),
+            };
+            (key, props.clone())
+        }
+    };
+    if matches!(end, MergeEnd::Pattern { .. }) && !props.iter().any(|(f, _)| f == NS_PROP) {
+        if let Some(ns) = src.row_merge_ns()? {
+            props.push((NS_PROP.to_string(), ns));
+        }
+    }
+    tally.created_props += props.len() as i64;
+    tally.created += 1;
+    tally.labels_added += i64::from(!node.label.is_empty());
+    ov.node_created(&key, &node.label, &props);
+    ops.push(BatchOp::InsertNode {
+        label: node.label.clone(),
+        key: key.clone(),
+        props,
+    });
+    Ok(key)
+}
+
+/// One MERGE for one row. Every environment it returns is the row's with the
+/// MERGE's variables bound, its `ON MATCH SET` / `ON CREATE SET` applied: one
+/// per match, or the one it created. The clauses after it run once for each.
+fn uw_merge<'v, S: RowSource + ?Sized>(
+    merge: &'v RowMerge,
+    ctx: &RowCtx<'_, S>,
+    mut env: HashMap<&'v str, String>,
+    ov: &mut Overlay,
+    ops: &mut Vec<BatchOp>,
+    tally: &mut Tally,
+) -> Result<Vec<HashMap<&'v str, String>>> {
+    if let Some(edge) = &merge.edge {
+        // A MERGE cannot match on null, on a relationship as on a node.
+        for (field, operand) in &edge.props {
+            if ctx.eval(operand, &env, ov)?.is_none() {
+                return Err(err(format!(
+                    "MERGE ()-[:{} {{{field}: null}}]->(): a MERGE cannot match on a null \
+                     property value",
+                    edge.etype
+                )));
+            }
+        }
+    }
+    let start = uw_merge_end(&merge.start, ctx, &env, ov)?;
+    let end = match &merge.edge {
+        Some(edge) => Some(uw_merge_end(&edge.end, ctx, &env, ov)?),
+        None => None,
+    };
+    let is_pattern = |e: &MergeEnd| matches!(e, MergeEnd::Pattern { .. });
+    if !is_pattern(&start) && !end.as_ref().is_some_and(is_pattern) {
+        uw_key_merge(merge, &start, end.as_ref(), ctx, &mut env, ov, ops, tally)?;
+        return Ok(vec![env]);
+    }
+    let src = ctx.src;
+    let starts = uw_merge_candidates(&merge.start, &start, ctx, &env, ov)?;
+    let (Some(edge), Some(end)) = (&merge.edge, end) else {
+        // One node.
+        let mut out = Vec::with_capacity(starts.len().max(1));
+        if starts.is_empty() {
+            let key = uw_merge_create(&merge.start, &start, ctx, &env, ov, ops, tally)?;
+            tally.merge_keys.push(key.clone());
+            env.insert(merge.start.var.as_str(), key);
+            uw_merge_sets(&merge.on_create, ctx, &env, ov, ops, tally)?;
+            out.push(env);
+        } else {
+            for key in starts {
+                tally.merge_keys.push(key.clone());
+                let mut branch = env.clone();
+                branch.insert(merge.start.var.as_str(), key);
+                uw_merge_sets(&merge.on_match, ctx, &branch, ov, ops, tally)?;
+                out.push(branch);
+            }
+        }
+        return Ok(out);
+    };
+    // A relationship with a pattern end: the whole path matches, or every
+    // part of it that is not bound or keyed is created.
+    let ends = uw_merge_candidates(&edge.end, &end, ctx, &env, ov)?;
+    let rel_var = edge.rel_var.as_deref().unwrap_or("r");
+    let rel_props = uw_rel_map(rel_var, &edge.props, None, ctx, &env, ov)?;
+    if !rel_props.is_empty() {
+        refuse_rule_owned(src, &edge.etype)?;
+    }
+    let directed = |a: &str, b: &str| match edge.dir {
+        RelDir::Left => (b.to_string(), a.to_string()),
+        _ => (a.to_string(), b.to_string()),
+    };
+    let mut found: Vec<(String, String, EdgeKey)> = Vec::new();
+    for s in &starts {
+        for e in &ends {
+            let (from, to) = directed(s, e);
+            if !uw_edge_exists(src, ov, &edge.etype, &from, &to) {
+                continue;
+            }
+            let rel: EdgeKey = (edge.etype.clone(), from, to);
+            let have = uw_edge_props(src, ov, &rel);
+            let holds = rel_props.iter().all(|(f, want)| {
+                have.get(f)
+                    .is_some_and(|got| core_query::values_equal(got, want))
+            });
+            if holds {
+                found.push((s.clone(), e.clone(), rel));
+            }
+        }
+    }
+    let bind = |env: &mut HashMap<&'v str, String>, s: String, e: String, rel: &EdgeKey| {
+        env.insert(merge.start.var.as_str(), s);
+        env.insert(edge.end.var.as_str(), e);
+        if let Some(var) = edge.rel_var.as_deref() {
+            env.insert(var, rel_binding(rel));
+        }
+    };
+    let mut out = Vec::with_capacity(found.len().max(1));
+    if found.is_empty() {
+        // A bound or keyed end is that one node; a pattern end is created
+        // anew unless its `id` names the node it matched (a key names one).
+        let reuse = |cands: &[String], e: &MergeEnd| match e {
+            MergeEnd::Pattern { id_key: None, .. } => None,
+            _ => cands.first().cloned(),
+        };
+        let s = match reuse(&starts, &start) {
+            Some(k) => k,
+            None => uw_merge_create(&merge.start, &start, ctx, &env, ov, ops, tally)?,
+        };
+        let e = match reuse(&ends, &end) {
+            Some(k) => k,
+            None => uw_merge_create(&edge.end, &end, ctx, &env, ov, ops, tally)?,
+        };
+        tally.merge_keys.push(s.clone());
+        tally.merge_keys.push(e.clone());
+        let (from, to) = directed(&s, &e);
+        let rel: EdgeKey = (edge.etype.clone(), from.clone(), to.clone());
+        if uw_edge_exists(src, ov, &edge.etype, &from, &to) {
+            return Err(err(format!(
+                "MERGE (…)-[:{}]->(…) from '{from}' to '{to}': {REL_EXISTS}",
+                edge.etype
+            )));
+        }
+        ops.push(BatchOp::InsertEdge {
+            edge_type: edge.etype.clone(),
+            src_key: from.clone(),
+            dst_key: to.clone(),
+        });
+        ov.edge_created(&edge.etype, &from, &to);
+        tally.relationships_created += 1;
+        tally.created_props += rel_props.len() as i64;
+        write_fresh_rel_props(&rel, rel_props, ov, ops);
+        bind(&mut env, s, e, &rel);
+        uw_merge_sets(&merge.on_create, ctx, &env, ov, ops, tally)?;
+        out.push(env);
+    } else {
+        for (s, e, rel) in found {
+            tally.merge_keys.push(s.clone());
+            tally.merge_keys.push(e.clone());
+            let mut branch = env.clone();
+            bind(&mut branch, s, e, &rel);
+            uw_merge_sets(&merge.on_match, ctx, &branch, ov, ops, tally)?;
+            out.push(branch);
+        }
+    }
+    Ok(out)
 }
 
 /// `ON CREATE SET` / `ON MATCH SET` items of a MERGE; each names a node
@@ -1555,9 +1991,12 @@ fn uw_create_edge<'v, S: RowSource + ?Sized>(
     tally: &mut Tally,
 ) -> Result<()> {
     let end = |var: &str, side: &str| -> Result<String> {
-        env.get(var)
-            .cloned()
-            .ok_or_else(|| err(format!("CREATE edge {side} variable '{var}' is not bound")))
+        env.get(var).cloned().ok_or_else(|| {
+            err(format!(
+                "CREATE edge {side} variable '{var}' is null in this row (an OPTIONAL MATCH \
+                     found nothing), so there is no node to create a relationship with"
+            ))
+        })
     };
     let from = end(&edge.src_var, "src")?;
     let to = end(&edge.dst_var, "dst")?;

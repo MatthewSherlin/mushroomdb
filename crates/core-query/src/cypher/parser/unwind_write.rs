@@ -295,14 +295,19 @@ impl<'a> Parser<'a> {
                 Some(Tok::Detach) => {
                     self.pos += 1;
                     self.expect(&Tok::Delete, "expected DELETE after DETACH")?;
-                    let vars = self.row_delete_targets(&scope)?;
-                    writes.push(RowWrite::Delete { vars, detach: true });
+                    let (vars, rels) = self.row_delete_targets(&scope)?;
+                    writes.push(RowWrite::Delete {
+                        vars,
+                        rels,
+                        detach: true,
+                    });
                 }
                 Some(Tok::Delete) => {
                     self.pos += 1;
-                    let vars = self.row_delete_targets(&scope)?;
+                    let (vars, rels) = self.row_delete_targets(&scope)?;
                     writes.push(RowWrite::Delete {
                         vars,
+                        rels,
                         detach: false,
                     });
                 }
@@ -484,21 +489,30 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if self.peek() == Some(&Tok::RParen) {
-            self.pos += 1;
-            // `(v)`: a reference, which must be a node already bound.
-            return match var {
-                Some(v) if scope.kind(&v) == Some(VarKind::Node) => Ok(v),
-                Some(v) => Err(format!(
-                    "CREATE ({v}): `{v}` is not a node bound by an earlier clause; \
-                     a new node needs a label, e.g. ({v}:Label {{id: …}})"
-                )),
-                None => Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))")),
-            };
+            if let Some(v) = &var {
+                match scope.kind(v) {
+                    // `(v)`: a reference to a node already bound.
+                    Some(VarKind::Node) => {
+                        self.pos += 1;
+                        return Ok(v.clone());
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "CREATE ({v}): `{v}` is already bound to a value that is not a node"
+                        ))
+                    }
+                    // `(v)` with `v` new: a new node with no label (QL-NM).
+                    None => {}
+                }
+            }
         }
-        if !self.eat(&Tok::Colon) {
-            return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
-        }
-        let label = self.ident("expected label identifier after ':'")?;
+        // A node needs no label (QL-NM): `()`, `(v)`, `({k: v})` are new nodes
+        // stored under no label.
+        let label = if self.eat(&Tok::Colon) {
+            self.label_name()?
+        } else {
+            String::new()
+        };
         let mut props_map = None;
         let props = match self.peek() {
             Some(Tok::LBrace) => self.row_props()?,
@@ -662,6 +676,8 @@ impl<'a> Parser<'a> {
             label: String::new(),
             key_field: String::new(),
             key: Operand::Var(var.clone()),
+            props: Vec::new(),
+            key_pattern: false,
             ns: None,
             bound: true,
         })
@@ -692,11 +708,17 @@ impl<'a> Parser<'a> {
                 v
             }
         };
+        let key_pattern = node.key.is_some();
+        let (key_field, key) = node
+            .key
+            .unwrap_or_else(|| (String::new(), Operand::Lit(Value::Null)));
         Ok(RowMergeNode {
             var,
             label: node.label,
-            key_field: node.key_field,
-            key: node.key_value,
+            key_field,
+            key,
+            props: node.props,
+            key_pattern,
             ns: node.ns,
             bound: false,
         })
@@ -753,14 +775,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Node variables after `[DETACH] DELETE`. A relationship variable is
-    /// refused by name.
-    fn row_delete_targets(&mut self, scope: &Scope) -> Result<Vec<String>, String> {
+    /// The node variables, and the relationship variables, after
+    /// `[DETACH] DELETE`. A relationship variable is refused by name, unless
+    /// the statement has an `OPTIONAL MATCH` (QL-ON): there it can be null, and
+    /// `DELETE r` on a null is skipped.
+    fn row_delete_targets(&mut self, scope: &Scope) -> Result<(Vec<String>, Vec<String>), String> {
+        let optional = self.toks.contains(&Tok::Optional);
         let mut vars = Vec::new();
+        let mut rels = Vec::new();
         loop {
             let var = self.ident("expected node variable to DELETE")?;
             match scope.kind(&var) {
                 Some(VarKind::Node) => vars.push(var),
+                Some(VarKind::Rel) if optional => rels.push(var),
                 Some(VarKind::Rel) => {
                     return Err(format!(
                         "not supported in mushroomdb 0.10: DELETE of the relationship `{var}` \
@@ -774,7 +801,7 @@ impl<'a> Parser<'a> {
                 }
             }
             if !self.eat(&Tok::Comma) {
-                return Ok(vars);
+                return Ok((vars, rels));
             }
         }
     }

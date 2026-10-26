@@ -126,6 +126,9 @@ pub struct Transaction {
     /// The state every statement reads, frozen at BEGIN.
     base_snap: ReaderSnapshot,
     opened_at: Instant,
+    /// The clock at BEGIN, in microseconds since the epoch: what
+    /// `.transaction()` returns in every statement of this transaction.
+    clock_micros: i64,
     /// Conflict set: node key → its `last_change` commit in `base_snap`.
     read_write_keys: HashMap<String, u64>,
     /// Identity of the store load `base_snap` came from.
@@ -515,6 +518,18 @@ impl RowSource for TxRows<'_, '_> {
         Ok(merge_node_props(key_field, key_value, named_ns))
     }
 
+    /// A transaction carries no role (role-bound writes are refused inside
+    /// one), so every label is in scope.
+    fn row_merge_scope(&self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// A transaction's MERGE stamps no role namespace, as its key MERGE's
+    /// create arm does not.
+    fn row_merge_ns(&self) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
     /// Views are the store's: the live registry answers.
     fn row_view_owns(&self, field: &str) -> bool {
         self.db.read().row_view_owns(field)
@@ -656,6 +671,7 @@ impl Transaction {
             buffer: Vec::new(),
             base_snap,
             opened_at: Instant::now(),
+            clock_micros: core_query::cypher::clock_micros(),
             read_write_keys: HashMap::new(),
             base_store,
             records: Vec::new(),
@@ -682,6 +698,8 @@ impl Transaction {
     /// reaches the store until [`commit`](Self::commit). A failed statement
     /// buffers nothing and leaves the transaction usable.
     pub fn execute(&mut self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        let _transaction_clock = core_query::cypher::TransactionClock::enter(self.clock_micros);
+        let _statement_clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(query_err("lex"))?;
         // `EXPLAIN` plans the statement after it: nothing runs, so nothing is
         // buffered and no key is read.

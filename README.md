@@ -97,8 +97,8 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 
 - Not a hosted service. There is no account and no endpoint.
 - Not a vector database. Vector rules and an HNSW index are built in; you bring the embeddings.
-- Not a transactional relational database. One writer at a time, no interactive transactions, and
-  the working graph lives in memory.
+- Not a transactional relational database. One writer at a time, transactions are snapshot-isolated
+  rather than serializable, and the working graph lives in memory.
 
 [Known limits](https://matthewsherlin.github.io/mushroomdb/docs/limits.html) says what has been measured and how far.
 

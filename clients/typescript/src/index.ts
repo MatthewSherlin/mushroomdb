@@ -5,6 +5,7 @@
  */
 
 export {
+  ConstraintViolationError,
   MushroomClient,
   MushroomError,
   TransactionConflictError,

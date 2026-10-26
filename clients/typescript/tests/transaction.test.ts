@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  ConstraintViolationError,
   MushroomClient,
   MushroomError,
   TransactionConflictError,
@@ -251,6 +252,107 @@ describe("beginTransaction", () => {
     expect(err).toBeInstanceOf(TransactionConflictError);
     expect((err as TransactionConflictError).code).toBe("conflict");
     expect(tx.isFinished).toBe(true);
+  });
+
+  it("a 409 with code constraint is a ConstraintViolationError, not a conflict, and ends the handle", async () => {
+    handler = (req) =>
+      req.path === "/tx/begin"
+        ? { status: 200, body: { tx_id: "abc123", expires_at: 1 } }
+        : {
+            status: 409,
+            body: { error: "unique constraint uniq_name violated on name", code: "constraint" },
+          };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConstraintViolationError);
+    expect(err).toBeInstanceOf(MushroomError);
+    expect(err).not.toBeInstanceOf(TransactionConflictError);
+    expect((err as ConstraintViolationError).code).toBe("constraint");
+    expect((err as ConstraintViolationError).status).toBe(409);
+    expect(tx.isFinished).toBe(true);
+  });
+
+  it("transaction(callback) rethrows a constraint refusal at commit as ConstraintViolationError", async () => {
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) {
+        return { status: 409, body: { error: "unique constraint", code: "constraint" } };
+      }
+      return { status: 200, body: { columns: [], rows: [] } };
+    };
+    const err = await client
+      .transaction(async (tx) => {
+        await tx.execute("CREATE (:Person {id: 'dup', name: 'taken'})");
+      })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConstraintViolationError);
+    expect(err).not.toBeInstanceOf(TransactionConflictError);
+  });
+
+  it("an auto-commit query refused by a constraint is a ConstraintViolationError", async () => {
+    handler = () => ({ status: 409, body: { error: "unique constraint", code: "constraint" } });
+    const err = await client.query("CREATE (:Person {id: 'dup', name: 'taken'})").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConstraintViolationError);
+    expect((err as ConstraintViolationError).code).toBe("constraint");
+  });
+
+  it("a commit error that ended the transaction on the server finishes the handle", async () => {
+    // A 400 from the engine at commit (a namespace or view-owned refusal): the
+    // server consumed the transaction, so GET /tx/{id} is 404.
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) return { status: 400, body: { error: "namespace refused" } };
+      if (req.method === "GET") return { status: 404, body: { error: "unknown transaction" } };
+      return { status: 200, body: { columns: [], rows: [] } };
+    };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MushroomError);
+    expect((err as MushroomError).status).toBe(400);
+    expect(tx.isFinished).toBe(true);
+    expect(seen.some((s) => s.method === "GET" && s.path === "/tx/abc123")).toBe(true);
+    await expect(tx.execute("RETURN 1")).rejects.toThrow(/already finished/);
+  });
+
+  it("a commit refused before it reached the transaction leaves the handle open", async () => {
+    // A 503 from load shedding: the server still holds the transaction.
+    let commits = 0;
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) {
+        commits += 1;
+        return commits === 1
+          ? { status: 503, body: { error: "server at its concurrency limit; retry" } }
+          : { status: 200, body: { bookmark: 7 } };
+      }
+      if (req.method === "GET") {
+        return { status: 200, body: { tx_id: "abc123", expires_at: 1, op_count: 0 } };
+      }
+      return { status: 200, body: { columns: [], rows: [] } };
+    };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect((err as MushroomError).status).toBe(503);
+    expect(tx.isFinished).toBe(false);
+    await expect(tx.commit()).resolves.toBe(7);
+  });
+
+  it("a commit error while the server still runs the commit makes the outcome unknown", async () => {
+    // A 408: the 120 s deadline hit but the commit is still running on the
+    // server, which answers GET /tx/{id} with 409 busy while a request holds it.
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) return { status: 408, body: { error: "request timed out" } };
+      if (req.method === "GET" && req.path === "/tx/abc123") {
+        return { status: 409, body: { error: "transaction busy", code: "busy" } };
+      }
+      return { status: 500, body: { error: "unexpected request" } };
+    };
+    const tx = await client.beginTransaction();
+    await tx.commit().catch(() => undefined);
+    expect(seen.filter((r) => r.method === "GET").length).toBe(1);
+    expect(tx.isFinished).toBe(false);
+    await expect(tx.execute("RETURN 1")).rejects.toThrow(/outcome is unknown/);
   });
 
   it("maps 404 on commit to TransactionExpiredError", async () => {

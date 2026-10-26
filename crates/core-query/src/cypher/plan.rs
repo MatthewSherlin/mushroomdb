@@ -841,7 +841,11 @@ fn compile_with_stage(
 }
 
 fn id_lookup(props: &[(String, Operand)]) -> Option<&Operand> {
-    if props.len() == 1 && props[0].0 == "id" {
+    // A literal that is not a string names no key: a node whose key was
+    // generated may store `{id: 1}` as an ordinary property (QL-NM), which the
+    // property match finds.
+    let not_a_key = matches!(&props.first(), Some((_, Operand::Lit(v))) if !matches!(v, core_storage::Value::Str(_)));
+    if props.len() == 1 && props[0].0 == "id" && !not_a_key {
         Some(&props[0].1)
     } else {
         None

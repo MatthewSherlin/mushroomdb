@@ -25,6 +25,13 @@ jobs:
       # (the whole run takes seconds and reuses this job's build).
       - run: cargo run -p tck-runner -- --check
         timeout-minutes: 10
+      # The generated Cypher function table (docs/site/conformance-functions.md)
+      # is checked against a fresh TCK run on the build above; a change that moves
+      # a TCK result regenerates it with `bash scripts/gen-conformance-table.sh`.
+      # A step, not a job, for the same reason (PS-6).
+      - run: bash scripts/gen-conformance-table.sh --check
+        timeout-minutes: 10
+      - run: bash scripts/tests/test_gen_conformance_table.sh
       # The examples docs/site/rust.md quotes. `cargo build --workspace
       # --examples` above built them; running the binaries checks each one's
       # assertions without building anything again.

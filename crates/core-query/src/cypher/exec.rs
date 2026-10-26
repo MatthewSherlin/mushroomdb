@@ -497,6 +497,7 @@ fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
 /// [`entity`](crate::cypher::entity)); no entity details are attached here.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     use crate::cypher::plan::row_bound;
+    let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut rs = execute_inner(view, plan, params, row_bound(plan))?;
     rs.set_column_kinds(output_kinds(plan));
     Ok(rs)
@@ -530,6 +531,8 @@ pub fn execute_planned_union(
     all_flags: &[bool],
     params: &Params,
 ) -> Result<ResultSet, String> {
+    // Every part of a `UNION` is one statement, so one instant.
+    let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut acc: Option<ResultSet> = None;
     for (i, ops) in plans.iter().enumerate() {
         let rs = execute(view, ops, params)?;
@@ -2782,8 +2785,10 @@ fn eval_func(
                 ));
             }
             // openCypher returns a list because a node may carry several
-            // labels; this store gives a node exactly one, so the list holds
-            // one element. `n.label` is the scalar spelling of the same thing.
+            // labels; this store gives a node at most one, so the list holds
+            // one element, or none for a node with no label (stored under the
+            // empty label, QL-NM). `n.label` is the scalar spelling of the
+            // same thing.
             let Operand::Var(var_name) = &args[0] else {
                 return Err(
                     "labels() argument must be a node variable (e.g. labels(n))".to_string()
@@ -2795,6 +2800,7 @@ fn eval_func(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Ok(Some(Value::List(
                     view.label_of(*id)
+                        .filter(|l| !l.is_empty())
                         .map(|l| vec![Value::Str(l.to_owned())])
                         .unwrap_or_default(),
                 ))),
@@ -3903,7 +3909,11 @@ fn is_identity_eq_field(field: &str) -> bool {
 fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
     match field {
         "key" | "id" => view.try_key_of(id).map(|k| Value::Str(k.to_owned())),
-        "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
+        // A node with no label (the empty label) has no `n.label`.
+        "label" => view
+            .label_of(id)
+            .filter(|l| !l.is_empty())
+            .map(|l| Value::Str(l.to_owned())),
         _ => None,
     }
 }
@@ -6738,6 +6748,10 @@ mod ql_04;
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]
 mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_cl.rs"]
+mod ql_cl;
 
 #[cfg(test)]
 #[path = "tests/ql_tf.rs"]

@@ -92,6 +92,9 @@ pub struct ImportReport {
     /// the rule that makes it and is made again when the rule is created, so it
     /// is not inserted.
     pub derived_edges_skipped: usize,
+    /// CSV node rows with an empty `:LABEL` cell, queued as nodes with no
+    /// label (QL-NM). Reported so a forgotten label does not pass unseen.
+    pub unlabelled_nodes: usize,
 }
 
 /// One committed batch, reported to the callback of [`run_import_with_progress`].
@@ -450,10 +453,9 @@ pub fn parse_node_row(
     if id.is_empty() {
         return Err("empty :ID".to_string());
     }
+    // An empty `:LABEL` cell is a node with no label (QL-NM), which is how
+    // `export` writes one.
     let label = &record[schema.label_index];
-    if label.is_empty() {
-        return Err("empty :LABEL".to_string());
-    }
     if label.contains(array_delimiter) || label.contains(';') {
         return Err(format!(
             "`{label}` has more than one label; mushroomdb stores one label per node"
@@ -694,6 +696,7 @@ fn import_nodes(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliEr
             run.bad_row(&file, line, &reason)?;
             continue;
         }
+        run.report.unlabelled_nodes += usize::from(label.is_empty());
         if schema.key_stored {
             batch.entry(label).or_default().push(row);
         } else {
@@ -1048,7 +1051,13 @@ fn parse_node_value(json: serde_json::Value, typed: bool) -> Result<NodeRecord, 
         None => Err(format!("the line has no `{name}`")),
     };
     let key = text_field("key")?;
-    let label = text_field("label")?;
+    // An empty `label` is a node with no label (QL-NM), which is how
+    // `export` writes one.
+    let label = match obj.remove("label") {
+        Some(serde_json::Value::String(s)) => s,
+        Some(_) => return Err("`label` must be a string".to_string()),
+        None => return Err("the line has no `label`".to_string()),
+    };
     let mut props: BTreeMap<String, Value> = BTreeMap::new();
     let reserved = match obj.remove(JSONL_PROPS_FIELD) {
         None => serde_json::Map::new(),
@@ -1431,6 +1440,12 @@ pub fn format_import(report: &ImportReport) -> String {
     if report.rows_skipped > 0 {
         out.push_str(&format!(", skipped {} bad rows", report.rows_skipped));
     }
+    if report.unlabelled_nodes > 0 {
+        out.push_str(&format!(
+            ", {} nodes with no label (an empty :LABEL cell)",
+            report.unlabelled_nodes
+        ));
+    }
     out.push('\n');
     out
 }
@@ -1566,9 +1581,28 @@ mod tests {
     }
 
     #[test]
-    fn csv_import_empty_label_and_empty_id_are_errors() {
+    fn the_summary_names_the_nodes_with_no_label() {
+        let report = ImportReport {
+            nodes_inserted: 3,
+            unlabelled_nodes: 2,
+            ..ImportReport::default()
+        };
+        let text = format_import(&report);
+        assert!(
+            text.contains("2 nodes with no label (an empty :LABEL cell)"),
+            "{text}"
+        );
+        assert!(!format_import(&ImportReport::default()).contains("no label"));
+    }
+
+    #[test]
+    fn csv_import_empty_id_is_an_error_and_an_empty_label_is_no_label() {
         let rows = parse_one(":ID,:LABEL\n1,\n,P\n");
-        assert!(rows[0].clone().unwrap_err().contains(":LABEL"));
+        assert_eq!(
+            rows[0].clone().unwrap().0,
+            "",
+            "a node with no label (QL-NM)"
+        );
         assert!(rows[1].clone().unwrap_err().contains(":ID"));
     }
 

@@ -586,6 +586,16 @@ takes at most 25 s, or less if the deadline leaves less after that reserve. The
 snapshot gets the rest: 55 - 25 - 22 = 8 s. A phase that finishes early gives its
 time to the next one.
 
+The flush grace also covers a lease acquisition already in progress. Its
+conditional-write checks must finish before anything is uploaded; the final
+backup uses only the grace that remains. Shutdown does not start another
+acquisition. If the checks fail or time runs out, the pending attempt is
+canceled and the worker tries to remove any lease still naming this instance,
+within the existing release deadline. An absent, malformed or foreign lease is
+left alone. Release reads the owner and then deletes: these are two requests,
+so a takeover between them is not atomic. A request the service already received
+can also finish after local cancellation; an unreachable lease expires by TTL.
+
 **The phases scale with `--shutdown-timeout-secs`.** With at least 55 s (more
 goes to the snapshot) the split above holds. With less, all three phases shrink
 in proportion, but the backup keeps a floor of 2 s and the drain gives way

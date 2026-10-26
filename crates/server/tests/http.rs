@@ -477,6 +477,27 @@ async fn query_format_json_matches_columns_and_rows() {
     assert_eq!(v["rows"], json!([["p1"]]));
 }
 
+/// QL-NM: a node with no label and no `id` is created over HTTP like any
+/// other statement; its key is generated and its labels are empty.
+#[tokio::test]
+async fn query_creates_a_node_with_no_label_and_no_id() {
+    let (app, db) = open("query-no-label");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "CREATE (n {name: 'a'}), (:A) \
+                   RETURN labels(n) AS l, key(n) STARTS WITH '_:' AS generated"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["rows"], json!([[[], true]]));
+    assert_eq!(db.read().node_count(), 2);
+}
+
 /// Binding: COUNT(*) via ?format=json → {"columns":["COUNT(*)"],"rows":[[n]]}.
 #[tokio::test]
 async fn query_count_star_format_json_wire_shape() {
@@ -7083,6 +7104,7 @@ async fn assert_constraint_refused(name: &str, method: &str, uri: &str, body: Js
         parse_json(&resp)["error"].as_str().unwrap(),
         CONSTRAINT_VIOLATION
     );
+    assert_eq!(parse_json(&resp)["code"], "constraint");
     assert_eq!(
         wal_bytes(&dir),
         before,

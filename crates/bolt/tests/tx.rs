@@ -838,3 +838,40 @@ async fn a_disconnect_during_a_bookmark_wait_ends_the_connection_promptly() {
         .unwrap()
         .unwrap();
 }
+
+/// 0.10 TX-21: a unique-constraint clash found at COMMIT is the client error
+/// `ConstraintValidationFailed`, not an internal or transient one, and the
+/// transaction's writes do not land.
+#[test]
+fn a_constraint_violation_at_commit_is_a_constraint_validation_failure() {
+    let (db, _dir) = open_db();
+    db.write()
+        .create_constraint("uniq_name", "Person", "name")
+        .unwrap();
+    let mut holder = connected(&db);
+    expect_success(holder.handle(run("CREATE (:Person {id: 'holder', name: 'taken'})")));
+    holder.handle(pull_all());
+
+    let mut conn = connected(&db);
+    expect_success(conn.handle(begin()));
+    expect_success(conn.handle(run("CREATE (:Person {id: 'dup', name: 'taken'})")));
+    let pulled = conn.handle(pull_all());
+    assert!(
+        matches!(pulled.last(), Some(ServerMessage::Success(_))),
+        "the clash is not judged while buffered: {pulled:?}"
+    );
+    let out = conn.handle(commit());
+    assert_eq!(
+        failure_code(&out),
+        "Neo.ClientError.Schema.ConstraintValidationFailed"
+    );
+    match out.last() {
+        Some(ServerMessage::Failure(err)) => {
+            assert!(err.message().contains("uniq_name"), "{}", err.message())
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(conn.state().name(), "Failed");
+    expect_success(conn.handle(ClientMessage::Reset));
+    assert_eq!(count(&mut conn, "Person"), 1);
+}
