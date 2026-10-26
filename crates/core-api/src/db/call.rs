@@ -96,9 +96,12 @@ impl ProcCatalog for ViewCatalog<'_, '_> {
             .filter(|&(id, sym)| sym != u32::MAX && self.view.visible(id as u32))
             .map(|(_, sym)| sym)
             .collect();
+        // The empty label is how a node with no label is stored (QL-NM),
+        // not a label.
         let names: BTreeSet<String> = syms
             .into_iter()
             .filter_map(|sym| self.view.sym_name(sym).map(str::to_string))
+            .filter(|name| !name.is_empty())
             .collect();
         names.into_iter().collect()
     }

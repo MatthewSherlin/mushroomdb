@@ -489,21 +489,30 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if self.peek() == Some(&Tok::RParen) {
-            self.pos += 1;
-            // `(v)`: a reference, which must be a node already bound.
-            return match var {
-                Some(v) if scope.kind(&v) == Some(VarKind::Node) => Ok(v),
-                Some(v) => Err(format!(
-                    "CREATE ({v}): `{v}` is not a node bound by an earlier clause; \
-                     a new node needs a label, e.g. ({v}:Label {{id: …}})"
-                )),
-                None => Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))")),
-            };
+            if let Some(v) = &var {
+                match scope.kind(v) {
+                    // `(v)`: a reference to a node already bound.
+                    Some(VarKind::Node) => {
+                        self.pos += 1;
+                        return Ok(v.clone());
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "CREATE ({v}): `{v}` is already bound to a value that is not a node"
+                        ))
+                    }
+                    // `(v)` with `v` new: a new node with no label (QL-NM).
+                    None => {}
+                }
+            }
         }
-        if !self.eat(&Tok::Colon) {
-            return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
-        }
-        let label = self.ident("expected label identifier after ':'")?;
+        // A node needs no label (QL-NM): `()`, `(v)`, `({k: v})` are new nodes
+        // stored under no label.
+        let label = if self.eat(&Tok::Colon) {
+            self.label_name()?
+        } else {
+            String::new()
+        };
         let mut props_map = None;
         let props = match self.peek() {
             Some(Tok::LBrace) => self.row_props()?,
@@ -667,6 +676,8 @@ impl<'a> Parser<'a> {
             label: String::new(),
             key_field: String::new(),
             key: Operand::Var(var.clone()),
+            props: Vec::new(),
+            key_pattern: false,
             ns: None,
             bound: true,
         })
@@ -697,11 +708,17 @@ impl<'a> Parser<'a> {
                 v
             }
         };
+        let key_pattern = node.key.is_some();
+        let (key_field, key) = node
+            .key
+            .unwrap_or_else(|| (String::new(), Operand::Lit(Value::Null)));
         Ok(RowMergeNode {
             var,
             label: node.label,
-            key_field: node.key_field,
-            key: node.key_value,
+            key_field,
+            key,
+            props: node.props,
+            key_pattern,
             ns: node.ns,
             bound: false,
         })

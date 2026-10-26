@@ -231,7 +231,7 @@ A result column that is a bare node, relationship or path variable (`RETURN n`, 
 | relationship | Relationship (`0x52`) | `id`, `start_id`, `end_id`, `type`, `properties`, `element_id`, `start_element_id`, `end_element_id` | the first five |
 | path | Path (`0x50`) | `nodes`, `relationships` (UnboundRelationship `0x72`: `id`, `type`, `properties`, `element_id`), `indices` | the same, without element ids |
 
-- **Labels.** A node has one label, so `labels` is a list of one.
+- **Labels.** A node has at most one label, so `labels` is a list of one, or empty for a node created without a label.
 - **Properties.** Everything the node or relationship stores, as the statement saw it: inside a transaction its own writes, after a write its written state.
 - **Element ids** are derived from the element's identity, so they are the same on every connection and after a restart: a node is `n:<key>` (`n:ada`); a relationship is `r:<type>|<start key>|<end key>` (`r:KNOWS|ada|bob`), with `\` and `|` inside a part escaped by a backslash. The store holds at most one relationship of a type in each direction between two nodes, so these name it. Renaming a node gives it a new key and so a new element id.
 - **Integer ids** all fit in 53 bits, so a JavaScript number holds them exactly. A node's `id` (and a relationship's `start_id` / `end_id`) is the node's dense id in the store: assigned when the node is created, never reused after a delete, and kept across a rename. A relationship's `id` is a 53-bit hash of its element id, the same for the same relationship in every result; two relationships can collide (about one chance in two million among 65,000 relationships), so compare element ids when that matters. Node and relationship ids are separate namespaces.

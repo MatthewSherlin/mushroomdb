@@ -308,24 +308,20 @@ fn an_empty_list_writes_nothing_and_commits_nothing() {
     assert_eq!(wal_frames(&dir), 0);
 }
 
+/// QL-NM: a row without a string `id` creates its node under a generated
+/// key; it used to refuse the statement.
 #[test]
-fn a_row_without_a_string_id_is_refused_and_nothing_is_written() {
+fn a_row_without_a_string_id_gets_a_generated_key() {
     let dir = tmp("no-id");
     let mut db = GraphDb::open(&dir).unwrap();
     let params = BTreeMap::from([(
         "rows".to_string(),
         Value::List(vec![map(&[("id", s("ok"))]), map(&[("name", s("anon"))])]),
     )]);
-    let e = db
-        .query_write(CREATE_PEOPLE, &params)
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        detail(e).contains("requires a string 'id' property"),
-        "named error"
-    );
-    assert!(!db.has_node("ok"), "row 1 was not written either");
-    assert_eq!(wal_frames(&dir), 0);
+    let rs = db.query_write(CREATE_PEOPLE, &params).unwrap();
+    assert_eq!(count(&rs, "created"), 2);
+    assert!(db.has_node("ok"), "a string id is still the key");
+    assert_eq!(db.node_count(), 2);
 }
 
 // ── Atomicity ───────────────────────────────────────────────────────────────
@@ -568,14 +564,16 @@ fn merge_after_a_create_in_the_same_statement_finds_the_created_node() {
     assert_eq!(db.node_count(), 2);
 }
 
+/// QL-NM: a MERGE key that is not a string matches the property as
+/// openCypher does; it used to be an error.
 #[test]
-fn merge_with_a_non_string_key_is_a_named_error() {
+fn merge_with_a_non_string_key_matches_the_property() {
     let mut db = GraphDb::open(&tmp("merge-key")).unwrap();
-    let e = db
-        .query_write("UNWIND [1, 2] AS k MERGE (:N {id: k})", &none())
-        .unwrap_err();
-    assert!(detail(e).contains("MERGE key value must be a string"));
-    assert_eq!(db.node_count(), 0);
+    let rs = db
+        .query_write("UNWIND [1, 2, 1] AS k MERGE (:N {id: k})", &none())
+        .unwrap();
+    assert_eq!(count(&rs, "created"), 2);
+    assert_eq!(db.node_count(), 2);
 }
 
 // ── SET / REMOVE / DELETE ───────────────────────────────────────────────────

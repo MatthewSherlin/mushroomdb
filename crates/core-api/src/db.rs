@@ -43,6 +43,9 @@ mod ddl;
 mod explain;
 pub use ddl::{SchemaError, SchemaErrorKind};
 mod match_write;
+mod node_key;
+pub(crate) use node_key::generate_node_key;
+pub use node_key::{is_generated_key, GENERATED_KEY_PREFIX};
 mod row_eval;
 pub(crate) use match_write::{match_remove_ops, match_set_map_ops, match_set_ops, MatchWrite};
 pub(crate) use row_eval::RowSource;
@@ -14358,20 +14361,32 @@ impl<F: Fs> GraphDb<F> {
 
     /// Whether the MERGE node `key` exists, after the role-scope check (when
     /// the write is role-scoped). See the comments inside for the oracle rules.
+    /// Scope-before-lookup for a role-scoped MERGE: `Err` when the role may
+    /// neither create nor update nodes of `label`, before any node is looked
+    /// at (timing oracle closure — see test_merge_unscoped_no_key_lookup).
+    /// `Ok` for an unscoped write.
+    pub(crate) fn merge_label_scope(&self, label: &str) -> Result<()> {
+        let Some(authz) = self.pending_write_authz.as_ref() else {
+            return Ok(());
+        };
+        let has_create = authz.scope.create_labels.iter().any(|l| l == label);
+        let has_update = authz.scope.update_labels.iter().any(|l| l == label);
+        if !has_create && !has_update {
+            return Err(GraphError::RoleWriteDenied {
+                reason: format!(
+                    "role-bound token: label '{}' not in write scope (create_labels)",
+                    label
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn merge_node_existed(&self, label: &str, key: &str) -> Result<bool> {
         if let Some(authz) = self.pending_write_authz.clone() {
+            self.merge_label_scope(label)?;
             let has_create = authz.scope.create_labels.iter().any(|l| l == label);
             let has_update = authz.scope.update_labels.iter().any(|l| l == label);
-            if !has_create && !has_update {
-                // Scope-before-lookup: 403 without has_node call (timing oracle
-                // closure — see test_merge_unscoped_no_key_lookup).
-                return Err(GraphError::RoleWriteDenied {
-                    reason: format!(
-                        "role-bound token: label '{}' not in write scope (create_labels)",
-                        label
-                    ),
-                });
-            }
             // Key lookup under mask.
             match self.ids.get(key) {
                 Some(id) if authz.mask.contains_id(id) => {

@@ -130,20 +130,25 @@ fn create_node_and_edge() {
     assert!(nbrs.contains(&"bob".to_string()));
 }
 
+/// QL-NM: a node without a string `id` gets a generated key; it used to be
+/// refused.
 #[test]
-fn create_node_missing_id_is_error() {
+fn create_node_missing_id_gets_a_generated_key() {
     let mut db = GraphDb::open(&tmp("create-no-id")).unwrap();
-    let err = db
-        .query_write("CREATE (n:Person {name: 'No ID'})", &no_params())
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("id"),
-        "error must mention 'id' field, got: {detail}"
-    );
+    db.query_write("CREATE (n:Person {name: 'No ID'})", &no_params())
+        .unwrap();
+    let rs = db
+        .query(
+            "MATCH (n:Person) RETURN key(n) AS k, n.name AS name",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    match rs.get(0, "k") {
+        Some(Value::Str(k)) => assert!(mushroomdb::is_generated_key(k), "{k}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rs.get(0, "name"), Some(&Value::Str("No ID".into())));
 }
 
 #[test]
@@ -631,19 +636,22 @@ fn merge_on_create_set() {
     );
 }
 
+/// QL-NM: a MERGE pattern with several properties matches by all of them;
+/// a string `id` among them is the key a created node gets.
 #[test]
-fn merge_multi_prop_is_error() {
+fn merge_multi_prop_matches_by_every_property() {
     let mut db = GraphDb::open(&tmp("merge-multi-prop")).unwrap();
-    let err = db
-        .query_write("MERGE (n:Person {id: 'x', name: 'Alice'})", &no_params())
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("one key property") || detail.contains("exactly one"),
-        "error must mention single-property constraint, got: {detail}"
+    let q = "MERGE (n:Person {id: 'x', name: 'Alice'})";
+    db.query_write(q, &no_params()).unwrap();
+    assert_eq!(
+        db.node_info("x").unwrap().props.get("name"),
+        Some(&Value::Str("Alice".into()))
+    );
+    let rs = db.query_write(q, &no_params()).unwrap();
+    assert_eq!(
+        rs.stats().unwrap().nodes_created,
+        0,
+        "the second MERGE matches"
     );
 }
 
@@ -699,28 +707,18 @@ fn delete_edge_survives_wal_replay() {
     );
 }
 
-/// I3: comma-separated CREATE (not supported by chain-syntax parser) returns a
-/// named error so users get a clear message, not a cryptic parse failure.
+/// QL-NM: comma-separated CREATE patterns create every node; they used to be
+/// a named error.
 #[test]
-fn create_comma_separated_form_is_named_error() {
+fn create_comma_separated_form_creates_every_pattern() {
     let mut db = GraphDb::open(&tmp("create-comma-err")).unwrap();
-    let err = db
-        .query_write(
-            "CREATE (a:Org {id: 'acme'}), (b:Person {id: 'bob'})",
-            &no_params(),
-        )
-        .unwrap_err();
-    // Must be a QueryError (not a panic), mentioning the parse failure.
-    match err {
-        GraphError::QueryError { detail } => {
-            // Message must indicate the parse problem (unexpected tokens after pattern).
-            assert!(
-                !detail.is_empty(),
-                "error detail must not be empty for comma-separated CREATE"
-            );
-        }
-        other => panic!("comma-separated CREATE must fail as QueryError, got {other:?}"),
-    }
+    db.query_write(
+        "CREATE (a:Org {id: 'acme'}), (b:Person {id: 'bob'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.node_info("acme").unwrap().label, "Org");
+    assert_eq!(db.node_info("bob").unwrap().label, "Person");
 }
 
 // ─── WAL durability ──────────────────────────────────────────────────────────

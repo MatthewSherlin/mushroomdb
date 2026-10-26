@@ -16,9 +16,9 @@ an inline pattern filter, and after a grouping `WITH`:
 | Spelling | Gives |
 |---|---|
 | `n.key` / `n.id` | the node's key (a stored property of that name wins) |
-| `n.label` | the node's label (stored `label` wins) |
+| `n.label` | the node's label (stored `label` wins); null for a node with no label |
 | `key(n)` / `id(n)` | always the id-map key; `id(n)` aliases `key(n)` |
-| `labels(n)` | a one-element list holding the label |
+| `labels(n)` | a one-element list holding the label; `[]` for a node with no label |
 
 `n.key`, `n.id`, and `n.label` are a **fallback**: a stored property of that
 name always wins, so a graph that really has an `id` or `key` property keeps
@@ -47,6 +47,33 @@ RETURN key(c), n ORDER BY n DESC
 
 A bare `RETURN n` also works: the result row value for a node variable is the
 key string, not a node object. In Python, `row["n"]` is `"alice"`, not a dict.
+
+### Nodes without an id or a label
+
+A node needs neither. `CREATE ()`, `CREATE (:Person {name: 'Ada'})` and
+`CREATE ({name: 'Ada'})` each make a node:
+
+- **A string `id` is the key, as always.** `CREATE (n:Person {id: 'ada'})` makes
+  the node whose key is `ada`, a second `CREATE` of `ada` is a `DuplicateKey`
+  error, and `MERGE (n:Person {id: 'ada'})` finds or creates it by that key.
+- **Without a string `id`, the key is generated:** `_:` followed by 32 lowercase
+  hex digits (`_:3f9c0a…`), random, and different from every live key. The node
+  has no `id` property; `key(n)`, `id(n)`, `n.key` and `n.id` read the generated
+  key, as they read any key. An `id` that is not a string (`{id: 1}`) is an
+  ordinary property of a node with a generated key, and `MATCH (n {id: 1})` finds
+  it by that property.
+- **The key is chosen once.** It is written to the log with the node, so a
+  reopen, a snapshot, `open_at`, a backup and an export all give the same key
+  back. Inside a transaction, the key a statement sees is the key `COMMIT` writes.
+- **`_:` is reserved for generated keys.** A key written by hand with it is
+  accepted (an export carries generated keys, and importing it must restore the
+  same nodes) and names that node like any key.
+- **A node with no label** matches `MATCH (n)` and no `MATCH (n:Label)`.
+  `labels(n)` is `[]`, `n.label` is null, a Bolt node has an empty `labels`
+  list, and `CALL db.labels()` does not list it. No rule, view, index or
+  constraint applies to it, since each names a label. A role scoped to labels
+  neither sees nor creates such a node; its `keys` grant is the one way to show
+  it one. An empty label name (`(:``)`) is a parse error.
 
 **Performance note.** `WHERE n.key` / `n.id` / `key(n)` / `id(n)` against a
 literal or `$param` plans as `ScanKey` (plus a stored-property filter so
@@ -570,11 +597,16 @@ constraints added and removed. See [Write counters](bolt.md#write-counters).
 CREATE (n:Person {id: 'alice', score: 1})
 ```
 
-- The `id` property is required and becomes the node key.
-- Multiple nodes with an edge between them use chain syntax (comma-separated
-  lists are not supported — attempting them returns a named parse error):
+- A string `id` property becomes the node key. Without one the node gets a
+  generated key, and a node may have no label (`CREATE ()`, `CREATE (:Person
+  {name: 'Ada'})`): see [Nodes without an id or a label](#nodes-without-an-id-or-a-label).
+- Nodes and the relationships between them are a chain, several
+  comma-separated patterns, or several `CREATE` clauses. A name an earlier
+  pattern of the statement bound is that node:
   ```cypher
   CREATE (a:Org {id: 'acme'})-[:MEMBER]->(b:Person {id: 'bob'})
+  CREATE (a:Org {name: 'Acme'}), (b:Person {name: 'Bob'}), (a)<-[:MEMBER]-(b)
+  CREATE ()-[:KNOWS]->()
   ```
 - A property value is any expression: a literal, a `$parameter`, a map entry
   of one (`$p.id`), a list or map built from them, arithmetic, a function call
@@ -583,8 +615,8 @@ CREATE (n:Person {id: 'alice', score: 1})
   type; a parameter whose value is null leaves that property out, and a
   missing parameter is an error naming it.
 - `CREATE (n:Person $props)` takes the whole property map from a parameter. A
-  null value in the map is left out; a parameter that is not a map is an error
-  naming it, and the map must hold a string `id`.
+  null value in the map is left out, and a parameter that is not a map is an
+  error naming it.
 - A statement whose map reads a `$parameter` runs as the per-row form
   ([UNWIND … write](#unwind--write-clauses)) over one row, so it meets the
   same checks and stores what the same statement with the values written as
@@ -721,8 +753,33 @@ edges (openCypher semantics).  If any edges remain the executor returns:
 MERGE (n:Person {id: 'alice'})
 ```
 
-- Match-or-create by a single key property. An optional `ns` names the
-  namespace the create arm writes into (`MERGE (n:Doc {id: 'x', ns: 'tenant-a'})`).
+- **A key MERGE** is a label and `id` alone, with a string value: it finds or
+  creates the node whose key is that value. An optional `ns` names the
+  namespace the create arm writes into (`MERGE (n:Doc {id: 'x', ns:
+  'tenant-a'})`).
+- **Every other pattern matches by its label and properties**, as openCypher's
+  MERGE does. That covers any other single property (`MERGE (n:Person {name:
+  'Ada'})`), no label (`MERGE (n {name: 'a'})`), no property (`MERGE (n:Tag)`),
+  several properties, and a value that is not a string (`MERGE (n:Item {num:
+  42})`). It matches every node carrying the label (any node when there is
+  none) whose properties equal the pattern's, the statement's own writes
+  included, and binds each: the clauses after it, its `ON MATCH SET` included,
+  run once per match. When nothing matches it creates the node as `CREATE`
+  would. A pattern of a label and one string property keys the new node by the
+  value when no node holds that key (`MERGE (:Person {name: 'Ada'})` creates the
+  node `Ada`, as 0.9 did); when a node holds it, visible or not, the key is
+  generated instead, as it is for an empty value or one beginning `_:`. The
+  node then holds that key, so a later `CREATE (:Any {id: 'Ada'})` under any
+  label is a `DuplicateKey`. Any other pattern gets a generated key unless it holds a
+  string `id`. A string `id` in such a pattern selects by key, as in `MATCH`;
+  when that node exists but does not match the rest of the pattern, the MERGE is
+  an error, since a key names one node. A null property value is an error.
+- **Cost.** A key MERGE is one key lookup. A property MERGE reads an index on
+  the label and one of the pattern's properties when one exists (`CREATE INDEX
+  FOR (n:Person) ON (n.name)`, or an equality index), and otherwise scans every
+  node of the label (every node, with no label). The scan is per row, so `UNWIND $rows AS r MERGE
+  (n:Person {name: r.name})` over N rows into a label of M nodes costs N × M
+  property reads: index the property, or MERGE on `{id: …}`.
 - A role bound to exactly one namespace stamps that namespace when the
   pattern does not name `ns`. A role bound to two or more must name one.
 - `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
@@ -733,11 +790,27 @@ MERGE (n:Person {id: 'alice'})
   MATCH SET n += $props` a null value removes that key.
 - The key (and `ns`) may be any expression, `$parameter`s included
   (`MERGE (n:Person {id: $id})`); the MERGE matches on the value exactly as it
-  does on the same literal. A key that evaluates to null is an error, as is a
-  key that is not a string.
-- Other extra properties are not supported, and neither is a parameter map in
-  the pattern (`MERGE (n:Person $props)`, refused by name): name the key and set
-  the rest, `MERGE (n:Person {id: $props.id}) ON CREATE SET n += $props`.
+  does on the same literal. A key that evaluates to null is an error; one that
+  is not a string makes the pattern one that matches by its properties.
+- A role-scoped MERGE checks the pattern's label against the role's create and
+  update scope before it looks at any node, and looks through the role's view:
+  a node the role cannot see is never bound. A label outside the role's scope
+  is refused before any lookup, so a hidden key and an absent key get the same
+  answer. In a label the role may create, a MERGE naming a hidden node's `id` is
+  refused with `role-bound token: target node not visible`, where an absent key
+  would be created: the key-existence signal every create-scoped write already
+  gives (see the accepted structural disclosure under [Threat model](http.md#threat-model)).
+- Inside a transaction, a MERGE guards its commit with the nodes it matched and
+  the key it created: a concurrent change to a matched node, or a second create
+  of the same key (a key MERGE, or a property MERGE keyed by its value), is a
+  conflict. A property MERGE that found nothing cannot see a matching node
+  another transaction creates meanwhile under another key: whether the MERGE
+  keyed its node by the value or generated one, a concurrent `CREATE (:Person
+  {name: 'Ada'})` and the MERGE both commit. A unique constraint on the property
+  (`CREATE CONSTRAINT … REQUIRE n.name IS UNIQUE`) is the guard.
+- A parameter map in the pattern (`MERGE (n:Person $props)`) is refused by
+  name: name the key and set the rest, `MERGE (n:Person {id: $props.id}) ON
+  CREATE SET n += $props`.
 
 #### MERGE with a relationship
 
@@ -749,7 +822,11 @@ RETURN a, b
 ```
 
 - Finds or creates each end node by its key, then finds or creates the edge
-  between them. Running the statement again changes nothing: the edge is never
+  between them.
+- An end that is neither bound nor a key pattern (`MATCH (a:A) MERGE
+  (a)-[:T]->(b:B)`, `MERGE (x:X)-[:U]->(y)`) makes the whole path the pattern:
+  the MERGE binds every path that matches it, and when none does it creates the
+  relationship and every such end, even if nodes matching that end alone exist. Running the statement again changes nothing: the edge is never
   duplicated, and a write that matches in full logs nothing.
 - `ON MATCH SET` runs when both nodes and the edge already existed; otherwise the
   missing nodes and the edge are created and `ON CREATE SET` runs. A `SET` item
@@ -942,7 +1019,8 @@ MERGE (n:Person {id: r.id})
 - **Null.** A property whose value is null in `CREATE` is left out, so a sparse
   row creates a node without it. `SET n.f = <null>` is an error, as for a single
   `SET`; in a map, a null entry removes the property under `+=` and is an absent
-  key under `=`. A `MERGE` key must be a string; a null key is an error.
+  key under `=`. A `MERGE` property that is null is an error; one that is not a
+  string makes the pattern one that matches by its properties.
 - **`RETURN`.** One row for each row the writes ran for, in order, after the
   commit. The read part is not run again: each row keeps the nodes and values it
   wrote with, and `RETURN` reads their properties from the committed state, so a
@@ -1828,12 +1906,10 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Form | Error message (excerpt) |
 |---|---|
 | Bare `RETURN rs` for a variable-length relationship variable | `cannot return variable-length relationship variable '…' bare; return ….length, or name the path (p = …) and return p` |
-| `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
 | `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
-| `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
 | Variable-length `*0..n` (zero-length min) | `zero-length variable-length paths are not supported; minimum hop count is 1` |
 | Variable-length `*n..` (unbounded upper) | `variable-length paths are capped at 10 hops` |
 | A `MATCH`, `UNWIND` or `WITH` after a write clause of an `UNWIND` statement | `not supported in mushroomdb 0.10: a MATCH, UNWIND or WITH clause after a write clause in the same statement; put the reads first` |
@@ -1878,8 +1954,6 @@ unexpected-token parse error or other unspecified result.
 |---|
 | Chained comparisons `a < b < c` (a parse error) |
 | Composite and full-text index DDL, `IS NOT NULL` / `IS NODE KEY` constraints, `SHOW … YIELD` |
-| A node with no label or no string `id` (`CREATE ()`, `CREATE (:A {name: 'x'})`): a parse error or a named error; the label and the key are required |
-| Comma-separated patterns in `CREATE` (`CREATE (a:A {id: 'a'}), (b:B {id: 'b'})`): a parse error; use a chain or two `CREATE` clauses |
 | List slices `l[1..3]`, `l[..2]` (a parse error) |
 | Unary minus on anything but a numeric literal (`-x`, `-(1 + 2)`): a parse error |
 | Hexadecimal and octal integer literals (`0x1F`, `0o17`): a parse error |
@@ -1899,7 +1973,7 @@ unexpected-token parse error or other unspecified result.
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
-| Multiple patterns in one MATCH | Supported, comma-separated — as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. Still a named error after CREATE |
+| Multiple patterns in one MATCH | Supported, comma-separated — as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. `CREATE` takes several patterns too |
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |

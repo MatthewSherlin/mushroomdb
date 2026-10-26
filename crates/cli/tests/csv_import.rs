@@ -173,13 +173,13 @@ fn csv_import_unknown_type_suffix_warns_and_stores_a_string() {
 #[test]
 fn csv_import_row_errors_stop_with_file_and_line() {
     let dir = tmp("rowerrors");
-    let cases: [(&str, &str, &str); 6] = [
+    let cases: [(&str, &str, &str); 5] = [
         (
             ":ID,:LABEL\n1,P\n2,Person;Employee\n",
             "n.csv:3:",
             "more than one label",
         ),
-        (":ID,:LABEL\n1,P\n2,\n", "n.csv:3:", "empty :LABEL"),
+        // An empty `:LABEL` is a node with no label (QL-NM), not an error.
         (":ID,:LABEL\n,P\n", "n.csv:2:", "empty :ID"),
         (":ID,:LABEL,age:int\n1,P,x\n", "n.csv:2:", "age"),
         (":ID,:LABEL\n1,P\n1,P\n", "n.csv:3:", "duplicate :ID"),

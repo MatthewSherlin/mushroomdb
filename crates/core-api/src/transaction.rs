@@ -518,6 +518,18 @@ impl RowSource for TxRows<'_, '_> {
         Ok(merge_node_props(key_field, key_value, named_ns))
     }
 
+    /// A transaction carries no role (role-bound writes are refused inside
+    /// one), so every label is in scope.
+    fn row_merge_scope(&self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// A transaction's MERGE stamps no role namespace, as its key MERGE's
+    /// create arm does not.
+    fn row_merge_ns(&self) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
     /// Views are the store's: the live registry answers.
     fn row_view_owns(&self, field: &str) -> bool {
         self.db.read().row_view_owns(field)

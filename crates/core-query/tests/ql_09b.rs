@@ -115,8 +115,13 @@ fn merge_takes_a_row_value_as_its_key_and_still_allows_one_key_only() {
     };
     assert_eq!(m.start.key_field, "id");
     assert!(m.start.ns.is_some());
-    let e = write("UNWIND $r AS x MERGE (a:A {id: x.id, name: x.n})").unwrap_err();
-    assert!(e.contains("exactly one key property"), "{e}");
+    // QL-NM: a second property makes it a pattern matched by every property.
+    let s = write("UNWIND $r AS x MERGE (a:A {id: x.id, name: x.n})").unwrap();
+    let RowWrite::Merge(m) = &s.writes[0] else {
+        panic!("expected Merge")
+    };
+    assert!(!m.start.key_pattern);
+    assert_eq!(m.start.props.len(), 2);
 }
 
 #[test]
@@ -142,8 +147,10 @@ fn refusals_are_named() {
     assert!(e.contains("DELETE of the relationship"), "{e}");
     let e = write("UNWIND [1] AS x MATCH (n) REMOVE n:Label").unwrap_err();
     assert!(e.contains("label removal"), "{e}");
-    let e = write("UNWIND [1] AS x CREATE (a)").unwrap_err();
-    assert!(e.contains("not a node bound"), "{e}");
+    // QL-NM: `(a)` with `a` new is a new node with no label; a value is not.
+    assert!(write("UNWIND [1] AS x CREATE (a)").is_ok());
+    let e = write("UNWIND [1] AS x CREATE (x)").unwrap_err();
+    assert!(e.contains("not a node"), "{e}");
     let e = write("UNWIND [1] AS x MATCH (n) SET x.a = 1").unwrap_err();
     assert!(e.contains("is a value, not a node variable"), "{e}");
     let e = write("UNWIND [1] AS x SET q.a = 1").unwrap_err();

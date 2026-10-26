@@ -561,6 +561,16 @@ impl CypherLoss {
     }
 }
 
+/// A node pattern's label part: `` :`Label` ``, or nothing for a node with no
+/// label (the empty label, QL-NM), which `MERGE (n {id: …})` finds by its key.
+fn cypher_label(label: &str) -> String {
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!(":{}", cypher_ident(label))
+    }
+}
+
 /// A backtick-quoted identifier.
 fn cypher_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -683,8 +693,8 @@ pub fn write_cypher(
         loss.ids_added += usize::from(!has_id);
         write!(
             out,
-            "MERGE (n:{} {{id: {}}})",
-            cypher_ident(&node.label),
+            "MERGE (n{} {{id: {}}})",
+            cypher_label(&node.label),
             cypher_string(&node.key)
         )?;
         if !sets.is_empty() {
@@ -706,11 +716,11 @@ pub fn write_cypher(
         };
         writeln!(
             out,
-            "MERGE (a:{} {{id: {}}})-[:{}]->(b:{} {{id: {}}})",
-            cypher_ident(&src_label),
+            "MERGE (a{} {{id: {}}})-[:{}]->(b{} {{id: {}}})",
+            cypher_label(&src_label),
             cypher_string(&edge.src),
             cypher_ident(&edge.edge_type),
-            cypher_ident(&dst_label),
+            cypher_label(&dst_label),
             cypher_string(&edge.dst)
         )?;
         Ok(())
