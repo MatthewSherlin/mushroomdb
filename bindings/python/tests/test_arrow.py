@@ -1,19 +1,30 @@
 """`to_arrow_tables`: the whole graph as two pyarrow Tables.
 
-pyarrow is an optional extra, so the module skips without it, except for the
-test that checks the error a caller sees when it is missing.
+pyarrow is an optional extra, so the module skips without it, except under CI,
+where a missing pyarrow, pandas or polars fails.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import sys
 
 import pytest
 
 from mushroomdb import GraphDb
 
-pa = pytest.importorskip("pyarrow")
+
+
+def _optional(name: str):
+    """Import `name`, skipping when absent, except under CI, where absent is a failure."""
+    if os.environ.get("CI"):
+        return importlib.import_module(name)
+    return pytest.importorskip(name)
+
+
+pa = _optional("pyarrow")
 
 
 @pytest.fixture
@@ -97,8 +108,8 @@ def test_scoped_handle_is_refused(db):
 
 
 def test_pandas_and_polars_conversions(db):
-    pytest.importorskip("pandas")
-    pl = pytest.importorskip("polars")
+    _optional("pandas")
+    pl = _optional("polars")
     nodes = db.to_arrow_tables()["nodes"]
     assert list(nodes.to_pandas()["key"]) == ["ada", "bob"]
     assert pl.from_arrow(nodes)["key"].to_list() == ["ada", "bob"]
