@@ -573,12 +573,6 @@ pub fn engine_implements_function(name: &str) -> bool {
         })
 }
 
-/// Features whose scenarios read the clock and flip between runs, so the
-/// function page leaves them out: a committed table that changed run to run
-/// cannot be gated. Drop an entry when its flake is fixed; the page's
-/// sentence about them is built from this list and goes with the last entry.
-const VOLATILE_FEATURES: &[&str] = &["expressions/temporal/Temporal10.feature"];
-
 /// Names only a TCK scenario about unknown functions calls: not Cypher
 /// functions in any catalog, so they get no row.
 const TCK_ONLY_NAMES: &[&str] = &["foo"];
@@ -597,26 +591,11 @@ const VARIABLE_ONLY_AGGREGATES: &[&str] = &[
     "sum",
 ];
 
-fn volatile_sentence() -> String {
-    if VOLATILE_FEATURES.is_empty() {
-        return String::new();
-    }
-    let names: Vec<String> = VOLATILE_FEATURES
-        .iter()
-        .map(|f| format!("`{}`", f.rsplit('/').next().unwrap_or(f)))
-        .collect();
-    format!(
-        "The scenarios of {} are not counted: they read the clock and pass or fail from run to run, and a table that changed from run to run could not be checked in CI. ",
-        names.join(", ")
-    )
-}
-
 /// The page `--function-table` writes: one row per Cypher function the TCK
 /// calls, plus every function the engine lists that no scenario calls. Two
 /// independent columns: what the engine implements (probed, not taken from
 /// the TCK) and the TCK scenarios that call the function, passing / total.
-/// Deterministic: sorted, counts only, no dates; scenarios of
-/// [`VOLATILE_FEATURES`] are not counted.
+/// Deterministic: sorted, counts only, no dates.
 pub fn function_page(
     scenarios: &[Scenario],
     outcomes: &[Outcome],
@@ -625,9 +604,6 @@ pub fn function_page(
 ) -> String {
     let mut uses: BTreeMap<String, Counts> = BTreeMap::new();
     for (s, o) in scenarios.iter().zip(outcomes) {
-        if VOLATILE_FEATURES.iter().any(|v| s.feature.ends_with(v)) {
-            continue;
-        }
         let mut called = BTreeSet::new();
         for q in s.queries() {
             called.extend(functions_called(q));
@@ -652,9 +628,8 @@ pub fn function_page(
          *TCK scenarios* counts the scenarios that call the function, passing / total, with `—` when none runs. \
          A scenario counts for every function it calls, and a scenario can fail for a reason that is not the function: \
          the name of a result column, or the setup. A low count is not proof the function is wrong. \
-         {}The overall rate is on [openCypher conformance](conformance.md).\n\n\
-         | Function | In the engine | TCK scenarios | Notes |\n|---|---|---|---|",
-        volatile_sentence()
+         The overall rate is on [openCypher conformance](conformance.md).\n\n\
+         | Function | In the engine | TCK scenarios | Notes |\n|---|---|---|---|"
     );
     for (f, c) in &uses {
         let run = c.passed + c.failed;
@@ -719,7 +694,8 @@ mod tests {
         let engine: BTreeSet<String> = ["abs".to_string()].into();
         let page = function_page(&[], &[], |_| true, &engine);
         assert!(page.starts_with("# Cypher function conformance"));
-        assert!(page.contains("Temporal10.feature"));
+        // QL-CL made Temporal10 stable: no feature is left out of the counts.
+        assert!(!page.contains("are not counted"), "{page}");
         assert!(
             page.contains("| `abs` | implemented | — | no TCK scenarios |"),
             "{page}"
