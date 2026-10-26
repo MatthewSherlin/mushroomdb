@@ -481,9 +481,9 @@ answers. A session can only call what its client was shown, though, so the two
 unlisted tools — `explain` and `rename_node` — are reached by starting the
 server with `mushroomdb mcp <db> --all-tools`, which lists the whole set with
 their schemas. The default listing a session pays for before its first turn —
-the `tools` array of the `tools/list` reply, as compact JSON — is 27,371 bytes;
-all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
-`was_linked`'s schema declaring the date it takes. Before 0.7 added `schema`,
+the `tools` array of the `tools/list` reply, as compact JSON — is 28,146 bytes;
+all 25 are 28,947. In 0.7.0 it was 27,067 and 27,868; 0.10 added 566 bytes
+of it by naming `create_rule`'s via-hop fields in its schema. Before 0.7 added `schema`,
 `analyze`, `suggest_rules` and `forget` it was 23,548 and 24,349;
 `scripts/measure-tool-listing.py` takes both.
 

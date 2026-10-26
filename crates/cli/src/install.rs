@@ -2866,9 +2866,9 @@ fn install_claude_code(
         manifest.files.push(skill_file.clone());
     }
 
-    // The same skill name at the other scope: the user-scope skill takes
-    // precedence over a project one, so an older copy there is what a session
-    // reads instead of the one just written (ledger row 63).
+    // The same skill name at the other scope. Which copy a session reads
+    // depends on the host, so the note names both and does not pick one; an
+    // identical copy is harmless and earns nothing (ledger row 63).
     let other_scope_skill = match ctx.scope {
         Scope::Project => ctx.home.join(".claude"),
         Scope::User => ctx.project_root.join(".claude"),
@@ -2876,9 +2876,12 @@ fn install_claude_code(
     .join("skills")
     .join("mushroom")
     .join("SKILL.md");
-    if other_scope_skill != skill_file && other_scope_skill.is_file() {
+    if other_scope_skill != skill_file
+        && other_scope_skill.is_file()
+        && !file_matches(&other_scope_skill, &skill_content)
+    {
         notes.push(format!(
-            "warning: a skill at {} may shadow the one just written at {}; the user-scope skill takes precedence",
+            "warning: another copy of the skill exists at {} (the one just written is at {}); only one will be used",
             other_scope_skill.display(),
             skill_file.display()
         ));

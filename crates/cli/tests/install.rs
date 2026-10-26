@@ -8,8 +8,9 @@
 //! of stand-ins or leaves it empty.
 
 use cli::install::{
-    classify_mcp_command, delivery_for_store_with_home, run_install_with, run_uninstall,
-    run_uninstall_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
+    classify_mcp_command, delivery_for_store, delivery_for_store_with_home, run_install_with,
+    run_uninstall, run_uninstall_with, Delivery, Externals, InstallOpts, McpCommand, Platform,
+    Scope,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -4042,7 +4043,8 @@ fn project_install_warns_when_a_user_scope_skill_shadows_it() {
     )
     .unwrap();
     assert!(
-        out.contains("warning: a skill at") && out.contains(&user_skill.display().to_string()),
+        out.contains("warning: another copy of the skill exists at")
+            && out.contains(&user_skill.display().to_string()),
         "no shadow warning in: {out}"
     );
 
@@ -4057,5 +4059,72 @@ fn project_install_warns_when_a_user_scope_skill_shadows_it() {
         &no_externals(),
     )
     .unwrap();
-    assert!(!out.contains("may shadow"), "spurious warning in: {out}");
+    assert!(
+        !out.contains("another copy of the skill"),
+        "spurious warning in: {out}"
+    );
+}
+
+/// The warning is right in the other direction too, and an identical copy at
+/// the other scope earns none.
+#[test]
+fn user_install_warns_of_a_differing_project_skill_and_not_an_identical_one() {
+    let root = temp_dir("shadow2-root");
+    let home = temp_dir("shadow2-home");
+    let project_skill = root
+        .join(".claude")
+        .join("skills")
+        .join("mushroom")
+        .join("SKILL.md");
+    fs::create_dir_all(project_skill.parent().unwrap()).unwrap();
+    fs::write(&project_skill, "a different skill").unwrap();
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::User),
+        db: Some(home.join("db")),
+        ..base_opts()
+    };
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals()).unwrap();
+    assert!(
+        out.contains("another copy of the skill exists at")
+            && out.contains(&project_skill.display().to_string()),
+        "no warning in: {out}"
+    );
+
+    // Now the project copy is byte-identical to the user one: nothing to say.
+    let user_skill = home
+        .join(".claude")
+        .join("skills")
+        .join("mushroom")
+        .join("SKILL.md");
+    fs::copy(&user_skill, &project_skill).unwrap();
+    fs::remove_file(&user_skill).unwrap();
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals()).unwrap();
+    assert!(
+        !out.contains("another copy of the skill"),
+        "identical copy warned: {out}"
+    );
+}
+
+/// The public lookup reads `HOME`. Process-wide, so this is the only test in
+/// this binary that sets it, and it puts it back.
+#[test]
+fn delivery_for_store_reads_the_user_scope_manifest_through_home() {
+    let home = temp_dir("delivery-env-home");
+    let elsewhere = temp_dir("delivery-env-elsewhere");
+    let db_dir = elsewhere.join("store");
+    fs::create_dir_all(home.join(".mushroomdb")).unwrap();
+    fs::write(
+        home.join(".mushroomdb").join("install-manifest.json"),
+        r#"{"files":[],"mcp_keys":[],"delivery":"mcp","disabled":false}"#,
+    )
+    .unwrap();
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let found = delivery_for_store(&db_dir);
+    match previous {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    assert_eq!(found, Delivery::Mcp);
 }

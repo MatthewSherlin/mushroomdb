@@ -783,11 +783,11 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
 
     // When a `vector` array is provided, use the HNSW / brute-force vector
     // similarity path instead of looking up pre-derived edges.
-    if let Some(vec_js) = args.get("vector").and_then(Js::as_array) {
-        let q = match numeric_vector(vec_js) {
-            Ok(q) => q,
-            Err(e) => return CallOutcome::ToolErr(e),
-        };
+    let vector = match vector_arg(args) {
+        Ok(v) => v,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if let Some(q) = vector {
         if q.is_empty() {
             return CallOutcome::ToolErr("vector must be a non-empty array of numbers".into());
         }
@@ -967,16 +967,23 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
-/// A `vector` argument's elements, every one a number. One that is not is an
-/// error, never an element dropped: `[1, "x", 0]` is not the vector `[1, 0]`.
-fn numeric_vector(items: &[Js]) -> Result<Vec<f64>, String> {
-    items
-        .iter()
-        .map(|v| {
-            v.as_f64()
-                .ok_or_else(|| "vector elements must all be numbers".to_string())
-        })
-        .collect()
+/// The `vector` argument: `None` when absent or null, the numbers when it is
+/// an array of numbers, an error otherwise. An element that is not a number is
+/// never dropped (`[1, "x", 0]` is not `[1, 0]`), and a `vector` that is not an
+/// array is never taken for absent.
+fn vector_arg(args: &Js) -> Result<Option<Vec<f64>>, String> {
+    match args.get("vector") {
+        None | Some(Js::Null) => Ok(None),
+        Some(Js::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .ok_or_else(|| "vector elements must all be numbers".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err("vector must be an array of numbers".to_string()),
+    }
 }
 
 /// A non-negative integer argument. Absent or null takes `default`; present
@@ -1070,12 +1077,9 @@ fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
         Err(e) => return CallOutcome::ToolErr(e),
     };
 
-    let query_vec: Vec<f64> = match args.get("vector").and_then(Js::as_array) {
-        Some(arr) => match numeric_vector(arr) {
-            Ok(q) => q,
-            Err(e) => return CallOutcome::ToolErr(e),
-        },
-        None => Vec::new(),
+    let query_vec: Vec<f64> = match vector_arg(args) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => return CallOutcome::ToolErr(e),
     };
 
     let hits = {
@@ -2686,9 +2690,6 @@ mod tests {
         );
     }
 
-    /// A `min`, `k` or `limit` that is present and not the number it should be
-    /// is a tool error, as `min` and `k` are over HTTP — never the default
-    /// applied in silence. Absent or null still takes the default.
     /// Ledger row 88: a `vector` with an element that is not a number was
     /// searched with the element dropped (`[1, "x", 0]` as `[1, 0]`); the same
     /// for `hybrid_search`'s `vector`, and `pairwise_similar` / `hybrid_search`
@@ -2709,6 +2710,16 @@ mod tests {
                     "vector": [1.0, null], "vector_field": "emb"
                 }),
                 "vector elements must all be numbers",
+            ),
+            (
+                "find_similar",
+                json!({ "vector": "1,0", "field": "emb" }),
+                "vector must be an array of numbers",
+            ),
+            (
+                "hybrid_search",
+                json!({ "query_text": "alice", "text_field": "name", "vector": 5 }),
+                "vector must be an array of numbers",
             ),
             (
                 "hybrid_search",
@@ -2766,6 +2777,9 @@ mod tests {
         assert_eq!(props["via_dir"]["enum"], json!(["Out", "In"]));
     }
 
+    /// A `min`, `k` or `limit` that is present and not the number it should be
+    /// is a tool error, as `min` and `k` are over HTTP — never the default
+    /// applied in silence. Absent or null still takes the default.
     #[test]
     fn test_find_similar_non_numeric_min_k_or_limit_is_error() {
         let db = demo_db();
