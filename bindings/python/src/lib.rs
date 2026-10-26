@@ -9,7 +9,7 @@ use core_api::{
     RuleDef, Scope, SharedDb, Transaction as CoreTransaction, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyImportError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMemoryView, PySequence,
@@ -1191,6 +1191,102 @@ impl GraphDb {
                 Ok(d.unbind())
             })
             .collect()
+    }
+
+    /// The whole graph as two `pyarrow.Table`s, `{"nodes": ..., "edges": ...}`.
+    ///
+    /// `nodes` has columns `key`, `label`, `properties` (string, a JSON object
+    /// with sorted keys; a date, time or binary value is written as its text),
+    /// sorted by key. `edges` has `source`, `type`, `target`, `derived`
+    /// (bool), `rule` (string, null for a manual edge) and `weight` (float,
+    /// null unless the creating rule declares a numeric `weight_prop`), sorted
+    /// by `(type, source, target)`. An empty store gives empty tables with the
+    /// same columns.
+    ///
+    /// It materialises every node and edge in memory at once. `pyarrow` is an
+    /// optional dependency, imported here: without it this raises
+    /// `ImportError` naming `pip install pyarrow`. Refused on a scoped handle.
+    ///
+    /// ```python
+    /// tables = db.to_arrow_tables()
+    /// df = tables["nodes"].to_pandas()
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn to_arrow_tables(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("to_arrow_tables")?;
+        let pa = PyModule::import(py, "pyarrow").map_err(|_| {
+            PyImportError::new_err(
+                "to_arrow_tables() needs pyarrow, which is not installed: pip install pyarrow",
+            )
+        })?;
+        let (nodes, edges) =
+            self.with_ref(|db| Ok((db.all_nodes_for_export(), db.all_edges_for_export())))?;
+        let json = PyModule::import(py, "json")?;
+        let dumps_kwargs = PyDict::new(py);
+        dumps_kwargs.set_item("sort_keys", true)?;
+        dumps_kwargs.set_item("default", PyModule::import(py, "builtins")?.getattr("str")?)?;
+
+        let node_rows = PyList::empty(py);
+        for node in &nodes {
+            let props = PyDict::new(py);
+            for (field, value) in &node.props {
+                props.set_item(field, value_to_py(py, value)?)?;
+            }
+            let row = PyDict::new(py);
+            row.set_item("key", &node.key)?;
+            row.set_item("label", &node.label)?;
+            row.set_item(
+                "properties",
+                json.call_method("dumps", (props,), Some(&dumps_kwargs))?,
+            )?;
+            node_rows.append(row)?;
+        }
+        let edge_rows = PyList::empty(py);
+        for edge in &edges {
+            let row = PyDict::new(py);
+            row.set_item("source", &edge.src)?;
+            row.set_item("type", &edge.edge_type)?;
+            row.set_item("target", &edge.dst)?;
+            row.set_item("derived", edge.derived)?;
+            row.set_item("rule", edge.rule.as_deref())?;
+            row.set_item("weight", edge.weight)?;
+            edge_rows.append(row)?;
+        }
+
+        let string = pa.call_method0("string")?;
+        let node_schema = arrow_schema(
+            &pa,
+            &[
+                ("key", &string),
+                ("label", &string),
+                ("properties", &string),
+            ],
+        )?;
+        let edge_schema = arrow_schema(
+            &pa,
+            &[
+                ("source", &string),
+                ("type", &string),
+                ("target", &string),
+                ("derived", &pa.call_method0("bool_")?),
+                ("rule", &string),
+                ("weight", &pa.call_method0("float64")?),
+            ],
+        )?;
+        let table = pa.getattr("Table")?;
+        let out = PyDict::new(py);
+        for (name, rows, schema) in [
+            ("nodes", node_rows, node_schema),
+            ("edges", edge_rows, edge_schema),
+        ] {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", schema)?;
+            out.set_item(
+                name,
+                table.call_method("from_pylist", (rows,), Some(&kwargs))?,
+            )?;
+        }
+        Ok(out.unbind())
     }
 
     /// Enable an equality index on `(label, field)` so `MATCH (n:label {field: v})`
@@ -3982,6 +4078,17 @@ fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>
         rows.push(dict.unbind());
     }
     Ok(rows)
+}
+
+fn arrow_schema<'py>(
+    pa: &Bound<'py, PyModule>,
+    fields: &[(&str, &Bound<'py, PyAny>)],
+) -> PyResult<Bound<'py, PyAny>> {
+    let list = PyList::empty(pa.py());
+    for (name, data_type) in fields {
+        list.append(pa.call_method1("field", (*name, *data_type))?)?;
+    }
+    pa.call_method1("schema", (list,))
 }
 
 fn node_info_to_py(py: Python<'_>, info: &NodeInfo) -> PyResult<Py<PyDict>> {

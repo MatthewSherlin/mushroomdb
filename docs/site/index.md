@@ -73,6 +73,7 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
 - [Python guide](python.md) — the binding, with worked examples
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
+- [Arrow, pandas and polars](arrow.md) — the whole graph as two Arrow tables, and how to read them in pandas or polars
 - [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists

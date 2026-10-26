@@ -204,6 +204,7 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
 - [Python guide](python.md) — the binding, with worked examples
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
+- [Arrow, pandas and polars](arrow.md) — the whole graph as two Arrow tables, and how to read them in pandas or polars
 - [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
@@ -4620,6 +4621,56 @@ mushroomdb query <db-dir> "MATCH (f:File {id: 'src/lib.rs'})-[:TOP_AUTHOR]->(a:A
 The `explain` endpoint (`GET /explain?a=<src>&b=<dst>`, also an MCP tool) names
 the rule and the score behind any derived edge, so a `CO_CHANGED` link is always
 traceable back to the shared commits.
+
+---
+
+## docs/site/arrow.md
+
+# Arrow, pandas and polars
+
+`GraphDb.to_arrow_tables()` returns the whole graph as two [Apache Arrow](https://arrow.apache.org/) tables, so a data tool can read it without a Cypher round trip.
+
+```python
+from mushroomdb import GraphDb
+
+db = GraphDb.open("./store")
+tables = db.to_arrow_tables()      # {"nodes": pyarrow.Table, "edges": pyarrow.Table}
+
+nodes_df = tables["nodes"].to_pandas()             # pandas
+
+import polars as pl
+edges_df = pl.from_arrow(tables["edges"])          # polars
+```
+
+`pyarrow` is optional. Install it with `pip install pyarrow`; without it the call raises `ImportError` naming that command. pandas and polars are yours to install as well.
+
+## Columns
+
+The columns are fixed, so a script written against one store reads any other.
+
+| Table | Column | Type | Meaning |
+|---|---|---|---|
+| `nodes` | `key` | string | The node key. Rows are sorted by it. |
+| `nodes` | `label` | string | The node's label. |
+| `nodes` | `properties` | string | A JSON object of the node's properties, keys sorted. A date, time or binary value is written as its text. |
+| `edges` | `source` | string | Key of the node the edge leaves. |
+| `edges` | `type` | string | The edge type. |
+| `edges` | `target` | string | Key of the node the edge enters. |
+| `edges` | `derived` | bool | `true` for an edge a rule derived, `false` for one you wrote. |
+| `edges` | `rule` | string | The deriving rule's name; null for a manual edge. |
+| `edges` | `weight` | float64 | The rule's `weight_prop` value when it is numeric; otherwise null. |
+
+Edges are sorted by `(type, source, target)`. An empty store gives empty tables with the same columns.
+
+Properties are one JSON column because different labels carry different properties. To read one back into a column, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))` or polars `str.json_decode`.
+
+## Limits
+
+- It materialises every node and edge in memory at once. Use it on a graph that fits in memory, or query a slice with `db.query` instead.
+- It is a read of the whole store, so a handle from `scoped()` refuses it with `ValueError`; call it on the handle `scoped()` was called on.
+- It reads the live store and takes no `at=` argument. For a past commit, use `query_at`.
+
+For a complete script that builds a graph and retrieves from it, see `examples/graph-retrieval/` in the repository.
 
 ---
 
@@ -10043,6 +10094,32 @@ scoped handle is caller misuse, the same kind of thing as `scoped()`'s
 empty-scope `ValueError`. So a sidecar wrapping its boot-time role
 check in `except MushroomError` will not catch this one: catch
 `ValueError` too, or call `roles()` before narrowing the handle.
+
+### `to_arrow_tables`
+
+```python
+def to_arrow_tables(self) -> dict[str, Any]
+```
+
+The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
+
+`nodes` has columns `key`, `label`, `properties` (string: a JSON
+object with sorted keys; a date, time or binary value is written as its
+text), sorted by key. `edges` has `source`, `type`, `target`,
+`derived` (bool), `rule` (string, null for a manual edge) and `weight`
+(float, null unless the creating rule declares a numeric
+`weight_prop`), sorted by `(type, source, target)`. An empty store
+gives empty tables with the same columns.
+
+It materialises every node and edge in memory at once. `pyarrow` is an
+optional dependency, imported here: without it this raises
+`ImportError` naming `pip install pyarrow`. Refused (`ValueError`) on a
+scoped handle.
+
+```python
+tables = db.to_arrow_tables()
+df = tables["nodes"].to_pandas()
+```
 
 ## Rules
 

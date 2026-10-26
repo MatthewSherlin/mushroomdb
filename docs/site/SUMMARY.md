@@ -39,6 +39,7 @@
 # Import and export
 
 - [Git ingest](ingest-git.md)
+- [Arrow, pandas and polars](arrow.md)
 
 # Deploy and backup
 
