@@ -124,6 +124,7 @@ use object_store::{ObjectStore, PutMode, PutPayload, PutResult, UpdateVersion};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -440,6 +441,9 @@ pub struct BackupWorker {
     instance_id: String,
     /// What lease attempts have seen of a suspect foreign lease.
     watch: LeaseWatch,
+    /// Owned across cancellation of a waiter: a remote acquisition PUT may
+    /// already have landed while its capability probes are still pending.
+    pending_lease: Option<PendingLease>,
     /// The store's lineage, once resume has established it.
     lineage: Option<String>,
     /// The lineage this store was restored on boot from, when it was: its
@@ -460,6 +464,11 @@ pub struct BackupWorker {
     /// Generation numbers this tenure allocated.
     allocated: BTreeSet<u64>,
 }
+
+type LeaseAttempt = Result<Result<BucketLease, LeaseError>, tokio::time::error::Elapsed>;
+// The worker's other async helpers borrow &self, so the worker must remain
+// Sync. Exclusive get_mut accesses the future; no mutex guard crosses await.
+type PendingLease = Mutex<Pin<Box<dyn Future<Output = (LeaseWatch, LeaseAttempt)> + Send>>>;
 
 /// An archive known to be in the bucket.
 #[derive(Debug, Clone)]
@@ -519,6 +528,7 @@ impl BackupWorker {
             foreign: None,
             instance_id: new_instance_id(),
             watch: LeaseWatch::default(),
+            pending_lease: None,
             lineage: None,
             parent_lineage: None,
             parent_keys: HashSet::new(),
@@ -655,13 +665,17 @@ impl BackupWorker {
     }
 
     async fn run(mut self, mut rx: watch::Receiver<BackupTrigger>) {
+        #[cfg(test)]
+        let probe_control = self.watch.probe_control.clone();
         let mut delay = Duration::ZERO;
         loop {
             let shutdown = tokio::select! {
                 _ = tokio::time::sleep(delay) => false,
                 changed = rx.changed() => is_shutdown(changed, &mut rx),
             };
-            if shutdown {
+            // A ready timer can win the select while Shutdown (or sender
+            // closure) is already observable. Do not start another attempt.
+            if shutdown || *rx.borrow() == BackupTrigger::Shutdown || rx.has_changed().is_err() {
                 break;
             }
             // Nothing is uploaded without the bucket lease.
@@ -686,6 +700,10 @@ impl BackupWorker {
                 break;
             }
         }
+        #[cfg(test)]
+        if let Some(control) = &probe_control {
+            control.shutdown.notify_one();
+        }
         if self.refused {
             // The prefix is not ours: give the lease back so its owner is not
             // kept out, and idle, unhealthy, until shutdown.
@@ -693,15 +711,32 @@ impl BackupWorker {
             until_shutdown(&mut rx, std::future::pending::<()>()).await;
             return;
         }
-        if self.holds_lease() {
-            let grace = Duration::from_millis(self.config.shutdown_grace_ms);
-            if tokio::time::timeout(grace, self.flush()).await.is_err() {
-                self.error_count.fetch_add(1, Ordering::AcqRel);
-                tracing::warn!(
-                    grace_ms = self.config.shutdown_grace_ms,
-                    "backup flush did not finish within the shutdown grace; abandoned"
-                );
-            }
+        // Completing an already-started acquire and flushing share one grace
+        // window. Shutdown never starts another acquisition or retries one.
+        let grace = Duration::from_millis(self.config.shutdown_grace_ms);
+        let flush_deadline = Instant::now() + grace;
+        if self.pending_lease.is_some()
+            && tokio::time::timeout_at(flush_deadline, self.finish_lease_attempt(true))
+                .await
+                .is_err()
+        {
+            self.error_count.fetch_add(1, Ordering::AcqRel);
+            tracing::warn!("backup lease acquisition exceeded the shutdown grace; canceled");
+        }
+        // Ordinary drop cancels the owned future before owner-ID cleanup;
+        // there is no detached task left that can send another local request.
+        self.pending_lease = None;
+        if self.holds_lease()
+            && Instant::now() < flush_deadline
+            && tokio::time::timeout_at(flush_deadline, self.flush())
+                .await
+                .is_err()
+        {
+            self.error_count.fetch_add(1, Ordering::AcqRel);
+            tracing::warn!(
+                grace_ms = self.config.shutdown_grace_ms,
+                "backup flush did not finish within the shutdown grace; abandoned"
+            );
         }
         self.release_lease().await;
     }
@@ -722,19 +757,46 @@ impl BackupWorker {
             self.lease = None;
             self.health.lease_held.store(false, Ordering::Release);
         }
-        let ttl_s = self.config.lease_ttl_s;
-        // A few requests: a read, a conditional write, the two probes.
-        let limit = self.op_timeout() * 4;
-        let acquire = BucketLease::acquire_as(
-            Arc::clone(&self.store),
-            &self.prefix,
-            ttl_s,
-            &self.instance_id,
-            &mut self.watch,
-        );
-        let wait = match tokio::time::timeout(limit, acquire).await {
+        if self.pending_lease.is_none() {
+            let store = Arc::clone(&self.store);
+            let prefix = self.prefix.clone();
+            let instance_id = self.instance_id.clone();
+            let ttl_s = self.config.lease_ttl_s;
+            let mut watch = std::mem::take(&mut self.watch);
+            // The original limit begins on the attempt's first poll and is
+            // retained unchanged if shutdown takes over its waiter.
+            let limit = self.op_timeout() * 4;
+            self.pending_lease = Some(Mutex::new(Box::pin(async move {
+                let attempt =
+                    BucketLease::acquire_as(store, &prefix, ttl_s, &instance_id, &mut watch);
+                let outcome = tokio::time::timeout(limit, attempt).await;
+                (watch, outcome)
+            })));
+        }
+        let wait = self.finish_lease_attempt(false).await;
+        let pos = self.position().await;
+        self.health.observe(&pos, Instant::now());
+        wait
+    }
+
+    /// Await the existing attempt by borrow so canceling this waiter retains
+    /// its requests, timeout and suspect-record observation state.
+    async fn finish_lease_attempt(&mut self, shutting_down: bool) -> Option<Duration> {
+        let (watch, outcome) = self
+            .pending_lease
+            .as_mut()?
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .await;
+        self.pending_lease = None;
+        self.watch = watch;
+        match outcome {
             Ok(Ok(lease)) => {
-                let first = lease.renew_interval();
+                let first = if shutting_down {
+                    Duration::ZERO
+                } else {
+                    lease.renew_interval()
+                };
                 self.hold(Arc::new(lease), first);
                 None
             }
@@ -752,7 +814,7 @@ impl BackupWorker {
                     "the backup bucket's lease is held by another instance ({instance_id}); \
                      this instance uploads nothing while it is"
                 ));
-                Some(poll_interval(ttl_s))
+                Some(poll_interval(self.config.lease_ttl_s))
             }
             Ok(Err(e @ LeaseError::PreconditionsIgnored { .. })) => {
                 tracing::error!(error = %e, "backup is not started");
@@ -770,10 +832,7 @@ impl BackupWorker {
             }
             Ok(Err(e)) => Some(self.failed(&BackupError::Lease(e.to_string()))),
             Err(_) => Some(self.failed(&BackupError::Timeout("taking the bucket lease".into()))),
-        };
-        let pos = self.position().await;
-        self.health.observe(&pos, Instant::now());
-        wait
+        }
     }
 
     /// Hold `lease`: start renewing it, and forget a previous tenure's view
@@ -833,18 +892,33 @@ impl BackupWorker {
 
     /// Stop renewing and delete the lease, if this worker still holds it.
     async fn release_lease(&mut self) {
+        self.pending_lease = None;
         self.health.lease_held.store(false, Ordering::Release);
-        let Some(lease) = self.lease.take() else {
-            return;
+        let deadline = Instant::now() + self.op_timeout();
+        let release = async {
+            if let Some(renewer) = self.renewer.take() {
+                renewer.abort();
+                let _ = renewer.await;
+            }
+            if let Some(lease) = self.lease.take() {
+                // A known lost lease keeps the existing no-release rule.
+                if lease.is_lost() {
+                    return Ok(());
+                }
+                if let Ok(lease) = Arc::try_unwrap(lease) {
+                    return lease.release().await;
+                }
+            }
+            // An acquisition that failed, timed out or was canceled can have
+            // left an own record without a handle. Never acquire it again.
+            crate::lease::release_own_record(
+                &self.store,
+                &ObjectPath::from(crate::lease::lease_key(&self.prefix)),
+                &self.instance_id,
+            )
+            .await
         };
-        if let Some(r) = self.renewer.take() {
-            r.abort();
-            let _ = r.await;
-        }
-        let Ok(lease) = Arc::try_unwrap(lease) else {
-            return;
-        };
-        match tokio::time::timeout(self.op_timeout(), lease.release()).await {
+        match tokio::time::timeout_at(deadline, release).await {
             Ok(Ok(())) => tracing::info!("released the backup bucket lease"),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "could not release the backup bucket lease; it expires by itself")
@@ -875,6 +949,10 @@ impl BackupWorker {
 
     /// Count a failed step or lease attempt; return the back-off to wait.
     fn failed(&mut self, e: &BackupError) -> Duration {
+        #[cfg(test)]
+        if let Some(control) = &self.watch.probe_control {
+            control.failed.notify_one();
+        }
         self.error_count.fetch_add(1, Ordering::AcqRel);
         let failures = {
             let mut s = self.health.lock();
@@ -2066,3 +2144,6 @@ fn now_rfc3339() -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests;

@@ -122,6 +122,22 @@ pub fn new_instance_id() -> String {
 #[derive(Debug, Default)]
 pub struct LeaseWatch {
     seen: Option<(String, Instant)>,
+    #[cfg(test)]
+    pub(crate) probe_control: Option<Arc<ProbeControl>>,
+}
+
+/// Per-attempt request barriers used only by the in-memory lifecycle tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ProbeControl {
+    pub(crate) block_probe: usize,
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
+    pub(crate) shutdown: tokio::sync::Notify,
+    pub(crate) failed: tokio::sync::Notify,
+    pub(crate) acquisitions: std::sync::atomic::AtomicUsize,
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
+    pub(crate) renewals: std::sync::atomic::AtomicUsize,
 }
 
 /// `{prefix}/LEASE`.
@@ -247,6 +263,8 @@ pub struct BucketLease {
     ttl_s: u64,
     acquired_at: String,
     held: Mutex<Held>,
+    #[cfg(test)]
+    probe_control: Option<Arc<ProbeControl>>,
 }
 
 impl BucketLease {
@@ -331,12 +349,21 @@ impl BucketLease {
                     exclusion,
                     lost: false,
                 }),
+                #[cfg(test)]
+                probe_control: watch.probe_control.clone(),
             };
+            #[cfg(test)]
+            if let Some(control) = &lease.probe_control {
+                control
+                    .acquisitions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if exclusion == Exclusion::Conditional {
                 if let Err(e) = lease.probe(&record).await {
                     if matches!(e, LeaseError::PreconditionsIgnored { .. }) {
                         // Hand the prefix back: this lease excludes nobody.
-                        let _ = lease.store.delete(&lease.key).await;
+                        let _ =
+                            release_own_record(&lease.store, &lease.key, &lease.instance_id).await;
                     }
                     return Err(e);
                 }
@@ -367,6 +394,17 @@ impl BucketLease {
             (PutMode::Create, "If-None-Match"),
             (PutMode::Update(fake), "If-Match"),
         ] {
+            #[cfg(test)]
+            if let Some(control) = &self.probe_control {
+                let index = control.probes.load(std::sync::atomic::Ordering::SeqCst);
+                if index == control.block_probe {
+                    control.entered.notify_one();
+                    control.resume.notified().await;
+                }
+                control
+                    .probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let answer = put(&self.store, &self.key, record, mode).await;
             match probe_verdict(answer, header)? {
                 Exclusion::Conditional => {}
@@ -476,6 +514,12 @@ impl BucketLease {
         h.version = version_of(written);
         h.confirmed = confirmed;
         h.confirmed_wall = confirmed_wall;
+        #[cfg(test)]
+        if let Some(control) = &self.probe_control {
+            control
+                .renewals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -536,15 +580,26 @@ impl BucketLease {
         if self.is_lost() {
             return Ok(());
         }
-        match read(&self.store, &self.key).await? {
-            Some((Some(r), _)) if r.instance_id == self.instance_id => {
-                match self.store.delete(&self.key).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-                    Err(e) => Err(e.into()),
-                }
+        release_own_record(&self.store, &self.key, &self.instance_id).await
+    }
+}
+
+/// Release an own record even when acquisition was canceled before its handle
+/// was returned. The caller supplies the whole operation's deadline. As for
+/// `BucketLease::release`, ownership read and DELETE are advisory, not atomic.
+pub(crate) async fn release_own_record(
+    store: &Arc<dyn ObjectStore>,
+    key: &ObjectPath,
+    instance_id: &str,
+) -> Result<(), LeaseError> {
+    match read(store, key).await? {
+        Some((Some(record), _)) if record.instance_id == instance_id => {
+            match store.delete(key).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error.into()),
             }
-            _ => Ok(()),
         }
+        _ => Ok(()),
     }
 }
 
