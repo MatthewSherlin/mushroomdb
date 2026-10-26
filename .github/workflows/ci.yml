@@ -231,6 +231,73 @@ jobs:
           bash tests/bolt/run_compat.sh target/release/mushroomdb
           node tests/bolt/js_compat.mjs
 
+  # The official Java, Go and .NET Bolt drivers, best effort: each connects,
+  # reads `MATCH (n) RETURN count(n)` and runs one explicit transaction against
+  # the release binary. Neither the job nor any step blocks a merge, and each
+  # language is its own step so one failure does not hide the others; a
+  # pass/fail line per language goes to the run summary. The driver versions
+  # are pinned in tests/bolt/extra_driver.sh. One job keeps the workflow at 20
+  # concurrent runs. Needs the bolt-compat job's gates green first in practice;
+  # it is not wired as a dependency so it never delays them.
+  bolt-drivers-best-effort:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-java@v4
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-go@v5
+        continue-on-error: true
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: "8.0.x"
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --release
+      - name: official Java driver
+        id: java
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh java
+      - name: official Go driver
+        id: go
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh go
+      - name: official .NET driver
+        id: dotnet
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh dotnet
+      - name: per-language result
+        if: ${{ !cancelled() }}
+        env:
+          JAVA_RESULT: ${{ steps.java.outcome }}
+          GO_RESULT: ${{ steps.go.outcome }}
+          DOTNET_RESULT: ${{ steps.dotnet.outcome }}
+        run: |
+          {
+            echo "### Best-effort Bolt drivers"
+            echo "- Java: $JAVA_RESULT"
+            echo "- Go: $GO_RESULT"
+            echo "- .NET: $DOTNET_RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
   # "format-compat" in CI, not the generic "test" job name.
