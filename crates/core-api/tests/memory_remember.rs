@@ -1,7 +1,9 @@
 //! remember: a fact may arrive before its subject, and the caller is told
 //! what the store did with it.
 use mushroomdb::memory::recall::{recall_digest, RecallOutcome};
-use mushroomdb::memory::remember::{describe_entity, remember, EntityIn, FactIn, RememberInput};
+use mushroomdb::memory::remember::{
+    describe_entity, remember, EntityIn, FactIn, LabelNotApplied, RememberInput,
+};
 use mushroomdb::memory_schema::{memory_defaults, NAME_FIELD, PROVISIONAL_PROP};
 use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
@@ -966,4 +968,50 @@ fn a_label_the_store_disagrees_with_is_not_declared_full_text() {
     assert_eq!((report.matched, report.created), (1, 1), "{report:?}");
     assert_eq!(report.fulltext_declared, vec!["Guild".to_string()]);
     assert!(db.fulltext_pairs().contains(&org_name));
+}
+
+/// Ledger row 64: the report says an entity's label went unused, instead of
+/// reporting a clean match.
+#[test]
+fn remember_reports_an_entity_label_that_disagrees_with_the_stored_one() {
+    let mut db = store("label-disagrees-report");
+    db.insert_node(
+        "Person",
+        "ada",
+        vec![(NAME_FIELD.into(), Value::Str("Ada".into()))],
+    )
+    .unwrap();
+    let entity = |key: &str, label: &str| EntityIn {
+        key: key.into(),
+        label: label.into(),
+        props: BTreeMap::new(),
+        aliases: Vec::new(),
+    };
+    let entities = vec![
+        entity("ada", "Guild"),
+        entity("ada", "Guild"),
+        entity("ada", "Person"),
+        entity("masons", "Guild"),
+    ];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            entities: &entities,
+            ..input("Ada founded the masons", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!(
+        report.labels_not_applied,
+        vec![LabelNotApplied {
+            key: "ada".into(),
+            requested: "Guild".into(),
+            stored: "Person".into(),
+        }],
+        "{report:?}"
+    );
+    assert_eq!(
+        report.labels_not_applied[0].to_string(),
+        "label 'Guild' was not applied to 'ada'; the node retains its existing label 'Person'"
+    );
 }

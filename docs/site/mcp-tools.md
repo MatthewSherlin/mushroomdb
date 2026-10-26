@@ -204,6 +204,9 @@ How should this kind of relationship be derived from now on — declare a rule (
 | `namespace` | string | no | Scope the rule to one namespace: it sees only that namespace's nodes — source, via hop and destination — so every edge it derives stays inside. Omitted means a global rule, which is the only kind that may derive an edge across a boundary. |
 | `predicate` | object | yes |  |
 | `src_label` | string | yes |  |
+| `via_dir` | one of `"Out"`, `"In"` | no | Direction to follow via_edge from the source (default: Out, source to via). |
+| `via_edge` | string | no | Optional intermediate hop: the edge type followed from the source to reach a via node. Give it together with via_label. |
+| `via_label` | string | no | Optional intermediate hop: the label of the via node. Give it together with via_edge. The predicate is then evaluated between the via node and the destination, and the derived edge still runs source to destination. |
 | `weight_prop` | string or null | no | Edge property that stores the score (default: weight). |
 
 ### `explain`

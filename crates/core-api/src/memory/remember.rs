@@ -153,6 +153,28 @@ pub struct RememberInput<'a> {
     pub facts: &'a [FactIn],
 }
 
+/// An `entities[]` entry whose `label` disagreed with the label the store
+/// already holds its key under (ledger row 64). The stored node was matched
+/// as it is and the requested label went unused: `remember` cannot relabel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LabelNotApplied {
+    pub key: String,
+    /// The label the entry asked for.
+    pub requested: String,
+    /// The label the node keeps.
+    pub stored: String,
+}
+
+impl std::fmt::Display for LabelNotApplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "label '{}' was not applied to '{}'; the node retains its existing label '{}'",
+            self.requested, self.key, self.stored
+        )
+    }
+}
+
 /// Everything one `remember` call writes.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct RememberReport {
@@ -212,6 +234,11 @@ pub struct RememberReport {
     /// read, not because nothing changed. `None` on every call whose read
     /// succeeded.
     pub same_as_unread: Option<String>,
+    /// `entities[]` entries whose `label` disagreed with the stored node's:
+    /// each matched the stored node, wrote its properties there, and its
+    /// label went unused. One entry per distinct key and requested label.
+    /// Empty on every call whose labels all agreed.
+    pub labels_not_applied: Vec<LabelNotApplied>,
 }
 
 /// Refuse a key that is empty, or only whitespace: it names nothing, and a
@@ -570,6 +597,7 @@ fn remember_reading<F: Fs>(
     // reported exactly as any other — only made not full-text-searchable
     // yet, a bounded-cost degradation rather than a refusal.
     let mut fulltext_declared: Vec<String> = Vec::new();
+    let mut labels_not_applied: Vec<LabelNotApplied> = Vec::new();
     {
         let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
         for entity in input.entities {
@@ -577,7 +605,16 @@ fn remember_reading<F: Fs>(
             // A key the store already holds under another label is matched
             // as it is stored, and this label goes unused (defect 64):
             // declaring it would spend a pair on a label with no node.
-            if db.node_ref(&entity.key).is_some_and(|n| n.label() != label) {
+            let stored_label = db.node_ref(&entity.key).map(|n| n.label().to_string());
+            if let Some(stored) = stored_label.filter(|stored| stored != label) {
+                let disagreement = LabelNotApplied {
+                    key: entity.key.clone(),
+                    requested: label.to_string(),
+                    stored,
+                };
+                if !labels_not_applied.contains(&disagreement) {
+                    labels_not_applied.push(disagreement);
+                }
                 continue;
             }
             if !declared_this_call.insert(label) {
@@ -676,6 +713,7 @@ fn remember_reading<F: Fs>(
     let mut report = RememberReport {
         note: key.clone(),
         fulltext_declared,
+        labels_not_applied,
         ..Default::default()
     };
 
