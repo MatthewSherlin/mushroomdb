@@ -16,9 +16,20 @@ Embedded for Rust, Python and TypeScript; `mushroomdb serve` adds HTTP and Bolt.
 - Derived edges: declare a rule once; writes add and retract matching edges
 - Agent memory: `remember`/`recall`, hybrid search, an MCP server
 
+## Install
+
+```sh
+cargo add mushroomdb            # Rust, embedded
+cargo install mushroomdb-cli    # CLI and server (mushroomdb serve)
+pip install mushroomdb          # Python
+npm install mushroomdb-client   # TypeScript client
+npx mushroomdb install          # assistant plugin and MCP entry
+```
+
+Docker and configuration: [Get started](docs/site/get-started.md).
+
 ## Docs
 
-- [Get started](docs/site/get-started.md)
 - [Cypher reference](docs/site/query.md)
 - [openCypher conformance](docs/site/conformance.md)
 - [Bolt](docs/site/bolt.md) and [HTTP](docs/site/http.md)
