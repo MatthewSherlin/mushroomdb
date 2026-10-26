@@ -1607,7 +1607,7 @@ fn graph_err(e: GraphError) -> Response {
         // duplicate key. The text names the constraint and field only.
         clash @ GraphError::ConstraintViolation { .. } => (
             StatusCode::CONFLICT,
-            Json(json!({ "error": clash.to_string() })),
+            Json(json!({ "error": clash.to_string(), "code": "constraint" })),
         )
             .into_response(),
         // A value over the store's size limit: the request is too large for

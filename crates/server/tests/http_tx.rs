@@ -315,6 +315,10 @@ async fn an_idle_transaction_expires_with_410_and_is_reaped() {
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let r = s.run(&id, None, "RETURN 1 AS x").await;
     assert_eq!(r.status, 410, "{}", r.body);
+    assert_eq!(
+        r.body["error"],
+        json!("transaction expired: idle too long, rolled back")
+    );
     assert_eq!(s.post(&id, None, "commit").await.status, 410);
     // Rolled back, not committed.
     let after = s
@@ -328,6 +332,43 @@ async fn an_idle_transaction_expires_with_410_and_is_reaped() {
         s.run(&"0".repeat(32), None, "RETURN 1 AS x").await.status,
         404
     );
+}
+
+#[tokio::test]
+async fn a_transaction_past_its_lifetime_expires_with_a_410_that_says_so() {
+    // Kept busy, so the idle timeout never fires; the lifetime does.
+    let s = plain(
+        "lifetime",
+        TxLimits {
+            max_open: 100,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_millis(600),
+        },
+    )
+    .await;
+    let id = s.begin_id(None).await;
+    s.run(&id, None, "CREATE (n:Person {id: 'long'})").await;
+    let mut last = None;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = s.run(&id, None, "RETURN 1 AS x").await;
+        if r.status != 200 {
+            last = Some(r);
+            break;
+        }
+    }
+    let r = last.expect("the lifetime must end the transaction");
+    assert_eq!(r.status, 410, "{}", r.body);
+    let lifetime = json!("transaction expired: open longer than its maximum lifetime, rolled back");
+    assert_eq!(r.body["error"], lifetime);
+    // The tombstone keeps the reason for later requests.
+    let c = s.post(&id, None, "commit").await;
+    assert_eq!(c.status, 410);
+    assert_eq!(c.body["error"], lifetime);
+    let after = s
+        .query(None, "MATCH (n:Person {id: 'long'}) RETURN n.id AS id")
+        .await;
+    assert_eq!(after["rows"], json!([]));
 }
 
 #[tokio::test]
@@ -551,10 +592,16 @@ async fn a_cancelled_run_hands_the_transaction_back() {
     let id = s.begin_id(None).await;
     cancelled_run(&s, &id, 50).await;
     // The statement finishes without its request, and the transaction is
-    // usable again, with that statement counted.
+    // usable again, with that statement counted. Until then the status says
+    // busy.
     let mut counted = false;
     for _ in 0..600 {
         let info = s.call("GET", &format!("/tx/{id}"), None, None).await;
+        if info.status == 409 {
+            assert_eq!(info.body["code"], json!("busy"), "{}", info.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
         assert_eq!(info.status, 200, "{}", info.body);
         if info.body["op_count"] == json!(1) {
             counted = true;
@@ -628,6 +675,29 @@ async fn a_second_request_while_one_runs_is_busy() {
     assert_eq!(probe.body["error"], json!("transaction busy"));
     // The busy answer changed nothing: the transaction is still ours.
     assert_eq!(s.run(&id, None, "RETURN 1 AS x").await.status, 200);
+}
+
+/// `GET /tx/{id}` while a statement runs is 409 busy, then 200 once it returns:
+/// a client probing after a failed commit can tell "still running" from
+/// "still open".
+#[tokio::test]
+async fn status_is_busy_while_a_statement_runs() {
+    let s = plain("status-busy", limits(100, 30_000)).await;
+    seed_big(&s.db, 1_500);
+    let id = s.begin_id(None).await;
+    let slow = s.run(&id, None, SLOW);
+    let probe = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.call("GET", &format!("/tx/{id}"), None, None).await
+    };
+    let (slow, probe) = tokio::join!(slow, probe);
+    assert_eq!(slow.status, 200, "{}", slow.body);
+    assert_eq!(probe.status, 409, "{}", probe.body);
+    assert_eq!(probe.body["code"], json!("busy"));
+    assert_eq!(probe.body["error"], json!("transaction busy"));
+    let after = s.call("GET", &format!("/tx/{id}"), None, None).await;
+    assert_eq!(after.status, 200, "{}", after.body);
+    assert_eq!(after.body["op_count"], json!(1));
 }
 
 /// TX-MW (ledger row 144): the driver's everyday write — find two nodes,
@@ -717,4 +787,36 @@ async fn create_and_merge_take_parameters_in_their_property_maps() {
         s.query(None, people).await["rows"],
         json!([["ann", null, true], ["bob", 41, null]])
     );
+}
+
+/// 0.10 TX-21: a unique-constraint clash found at COMMIT is a 409 naming the
+/// constraint, not a 500, and the transaction's writes do not land.
+#[tokio::test]
+async fn a_constraint_violation_at_commit_is_a_409_naming_the_constraint() {
+    let s = plain("constraint-at-commit", limits(100, 30_000)).await;
+    s.db.write()
+        .create_constraint("uniq_name", "Person", "name")
+        .unwrap();
+    s.query(None, "CREATE (n:Person {id: 'holder', name: 'taken'})")
+        .await;
+    let id = s.begin_id(None).await;
+    let r = s
+        .run(&id, None, "CREATE (n:Person {id: 'dup', name: 'taken'})")
+        .await;
+    assert_eq!(
+        r.status, 200,
+        "the clash is not judged while buffered: {}",
+        r.body
+    );
+    let c = s.post(&id, None, "commit").await;
+    assert_eq!(c.status, 409, "{}", c.body);
+    let msg = c.body["error"].as_str().unwrap();
+    assert!(msg.contains("uniq_name") && msg.contains("name"), "{msg}");
+    assert_eq!(c.body["code"], json!("constraint"));
+    // The transaction ended with the refusal, and nothing of it is visible.
+    assert_eq!(s.post(&id, None, "rollback").await.status, 404);
+    let v = s
+        .query(None, "MATCH (n:Person {name: 'taken'}) RETURN n.id AS id")
+        .await;
+    assert_eq!(v["rows"], json!([["holder"]]));
 }
