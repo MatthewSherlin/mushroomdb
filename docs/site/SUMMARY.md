@@ -20,6 +20,7 @@
 
 - [Query](query.md)
 - [openCypher conformance](conformance.md)
+- [Cypher function conformance](conformance-functions.md)
 
 # Drivers and Bolt
 

@@ -94,6 +94,7 @@ Reference:
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
 - [Cypher Query Reference](query.md)
 - [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
+- [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it
 - [Bolt protocol](bolt.md) — the versions the server negotiates and the driver audit behind them
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)

@@ -89,6 +89,8 @@ pub fn baseline_text(rate: f64, strict: f64) -> String {
          # the TCK names (see docs/site/conformance.md).\n\
          # Raise them in the change that raises the rates:\n\
          #   cargo run --release -p tck-runner -- --update-baseline\n\
+         # and regenerate the function table the same run moves:\n\
+         #   bash scripts/gen-conformance-table.sh\n\
          # A change that adds or edits a skip rule says, beside the new rates, how\n\
          # many scenarios the rule moved: a skip changes the denominator.\n\
          {}\n\

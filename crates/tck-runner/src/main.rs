@@ -6,7 +6,8 @@
 //! ```
 //!
 //! - `--report <path>` writes the conformance page (docs/site/conformance.md).
-//! - `--function-table <path>` writes the Cypher function table (contract C5).
+//! - `--function-table <path>` writes the Cypher function conformance page
+//!   (docs/site/conformance-functions.md; `scripts/gen-conformance-table.sh`).
 //! - `--failures <path>` writes every failing scenario with each failed step.
 //! - `--check` exits 1 when the pass rate or the strict rate is below
 //!   `tck-baseline.txt`, and prints the new rates when either is above (it
@@ -22,7 +23,10 @@
 
 use std::fmt::Write as _;
 use std::process::ExitCode;
-use tck_runner::report::{conformance_page, engine_knows_function, failure_groups, function_table};
+use tck_runner::report::{
+    conformance_page, engine_function_names, engine_implements_function, engine_knows_function,
+    failure_groups, function_page, function_table,
+};
 use tck_runner::value::from_cell;
 use tck_runner::{
     baseline_path, baseline_text, baselines_from_file, check_baseline, default_threads,
@@ -120,7 +124,9 @@ fn main() -> ExitCode {
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
 
-    let functions = (args.report.is_some() || args.function_table.is_some())
+    let functions = args
+        .report
+        .is_some()
         .then(|| function_table(&scenarios, &outcomes, engine_knows_function));
     if let Some(path) = &args.report {
         let page = conformance_page(&scenarios, &outcomes, &version, functions.as_deref());
@@ -130,8 +136,14 @@ fn main() -> ExitCode {
         }
         println!("wrote {path}");
     }
-    if let (Some(path), Some(table)) = (&args.function_table, &functions) {
-        if let Err(e) = std::fs::write(path, table) {
+    if let Some(path) = &args.function_table {
+        let page = function_page(
+            &scenarios,
+            &outcomes,
+            engine_implements_function,
+            &engine_function_names(),
+        );
+        if let Err(e) = std::fs::write(path, page) {
             eprintln!("write {path}: {e}");
             return ExitCode::FAILURE;
         }
