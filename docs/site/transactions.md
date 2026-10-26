@@ -201,7 +201,8 @@ curl -s -X POST localhost:8080/tx/$TX/commit -H "Authorization: Bearer $TOKEN"
 ```
 
 `POST /tx/{id}/rollback` (or `DELETE /tx/{id}`) discards the transaction. A transaction belongs to the
-credential that began it; anyone else gets `404` for its id. The routes, their bodies and every status
+credential that began it; anyone else gets `404` for its id. A server with no token and no keys has a
+single owner, so every caller can reach every transaction whose id it knows. The routes, their bodies and every status
 code are in [HTTP API: Transactions](http.md#transactions).
 
 The server holds open transactions in memory and bounds them:
@@ -215,8 +216,9 @@ The server holds open transactions in memory and bounds them:
 A flag wins over its variable. These limits apply to HTTP transactions; Bolt has its own idle limit
 (see [Bolt](#bolt)). An expired transaction answers its owner `410` for a while, then `404`. The
 message says which limit ended it: `transaction expired: idle too long, rolled back`, or
-`transaction expired: open longer than its maximum lifetime, rolled back`. When the server is told to stop, it rolls back every
-open transaction at the start of the drain and answers `POST /tx/begin` with `503`.
+`transaction expired: open longer than its maximum lifetime, rolled back`. When the server is told
+to stop, it rolls back every open transaction at the start of the drain and answers
+`POST /tx/begin` with `503`.
 
 ## TypeScript
 
@@ -253,8 +255,11 @@ try {
 }
 ```
 
-A failed commit ends the transaction on the server. If `commit()` fails at the network level instead,
-its outcome is unknown and the handle refuses further use: check the store before retrying.
+A commit that reaches the engine ends the transaction on the server whatever its outcome, and the
+handle follows: after a failed commit the client asks the server (`GET /tx/{id}`) whether it still
+holds the transaction, and the handle stays usable only if it does. If `commit()` fails at the network
+level, or the server is still running the commit, the outcome is unknown and the handle refuses
+further use: check the store before retrying.
 
 The client does not retry by itself. See [TypeScript client: Transactions](typescript.md#transactions)
 for every error it throws.
@@ -281,15 +286,18 @@ fields, bookmark waits and the state machine.
 
 ## Bookmarks
 
-A commit returns its commit number. HTTP returns it as `bookmark` and as the text
-`mushroomdb:commit:<n>` in `bookmark_text`; Bolt returns the text form. Either form can be handed to
-the other protocol. A Bolt `BEGIN` or `RUN` given a bookmark waits until the store has reached that
-commit (5 s by default, `--bookmark-timeout-secs`), so a read on another session sees the write.
+A commit returns its commit number. HTTP returns it twice: as the integer `bookmark` and as the text
+`mushroomdb:commit:<n>` in `bookmark_text`. Bolt returns only the text form. Only Bolt takes a
+bookmark back: pass `bookmark_text`, or a bookmark a Bolt commit returned, in a later Bolt `BEGIN` or
+`RUN`. Any other form, the bare integer included, is refused as an unrecognised bookmark. HTTP takes
+no bookmark. A Bolt `BEGIN` or `RUN` given a bookmark waits until the store has reached that commit
+(5 s by default, `--bookmark-timeout-secs`), so a read on another session sees the write.
 
 ## Scoped transactions are read-only
 
 A transaction begun with a role token or a `read`-tier key (HTTP and Bolt), or on a Python `scoped()`
-handle, reads through its role on the snapshot it began on, and **cannot write**. This holds even for a
+handle, reads through its role (for a `read` key, the role the key names) on the snapshot it began
+on, and **cannot write**. This holds even for a
 role whose write scope lets it write through `POST /query` or a Bolt auto-commit `RUN`: the
 transaction engine has no role-scoped commit yet. Its commit writes nothing and returns the commit it
 read. Role-scoped writes inside a transaction are planned for 0.11 (ledger row 140); until then, write

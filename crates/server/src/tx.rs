@@ -365,7 +365,7 @@ impl TxStore {
         if slot.deadline <= now {
             // Expired before the reaper got to it: it is rolled back now.
             slot.body = Some(body);
-            let why = self.expiry(slot, now);
+            let why = self.expiry(slot);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
@@ -418,7 +418,7 @@ impl TxStore {
             return Err(TxError::NotFound);
         }
         if slot.body.is_some() && slot.deadline <= now {
-            let why = self.expiry(slot, now);
+            let why = self.expiry(slot);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
             drop(reaped);
@@ -482,15 +482,18 @@ impl TxStore {
     /// it (the rollback) after releasing the lock.
     fn expire(&self, state: &mut Registry, id: &str, now: Instant) -> Option<Slot> {
         let slot = state.open.remove(id)?;
-        let why = self.expiry(&slot, now);
+        let why = self.expiry(&slot);
         self.remember(state, id, &slot.owner, now, why);
         Some(slot)
     }
 
-    /// Which limit a slot that is due at `now` ran into: the lifetime when it
-    /// has passed, else the idle timeout.
-    fn expiry(&self, slot: &Slot, now: Instant) -> Expiry {
-        if slot.born + self.inner.limits.max_lifetime <= now {
+    /// Which limit a due slot ran into first, whenever it is noticed. A slot a
+    /// request holds has no idle deadline, so only the lifetime can end it.
+    /// Otherwise `deadline` is the nearer of the idle deadline and the
+    /// lifetime ([`Self::next_deadline`]): equal to the lifetime when that is
+    /// the nearer one, earlier when the idle deadline is.
+    fn expiry(&self, slot: &Slot) -> Expiry {
+        if slot.body.is_none() || slot.deadline >= slot.born + self.inner.limits.max_lifetime {
             Expiry::Lifetime
         } else {
             Expiry::Idle
@@ -980,8 +983,46 @@ mod tests {
         assert!(expires <= SystemTime::now() + Duration::from_secs(61));
         let held = s.checkout(&id, "a").unwrap();
         s.checkin(&id, held, true).unwrap();
-        // Past the lifetime it goes, even though it was just used.
+        // Past the lifetime it goes, even while a request is using it.
+        let held = s.checkout(&id, "a").unwrap();
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(101)), 1);
+        assert_eq!(
+            s.checkin(&id, held, true).err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Lifetime))
+        );
+    }
+
+    #[test]
+    fn an_idle_expiry_noticed_after_the_lifetime_is_still_idle() {
+        let s = TxStore::new(TxLimits {
+            max_open: 10,
+            idle_timeout: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(100),
+        });
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        // Idle from 10 s; the reap that notices it runs only at 150 s.
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(150)), 1);
+        assert_eq!(
+            s.checkout(&id, "a").err(),
+            Some(TxError::Expired(Expiry::Idle))
+        );
+    }
+
+    #[test]
+    fn a_lifetime_expiry_is_lifetime_when_the_idle_deadline_lies_beyond_it() {
+        let s = TxStore::new(TxLimits {
+            max_open: 10,
+            idle_timeout: Duration::from_secs(60),
+            max_lifetime: Duration::from_secs(30),
+        });
+        let (b, _dir) = body();
+        let (id, _) = s.begin("a".into(), b).unwrap();
+        assert_eq!(s.reap(Instant::now() + Duration::from_secs(31)), 1);
         assert_eq!(
             s.checkout(&id, "a").err(),
             Some(TxError::Expired(Expiry::Lifetime))

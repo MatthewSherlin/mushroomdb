@@ -296,6 +296,60 @@ describe("beginTransaction", () => {
     expect((err as ConstraintViolationError).code).toBe("constraint");
   });
 
+  it("a commit error that ended the transaction on the server finishes the handle", async () => {
+    // A 400 from the engine at commit (a namespace or view-owned refusal): the
+    // server consumed the transaction, so GET /tx/{id} is 404.
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) return { status: 400, body: { error: "namespace refused" } };
+      if (req.method === "GET") return { status: 404, body: { error: "unknown transaction" } };
+      return { status: 200, body: { columns: [], rows: [] } };
+    };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MushroomError);
+    expect((err as MushroomError).status).toBe(400);
+    expect(tx.isFinished).toBe(true);
+    expect(seen.some((s) => s.method === "GET" && s.path === "/tx/abc123")).toBe(true);
+    await expect(tx.execute("RETURN 1")).rejects.toThrow(/already finished/);
+  });
+
+  it("a commit refused before it reached the transaction leaves the handle open", async () => {
+    // A 503 from load shedding: the server still holds the transaction.
+    let commits = 0;
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) {
+        commits += 1;
+        return commits === 1
+          ? { status: 503, body: { error: "server at its concurrency limit; retry" } }
+          : { status: 200, body: { bookmark: 7 } };
+      }
+      if (req.method === "GET") {
+        return { status: 200, body: { tx_id: "abc123", expires_at: 1, op_count: 0 } };
+      }
+      return { status: 200, body: { columns: [], rows: [] } };
+    };
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect((err as MushroomError).status).toBe(503);
+    expect(tx.isFinished).toBe(false);
+    await expect(tx.commit()).resolves.toBe(7);
+  });
+
+  it("a commit error while the server still runs the commit makes the outcome unknown", async () => {
+    // A 408: the deadline hit but the commit is still running, so the probe is busy.
+    handler = (req) => {
+      if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
+      if (req.path.endsWith("/commit")) return { status: 408, body: { error: "request timed out" } };
+      return { status: 409, body: { error: "transaction busy", code: "busy" } };
+    };
+    const tx = await client.beginTransaction();
+    await tx.commit().catch(() => undefined);
+    expect(tx.isFinished).toBe(false);
+    await expect(tx.execute("RETURN 1")).rejects.toThrow(/outcome is unknown/);
+  });
+
   it("maps 404 on commit to TransactionExpiredError", async () => {
     handler = (req) =>
       req.path === "/tx/begin"

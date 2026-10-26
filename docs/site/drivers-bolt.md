@@ -34,7 +34,7 @@ and [Driver compatibility matrix](bolt.md#driver-compatibility-matrix).
 | `PROFILE` | No | |
 | Impersonation | No | Naming a user fails with `Forbidden` |
 | Re-authentication on an open connection (Bolt 5.1 and later) | No | Not offered |
-| Time travel, masks and namespaces per statement | No | HTTP only; see [Not available over Bolt](bolt.md#not-available-over-bolt) |
+| Time travel, masks and namespaces per statement | No | HTTP, and time travel also embedded (`open_at`); see [Not available over Bolt](bolt.md#not-available-over-bolt) |
 
 ## Access control
 

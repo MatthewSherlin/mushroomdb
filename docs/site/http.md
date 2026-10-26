@@ -1206,8 +1206,9 @@ No body. Writes everything the transaction buffered as one commit and ends the t
 ```
 
 `bookmark` is the commit number of that write (for a transaction that wrote nothing, the commit it
-read). `bookmark_text` is the same number in the text form a Bolt `COMMIT` returns, so either can be
-handed to the other protocol. A node the transaction read or wrote that changed after `begin` makes
+read). `bookmark_text` is the same number in the text form a Bolt `COMMIT` returns; pass it in a later
+Bolt `BEGIN` or `RUN` to read at least that commit. Bolt refuses the bare integer, and no HTTP route
+takes a bookmark. A node the transaction read or wrote that changed after `begin` makes
 the commit `409` and writes nothing; the transaction is over either way.
 
 ### `POST /tx/{id}/rollback`

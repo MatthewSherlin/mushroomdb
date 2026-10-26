@@ -224,7 +224,8 @@ export class TxHandle {
    *
    * A second `commit()` while one is in flight throws without a request. If the
    * request fails at the network level the outcome is unknown and the handle
-   * refuses all further use.
+   * refuses all further use. After any other error the handle mirrors the
+   * server: it stays usable only if the server still holds the transaction.
    *
    * @throws {@link TransactionConflictError} when a node the transaction read or wrote changed since begin.
    * @throws {@link ConstraintViolationError} when a unique constraint refuses the writes; not retryable.
@@ -245,13 +246,34 @@ export class TxHandle {
       ) {
         // The server ended the transaction.
         this.state = "finished";
-      } else if (err instanceof MushroomError) {
-        // The server answered with an error; the commit did not apply.
+      } else if (err instanceof MushroomError && err.code === "busy") {
+        // Another request held the transaction; the commit never started.
         this.state = "open";
+      } else if (err instanceof MushroomError) {
+        // Any other answer: the server may have consumed the transaction (a
+        // commit that reached the engine ends it whatever the outcome) or not
+        // (refused before it, e.g. 401 or load shedding). Ask it.
+        this.state = await this.probeAfterFailedCommit();
       } else {
         this.state = "unknown";
       }
       throw err;
+    }
+  }
+
+  /**
+   * The handle's state after a commit the server answered with an error other
+   * than a conflict, a constraint refusal, an expiry or `busy`, read from
+   * `GET /tx/{tx_id}` (which does not restart the idle timer): still listed is
+   * `open`, gone (404/410) is `finished`, and anything else, a commit still
+   * running included, is `unknown`.
+   */
+  private async probeAfterFailedCommit(): Promise<"open" | "finished" | "unknown"> {
+    try {
+      await this.call<unknown>("", { method: "GET" });
+      return "open";
+    } catch (probeErr) {
+      return probeErr instanceof TransactionExpiredError ? "finished" : "unknown";
     }
   }
 
