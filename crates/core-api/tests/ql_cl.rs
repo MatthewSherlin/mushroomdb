@@ -3,7 +3,9 @@
 //! every read, so a value written twice from two reads could never match.
 
 use core_query::cypher::with_test_clock;
-use mushroomdb::{RealFs, ResultSet, SharedDb, Value};
+use mushroomdb::{
+    schema::Schema, DbEvent, RealFs, ResultSet, RoleDef, SharedDb, Value, WriteScope,
+};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -249,5 +251,75 @@ fn a_query_with_a_constant_property_pattern_reads_one_instant() {
             )
             .unwrap();
         assert!(first_is_true(&rs, "ab") && first_is_true(&rs, "ad"));
+    });
+}
+
+#[test]
+fn a_role_scoped_write_with_a_literal_map_stores_one_instant() {
+    // `query_write_authz` has its own entry point: its literal property map
+    // folds at parse time, before `exec_write_stmt`.
+    let mut db = GraphDb::open(&tmp("authz")).unwrap();
+    db.apply_schema(&Schema {
+        fulltext: vec![],
+        indexes: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![RoleDef {
+            name: "writer".into(),
+            keys: vec![],
+            labels: vec!["Mine".into()],
+            visible_where: None,
+            namespaces: None,
+            write: Some(WriteScope {
+                create_labels: vec!["Mine".into()],
+                update_labels: vec!["Mine".into()],
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+                update_edge_types: vec![],
+            }),
+        }],
+    })
+    .unwrap();
+    with_test_clock(ticking(), || {
+        db.query_write_authz(
+            "writer",
+            "CREATE (n:Mine {id: 'x', a: datetime(), b: datetime(), c: datetime.statement()})",
+            &p(),
+        )
+        .unwrap();
+        let rs = db
+            .query(
+                "MATCH (n:Mine {id: 'x'}) RETURN n.a = n.b AS ab, n.a = n.c AS ac",
+                &p(),
+            )
+            .unwrap();
+        assert!(first_is_true(&rs, "ab"), "{rs:?}");
+        assert!(first_is_true(&rs, "ac"), "{rs:?}");
+    });
+}
+
+#[test]
+fn a_subscription_query_reads_its_own_instant_not_the_writers() {
+    // The subscription's query runs inside the writing statement on the
+    // direct commit path; it is a statement of its own all the same.
+    let mut db = GraphDb::open(&tmp("sub")).unwrap();
+    with_test_clock(ticking(), || {
+        let sub = db
+            .subscribe_query("MATCH (n:P) RETURN n.id AS id, n.t = datetime() AS same")
+            .unwrap();
+        db.query_write("CREATE (n:P {id: 'b', t: datetime()})", &p())
+            .unwrap();
+        let event = sub
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the new row");
+        match event {
+            DbEvent::QueryRowAdded { row, .. } => {
+                assert_eq!(row[0], Some(Value::Str("b".into())));
+                // The writer's instant is not the subscription statement's.
+                assert_eq!(row[1], Some(Value::Bool(false)), "{row:?}");
+            }
+            other => panic!("expected QueryRowAdded, got {other:?}"),
+        }
     });
 }
