@@ -25,7 +25,7 @@ pub use algo::{
     AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
     PageRankReport, WccConfig, WccReport,
 };
-pub use core_query::cypher::with_entity_detail;
+pub use core_query::cypher::{clock_micros, with_entity_detail};
 pub use core_query::{
     node_element_id, relationship_element_id, CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity,
     PathEntity, RelationshipEntity, ResultSet, WriteStats,

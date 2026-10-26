@@ -126,6 +126,9 @@ pub struct Transaction {
     /// The state every statement reads, frozen at BEGIN.
     base_snap: ReaderSnapshot,
     opened_at: Instant,
+    /// The clock at BEGIN, in microseconds since the epoch: what
+    /// `.transaction()` returns in every statement of this transaction.
+    clock_micros: i64,
     /// Conflict set: node key → its `last_change` commit in `base_snap`.
     read_write_keys: HashMap<String, u64>,
     /// Identity of the store load `base_snap` came from.
@@ -656,6 +659,7 @@ impl Transaction {
             buffer: Vec::new(),
             base_snap,
             opened_at: Instant::now(),
+            clock_micros: core_query::cypher::clock_micros(),
             read_write_keys: HashMap::new(),
             base_store,
             records: Vec::new(),
@@ -682,6 +686,8 @@ impl Transaction {
     /// reaches the store until [`commit`](Self::commit). A failed statement
     /// buffers nothing and leaves the transaction usable.
     pub fn execute(&mut self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        let _transaction_clock = core_query::cypher::TransactionClock::enter(self.clock_micros);
+        let _statement_clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(query_err("lex"))?;
         // `EXPLAIN` plans the statement after it: nothing runs, so nothing is
         // buffered and no key is read.

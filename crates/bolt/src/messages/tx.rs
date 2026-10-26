@@ -149,6 +149,8 @@ pub struct ScopedTransaction {
     snapshot: ReaderSnapshot,
     mask: NodeMask,
     read_tier_key: bool,
+    /// The clock at BEGIN: what `.transaction()` reads in each statement.
+    clock_micros: i64,
 }
 
 impl ScopedTransaction {
@@ -159,6 +161,7 @@ impl ScopedTransaction {
             snapshot,
             mask,
             read_tier_key,
+            clock_micros: mushroomdb::clock_micros(),
         }
     }
 }
@@ -184,7 +187,7 @@ impl OpenTransaction for ScopedTransaction {
         }
         let result = self
             .snapshot
-            .query_masked(cypher, params, &self.mask)
+            .query_masked_in_transaction(cypher, params, &self.mask, self.clock_micros)
             .map_err(role_mask_error)?;
         Ok(Box::new(RowCursor::new(result, false, None)))
     }
@@ -215,6 +218,26 @@ mod tests {
                 read_only: false
             }
         );
+    }
+
+    /// QL-CL (row 161): a role-scoped transaction holds the instant it began
+    /// at for `.transaction()`, in every statement.
+    #[test]
+    fn a_scoped_transaction_reads_one_transaction_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = mushroomdb::SharedDb::open(dir.path()).unwrap();
+        let mut tx = ScopedTransaction::new(db.reader(), NodeMask::from_ids([]), false);
+        tx.clock_micros = 1_700_000_000_000_000;
+        let q = "RETURN datetime.transaction() = datetime.fromepoch(1700000000, 0) AS began, \
+                 datetime.statement() = datetime.fromepoch(1700000000, 0) AS stmt";
+        for _ in 0..2 {
+            let mut cursor = tx.execute(q, &BTreeMap::new()).unwrap();
+            let rows = cursor.take(None, (5, 0)).unwrap();
+            assert_eq!(
+                rows,
+                vec![vec![PackValue::Bool(true), PackValue::Bool(false)]]
+            );
+        }
     }
 
     #[test]

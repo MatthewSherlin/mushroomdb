@@ -2822,6 +2822,8 @@ enum TxBody {
     Scoped {
         snapshot: ReaderSnapshot,
         mask: NodeMask,
+        /// The clock at BEGIN: what `.transaction()` reads in each statement.
+        clock_micros: i64,
     },
 }
 
@@ -2830,6 +2832,7 @@ fn scoped_body(db: &Db, scope: &Scope) -> core_api::Result<TxBody> {
     Ok(TxBody::Scoped {
         snapshot: db.reader(),
         mask,
+        clock_micros: core_api::clock_micros(),
     })
 }
 
@@ -2919,8 +2922,12 @@ impl Transaction {
             let state = guard.as_mut().ok_or_else(transaction_finished)?;
             match &mut state.body {
                 TxBody::Full(tx) => Ok(tx.execute(cypher, &map)),
-                TxBody::Scoped { snapshot, mask } => {
-                    match snapshot.query_masked(cypher, &map, mask) {
+                TxBody::Scoped {
+                    snapshot,
+                    mask,
+                    clock_micros,
+                } => {
+                    match snapshot.query_masked_in_transaction(cypher, &map, mask, *clock_micros) {
                         Err(GraphError::MaskedReadOnly) => Err(ReadOnly::new_err(
                             "this transaction is on a scoped handle, and a scoped handle \
                                  never writes; begin it on the handle scoped() was called on",
