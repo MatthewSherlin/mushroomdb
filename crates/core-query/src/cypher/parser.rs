@@ -174,8 +174,9 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
                 || has_remove_clause(tokens)
         }
         // `UNWIND … CREATE|MERGE|SET|DELETE|REMOVE …`: a write when any write
-        // clause follows; `UNWIND … RETURN` stays a read.
-        Some(Tok::Unwind) => {
+        // clause follows; `UNWIND … RETURN` stays a read. The same holds after
+        // a leading `OPTIONAL MATCH` (QL-ON).
+        Some(Tok::Unwind) | Some(Tok::Optional) => {
             tokens.iter().any(|t| {
                 matches!(
                     t,
@@ -1972,7 +1973,7 @@ impl<'a> Parser<'a> {
             Some(Tok::Create) => self.create_stmt(),
             Some(Tok::Merge) => self.merge_stmt(),
             Some(Tok::Match) => self.match_write_stmt(),
-            Some(Tok::Unwind) => self.unwind_write_stmt(),
+            Some(Tok::Unwind) | Some(Tok::Optional) => self.unwind_write_stmt(),
             _ => Err(self.err(
                 "expected CREATE, MERGE, MATCH … SET/DELETE, or UNWIND … CREATE/MERGE/SET \
                  (write statement required)",
@@ -2447,9 +2448,12 @@ impl<'a> Parser<'a> {
         // `UNWIND [1] AS _ MATCH …` form does.
         // So do the statements that write a relationship's properties
         // (`MATCH ()-[r]->() SET r.w = 1`): the per-row executor writes them.
+        // So does a statement with an `OPTIONAL MATCH` (QL-ON): its write skips
+        // the rows where the optional node is null, and only the per-row
+        // executor sees one row at a time.
         if self.toks[self.pos..]
             .iter()
-            .any(|t| matches!(t, Tok::Create | Tok::Merge))
+            .any(|t| matches!(t, Tok::Create | Tok::Merge | Tok::Optional))
             || writes_relationship_properties(&self.toks[self.pos..])
         {
             return self.unwind_write_stmt();

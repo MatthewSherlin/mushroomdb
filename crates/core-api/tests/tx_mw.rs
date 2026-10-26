@@ -554,20 +554,22 @@ fn a_merged_node_that_was_only_found_guards_the_commit() {
     }
 }
 
-/// `OPTIONAL MATCH … MERGE` is not a write form: it is refused (a parse
-/// error) on both paths, writes nothing, and the transaction goes on.
+/// `OPTIONAL MATCH … MERGE` is a write form (QL-ON): it runs per row on both
+/// write paths, and the read path refuses it.
 #[test]
-fn optional_match_then_merge_is_a_clean_refusal() {
+fn optional_match_then_merge_runs_as_a_write() {
     let db = people("optional-merge");
     let q = "OPTIONAL MATCH (a:Person {id: 'a'}) MERGE (:T {id: 't'})";
-    assert!(db.write().query_write(q, &none()).is_err());
     assert!(db.reader().query(q, &none()).is_err());
     let mut tx = db.begin_transaction();
-    assert!(tx.execute(q, &none()).is_err());
+    let rs = tx.execute(q, &none()).unwrap();
+    assert_eq!(count(&rs, "created"), 1);
     tx.execute(CONNECT, &ab("a", "b")).unwrap();
     tx.commit().unwrap();
-    assert!(db.reader().node_info("t").is_none());
+    assert!(db.reader().node_info("t").is_some());
     assert_eq!(outside(&db, EDGES), vec![vec![Some(s("a")), Some(s("b"))]]);
+    let rs = db.write().query_write(q, &none()).unwrap();
+    assert_eq!(count(&rs, "created"), 0, "found, not created");
 }
 
 // ── Commit-time checks ──────────────────────────────────────────────────────

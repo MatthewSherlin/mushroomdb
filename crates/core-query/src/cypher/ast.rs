@@ -861,8 +861,15 @@ pub enum RowWrite {
     },
     /// `REMOVE n.f [, …]`
     Remove(Vec<(String, String)>),
-    /// `[DETACH] DELETE n [, …]` (node variables only)
-    Delete { vars: Vec<String>, detach: bool },
+    /// `[DETACH] DELETE n [, …]`. `rels` holds the relationship variables of
+    /// the clause, accepted only in a statement with an `OPTIONAL MATCH` (QL-ON):
+    /// a null one is skipped, and one that holds a relationship is an error,
+    /// as this form does not delete relationships.
+    Delete {
+        vars: Vec<String>,
+        rels: Vec<String>,
+        detach: bool,
+    },
 }
 
 /// One node of a per-row CREATE. `var` is always set (the parser names an
