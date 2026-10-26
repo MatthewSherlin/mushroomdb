@@ -592,10 +592,16 @@ async fn a_cancelled_run_hands_the_transaction_back() {
     let id = s.begin_id(None).await;
     cancelled_run(&s, &id, 50).await;
     // The statement finishes without its request, and the transaction is
-    // usable again, with that statement counted.
+    // usable again, with that statement counted. Until then the status says
+    // busy.
     let mut counted = false;
     for _ in 0..600 {
         let info = s.call("GET", &format!("/tx/{id}"), None, None).await;
+        if info.status == 409 {
+            assert_eq!(info.body["code"], json!("busy"), "{}", info.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
         assert_eq!(info.status, 200, "{}", info.body);
         if info.body["op_count"] == json!(1) {
             counted = true;
@@ -669,6 +675,29 @@ async fn a_second_request_while_one_runs_is_busy() {
     assert_eq!(probe.body["error"], json!("transaction busy"));
     // The busy answer changed nothing: the transaction is still ours.
     assert_eq!(s.run(&id, None, "RETURN 1 AS x").await.status, 200);
+}
+
+/// `GET /tx/{id}` while a statement runs is 409 busy, then 200 once it returns:
+/// a client probing after a failed commit can tell "still running" from
+/// "still open".
+#[tokio::test]
+async fn status_is_busy_while_a_statement_runs() {
+    let s = plain("status-busy", limits(100, 30_000)).await;
+    seed_big(&s.db, 1_500);
+    let id = s.begin_id(None).await;
+    let slow = s.run(&id, None, SLOW);
+    let probe = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.call("GET", &format!("/tx/{id}"), None, None).await
+    };
+    let (slow, probe) = tokio::join!(slow, probe);
+    assert_eq!(slow.status, 200, "{}", slow.body);
+    assert_eq!(probe.status, 409, "{}", probe.body);
+    assert_eq!(probe.body["code"], json!("busy"));
+    assert_eq!(probe.body["error"], json!("transaction busy"));
+    let after = s.call("GET", &format!("/tx/{id}"), None, None).await;
+    assert_eq!(after.status, 200, "{}", after.body);
+    assert_eq!(after.body["op_count"], json!(1));
 }
 
 /// TX-MW (ledger row 144): the driver's everyday write — find two nodes,

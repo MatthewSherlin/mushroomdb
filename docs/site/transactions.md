@@ -177,7 +177,8 @@ for _ in range(3):
   raised. Using a finished transaction raises `TransactionClosed`. A transaction dropped unfinished is
   a rollback.
 - A `read_only=True` handle cannot begin one (`ReadOnly`). A transaction on a `scoped()` handle reads
-  through the scope and cannot write (`ReadOnly`); see [Scoped transactions are read-only](#scoped-transactions-are-read-only).
+  through the scope and cannot write (`ReadOnly`); see
+  [Scoped transactions are read-only](#scoped-transactions-are-read-only).
 - `close()` raises while a transaction is open on the store.
 - Many transactions may run at once from different threads; one transaction used from two threads is
   serialised. An embedded transaction has no timeout.
@@ -202,8 +203,9 @@ curl -s -X POST localhost:8080/tx/$TX/commit -H "Authorization: Bearer $TOKEN"
 
 `POST /tx/{id}/rollback` (or `DELETE /tx/{id}`) discards the transaction. A transaction belongs to the
 credential that began it; anyone else gets `404` for its id. A server with no token and no keys has a
-single owner, so every caller can reach every transaction whose id it knows. The routes, their bodies and every status
-code are in [HTTP API: Transactions](http.md#transactions).
+single owner, so every caller can reach every transaction whose id it knows. `GET /tx/{id}` reports
+the transaction, or `409` with `"code": "busy"` while a statement or a commit is running on it. The
+routes, their bodies and every status code are in [HTTP API: Transactions](http.md#transactions).
 
 The server holds open transactions in memory and bounds them:
 

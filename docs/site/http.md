@@ -1227,7 +1227,10 @@ The same as `POST /tx/{id}/rollback`.
 ```
 
 `op_count` is the number of statements that ran successfully. Reading it does not restart the idle
-clock.
+clock. While a statement or a commit is running on the transaction the answer is `409` with
+`{"error": "transaction busy", "code": "busy"}`, as for any other request on it; ask again once that
+request has returned. A commit that is still running after its own request gave up (the 120 s
+deadline) answers this way until it ends, and `404` after.
 
 ## Writing nodes and edges
 

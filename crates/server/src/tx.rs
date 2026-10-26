@@ -407,7 +407,9 @@ impl TxStore {
         drop(slot);
     }
 
-    /// What `GET /tx/{id}` reports. Does not restart the idle timer.
+    /// What `GET /tx/{id}` reports. Does not restart the idle timer. While a
+    /// request has the transaction checked out it is [`TxError::Busy`], as
+    /// every other request on it is.
     pub(crate) fn info(&self, id: &str, owner: &str) -> Result<(SystemTime, usize), TxError> {
         let now = Instant::now();
         let mut state = lock(&self.inner.state);
@@ -417,7 +419,12 @@ impl TxStore {
         if !same_owner(&slot.owner, owner) {
             return Err(TxError::NotFound);
         }
-        if slot.body.is_some() && slot.deadline <= now {
+        // A request holds it: a statement or a commit is running, and the
+        // caller cannot yet know whether the transaction will still be there.
+        if slot.body.is_none() {
+            return Err(TxError::Busy);
+        }
+        if slot.deadline <= now {
             let why = self.expiry(slot);
             let reaped = self.expire(&mut state, id, now);
             drop(state);
@@ -939,6 +946,25 @@ mod tests {
         assert_eq!(s.reap(Instant::now() + Duration::from_secs(1)), 0);
         s.checkin(&id, held, true).unwrap();
         assert_eq!(s.info(&id, "alice").unwrap().1, 1);
+    }
+
+    #[test]
+    fn info_is_busy_while_a_request_holds_the_transaction() {
+        let s = store(10, 60_000);
+        let (b, _dir) = body();
+        let (id, _) = s.begin("alice".into(), b).unwrap();
+        let held = s.checkout(&id, "alice").unwrap();
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::Busy));
+        // Ownership is checked first: a stranger still hears 404.
+        assert_eq!(s.info(&id, "mallory").err(), Some(TxError::NotFound));
+        s.checkin(&id, held, true).unwrap();
+        assert_eq!(s.info(&id, "alice").unwrap().1, 1);
+        // A commit consumes it: busy while it runs, gone after.
+        let held = s.checkout(&id, "alice").unwrap();
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::Busy));
+        s.finish(&id);
+        drop(held);
+        assert_eq!(s.info(&id, "alice").err(), Some(TxError::NotFound));
     }
 
     #[test]

@@ -338,14 +338,19 @@ describe("beginTransaction", () => {
   });
 
   it("a commit error while the server still runs the commit makes the outcome unknown", async () => {
-    // A 408: the deadline hit but the commit is still running, so the probe is busy.
+    // A 408: the 120 s deadline hit but the commit is still running on the
+    // server, which answers GET /tx/{id} with 409 busy while a request holds it.
     handler = (req) => {
       if (req.path === "/tx/begin") return { status: 200, body: { tx_id: "abc123", expires_at: 1 } };
       if (req.path.endsWith("/commit")) return { status: 408, body: { error: "request timed out" } };
-      return { status: 409, body: { error: "transaction busy", code: "busy" } };
+      if (req.method === "GET" && req.path === "/tx/abc123") {
+        return { status: 409, body: { error: "transaction busy", code: "busy" } };
+      }
+      return { status: 500, body: { error: "unexpected request" } };
     };
     const tx = await client.beginTransaction();
     await tx.commit().catch(() => undefined);
+    expect(seen.filter((r) => r.method === "GET").length).toBe(1);
     expect(tx.isFinished).toBe(false);
     await expect(tx.execute("RETURN 1")).rejects.toThrow(/outcome is unknown/);
   });
