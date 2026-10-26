@@ -1359,7 +1359,9 @@ Returns the report as a dict: `note` (the note's key — **not** `key`,
 which is what the MCP tool's JSON reply calls it), `created`,
 `matched`, `derived`, `provisional`, `provisional_capped` (keys past
 the per-call cap of 20, **not** created), `fulltext_declared`,
-`same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+`labels_not_applied` (a list of `{"key", "requested", "stored"}`: an
+`entities` entry whose label disagreed with the stored node's, so the
+label went unused), `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
 the identity links this call made, and the ones it retracted), and
 `same_as_unread` (`None`, or the error text when the write committed
 but its links could not be read back, so both lists are empty because

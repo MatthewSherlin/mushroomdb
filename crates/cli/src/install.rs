@@ -2863,7 +2863,25 @@ fn install_claude_code(
             .map_err(|e| CliError(format!("cannot create {}: {e}", skill_dir.display())))?;
         fs::write(&skill_file, &skill_content)
             .map_err(|e| CliError(format!("cannot write {}: {e}", skill_file.display())))?;
-        manifest.files.push(skill_file);
+        manifest.files.push(skill_file.clone());
+    }
+
+    // The same skill name at the other scope: the user-scope skill takes
+    // precedence over a project one, so an older copy there is what a session
+    // reads instead of the one just written (ledger row 63).
+    let other_scope_skill = match ctx.scope {
+        Scope::Project => ctx.home.join(".claude"),
+        Scope::User => ctx.project_root.join(".claude"),
+    }
+    .join("skills")
+    .join("mushroom")
+    .join("SKILL.md");
+    if other_scope_skill != skill_file && other_scope_skill.is_file() {
+        notes.push(format!(
+            "warning: a skill at {} may shadow the one just written at {}; the user-scope skill takes precedence",
+            other_scope_skill.display(),
+            skill_file.display()
+        ));
     }
 
     // `cli` delivery is defined by what it does *not* write: no server entry,
@@ -3425,17 +3443,33 @@ fn load_manifest(path: &Path) -> Manifest {
 /// a door too many costs a reader a moment where naming too few would cost
 /// them the graph.
 pub fn delivery_for_store(db_dir: &Path) -> Delivery {
-    let Some(parent) = db_dir.parent() else {
-        return Delivery::default();
-    };
-    let candidates = [
-        parent
-            .join(".claude")
-            .join("skills")
-            .join("mushroom")
-            .join(".install-manifest.json"),
-        parent.join("install-manifest.json"),
-    ];
+    // `HOME`, then `USERPROFILE` — a native Windows shell sets only the latter.
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from);
+    delivery_for_store_with_home(db_dir, home.as_deref())
+}
+
+/// [`delivery_for_store`] with the home directory given, so it can be tested
+/// without touching the process environment. A user-scope install keeps its
+/// manifest at `<home>/.mushroomdb/install-manifest.json` whatever the store's
+/// path, so that is the last place looked (ledger row 69).
+pub fn delivery_for_store_with_home(db_dir: &Path, home: Option<&Path>) -> Delivery {
+    let mut candidates = Vec::new();
+    if let Some(parent) = db_dir.parent() {
+        candidates.push(
+            parent
+                .join(".claude")
+                .join("skills")
+                .join("mushroom")
+                .join(".install-manifest.json"),
+        );
+        candidates.push(parent.join("install-manifest.json"));
+    }
+    if let Some(home) = home {
+        candidates.push(home.join(".mushroomdb").join("install-manifest.json"));
+    }
     for candidate in candidates {
         if candidate.is_file() {
             return load_manifest(&candidate).delivery;

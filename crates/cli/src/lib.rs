@@ -244,14 +244,6 @@ pub enum AlgoSubcmd {
 /// No `Eq` derive: `Algo { min_weight: Option<f64>, .. }` carries a float.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// A hook body 0.6 installed and 0.7 retired: `touch`, `intercept`,
-    /// `impact-hook` and `enrich` in the assistant's settings, `sync` in the
-    /// git hooks. A machine that upgraded without re-running `install` still
-    /// calls them, so each is accepted with any arguments, opens nothing, and
-    /// prints one stderr line saying how to remove it. Never in [`usage`].
-    RetiredHook {
-        sub: &'static str,
-    },
     Serve {
         db_dir: PathBuf,
         addr: SocketAddr,
@@ -986,13 +978,6 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "disable" => parse_toggle_cmd(&args[1..]).map(Command::Disable),
         "enable" => parse_toggle_cmd(&args[1..]).map(Command::Enable),
         "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
-        // Arguments are not parsed: whatever a 0.6 install wrote after the
-        // subcommand, the answer is the same.
-        "touch" => Ok(Command::RetiredHook { sub: "touch" }),
-        "intercept" => Ok(Command::RetiredHook { sub: "intercept" }),
-        "impact-hook" => Ok(Command::RetiredHook { sub: "impact-hook" }),
-        "enrich" => Ok(Command::RetiredHook { sub: "enrich" }),
-        "sync" => Ok(Command::RetiredHook { sub: "sync" }),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -4394,12 +4379,11 @@ mod tests {
         }
     }
 
-    /// The five hook bodies 0.6 installed parse, with any arguments, to the
-    /// inert [`Command::RetiredHook`], so an upgraded machine that has not
-    /// re-run `install` is not shown a hook error on every tool call. The help
-    /// still names none of them.
+    /// The five hook bodies 0.6 installed and 0.7 retired are unknown
+    /// commands now (ledger row 44), so a stale hook fails instead of passing
+    /// silently. The help names none of them.
     #[test]
-    fn the_retired_hook_bodies_parse_as_inert() {
+    fn the_retired_hook_bodies_are_unknown_commands() {
         for sub in ["touch", "intercept", "impact-hook", "enrich", "sync"] {
             for args in [
                 vec![sub],
@@ -4408,7 +4392,7 @@ mod tests {
             ] {
                 assert_eq!(
                     parse_args(&args),
-                    Ok(Command::RetiredHook { sub }),
+                    Err(format!("unknown command: {sub}")),
                     "{args:?}"
                 );
             }

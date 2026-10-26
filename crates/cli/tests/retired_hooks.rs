@@ -5,8 +5,9 @@
 //! assistant's settings and `sync` into three git hooks. Until `install` or
 //! `doctor` prunes them, those hooks keep calling the new binary. An unknown
 //! subcommand exits 1 with the whole usage text on stderr, which the host
-//! shows as a hook error on every Grep, Edit or commit. So each of the five is
-//! accepted, does nothing, and says once on stderr how to remove itself.
+//! shows as a hook error on every Grep, Edit or commit. 0.7 accepted the five
+//! inertly for one release; 0.10 (ledger row 44) removed them, so a stale hook
+//! now fails as an unknown command and `mushroomdb doctor` lists it.
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -39,14 +40,8 @@ fn run(args: &[&str], stdin: &str) -> std::process::Output {
     child.wait_with_output().expect("wait")
 }
 
-fn expected_stderr(sub: &str) -> String {
-    format!(
-        "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` to remove this hook (`mushroomdb doctor` lists any that remain)\n"
-    )
-}
-
 #[test]
-fn each_retired_hook_body_exits_quietly_with_one_line_of_advice() {
+fn each_retired_hook_body_is_an_unknown_command_that_fails() {
     let db = tmp("db");
     let payload = r#"{"session_id":"s","tool_name":"Grep","tool_input":{"pattern":"fn main"}}"#;
     for sub in RETIRED {
@@ -55,19 +50,18 @@ fn each_retired_hook_body_exits_quietly_with_one_line_of_advice() {
             (vec![sub], ""),
             (vec![sub, "--auto"], payload),
             (vec![sub, db_arg], payload),
-            (vec![sub, db_arg, "--quiet", "extra", "-x=1"], ""),
         ] {
             let out = run(&args, stdin);
-            assert_eq!(out.status.code(), Some(0), "{args:?} must exit 0: {out:?}");
+            assert_eq!(out.status.code(), Some(1), "{args:?} must exit 1: {out:?}");
             assert!(
                 out.stdout.is_empty(),
                 "{args:?} must print nothing on stdout, got {:?}",
                 String::from_utf8_lossy(&out.stdout)
             );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stderr),
-                expected_stderr(sub),
-                "{args:?} stderr"
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(&format!("unknown command: {sub}")),
+                "{args:?} stderr: {stderr}"
             );
         }
     }

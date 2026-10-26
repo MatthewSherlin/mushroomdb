@@ -8,8 +8,8 @@
 //! of stand-ins or leaves it empty.
 
 use cli::install::{
-    classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Delivery, Externals,
-    InstallOpts, McpCommand, Platform, Scope,
+    classify_mcp_command, delivery_for_store_with_home, run_install_with, run_uninstall,
+    run_uninstall_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3991,4 +3991,71 @@ fn every_0_6_program_spelling_of_a_retired_hook_is_pruned() {
         hook_events_written(&env),
         ["SessionStart", "UserPromptSubmit"]
     );
+}
+
+/// Ledger row 69: a user-scope install keeps its manifest at
+/// `<home>/.mushroomdb/install-manifest.json`, and the store may live anywhere.
+#[test]
+fn delivery_for_store_finds_user_scope_manifest_beside_home() {
+    let home = temp_dir("delivery-home");
+    let elsewhere = temp_dir("delivery-elsewhere");
+    let db_dir = elsewhere.join("store");
+    fs::create_dir_all(home.join(".mushroomdb")).unwrap();
+    fs::write(
+        home.join(".mushroomdb").join("install-manifest.json"),
+        r#"{"files":[],"mcp_keys":[],"delivery":"cli","disabled":false}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        delivery_for_store_with_home(&db_dir, Some(&home)),
+        Delivery::Cli
+    );
+    // No home, or a home with no manifest, is still the default.
+    assert_eq!(delivery_for_store_with_home(&db_dir, None), Delivery::Both);
+    assert_eq!(
+        delivery_for_store_with_home(&db_dir, Some(&elsewhere)),
+        Delivery::Both
+    );
+}
+
+/// Ledger row 63: an older user-scope skill takes precedence over the project
+/// skill `install` writes, and nothing said so. The install output now names it.
+#[test]
+fn project_install_warns_when_a_user_scope_skill_shadows_it() {
+    let root = temp_dir("shadow-root");
+    let home = temp_dir("shadow-home");
+    let db = root.join("db");
+    let user_skill = home
+        .join(".claude")
+        .join("skills")
+        .join("mushroom")
+        .join("SKILL.md");
+    fs::create_dir_all(user_skill.parent().unwrap()).unwrap();
+    fs::write(&user_skill, "an older skill").unwrap();
+
+    let out = run_install_with(
+        &root,
+        &home,
+        &claude_project_opts(&db),
+        &McpCommand::npx(),
+        &no_externals(),
+    )
+    .unwrap();
+    assert!(
+        out.contains("warning: a skill at") && out.contains(&user_skill.display().to_string()),
+        "no shadow warning in: {out}"
+    );
+
+    // With no other skill there is nothing to warn about.
+    let clean_root = temp_dir("shadow-clean-root");
+    let clean_home = temp_dir("shadow-clean-home");
+    let out = run_install_with(
+        &clean_root,
+        &clean_home,
+        &claude_project_opts(&clean_root.join("db")),
+        &McpCommand::npx(),
+        &no_externals(),
+    )
+    .unwrap();
+    assert!(!out.contains("may shadow"), "spurious warning in: {out}");
 }
