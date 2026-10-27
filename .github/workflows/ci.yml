@@ -438,6 +438,55 @@ jobs:
       # A write that returned survives the process aborting right after it
       # (PF-06a). Process death, not power loss: see the test's module doc.
       - run: cargo test --release -p mushroomdb --test process_abort_durability -- write_survives_process_abort --ignored --nocapture
+      - name: Pin typed V11 fixture and upgrade behavior
+        run: cargo test -p mushroomdb -j 3 --test snapshot_v11 -- --test-threads=4
+      - name: Fetch verified v0.9.2 reader
+        shell: bash
+        run: |
+          set -euo pipefail
+          compat="$RUNNER_TEMP/ty13-format-compat"
+          mkdir "$compat"
+          mkdir "$compat/release" "$compat/diagnostics"
+          archive=mushroomdb-v0.9.2-x86_64-unknown-linux-gnu.tar.gz
+          curl --fail --location --silent --show-error --connect-timeout 20 --max-time 180 \
+            "https://github.com/MatthewSherlin/mushroomdb/releases/download/v0.9.2/$archive" \
+            --output "$compat/$archive"
+          printf '%s  %s\n' 4512a5fdaed680068abf967550c76f53da8b7db634b16ca79a03bfa89921b6b8 "$compat/$archive" \
+            | sha256sum --check | tee "$compat/diagnostics/archive-checksum.txt"
+          tar -xzf "$compat/$archive" -C "$compat/release"
+          test -x "$compat/release/mushroomdb"
+          "$compat/release/mushroomdb" --version | tee "$compat/diagnostics/release-version.txt"
+          test "$(cat "$compat/diagnostics/release-version.txt")" = 'mushroomdb 0.9.2'
+          sha256sum "$compat/release/mushroomdb" crates/core-api/tests/fixtures/v11_fixture.bin \
+            > "$compat/diagnostics/binary-fixture-sha256.txt"
+          git rev-parse HEAD > "$compat/diagnostics/source-head.txt"
+          printf 'MUSHROOMDB_V092_BINARY=%s\nMUSHROOMDB_FORMAT_DIAGNOSTICS=%s\n' \
+            "$compat/release/mushroomdb" "$compat/diagnostics" >> "$GITHUB_ENV"
+      - name: Released reader refuses V11 without touching files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p mushroomdb -j 3 --test snapshot_v11 -- test_v11_refused_by_09x_binary --ignored --exact --nocapture --test-threads=4 \
+            2>&1 | tee "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v11-test.log"
+          grep -F 'test test_v11_refused_by_09x_binary ... ok' "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v11-test.log"
+          grep -F 'test result: ok. 1 passed;' "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v11-test.log"
+      - name: Released reader preserves V9 and snapshot bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p mushroomdb -j 3 --test snapshot_v11 -- test_v9_store_still_opens_under_09x --ignored --exact --nocapture --test-threads=4 \
+            2>&1 | tee "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v9-test.log"
+          grep -F 'test test_v9_store_still_opens_under_09x ... ok' "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v9-test.log"
+          grep -F 'test result: ok. 1 passed;' "$MUSHROOMDB_FORMAT_DIAGNOSTICS/v9-test.log"
+      - name: Preserve format compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ty13-format-compat-${{ github.run_id }}
+          path: |
+            crates/core-api/tests/fixtures/v11_fixture.bin
+            ${{ runner.temp }}/ty13-format-compat/diagnostics/
+          if-no-files-found: warn
 
   # The TypeScript client is published by publish.yml on every release and,
   # until 0.6.12, was tested by no workflow at all — a broken build would have
