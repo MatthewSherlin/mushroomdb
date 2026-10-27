@@ -43,10 +43,6 @@ core-api/tests/query.rs::harness_industry_alignment_timing — rule backfill tak
 # memory_brief.rs — timing probe; requires MUSHROOMDB_BENCH_STORE env var
 core-api/tests/memory_brief.rs::memory_brief_bench_on_large_store — no reason given in the source
 
-# shared_edge_rules.rs — known defects tracked in the ledger
-core-api/tests/shared_edge_rules.rs::a_via_rule_takes_an_edge_a_plain_rule_retracted — ledger row 84: a via-hop rule does not take an edge a plain rule retracted
-core-api/tests/shared_edge_rules.rs::a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build — ledger row 83: a top-k rule beside another rule over the same edge loses its fallback
-
 # mask_bench.rs — large store; machine-dependent timings
 core-api/tests/mask_bench.rs::mask_paths_measured — builds a 200k-node store and prints machine-dependent timings; run it with --ignored
 
