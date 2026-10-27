@@ -38,6 +38,8 @@ jobs:
       - run: target/debug/examples/embed_basics
       - run: target/debug/examples/embed_batch
       - run: target/debug/examples/embed_shared
+      # PS-5 asserts the exact two-person graph result, not only exit status.
+      - run: cargo run --example graph_quickstart --release -p mushroomdb
       # Counts #[ignore]d tests against how many any workflow actually names.
       # Exits 1 if a test is neither named in a workflow nor listed in
       # scripts/ignored-tests-allowed.txt. Added because 20 of 28 ran nowhere.
