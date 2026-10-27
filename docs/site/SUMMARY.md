@@ -15,6 +15,7 @@
 # Data model
 
 - [Concepts](concepts.md)
+- [Property value types](types.md)
 
 # Cypher reference
 
@@ -34,6 +35,7 @@
 # Indexes and constraints
 
 - [Indexes](indexes.md)
+- [Unique constraints](constraints.md)
 - [Full-text search](fulltext.md)
 - [Vector search](vector.md)
 

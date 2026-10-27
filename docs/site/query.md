@@ -1134,9 +1134,9 @@ The answer is the scan's, row for row and in the same order: integers and
 floats compare as numbers (`n.prop > 5.5` finds the integer 10), a string bound
 finds only strings, and `Date`, `LocalDateTime` and `DateTime` values range in
 their own order. A node without the property is still sorted where `ORDER BY`
-puts it (last ascending, first descending). A `Duration`, `Bool`, list or `null`
-bound is answered by the scan, which finds nothing for it, since those values
-are not ordered. The index is not read for `n.key`, `n.id` or `n.label`, inside
+puts it (last ascending, first descending). A `Bool` bound is answered by a
+scan, where `false < true`. A `Duration`, list or `null` bound also uses the
+scan, but has no ordered matches. The index is not read for `n.key`, `n.id` or `n.label`, inside
 a transaction, through a reader whose recent commits are not yet folded, or
 across a relationship (`MATCH (n:L)-[:R]->(m) WHERE n.prop > 1`); those scan,
 with the same answer.

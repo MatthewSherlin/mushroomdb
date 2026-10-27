@@ -68,6 +68,7 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 - [Transactions](transactions.md) — several statements as one atomic commit, under snapshot isolation, from every surface
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
+- [Property value types](types.md) — date/time, duration and binary representations and limits
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — which page covers which surface
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
@@ -100,7 +101,8 @@ Reference:
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
 - [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
-- [Property (equality) indexes](indexes.md)
+- [Property indexes](indexes.md)
+- [Unique constraints](constraints.md) — declare single-property uniqueness and understand write refusals
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
 - [Live Subscriptions](subscriptions.md)

@@ -31,6 +31,7 @@ SITE_DOCS=(
     quickstart.md
     install.md
     concepts.md
+    types.md
     skill.md
     concurrency.md
     multiprocess.md
@@ -59,6 +60,7 @@ SITE_DOCS=(
     fulltext.md
     vector.md
     indexes.md
+    constraints.md
     algorithms.md
     masks.md
     service.md
