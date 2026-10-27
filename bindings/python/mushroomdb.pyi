@@ -402,7 +402,9 @@ class MemoryAccessor:
         which is what the MCP tool's JSON reply calls it), `created`,
         `matched`, `derived`, `provisional`, `provisional_capped` (keys past
         the per-call cap of 20, **not** created), `fulltext_declared`,
-        `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+        `labels_not_applied` (a list of `{"key", "requested", "stored"}`: an
+        `entities` entry whose label disagreed with the stored node's, so the
+        label went unused), `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
         the identity links this call made, and the ones it retracted), and
         `same_as_unread` (`None`, or the error text when the write committed
         but its links could not be read back, so both lists are empty because
@@ -880,6 +882,30 @@ class GraphDb:
 
         `node_info` answers `None` on the same miss, because Rust returns
         `Option` there and `Result` here. The asymmetry is the core API.
+        """
+
+    def to_arrow_tables(self) -> dict[str, Any]:
+        """The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
+
+        `nodes` has columns `key`, `label`, `properties` (string: a JSON
+        object with sorted keys, each value written as the HTTP API writes it: a
+        non-finite float is `null`, a date, time, duration or binary value is a
+        tagged object such as `{"$date": "2024-01-15"}`), sorted by key. `edges` has `source`, `type`, `target`,
+        `derived` (bool), `rule` (string, null for a manual edge), `weight`
+        (float, null unless the creating rule declares a numeric
+        `weight_prop`) and `properties` (string, the same sorted JSON form as
+        node properties; `{}` when absent), sorted by `(type, source, target)`.
+        An empty store gives empty tables with the same columns.
+
+        It materialises every node and edge in memory at once. `pyarrow` is an
+        optional dependency, imported here: without it this raises
+        `ImportError` naming `pip install pyarrow`. Refused (`ValueError`) on a
+        scoped handle.
+
+        ```python
+        tables = db.to_arrow_tables()
+        df = tables["nodes"].to_pandas()
+        ```
         """
 
     def node_history(self, key: str) -> Row:

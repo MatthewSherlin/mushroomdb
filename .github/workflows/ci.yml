@@ -160,6 +160,45 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
+      # Preserve the actual canonical runner/source context without altering gate inputs.
+      - name: capture concurrency gate build context
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PYMETA'
+          from pathlib import Path
+          import datetime, hashlib, json, os, subprocess
+          root = Path.cwd()
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "concurrency-gate-evidence"
+          evidence.mkdir(parents=True, exist_ok=True)
+          def command(args):
+              result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+              return {"command": args, "returncode": result.returncode, "output": result.stdout}
+          files = {}
+          for name in ("/proc/cpuinfo", "/proc/self/status", "/proc/loadavg", "/proc/meminfo",
+                       "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu.pressure", "/etc/os-release"):
+              path = Path(name)
+              if path.is_file():
+                  files[name] = path.read_text()
+          env_names = ("RUNNER_OS", "RUNNER_ARCH", "RUNNER_NAME", "ImageOS", "ImageVersion", "GITHUB_SHA", "GITHUB_REF",
+                       "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "RUSTUP_TOOLCHAIN", "CARGO_INCREMENTAL", "CARGO_BUILD_JOBS",
+                       "CARGO_BUILD_TARGET", "CARGO_TARGET_DIR", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUST_TEST_THREADS",
+                       "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+                       "CARGO_PROFILE_RELEASE_LTO", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_DEBUG",
+                       "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")
+          inputs = [root / n for n in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
+          for name in ("core-api", "core-query", "core-storage", "core-rules", "core-bench"):
+              crate = root / "crates" / name
+              inputs.extend([crate / "Cargo.toml", *crate.rglob("*.rs")])
+          metadata = {"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "cpu_count": os.cpu_count(),
+              "affinity": sorted(os.sched_getaffinity(0)), "system_files": files,
+              "environment": {name: os.environ.get(name) for name in env_names},
+              "compiler": command(["rustc", "--version", "--verbose"]), "cargo": command(["cargo", "--version"]),
+              "checkout": command(["git", "log", "-1", "--format=%H%n%T%n%P"]),
+              "tracked_status": command(["git", "status", "--porcelain", "--untracked-files=no"]),
+              "source_sha256": {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs if p.is_file()}}
+          (evidence / "before.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PYMETA
       - name: build the v0.9.2 baseline
         run: |
           base="$RUNNER_TEMP/v092"
@@ -178,6 +217,86 @@ jobs:
       # Ledger row 130's scaling pin: a create-edges-and-delete batch of 20k
       # rows within 8x one of 5k (linear is ~4x; the old quadratic 9-16x).
       - run: cargo test --release -p mushroomdb --test batch_vs_commits -- bench_create_edges_and_delete_batch_is_linear --ignored --nocapture
+      # Collection is observation only and runs after every original gated command.
+      - name: preserve actual concurrency gate artifacts
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          python3 - <<'PYMETA'
+          from pathlib import Path
+          import datetime, hashlib, json, os, shutil, subprocess
+          root = Path.cwd()
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "concurrency-gate-evidence"
+          evidence.mkdir(parents=True, exist_ok=True)
+          receipt = {"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "engines": {}, "errors": []}
+          def digest(path):
+              with path.open("rb") as handle:
+                  return hashlib.file_digest(handle, "sha256").hexdigest()
+          def copy(path, destination):
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(path, destination)
+              return {"source": str(path), "saved": str(destination.relative_to(evidence)),
+                      "sha256": digest(destination), "bytes": destination.stat().st_size}
+          try:
+              receipt["checkout"] = subprocess.check_output(["git", "log", "-1", "--format=%H%n%T%n%P"], text=True, timeout=30)
+              receipt["v092_commit"] = subprocess.check_output(["git", "rev-parse", "v0.9.2^{commit}"], text=True, timeout=30).strip()
+              receipt["baseline_executable_environment"] = os.environ.get("MUSHROOMDB_GATE_V092")
+              receipt["cpu_count"] = os.cpu_count()
+              receipt["affinity"] = sorted(os.sched_getaffinity(0))
+              receipt["system_files"] = {name: Path(name).read_text() for name in
+                  ("/proc/loadavg", "/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu.pressure", "/proc/meminfo") if Path(name).is_file()}
+              for label, source in (("candidate", root), ("v092", Path(os.environ["RUNNER_TEMP"]) / "v092")):
+                  engine = {"source_root": str(source), "source_sha256": {}, "files": [], "executables": []}
+                  receipt["engines"][label] = engine
+                  if not source.is_dir():
+                      receipt["errors"].append(f"{label}: source directory absent (earlier step may have failed)")
+                      continue
+                  inputs = [source / n for n in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
+                  for name in ("core-api", "core-query", "core-storage", "core-rules", "core-bench"):
+                      crate = source / "crates" / name
+                      inputs.extend([crate / "Cargo.toml", *crate.rglob("*.rs")])
+                  engine["source_sha256"] = {str(p.relative_to(source)): digest(p) for p in inputs if p.is_file()}
+                  saved_inputs = [source / n for n in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+                      "crates/core-bench/tests/concurrency_gate.rs", "crates/core-bench/benches/shared/concurrency.rs")]
+                  saved_inputs.extend(source / "crates" / n / "Cargo.toml" for n in
+                                      ("core-api", "core-query", "core-storage", "core-rules", "core-bench"))
+                  for path in saved_inputs:
+                      if path.is_file():
+                          engine["files"].append(copy(path, evidence / label / "source" / path.relative_to(source)))
+                  baseline = os.environ.get("MUSHROOMDB_GATE_V092") if label == "v092" else None
+                  binaries = [Path(baseline)] if baseline else sorted((source / "target/release/deps").glob("concurrency_gate-*"))
+                  for binary in binaries:
+                      if not binary.is_file() or not os.access(binary, os.X_OK):
+                          continue
+                      binary_receipt = copy(binary, evidence / label / "binaries" / binary.name)
+                      engine["executables"].append(binary_receipt)
+                      suffix = binary.name.removeprefix("concurrency_gate-")
+                      fingerprint_dir = binary.parent.parent / ".fingerprint" / f"core-bench-{suffix}"
+                      fingerprint = fingerprint_dir / "test-integration-test-concurrency_gate.json"
+                      if fingerprint.is_file():
+                          binary_receipt["fingerprint"] = copy(fingerprint, evidence / label / "fingerprints" / fingerprint_dir.name / fingerprint.name)
+                          binary_receipt["profile_fingerprint"] = json.loads(fingerprint.read_text())
+                      else:
+                          receipt["errors"].append(f"{label}: no matching fingerprint for {binary.name}")
+                  if not engine["executables"]:
+                      receipt["errors"].append(f"{label}: no executable (earlier build may have failed)")
+          except Exception as error:
+              receipt["errors"].append(f"{type(error).__name__}: {error}")
+          finally:
+              (evidence / "after.json").write_text(json.dumps(receipt, indent=2) + "\n")
+              inventory = {str(p.relative_to(evidence)): {"sha256": digest(p), "bytes": p.stat().st_size}
+                           for p in sorted(evidence.rglob("*")) if p.is_file() and p.name != "files.json"}
+              (evidence / "files.json").write_text(json.dumps(inventory, indent=2) + "\n")
+          PYMETA
+      - name: upload concurrency gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concurrency-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/concurrency-gate-evidence
+          if-no-files-found: error
+          retention-days: 14
 
   # The official Python and JavaScript Bolt drivers, at pinned versions, run
   # the twelve scenarios of the 0.10 transactions spec (W3 section 6) against
@@ -230,6 +349,73 @@ jobs:
         run: >-
           bash tests/bolt/run_compat.sh target/release/mushroomdb
           node tests/bolt/js_compat.mjs
+
+  # The official Java, Go and .NET Bolt drivers, best effort: each connects,
+  # reads `MATCH (n) RETURN count(n)` and runs one explicit transaction against
+  # the release binary. Neither the job nor any step blocks a merge, and each
+  # language is its own step so one failure does not hide the others; a
+  # pass/fail line per language goes to the run summary. The driver versions
+  # are pinned in tests/bolt/extra_driver.sh. One job keeps the workflow at 20
+  # concurrent runs. Needs the bolt-compat job's gates green first in practice;
+  # it is not wired as a dependency so it never delays them.
+  bolt-drivers-best-effort:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-java@v4
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-go@v5
+        continue-on-error: true
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: "8.0.x"
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --release
+      - name: official Java driver
+        id: java
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh java
+      - name: official Go driver
+        id: go
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh go
+      - name: official .NET driver
+        id: dotnet
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: >-
+          bash tests/bolt/run_compat.sh target/release/mushroomdb
+          bash tests/bolt/extra_driver.sh dotnet
+      - name: per-language result
+        if: ${{ !cancelled() }}
+        env:
+          JAVA_RESULT: ${{ steps.java.outcome }}
+          GO_RESULT: ${{ steps.go.outcome }}
+          DOTNET_RESULT: ${{ steps.dotnet.outcome }}
+        run: |
+          {
+            echo "### Best-effort Bolt drivers"
+            echo "- Java: $JAVA_RESULT"
+            echo "- Go: $GO_RESULT"
+            echo "- .NET: $DOTNET_RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
@@ -373,7 +559,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -U pip maturin pytest
+      - run: .venv/bin/pip install -U pip maturin pytest pyarrow pandas polars
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
       - run: .venv/bin/python -m pytest ../../dogfood -q
@@ -434,7 +620,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
-        with: { toolchain: "1.92.0" }
+        with: { toolchain: "1.92.0", components: "clippy" }
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -444,6 +630,9 @@ jobs:
         working-directory: ui
       - run: npm run build
         working-directory: ui
+      # Every feature at once, as no other step builds them (ledger row 54).
+      # `embed-ui` needs the UI built above, which is why this is not in `test`.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test -p mushroomdb-server --features embed-ui
       # The Dockerfile's build, features and all: the image ships this binary.
       - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui,tls --release

@@ -2,6 +2,7 @@
 //! what `all_nodes_for_export` / `all_edges_for_export` return, in the same
 //! order: live, after deletes and renames, after a snapshot, and after a reopen.
 use mushroomdb::{default_max_edges, GraphDb, Predicate, RealFs, RuleDef, Value};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -104,4 +105,77 @@ fn streamed_export_stops_at_the_first_error() {
         }
     });
     assert_eq!((r, seen), (Err("stop"), 2));
+}
+
+#[test]
+fn edge_property_export_reads_base_overlay_and_tombstones() {
+    fn properties(db: &GraphDb<RealFs>) -> BTreeMap<String, Value> {
+        let edges = db.all_edges_with_props_for_export();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|(edge, _)| edge.clone())
+                .collect::<Vec<_>>(),
+            db.all_edges_for_export()
+        );
+        edges
+            .into_iter()
+            .find(|(edge, _)| edge.edge_type == "K" && edge.src == "a" && edge.dst == "b")
+            .map(|(_, props)| props)
+            .unwrap_or_default()
+    }
+
+    for initial_snapshot in [false, true] {
+        let dir = tmp(if initial_snapshot {
+            "props-snapshot"
+        } else {
+            "props-wal"
+        });
+        let params = BTreeMap::new();
+        let mut db = GraphDb::<RealFs>::open(&dir).unwrap();
+        db.query_write(
+            "CREATE (:P {id: 'a'})-[:K {keep: 1, stale: 2}]->(:P {id: 'b'})",
+            &params,
+        )
+        .unwrap();
+        let initial = BTreeMap::from([
+            ("keep".into(), Value::Int(1)),
+            ("stale".into(), Value::Int(2)),
+        ]);
+        assert_eq!(properties(&db), initial);
+        assert_eq!(db.all_edges_with_props_for_export().len(), 1);
+        if initial_snapshot {
+            db.snapshot().unwrap();
+        }
+        drop(db);
+
+        let mut db = GraphDb::<RealFs>::open(&dir).unwrap();
+        assert_eq!(properties(&db), initial);
+        db.query_write("MATCH (a)-[r:K]->(b) SET r.keep = 3", &params)
+            .unwrap();
+        // The untouched base field still shows before a removal masks it.
+        assert_eq!(
+            properties(&db),
+            BTreeMap::from([
+                ("keep".into(), Value::Int(3)),
+                ("stale".into(), Value::Int(2)),
+            ])
+        );
+        db.query_write("MATCH (a)-[r:K]->(b) REMOVE r.stale", &params)
+            .unwrap();
+        let updated = BTreeMap::from([("keep".into(), Value::Int(3))]);
+        assert_eq!(properties(&db), updated);
+        drop(db);
+
+        let mut db = GraphDb::<RealFs>::open(&dir).unwrap();
+        assert_eq!(properties(&db), updated);
+        db.delete_edge("K", "a", "b").unwrap();
+        assert!(db.all_edges_with_props_for_export().is_empty());
+        db.insert_edge("K", "a", "b").unwrap();
+        assert!(properties(&db).is_empty());
+        db.snapshot().unwrap();
+        drop(db);
+        let db = GraphDb::<RealFs>::open(&dir).unwrap();
+        assert!(properties(&db).is_empty());
+    }
 }

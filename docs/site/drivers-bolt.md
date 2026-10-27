@@ -1,7 +1,9 @@
 # Drivers and Bolt
 
-`mushroomdb serve --bolt-port <port>` accepts connections from the official graph-database drivers over
-the Bolt protocol. The server speaks Bolt 5.0 and 4.4; every current official driver negotiates 5.0.
+`mushroomdb serve --bolt-port <port>` supports the Python and JavaScript drivers checked below over
+the Bolt protocol, with smaller best-effort Go and .NET checks. The server speaks Bolt 5.0 and 4.4.
+The checked Java driver offers these versions but rejects the server's product identifier before
+queries, so it is currently unsupported.
 To connect an application, see [An existing Cypher app, over Bolt](get-started-bolt.md). For the flags,
 limits and wire details, see [Bolt protocol](bolt.md).
 
@@ -11,7 +13,13 @@ limits and wire details, see [Bolt protocol](bolt.md).
 |---|---|
 | Official Python driver 6.4.1 | Twelve application scenarios, against a release build, on every pull request and push to `main` |
 | Official JavaScript driver 6.2.0 | The same twelve scenarios, in the same CI job |
-| Official Java, Go and .NET drivers | Their handshake source was audited; they are not run in CI |
+| Official Java driver 6.3.0 | Checked but unsupported: 0 of 3 checks pass; the client rejects `MushroomDB/<version>` during connection, before queries |
+| Official Go driver 6.3.0 | All three best-effort checks pass: connect, integer read and explicit-transaction commit/read-back |
+| Official .NET driver 6.4.0 | The same three best-effort checks pass |
+
+The best-effort steps report each language's result separately and do not block a merge. They attempt
+the three checks above, rather than the twelve-scenario Python and JavaScript suite. Java's failed
+connection remains a reported failure in CI; no Java query or transaction coverage is claimed.
 
 The scenarios and the audit are in [Driver compatibility tests](bolt.md#driver-compatibility-tests)
 and [Driver compatibility matrix](bolt.md#driver-compatibility-matrix).

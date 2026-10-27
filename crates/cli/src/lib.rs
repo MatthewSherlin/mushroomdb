@@ -247,11 +247,10 @@ pub enum Command {
     /// A hook body 0.6 installed and 0.7 retired: `touch`, `intercept`,
     /// `impact-hook` and `enrich` in the assistant's settings, `sync` in the
     /// git hooks. A machine that upgraded without re-running `install` still
-    /// calls them, so each is accepted with any arguments, opens nothing, and
-    /// prints one stderr line saying how to remove it. Never in [`usage`].
-    RetiredHook {
-        sub: &'static str,
-    },
+    /// calls them, so each is accepted with any arguments, opens nothing,
+    /// prints nothing and exits 0. `mushroomdb doctor` lists any that remain
+    /// and `install` removes them. Never in [`usage`].
+    RetiredHook,
     Serve {
         db_dir: PathBuf,
         addr: SocketAddr,
@@ -988,11 +987,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
         // Arguments are not parsed: whatever a 0.6 install wrote after the
         // subcommand, the answer is the same.
-        "touch" => Ok(Command::RetiredHook { sub: "touch" }),
-        "intercept" => Ok(Command::RetiredHook { sub: "intercept" }),
-        "impact-hook" => Ok(Command::RetiredHook { sub: "impact-hook" }),
-        "enrich" => Ok(Command::RetiredHook { sub: "enrich" }),
-        "sync" => Ok(Command::RetiredHook { sub: "sync" }),
+        "touch" | "intercept" | "impact-hook" | "enrich" | "sync" => Ok(Command::RetiredHook),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -4406,11 +4401,7 @@ mod tests {
                 vec![sub, "--auto"],
                 vec![sub, "/tmp/db", "--whatever", "x"],
             ] {
-                assert_eq!(
-                    parse_args(&args),
-                    Ok(Command::RetiredHook { sub }),
-                    "{args:?}"
-                );
+                assert_eq!(parse_args(&args), Ok(Command::RetiredHook), "{args:?}");
             }
             assert!(
                 !usage().contains(&format!("mushroomdb {sub}")),

@@ -9,7 +9,7 @@ use core_api::{
     RuleDef, Scope, SharedDb, Transaction as CoreTransaction, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyImportError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMemoryView, PySequence,
@@ -1191,6 +1191,108 @@ impl GraphDb {
                 Ok(d.unbind())
             })
             .collect()
+    }
+
+    /// The whole graph as two `pyarrow.Table`s, `{"nodes": ..., "edges": ...}`.
+    ///
+    /// `nodes` has columns `key`, `label`, `properties` (string, a JSON object
+    /// with sorted keys, each value written as the HTTP API writes it: a
+    /// non-finite float is `null`, a date, time, duration or binary value is a
+    /// tagged object such as `{"$date": "2024-01-15"}`),
+    /// sorted by key. `edges` has `source`, `type`, `target`, `derived`
+    /// (bool), `rule` (string, null for a manual edge), `weight` (float,
+    /// null unless the creating rule declares a numeric `weight_prop`) and
+    /// `properties` (string, the same sorted JSON form as node properties;
+    /// `{}` when absent), sorted by `(type, source, target)`. An empty store
+    /// gives empty tables with the same columns.
+    ///
+    /// It materialises every node and edge in memory at once. `pyarrow` is an
+    /// optional dependency, imported here: without it this raises
+    /// `ImportError` naming `pip install pyarrow`. Refused on a scoped handle.
+    ///
+    /// ```python
+    /// tables = db.to_arrow_tables()
+    /// df = tables["nodes"].to_pandas()
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn to_arrow_tables(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("to_arrow_tables")?;
+        let pa = PyModule::import(py, "pyarrow").map_err(|_| {
+            PyImportError::new_err(
+                "to_arrow_tables() needs pyarrow, which is not installed: pip install pyarrow",
+            )
+        })?;
+        let (nodes, edges) = self.with_ref(|db| {
+            Ok((
+                db.all_nodes_for_export(),
+                db.all_edges_with_props_for_export(),
+            ))
+        })?;
+        let node_rows = PyList::empty(py);
+        for node in &nodes {
+            let props: serde_json::Map<String, serde_json::Value> = node
+                .props
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
+            let row = PyDict::new(py);
+            row.set_item("key", &node.key)?;
+            row.set_item("label", &node.label)?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
+            node_rows.append(row)?;
+        }
+        let edge_rows = PyList::empty(py);
+        for (edge, properties) in &edges {
+            let props: serde_json::Map<String, serde_json::Value> = properties
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
+            let row = PyDict::new(py);
+            row.set_item("source", &edge.src)?;
+            row.set_item("type", &edge.edge_type)?;
+            row.set_item("target", &edge.dst)?;
+            row.set_item("derived", edge.derived)?;
+            row.set_item("rule", edge.rule.as_deref())?;
+            row.set_item("weight", edge.weight)?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
+            edge_rows.append(row)?;
+        }
+
+        let string = pa.call_method0("string")?;
+        let node_schema = arrow_schema(
+            &pa,
+            &[
+                ("key", &string),
+                ("label", &string),
+                ("properties", &string),
+            ],
+        )?;
+        let edge_schema = arrow_schema(
+            &pa,
+            &[
+                ("source", &string),
+                ("type", &string),
+                ("target", &string),
+                ("derived", &pa.call_method0("bool_")?),
+                ("rule", &string),
+                ("weight", &pa.call_method0("float64")?),
+                ("properties", &string),
+            ],
+        )?;
+        let table = pa.getattr("Table")?;
+        let out = PyDict::new(py);
+        for (name, rows, schema) in [
+            ("nodes", node_rows, node_schema),
+            ("edges", edge_rows, edge_schema),
+        ] {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", schema)?;
+            out.set_item(
+                name,
+                table.call_method("from_pylist", (rows,), Some(&kwargs))?,
+            )?;
+        }
+        Ok(out.unbind())
     }
 
     /// Enable an equality index on `(label, field)` so `MATCH (n:label {field: v})`
@@ -3989,6 +4091,44 @@ fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>
         rows.push(dict.unbind());
     }
     Ok(rows)
+}
+
+/// A value as the HTTP API writes it (`crates/server/src/json.rs`), so the two
+/// surfaces agree: scalars untagged, a non-finite float as `null`, and a
+/// temporal, duration or binary value as the tagged object `tagged_json`
+/// writes (`{"$date": "2024-01-15"}`). Never produces invalid JSON, and never
+/// goes through a Python `datetime`, so no engine value can abort an export.
+fn value_to_http_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as Js;
+    match v {
+        Value::Int(i) => Js::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Js::Null, Js::Number),
+        Value::Str(s) => Js::String(s.clone()),
+        Value::Bool(b) => Js::Bool(*b),
+        Value::List(xs) => Js::Array(xs.iter().map(value_to_http_json).collect()),
+        Value::Map(m) => Js::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), value_to_http_json(v)))
+                .collect(),
+        ),
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => core_api::tagged_json(v).ok().flatten().unwrap_or(Js::Null),
+        Value::Null => Js::Null,
+    }
+}
+
+fn arrow_schema<'py>(
+    pa: &Bound<'py, PyModule>,
+    fields: &[(&str, &Bound<'py, PyAny>)],
+) -> PyResult<Bound<'py, PyAny>> {
+    let list = PyList::empty(pa.py());
+    for (name, data_type) in fields {
+        list.append(pa.call_method1("field", (*name, *data_type))?)?;
+    }
+    pa.call_method1("schema", (list,))
 }
 
 fn node_info_to_py(py: Python<'_>, info: &NodeInfo) -> PyResult<Py<PyDict>> {

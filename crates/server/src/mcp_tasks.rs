@@ -1999,6 +1999,12 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     digest::sanitize(unread)
                 ));
             }
+            for unused in &report.labels_not_applied {
+                rendered.push_str(&format!(
+                    "label    {}\n",
+                    digest::sanitize(&unused.to_string())
+                ));
+            }
             if !report.fulltext_declared.is_empty() {
                 rendered.push_str(&format!(
                     "indexed  {} — full-text search enabled for the first time\n",
@@ -2017,6 +2023,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     "provisional": report.provisional,
                     "provisional_capped": report.provisional_capped,
                     "fulltext_declared": report.fulltext_declared,
+                    "labels_not_applied": report.labels_not_applied,
                     // Fixed precision, as the text's `{:.2}`; the report
                     // itself keeps the raw score.
                     "same_as": report

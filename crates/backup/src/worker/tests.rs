@@ -418,6 +418,63 @@ async fn delayed_probe_does_not_refresh_the_acquisition_write_fence() {
     assert!(bytes(&store, &lease_key(PREFIX)).await.is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_expired_pending_lease_puts_no_data_before_a_real_renewal() {
+    let mut settings = config();
+    settings.lease_ttl_s = 1;
+    settings.op_timeout_ms = 1000;
+    let Fixture {
+        dir: _dir,
+        db: _db,
+        store,
+        control,
+        mut worker,
+    } = setup(0, settings);
+    {
+        let taking = worker.take_lease();
+        tokio::pin!(taking);
+        tokio::select! {
+            _ = control.entered.notified() => {}
+            result = &mut taking => panic!("the real probe must wait: {result:?}"),
+        }
+    }
+    tokio::time::advance(Duration::from_millis(800)).await;
+    control.resume.notify_one();
+    assert!(worker.finish_lease_attempt(true).await.is_none());
+    // No await between adoption returning and aborting this fixture's newly
+    // spawned renewer: the current-thread runtime cannot renew it first.
+    let renewer = worker.renewer.take().expect("adoption starts a renewer");
+    renewer.abort();
+    let _ = renewer.await;
+    assert_eq!(control.acquisitions.load(Ordering::SeqCst), 1);
+    assert_eq!(control.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(control.renewals.load(Ordering::SeqCst), 0);
+
+    let key = format!("{PREFIX}/fence-order-data");
+    let payload = PutPayload::from(vec![1, 2, 3]);
+    let denied = worker
+        .put_mode(&key, payload.clone(), PutMode::Create)
+        .await;
+    assert!(
+        matches!(denied, Err(BackupError::Lease(_))),
+        "expired adoption must fence the first data PUT: {denied:?}"
+    );
+    assert!(bytes(&store, &key).await.is_none());
+    assert_no_data(&store).await;
+
+    worker.lease.as_ref().unwrap().renew().await.unwrap();
+    assert_eq!(control.renewals.load(Ordering::SeqCst), 1);
+    worker
+        .put_mode(&key, payload, PutMode::Create)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes(&store, &key).await, Some(vec![1, 2, 3]));
+    worker.release_lease().await;
+    assert!(bytes(&store, &lease_key(PREFIX)).await.is_none());
+    assert_eq!(control.renewals.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn already_adopted_boot_lease_flushes_without_a_new_attempt() {
     let Fixture {

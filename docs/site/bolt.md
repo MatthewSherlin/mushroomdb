@@ -1,6 +1,6 @@
 # Bolt protocol
 
-`mushroomdb serve` can listen for Bolt beside HTTP, so the official graph-database drivers can connect without a configuration change. This page covers how to turn the listener on, how clients authenticate, TLS, the routing table, the version negotiation and its audit, value types, and what is not available over Bolt. For what a transaction guarantees, on Bolt and every other surface, see [Transactions](transactions.md).
+`mushroomdb serve` can listen for Bolt beside HTTP. The checked Python and JavaScript drivers connect without a configuration change; Go and .NET pass smaller best-effort checks. Java 6.3.0 rejects the server's product identifier before queries and is currently unsupported. This page covers how to turn the listener on, how clients authenticate, TLS, the routing table, the version negotiation and its audit, value types, and what is not available over Bolt. For what a transaction guarantees, on Bolt and every other surface, see [Transactions](transactions.md).
 
 ## Turning the listener on
 
@@ -115,7 +115,7 @@ Audited 2026-10-20 from each driver's handshake source on its default branch. "L
 |---|---|---|---|---|---|
 | Official Python driver | 6.4.1 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
 | Official JavaScript driver | 6.2.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
-| Official Java driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
+| Official Java driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0; client refuses the `HELLO` product identifier |
 | Official Go driver | 6.3.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
 | Official .NET driver | 6.4.0 | 3.0 | 5.8 in the opening handshake (6.1 only after a manifest exchange) | yes, first slot | 5.0 |
 
@@ -130,7 +130,7 @@ All five send the same four slots, in this order:
 
 ## Why 5.0 and 4.4
 
-Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that speaks only those two versions connects to all five. Slot 1 is skipped and slot 2 holds 5.0, so each of them negotiates 5.0; a client whose offer holds 4.4 and not 5.0 gets 4.4. Only the Python and JavaScript drivers are run against the server in CI (see [Driver compatibility tests](#driver-compatibility-tests)); the Java, Go and .NET rows come from the handshake audit alone. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
+Slots 2 and 3 of every checked driver's handshake offer contain 5.0 and 4.4, so the version ranges overlap all five. Slot 1 is skipped and slot 2 holds 5.0; a client whose offer holds 4.4 and not 5.0 gets 4.4. Version negotiation alone does not prove compatibility: Java 6.3.0 rejects the truthful `MushroomDB/<version>` identifier in `HELLO` before queries. Python and JavaScript run the twelve-scenario suite in CI; Go and .NET pass three smaller best-effort checks, while Java reports a failed connection (see [Driver compatibility tests](#driver-compatibility-tests)). The handshake version ranges in the matrix come from the source audit. At a negotiated 5.0 the driver authenticates inside `HELLO`; `LOGON` and `LOGOFF` start at 5.1 and are not needed. Nothing in the audit requires a later 5.x message.
 
 ## How the handshake is matched
 
@@ -157,6 +157,8 @@ Every pull request and push to `main` runs the official Python driver 6.4.1 and 
 | 10 | `CALL db.labels()` | The full token sees every label; a role token sees only its role's labels and nodes, and is refused a write |
 | 11 | Routing scheme | The driver asks `ROUTE` and runs its reads and writes on the advertised address |
 | 12 | Bookmarks | A read on a second session, given the first session's bookmark, sees the first session's commit |
+
+The separate `bolt-drivers-best-effort` job attempts three checks each for Java 6.3.0, Go 6.3.0 and .NET 6.4.0: connect and authenticate, read an integer count, and commit an explicit transaction whose write is read back. Go and .NET pass all three. Java passes none: its client rejects the server's product identifier during connection, so no Java query or transaction is checked. Each language has its own step and summary result; Java's failure remains visible there even when the job is green. These steps do not block a merge and do not cover the full twelve-scenario suite above.
 
 Where these drivers meet the server's current limits: a node or relationship inside a map built in the query, inside a list that mixes kinds, or behind a function arrives as its key or its `{type, start, end}` map, not as a Node or Relationship structure (see [Nodes, relationships and paths](#nodes-relationships-and-paths)). No scenario depends on that form.
 
