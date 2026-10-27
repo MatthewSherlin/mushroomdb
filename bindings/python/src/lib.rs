@@ -1200,10 +1200,11 @@ impl GraphDb {
     /// non-finite float is `null`, a date, time, duration or binary value is a
     /// tagged object such as `{"$date": "2024-01-15"}`),
     /// sorted by key. `edges` has `source`, `type`, `target`, `derived`
-    /// (bool), `rule` (string, null for a manual edge) and `weight` (float,
-    /// null unless the creating rule declares a numeric `weight_prop`), sorted
-    /// by `(type, source, target)`. An empty store gives empty tables with the
-    /// same columns.
+    /// (bool), `rule` (string, null for a manual edge), `weight` (float,
+    /// null unless the creating rule declares a numeric `weight_prop`) and
+    /// `properties` (string, the same sorted JSON form as node properties;
+    /// `{}` when absent), sorted by `(type, source, target)`. An empty store
+    /// gives empty tables with the same columns.
     ///
     /// It materialises every node and edge in memory at once. `pyarrow` is an
     /// optional dependency, imported here: without it this raises
@@ -1221,8 +1222,12 @@ impl GraphDb {
                 "to_arrow_tables() needs pyarrow, which is not installed: pip install pyarrow",
             )
         })?;
-        let (nodes, edges) =
-            self.with_ref(|db| Ok((db.all_nodes_for_export(), db.all_edges_for_export())))?;
+        let (nodes, edges) = self.with_ref(|db| {
+            Ok((
+                db.all_nodes_for_export(),
+                db.all_edges_with_props_for_export(),
+            ))
+        })?;
         let node_rows = PyList::empty(py);
         for node in &nodes {
             let props: serde_json::Map<String, serde_json::Value> = node
@@ -1237,7 +1242,11 @@ impl GraphDb {
             node_rows.append(row)?;
         }
         let edge_rows = PyList::empty(py);
-        for edge in &edges {
+        for (edge, properties) in &edges {
+            let props: serde_json::Map<String, serde_json::Value> = properties
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
             let row = PyDict::new(py);
             row.set_item("source", &edge.src)?;
             row.set_item("type", &edge.edge_type)?;
@@ -1245,6 +1254,7 @@ impl GraphDb {
             row.set_item("derived", edge.derived)?;
             row.set_item("rule", edge.rule.as_deref())?;
             row.set_item("weight", edge.weight)?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
             edge_rows.append(row)?;
         }
 
@@ -1266,6 +1276,7 @@ impl GraphDb {
                 ("derived", &pa.call_method0("bool_")?),
                 ("rule", &string),
                 ("weight", &pa.call_method0("float64")?),
+                ("properties", &string),
             ],
         )?;
         let table = pa.getattr("Table")?;

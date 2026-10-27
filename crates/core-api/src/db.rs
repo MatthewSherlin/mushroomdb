@@ -12842,6 +12842,31 @@ impl<F: Fs> GraphDb<F> {
         edges
     }
 
+    /// All directed edges with their complete property maps, in the same
+    /// order as [`all_edges_for_export`](Self::all_edges_for_export).
+    ///
+    /// Reads each proven-live exported identity's composite snapshot and WAL
+    /// properties, including removals and tombstones, without collecting its
+    /// source's neighbors again. An edge with no properties has an empty map.
+    pub fn all_edges_with_props_for_export(&self) -> Vec<(ExportEdge, BTreeMap<String, Value>)> {
+        let edges = self.all_edges_for_export();
+        let properties = self.edge_props_view();
+        edges
+            .into_iter()
+            .map(|edge| {
+                let props = match (
+                    self.syms.get(&edge.edge_type),
+                    self.ids.get(&edge.src),
+                    self.ids.get(&edge.dst),
+                ) {
+                    (Some(etype), Some(src), Some(dst)) => properties.props_of(etype, src, dst),
+                    _ => BTreeMap::new(),
+                };
+                (edge, props)
+            })
+            .collect()
+    }
+
     /// [`all_nodes_for_export`](Self::all_nodes_for_export), one node at a time.
     ///
     /// Calls `each` with every live node in key order, and stops at its first

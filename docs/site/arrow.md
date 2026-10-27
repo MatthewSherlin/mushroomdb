@@ -31,10 +31,11 @@ The columns are fixed, so a script written against one store reads any other.
 | `edges` | `derived` | bool | `true` for an edge a rule derived, `false` for one you wrote. |
 | `edges` | `rule` | string | The deriving rule's name; null for a manual edge. |
 | `edges` | `weight` | float64 | The rule's `weight_prop` value when it is numeric; otherwise null. |
+| `edges` | `properties` | string | A JSON object of all edge properties, including stored rule weights and insert `count`, with the same sorted keys and value forms as node properties. `{}` when none are stored. |
 
 Edges are sorted by `(type, source, target)`. An empty store gives empty tables with the same columns.
 
-Properties are one JSON column because different labels carry different properties. To read them into columns, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))`, or polars `str.json_decode(dtype)` with a `pl.Struct` naming the properties you want.
+Each table has one JSON properties column because different nodes and edges carry different properties. To read them into columns, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))` (or `edges_df` for edges), or polars `str.json_decode(dtype)` with a `pl.Struct` naming the properties you want. The `weight` metadata column describes the deriving rule; a manual property named `weight` appears in `properties` while the metadata stays null.
 
 ### Property value forms
 

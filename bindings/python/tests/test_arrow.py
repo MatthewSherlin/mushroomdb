@@ -57,6 +57,7 @@ def test_schema_is_stable_and_rows_are_sorted(db):
         "derived",
         "rule",
         "weight",
+        "properties",
     ]
     nodes = tables["nodes"].to_pylist()
     assert [n["key"] for n in nodes] == ["ada", "bob"]
@@ -71,6 +72,7 @@ def test_schema_is_stable_and_rows_are_sorted(db):
             "derived": False,
             "rule": None,
             "weight": None,
+            "properties": "{}",
         }
     ]
 
@@ -81,25 +83,34 @@ def test_empty_store_gives_empty_tables_with_the_same_schema(tmp_path):
     assert len(tables["nodes"]) == 0
     assert len(tables["edges"]) == 0
     assert tables["nodes"].schema.names == ["key", "label", "properties"]
+    assert tables["edges"].schema.names == [
+        "source", "type", "target", "derived", "rule", "weight", "properties"
+    ]
+    assert tables["edges"].schema.field("properties").type == pa.string()
 
 
 def test_derived_edges_carry_rule_and_weight(tmp_path):
     with GraphDb.open(str(tmp_path / "db")) as db:
         db.create_rule(
             {
-                "name": "same_team",
+                "name": "close_score",
                 "src_label": "Person",
                 "dst_label": "Person",
-                "predicate": {"FieldEqual": {"field": "team"}},
-                "edge_type": "SAME_TEAM",
-                "weight_prop": None,
+                "predicate": {"NumericWithin": {"field": "score", "tolerance": 5.0}},
+                "edge_type": "CLOSE_SCORE",
+                "weight_prop": "score",
             }
         )
-        db.insert_node("Person", "a", {"team": "red"})
-        db.insert_node("Person", "b", {"team": "red"})
+        db.insert_node("Person", "a", {"score": 10.0})
+        db.insert_node("Person", "b", {"score": 9.0})
         edges = db.to_arrow_tables()["edges"].to_pylist()
-    assert edges
-    assert all(e["derived"] and e["rule"] == "same_team" for e in edges)
+        assert edges
+        for edge in edges:
+            actual = db.get_edge_prop("CLOSE_SCORE", edge["source"], edge["target"], "score")
+            assert isinstance(actual, float)
+            assert edge["derived"] and edge["rule"] == "close_score"
+            assert edge["weight"] == actual
+            assert json.loads(edge["properties"]) == {"score": actual}
 
 
 def test_scoped_handle_is_refused(db):
@@ -187,3 +198,85 @@ def test_a_date_outside_pythons_range_does_not_abort_the_export(db):
     rows = {r["key"]: r for r in db.to_arrow_tables()["nodes"].to_pylist()}
     assert json.loads(rows["far"]["properties"])["v"] == {"$date": "+012000-01-01"}
     assert set(rows) == {"ada", "bob", "far"}
+
+
+def test_manual_edge_properties_use_the_http_value_forms(db):
+    _typed_node(db)
+    values = db.node_info("typed")["props"]
+    values["nested"] = {"z": [0, float("nan"), {"b": b"\x00\xff"}], "a": True}
+    fields = ", ".join(f"`{name}`: ${name}" for name in values)
+    db.query_write(
+        "CREATE (:Arrow {id: 'edge-a'})-[:TYPED {" + fields + "}]->(:Arrow {id: 'edge-b'})",
+        values,
+    )
+    tables = db.to_arrow_tables()
+    [edge] = [row for row in tables["edges"].to_pylist() if row["type"] == "TYPED"]
+    # Pin actual data, not just the presence of a seventh schema field.
+    props = json.loads(edge["properties"], parse_constant=lambda c: pytest.fail(f"non-JSON constant {c}"))
+    node = next(row for row in tables["nodes"].to_pylist() if row["key"] == "typed")
+    expected = json.loads(node["properties"])
+    expected["nested"] = {"a": True, "z": [0, None, {"b": {"$binary": "AP8="}}]}
+    assert props == expected
+    assert props["big"] == 2**62 + 1
+    assert props["date"] == {"$date": "2024-01-15"}
+    assert props["nan"] is None and props["inf"] is None and props["ninf"] is None
+    assert list(props) == sorted(props)
+    assert list(props["nested"]) == ["a", "z"]
+    assert edge["weight"] is None and edge["rule"] is None and not edge["derived"]
+
+
+def test_manual_edge_properties_include_weight_and_insert_count(db):
+    db.enable_multiplicity()
+    db.query_write(
+        "CREATE (:Arrow {id: 'count-a'})-[:COUNTED {w: 7, weight: 3.5}]->(:Arrow {id: 'count-b'})"
+    )
+    assert db.insert_edge("COUNTED", "count-a", "count-b") is False
+    [edge] = [row for row in db.to_arrow_tables()["edges"].to_pylist() if row["type"] == "COUNTED"]
+    assert db.get_edge_prop("COUNTED", "count-a", "count-b", "count") == 2
+    assert json.loads(edge["properties"]) == {"count": 2, "w": 7, "weight": 3.5}
+    # Metadata continues to describe a deriving rule, rather than a manual field named weight.
+    assert edge["weight"] is None and edge["rule"] is None and not edge["derived"]
+
+
+def test_edge_rows_keep_their_order_with_property_maps(db):
+    db.insert_edge("Z", "bob", "ada")
+    db.insert_edge("A", "bob", "ada")
+    db.insert_edge("A", "ada", "bob")
+    edges = db.to_arrow_tables()["edges"].to_pylist()
+    assert [(e["type"], e["source"], e["target"]) for e in edges] == [
+        ("A", "ada", "bob"), ("A", "bob", "ada"), ("KNOWS", "ada", "bob"), ("Z", "bob", "ada")
+    ]
+    assert all(e["properties"] == "{}" for e in edges)
+
+
+@pytest.mark.parametrize("initial_snapshot", [False, True], ids=["wal", "snapshot"])
+def test_edge_properties_follow_cold_reopen_update_remove_and_reinsert(tmp_path, initial_snapshot):
+    path = str(tmp_path / "db")
+
+    def properties(db):
+        [edge] = db.to_arrow_tables()["edges"].to_pylist()
+        assert (edge["type"], edge["source"], edge["target"]) == ("K", "a", "b")
+        return json.loads(edge["properties"])
+
+    with GraphDb.open(path) as db:
+        db.query_write("CREATE (:P {id: 'a'})-[:K {keep: 1, stale: 2, nested: {v: 7}}]->(:P {id: 'b'})")
+        assert properties(db) == {"keep": 1, "stale": 2, "nested": {"v": 7}}
+        if initial_snapshot:
+            db.snapshot()
+
+    with GraphDb.open(path) as db:
+        assert properties(db) == {"keep": 1, "stale": 2, "nested": {"v": 7}}
+        db.query_write("MATCH (a)-[r:K]->(b) SET r.keep = 3")
+        db.query_write("MATCH (a)-[r:K]->(b) REMOVE r.stale")
+        assert properties(db) == {"keep": 3, "nested": {"v": 7}}
+
+    with GraphDb.open(path) as db:
+        assert properties(db) == {"keep": 3, "nested": {"v": 7}}
+        assert db.delete_edge("K", "a", "b")
+        assert db.to_arrow_tables()["edges"].num_rows == 0
+        assert db.insert_edge("K", "a", "b")
+        assert properties(db) == {}
+        db.snapshot()
+
+    with GraphDb.open(path) as db:
+        assert properties(db) == {}

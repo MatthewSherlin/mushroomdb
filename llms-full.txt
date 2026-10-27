@@ -4667,10 +4667,11 @@ The columns are fixed, so a script written against one store reads any other.
 | `edges` | `derived` | bool | `true` for an edge a rule derived, `false` for one you wrote. |
 | `edges` | `rule` | string | The deriving rule's name; null for a manual edge. |
 | `edges` | `weight` | float64 | The rule's `weight_prop` value when it is numeric; otherwise null. |
+| `edges` | `properties` | string | A JSON object of all edge properties, including stored rule weights and insert `count`, with the same sorted keys and value forms as node properties. `{}` when none are stored. |
 
 Edges are sorted by `(type, source, target)`. An empty store gives empty tables with the same columns.
 
-Properties are one JSON column because different labels carry different properties. To read them into columns, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))`, or polars `str.json_decode(dtype)` with a `pl.Struct` naming the properties you want.
+Each table has one JSON properties column because different nodes and edges carry different properties. To read them into columns, use `pandas.json_normalize(nodes_df["properties"].map(json.loads))` (or `edges_df` for edges), or polars `str.json_decode(dtype)` with a `pl.Struct` naming the properties you want. The `weight` metadata column describes the deriving rule; a manual property named `weight` appears in `properties` while the metadata stays null.
 
 ### Property value forms
 
@@ -10708,10 +10709,11 @@ The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
 object with sorted keys, each value written as the HTTP API writes it: a
 non-finite float is `null`, a date, time, duration or binary value is a
 tagged object such as `{"$date": "2024-01-15"}`), sorted by key. `edges` has `source`, `type`, `target`,
-`derived` (bool), `rule` (string, null for a manual edge) and `weight`
+`derived` (bool), `rule` (string, null for a manual edge), `weight`
 (float, null unless the creating rule declares a numeric
-`weight_prop`), sorted by `(type, source, target)`. An empty store
-gives empty tables with the same columns.
+`weight_prop`) and `properties` (string, the same sorted JSON form as
+node properties; `{}` when absent), sorted by `(type, source, target)`.
+An empty store gives empty tables with the same columns.
 
 It materialises every node and edge in memory at once. `pyarrow` is an
 optional dependency, imported here: without it this raises
