@@ -108,6 +108,7 @@ Reference:
 - [Live Subscriptions](subscriptions.md)
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
+- [Data safety and evidence](data-safety.md) — recovery, compatibility, sync policy and backup checks
 - [Running several processes against one store](multiprocess.md)
 - [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)

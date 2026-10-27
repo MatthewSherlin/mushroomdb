@@ -56,6 +56,7 @@ SITE_DOCS=(
     subscriptions.md
     timetravel.md
     durability.md
+    data-safety.md
     views.md
     fulltext.md
     vector.md

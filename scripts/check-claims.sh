@@ -246,6 +246,12 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
   fi
 fi
 
+# Explicit safety claims must still name real jobs. Successful execution is
+# checked separately by the release controller; this guard checks existence.
+if ! python3 "$ROOT/scripts/check-safety-evidence.py"; then
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "check-claims.sh: FAILED — see the lines above" >&2
   exit 1

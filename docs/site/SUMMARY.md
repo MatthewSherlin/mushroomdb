@@ -59,6 +59,7 @@
 
 # Data safety
 
+- [Data safety and evidence](data-safety.md)
 - [Concurrency](concurrency.md)
 - [Panic policy](panic-policy.md)
 - [Testing](testing.md)
