@@ -3193,6 +3193,10 @@ async fn find_similar(
     }
 }
 
+fn refuse_nonobject_algorithm_config(body: &serde_json::Value) -> Option<Response> {
+    (!body.is_object()).then(|| err_response("algorithm configuration must be a JSON object"))
+}
+
 /// `POST /algo/pagerank` — run PageRank over the unified topology.
 ///
 /// # Locking and blocking strategy
@@ -3209,6 +3213,9 @@ async fn algo_pagerank(
     // v1: deny role tokens — algo endpoints scan the full graph.
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
+    }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
     }
     let config: PageRankConfig = match serde_json::from_value(body) {
         Ok(c) => c,
@@ -3237,6 +3244,9 @@ async fn algo_wcc(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
     }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
+    }
     let config: WccConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid wcc config: {e}")),
@@ -3259,6 +3269,9 @@ async fn algo_degree(
 ) -> Response {
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
+    }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
     }
     let config: DegreeConfig = match serde_json::from_value(body) {
         Ok(c) => c,

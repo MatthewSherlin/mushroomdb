@@ -60,6 +60,15 @@ import {
   type WsConstructor,
 } from "./ws.js";
 
+type AlgoConfigKeys<T> = T extends unknown ? keyof T : never;
+type ForeignAlgoOptions<Allowed> = Partial<Record<
+  Exclude<keyof PageRankConfig | keyof WccConfig | keyof DegreeConfig, keyof Allowed>,
+  never
+>>;
+type ExactAlgoConfig<Allowed, Candidate> = Candidate &
+  NoInfer<Allowed & ForeignAlgoOptions<Allowed> &
+    Record<Exclude<AlgoConfigKeys<Candidate>, keyof Allowed>, never>>;
+
 export type {
   AlgoDir,
   AlgoReport,
@@ -497,9 +506,15 @@ export class MushroomClient {
    * console.log(pr.scores.slice(0, 5));
    * ```
    */
-  async algo(algo: "pagerank", config?: PageRankConfig): Promise<PageRankReport>;
-  async algo(algo: "wcc", config?: WccConfig): Promise<WccReport>;
-  async algo(algo: "degree", config?: DegreeConfig): Promise<DegreeReport>;
+  async algo<C = PageRankConfig>(
+    algo: "pagerank", config?: ExactAlgoConfig<PageRankConfig, C>,
+  ): Promise<PageRankReport>;
+  async algo<C = WccConfig>(
+    algo: "wcc", config?: ExactAlgoConfig<WccConfig, C>,
+  ): Promise<WccReport>;
+  async algo<C = DegreeConfig>(
+    algo: "degree", config?: ExactAlgoConfig<DegreeConfig, C>,
+  ): Promise<DegreeReport>;
   async algo(
     algo: "pagerank" | "wcc" | "degree",
     config?: PageRankConfig | WccConfig | DegreeConfig,

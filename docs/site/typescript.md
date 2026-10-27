@@ -79,6 +79,30 @@ Each method calls one route. The route's page has the request and the response i
 | `client.transaction(` | Run a callback in a transaction; commit when it resolves, roll back when it throws | [`POST /tx/begin`](http.md#post-txbegin), [`POST /tx/{tx_id}/commit`](http.md#post-txidcommit), [`POST /tx/{tx_id}/rollback`](http.md#post-txidrollback) |
 | `client.watch(` | Stream the raw mutation log over WebSocket | [`GET /watch`](http.md#get-watch) |
 
+## Algorithm configs
+
+`client.algo` returns the report for the selected algorithm. Configs are optional;
+`client.algo('wcc')` and `client.algo('wcc', undefined)` use the server defaults.
+All three configs support `edge_type`, `budget_ms`, `weight_prop` and `min_weight`.
+PageRank uses edge weights; components and degree use the weight fields only to
+filter edges, and degree still counts edges.
+
+The compiler checks a config variable's declared keys. A `PageRankConfig` variable
+cannot be passed to `wcc` or `degree`, and a `DegreeConfig` cannot be passed to `wcc`,
+even if its current value sets only shared fields. Declare a narrower shared type
+when the same config is intended for several algorithms:
+
+```ts
+const shared: { edge_type?: string | null; budget_ms?: number } = {
+  edge_type: 'KNOWS', budget_ms: 1000,
+};
+await client.algo('wcc', shared);
+await client.algo('degree', shared);
+```
+
+This is a compile-time check; `any`, casts and annotations that erase extra keys can
+bypass it. The server separately refuses unknown fields and requires an object body.
+
 ## Transactions
 
 ```ts

@@ -1381,10 +1381,14 @@ type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
 
 ### `POST /algo/pagerank`
 
-PageRank over hand-written and derived edges together. The body is a JSON object and may be
-`{}`: every field has a default. It may not be empty. A field the config does not have is 400
-on all three `/algo` routes, so `max_iter` for `max_iters` is refused and not run with the
-default.
+PageRank over hand-written and derived edges together. The body must be a JSON object;
+`{}` uses every field's default. With `Content-Type: application/json`, an absent body,
+an array, a scalar or `null` is 400 on all three `/algo` routes. The request parser
+returns 415 for a missing or non-JSON content type. Arrays are refused even when their
+positions could match the fields.
+A field the config does not have is also 400, so `max_iter` for `max_iters` is refused
+and not run with the default. A well-formed non-object body returns
+`{"error":"algorithm configuration must be a JSON object"}`.
 
 | Field | Default | What it is |
 |---|---|---|
@@ -1414,6 +1418,8 @@ A value the config does not accept is 400, and the message names what it would h
 ```
 
 A role-bound token gets 403 on every `/algo` route, because the scan covers the whole graph.
+For well-formed JSON, that refusal precedes config validation. Malformed JSON is refused
+by the request parser before the handler.
 More in [Algorithms](algorithms.md).
 
 ### `POST /algo/wcc`

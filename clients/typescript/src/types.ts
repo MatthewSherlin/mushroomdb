@@ -352,6 +352,8 @@ export interface PageRankConfig {
   edge_type?: string | null;
   direction?: AlgoDir;
   budget_ms?: number;
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
@@ -374,6 +376,9 @@ export interface PageRankReport {
 export interface WccConfig {
   edge_type?: string | null;
   budget_ms?: number;
+  /** Edge weight used for min_weight filtering; components stay unweighted. */
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
@@ -396,6 +401,9 @@ export interface DegreeConfig {
   edge_type?: string | null;
   direction?: AlgoDir;
   budget_ms?: number;
+  /** Edge weight used for min_weight filtering; degree stays an edge count. */
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
