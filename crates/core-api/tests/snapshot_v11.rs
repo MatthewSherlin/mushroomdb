@@ -553,8 +553,8 @@ fn a_failed_upgrade_appends_nothing() {
 ///
 /// 0.9.2 accepts V5–V10 and refuses every other version through the same
 /// `other` arm this binary uses for V12, with the text `snapshot: unsupported
-/// version {N}` — so V12 here stands in for what 0.9.2 does with V11 (TY-13's
-/// format-compat job runs the released binary itself).
+/// version {N}`. This checks the current reader's unknown-version arm;
+/// `test_v11_refused_by_09x_binary` separately runs the released v0.9.2 reader.
 #[test]
 fn a_reader_that_does_not_know_v11_refuses_by_name_and_touches_nothing() {
     assert!(!V0_9_2_ACCEPTS.contains(&11));
@@ -1170,4 +1170,565 @@ fn commit_group_nosync_upgrades_ahead_of_its_first_append() {
     let reopened = GraphDb::open(&dir).unwrap();
     assert_eq!(reopened.get_prop("a", "on"), Some(date(1)));
     assert_eq!(reopened.get_prop("b", "on"), Some(date(2)));
+}
+
+// TY-13: committed typed V11 bytes are a permanent compatibility pin.
+#[test]
+fn test_v11_golden_fixture_opens() {
+    let bytes = include_bytes!("fixtures/v11_fixture.bin");
+    assert_eq!(&bytes[..4], b"GDB1");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 11);
+    let store = CompatStore::new("golden-v11");
+    let dir = store.0.as_path();
+    std::fs::write(dir.join("snapshot.bin"), bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), []).unwrap();
+    assert!(section_ids(dir).contains(&SECTION_DECLARATIONS));
+    for _ in 0..2 {
+        let db = GraphDb::open(dir).unwrap();
+        assert!(db.is_v11());
+        assert_eq!(db.node_count(), 1);
+        assert_eq!(db.node_info("e1").unwrap().label, "E");
+        assert_eq!(db.get_prop("e1", "on"), Some(Value::Date(19_737)));
+    }
+}
+
+/// Owns only a directory created by this invocation. Failed runs retain their
+/// input, and CI also copies the closed files into its dedicated artifact root.
+struct CompatStore(PathBuf);
+
+impl CompatStore {
+    fn new(name: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ty13-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn capture(&self, name: &str) {
+        if let Some(root) = std::env::var_os("MUSHROOMDB_FORMAT_DIAGNOSTICS") {
+            let out = PathBuf::from(root).join(name);
+            std::fs::create_dir_all(&out).unwrap();
+            for file in ["snapshot.bin", "wal.bin"] {
+                let source = self.0.join(file);
+                if source.exists() {
+                    std::fs::copy(source, out.join(file)).unwrap();
+                }
+            }
+        }
+    }
+
+    fn clone_closed(&self, name: &str) -> Self {
+        let copy = Self::new(name);
+        // Preserve the entire closed input/history, including commit times and
+        // WAL floor. A lock file is process-local state and is recreated.
+        for entry in std::fs::read_dir(&self.0).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() != "LOCK" {
+                assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(entry.path(), copy.0.join(entry.file_name())).unwrap();
+            }
+        }
+        copy
+    }
+}
+
+impl Drop for CompatStore {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("compatibility input retained: {}", self.0.display());
+        } else {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+}
+
+fn released_binary(test: &str) -> PathBuf {
+    let path = PathBuf::from(std::env::var_os("MUSHROOMDB_V092_BINARY").expect(
+        "explicit format-compat gate requires MUSHROOMDB_V092_BINARY=<absolute verified v0.9.2 executable>",
+    ));
+    assert!(
+        path.is_absolute(),
+        "release executable path must be absolute"
+    );
+    assert!(
+        path.is_file(),
+        "release executable missing: {}",
+        path.display()
+    );
+    let version = old_cli(&path, &format!("{test}-version"), &["--version"]);
+    assert!(
+        version.status.success(),
+        "version command failed: {version:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        "mushroomdb 0.9.2"
+    );
+    // Current package metadata is still 0.9.2. The immutable archive checksum
+    // authenticates the release; the actual refusal below rejects a current CLI.
+    path
+}
+
+fn old_cli(binary: &Path, name: &str, args: &[&str]) -> std::process::Output {
+    let output = std::process::Command::new(binary)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("could not execute {}: {e}", binary.display()));
+    if let Some(root) = std::env::var_os("MUSHROOMDB_FORMAT_DIAGNOSTICS") {
+        let root = PathBuf::from(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(format!("{name}.stdout")), &output.stdout).unwrap();
+        std::fs::write(root.join(format!("{name}.stderr")), &output.stderr).unwrap();
+        std::fs::write(
+            root.join(format!("{name}.status")),
+            output.status.to_string(),
+        )
+        .unwrap();
+    }
+    output
+}
+
+fn wal_has_date(record: &WalRecord) -> bool {
+    match record {
+        WalRecord::Batch(records) => records.iter().any(wal_has_date),
+        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
+            matches!(value, Value::Date(19_737))
+        }
+        WalRecord::InsertNode { props, .. } => {
+            props.iter().any(|(_, v)| matches!(v, Value::Date(19_737)))
+        }
+        WalRecord::InsertNodeId { props, .. } => {
+            props.iter().any(|(_, v)| matches!(v, Value::Date(19_737)))
+        }
+        _ => false,
+    }
+}
+
+#[test]
+#[ignore = "requires the verified v0.9.2 release binary; run by format-compat"]
+fn test_v11_refused_by_09x_binary() {
+    let binary = released_binary("v11");
+    let store = CompatStore::new("released-refusal");
+    {
+        let mut db = GraphDb::open(&store.0).unwrap();
+        db.insert_node("E", "e1", props(&[("name", Value::Str("ordinary".into()))]))
+            .unwrap();
+        db.snapshot().unwrap();
+        db.set_prop("e1", "on", Value::Date(19_737)).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
+    }
+    assert_eq!(peek_snapshot_version(&store.0), Some(11));
+    let before_wal = wal_bytes(&store.0);
+    assert!(!before_wal.is_empty());
+    let (records, consumed) = decode_all(&before_wal);
+    assert_eq!(consumed, before_wal.len());
+    assert!(records.iter().any(wal_has_date));
+    let before_snapshot = std::fs::read(store.0.join("snapshot.bin")).unwrap();
+    store.capture("v11-before");
+    let result = old_cli(
+        &binary,
+        "v11-refusal",
+        &["verify", store.0.to_str().unwrap()],
+    );
+    store.capture("v11-after");
+    assert_eq!(
+        wal_bytes(&store.0),
+        before_wal,
+        "old reader changed V11 WAL"
+    );
+    assert_eq!(
+        std::fs::read(store.0.join("snapshot.bin")).unwrap(),
+        before_snapshot
+    );
+    assert!(
+        !result.status.success(),
+        "released reader must refuse actual V11; got {result:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("v8: expected one of versions [8, 9, 10], got 11"),
+        "wrong verify-path refusal: {result:?}"
+    );
+    let db = GraphDb::open(&store.0).unwrap();
+    assert_eq!(db.get_prop("e1", "on"), Some(Value::Date(19_737)));
+    assert_eq!(
+        db.get_prop("e1", "name"),
+        Some(Value::Str("ordinary".into()))
+    );
+}
+
+/// Bincode maps and sequences have the same length/pair wire representation.
+/// Decode into a sequence so duplicate IDs cannot disappear in a HashMap.
+fn sorted_map_bytes<T: serde::de::DeserializeOwned + serde::Serialize>(bytes: &[u8]) -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut entries: Vec<(u32, T)> = bincode::deserialize_from(&mut cursor).unwrap();
+    assert_eq!(
+        cursor.position() as usize,
+        bytes.len(),
+        "trailing map bytes"
+    );
+    entries.sort_by_key(|(id, _)| *id);
+    assert!(
+        entries.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "duplicate node IDs"
+    );
+    let normalized = bincode::serialize(&entries).unwrap();
+    assert_eq!(normalized.len(), bytes.len());
+    normalized
+}
+
+/// Normalize only HashMap pair order in LAST_CHANGE and Mixed blobs. All
+/// original CRCs are verified first. Only their derived CRC fields and the
+/// header CRC are cleared; every other container/section/padding byte remains.
+fn normalized_v9_snapshot(bytes: Vec<u8>) -> Vec<u8> {
+    use core_storage::v8::layout::ArchivedColumnData;
+    use core_storage::v8::{MappedBase, SECTION_COLUMNS, SECTION_LAST_CHANGE};
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 9);
+    let origin = bytes.as_ptr() as usize;
+    let mut normalized = bytes.clone();
+    let base = MappedBase::from_bytes(bytes).unwrap();
+    base.validate_section_bounds().unwrap();
+    for (id, _, _, result) in base.verify_integrity() {
+        assert!(result.is_ok(), "section {id}: {result:?}");
+    }
+    let mut mixed_count = 0;
+    for field in base.columns().unwrap().fields.iter() {
+        if let ArchivedColumnData::Mixed(blob) = &field.col {
+            let blob = blob.as_slice();
+            let start = blob.as_ptr() as usize - origin;
+            normalized[start..start + blob.len()].copy_from_slice(&sorted_map_bytes::<Value>(blob));
+            mixed_count += 1;
+        }
+    }
+    assert!(
+        mixed_count > 0,
+        "M4 control must exercise an actual Mixed column"
+    );
+    let count = u16::from_le_bytes([normalized[6], normalized[7]]) as usize;
+    let mut history_seen = false;
+    for index in 0..count {
+        let entry = 8 + 16 * index;
+        let id = normalized[entry];
+        if id == SECTION_LAST_CHANGE {
+            let start =
+                u32::from_le_bytes(normalized[entry + 4..entry + 8].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(normalized[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            let map = sorted_map_bytes::<u64>(&normalized[start..start + len]);
+            assert!(map.len() > 8, "M4 control requires nonempty LAST_CHANGE");
+            normalized[start..start + len].copy_from_slice(&map);
+            history_seen = true;
+        }
+        if id == SECTION_COLUMNS || id == SECTION_LAST_CHANGE {
+            normalized[entry + 12..entry + 16].fill(0);
+        }
+    }
+    assert!(history_seen);
+    normalized[8 + 16 * count..12 + 16 * count].fill(0);
+    normalized
+}
+
+#[test]
+fn compatibility_map_normalization_preserves_values_and_float_bits() {
+    let history = bincode::serialize(&vec![(2u32, 9u64), (1, 4)]).unwrap();
+    let reordered = bincode::serialize(&vec![(1u32, 4u64), (2, 9)]).unwrap();
+    let changed = bincode::serialize(&vec![(1u32, 5u64), (2, 9)]).unwrap();
+    assert_eq!(
+        sorted_map_bytes::<u64>(&history),
+        sorted_map_bytes::<u64>(&reordered)
+    );
+    assert_ne!(
+        sorted_map_bytes::<u64>(&history),
+        sorted_map_bytes::<u64>(&changed)
+    );
+    let mixed = |a, b| bincode::serialize(&vec![(2u32, a), (1, b)]).unwrap();
+    let original = mixed(Value::Int(7), Value::Str("a".into()));
+    let reordered =
+        bincode::serialize(&vec![(1u32, Value::Str("a".into())), (2, Value::Int(7))]).unwrap();
+    assert_eq!(
+        sorted_map_bytes::<Value>(&original),
+        sorted_map_bytes::<Value>(&reordered)
+    );
+    assert_ne!(
+        sorted_map_bytes::<Value>(&original),
+        sorted_map_bytes::<Value>(&mixed(Value::Int(8), Value::Str("a".into())))
+    );
+    assert_ne!(
+        sorted_map_bytes::<Value>(&mixed(Value::Float(0.0), Value::Int(1))),
+        sorted_map_bytes::<Value>(&mixed(Value::Float(-0.0), Value::Int(1)))
+    );
+    assert_ne!(
+        sorted_map_bytes::<Value>(&mixed(
+            Value::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::Int(1)
+        )),
+        sorted_map_bytes::<Value>(&mixed(
+            Value::Float(f64::from_bits(0x7ff8_0000_0000_0002)),
+            Value::Int(1)
+        ))
+    );
+
+    // Exercise the complete container comparator, not just its sorting helper.
+    // Each mutation gets genuine recomputed section/header CRCs so a changed
+    // value is rejected by the comparison rather than by checksum validation.
+    fn rewrite_maps(
+        snapshot: &[u8],
+        history: impl FnOnce(&mut Vec<(u32, u64)>),
+        mixed: impl FnOnce(&mut Vec<(u32, Value)>),
+    ) -> Vec<u8> {
+        use core_storage::v8::layout::ArchivedColumnData;
+        use core_storage::v8::MappedBase;
+        let owned = snapshot.to_vec();
+        let origin = owned.as_ptr() as usize;
+        let base = MappedBase::from_bytes(owned).unwrap();
+        let blob = base
+            .columns()
+            .unwrap()
+            .fields
+            .iter()
+            .find_map(|field| {
+                if let ArchivedColumnData::Mixed(blob) = &field.col {
+                    Some(blob.as_slice())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let start = blob.as_ptr() as usize - origin;
+        let mut values: Vec<(u32, Value)> = bincode::deserialize(blob).unwrap();
+        mixed(&mut values);
+        let mut out = snapshot.to_vec();
+        let encoded = bincode::serialize(&values).unwrap();
+        assert_eq!(encoded.len(), blob.len());
+        out[start..start + blob.len()].copy_from_slice(&encoded);
+        let count = u16::from_le_bytes([out[6], out[7]]) as usize;
+        let entry = (0..count)
+            .map(|i| 8 + 16 * i)
+            .find(|&p| out[p] == 11)
+            .unwrap();
+        let start = u32::from_le_bytes(out[entry + 4..entry + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(out[entry + 8..entry + 12].try_into().unwrap()) as usize;
+        let mut entries: Vec<(u32, u64)> = bincode::deserialize(&out[start..start + len]).unwrap();
+        history(&mut entries);
+        let encoded = bincode::serialize(&entries).unwrap();
+        assert_eq!(encoded.len(), len);
+        out[start..start + len].copy_from_slice(&encoded);
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            !crc
+        }
+        for index in 0..count {
+            let p = 8 + 16 * index;
+            let start = u32::from_le_bytes(out[p + 4..p + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(out[p + 8..p + 12].try_into().unwrap()) as usize;
+            let crc = crc32(&out[start..start + len]);
+            out[p + 12..p + 16].copy_from_slice(&crc.to_le_bytes());
+        }
+        let end = 8 + 16 * count;
+        let crc = crc32(&out[..end]);
+        out[end..end + 4].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+    use core_storage::v8::encode::{encode_v8, V8Meta};
+    use core_storage::{ColumnStore, IdMap, Interner, Topology};
+    let mut columns = ColumnStore::new();
+    columns.set(0, "mixed", Value::Int(7));
+    columns.set(1, "mixed", Value::Str("seven".into()));
+    columns.set(2, "mixed", Value::Float(0.0));
+    let mut ids = IdMap::new();
+    for key in ["a", "b", "c"] {
+        ids.get_or_insert(key);
+    }
+    let mut symbols = Interner::new();
+    let label = symbols.intern("E");
+    let meta = V8Meta {
+        labels: vec![label; 3],
+        last_change: [(0, 1), (1, 2), (2, 3)].into_iter().collect(),
+        ..V8Meta::default()
+    };
+    let mut original = Vec::new();
+    encode_v8(
+        None,
+        None,
+        None,
+        None,
+        None,
+        &Topology::new(),
+        &columns,
+        &ids,
+        &symbols,
+        &meta,
+        &mut original,
+    )
+    .unwrap();
+    let reordered = rewrite_maps(
+        &original,
+        |history| history.reverse(),
+        |values| values.reverse(),
+    );
+    assert_ne!(
+        original, reordered,
+        "control must actually permute the raw bytes"
+    );
+    let normalized = normalized_v9_snapshot(original.clone());
+    assert_eq!(normalized, normalized_v9_snapshot(reordered));
+    let changed_history = rewrite_maps(&original, |history| history[0].1 += 1, |_| {});
+    assert_ne!(normalized, normalized_v9_snapshot(changed_history));
+    let changed_mixed = rewrite_maps(
+        &original,
+        |_| {},
+        |values| values.iter_mut().find(|(id, _)| *id == 0).unwrap().1 = Value::Int(8),
+    );
+    assert_ne!(normalized, normalized_v9_snapshot(changed_mixed));
+    let with_float = |bits| {
+        rewrite_maps(
+            &original,
+            |_| {},
+            |values| {
+                values.iter_mut().find(|(id, _)| *id == 2).unwrap().1 =
+                    Value::Float(f64::from_bits(bits))
+            },
+        )
+    };
+    assert_ne!(
+        normalized,
+        normalized_v9_snapshot(with_float((-0.0f64).to_bits()))
+    );
+    assert_ne!(
+        normalized_v9_snapshot(with_float(0x7ff8_0000_0000_0001)),
+        normalized_v9_snapshot(with_float(0x7ff8_0000_0000_0002))
+    );
+}
+
+#[test]
+#[ignore = "requires the verified v0.9.2 release binary; run by format-compat"]
+fn test_v9_store_still_opens_under_09x() {
+    let binary = released_binary("v9");
+    let input = CompatStore::new("released-v9-input");
+    {
+        let mut db = GraphDb::open(&input.0).unwrap();
+        // Sorted-first homogeneous text interns every string used by Mixed.
+        // Released 0.9.2 itself otherwise varies its unused string-table entries
+        // when an unordered Mixed map starts with Str versus Int. This bounded
+        // fixture controls that history; no string-table normalization is used.
+        db.insert_node(
+            "E",
+            "snapshot",
+            props(&[
+                ("a_text", Value::Str("seven".into())),
+                ("mixed", Value::Int(7)),
+                ("name", Value::Str("snapshot".into())),
+            ]),
+        )
+        .unwrap();
+        db.insert_node(
+            "E",
+            "other",
+            props(&[
+                ("mixed", Value::Str("seven".into())),
+                ("name", Value::Str("other".into())),
+            ]),
+        )
+        .unwrap();
+        db.snapshot().unwrap();
+        assert_eq!(peek_snapshot_version(&input.0), Some(9));
+        db.insert_node(
+            "E",
+            "tail",
+            props(&[
+                ("name", Value::Str("tail".into())),
+                ("mixed", Value::Int(9)),
+            ]),
+        )
+        .unwrap();
+    }
+    input.capture("v9-input");
+    let verify = old_cli(&binary, "v9-verify", &["verify", input.0.to_str().unwrap()]);
+    assert!(verify.status.success(), "V9 verify: {verify:?}");
+    let query = old_cli(
+        &binary,
+        "v9-query",
+        &[
+            "query",
+            input.0.to_str().unwrap(),
+            "MATCH (n:E) RETURN n.name AS name ORDER BY name",
+        ],
+    );
+    assert!(query.status.success(), "V9 query: {query:?}");
+    let text = String::from_utf8_lossy(&query.stdout);
+    assert_eq!(
+        text.trim(),
+        "columns: name\n  name=other\n  name=snapshot\n  name=tail"
+    );
+    for keep_wal in [true, false] {
+        let mode = if keep_wal { "keep" } else { "truncate" };
+        let current = input.clone_closed(&format!("v9-current-{mode}"));
+        let old = input.clone_closed(&format!("v9-old-{mode}"));
+        {
+            let mut db = GraphDb::open(&current.0).unwrap();
+            db.snapshot_with(SnapshotOptions {
+                keep_wal,
+                ..SnapshotOptions::default()
+            })
+            .unwrap();
+        }
+        let result = old_cli(
+            &binary,
+            &format!("v9-snapshot-{mode}"),
+            &[
+                "snapshot",
+                old.0.to_str().unwrap(),
+                if keep_wal { "--keep-wal" } else { "--truncate" },
+            ],
+        );
+        current.capture(&format!("v9-current-{mode}"));
+        old.capture(&format!("v9-old-{mode}"));
+        assert!(result.status.success(), "old snapshot {mode}: {result:?}");
+        assert_eq!(wal_bytes(&current.0), wal_bytes(&old.0), "WAL {mode}");
+        let current_bytes =
+            normalized_v9_snapshot(std::fs::read(current.0.join("snapshot.bin")).unwrap());
+        let old_bytes = normalized_v9_snapshot(std::fs::read(old.0.join("snapshot.bin")).unwrap());
+        if let Some(root) = std::env::var_os("MUSHROOMDB_FORMAT_DIAGNOSTICS") {
+            std::fs::write(
+                PathBuf::from(&root).join(format!("v9-current-{mode}.normalized.bin")),
+                &current_bytes,
+            )
+            .unwrap();
+            std::fs::write(
+                PathBuf::from(root).join(format!("v9-old-{mode}.normalized.bin")),
+                &old_bytes,
+            )
+            .unwrap();
+        }
+        let first_difference = current_bytes
+            .iter()
+            .zip(&old_bytes)
+            .position(|(a, b)| a != b);
+        assert!(current_bytes == old_bytes, "snapshot bytes differ beyond map order ({mode}); lengths {} / {}, first differing offset {first_difference:?}", current_bytes.len(), old_bytes.len());
+    }
+    assert_eq!(peek_snapshot_version(&input.0), Some(9));
+    let db = GraphDb::open(&input.0).unwrap();
+    assert_eq!(db.node_count(), 3);
+    for key in ["snapshot", "other", "tail"] {
+        assert_eq!(db.get_prop(key, "name"), Some(Value::Str(key.into())));
+    }
+    assert_eq!(db.get_prop("snapshot", "mixed"), Some(Value::Int(7)));
+    assert_eq!(
+        db.get_prop("other", "mixed"),
+        Some(Value::Str("seven".into()))
+    );
+    assert_eq!(db.get_prop("tail", "mixed"), Some(Value::Int(9)));
 }
