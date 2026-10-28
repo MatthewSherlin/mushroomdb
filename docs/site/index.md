@@ -94,6 +94,7 @@ Reference:
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
 - [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
+- [Upgrade from 0.9](upgrade-from-0.9.md) — what changes for a 0.9 caller, and what stays
 - [Cypher Query Reference](query.md)
 - [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
 - [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it

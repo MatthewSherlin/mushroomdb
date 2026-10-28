@@ -57,6 +57,7 @@ SITE_DOCS=(
     python-api.md
     rust.md
     typescript.md
+    upgrade-from-0.9.md
     subscriptions.md
     timetravel.md
     durability.md

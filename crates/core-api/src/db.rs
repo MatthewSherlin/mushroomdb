@@ -16968,13 +16968,16 @@ impl<F: Fs> GraphDb<F> {
                 lost.insert(edge);
             }
         }
-        // An edge retracted and re-derived within the same re-derivation (top-k
-        // churn) is not a change the caller would see.
-        let churn: Vec<EdgeAt> = lost.intersection(&gained).cloned().collect();
-        for e in churn {
-            lost.remove(&e);
-            gained.remove(&e);
-        }
+        // Net on the edge, not the rule that owns it (ledger row 85). A top-k
+        // retraction that the same rule puts back, and an edge that changes
+        // owner inside this re-derivation, are both still there afterwards.
+        // `EdgeAt` orders the rule name too, so comparing the whole value
+        // reports that owner change as one loss and one gain.
+        let key_of = |e: &EdgeAt| (e.edge_type.clone(), e.src_key.clone(), e.dst_key.clone());
+        let lost_keys: BTreeSet<_> = lost.iter().map(key_of).collect();
+        let gained_keys: BTreeSet<_> = gained.iter().map(key_of).collect();
+        lost.retain(|e| !gained_keys.contains(&key_of(e)));
+        gained.retain(|e| !lost_keys.contains(&key_of(e)));
 
         Ok(WhatIf {
             lost: lost.into_iter().collect(),
@@ -18780,6 +18783,11 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // Provenance-owned OR a live rule would derive this pair. User-first
         // edges that a later rule matches are not in `owned`, but deleting
         // them would leave a hole `rebuild_rule` immediately fills.
+        // An edge the graph does not hold is absent, not rule-owned (ledger
+        // row 67). The rule checks below are for an edge a delete would remove.
+        if !self.has_edge(edge_type, src_key, dst_key) {
+            return Ok(false);
+        }
         if self.is_rule_owned(edge_type, src_key, dst_key) {
             return Err(GraphError::RuleOwned {
                 detail: format!(
@@ -18796,7 +18804,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 ),
             });
         }
-        Ok(self.has_edge(edge_type, src_key, dst_key))
+        Ok(true)
     }
 
     /// True if any live rule (minus overlay-deleted names) would derive
@@ -18804,19 +18812,26 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     /// CreateRule names in `extra_rules` are ignored — same documented
     /// same-batch rule-window as [`Self::is_rule_owned`].
     ///
-    /// Mirrored by `guard_matches` in `memory/forget.rs`, which names the
-    /// rules this refused for: change the two together (ledger row 67).
+    /// The same questions `memory/forget.rs`'s `would_derive` asks: namespace,
+    /// the via hop, and whether the cap can bind. A cap that can bind answers
+    /// no, which lets the delete through rather than refuse for a pair the
+    /// rule might not keep (ledger row 67). Labels come from
+    /// [`Self::label_in_batch`], so a key this batch freed and reused is the
+    /// new node, not the one the store still holds the key on (ledger row 90).
     fn would_derive(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
         if src_key == dst_key {
             return false;
         }
-        let Some(src_label) = self.label_of(src_key) else {
+        let Some(src_label) = self.label_in_batch(src_key) else {
             return false;
         };
-        let Some(dst_label) = self.label_of(dst_key) else {
+        let Some(dst_label) = self.label_in_batch(dst_key) else {
             return false;
         };
-        for rule in self.db.engine.rules() {
+        // Owned copies: a via hop asks `self.db` for neighbours, which cannot
+        // borrow the engine the rule iterator already holds.
+        let rules: Vec<RuleDef> = self.db.engine.rules().cloned().collect();
+        for rule in &rules {
             if self.overlay.deleted_rules.contains(&rule.name) {
                 continue;
             }
@@ -18826,17 +18841,64 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             if rule.src_label != src_label || rule.dst_label != dst_label {
                 continue;
             }
-            let src_props = |f: &str| self.prop_value(src_key, f);
-            let dst_props = |f: &str| self.prop_value(dst_key, f);
-            let src_view = NodeView {
-                key: src_key,
-                props: &src_props,
+            if !self.in_rule_namespace(rule, src_key) || !self.in_rule_namespace(rule, dst_key) {
+                continue;
+            }
+            let sources = self.db.nodes_with_label(&rule.src_label).len() as u64;
+            let targets = self.db.nodes_with_label(&rule.dst_label).len() as u64;
+            let cap_cannot_bind = match rule.max_edges {
+                Some(k) => targets <= k,
+                None => sources.saturating_mul(targets) <= core_rules::engine::DEFAULT_MAX_EDGES,
             };
-            let dst_view = NodeView {
-                key: dst_key,
-                props: &dst_props,
+            if !cap_cannot_bind {
+                continue;
+            }
+            let holds = match (rule.via_label.as_deref(), rule.via_edge.as_deref()) {
+                (Some(via_label), Some(via_edge)) => {
+                    let dir = rule.via_dir.unwrap_or(Direction::Out);
+                    self.db
+                        .neighbors(src_key, via_edge, dir)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|via| {
+                            self.label_in_batch(via).as_deref() == Some(via_label)
+                                && self.in_rule_namespace(rule, via)
+                                && {
+                                    let via_props = |f: &str| self.prop_value(via, f);
+                                    let dst_props = |f: &str| self.prop_value(dst_key, f);
+                                    evaluate(
+                                        &rule.predicate,
+                                        &NodeView {
+                                            key: via,
+                                            props: &via_props,
+                                        },
+                                        &NodeView {
+                                            key: dst_key,
+                                            props: &dst_props,
+                                        },
+                                    )
+                                    .is_some()
+                                }
+                        })
+                }
+                _ => {
+                    let src_props = |f: &str| self.prop_value(src_key, f);
+                    let dst_props = |f: &str| self.prop_value(dst_key, f);
+                    evaluate(
+                        &rule.predicate,
+                        &NodeView {
+                            key: src_key,
+                            props: &src_props,
+                        },
+                        &NodeView {
+                            key: dst_key,
+                            props: &dst_props,
+                        },
+                    )
+                    .is_some()
+                }
             };
-            if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
+            if holds {
                 return true;
             }
         }
@@ -18861,6 +18923,15 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return None;
         }
         self.db.syms.resolve(sym).map(str::to_string)
+    }
+
+    /// Whether `key` is in `rule`'s namespace, as this batch sees the node.
+    /// A rule with no namespace sees every node.
+    fn in_rule_namespace(&self, rule: &RuleDef, key: &str) -> bool {
+        match rule.namespace.as_deref() {
+            None => true,
+            Some(ns) => namespace_of_value(self.prop_value(key, NS_PROP).as_ref()) == ns,
+        }
     }
 
     /// The label `key` carries as this batch sees it — including a node

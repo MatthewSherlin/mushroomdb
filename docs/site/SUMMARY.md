@@ -91,6 +91,7 @@
 - [Python API](python-api.md)
 - [Rust](rust.md)
 - [TypeScript client](typescript.md)
+- [Upgrade from 0.9](upgrade-from-0.9.md)
 
 # Project
 
