@@ -287,6 +287,21 @@ describe.skipIf(NO_SERVER)("algo", () => {
     expect(report.scores.length).toBeGreaterThan(0);
     expect(typeof report.truncated).toBe("boolean");
   });
+
+  it("accepts shared weight-filter options for each algorithm", async () => {
+    const options = { weight_prop: "algcf_absent_weight", min_weight: 2, budget_ms: 0 };
+    const rank = await client.algo("pagerank", options);
+    expect(rank.scores.length).toBeGreaterThan(0);
+    for (const [, value] of rank.scores) {
+      expect(value).toBeCloseTo(1 / rank.scores.length, 12);
+    }
+    const components = await client.algo("wcc", options);
+    expect(components.components.length).toBeGreaterThan(0);
+    expect(components.components.every(([key, component]) => key === component)).toBe(true);
+    const degree = await client.algo("degree", options);
+    expect(degree.scores.length).toBeGreaterThan(0);
+    expect(degree.scores.every(([, value]) => value === 0)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

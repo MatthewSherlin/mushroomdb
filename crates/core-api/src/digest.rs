@@ -47,10 +47,14 @@ pub const UNTRUSTED_FRAMING: &str =
 /// only U+202E would leave U+202D, and only U+2028 would leave U+0085.
 ///
 /// - **ASCII controls** `0x00-0x1f` and `0x7f`, tabs and newlines included.
-/// - **Line and paragraph separators** outside ASCII: U+0085, U+2028, U+2029.
-/// - **Bidi controls and zero-width characters**: U+200B-U+200F, U+202A-U+202E,
-///   U+2066-U+2069, U+FEFF. These reorder or conceal rendered text without
-///   changing the bytes a reader would diff.
+/// - **C1 controls** U+0080–U+009F, which includes the line break U+0085, plus
+///   the soft hyphen U+00AD.
+/// - **Line and paragraph separators** outside those: U+2028, U+2029.
+/// - **Bidi controls, zero-width characters and variation selectors**:
+///   U+200B-U+200F, U+202A-U+202E, U+2060-U+2064, U+2066-U+2069, U+FE00-U+FE0F,
+///   U+FEFF. These reorder or conceal rendered text without changing the bytes
+///   a reader would diff. U+2060, U+00AD, U+FE0F and the rest of the C1 block
+///   are the gap ledger row 90 named.
 ///
 /// One char in, one char out, so a caller's character budget is unaffected and
 /// the byte length can only shrink — never grow.
@@ -85,7 +89,7 @@ pub fn sanitize(s: &str) -> String {
 /// from it.
 ///
 /// No behavioural test can distinguish the two forms: the `matches!` set's
-/// smallest member is U+0085, so it is disjoint from ASCII, and
+/// smallest member is U+0080, so it is disjoint from ASCII, and
 /// `is_ascii_control` is false above U+007F — the reorder is equivalent over
 /// every code point, which `sanitize_bench` asserts before it times anything.
 /// `sanitize_classifies_every_ascii_byte` pins the branch this reordering moves.
@@ -95,11 +99,14 @@ fn is_shape_forging(c: char) -> bool {
         return c.is_ascii_control();
     }
     matches!(c,
-        '\u{0085}'                      // NEL
+        '\u{0080}'..='\u{009f}'         // C1 controls, NEL included
+        | '\u{00ad}'                    // soft hyphen
         | '\u{200b}'..='\u{200f}'       // ZWSP, ZWNJ, ZWJ, LRM, RLM
         | '\u{2028}' | '\u{2029}'       // line / paragraph separator
         | '\u{202a}'..='\u{202e}'       // bidi embeddings and overrides
+        | '\u{2060}'..='\u{2064}'       // word joiner and invisible operators
         | '\u{2066}'..='\u{2069}'       // bidi isolates
+        | '\u{fe00}'..='\u{fe0f}'       // variation selectors
         | '\u{feff}'                    // zero-width no-break space / BOM
     )
 }
@@ -160,6 +167,10 @@ mod tests {
             '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', // ZWNJ/ZWJ, LRM/RLM
             '\u{feff}', // BOM as zero-width no-break space
             '\u{0085}', // NEL — a line break outside ASCII
+            '\u{0080}', '\u{009f}', // the ends of the C1 block
+            '\u{00ad}', // soft hyphen
+            '\u{2060}', // word joiner
+            '\u{fe0f}', // variation selector-16
         ] {
             let clean = sanitize(&format!("a{cp}b"));
             assert_eq!(

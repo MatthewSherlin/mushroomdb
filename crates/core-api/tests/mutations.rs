@@ -925,3 +925,56 @@ fn cypher_set_topk_evict_and_backfill() {
     );
     assert_eq!(db.stats().rules[0].edges, 2);
 }
+
+/// Deleting an edge the graph does not hold is `false`, even when a live rule
+/// matches the two nodes. A hand-written edge a via-hop rule cannot reach —
+/// there is no via node — deletes (ledger row 67).
+#[test]
+fn delete_of_an_absent_edge_is_not_rule_owned_and_a_via_rule_with_no_hop_does_not_block() {
+    let dir = tmp("mut-row67");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![("team".into(), Value::Str("red".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "b",
+        vec![("team".into(), Value::Str("red".into()))],
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "via_team".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: Predicate::FieldEqual {
+            field: "team".into(),
+        },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Team".into()),
+        via_edge: Some("MEMBER_OF".into()),
+        via_dir: Some(Direction::Out),
+        namespace: None,
+    })
+    .unwrap();
+
+    assert!(
+        !db.delete_edge("LINKED", "a", "b").unwrap(),
+        "no edge is there to delete"
+    );
+
+    assert!(db.insert_edge("LINKED", "a", "b").unwrap());
+    assert!(
+        db.delete_edge("LINKED", "a", "b").unwrap(),
+        "a via-hop rule with no via node must not keep a hand-written edge"
+    );
+    assert!(db
+        .neighbors("a", "LINKED", Direction::Out)
+        .unwrap()
+        .is_empty());
+}

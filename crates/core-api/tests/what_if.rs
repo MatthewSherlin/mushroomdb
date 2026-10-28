@@ -253,3 +253,65 @@ fn what_if_set_prop_with_no_effect_is_empty() {
         .unwrap();
     assert!(wi.lost.is_empty() && wi.gained.is_empty(), "{wi:?}");
 }
+
+/// An edge that changes owner is still there. It is not one loss and one gain
+/// (ledger row 85).
+#[test]
+fn what_if_set_prop_nets_an_edge_that_changes_owner() {
+    let dir = tmp("owner");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (k, team) in [("a", "red"), ("b", "red")] {
+        db.insert_node(
+            "Person",
+            k,
+            vec![
+                ("team".into(), Value::Str(team.into())),
+                ("city".into(), Value::Str("nyc".into())),
+            ],
+        )
+        .unwrap();
+    }
+    let mut by_team = teammates_rule();
+    by_team.name = "by_team".into();
+    by_team.edge_type = "LINKED".into();
+    let by_city = RuleDef {
+        name: "by_city".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: Predicate::FieldEqual {
+            field: "city".into(),
+        },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    };
+    db.create_rule(by_team).unwrap();
+    db.create_rule(by_city).unwrap();
+    let before = derived_edges(&db, "a");
+    assert!(
+        before.contains(&("LINKED".into(), "a".into(), "b".into()))
+            || before.contains(&("LINKED".into(), "b".into(), "a".into())),
+        "a rule should link a and b before the change: {before:?}"
+    );
+
+    let wi = db
+        .what_if_set_prop("a", "team", Value::Str("blue".into()))
+        .unwrap();
+    drop(db);
+    let lost = as_triples(&wi.lost);
+    let gained = as_triples(&wi.gained);
+    let overlap: BTreeSet<_> = lost.intersection(&gained).cloned().collect();
+    assert!(
+        overlap.is_empty(),
+        "an edge in both lists changed owner and is still there: lost {lost:?} gained {gained:?}"
+    );
+
+    let (want_lost, want_gained) = real_diff(&dir, "a", "team", Value::Str("blue".into()));
+    assert_eq!(lost, want_lost, "lost");
+    assert_eq!(gained, want_gained, "gained");
+}

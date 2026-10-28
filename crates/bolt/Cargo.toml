@@ -19,7 +19,7 @@ default = []
 tls = ["dep:tokio-rustls"]
 
 [dependencies]
-mushroomdb = { path = "../core-api", version = "0.9.2" }
+mushroomdb = { path = "../core-api", version = "0.10.0" }
 tokio = { version = "1", features = ["io-util", "time", "sync", "rt", "macros", "net"] }
 # Already in the tree through the HTTP TLS stack; no crypto provider is chosen
 # here, the binary's rustls features decide it.

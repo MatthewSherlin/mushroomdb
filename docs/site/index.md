@@ -68,6 +68,7 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 - [Transactions](transactions.md) — several statements as one atomic commit, under snapshot isolation, from every surface
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
+- [Property value types](types.md) — date/time, duration and binary representations and limits
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — which page covers which surface
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
@@ -93,6 +94,7 @@ Reference:
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
 - [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
+- [Upgrade from 0.9](upgrade-from-0.9.md) — what changes for a 0.9 caller, and what stays
 - [Cypher Query Reference](query.md)
 - [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
 - [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it
@@ -100,12 +102,14 @@ Reference:
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
 - [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
-- [Property (equality) indexes](indexes.md)
+- [Property indexes](indexes.md)
+- [Unique constraints](constraints.md) — declare single-property uniqueness and understand write refusals
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
 - [Live Subscriptions](subscriptions.md)
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
+- [Data safety and evidence](data-safety.md) — recovery, compatibility, sync policy and backup checks
 - [Running several processes against one store](multiprocess.md)
 - [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)

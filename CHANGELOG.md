@@ -1,12 +1,47 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — Cypher, Bolt, and a store you host yourself
 
-- **The published container image is built with TLS**, so `--tls-cert` and `--tls-key` work at container start without a custom build (HO-01). CI now runs the server's TLS tests with `--features tls`.
+Not tagged. The date in the release heading is the tag date. Per-unit notes that
+are not repeated here are in `changelog.d/`.
+
+A store that never uses a 0.10 feature opens under 0.9.x, and 0.9.x opens under
+0.10. The first write of a new value type, a unique constraint, a range index or
+a relationship property moves that store to snapshot format V11. 0.9.x then
+stops with `snapshot: unsupported version 11` and does not touch the WAL. There
+is no downgrade. That first write costs one snapshot (5.6 s at 1M nodes, measured
+for the spec). Later writes do not.
+
+### Migration from 0.9.x
+
+See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
+
+- **Python.** `db.remember`, `db.recall`, `db.upsert_entity`, `db.forget`, `db.schema_report` and `db.identity_clusters` still work and emit `DeprecationWarning`. Call `db.memory.<name>`. The old names go away in 0.11.
+- **Rust.** `Value` has five new variants (`Date`, `LocalDateTime`, `DateTime`, `Duration`, `Binary`). `GraphError` has `ConstraintViolation`, `ConstraintCreationConflict`, `ValueTooLarge` and `Unwritable`. An exhaustive `match` needs the new arms. `json_to_value` returns `Result`.
+- **JSON.** A one-key object `{"$date":…}`, `{"$ldt":…}`, `{"$dt":…}`, `{"$dur":…}` or `{"$binary":…}` is a typed value, not a map. A payload that is not that tag's text is an error. A bare string is still a string. A store that already holds the old map exports it as a map, and importing that export stores the typed value.
+- **CLI help** is grouped differently. Flags and subcommand names are unchanged.
+- **Crate keywords** on the library no longer include `agent-memory` or `mcp`. Search only; no code change.
+
+### What's new
+
+- **Cypher.** Scalar and list functions, aggregates, list comprehensions, `UNWIND`, `REMOVE`, `SET` from a map, `MERGE` of a relationship, named paths, `EXPLAIN`, temporal functions (`date`, `localdatetime`, `datetime`, `duration`), and `CALL` of the built-in procedures. `LOAD CSV` reads a file in a query. OpenCypher conformance on the vendored TCK is 72.7% (strict 72.1%). `time()` and `localtime()` fail with `not supported in mushroomdb 0.10: time types`.
+- **Bolt and transactions.** A Bolt listener on `--bolt-port` (unset means no listener). Explicit transactions in Rust (`SharedDb::begin_transaction`), Python, TypeScript and `POST /tx/*`. A commit that conflicts is a retryable error. Reads on HTTP do not take the write lock.
+- **Deploy.** The published image is built with TLS. `/ready`, CORS, hashed access keys, Prometheus text on `GET /metrics`, JSON logs, continuous S3 backup with a bucket lease, `mushroomdb restore --from`, restore on boot, and graceful shutdown. Templates for Fly, Render, Compose, Railway and Kubernetes are in `deploy/`.
+- **Docs and integrations.** Language quickstarts, a conformance table, property types, constraints, range indexes, a data-safety page, and an offline graph retrieval example. `langchain-mushroomdb` and `llama-index-graph-stores-mushroomdb` publish with the release.
 
 ### Fixed
 
 - **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
+- **Deleting an edge that is not in the graph is no longer `RuleOwned` when a rule matches the two nodes.** A via-hop rule with no via node, a rule in another namespace, and a rule whose cap can exclude the pair no longer block a hand-written edge either (row 67).
+- **`what_if_set_prop` no longer lists an edge that changes owner as both lost and gained.** The diff nets on the edge (row 85).
+- **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
+- **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
+
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 101, 120, 121, 122, 136, 137, 140, 142, 152, 155, 156 and 159 stay deferred.
+
+### Deprecated
+
+- **Python top-level memory methods.** Use `db.memory.remember` and the same for `recall`, `upsert_entity`, `forget`, `schema_report` and `identity_clusters`. Removed in 0.11.
 
 ### Changed
 

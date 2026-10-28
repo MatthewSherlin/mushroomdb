@@ -14,7 +14,7 @@ name = "core_query"
 
 [dependencies]
 rand = "0.9"
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.9.2" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.10.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }

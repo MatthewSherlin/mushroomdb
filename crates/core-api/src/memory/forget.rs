@@ -240,10 +240,9 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
         } => {
             let changed = match db.delete_edge(predicate, subject, object) {
                 Ok(c) => c,
-                // The engine's guard refuses before it looks for the edge
-                // (ledger row 67), so a fact nobody stated can come back
-                // `RuleOwned`. An edge that is not there is nothing to
-                // retract, whatever a rule says about the pair.
+                // An absent edge is `Ok(false)` (ledger row 67). This arm
+                // remains so a `RuleOwned` raised for an edge the store does
+                // not hold is still nothing to retract.
                 Err(GraphError::RuleOwned { .. }) if !has_edge(db, predicate, subject, object) => {
                     false
                 }

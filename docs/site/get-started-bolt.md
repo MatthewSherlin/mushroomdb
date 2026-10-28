@@ -41,12 +41,26 @@ repository: [`tests/bolt/python_compat.py`](https://github.com/MatthewSherlin/mu
 and [`tests/bolt/js_compat.mjs`](https://github.com/MatthewSherlin/mushroomdb/blob/main/tests/bolt/js_compat.mjs).
 CI runs both against every change.
 
+On a fresh store, run each statement in its own call through the connected driver:
+
+```cypher
+CREATE (:Person {id: 'alice', name: 'Alice'})-[:KNOWS]->(:Person {id: 'bob', name: 'Bob'})
+```
+
+```cypher
+MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name
+```
+
+The query returns one row: `Alice`, `Bob`. The linked working driver programs
+show session creation and result iteration; the server retains the graph in
+`./db` when stopped.
+
 ## 3. Check the app's queries
 
 Auto-commit statements, explicit and managed transactions, bookmarks, streaming and result summaries
 work as the drivers expect. What most often needs a change in an existing app:
 
-- **One label per node.** A node has exactly one label, set when it is created; see
+- **At most one label per node.** A node may be unlabeled, or have one label set when it is created; see
   [Concepts](concepts.md).
 - **`id(n)` is the node's key**, not the integer id a driver shows for a node. Match on the key, or on
   the element id; see [Nodes, relationships and paths](bolt.md#nodes-relationships-and-paths).
@@ -65,3 +79,5 @@ work as the drivers expect. What most often needs a change in an existing app:
 
 - [Drivers and Bolt](drivers-bolt.md): which driver features are supported.
 - [Bolt protocol](bolt.md): flags, limits, the version handshake and the value mapping.
+- [Agent memory](quickstart.md): memory operations when your application needs them.
+- [Deployment](deployment.md): run the service with persistent storage.

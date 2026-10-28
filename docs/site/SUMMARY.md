@@ -15,6 +15,7 @@
 # Data model
 
 - [Concepts](concepts.md)
+- [Property value types](types.md)
 
 # Cypher reference
 
@@ -34,6 +35,7 @@
 # Indexes and constraints
 
 - [Indexes](indexes.md)
+- [Unique constraints](constraints.md)
 - [Full-text search](fulltext.md)
 - [Vector search](vector.md)
 
@@ -57,6 +59,7 @@
 
 # Data safety
 
+- [Data safety and evidence](data-safety.md)
 - [Concurrency](concurrency.md)
 - [Panic policy](panic-policy.md)
 - [Testing](testing.md)
@@ -88,6 +91,7 @@
 - [Python API](python-api.md)
 - [Rust](rust.md)
 - [TypeScript client](typescript.md)
+- [Upgrade from 0.9](upgrade-from-0.9.md)
 
 # Project
 

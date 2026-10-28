@@ -36,4 +36,5 @@ Docker and configuration: [Get started](docs/site/get-started.md).
 - [Time travel](docs/site/timetravel.md)
 - [Rules](docs/site/rules.md)
 - [MCP tools](docs/site/mcp-tools.md)
+- [Upgrade from 0.9](docs/site/upgrade-from-0.9.md)
 - [Full reference for LLMs](llms-full.txt)

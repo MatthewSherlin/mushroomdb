@@ -1,68 +1,128 @@
-# Property (equality) indexes
+# Property indexes
 
-An equality index makes `MATCH (n:Label {field: value})` a direct lookup
-instead of a full scan of every node with that label. It is the right tool for
-selective property filters — `WHERE`-style equality on an id, email, city,
-status, or any scalar field — once a label holds more than a few thousand nodes.
+Equality indexes answer exact scalar lookups. Range indexes also answer
+ordered bounds, string prefixes and eligible ordered top-k queries. Both
+maintain postings as data changes; declaring one preserves query results.
 
-Only **scalar** values are indexable (`Int`, `Float`, `Str`, `Bool`). List- and
-map-valued properties are skipped: a list has no single equality key.
+| Index | Declare through | Query uses |
+|---|---|---|
+| Equality | `enable_index`, schema file, HTTP | exact equality and compound equality intersection |
+| Range | Cypher `CREATE INDEX`, `enable_range_index`, HTTP | equality, ordered bounds, `STARTS WITH`, eligible `ORDER BY … LIMIT` |
 
-## Declaring an index
+Indexable scalars are Int, Float, Str, Bool, Date, LocalDateTime, DateTime and
+Binary. Lists, maps and Duration have no index key. Binary equality is
+supported; Binary range-query acceleration is outside the advertised
+guarantee. See [Property value types](types.md).
 
-Via a schema file (idempotent — re-applying is a no-op):
+## Declare and inspect
+
+A named or anonymous Cypher index is a **range index**:
+
+```sh
+mushroomdb query index-demo "CREATE INDEX by_age FOR (n:Person) ON (n.age)"
+mushroomdb query index-demo "CREATE INDEX FOR (n:Person) ON (n.score)"
+mushroomdb schema indexes index-demo
+```
+
+```text
+name             | type  | label  | property | state
+by_age           | range | Person | age      | online
+idx_Person_score | range | Person | score    | online
+```
+
+The equivalent listing is `SHOW INDEXES`; its columns are `name`, `type`,
+`label`, `property` and `state`. Type is `range`, `equality` or `fulltext`;
+state is always `online`, since declaration builds the index synchronously.
+Rows are sorted by name.
+
+```cypher
+CREATE INDEX by_age IF NOT EXISTS FOR (n:Person) ON (n.age)
+SHOW INDEXES
+DROP INDEX by_age IF EXISTS
+```
+
+Without a name, the default is `idx_<Label>_<property>` and redeclaring that
+label/property pair is a no-op. A named duplicate is an error unless `IF NOT
+EXISTS` applies. `DROP INDEX name` refuses a missing name; `IF EXISTS` makes
+that a no-op. Each schema statement is the whole statement, with no trailing
+`RETURN`. See [Cypher DDL](query.md#schema-statements-ddl) for collisions and
+scope rules.
+
+For an equality index, retain the existing schema-file form:
 
 ```json
 { "indexes": [["Person", "city"], ["Company", "status"]] }
 ```
 
-```bash
-mushroomdb schema apply mydb.db schema.json
-# → created index:Person.city
-```
-
-Or from the embedded API:
+Or use the Rust API on an open `db`:
 
 ```rust
 db.enable_index("Person", "city")?;
-// db.disable_index("Person", "city")?;
-// db.is_index_enabled("Person", "city");
+db.enable_range_index("by_age", "Person", "age")?;
 ```
 
-Over HTTP, apply a schema through `POST /query` / the schema endpoint the same
-way you declare rules or fulltext fields.
+[CLI schema commands](cli.md#schema) list and apply schemas. The
+[HTTP schema reference](http.md#schema-indexes-and-constraints) documents the
+actual list/create/delete routes and accepted bodies. Equality and full-text
+indexes are not created by Cypher `CREATE INDEX`.
 
-## Semantics
+## Equality predicates
 
-- **Maintained incrementally.** Every insert, `SET`, and delete updates the
-  index; you never rebuild it by hand.
-- **Rebuilt on open.** The *declaration* is persisted in the WAL (and the
-  snapshot baseline); the postings are rebuilt from live data when the store
-  opens — so an index survives a snapshot and reopen with no format migration.
-- **Used automatically.** The planner rewrites a single non-`id` equality in a
-  MATCH property map to an indexed lookup. If the field is not indexed the query
-  still runs, just as a scan — declaring an index never changes results, only
-  speed.
-- **Which query shapes.** The fast path covers:
-  - A single non-`id` equality in the inline property map:
-    `MATCH (n:Person {city: 'austin'})` or `MATCH (n:Person {city: $c})`.
-  - A `WHERE`-clause single equality on the scan variable:
-    `MATCH (n:Person) WHERE n.city = 'austin'` or `WHERE n.city = $c`.
-    The equality is folded into an `IndexScan` at plan time.
-  - **Compound equalities** (two or more equalities on the same scan variable):
-    `MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30` or equivalently
-    as an inline map `MATCH (n:Person {city: 'austin', age: 30})`. The planner
-    emits an `IndexIntersect` op; the executor resolves each field against the
-    property index, two-pointer-intersects the resulting sorted node-ID lists,
-    then post-filters any fields that have no declared index. If no fields are
-    indexed the query falls back to a full label scan — results are always
-    correct; only the speed benefit depends on indexes being declared. Compound
-    `WHERE` predicates with non-equality residuals (`AND n.score > 10`) fold
-    the equality terms and leave the rest as a trailing filter.
-  - Eligibility rules: the fold applies when the scan node has no prior
-    `Expand` binding it (conservative — cross-expand pushdown is not yet
-    supported). The `id` pseudo-property is always resolved via the identity
-    map and is excluded from index intersection.
+A declared equality or range index can answer a non-`id` property-map lookup
+such as `MATCH (n:Person {city:'London'})` or a single `WHERE n.city = 'London'`.
+Compound equalities on the same scan variable can intersect indexed node-ID
+lists; unindexed fields remain residual filters. With no eligible index the
+query scans. The `id` pseudo-property uses the identity map instead.
+Cross-expand pushdown is not supported.
+
+## Range predicates and ordering
+
+With a range index on `(Person, age)`, these use supported predicate syntax:
+
+```cypher
+MATCH (n:Person) WHERE n.age >= 30 AND n.age < 50 RETURN n
+MATCH (n:Person) WHERE n.age < 50 RETURN n
+MATCH (n:Person) WHERE n.age <= 50 RETURN n
+MATCH (n:Person) WHERE n.age > 30 RETURN n
+MATCH (n:Person) RETURN n.age ORDER BY n.age DESC LIMIT 10
+```
+
+Either side may hold the property (`30 < n.age`); bounds may be literals or
+parameters. A Str range index also supports `n.name STARTS WITH 'Ad'`.
+`BETWEEN` is not supported: use two bounds joined by `AND`.
+
+Eligible `ORDER BY n.prop [DESC] … LIMIT` (with optional `SKIP`) has no WHERE,
+or only range/prefix bounds on that same property. It reads from the ordered
+index and stops once the required rows and all boundary ties are known. Tie
+order and null placement match the scan: missing values sort last ascending,
+first descending. Unfiltered DESC also walks the label once to find missing
+values. An ascending query that reaches beyond numbers, strings and booleans
+can also walk the label; descending `STARTS WITH` reads all prefix matches.
+
+Temporal bounds range within their own type; Int and Float compare as
+numbers. Bool inequality bounds use a scan, where `false < true`; the range
+index is not read for them. Duration, list or null bounds also fall back to
+the scan, but have no ordered matches. A range declaration does not create
+an ordered Duration key or change those comparisons.
+
+Transactions, readers with an unfolded recent-commit layer, pseudo-properties
+`key`/`id`/`label`, and cross-relationship query shapes may scan. Declaring a
+range index is not a promise that every query avoids scanning. The complete
+eligibility rules are in [the query reference](query.md#schema-statements-ddl).
+
+## Persistence and ownership
+
+Declarations survive WAL replay and snapshots. Postings rebuild from live
+properties on open. Equality-only declarations preserve the older format;
+the first range-index declaration opts the store into sticky V11. Removing
+the last range index does not downgrade it. See
+[Format stability](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md#v11-is-opt-in-and-sticky).
+
+An equality index used by a [unique constraint](constraints.md) cannot be
+dropped while the constraint owns it. Dropping the constraint leaves that
+index in place. `SHOW INDEXES` names equality indexes `eq_<Label>_<property>`
+and full-text indexes `ft_<Label>_<property>`; those prefixes are reserved for
+those kinds and cannot name a range index.
 
 ## Relationship to the vector index
 
