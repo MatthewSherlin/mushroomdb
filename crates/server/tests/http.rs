@@ -73,6 +73,190 @@ fn parse_json(bytes: &[u8]) -> Json {
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
 }
 
+async fn algcf_arrays_need_objects(algorithm: &str, arrays: Vec<Json>) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("algcf-{algorithm}-{nonce}");
+    let dir = std::env::temp_dir().join(format!("graphdb-http-{name}-{}", std::process::id()));
+    let (app, db) = open(&name);
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    let before = {
+        let read = db.read();
+        (
+            read.commit_seq(),
+            read.all_nodes_for_export(),
+            read.all_edges_with_props_for_export(),
+        )
+    };
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    for value in arrays {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req("POST", &format!("/algo/{algorithm}"), value),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(parse_json(&body)["error"]
+            .as_str()
+            .unwrap()
+            .contains("object"));
+        let read = db.read();
+        assert_eq!(
+            (
+                read.commit_seq(),
+                read.all_nodes_for_export(),
+                read.all_edges_with_props_for_export()
+            ),
+            before
+        );
+        assert_eq!(std::fs::read(dir.join("wal.bin")).unwrap(), wal);
+    }
+}
+
+#[tokio::test]
+async fn algcf_pagerank_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "pagerank",
+        vec![
+            json!([]),
+            json!([0.85]),
+            json!([0.85, 50, 0.000001, null, "out", 5000, null, null]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_wcc_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "wcc",
+        vec![json!([]), json!([null]), json!([null, 5000, null, null])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_degree_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "degree",
+        vec![
+            json!([]),
+            json!([null]),
+            json!([null, "both", 5000, null, null]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_scalars_are_not_configs_and_malformed_json_stays_an_extractor_error() {
+    for algorithm in ["pagerank", "wcc", "degree"] {
+        algcf_arrays_need_objects(
+            algorithm,
+            vec![Json::Null, json!(17), json!(true), json!("text")],
+        )
+        .await;
+        let (app, _) = open(&format!("algcf-malformed-{algorithm}"));
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/algo/{algorithm}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, body, _) = send(app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn algcf_named_defaults_and_weight_filters_keep_algorithm_results() {
+    let (app, db) = open("algcf-named-weighted");
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    db.submit_batch(vec![mushroomdb::BatchOp::SetEdgeProp {
+        edge_type: "KNOWS".into(),
+        src_key: "a".into(),
+        dst_key: "b".into(),
+        field: "score".into(),
+        value: Value::Float(0.1),
+    }])
+    .unwrap();
+    let configs = [
+        (
+            "pagerank",
+            serde_json::to_value(mushroomdb::algo::PageRankConfig::default()).unwrap(),
+        ),
+        (
+            "wcc",
+            serde_json::to_value(mushroomdb::algo::WccConfig::default()).unwrap(),
+        ),
+        (
+            "degree",
+            serde_json::to_value(mushroomdb::algo::DegreeConfig::default()).unwrap(),
+        ),
+    ];
+    for (algorithm, named) in configs {
+        let route = format!("/algo/{algorithm}");
+        let (status, defaults, _) = send(app.clone(), json_req("POST", &route, json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, explicit, _) = send(app.clone(), json_req("POST", &route, named)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parse_json(&defaults), parse_json(&explicit));
+        let (status, filtered, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                &route,
+                json!({"weight_prop":"score","min_weight":0.5,"budget_ms":0}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&filtered)
+        );
+        let filtered = parse_json(&filtered);
+        match algorithm {
+            "pagerank" => {
+                assert!(filtered["scores"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| (row[1].as_f64().unwrap() - 0.5).abs() < 1e-12));
+            }
+            "wcc" => assert_eq!(filtered["components"], json!([["a", "a"], ["b", "b"]])),
+            _ => assert_eq!(filtered["scores"], json!([["a", 0], ["b", 0]])),
+        }
+    }
+    let (status, out, _) = send(
+        app.clone(),
+        json_req("POST", "/algo/degree", json!({"direction":"out"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&out)["scores"], json!([["a", 1], ["b", 0]]));
+    let (status, incoming, _) = send(
+        app,
+        json_req("POST", "/algo/degree", json!({"direction":"in"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&incoming)["scores"], json!([["b", 1], ["a", 0]]));
+}
+
 /// Binding: `/health` answers without a credential, and tells an
 /// uncredentialed caller nothing but that the server is alive.
 ///
@@ -2121,17 +2305,18 @@ async fn role_token_algo_is_403() {
         Some("admin"),
         &[("role-tok", "analyst")],
     );
-    let req = authed_json_req("POST", "/algo/pagerank", "role-tok", json!({}));
-    let (status, _, _) = send(app.clone(), req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/pagerank must be 403");
-
-    let req = authed_json_req("POST", "/algo/wcc", "role-tok", json!({}));
-    let (status, _, _) = send(app.clone(), req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/wcc must be 403");
-
-    let req = authed_json_req("POST", "/algo/degree", "role-tok", json!({}));
-    let (status, _, _) = send(app, req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/degree must be 403");
+    for route in ["/algo/pagerank", "/algo/wcc", "/algo/degree"] {
+        for body in [json!({}), json!([]), Json::Null, json!(17)] {
+            let req = authed_json_req("POST", route, "role-tok", body);
+            let (status, body, _) = send(app.clone(), req).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{route}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
 }
 
 // ── 12. /explain via role token → 403 ────────────────────────────────────────
