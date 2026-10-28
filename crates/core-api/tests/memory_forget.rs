@@ -431,24 +431,15 @@ fn a_fact_that_does_not_exist_is_nothing_to_retract_even_when_a_rule_matches_the
     assert_eq!(report, expected);
 }
 
-/// A via-hop rule with no via node would not derive the edge. The engine's
-/// guard refuses all the same — it evaluates the predicate on the pair and
-/// never looks at the hop — so the refusal names the rule as the reason
-/// without saying it would derive anything.
+/// A via-hop rule with no via node would not derive the edge, so the
+/// hand-written edge deletes (ledger row 67).
 #[test]
-fn a_via_rule_with_no_via_node_is_not_said_to_derive_the_hand_written_fact() {
+fn a_via_rule_with_no_via_node_does_not_keep_the_hand_written_fact() {
     let mut db = store("via-missing");
     two_reds(&mut db);
     db.insert_edge("LINKED", "a", "b").unwrap();
     db.create_rule(via_team_rule()).unwrap();
-
-    assert_eq!(
-        refusal(&mut db),
-        "refused: LINKED a → b was written by hand and no rule derived it, but rule \
-         via_team matches these two nodes' properties and may derive it again, so the \
-         delete is refused. It can be deleted once the fields that rule reads (team) no \
-         longer match, or once the rule is deleted. Nothing was written."
-    );
+    forgets_the_hand_written_edge(&mut db);
 }
 
 /// The same rule with its hop in place — a `Team` node the source belongs to,
@@ -477,10 +468,10 @@ fn a_via_rule_whose_hop_holds_is_said_to_derive_the_hand_written_fact() {
     );
 }
 
-/// A rule scoped to a namespace sees neither node outside it and derives
-/// nothing between them; the guard does not look at the namespace either.
+/// A rule scoped to another namespace sees neither node and derives nothing
+/// between them, so the hand-written edge deletes (ledger row 67).
 #[test]
-fn a_rule_scoped_to_another_namespace_is_not_said_to_derive_the_hand_written_fact() {
+fn a_rule_scoped_to_another_namespace_does_not_keep_the_hand_written_fact() {
     let mut db = store("other-namespace");
     two_reds(&mut db);
     db.insert_edge("LINKED", "a", "b").unwrap();
@@ -488,20 +479,14 @@ fn a_rule_scoped_to_another_namespace_is_not_said_to_derive_the_hand_written_fac
     scoped.edge_type = "LINKED".into();
     scoped.namespace = Some("tenant".into());
     db.create_rule(scoped).unwrap();
-
-    let detail = refusal(&mut db);
-    assert!(
-        detail.contains("rule same_team matches these two nodes' properties and may derive it")
-            && !detail.contains("would derive"),
-        "{detail}"
-    );
+    forgets_the_hand_written_edge(&mut db);
 }
 
 /// A rule keeps its best `max_edges` targets per source. With more candidates
-/// than that, whether this pair is among them is not something the predicate
-/// answers, so the refusal does not say the rule would derive it.
+/// than that, the guard does not claim the rule would keep this pair, so the
+/// hand-written edge deletes (ledger row 67).
 #[test]
-fn a_rule_whose_per_source_cap_could_bind_is_not_said_to_derive_the_hand_written_fact() {
+fn a_rule_whose_per_source_cap_could_bind_does_not_keep_the_hand_written_fact() {
     let mut db = store("cap-binds");
     two_reds(&mut db);
     db.insert_edge("LINKED", "a", "b").unwrap();
@@ -517,18 +502,18 @@ fn a_rule_whose_per_source_cap_could_bind_is_not_said_to_derive_the_hand_written
     capped.edge_type = "LINKED".into();
     capped.max_edges = Some(1);
     db.create_rule(capped).unwrap();
-    assert!(
-        db.explain("a", "b")
-            .unwrap()
-            .iter()
-            .all(|e| e.src_key != "a"),
-        "fixture: a → b was there first, so it is in no provenance"
-    );
+    forgets_the_hand_written_edge(&mut db);
+}
 
-    let detail = refusal(&mut db);
+/// The edge is gone, and `forget` reports that it changed something.
+fn forgets_the_hand_written_edge(db: &mut Db) {
+    let report =
+        forget(db, &linked_a_b()).expect("a rule that would not derive the edge lets it go");
+    assert!(report.changed, "{report:?}");
     assert!(
-        detail.contains("rule same_team matches these two nodes' properties and may derive it")
-            && !detail.contains("would derive"),
-        "{detail}"
+        db.neighbors("a", "LINKED", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "the hand-written edge is gone"
     );
 }
