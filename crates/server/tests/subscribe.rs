@@ -386,3 +386,32 @@ async fn subscribe_ws_query_sub_invalid_cypher_returns_error() {
         "expected error frame for non-allowlisted query, got {ev}"
     );
 }
+
+/// QL-17: a query subscription whose rows hold a null list element streams
+/// the row (it used to panic the connection task on serialisation).
+#[tokio::test]
+async fn subscribe_ws_query_row_with_a_null_element_is_delivered() {
+    let db = SharedDb::open(&tmp("ws-query-null")).unwrap();
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect_subscribe(
+        addr,
+        r#"{"cypher":"MATCH (n:L) RETURN [n.x, n.missing] AS l"}"#,
+    )
+    .await;
+    db.write()
+        .insert_node("L", "a", vec![("x".into(), Value::Int(9))])
+        .unwrap();
+    let ev = next_text(&mut ws).await;
+    assert_eq!(ev["type"], "query_row_added", "{ev}");
+    assert_eq!(
+        ev["row"],
+        serde_json::json!([{"List": [{"Int": 9}, "Null"]}]),
+        "{ev}"
+    );
+    // The connection is still alive: a second insert arrives too.
+    db.write()
+        .insert_node("L", "b", vec![("x".into(), Value::Int(10))])
+        .unwrap();
+    let ev = next_text(&mut ws).await;
+    assert_eq!(ev["type"], "query_row_added", "{ev}");
+}

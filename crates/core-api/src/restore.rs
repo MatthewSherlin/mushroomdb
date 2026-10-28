@@ -9,7 +9,7 @@
 //! over [`restore_if_empty`] here, with the CLI's error type; the semantics are
 //! unchanged.
 
-use crate::{GraphDb, GraphError, Result};
+use crate::{GraphDb, GraphError, RealFs, Result};
 use std::path::{Path, PathBuf};
 
 /// What [`restore_if_empty`] did.
@@ -32,16 +32,42 @@ pub enum RestoreOutcome {
 ///
 /// Kept in the same order, so a restore writes them the way a backup wrote
 /// them. Archives are found by name at copy time, since their count varies.
-const RESTORE_FILES: [&str; 8] = [
+const RESTORE_FILES: [&str; 9] = [
     "snapshot.bin",
     "snapshot.bin.bak",
     "wal.bin",
     "wal.floor",
     "wal.genesis",
+    "wal.genesis.v11",
     "roles.json",
     "commit_times.bin",
     "snapshot.intent",
 ];
+
+/// The file a restore on boot (`MUSHROOMDB_RESTORE_FROM_S3`) writes into a
+/// data directory while it moves a restored store into it, naming the files
+/// it moves. While it is there the directory holds a part of a store, and
+/// [`GraphDb::open`](crate::GraphDb::open) refuses it
+/// ([`refuse_half_installed`]).
+pub const INSTALL_MARKER: &str = ".mushroomdb-restore-install";
+
+/// Refuse to open `dir` while it holds [`INSTALL_MARKER`]: a restore on boot
+/// stopped while it moved its files in, and what is there is a part of a
+/// store. The error names the marker and the two ways out.
+pub fn refuse_half_installed(dir: &Path) -> Result<()> {
+    let marker = dir.join(INSTALL_MARKER);
+    if !marker.exists() {
+        return Ok(());
+    }
+    Err(GraphError::Io(std::io::Error::other(format!(
+        "{} holds a restore on boot that stopped while it moved its files in ({} is \
+         there): what the directory holds is a part of a store, and it is not opened. \
+         Start `mushroomdb serve` on it with MUSHROOMDB_RESTORE_FROM_S3 set to the backup it \
+         came from to restore it again, or empty the directory",
+        dir.display(),
+        marker.display()
+    ))))
+}
 
 /// Is there a store in `dir` already?
 ///
@@ -243,4 +269,262 @@ fn stage_and_install(db_dir: &Path, staging: &Path, backup: &Path) -> Result<Res
         files,
         bytes,
     })
+}
+
+// ── Point in time ────────────────────────────────────────────────────────────
+
+/// Cut the closed store in `dir` back to the state right after `commit`, so
+/// that an ordinary open of it shows exactly what [`GraphDb::open_at`] at
+/// `commit` shows, and it holds `commit + 1` commits.
+///
+/// `commit` is the 0-based index `open_at` and `asof --commit` take. The cut
+/// reaches exactly the commits `open_at` reaches, by the same rules, and
+/// refuses the rest with the same [`GraphError::CommitOutOfRange`]:
+///
+/// - **A commit in the live WAL** keeps the snapshot when it is the WAL's
+///   base (a snapshot that replaced its WAL), and the WAL is cut after the
+///   commit's frame. A snapshot that kept its WAL is the state at the WAL's
+///   end, not its start; it is removed and the WAL prefix replays from
+///   nothing, which is possible only while the WAL starts at the store's
+///   first commit (no floor, no archives).
+/// - **A commit in an archive** is rebuilt from nothing: the archives' frames
+///   up to it become the WAL and the snapshot and archives are removed. That
+///   needs the archive chain to start at the store's first commit (the
+///   genesis marker, no floor).
+///
+/// The commit-time sidecar loses the entries after `commit`, so the next
+/// commit is stamped. Nothing else is touched: roles, keys and the other
+/// sidecars are what the store held.
+///
+/// The store must be closed and must not be in the middle of a snapshot: a
+/// non-empty `snapshot.intent` is refused. This is the restore path's tool,
+/// run on a staged copy before it is installed.
+///
+/// # Errors
+///
+/// [`GraphError::CommitOutOfRange`] for a commit `open_at` cannot reach;
+/// [`GraphError::Io`] or [`GraphError::Corrupt`] when a file cannot be read
+/// or written. Every check runs before the first write.
+pub fn cut_at_commit(dir: &Path, commit: u64) -> Result<()> {
+    use core_storage::fs::Fs as _;
+
+    let intent = dir.join("snapshot.intent");
+    if std::fs::metadata(&intent).is_ok_and(|m| m.len() > 0) {
+        return Err(failed(format!(
+            "cut {} at commit {commit}: a snapshot was interrupted half way ({} is not empty); \
+             open the store once to settle it first",
+            dir.display(),
+            intent.display()
+        )));
+    }
+    let fs = RealFs::new(dir)?;
+    let floor = fs.read_horizon_floor()?;
+    let genesis = fs.has_genesis_marker();
+    // Archives at or below a raised floor are orphans the next open removes;
+    // they hold no reachable commit.
+    let archive_ns: Vec<u64> = fs
+        .list_archives()?
+        .into_iter()
+        .filter(|&n| floor == 0 || n > floor)
+        .collect();
+    let mut archives = Vec::new();
+    for &n in &archive_ns {
+        let bytes = fs.read_archive(n)?;
+        let ends = frame_ends(&bytes);
+        archives.push((n, bytes, ends));
+    }
+    let archive_frames: u64 = archives.iter().map(|(_, _, e)| e.len() as u64).sum();
+    let wal = match std::fs::read(dir.join("wal.bin")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    let live_ends = frame_ends(&wal);
+    let total = floor + archive_frames + live_ends.len() as u64;
+    let out_of_range = GraphError::CommitOutOfRange {
+        commit,
+        total,
+        floor,
+    };
+    if commit < floor || commit >= total {
+        return Err(out_of_range);
+    }
+    let local = commit - floor;
+
+    if local < archive_frames {
+        if floor > 0 || !genesis {
+            return Err(out_of_range);
+        }
+        let mut prefix = Vec::new();
+        let mut left = local + 1;
+        for (_, bytes, ends) in &archives {
+            let take = left.min(ends.len() as u64) as usize;
+            if take > 0 {
+                prefix.extend_from_slice(&bytes[..ends[take - 1]]);
+            }
+            left -= take as u64;
+            if left == 0 {
+                break;
+            }
+        }
+        trim_commit_times(dir, commit + 1)?;
+        write_file(dir, "wal.bin", &prefix)?;
+        remove_if_present(&dir.join("snapshot.bin"))?;
+        for (n, _, _) in &archives {
+            remove_if_present(&dir.join(format!("wal.{n}.archive")))?;
+        }
+        return Ok(());
+    }
+
+    let keep = (local - archive_frames + 1) as usize;
+    let drop_snapshot = match snapshot_replaced_its_wal(dir)? {
+        None | Some(true) => false,
+        Some(false) if floor > 0 || archive_frames > 0 => return Err(out_of_range),
+        Some(false) => true,
+    };
+    trim_commit_times(dir, commit + 1)?;
+    write_file(dir, "wal.bin", &wal[..live_ends[keep - 1]])?;
+    if drop_snapshot {
+        remove_if_present(&dir.join("snapshot.bin"))?;
+    }
+    Ok(())
+}
+
+/// What an instant resolves to through a `commit_times.bin`
+/// ([`commit_at_instant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstantAt {
+    /// The last commit recorded at or before the instant.
+    pub commit: u64,
+    /// The newest commit the sidecar records a time for (below the commit
+    /// limit it was read with). A store holding commits past it has no time
+    /// for them, so an instant that resolves to it may belong to one of them.
+    pub newest_recorded: u64,
+    /// The recorded time of `newest_recorded`, in Unix milliseconds.
+    pub newest_recorded_ms: i64,
+}
+
+/// The commit an instant resolves to through a store's `commit_times.bin`
+/// (`bytes`), above the store's WAL floor `wal_floor`, over the store's first
+/// `commits` commits: the last of them recorded at or before `unix_ms`. The
+/// same resolution a date query makes. Entries for commits at or past
+/// `commits` are ignored: a sidecar copied beside a WAL can be ahead of it.
+///
+/// # Errors
+///
+/// [`GraphError::NoRecordedTime`], [`GraphError::TimeBeforeFloor`] and
+/// [`GraphError::CommitOutOfRange`] as a date query returns them;
+/// [`GraphError::Corrupt`] when `bytes` does not decode.
+pub fn commit_at_instant(
+    bytes: &[u8],
+    wal_floor: u64,
+    unix_ms: i64,
+    commits: u64,
+) -> Result<InstantAt> {
+    core_storage::commit_times::decode(bytes)?;
+    let times = core_storage::commit_times::decode(&commit_times_below(bytes, commits))?;
+    let commit = times.resolve_instant(unix_ms, wal_floor)?;
+    let newest_recorded = times.newest_commit().unwrap_or(commit);
+    Ok(InstantAt {
+        commit,
+        newest_recorded,
+        newest_recorded_ms: times.time_of(newest_recorded).unwrap_or(unix_ms),
+    })
+}
+
+/// Drop the entries of `dir/commit_times.bin` for commits at or past
+/// `commits`, so that a store holding `commits` commits stamps its next one.
+///
+/// A sidecar is read after the WAL it describes, so it can name commits the
+/// WAL beside it does not hold; [`GraphDb`] ignores a time for a commit at or
+/// below the newest one recorded, so without this the store's next commits
+/// would get no time of their own, and dates would resolve to the source's.
+/// A missing sidecar, or one that does not decode, is left as it is.
+pub fn trim_commit_times(dir: &Path, commits: u64) -> Result<()> {
+    let path = dir.join("commit_times.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    if core_storage::commit_times::decode(&bytes).is_err() {
+        return Ok(());
+    }
+    let out = commit_times_below(&bytes, commits);
+    if out.len() != bytes.len() {
+        write_file(dir, "commit_times.bin", &out)?;
+    }
+    Ok(())
+}
+
+/// A decodable sidecar's bytes with only the entries for commits below
+/// `commits`. Entries are `(commit u64, unix_ms i64)`, ascending by commit.
+fn commit_times_below(bytes: &[u8], commits: u64) -> Vec<u8> {
+    use core_storage::commit_times::{ENTRY_LEN, HEADER_LEN};
+    let mut out = bytes[..HEADER_LEN].to_vec();
+    for entry in bytes[HEADER_LEN..].chunks_exact(ENTRY_LEN) {
+        let c = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
+        if c < commits {
+            out.extend_from_slice(entry);
+        }
+    }
+    out
+}
+
+/// The byte offset at which each whole, valid frame of `bytes` ends, as far
+/// as the engine's own decoder reads.
+fn frame_ends(bytes: &[u8]) -> Vec<usize> {
+    let (records, valid) = core_storage::wal::decode_all(bytes);
+    let mut ends = Vec::with_capacity(records.len());
+    let mut pos = 0usize;
+    while pos < valid {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+        pos += 8 + len;
+        ends.push(pos);
+    }
+    debug_assert_eq!(ends.len(), records.len());
+    ends
+}
+
+/// Whether `snapshot.bin` replaced its WAL (`Some(true)`: it is the state at
+/// the WAL's start), kept it (`Some(false)`: the state at its end), or is
+/// absent (`None`). The flag `open_at` reads to decide the same thing.
+fn snapshot_replaced_its_wal(dir: &Path) -> Result<Option<bool>> {
+    let path = dir.join("snapshot.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) if b.is_empty() => return Ok(None),
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(GraphError::Io(e)),
+    };
+    let container = bytes.len() >= 6
+        && &bytes[0..4] == b"GDB1"
+        && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([bytes[4], bytes[5]]));
+    if container {
+        drop(bytes);
+        let mapped = core_storage::v8::MappedBase::map(&path)?;
+        let meta = core_storage::v8::encode::decode_meta(mapped.meta_bytes()?)?;
+        return Ok(Some(meta.wal_truncated));
+    }
+    Ok(core_storage::snapshot::decode(&bytes)?.map(|s| s.wal_truncated))
+}
+
+/// Write `dir/name` whole: a temporary file, fsynced, renamed into place.
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{name}.cut-tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GraphError::Io(e)),
+    }
 }

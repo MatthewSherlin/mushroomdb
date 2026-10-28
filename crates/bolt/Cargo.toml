@@ -1,0 +1,39 @@
+[package]
+name = "mushroomdb-bolt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Bolt wire protocol (PackStream v1) for mushroomdb"
+
+[lib]
+name = "bolt"
+
+[features]
+default = []
+# Bolt over TLS (`--bolt-tls`): the listener wraps each socket in a rustls
+# session built from the server's certificate.
+tls = ["dep:tokio-rustls"]
+
+[dependencies]
+mushroomdb = { path = "../core-api", version = "0.10.0" }
+tokio = { version = "1", features = ["io-util", "time", "sync", "rt", "macros", "net"] }
+# Already in the tree through the HTTP TLS stack; no crypto provider is chosen
+# here, the binary's rustls features decide it.
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+# Structured events, as the server crate emits them; the binary installs the
+# subscriber.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "time", "sync", "test-util", "net"] }
+tempfile = "3"
+# Captures the events `From<GraphError>` logs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+# TLS listener tests: a self-signed certificate and a client.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false }

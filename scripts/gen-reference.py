@@ -39,6 +39,11 @@ TEMPLATES = ROOT / "scripts" / "reference"
 SITE = ROOT / "docs" / "site"
 STUB = ROOT / "bindings" / "python" / "mushroomdb.pyi"
 
+#: Value classes the stub may declare besides `GraphDb` and the errors. Each is
+#: listed under Types; a class not named here is refused, so a new one is a
+#: decision and not a silent omission.
+VALUE_CLASSES = {"Duration"}
+
 PAGES = ("cli", "mcp-tools", "python-api")
 BINARY_PAGES = ("cli", "mcp-tools")
 
@@ -229,6 +234,7 @@ GROUPS: dict[str, list[str]] = {
     "Querying": [
         "query", "query_with_params", "query_write", "query_at", "neighbors", "node_info",
         "node_edges", "get_edge_prop", "degree", "degrees", "stats", "roles",
+        "to_arrow_tables",
     ],
     "Rules": [
         "create_rule", "rules", "delete_rule", "rebuild_rule", "suggest_rules", "explain", "has_vector_rule",
@@ -245,7 +251,24 @@ GROUPS: dict[str, list[str]] = {
     ],
     "Graph algorithms": ["pagerank", "connected_components", "degree_centrality", "communities"],
     "Memory": ["remember", "recall", "upsert_entity", "forget", "schema_report", "identity_clusters"],
+    "Transactions": ["begin_transaction", "transaction"],
 }
+
+
+#: The stub class `db.memory` returns, the `GraphDb` property that returns it,
+#: and the docstring opening that marks a top-level method as a deprecated alias.
+MEMORY_CLASS = "MemoryAccessor"
+MEMORY_PROPERTY = "memory"
+DEPRECATED_PREFIX = "Deprecated:"
+#: The one section whose methods live on the accessor, not on `GraphDb`.
+MEMORY_SECTION = "Memory"
+#: The stub class `begin_transaction()` returns; its methods are listed under
+#: the Transactions section, after the two `GraphDb` methods that begin one.
+#: `TransactionContext` is what `transaction()` returns: only `__enter__` and
+#: `__exit__`, which have no entry of their own.
+TRANSACTION_CLASS = "Transaction"
+TRANSACTION_CONTEXT_CLASS = "TransactionContext"
+TRANSACTION_SECTION = "Transactions"
 
 
 def parse_stub(source: str) -> dict:
@@ -255,6 +278,12 @@ def parse_stub(source: str) -> dict:
     errors:  (name, base, docstring, [(field, annotation)]) — `code` left out,
              every class has it
     methods: (name, signature, docstring) — `__dunder__` methods left out
+    classes: (name, docstring, [(field, annotation)], init signature) — the
+             value classes in VALUE_CLASSES
+    memory_methods: like methods, for the `MemoryAccessor` class (`db.memory`)
+    transaction_methods: like methods, for the `Transaction` class
+    deprecated: like methods, for the `GraphDb` aliases whose docstring starts
+             with "Deprecated:" — the old top-level names of the memory methods
 
     Anything else the stub holds is refused by name. A page that quietly left
     out a module-level function, an `async def` or the second of two
@@ -264,7 +293,8 @@ def parse_stub(source: str) -> dict:
     tree = ast.parse(source)
     lines = source.splitlines()
     segment = lambda node: ast.get_source_segment(source, node) or ""
-    aliases, errors, methods = [], [], []
+    aliases, errors, methods, classes = [], [], [], []
+    memory_methods, deprecated, transaction_methods = [], [], []
     error_names = {"MushroomError"}
     for i, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -277,13 +307,19 @@ def parse_stub(source: str) -> dict:
             if isinstance(after, ast.Expr) and isinstance(after.value, ast.Constant) and isinstance(after.value.value, str):
                 doc = after.value.value.strip()
             aliases.append((node.targets[0].id, segment(node.value), doc))
-        elif isinstance(node, ast.ClassDef) and node.name == "GraphDb":
+        elif isinstance(node, ast.ClassDef) and node.name == TRANSACTION_CONTEXT_CLASS:
+            continue
+        elif isinstance(node, ast.ClassDef) and node.name in ("GraphDb", MEMORY_CLASS, TRANSACTION_CLASS):
+            on_memory = node.name == MEMORY_CLASS
+            target = {MEMORY_CLASS: memory_methods, TRANSACTION_CLASS: transaction_methods}.get(node.name, methods)
             for fn in node.body:
                 if isinstance(fn, ast.AsyncFunctionDef):
                     raise Problem(f"the stub declares `async def {fn.name}`, which the Python page has no form for")
                 if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("__"):
                     continue
-                if any(fn.name == seen for seen, _, _ in methods):
+                if not on_memory and fn.name == MEMORY_PROPERTY:
+                    continue  # the accessor property: the Memory section introduces it
+                if any(fn.name == seen for seen, _, _ in target + deprecated):
                     raise Problem(f"the stub declares `{fn.name}` more than once, and the Python page has one entry a name")
                 first = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
                 body = fn.body[0]
@@ -291,7 +327,24 @@ def parse_stub(source: str) -> dict:
                 # `def f(self) -> None: ...` — the column it starts at.
                 text = "\n".join(lines[first - 1 : body.lineno - 1] + [lines[body.lineno - 1][: body.col_offset]])
                 signature = re.sub(r"(?m)^    ", "", text).rstrip().removesuffix(":")
-                methods.append((fn.name, signature, ast.get_docstring(fn) or ""))
+                doc = ast.get_docstring(fn) or ""
+                # A top-level alias the stub keeps for the old name is listed
+                # in one table, not given a section beside its replacement.
+                if not on_memory and doc.startswith(DEPRECATED_PREFIX):
+                    deprecated.append((fn.name, signature, doc))
+                else:
+                    target.append((fn.name, signature, doc))
+        elif isinstance(node, ast.ClassDef) and node.name in VALUE_CLASSES:
+            fields = [
+                (f.target.id, segment(f.annotation))
+                for f in node.body
+                if isinstance(f, ast.AnnAssign) and isinstance(f.target, ast.Name)
+            ]
+            init = next((f for f in node.body if isinstance(f, ast.FunctionDef) and f.name == "__init__"), None)
+            params = ""
+            if init is not None:
+                params = re.sub(r"(?<=\w)=", " = ", ast.unparse(init.args).removeprefix("self, ").removeprefix("self"))
+            classes.append((node.name, ast.get_docstring(node) or "", fields, params))
         elif isinstance(node, ast.ClassDef):
             base = segment(node.bases[0]) if node.bases else ""
             if node.name not in error_names and base not in error_names:
@@ -309,14 +362,39 @@ def parse_stub(source: str) -> dict:
         else:
             name = getattr(node, "name", None) or type(node).__name__
             raise Problem(f"the stub has a top-level `{name}` the Python page has no section for (line {node.lineno})")
-    return {"aliases": aliases, "errors": errors, "methods": methods}
+    return {
+        "aliases": aliases,
+        "errors": errors,
+        "methods": methods,
+        "classes": classes,
+        "memory_methods": memory_methods,
+        "transaction_methods": transaction_methods,
+        "deprecated": deprecated,
+    }
+
+
+MEMORY_INTRO = (
+    "The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph "
+    "store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's "
+    "store and scope. Each access returns a new accessor; one you keep holds the store open, as a "
+    "`scoped()` handle does, and the store is released when the handle and every accessor are dropped."
+)
+DEPRECATED_INTRO = (
+    "### Deprecated aliases\n\n"
+    "The old top-level names still work on `GraphDb`. Each takes the same arguments, returns the same "
+    "result and emits a `DeprecationWarning` that names the caller's line. New code should use `db.memory`."
+)
 
 
 def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROUPS) -> str:
     by_name = {m[0]: m for m in stub["methods"]}
-    grouped = [name for members in groups.values() for name in members]
-    ungrouped = [name for name in by_name if name not in grouped]
-    unknown = [name for name in grouped if name not in by_name]
+    memory_by_name = {m[0]: m for m in stub.get("memory_methods", [])}
+    on_graph = [n for title, members in groups.items() if title != MEMORY_SECTION for n in members]
+    on_memory = groups.get(MEMORY_SECTION, [])
+    ungrouped = [name for name in by_name if name not in on_graph]
+    ungrouped += [f"{MEMORY_PROPERTY}.{name}" for name in memory_by_name if name not in on_memory]
+    unknown = [name for name in on_graph if name not in by_name]
+    unknown += [f"{MEMORY_PROPERTY}.{name}" for name in on_memory if name not in memory_by_name]
     if ungrouped:
         raise Problem(
             "the stub has methods in no section of the Python page — add each to GROUPS in "
@@ -329,15 +407,42 @@ def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROU
         f"### `{name}`\n\n{fence(f'{name} = {value}', 'python')}\n\n{escape_html(doc)}".rstrip()
         for name, value, doc in stub["aliases"]
     )
+    value_classes = "\n\n".join(
+        f"### `{name}`\n\n{fence(f'class {name}({params})', 'python')}\n\n"
+        + (f"Fields: {', '.join(f'`{field}: {annotation}`' for field, annotation in fields)}.\n\n" if fields else "")
+        + escape_html(doc)
+        for name, doc, fields, params in stub["classes"]
+    )
+    if value_classes:
+        types = f"{types}\n\n{value_classes}"
     sections = []
     for title, members in groups.items():
         parts = [f"## {title}"]
+        if title == MEMORY_SECTION:
+            parts.append(MEMORY_INTRO)
         for name in members:
-            _, signature, doc = by_name[name]
-            parts.append(f"### `{name}`\n\n{fence(signature, 'python')}\n\n{escape_html(doc)}".rstrip())
+            if title == MEMORY_SECTION:
+                _, signature, doc = memory_by_name[name]
+                heading = f"{MEMORY_PROPERTY}.{name}"
+            else:
+                _, signature, doc = by_name[name]
+                heading = name
+            parts.append(f"### `{heading}`\n\n{fence(signature, 'python')}\n\n{escape_html(doc)}".rstrip())
+        if title == TRANSACTION_SECTION:
+            for name, signature, doc in stub.get("transaction_methods", []):
+                parts.append(
+                    f"### `{TRANSACTION_CLASS}.{name}`\n\n{fence(signature, 'python')}\n\n{escape_html(doc)}".rstrip()
+                )
+        if title == MEMORY_SECTION and stub.get("deprecated"):
+            rows = ["| Old name | Use instead |", "|---|---|"]
+            rows += [f"| `{name}` | `{MEMORY_PROPERTY}.{name}` |" for name, _, _ in stub["deprecated"]]
+            parts.append(DEPRECATED_INTRO + "\n\n" + "\n".join(rows))
         sections.append("\n\n".join(parts))
     rows = ["| Class | Fields | Raised when |", "|---|---|---|"]
-    for name, _base, doc, fields in stub["errors"]:
+    own_fields = {name: fields for name, _base, _doc, fields in stub["errors"]}
+    for name, base, doc, fields in stub["errors"]:
+        # A subclass of another error carries that error's fields too.
+        fields = own_fields.get(base, []) + fields
         shown = ", ".join(f"`{field}: {annotation}`" for field, annotation in fields) or "—"
         summary = doc.split("\n\n", 1)[0]
         rows.append(f"| `{name}` | {cell(shown)} | {cell(escape_html(summary))} |")

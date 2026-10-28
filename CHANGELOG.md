@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.10.0 — Cypher, Bolt, and a store you host yourself
+
+Not tagged. The date in the release heading is the tag date. Per-unit notes that
+are not repeated here are in `changelog.d/`.
+
+A store that never uses a 0.10 feature opens under 0.9.x, and 0.9.x opens under
+0.10. The first write of a new value type, a unique constraint, a range index or
+a relationship property moves that store to snapshot format V11. 0.9.x then
+stops with `snapshot: unsupported version 11` and does not touch the WAL. There
+is no downgrade. That first write costs one snapshot (5.6 s at 1M nodes, measured
+for the spec). Later writes do not.
+
+### Migration from 0.9.x
+
+See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
+
+- **Python.** `db.remember`, `db.recall`, `db.upsert_entity`, `db.forget`, `db.schema_report` and `db.identity_clusters` still work and emit `DeprecationWarning`. Call `db.memory.<name>`. The old names go away in 0.11.
+- **Rust.** `Value` has five new variants (`Date`, `LocalDateTime`, `DateTime`, `Duration`, `Binary`). `GraphError` has `ConstraintViolation`, `ConstraintCreationConflict`, `ValueTooLarge` and `Unwritable`. An exhaustive `match` needs the new arms. `json_to_value` returns `Result`.
+- **JSON.** A one-key object `{"$date":…}`, `{"$ldt":…}`, `{"$dt":…}`, `{"$dur":…}` or `{"$binary":…}` is a typed value, not a map. A payload that is not that tag's text is an error. A bare string is still a string. A store that already holds the old map exports it as a map, and importing that export stores the typed value.
+- **CLI help** is grouped differently. Flags and subcommand names are unchanged.
+- **Crate keywords** on the library no longer include `agent-memory` or `mcp`. Search only; no code change.
+
+### What's new
+
+- **Cypher.** Scalar and list functions, aggregates, list comprehensions, `UNWIND`, `REMOVE`, `SET` from a map, `MERGE` of a relationship, named paths, `EXPLAIN`, temporal functions (`date`, `localdatetime`, `datetime`, `duration`), and `CALL` of the built-in procedures. `LOAD CSV` reads a file in a query. OpenCypher conformance on the vendored TCK is 72.7% (strict 72.1%). `time()` and `localtime()` fail with `not supported in mushroomdb 0.10: time types`.
+- **Bolt and transactions.** A Bolt listener on `--bolt-port` (unset means no listener). Explicit transactions in Rust (`SharedDb::begin_transaction`), Python, TypeScript and `POST /tx/*`. A commit that conflicts is a retryable error. Reads on HTTP do not take the write lock.
+- **Deploy.** The published image is built with TLS. `/ready`, CORS, hashed access keys, Prometheus text on `GET /metrics`, JSON logs, continuous S3 backup with a bucket lease, `mushroomdb restore --from`, restore on boot, and graceful shutdown. Templates for Fly, Render, Compose, Railway and Kubernetes are in `deploy/`.
+- **Docs and integrations.** Language quickstarts, a conformance table, property types, constraints, range indexes, a data-safety page, and an offline graph retrieval example. `langchain-mushroomdb` and `llama-index-graph-stores-mushroomdb` publish with the release.
+
+### Fixed
+
+- **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
+- **Deleting an edge that is not in the graph is no longer `RuleOwned` when a rule matches the two nodes.** A via-hop rule with no via node, a rule in another namespace, and a rule whose cap can exclude the pair no longer block a hand-written edge either (row 67).
+- **`what_if_set_prop` no longer lists an edge that changes owner as both lost and gained.** The diff nets on the edge (row 85).
+- **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
+- **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
+
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 101, 120, 121, 122, 136, 137, 140, 142, 152, 155, 156 and 159 stay deferred.
+
+### Deprecated
+
+- **Python top-level memory methods.** Use `db.memory.remember` and the same for `recall`, `upsert_entity`, `forget`, `schema_report` and `identity_clusters`. Removed in 0.11.
+
+### Changed
+
+- **A JSON object `{"$date": …}`, `{"$ldt": …}`, `{"$dt": …}`, `{"$dur": …}` or `{"$binary": …}` is now a typed value, stored once the store is V11.** Through 0.9.x such an object was stored as a map. It now parses to a Date, LocalDateTime, DateTime, Duration or Binary value (ISO 8601 text, base64 for binary), and a query that takes one as a parameter returns it in the same form. V11 is opt-in and sticky: the first write that would store one of these values first moves the store to the V11 snapshot format, then stores the value, and the store stays V11 from then on. A store that never stores one keeps the format 0.9.x reads. 0.9.x cannot open a V11 store: it stops with `snapshot: unsupported version 11`. A bare string is still a string, and a tagged object whose text does not parse is still a map. A store that already holds such a map exports it in that form, which now re-imports as the typed value. Role predicates (`visible_where`) refuse the new types.
+- **Rust: `Value` has five new variants** (`Date`, `LocalDateTime`, `DateTime`, `Duration`, `Binary`), so an exhaustive `match` on it needs new arms. `tagged_text` and `tagged_json` give their wire forms.
+
 ## v0.9.4 — aggregates over variables, integer sums, boolean comparisons and rule weights are right
 
 No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot opens under 0.9.3: no byte layout in the snapshot or the WAL changed. The edge-property section of a snapshot is written the same way 0.9.3 writes it in every case a 0.9.x write path can reach, row 154's included.

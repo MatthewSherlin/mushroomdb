@@ -18,16 +18,16 @@
 #        - Repository name: mushroomdb
 #        - Workflow filename: publish.yml
 #      Do this for: mushroomdb-storage, mushroomdb-rules, mushroomdb-query,
-#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-extract,
-#        mushroomdb-cli
+#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-bolt,
+#        mushroomdb-extract, mushroomdb-backup, mushroomdb-cli
 #   FIRST-PUBLISH BOOTSTRAP: crates.io Trusted Publishing requires the crate
 #   to already exist on the registry before a trusted publisher can be added.
 #   Bootstrap via: cargo login <your-api-token> && cargo publish -p <crate>
 #   (publishing once with a token, then switching to Trusted Publishing for all
 #   subsequent releases). Publish in dependency order:
 #     mushroomdb-storage → mushroomdb-rules → mushroomdb-query → mushroomdb
-#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-extract
-#     → mushroomdb-cli
+#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-bolt → mushroomdb-extract
+#     → mushroomdb-backup → mushroomdb-cli
 #   Wait ~30 seconds between each publish for the index to update.
 #
 # PYPI (Trusted Publishing — no token):
@@ -39,6 +39,9 @@
 #        Repository name: mushroomdb
 #        Workflow name: publish.yml
 #        Environment name: pypi  (or leave blank — must match the `environment:` below)
+#   The adapter packages langchain-mushroomdb and llama-index-graph-stores-mushroomdb
+#   each need the same form filled in with their own project name (see the
+#   "PyPI: adapter packages" section below).
 #   FIRST-PUBLISH BOOTSTRAP: PyPI Trusted Publishing supports "pending publishers"
 #   so you can configure it BEFORE the first publish — no prior token publish
 #   needed. Just configure the pending publisher and the first push via this
@@ -118,8 +121,8 @@ jobs:
           # mushroomdb-extract = "^0.8.2"` and published on the third attempt.
           # So that error is retried, every two minutes for up to fourteen.
           for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
-                   mushroomdb mushroomdb-arrow mushroomdb-server \
-                   mushroomdb-extract mushroomdb-cli; do
+                   mushroomdb mushroomdb-arrow mushroomdb-server mushroomdb-bolt \
+                   mushroomdb-extract mushroomdb-backup mushroomdb-cli; do
             echo "── publishing $c ──"
             attempt=1
             while :; do
@@ -233,6 +236,127 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
+          # Idempotent, so a fresh dispatch can re-run the adapter jobs (which
+          # need this one) without failing on "file exists".
+          skip-existing: true
+
+  # ── PyPI: adapter packages ─────────────────────────────────────────────────
+  # langchain-mushroomdb and llama-index-graph-stores-mushroomdb are pure-Python
+  # (setuptools) and release in lockstep with the workspace version. Each needs
+  # its OWN pending publisher, registered by the owner before the first release
+  # that includes it (same form as the `mushroomdb` project above, one per name):
+  #     PyPI project name: langchain-mushroomdb
+  #     PyPI project name: llama-index-graph-stores-mushroomdb
+  #     Owner: MatthewSherlin   Repository name: mushroomdb
+  #     Workflow name: publish.yml   Environment name: pypi
+  # Register BOTH before approving the adapter jobs (a pending publisher does
+  # not reserve the name until the first successful publish). Both jobs sit
+  # behind the `pypi` environment, so each needs owner approval.
+  publish-langchain:
+    name: PyPI (langchain-mushroomdb)
+    # After the main wheel, so an adapter never lands pointing at a
+    # `mushroomdb` that is not on PyPI yet.
+    needs: [publish-pypi-upload]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC Trusted Publishing
+    environment:
+      name: pypi
+      url: https://pypi.org/p/langchain-mushroomdb
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install build
+
+      # Same tag guard as the npm jobs: a v* tag must match the version the
+      # sdist/wheel will carry (bump-version.sh keeps it in step), or PyPI
+      # would get a package labelled with a different release.
+      - name: check the package version matches the tag
+        working-directory: integrations/langchain-mushroomdb
+        run: |
+          VER=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [[ "$GITHUB_REF_NAME" == v* && "${GITHUB_REF_NAME#v}" != "$VER" ]]; then
+            echo "integrations/langchain-mushroomdb/pyproject.toml is $VER but the tag is $GITHUB_REF_NAME — run scripts/bump-version.sh" >&2
+            exit 1
+          fi
+
+      - run: python -m build integrations/langchain-mushroomdb/
+
+      # skip-existing keeps a re-run after a partial failure idempotent, as the
+      # crates.io and npm jobs are.
+      - id: upload
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: integrations/langchain-mushroomdb/dist/
+          skip-existing: true
+
+      - name: how to fix a rejected publisher
+        if: failure() && steps.upload.outcome == 'failure'
+        run: |
+          echo "If the upload above was rejected as an invalid or unregistered trusted publisher," >&2
+          echo "the owner has not yet registered the pending publisher. On pypi.org > Publishing >" >&2
+          echo "'Add a new pending publisher' enter exactly: project 'langchain-mushroomdb'," >&2
+          echo "owner 'MatthewSherlin', repository 'mushroomdb', workflow 'publish.yml'," >&2
+          echo "environment 'pypi'. Then re-run this job." >&2
+
+  publish-llamaindex:
+    name: PyPI (llama-index-graph-stores-mushroomdb)
+    # After the main wheel, so an adapter never lands pointing at a
+    # `mushroomdb` that is not on PyPI yet.
+    needs: [publish-pypi-upload]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC Trusted Publishing
+    environment:
+      name: pypi
+      url: https://pypi.org/p/llama-index-graph-stores-mushroomdb
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install build
+
+      # Same tag guard as the npm jobs: a v* tag must match the version the
+      # sdist/wheel will carry (bump-version.sh keeps it in step), or PyPI
+      # would get a package labelled with a different release.
+      - name: check the package version matches the tag
+        working-directory: integrations/llama-index-mushroomdb
+        run: |
+          VER=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [[ "$GITHUB_REF_NAME" == v* && "${GITHUB_REF_NAME#v}" != "$VER" ]]; then
+            echo "integrations/llama-index-mushroomdb/pyproject.toml is $VER but the tag is $GITHUB_REF_NAME — run scripts/bump-version.sh" >&2
+            exit 1
+          fi
+
+      - run: python -m build integrations/llama-index-mushroomdb/
+
+      # skip-existing keeps a re-run after a partial failure idempotent, as the
+      # crates.io and npm jobs are.
+      - id: upload
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: integrations/llama-index-mushroomdb/dist/
+          skip-existing: true
+
+      - name: how to fix a rejected publisher
+        if: failure() && steps.upload.outcome == 'failure'
+        run: |
+          echo "If the upload above was rejected as an invalid or unregistered trusted publisher," >&2
+          echo "the owner has not yet registered the pending publisher. On pypi.org > Publishing >" >&2
+          echo "'Add a new pending publisher' enter exactly: project 'llama-index-graph-stores-mushroomdb'," >&2
+          echo "owner 'MatthewSherlin', repository 'mushroomdb', workflow 'publish.yml'," >&2
+          echo "environment 'pypi'. Then re-run this job." >&2
 
   # ── npm ────────────────────────────────────────────────────────────────────
   # Publishes both npm packages with provenance attestation.

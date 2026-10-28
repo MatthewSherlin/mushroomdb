@@ -1,10 +1,23 @@
+# PyPI publishing (publish.yml, job `publish-llamaindex`) uses OIDC trusted publishing, no
+# token. Owner-only, once, before the first release that includes this package:
+# pypi.org > Publishing > "Add a new pending publisher" with
+#   PyPI project name: llama-index-graph-stores-mushroomdb
+#   Owner:             MatthewSherlin
+#   Repository name:   mushroomdb
+#   Workflow name:     publish.yml
+#   Environment name:  pypi
+# The version below and the `mushroomdb` dependency range are set by
+# scripts/bump-version.sh; do not edit them by hand. Register BOTH pending
+# publishers before approving the adapter jobs; a pending publisher does not
+# reserve the name until the first successful publish.
+
 [build-system]
 requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "llama-index-graph-stores-mushroomdb"
-version = "0.1.0"
+version = "0.10.0"
 description = "LlamaIndex PropertyGraphStore backed by the mushroomdb embedded graph database"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,11 +32,12 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.14",
-    "mushroomdb",
+    "mushroomdb>=0.10.0,<0.11",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "maturin"]
+test = ["pytest>=7"]
 
 [tool.setuptools.packages.find]
 where = ["."]

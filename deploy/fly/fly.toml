@@ -1,0 +1,108 @@
+# mushroomdb on Fly.io.
+#
+# Setup:
+#   fly launch --no-deploy --copy-config
+#   fly volumes create mushroomdb_data --size 10 --region iad
+#   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+#   fly deploy
+#
+# `app` must be globally unique on Fly; `fly launch --copy-config` prompts for it.
+#
+# VOLUME OWNERSHIP: the image runs as uid 65532, not root, and has no shell, so
+# it cannot chown its own volume. A new Fly volume is root-owned. If serve exits
+# at start with `the data directory is not writable ... uid 65532`, change the
+# volume's owner once with a one-off machine on it (same region), then deploy:
+#   fly machine run busybox:stable chown -R 65532:65532 /data \
+#     --app <app> --region iad --volume mushroomdb_data:/data --rm
+# Status: this recipe is confirmed at the release gate by a real Fly deploy; it
+# has not been run yet. Full recipe for every platform: docs/site/deployment.md,
+# "Volume ownership on managed platforms".
+
+app = "mushroomdb"
+primary_region = "iad"
+
+# Seconds between SIGTERM and SIGKILL (default 5, maximum 300). serve drains, snapshots, then flushes the
+# backup and deletes its bucket lease; 60 s covers that at the defaults
+# (docs/site/deployment.md, "Stopping cleanly, and the grace period").
+kill_timeout = 60
+
+[build]
+  image = "ghcr.io/matthewsherlin/mushroomdb:latest"
+
+[env]
+  # Non-secret settings only. Secrets (never put values here):
+  #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+  # Structured logs for the platform log shipper:
+  MUSHROOMDB_LOG_FORMAT = "json"
+  # Bolt (docs/site/deployment.md, "Exposing the Bolt port"). The listener is
+  # plaintext inside the machine; Fly's `tls` handler (the [[services]] block
+  # for 7687 below) terminates TLS at the edge, so the public port is
+  # encrypted. Bolt takes the same token as HTTP (MUSHROOMDB_TOKEN above): the
+  # server refuses to start on a non-loopback address without one.
+  MUSHROOMDB_BOLT_PORT = "7687"
+  # What a routing URI hands drivers: this app's public host and port. CHANGE
+  # the host to your `app` name's address (<app>.fly.dev, or your own domain);
+  # the placeholder never resolves, so a routing URI fails until you do.
+  MUSHROOMDB_BOLT_ADVERTISED_HOST = "CHANGE-ME.invalid"
+  MUSHROOMDB_BOLT_ADVERTISED_PORT = "7687"
+  # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in
+  # `fly secrets set`, never here:
+  # MUSHROOMDB_BACKUP_S3_URL = "s3://<bucket>/<prefix>"
+  # Restore on boot: an empty volume restores the newest backup there before serving.
+  # MUSHROOMDB_RESTORE_FROM_S3 = "s3://<bucket>/<prefix>"
+  # Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+  # settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.
+
+[processes]
+  # Explicit command: no --demo-if-empty, so a production volume is never seeded.
+  app = "serve /data --addr 0.0.0.0:8080 --snapshot-every 300"
+
+[[services]]
+  processes = ["app"]
+  protocol = "tcp"
+  internal_port = 8080
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [services.concurrency]
+    type = "requests"
+    hard_limit = 256
+    soft_limit = 200
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "5s"
+    # Fly's maximum: flyctl lowers anything longer to 60 s. A WAL replay or a
+    # restore on boot that takes longer leaves the check failing, and the
+    # machine unhealthy, until /ready answers (docs/site/deployment.md,
+    # "Restoring on boot").
+    grace_period = "60s"
+    method = "get"
+    path = "/ready"
+
+# Bolt: a raw TCP service with Fly's `tls` handler. Fly terminates TLS and
+# forwards plaintext to the server, so clients must use the TLS form of the
+# Bolt scheme (docs/site/deployment.md). No `http` handler: Bolt is not HTTP.
+[[services]]
+  processes = ["app"]
+  protocol = "tcp"
+  internal_port = 7687
+  [[services.ports]]
+    port = 7687
+    handlers = ["tls"]
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 256
+    soft_limit = 200
+
+[[mounts]]
+  source = "mushroomdb_data"
+  destination = "/data"
+
+# SINGLE WRITER - replicas must be 1.
+# mushroomdb is single-writer: two machines sharing one store will fail to
+# acquire the write lock. Run exactly one machine (`fly scale count 1`).
+[deploy]
+  strategy = "immediate"    # a rolling deploy cannot work with a single volume

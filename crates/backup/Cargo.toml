@@ -1,0 +1,32 @@
+[package]
+name = "mushroomdb-backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Continuous backup of a mushroomdb store to S3-compatible object storage"
+
+[lib]
+name = "backup"
+
+[dependencies]
+mushroomdb = { path = "../core-api", version = "0.10.0" }
+# Owner-approved for W4 (spec §9.1): the `aws` feature only.
+object_store = { version = "0.11", default-features = false, features = ["aws"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "fs", "sync", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Object integrity in manifests: corruption detection, not adversarial
+# integrity. S3 also verifies every upload with its own SHA-256 checksum.
+crc32fast = { workspace = true }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+# The bucket lease's instance id (owner-approved for W4, spec §9.1).
+rand = "0.9"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }

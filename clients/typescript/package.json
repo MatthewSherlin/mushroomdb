@@ -1,6 +1,6 @@
 {
   "name": "mushroomdb-client",
-  "version": "0.9.4",
+  "version": "0.10.0",
   "description": "TypeScript client for the mushroomdb graph database HTTP + WebSocket API",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.type-tests.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },

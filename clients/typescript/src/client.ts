@@ -13,9 +13,14 @@
  */
 
 import {
+  ConstraintViolationError,
   MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
   type AlgoReport,
   type BackupReport,
+  type ConstraintInfo,
+  type CreateIndexOptions,
   type CreateNodeResult,
   type DegreeConfig,
   type DegreeReport,
@@ -24,6 +29,7 @@ import {
   type FindSimilarOptions,
   type FindSimilarResult,
   type HealthReport,
+  type IndexInfo,
   type IngestReport,
   type IngestRequest,
   type MetricsReport,
@@ -37,6 +43,8 @@ import {
   type RuleDef,
   type Stats,
   type SuggestReport,
+  type TxBeginResponse,
+  type TxCommitResponse,
   type WasLinkedResult,
   type WccConfig,
   type WccReport,
@@ -52,11 +60,22 @@ import {
   type WsConstructor,
 } from "./ws.js";
 
+type AlgoConfigKeys<T> = T extends unknown ? keyof T : never;
+type ForeignAlgoOptions<Allowed> = Partial<Record<
+  Exclude<keyof PageRankConfig | keyof WccConfig | keyof DegreeConfig, keyof Allowed>,
+  never
+>>;
+type ExactAlgoConfig<Allowed, Candidate> = Candidate &
+  NoInfer<Allowed & ForeignAlgoOptions<Allowed> &
+    Record<Exclude<AlgoConfigKeys<Candidate>, keyof Allowed>, never>>;
+
 export type {
   AlgoDir,
   AlgoReport,
   BackupReport,
   CellValue,
+  ConstraintInfo,
+  CreateIndexOptions,
   CreateNodeResult,
   DegreeConfig,
   DegreeReport,
@@ -69,6 +88,7 @@ export type {
   HealthReport,
   HistoryChange,
   HistoryEntry,
+  IndexInfo,
   IngestEdge,
   IngestOptions,
   IngestReport,
@@ -96,7 +116,13 @@ export type {
   WccConfig,
   WccReport,
 } from "./types.js";
-export { MushroomError };
+export {
+  ConstraintViolationError,
+  MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
+};
+export type { TxBeginResponse, TxCommitResponse };
 
 /** Optional constructor flags for {@link MushroomClient}. */
 export interface ClientOptions {
@@ -107,12 +133,12 @@ export interface ClientOptions {
   token?: string;
 }
 
-/** Parameters for a Cypher query. Values must be JSON scalars. */
-export type QueryParams = Record<string, string | number | boolean>;
+/** Parameters for a Cypher query. Values must be JSON scalars; `null` binds as a null. */
+export type QueryParams = Record<string, string | number | boolean | null>;
 
 /** Options accepted by {@link MushroomClient.query}. */
 export interface QueryOptions {
-  /** Bound parameters. Values must be JSON scalars (string | number | boolean). */
+  /** Bound parameters. Values must be JSON scalars (string | number | boolean | null); `null` binds as a null. */
   params?: QueryParams;
   /**
    * Time-travel: run the query against the graph as it existed at this WAL
@@ -133,6 +159,156 @@ export interface QueryOptions {
    * Makes the query read-only.
    */
   namespace?: string;
+}
+
+/**
+ * An open interactive transaction. Obtained from
+ * {@link MushroomClient.beginTransaction} or passed to the callback of
+ * {@link MushroomClient.transaction}.
+ *
+ * Statements run against a snapshot frozen at begin, with the transaction's own
+ * writes visible. Nothing reaches the store until {@link TxHandle.commit}.
+ */
+export class TxHandle {
+  /** Server-assigned transaction id. */
+  readonly txId: string;
+  /** Expiry time as the server reported it at begin. */
+  readonly expiresAt: string | number;
+  /**
+   * open        usable.
+   * committing  a commit request is in flight; every other call throws.
+   * unknown     a commit failed at the network level: whether it applied is
+   *             not known, so the handle refuses further use. Check the store.
+   * finished    committed, rolled back, conflicted, or expired.
+   * A rollback that fails leaves the state `open`, so it can be retried.
+   */
+  private state: "open" | "committing" | "unknown" | "finished" = "open";
+
+  /** @internal Use {@link MushroomClient.beginTransaction}. */
+  constructor(
+    txId: string,
+    expiresAt: string | number,
+    private readonly call: <T>(suffix: string, init?: RequestInit) => Promise<T>,
+  ) {
+    this.txId = txId;
+    this.expiresAt = expiresAt;
+  }
+
+  /** True once the transaction is committed, rolled back, conflicted or expired. */
+  get isFinished(): boolean {
+    return this.state === "finished";
+  }
+
+  private assertOpen(): void {
+    if (this.state === "committing") {
+      throw new MushroomError(`transaction ${this.txId} has a commit in flight`);
+    }
+    if (this.state === "unknown") {
+      throw new MushroomError(
+        `transaction ${this.txId}: the commit failed at the network level and its outcome is unknown; check the store before retrying`,
+      );
+    }
+    if (this.state === "finished") {
+      throw new MushroomError(`transaction ${this.txId} is already finished`);
+    }
+  }
+
+  /**
+   * Run one Cypher statement inside the transaction
+   * (`POST /tx/{tx_id}/run`).
+   *
+   * @throws {@link TransactionExpiredError} when the server no longer knows the transaction.
+   */
+  async execute(cypher: string, params?: QueryParams): Promise<QueryResult> {
+    this.assertOpen();
+    return this.call<QueryResult>("/run", {
+      method: "POST",
+      body: JSON.stringify({ cypher, params: params ?? {} }),
+    });
+  }
+
+  /**
+   * Commit (`POST /tx/{tx_id}/commit`). Resolves to the bookmark: the commit
+   * number of the one WAL frame the transaction wrote.
+   *
+   * A second `commit()` while one is in flight throws without a request. If the
+   * request fails at the network level the outcome is unknown and the handle
+   * refuses all further use. After any other error the handle mirrors the
+   * server: it stays usable only if the server still holds the transaction.
+   *
+   * @throws {@link TransactionConflictError} when a node the transaction read or wrote changed since begin.
+   * @throws {@link ConstraintViolationError} when a unique constraint refuses the writes; not retryable.
+   * @throws {@link TransactionExpiredError} when the transaction expired before the commit.
+   */
+  async commit(): Promise<number> {
+    this.assertOpen();
+    this.state = "committing";
+    try {
+      const out = await this.call<TxCommitResponse>("/commit", { method: "POST" });
+      this.state = "finished";
+      return out.bookmark;
+    } catch (err) {
+      if (
+        err instanceof TransactionConflictError ||
+        err instanceof ConstraintViolationError ||
+        err instanceof TransactionExpiredError
+      ) {
+        // The server ended the transaction.
+        this.state = "finished";
+      } else if (err instanceof MushroomError && err.code === "busy") {
+        // Another request held the transaction; the commit never started.
+        this.state = "open";
+      } else if (err instanceof MushroomError) {
+        // Any other answer: the server may have consumed the transaction (a
+        // commit that reached the engine ends it whatever the outcome) or not
+        // (refused before it, e.g. 401 or load shedding). Ask it.
+        this.state = await this.probeAfterFailedCommit();
+      } else {
+        this.state = "unknown";
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The handle's state after a commit the server answered with an error other
+   * than a conflict, a constraint refusal, an expiry or `busy`, read from
+   * `GET /tx/{tx_id}` (which does not restart the idle timer): still listed is
+   * `open`, gone (404/410) is `finished`, and anything else, a commit still
+   * running included, is `unknown`.
+   */
+  private async probeAfterFailedCommit(): Promise<"open" | "finished" | "unknown"> {
+    try {
+      await this.call<unknown>("", { method: "GET" });
+      return "open";
+    } catch (probeErr) {
+      return probeErr instanceof TransactionExpiredError ? "finished" : "unknown";
+    }
+  }
+
+  /**
+   * Discard everything the transaction buffered (`POST /tx/{tx_id}/rollback`).
+   *
+   * Deliberately a silent no-op when the transaction is already finished, and
+   * when the server reports it expired: {@link MushroomClient.transaction}
+   * relies on this. If the request fails the handle stays open, so the
+   * rollback can be retried. Throws if a commit is in flight or its outcome is
+   * unknown.
+   */
+  async rollback(): Promise<void> {
+    if (this.state === "finished") return;
+    this.assertOpen();
+    try {
+      await this.call<unknown>("/rollback", { method: "POST" });
+      this.state = "finished";
+    } catch (err) {
+      if (err instanceof TransactionExpiredError) {
+        this.state = "finished";
+        return;
+      }
+      throw err;
+    }
+  }
 }
 
 /**
@@ -238,7 +414,12 @@ export class MushroomClient {
     if (!resp.ok) {
       const detail: string =
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
+      const code: string | undefined =
+        typeof body?.code === "string" ? body.code : undefined;
+      if (resp.status === 409 && code === "constraint") {
+        throw new ConstraintViolationError(detail, resp.status, code);
+      }
+      throw new MushroomError(detail, resp.status, code);
     }
     return body as T;
   }
@@ -325,9 +506,15 @@ export class MushroomClient {
    * console.log(pr.scores.slice(0, 5));
    * ```
    */
-  async algo(algo: "pagerank", config?: PageRankConfig): Promise<PageRankReport>;
-  async algo(algo: "wcc", config?: WccConfig): Promise<WccReport>;
-  async algo(algo: "degree", config?: DegreeConfig): Promise<DegreeReport>;
+  async algo<C = PageRankConfig>(
+    algo: "pagerank", config?: ExactAlgoConfig<PageRankConfig, C>,
+  ): Promise<PageRankReport>;
+  async algo<C = WccConfig>(
+    algo: "wcc", config?: ExactAlgoConfig<WccConfig, C>,
+  ): Promise<WccReport>;
+  async algo<C = DegreeConfig>(
+    algo: "degree", config?: ExactAlgoConfig<DegreeConfig, C>,
+  ): Promise<DegreeReport>;
   async algo(
     algo: "pagerank" | "wcc" | "degree",
     config?: PageRankConfig | WccConfig | DegreeConfig,
@@ -361,6 +548,86 @@ export class MushroomClient {
     await this.fetchJson("/rules", {
       method: "POST",
       body: JSON.stringify(def),
+    });
+  }
+
+  /**
+   * List every index (range, equality and full-text), as `SHOW INDEXES` does.
+   *
+   * Wraps `GET /schema/indexes`. A role-bound token sees only the labels it
+   * can see a node of.
+   */
+  async indexes(): Promise<IndexInfo[]> {
+    return this.fetchJson<IndexInfo[]>("/schema/indexes");
+  }
+
+  /**
+   * Declare an index on `label.property`.
+   *
+   * Wraps `POST /schema/indexes`. Needs write access: a role-bound token or a
+   * `read` key gets a {@link MushroomError} (403). A name that exists is 409.
+   *
+   * @returns The row {@link MushroomClient.indexes} lists for it.
+   */
+  async createIndex(
+    label: string,
+    property: string,
+    opts?: CreateIndexOptions,
+  ): Promise<IndexInfo> {
+    return this.fetchJson<IndexInfo>("/schema/indexes", {
+      method: "POST",
+      body: JSON.stringify({ label, property, ...opts }),
+    });
+  }
+
+  /**
+   * Drop the index listed under `name`, of any kind.
+   *
+   * Wraps `DELETE /schema/indexes/{name}`. 404 for an unknown name; 409 for an
+   * equality index a unique constraint is checked against.
+   */
+  async dropIndex(name: string): Promise<void> {
+    this.checkPathSeg(name);
+    await this.fetchJson(`/schema/indexes/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * List every unique constraint, as `SHOW CONSTRAINTS` does.
+   *
+   * Wraps `GET /schema/constraints`.
+   */
+  async constraints(): Promise<ConstraintInfo[]> {
+    return this.fetchJson<ConstraintInfo[]>("/schema/constraints");
+  }
+
+  /**
+   * Declare a unique constraint on `label.property`.
+   *
+   * Wraps `POST /schema/constraints`. Needs write access. 409 when the name
+   * exists or live nodes already hold duplicate values.
+   */
+  async createConstraint(
+    name: string,
+    label: string,
+    property: string,
+  ): Promise<ConstraintInfo> {
+    return this.fetchJson<ConstraintInfo>("/schema/constraints", {
+      method: "POST",
+      body: JSON.stringify({ name, label, property, type: "unique" }),
+    });
+  }
+
+  /**
+   * Withdraw a unique constraint.
+   *
+   * Wraps `DELETE /schema/constraints/{name}`. 404 for an unknown name.
+   */
+  async dropConstraint(name: string): Promise<void> {
+    this.checkPathSeg(name);
+    await this.fetchJson(`/schema/constraints/${encodeURIComponent(name)}`, {
+      method: "DELETE",
     });
   }
 
@@ -773,6 +1040,123 @@ export class MushroomClient {
       method: "POST",
       body: JSON.stringify({ dest }),
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Transactions
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run one request against a transaction route and map its failures: HTTP 409
+   * becomes {@link TransactionConflictError}, except `busy` (a plain
+   * {@link MushroomError}) and `constraint` (a {@link ConstraintViolationError}). 404 and 410 become
+   * {@link TransactionExpiredError} on `/run`, `/commit` and `/rollback`
+   * (`expiredOnMissing`); on `/tx/begin` they mean the server has no
+   * transaction routes.
+   */
+  private async txJson<T>(
+    path: string,
+    init?: RequestInit,
+    expiredOnMissing = true,
+  ): Promise<T> {
+    try {
+      return await this.fetchJson<T>(path, init);
+    } catch (err) {
+      if (err instanceof MushroomError) {
+        // `busy` is a request that raced another on the same transaction:
+        // nothing is wrong with the transaction, so it is not a conflict and
+        // the handle stays open. `constraint` is already a
+        // ConstraintViolationError: a retry cannot fix it. Any other 409
+        // (`conflict`, or no code from an older server) is a commit conflict.
+        if (err.status === 409 && err.code !== "busy" && err.code !== "constraint") {
+          throw new TransactionConflictError(err.detail, err.status, err.code);
+        }
+        if (expiredOnMissing && (err.status === 404 || err.status === 410)) {
+          throw new TransactionExpiredError(err.detail, err.status);
+        }
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Begin an interactive transaction (`POST /tx/begin`).
+   *
+   * Prefer {@link MushroomClient.transaction}, which commits or rolls back for
+   * you. With this form, always end the handle with `commit()` or `rollback()`;
+   * an abandoned transaction is rolled back by the server when it expires.
+   *
+   * @example
+   * ```ts
+   * const tx = await client.beginTransaction();
+   * await tx.execute("CREATE (:Person {id: $id})", { id: "p1" });
+   * const bookmark = await tx.commit();
+   * ```
+   */
+  async beginTransaction(): Promise<TxHandle> {
+    let begun: TxBeginResponse;
+    try {
+      begun = await this.txJson<TxBeginResponse>(
+        "/tx/begin",
+        { method: "POST" },
+        false,
+      );
+    } catch (err) {
+      if (err instanceof MushroomError && (err.status === 404 || err.status === 405)) {
+        throw new MushroomError(
+          "this server does not support transactions (POST /tx/begin not found)",
+          err.status,
+        );
+      }
+      throw err;
+    }
+    const base = `/tx/${encodeURIComponent(begun.tx_id)}`;
+    return new TxHandle(
+      begun.tx_id,
+      begun.expires_at,
+      <T>(suffix: string, init?: RequestInit): Promise<T> =>
+        this.txJson<T>(`${base}${suffix}`, init),
+    );
+  }
+
+  /**
+   * Run `fn` inside a transaction. The transaction commits when `fn` resolves
+   * and rolls back when it throws; the error is rethrown unchanged. If the
+   * rollback itself fails, that failure is attached to the thrown error as a
+   * `rollbackError` property (when the thrown value is an object) and never
+   * replaces it. If `fn`
+   * commits or rolls back itself, nothing more is done.
+   *
+   * A commit conflict throws {@link TransactionConflictError}; the callback is
+   * not retried.
+   *
+   * @returns what `fn` returned.
+   */
+  async transaction<T>(fn: (tx: TxHandle) => Promise<T>): Promise<T> {
+    const tx = await this.beginTransaction();
+    let result: T;
+    try {
+      result = await fn(tx);
+    } catch (err) {
+      try {
+        await tx.rollback();
+      } catch (rollbackError) {
+        // The callback's error is the one the caller needs; keep the other beside it.
+        if (typeof err === "object" && err !== null) {
+          Object.defineProperty(err, "rollbackError", {
+            value: rollbackError,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+          });
+        }
+      }
+      throw err;
+    }
+    if (!tx.isFinished) {
+      await tx.commit();
+    }
+    return result;
   }
 
   // -------------------------------------------------------------------------

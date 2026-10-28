@@ -2,10 +2,10 @@
 
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
-    parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
-    run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
-    ServeUi,
+    parse_args, read_stats, resolve_statement, run_algo, run_asof, run_backup, run_build_index,
+    run_demo, run_export, run_import, run_migrate, run_query, run_schema_apply,
+    run_schema_apply_memory_defaults, run_schema_apply_memory_identity, run_schema_list,
+    run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
 use mushroomdb::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The default log filter.
@@ -23,7 +25,7 @@ use std::time::Duration;
 /// that matches nothing is indistinguishable from a server with nothing to say;
 /// `default_filter_enables_the_crates_that_log` exists because that is exactly
 /// the mistake this line shipped with for an afternoon.
-const DEFAULT_LOG_FILTER: &str = "mushroomdb=info,server=info,cli=info,warn";
+const DEFAULT_LOG_FILTER: &str = "mushroomdb=info,server=info,bolt=info,cli=info,warn";
 
 /// Install the log subscriber for a long-running `serve`.
 ///
@@ -43,13 +45,45 @@ fn init_logging() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("MUSHROOMDB_LOG")
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let format = match parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref()) {
+        Ok(format) => format,
+        Err(message) => {
+            // A hosted deployment that typo'd the format must not silently ship
+            // text to a collector expecting JSON: refuse to start.
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+    };
     // `try_init` rather than `init`: a second call must not panic the server,
     // and an embedder that already installed a subscriber keeps theirs.
-    let _ = fmt()
+    let builder = fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder.json().try_init(),
+    };
+}
+
+/// Log output format, chosen by `MUSHROOMDB_LOG_FORMAT`.
+#[derive(Debug, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// `unset`/empty/`text` -> text (today's output); `json` -> newline-delimited
+/// JSON; anything else is an error naming the accepted values.
+fn parse_log_format(value: Option<&str>) -> Result<LogFormat, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("text") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("json") => Ok(LogFormat::Json),
+        Some(other) => Err(format!(
+            "MUSHROOMDB_LOG_FORMAT={other:?} is not recognised; use \"text\" (the default) or \"json\""
+        )),
+    }
 }
 
 fn main() -> ExitCode {
@@ -59,16 +93,12 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::RetiredHook { sub }) => {
+        Ok(Command::RetiredHook) => {
             // Drain a hook payload so the runner's write never meets a closed
             // pipe. A terminal is not drained: nobody is going to type EOF.
             if !io::stdin().is_terminal() {
                 let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
             }
-            let _ = writeln!(
-                io::stderr(),
-                "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` to remove this hook (`mushroomdb doctor` lists any that remain)"
-            );
             ExitCode::SUCCESS
         }
         Ok(Command::Recall { db_dir, auto }) => {
@@ -124,21 +154,82 @@ fn main() -> ExitCode {
             token,
             role_tokens,
             snapshot_every,
+            shutdown_timeout,
             restore_from,
             tls_cert,
             tls_key,
+            bolt,
+            tx,
         }) => {
+            // Before anything touches the store (restore, demo, open).
+            if let Err(message) =
+                parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref())
+            {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("MUSHROOMDB_TOKEN")
                     .ok()
                     .filter(|s| !s.is_empty())
             });
-            if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            // The documentation placeholder is a publicly known value; a deploy
+            // that forgot to replace it must not come up authenticated by it.
+            if token.as_deref() == Some(PLACEHOLDER_TOKEN) {
                 return fail(
-                    "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
-                     (see SECURITY.md)",
+                    "the token is the documentation placeholder `<set-me>`; \
+                     set --token or MUSHROOMDB_TOKEN to a real secret",
                 );
             }
+            if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                // An admin key in keys.json is authentication too. Read and
+                // write keys are not: they leave no way to administer the server.
+                let admin_key = match mushroomdb::AccessKeys::load(db_dir.join("keys.json")) {
+                    Ok(keys) => keys.has_admin(),
+                    Err(e) => return fail(&e.to_string()),
+                };
+                if !admin_key {
+                    return fail(
+                        "non-loopback --addr requires --token, MUSHROOMDB_TOKEN or an admin key \
+                         in keys.json (see SECURITY.md)",
+                    );
+                }
+            }
+            // Fail before the store is opened: a bad origin list must not be
+            // discovered after a long restore or open.
+            if let Err(e) = server::cors_layer_from_env() {
+                return fail(&e);
+            }
+            // Restore on boot, checked before anything fills the directory.
+            let restore_from_s3 = match restore_from_s3_url() {
+                Ok(url) => url,
+                Err(e) => return fail(&e),
+            };
+            if restore_from_s3.is_some() {
+                for (set, flag) in [
+                    (restore_from.is_some(), "--restore-from"),
+                    (demo_if_empty, "--demo-if-empty"),
+                ] {
+                    if set {
+                        return fail(&format!(
+                            "MUSHROOMDB_RESTORE_FROM_S3 and {flag} both fill an empty data \
+                             directory; use one of them"
+                        ));
+                    }
+                }
+            }
+            // The Bolt listener binds --addr's IP, so the non-loopback rule
+            // above already covers it. Its own settings are checked here, for
+            // the same reason as the origin list.
+            let bolt = match cli::serve_bolt::resolve_bolt_settings(
+                &bolt,
+                &|name| std::env::var(name).ok(),
+                addr,
+                tls_cert.is_some(),
+            ) {
+                Ok(bolt) => bolt,
+                Err(e) => return fail(&e),
+            };
             // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
             // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
             // collision (flags are inserted last; HashMap retains last writer).
@@ -201,8 +292,12 @@ fn main() -> ExitCode {
                 token,
                 all_role_tokens,
                 snapshot_every,
+                shutdown_timeout,
                 tls_cert,
                 tls_key,
+                restore_from_s3,
+                bolt,
+                cli::resolve_tx_limits(&tx, &|name| std::env::var(name).ok()),
             ))
         }
         Ok(Command::Mcp {
@@ -236,14 +331,24 @@ fn main() -> ExitCode {
             commit,
             at,
             query,
+            file,
+            stdin,
             namespace,
-        }) => match run_asof(
-            &db_dir,
-            commit,
-            at.as_deref(),
+        }) => match resolve_statement(
             query.as_deref(),
-            namespace.as_deref(),
-        ) {
+            file.as_deref(),
+            stdin,
+            &mut std::io::stdin(),
+        )
+        .and_then(|statement| {
+            run_asof(
+                &db_dir,
+                commit,
+                at.as_deref(),
+                statement.as_deref(),
+                namespace.as_deref(),
+            )
+        }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -276,9 +381,19 @@ fn main() -> ExitCode {
         Ok(Command::Query {
             db_dir,
             cypher,
+            file,
+            stdin,
             role,
             namespace,
-        }) => match run_query(&db_dir, &cypher, role.as_deref(), namespace.as_deref()) {
+        }) => match resolve_statement(Some(&cypher), file.as_deref(), stdin, &mut std::io::stdin())
+            .and_then(|statement| {
+                run_query(
+                    &db_dir,
+                    statement.as_deref().unwrap_or_default(),
+                    role.as_deref(),
+                    namespace.as_deref(),
+                )
+            }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -305,6 +420,13 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Ok(Command::SchemaList { db_dir, what }) => match run_schema_list(&db_dir, what) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
         Ok(Command::SchemaApply {
             db_dir,
             schema_file,
@@ -338,6 +460,31 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::KeysAdd {
+            db_dir,
+            name,
+            tier,
+            role,
+        }) => match run_keys_add(&db_dir, &name, &tier, role.as_deref()) {
+            Ok(token) => {
+                println!("{token}");
+                eprintln!(
+                    "key {name:?} added to {} (tier {tier}). The token above is shown once \
+                     and is not stored; only its hash is. A running server loads it on SIGHUP \
+                     (kill -HUP <pid>; not available on Windows, where you restart).",
+                    db_dir.join("keys.json").display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::KeysHash) => match run_keys_hash() {
+            Ok(hash) => {
+                println!("{hash}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Ok(Command::Verify { db_dir }) => match run_verify(&db_dir) {
             Ok(msg) => {
                 println!("{msg}");
@@ -355,6 +502,32 @@ fn main() -> ExitCode {
                     eprintln!("warning: backup verification failed");
                     return ExitCode::from(1);
                 }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::RestoreS3 { from, at, into }) => {
+            print_or_fail(cli::run_restore_s3(&from, at.as_deref(), into.as_deref()))
+        }
+        Ok(Command::Import {
+            db_dir,
+            inputs,
+            opts,
+        }) => match run_import(&db_dir, &inputs, &opts) {
+            Ok(report) => {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                for e in &report.errors {
+                    eprintln!("skipped: {e}");
+                }
+                if report.rows_skipped > report.errors.len() {
+                    eprintln!(
+                        "skipped: ... and {} more",
+                        report.rows_skipped - report.errors.len()
+                    );
+                }
+                print!("{}", cli::import::format_import(&report));
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e.to_string()),
@@ -456,6 +629,9 @@ fn print_or_fail(r: Result<String, cli::CliError>) -> ExitCode {
     }
 }
 
+/// The placeholder the deploy templates and docs show where a token goes.
+const PLACEHOLDER_TOKEN: &str = "<set-me>";
+
 fn fail(msg: &str) -> ExitCode {
     let _ = writeln!(io::stderr(), "{msg}");
     ExitCode::from(1)
@@ -502,6 +678,43 @@ fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
     }
 }
 
+/// A new random token: 32 bytes from the operating system's random source (any
+/// platform), in hex.
+fn random_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("no random source: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `keys add`: issue a token, store only its hash, return the token to print.
+fn run_keys_add(
+    db_dir: &std::path::Path,
+    name: &str,
+    tier: &str,
+    role: Option<&str>,
+) -> Result<String, String> {
+    let token = random_token()?;
+    let hash = mushroomdb::hash_token(&token).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(db_dir).map_err(|e| format!("{}: {}", db_dir.display(), e.kind()))?;
+    mushroomdb::add_key(&db_dir.join("keys.json"), name, &hash, tier, role)
+        .map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+/// `keys hash`: the hash of a token read from stdin (one trailing newline dropped).
+fn run_keys_hash() -> Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::io::stdin()
+        .take(4096)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("could not read the token: {}", e.kind()))?;
+    // A trailing newline, or a Windows `\r\n`, is not part of the token.
+    let token = text.strip_suffix('\n').unwrap_or(&text);
+    let token = token.strip_suffix('\r').unwrap_or(token);
+    mushroomdb::hash_token(token).map_err(|e| e.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_serve(
     db_dir: PathBuf,
@@ -510,32 +723,71 @@ fn run_serve(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     snapshot_every: Option<Duration>,
+    shutdown_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    restore_from_s3: Option<String>,
+    bolt: Option<cli::serve_bolt::BoltSettings>,
+    tx_limits: server::TxLimits,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(async {
-        // Same guard as `run_mcp`: checked before `open` creates the
-        // directory's files, so it tells a brand-new store from one this
-        // invocation is merely reopening (or one `--demo-if-empty` /
-        // `--restore-from` already populated above, in which case this is
-        // already `true` and nothing here re-declares anything). Declaring
-        // full-text on a populated store builds the index at each open until
-        // a snapshot carries it (ledger row 36), and changes what an existing
-        // store indexes, so an existing store is never touched here.
-        let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
-        let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
-        if is_new_store {
-            // The first store most HTTP callers open. Declare the memory
-            // schema before the first write so `recall` can answer on it.
-            db.write()
-                .apply_schema(&mushroomdb::memory_schema::memory_defaults())
-                .map_err(|e| e.to_string())?;
+    let result = rt.block_on(async {
+        // `keys.json` beside the store: extra tokens with tiers, re-read on
+        // SIGHUP. An invalid file stops the start, before a boot restore takes
+        // the bucket lease and before the store is opened, rather than serve
+        // with the keys the operator meant to add missing.
+        let keys_path = db_dir.join("keys.json");
+        let access_keys = mushroomdb::AccessKeys::load(&keys_path).map_err(|e| e.to_string())?;
+        // A token configured twice, here and as a key, would be ambiguous.
+        if token
+            .iter()
+            .chain(role_tokens.keys())
+            .any(|t| access_keys.resolve(t).is_some())
+        {
+            return Err(format!(
+                "a token given by --token, MUSHROOMDB_TOKEN or a role token is also a key in {}; \
+                 each token may be configured in one place",
+                keys_path.display()
+            ));
         }
+        // Always, on Unix: SIGHUP re-reads keys.json, picks up one created after
+        // the start, and with none is a logged no-op. It must never end the process.
+        server::watch_sighup(&access_keys);
+        // Restore on boot comes first: before the store is opened and before
+        // the port is bound, so a platform's health check sees a process
+        // still starting, never an empty store.
+        let boot_lease = match &restore_from_s3 {
+            Some(url) => restore_on_boot(url, &db_dir).await?,
+            None => {
+                if backup::restore::install_interrupted(&db_dir) {
+                    return Err(format!(
+                        "{} holds a restore on boot that stopped while it moved its files in \
+                         ({} is there): a part of a store, which serve will not open. Set \
+                         MUSHROOMDB_RESTORE_FROM_S3 to the backup it came from and start again: \
+                         the boot removes what was moved in and restores again",
+                        db_dir.display(),
+                        backup::restore::INSTALL_MARKER
+                    ));
+                }
+                None
+            }
+        };
+        // `GET /ready` answers 503 until the store is open and its schema is in.
+        let ready_flag = Arc::new(AtomicBool::new(false));
+        let mut boot_lease = boot_lease;
+        let opened = open_for_serve(&db_dir, shutdown_timeout, &mut boot_lease).await;
+        // A lease the worker did not take: give it back at once.
+        if let Some(lease) = boot_lease.take() {
+            lease.release().await;
+        }
+        let (db, backup, plan) = opened?;
+        ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut snapshot_task = None;
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
-            tokio::spawn(async move {
+            let backup_tx = backup.as_ref().map(|(tx, _, _)| tx.clone());
+            snapshot_task = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await; // skip immediate fire
@@ -549,7 +801,13 @@ fn run_serve(
                     let taken =
                         tokio::task::spawn_blocking(move || cli::snapshot_shared(&db_snap)).await;
                     match taken {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            // Upload it now rather than at the worker's next
+                            // tick.
+                            if let Some(tx) = &backup_tx {
+                                let _ = tx.send(backup::BackupTrigger::Snapshot);
+                            }
+                        }
                         Ok(Err(GraphError::Busy { .. })) => {
                             eprintln!(
                                 "snapshot-every skipped: another process holds the write lock"
@@ -559,7 +817,7 @@ fn run_serve(
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
                 }
-            });
+            }));
         }
         // A quiescent server still finishes a vector-index build it was handed:
         // one slice a second, and the rule's edges appear when it completes.
@@ -613,6 +871,22 @@ fn run_serve(
             });
         }
         init_logging();
+        // Bound before HTTP starts, so a taken port stops the start with
+        // nothing served yet.
+        let bolt = match bolt {
+            Some(settings) => Some(
+                bind_bolt(
+                    settings,
+                    tls_cert.as_deref().zip(tls_key.as_deref()),
+                    token.clone(),
+                    role_tokens.clone(),
+                    access_keys.clone(),
+                    plan.drain,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let db_serve = db.clone();
         // The graceful-stop channel. Firing it — or dropping the sender — makes
         // the server stop accepting and let in-flight requests and subscribers
@@ -624,7 +898,7 @@ fn run_serve(
             if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
                 #[cfg(feature = "tls")]
                 {
-                    return server::serve_tls_with_shutdown(
+                    return server::serve_tls_with_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -633,12 +907,27 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
+                        Some(access_keys),
+                        tx_limits,
                     )
                     .await;
                 }
                 #[cfg(not(feature = "tls"))]
                 {
-                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens, stop_rx);
+                    let _ = (
+                        cert,
+                        key,
+                        db_serve,
+                        addr,
+                        tx,
+                        token,
+                        role_tokens,
+                        stop_rx,
+                        ready_flag,
+                        access_keys,
+                        tx_limits,
+                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "this binary was built without TLS support; \
@@ -649,7 +938,7 @@ fn run_serve(
             }
             match ui {
                 ServeUi::Filesystem(dir) => {
-                    server::serve_with_ui_and_role_tokens_and_shutdown(
+                    server::serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -657,42 +946,54 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
+                        Some(access_keys),
+                        tx_limits,
                     )
                     .await
                 }
                 ServeUi::None => {
-                    server::serve_with_role_tokens_and_shutdown(
+                    server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
+                        Some(access_keys),
+                        tx_limits,
                     )
                     .await
                 }
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui_and_shutdown(
+                        server::serve_with_embedded_ui_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
+                            Some(access_keys),
+                            tx_limits,
                         )
                         .await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve_with_role_tokens_and_shutdown(
+                        server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
+                            Some(access_keys),
+                            tx_limits,
                         )
                         .await
                     }
@@ -714,38 +1015,564 @@ fn run_serve(
                 };
             }
         }
-        tokio::select! {
+        // After the HTTP line: the docs and tests read that one first.
+        let mut bolt = bolt.map(|bound| bound.start(&db));
+        let mut backup = backup;
+        let outcome = tokio::select! {
             result = &mut serve => match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(e.to_string()),
             },
             _ = shutdown_signal() => {
-                // Ask the server to stop, then wait for it. In-flight requests
-                // and live subscribers finish; `serve.abort()` cut them off.
-                tracing::info!("shutdown signal received; draining in-flight requests");
-                let _ = stop_tx.send(());
-                match (&mut serve).await {
-                    Ok(Ok(())) => tracing::info!("drained; stopped"),
-                    Ok(Err(e)) => tracing::error!(error = %e, "server exited with an error"),
-                    Err(e) => tracing::error!(error = %e, "server task failed"),
+                let deadline = std::time::Instant::now() + shutdown_timeout;
+                // The periodic snapshot must not run beside the shutdown one.
+                if let Some(task) = &snapshot_task {
+                    task.abort();
                 }
-                // Same rule as the periodic snapshot: it needs the store's
-                // write lock. Shutting down without one is fine — the WAL holds
-                // every commit, and the next open replays it.
-                match cli::snapshot_shared(&db) {
-                    Ok(()) => {}
-                    Err(GraphError::Busy { .. }) => {
-                        eprintln!(
-                            "shutdown snapshot skipped: another process holds the write lock"
+                // Listen for a second signal before the sequence starts, so
+                // none is swallowed by the handler tokio keeps installed.
+                let second = shutdown_signal();
+                let sequence = graceful_stop(
+                    &mut serve,
+                    stop_tx,
+                    bolt.take(),
+                    &db,
+                    backup.take(),
+                    plan,
+                    deadline,
+                );
+                tokio::select! {
+                    result = sequence => result,
+                    _ = second => {
+                        tracing::warn!(
+                            "second shutdown signal: exiting now; the backup lease, if held, \
+                             expires on its own after its TTL"
                         );
+                        Err("shutdown forced by a second signal".to_string())
                     }
-                    Err(e) => return Err(e.to_string()),
                 }
-                Ok(())
+            }
+        };
+        // The server ended by itself: the Bolt listener stops with it, and
+        // the backup still gets its last flush.
+        if let Some(running) = bolt.take() {
+            running.stop(plan.drain).await;
+        }
+        if let Some((tx, handle, budget)) = backup.take() {
+            stop_backup(tx, handle, budget).await;
+        }
+        outcome
+    });
+    // A snapshot abandoned past the deadline runs on a blocking thread; do not
+    // wait for it (the WAL already holds every commit).
+    rt.shutdown_background();
+    result
+}
+
+/// Open the store for `serve`, declare the memory schema on a new one, and
+/// start continuous backup. `boot_lease` is handed to the backup worker,
+/// which renews it at once; it is left in place when this fails earlier, for
+/// the caller to release.
+async fn open_for_serve(
+    db_dir: &std::path::Path,
+    shutdown_timeout: Duration,
+    boot_lease: &mut Option<backup::BootLease>,
+) -> Result<(SharedDb, Option<RunningBackup>, cli::ShutdownPlan), String> {
+    // Test hook: an open that takes this long (a large restored store).
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var(TEST_OPEN_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    // Same guard as `run_mcp`: checked before `open` creates the
+    // directory's files, so it tells a brand-new store from one this
+    // invocation is merely reopening (or one `--demo-if-empty` /
+    // `--restore-from` already populated above, in which case this is
+    // already `true` and nothing here re-declares anything). Declaring
+    // full-text on a populated store builds the index at each open until
+    // a snapshot carries it (ledger row 36), and changes what an existing
+    // store indexes, so an existing store is never touched here.
+    let is_new_store = !mushroomdb::restore::holds_a_store(db_dir);
+    let db = SharedDb::open(db_dir).map_err(|e| e.to_string())?;
+    // A shared open takes no lock, so an unwritable data directory would
+    // otherwise surface at the first write, long after the platform called
+    // the deploy healthy. Try the write lock once: only a permission
+    // refusal is fatal. A peer holding the lock (`Busy`) is not this
+    // check's business, and serving reads alongside it stays as it was.
+    match db.write_with_wait(Duration::ZERO) {
+        // A read-only mount is a deliberate setup that 0.9.2 served reads
+        // from, so an existing store on one still starts; its writes fail
+        // with the cause. A new store has nothing to serve without a write.
+        Err(GraphError::Unwritable {
+            detail,
+            read_only_filesystem: true,
+            ..
+        }) if !is_new_store => {
+            eprintln!("serve: read-only store, writes will fail: {detail}");
+        }
+        Err(e @ GraphError::Unwritable { .. }) => return Err(e.to_string()),
+        _ => {}
+    }
+    if is_new_store {
+        // The first store most HTTP callers open. Declare the memory
+        // schema before the first write so `recall` can answer on it.
+        db.write()
+            .apply_schema(&mushroomdb::memory_schema::memory_defaults())
+            .map_err(|e| e.to_string())?;
+    }
+    // Continuous backup, when MUSHROOMDB_BACKUP_S3_URL asks for it. Held
+    // for the life of the server: dropping the sender stops the worker.
+    let (backup, plan) = start_backup(&db, db_dir, shutdown_timeout, boot_lease)?;
+    Ok((db, backup, plan))
+}
+
+/// Test hook (the `test-hooks` feature): delay the open in `serve` by this
+/// many milliseconds.
+#[cfg(feature = "test-hooks")]
+const TEST_OPEN_DELAY_ENV: &str = "MUSHROOMDB_TEST_OPEN_DELAY_MS";
+
+/// Test hook, compiled only with the `test-hooks` feature (enabled for this
+/// package's own tests, never in a release build): delay the shutdown
+/// snapshot by this many milliseconds, to exercise the overrun path.
+#[cfg(feature = "test-hooks")]
+const TEST_SNAPSHOT_DELAY_ENV: &str = "MUSHROOMDB_TEST_SHUTDOWN_SNAPSHOT_DELAY_MS";
+
+/// The graceful shutdown, in three bounded phases inside one `deadline`:
+///
+/// 1. **Drain**: stop accepting and let in-flight requests finish, for at most
+///    `plan.drain` (25 s at the default timeout, scaled down for a shorter one). What is still open then is cut off.
+///    The Bolt listener, when there is one, stops accepting at the same moment
+///    and closes each connection at its next idle point, which rolls back an
+///    open transaction; it shares the same drain bound.
+/// 2. **Snapshot**, on a blocking thread, in what remains once the backup's
+///    reserve is set aside. If it overruns it is skipped: the WAL holds every
+///    commit and the next open replays it.
+/// 3. **Backup**: flush, final manifest, lease release, for at most the
+///    backup's own bound (or what the deadline leaves).
+///
+/// Every phase runs even if an earlier one failed or ran out, so the lease is
+/// always released when the bucket is reachable.
+async fn graceful_stop(
+    serve: &mut tokio::task::JoinHandle<io::Result<()>>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    bolt: Option<RunningBolt>,
+    db: &SharedDb,
+    backup: Option<RunningBackup>,
+    plan: cli::ShutdownPlan,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let reserve = backup.as_ref().map_or(Duration::ZERO, |(_, _, b)| *b);
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
+    let _ = stop_tx.send(());
+    let drain = plan.drain.min(left().saturating_sub(reserve));
+    let drain_ends = std::time::Instant::now() + drain;
+    let bolt_stopping = bolt.map(|running| {
+        let _ = running.stop.send(true);
+        running.task
+    });
+    match tokio::time::timeout(drain, &mut *serve).await {
+        Ok(Ok(Ok(()))) => tracing::info!("drained; stopped"),
+        Ok(Ok(Err(e))) => tracing::error!(error = %e, "server exited with an error"),
+        Ok(Err(e)) => tracing::error!(error = %e, "server task failed"),
+        Err(_) => {
+            tracing::warn!(
+                drain_s = drain.as_secs(),
+                "requests still open after the drain period; closing them"
+            );
+            serve.abort();
+        }
+    }
+    if let Some(mut task) = bolt_stopping {
+        // The listener holds itself to the same bound; this is the backstop.
+        let left_of_drain = drain_ends.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left_of_drain + BOLT_DRAIN_SLACK, &mut task).await {
+            Ok(Ok(Ok(()))) => tracing::info!("bolt: drained; stopped"),
+            Ok(Ok(Err(e))) => tracing::error!(error = %e, "bolt: listener exited with an error"),
+            Ok(Err(e)) => tracing::error!(error = %e, "bolt: listener task failed"),
+            Err(_) => {
+                tracing::warn!("bolt: connections still open after the drain period; closing them");
+                task.abort();
             }
         }
+    }
+
+    // Same rule as the periodic snapshot: it needs the store's write lock.
+    // Shutting down without one is fine: the WAL holds every commit.
+    let mut outcome = Ok(());
+    let snapshot_budget = left().saturating_sub(reserve);
+    if snapshot_budget.is_zero() {
+        tracing::warn!("no time left for the shutdown snapshot; skipped (the WAL is durable)");
+    } else {
+        let db_snap = db.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-hooks")]
+            if let Some(ms) = std::env::var(TEST_SNAPSHOT_DELAY_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            cli::snapshot_shared(&db_snap)
+        });
+        match tokio::time::timeout(snapshot_budget, snapshot).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(GraphError::Busy { .. }))) => {
+                eprintln!("shutdown snapshot skipped: another process holds the write lock");
+            }
+            Ok(Ok(Err(e))) => outcome = Err(e.to_string()),
+            Ok(Err(e)) => outcome = Err(format!("shutdown snapshot task failed: {e}")),
+            Err(_) => tracing::warn!(
+                budget_s = snapshot_budget.as_secs(),
+                "the shutdown snapshot overran its budget; skipped (the WAL is durable)"
+            ),
+        }
+    }
+
+    if let Some((tx, handle, budget)) = backup {
+        stop_backup(tx, handle, budget.min(left())).await;
+    }
+    outcome
+}
+
+/// How long past the drain bound the Bolt listener's task is waited for. The
+/// listener aborts its own connections at the bound; this covers the abort.
+const BOLT_DRAIN_SLACK: Duration = Duration::from_millis(500);
+
+/// A Bolt listener that is bound and not yet serving.
+struct BoundBolt {
+    listener: bolt::server::BoltListener,
+    authenticator: Arc<bolt::messages::hello::TokenAuthenticator>,
+    config: bolt::server::BoltConfig,
+    scheme: &'static str,
+    bound: SocketAddr,
+}
+
+/// A serving Bolt listener: its task and its stop signal.
+struct RunningBolt {
+    task: tokio::task::JoinHandle<io::Result<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl BoundBolt {
+    /// Starts serving and prints the line that says where.
+    fn start(self, db: &SharedDb) -> RunningBolt {
+        println!("listening on {}://{}", self.scheme, self.bound);
+        let advertised = self
+            .config
+            .connection
+            .routing
+            .as_ref()
+            .map(|r| r.advertised_address().to_string())
+            .unwrap_or_default();
+        tracing::info!(addr = %self.bound, %advertised, scheme = self.scheme, "bolt: listening");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let watched = stop_rx.clone();
+        let serving = self
+            .listener
+            .serve(db.clone(), self.authenticator, self.config, stop_rx);
+        let task = tokio::spawn(async move {
+            let ended = serving.await;
+            // The listener returns only when told to stop. Ending any other
+            // way leaves HTTP up with Bolt gone, which must not be silent.
+            if !*watched.borrow() {
+                match &ended {
+                    Ok(()) => tracing::error!("bolt: the listener stopped on its own"),
+                    Err(e) => tracing::error!(error = %e, "bolt: the listener failed"),
+                }
+            }
+            ended
+        });
+        RunningBolt { task, stop }
+    }
+}
+
+impl RunningBolt {
+    /// Stops the listener and waits for it, no longer than `drain` and the
+    /// slack.
+    async fn stop(mut self, drain: Duration) {
+        let _ = self.stop.send(true);
+        if tokio::time::timeout(drain + BOLT_DRAIN_SLACK, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
+    }
+}
+
+/// Binds the Bolt listener `settings` describes. Its credentials are exactly
+/// the HTTP server's: the token, the role tokens and the `keys.json` set (the
+/// same set, so a SIGHUP reload reaches both). With TLS it serves the HTTP
+/// certificate.
+async fn bind_bolt(
+    settings: cli::serve_bolt::BoltSettings,
+    tls: Option<(&std::path::Path, &std::path::Path)>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    access_keys: mushroomdb::AccessKeys,
+    drain: Duration,
+) -> Result<BoundBolt, String> {
+    let mut config = bolt::server::BoltConfig {
+        max_connections: settings.max_connections,
+        drain_timeout: drain,
+        ..bolt::server::BoltConfig::default()
+    };
+    // `GET /metrics` reports the listener's connection counters.
+    server::register_bolt_metrics(server::BoltMetrics {
+        open: config.stats.open.clone(),
+        accepted: config.stats.accepted.clone(),
+    });
+    config.connection.tx_timeout = settings.tx_timeout;
+    config.connection.bookmark_timeout = settings.bookmark_timeout;
+    if settings.tls {
+        let Some((cert, key)) = tls else {
+            return Err("--bolt-tls needs --tls-cert and --tls-key".into());
+        };
+        #[cfg(feature = "tls")]
+        {
+            config.tls = Some(server::load_server_config(cert, key)?);
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = (cert, key);
+            return Err(
+                "this binary was built without TLS support; rebuild with --features tls, \
+                 or give --bolt-plaintext and terminate TLS at a proxy \
+                 (see docs/site/bolt.md)"
+                    .into(),
+            );
+        }
+    }
+    let listener = bolt::server::BoltListener::bind(settings.bind)
+        .await
+        .map_err(|e| format!("--bolt-port: cannot listen on {}: {e}", settings.bind))?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    config.connection.routing = Some(settings.routing(bound)?);
+    let authenticator = Arc::new(
+        bolt::messages::hello::TokenAuthenticator::new(token, role_tokens)
+            .with_access_keys(access_keys),
+    );
+    Ok(BoundBolt {
+        listener,
+        authenticator,
+        config,
+        scheme: settings.scheme(),
+        bound,
     })
+}
+
+/// Send the backup worker `Shutdown` and wait for it, no longer than `wait`.
+/// The worker flushes the last WAL segment and any new snapshot, writes a
+/// final manifest, and deletes its lease. A timeout is logged and ignored: the
+/// local store is already safe, and the lease then expires by itself.
+async fn stop_backup(
+    tx: tokio::sync::watch::Sender<backup::BackupTrigger>,
+    handle: backup::BackupHandle,
+    wait: Duration,
+) {
+    tracing::info!("shutdown: flushing the S3 backup");
+    let _ = tx.send(backup::BackupTrigger::Shutdown);
+    match tokio::time::timeout(wait, handle.join).await {
+        Ok(Ok(())) => tracing::info!("shutdown: backup flushed"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "shutdown: the backup worker failed"),
+        Err(_) => tracing::warn!(
+            wait_s = wait.as_secs(),
+            "shutdown: the S3 flush did not finish in time; the local store is safe"
+        ),
+    }
+}
+
+/// The backup worker, the sender that drives it and the longest its shutdown
+/// may take, or `None` when `MUSHROOMDB_BACKUP_S3_URL` is unset.
+type RunningBackup = (
+    tokio::sync::watch::Sender<backup::BackupTrigger>,
+    backup::BackupHandle,
+    Duration,
+);
+
+/// Start the backup worker when the environment configures one.
+///
+/// A configuration that is set but malformed refuses to start the server: a
+/// typo must not quietly leave a store without the backup its operator asked
+/// for. The worker itself never stops the server — its failures are retried
+/// and counted on the handle.
+///
+/// Also divides `shutdown_timeout` between the shutdown phases. The backup's
+/// flush grace and request deadline are shrunk when its share of a short
+/// timeout is smaller than they are, so the lease release still fits.
+///
+/// `boot_lease` is the bucket lease a restore on boot took on this backup's
+/// prefix: the worker holds it from the start instead of taking one. It is
+/// taken out of the option only once nothing else here can fail.
+fn start_backup(
+    db: &SharedDb,
+    db_dir: &std::path::Path,
+    shutdown_timeout: Duration,
+    boot_lease: &mut Option<backup::BootLease>,
+) -> Result<(Option<RunningBackup>, cli::ShutdownPlan), String> {
+    let Some(mut config) = backup::BackupConfig::from_env().map_err(|e| e.to_string())? else {
+        return Ok((None, cli::shutdown_plan(shutdown_timeout, Duration::ZERO)));
+    };
+    let plan = cli::shutdown_plan(shutdown_timeout, config.shutdown_budget());
+    config.fit_shutdown_within(plan.backup);
+    let store = backup::build_store(&config).map_err(|e| e.to_string())?;
+    let budget = plan.backup;
+    let (tx, rx) = tokio::sync::watch::channel(backup::BackupTrigger::Idle);
+    let mut worker = backup::BackupWorker::new(
+        config,
+        store,
+        std::sync::Arc::new(db.clone()),
+        db_dir.to_path_buf(),
+    )
+    .map_err(|e| e.to_string())?;
+    // Taken only here, with nothing left that can fail: the boot's renewer
+    // stops and the worker's renews at once.
+    if let Some(lease) = boot_lease.take() {
+        worker.adopt_lease(lease.detach());
+    }
+    let handle = worker.start(rx);
+    // `GET /metrics` reports the worker's counters as `mushroomdb_backup_*`.
+    server::register_backup_metrics(server::BackupMetrics {
+        error_count: handle.error_count.clone(),
+        last_success_ts: handle.last_success_ts.clone(),
+        lag_s: handle.lag_s.clone(),
+        healthy: handle.healthy.clone(),
+        lease_held: handle.lease_held.clone(),
+    });
+    Ok((Some((tx, handle, budget)), plan))
+}
+
+/// `MUSHROOMDB_RESTORE_FROM_S3`, checked: `None` when unset or empty.
+fn restore_from_s3_url() -> Result<Option<String>, String> {
+    let Some(url) = std::env::var("MUSHROOMDB_RESTORE_FROM_S3")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    restore_config(&url)?;
+    Ok(Some(url))
+}
+
+/// The configuration a restore on boot from `url` runs with: the bucket
+/// lease settings (`MUSHROOMDB_BACKUP_LEASE_TTL`, `…_LEASE_CONDITIONAL`,
+/// `…_OP_TIMEOUT_MS`) as backup reads them, for the prefix `url` names.
+fn restore_config(url: &str) -> Result<backup::BackupConfig, String> {
+    backup::BackupConfig::from_lookup(|k| match k {
+        "MUSHROOMDB_BACKUP_S3_URL" => Some(url.to_string()),
+        _ => std::env::var(k).ok(),
+    })
+    .map_err(|e| {
+        e.to_string()
+            .replace("MUSHROOMDB_BACKUP_S3_URL", "MUSHROOMDB_RESTORE_FROM_S3")
+    })?
+    .ok_or_else(|| "MUSHROOMDB_RESTORE_FROM_S3 is empty".to_string())
+}
+
+/// Restore on boot from `url` into `db_dir` when it holds no store
+/// ([`backup::restore_on_boot`]), saying what happened on stderr. Returns the
+/// bucket lease to hand to the backup worker when backup continues under
+/// the same prefix; otherwise the lease is released here.
+///
+/// A prefix with no backup is a warning: a first deploy starts an empty
+/// store. Any other failure is an error, and the server does not start.
+async fn restore_on_boot(
+    url: &str,
+    db_dir: &std::path::Path,
+) -> Result<Option<backup::BootLease>, String> {
+    let config = restore_config(url)?;
+    let continues = match backup::BackupConfig::from_env() {
+        Ok(Some(b)) => b.location().ok() == config.location().ok(),
+        _ => false,
+    };
+    let store =
+        backup::build_store(&config).map_err(|e| format!("restore-on-boot from {url}: {e}"))?;
+    let started = std::time::Instant::now();
+    let lease = match backup::restore_on_boot(&config, store, db_dir).await {
+        Ok(backup::BootRestore::Skipped) => {
+            eprintln!(
+                "restore-on-boot: {} already holds a store; not restoring",
+                db_dir.display()
+            );
+            return Ok(None);
+        }
+        Ok(backup::BootRestore::NoBackup { lease }) => {
+            eprintln!("restore-on-boot: warning: {url} holds no backup; starting an empty store");
+            lease
+        }
+        Ok(backup::BootRestore::Restored {
+            outcome,
+            lease,
+            undone,
+            leftovers,
+        }) => {
+            for path in &leftovers {
+                eprintln!(
+                    "restore-on-boot: warning: a killed restore's leftover stays in the data \
+                     directory (in use, too young, or no advisory locks here): {}; remove it once \
+                     no restore runs",
+                    path.display()
+                );
+            }
+            if !undone.is_empty() {
+                eprintln!(
+                    "restore-on-boot: removed what an interrupted restore had moved in: {}",
+                    undone.join(", ")
+                );
+            }
+            for path in &outcome.swept {
+                eprintln!(
+                    "restore-on-boot: removed a killed restore's leftover: {}",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "restore-on-boot: restored {url} into {}: {} commits from {}, {} bytes in {:.1} s",
+                db_dir.display(),
+                outcome.commits,
+                outcome.manifest,
+                outcome.bytes,
+                started.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "restore-on-boot: lineage {} (new; restored from {})",
+                outcome.lineage, outcome.source_lineage
+            );
+            for note in outcome.tail_note.iter().chain(&outcome.install_note) {
+                eprintln!("restore-on-boot: warning: {note}");
+            }
+            lease
+        }
+        Err(e) => {
+            // Some failures leave a store in place (one that may have served
+            // writes, or one whose install is not yet durable): say "holds
+            // no store" only when that is true on disk.
+            let left = if mushroomdb::restore::holds_a_store(db_dir) {
+                format!(
+                    "{} still holds a store; do not empty it without reading the error above",
+                    db_dir.display()
+                )
+            } else {
+                format!("{} holds no store", db_dir.display())
+            };
+            return Err(format!(
+                "restore-on-boot from {url} failed: {e}. Nothing is served, and {left}"
+            ));
+        }
+    };
+    if continues {
+        // Still renewed: the worker takes it over once the store is open.
+        Ok(Some(lease))
+    } else {
+        lease.release().await;
+        Ok(None)
+    }
 }
 
 async fn shutdown_signal() {
@@ -828,7 +1655,7 @@ fn home_from(home: Option<OsString>, userprofile: Option<OsString>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_LOG_FILTER;
+    use super::{parse_log_format, LogFormat, DEFAULT_LOG_FILTER};
     use std::path::PathBuf;
 
     #[test]
@@ -864,6 +1691,15 @@ mod tests {
             "the default filter {DEFAULT_LOG_FILTER:?} does not name the \
              server's log target {root:?}, so nothing it logs would appear"
         );
+    }
+
+    #[test]
+    fn log_format_values() {
+        assert_eq!(parse_log_format(None), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("text")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("JSON")), Ok(LogFormat::Json));
+        assert!(parse_log_format(Some("yaml")).unwrap_err().contains("yaml"));
     }
 
     /// The filter parses. An unparseable default falls back to silence.

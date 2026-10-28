@@ -166,7 +166,7 @@ These reach the store directly. In the listing a client receives, each descripti
 
 ### `query`
 
-Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.
+Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range or the list is null, and an error when the property is not a list or map or the index is not an integer.
 
 | Argument | Type | Required | What it is |
 |---|---|---|---|
@@ -204,6 +204,9 @@ How should this kind of relationship be derived from now on — declare a rule (
 | `namespace` | string | no | Scope the rule to one namespace: it sees only that namespace's nodes — source, via hop and destination — so every edge it derives stays inside. Omitted means a global rule, which is the only kind that may derive an edge across a boundary. |
 | `predicate` | object | yes |  |
 | `src_label` | string | yes |  |
+| `via_dir` | one of `"Out"`, `"In"` | no | Direction to follow via_edge from the source (default: Out, source to via). |
+| `via_edge` | string | no | Optional intermediate hop: the edge type followed from the source to reach a via node. Give it together with via_label. |
+| `via_label` | string | no | Optional intermediate hop: the label of the via node. Give it together with via_edge. The predicate is then evaluated between the via node and the destination, and the derived edge still runs source to destination. |
 | `weight_prop` | string or null | no | Edge property that stores the score (default: weight). |
 
 ### `explain`

@@ -1,3 +1,4 @@
+use crate::durable_wal::{DurableWal, WalPosition};
 use crate::ingest::{IngestOptions, IngestReport};
 use crate::roles::{PropPredicate, RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
@@ -5,11 +6,13 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::{ret_val_label, ArithOp};
 use core_query::cypher::{
-    execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
-    plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
-    RetVal, WriteStatement,
+    execute, execute_planned_union, is_subscribable, is_write_tokens, lex, parse, parse_read,
+    parse_write, plan, plan_union, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
+    PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
-use core_query::{eval_cmp, eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
+use core_query::{
+    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet, WriteStats,
+};
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
     Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
@@ -22,11 +25,11 @@ use core_storage::v8::encode::{
     archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
-use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::wal::{decode_all, encode_record, try_encode_record, WalRecord};
 use core_storage::EdgePropsView;
 use core_storage::{
     namespace_of_value, ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result,
-    Topology, Value,
+    Topology, UniqueConstraint, Value, ValueKey, BINARY_MAX_BYTES,
 };
 pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 
@@ -35,6 +38,27 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod call;
+mod ddl;
+mod explain;
+pub use ddl::{SchemaError, SchemaErrorKind};
+mod match_write;
+mod node_key;
+pub(crate) use node_key::generate_node_key;
+pub use node_key::{is_generated_key, GENERATED_KEY_PREFIX};
+mod row_eval;
+pub(crate) use match_write::{match_remove_ops, match_set_map_ops, match_set_ops, MatchWrite};
+pub(crate) use row_eval::RowSource;
+pub(crate) use unwind_write::{unwind_rows, RowPass};
+mod unwind_write;
+
+pub(crate) use call::{call_statement, run_call};
+pub(crate) use ddl::{
+    ddl_statement, schema_change_in_a_transaction, schema_change_on_a_read, SchemaListing,
+};
+pub(crate) use explain::{explain_answer, Seen};
+pub use explain::{explain_plan_value, is_explain_query};
+
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
 /// Absent means 1 — the count is written only from the second insert of a
@@ -42,6 +66,12 @@ const NS_DEFAULT_IDX: u32 = 0;
 /// [`GraphDb::enable_multiplicity`]. The engine owns the name: Cypher `SET` on
 /// it is refused, as the other reserved names are.
 pub const EDGE_COUNT_PROP: &str = "count";
+
+/// The conflict-set entry of a key that changed between a transaction's BEGIN
+/// and the moment the transaction first touched it. No node's `last_change`
+/// is ever `u64::MAX`, so a `NodeUnchangedSince` carrying it always fails —
+/// the same sentinel `Precondition::NodeAbsent` reports as `expected`.
+pub(crate) const TX_CHANGED_SINCE_BEGIN: u64 = u64::MAX;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -381,6 +411,10 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DisableFulltext { .. }
         | WalRecord::EnableIndex { .. }
         | WalRecord::DisableIndex { .. }
+        | WalRecord::CreateConstraint { .. }
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
         | WalRecord::Intern { .. }
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
@@ -389,23 +423,31 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // A count changes neither the node nor the edge population: the pair it
         // counts was already there, which is why it is written at all.
         | WalRecord::SetEdgeCount { .. }
+        // A relationship property has no mutation event of its own (0.10).
+        | WalRecord::SetEdgePropId { .. }
+        | WalRecord::RemoveEdgePropId { .. }
         // RenameNode carries no node/edge count change; no special event.
         | WalRecord::RenameNode { .. } => None,
     }
 }
 
 /// Whether `rec` only declares or withdraws something about the store — a
-/// full-text pair, an equality index, the multiplicity opt-in — and writes no
+/// full-text pair, an equality or range index, a unique constraint, the
+/// multiplicity opt-in — and writes no
 /// node, edge or property. These are the records a truncating snapshot
 /// re-emits into its baseline WAL.
-fn is_declaration(rec: &WalRecord) -> bool {
+pub(crate) fn is_declaration(rec: &WalRecord) -> bool {
     matches!(
         rec,
         WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. }
             | WalRecord::EnableIndex { .. }
             | WalRecord::DisableIndex { .. }
-    ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
+            | WalRecord::CreateConstraint { .. }
+            | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
+    ) || rec.is_multiplicity_decl()
 }
 
 /// Database-wide counters plus per-rule budget/fire stats.
@@ -491,13 +533,64 @@ pub struct SlowQuerySnapshot {
 
 /// Internal ring-buffer state protected by a `Mutex` so `query(&self)` can
 /// write to it without a mutable borrow.
-struct SlowQueryLog {
+pub(crate) struct SlowQueryLog {
     entries: std::collections::VecDeque<SlowQueryEntry>,
     total: u64,
 }
 
 /// Maximum number of entries kept in the slow-query ring buffer.
 const SLOW_QUERY_RING_CAP: usize = 16;
+
+/// Where an unmasked read query reports itself when it is slow: the handle's
+/// threshold and ring buffer. A [`crate::reader::ReaderSnapshot`] carries one,
+/// so a query run on the lock-free reader lands in the same `/metrics` ring a
+/// query run under the read lock does.
+#[derive(Clone)]
+pub(crate) struct SlowQuerySink {
+    threshold_ms: u64,
+    log: Arc<std::sync::Mutex<SlowQueryLog>>,
+}
+
+impl SlowQuerySink {
+    /// The ring and threshold as [`GraphDb::slow_query_snapshot`] reports them.
+    pub(crate) fn snapshot(&self) -> SlowQuerySnapshot {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        SlowQuerySnapshot {
+            threshold_ms: self.threshold_ms,
+            count: log.total,
+            last: log.entries.iter().cloned().collect(),
+        }
+    }
+
+    /// Record `cypher` if `elapsed_ms` reaches the threshold.
+    pub(crate) fn record(&self, elapsed_ms: u64, cypher: &str, at_commit: u64) {
+        let threshold = self.threshold_ms;
+        if threshold > 0 && elapsed_ms >= threshold {
+            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
+            let entry = SlowQueryEntry {
+                ms: elapsed_ms,
+                query: cypher.to_string(),
+                at_commit,
+            };
+            if let Ok(mut log) = self.log.lock() {
+                if log.entries.len() == SLOW_QUERY_RING_CAP {
+                    log.entries.pop_front();
+                }
+                log.entries.push_back(entry);
+                log.total += 1;
+            }
+        }
+    }
+}
+
+/// Whether `rec` declares or withdraws an index or a constraint, inside a
+/// batch or not (see [`is_declaration`]).
+fn declares_schema(rec: &WalRecord) -> bool {
+    match rec {
+        WalRecord::Batch(inner) => inner.iter().any(declares_schema),
+        rec => is_declaration(rec),
+    }
+}
 
 /// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
 /// bincode-persisted (WAL/snapshots store `RuleDef` bytes, not this type).
@@ -787,16 +880,192 @@ pub struct EdgeTypeCensus {
     pub sample: Option<(String, String)>,
 }
 
-/// Construct the standard write-query result set (columns: created, properties_set, deleted).
-fn write_result_set() -> ResultSet {
+/// True when a node's stored `id` property is its own key: the convention
+/// `CREATE` and the default ingest follow. A node whose `id` differs from the
+/// key, or that has none, is not covered by the key-property rule.
+pub(crate) fn id_mirrors_key(key: &str, stored_id: Option<&Value>) -> bool {
+    matches!(stored_id, Some(Value::Str(s)) if s == key)
+}
+
+/// The refusal for a write that would break the `id`-equals-key correspondence
+/// of a node that has it: only `rename_node` moves both together. Raised at
+/// `rewrite_wal_dense_inner` (set) and `prepare_remove_prop` (removal), so
+/// every API gets it.
+pub(crate) fn key_property_error(key: &str) -> GraphError {
+    GraphError::QueryError {
+        detail: format!(
+            "cannot change the key property `id` of node {key}; \
+             renaming a node is rename_node"
+        ),
+    }
+}
+
+/// The refusal for removing the key property (`REMOVE n.id`, a null `id`) of a
+/// node whose `id` is its key.
+pub(crate) fn key_property_removal_error() -> GraphError {
+    GraphError::QueryError {
+        detail: "cannot REMOVE the key property `id`; renaming a node is rename_node".into(),
+    }
+}
+
+/// `Err` when setting `id` to `new` on the node `key`, whose stored `id` is
+/// `stored_id`, would break `id == key`. The engine enforces this at its write
+/// choke point; a transaction calls it to refuse at the statement, not at
+/// commit.
+pub(crate) fn check_key_property_write(
+    key: &str,
+    stored_id: Option<&Value>,
+    new: Option<&Value>,
+) -> Result<()> {
+    if id_mirrors_key(key, stored_id) && !id_mirrors_key(key, new) {
+        return Err(key_property_error(key));
+    }
+    Ok(())
+}
+
+/// `Err` when removing `id` from the node `key` whose stored `id` is `stored_id`
+/// would break `id == key`.
+pub(crate) fn check_key_property_removal(key: &str, stored_id: Option<&Value>) -> Result<()> {
+    if id_mirrors_key(key, stored_id) {
+        return Err(key_property_removal_error());
+    }
+    Ok(())
+}
+
+/// A SET map's keys with each value evaluated for one matched row; `None` is null.
+type MapEntries = Vec<(String, Option<Value>)>;
+
+/// One property write a Cypher `SET n = {…}` / `SET n += {…}` plans for a node.
+#[derive(Debug, Clone, PartialEq)]
+enum MapWrite {
+    Set { field: String, value: Value },
+    Remove { field: String },
+}
+
+/// The writes `SET n = map` (`merge == false`) or `SET n += map` (`merge ==
+/// true`) makes to the node `key`, whose current properties are `existing`.
+/// `entries` pairs each map key with its evaluated value; `None` is null.
+///
+/// Decisions, each pinned by a test:
+/// - `+=`: a non-null value sets the property; a null value removes it (a
+///   no-op when the node lacks it); every other property is left alone.
+/// - `=`: the node's properties become exactly the non-null entries. A null
+///   entry is an absent key, so it removes the property if the node has it.
+///   Removals are listed before sets in the batch.
+/// - `id`: on a node whose `id` is its key, `=` never removes it and a map that
+///   names it writes it like any property; the engine's write choke point
+///   decides (the key passes, any other value or null is refused — a key change
+///   is `rename_node`). On a node whose `id` differs from its key, or that has
+///   none, it is an ordinary property.
+/// - `ns` is never removed by `=` (a map without it keeps the namespace). A
+///   map that sets it is checked by the batch (`NamespaceImmutable` for a
+///   different one); `+= {ns: null}` is a removal, refused there the same way.
+/// - A view-owned property is never removed by `=` (`is_view_owned`), the same
+///   filter `on_conflict="replace"` applies. Naming one in the map, with a value
+///   or null, reaches the batch and is `ViewPropReadOnly`.
+fn plan_map_write(
+    key: &str,
+    existing: &BTreeMap<String, Value>,
+    merge: bool,
+    entries: &[(String, Option<Value>)],
+    is_view_owned: &dyn Fn(&str) -> bool,
+) -> Vec<MapWrite> {
+    let mut sets = Vec::new();
+    let mut removes = Vec::new();
+    for (field, value) in entries {
+        match value {
+            Some(v) => sets.push(MapWrite::Set {
+                field: field.clone(),
+                value: v.clone(),
+            }),
+            None => removes.push(MapWrite::Remove {
+                field: field.clone(),
+            }),
+        }
+    }
+    if !merge {
+        let kept: BTreeSet<&str> = entries
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(f, _)| f.as_str())
+            .collect();
+        // A null entry is already a removal above; do not plan it twice.
+        for field in existing.keys() {
+            let protected = (field == "id" && id_mirrors_key(key, existing.get("id")))
+                || field == NS_PROP
+                || is_view_owned(field);
+            let already = removes
+                .iter()
+                .any(|w| matches!(w, MapWrite::Remove { field: f } if f == field));
+            if !protected && !kept.contains(field.as_str()) && !already {
+                removes.push(MapWrite::Remove {
+                    field: field.clone(),
+                });
+            }
+        }
+    }
+    removes.extend(sets);
+    removes
+}
+
+/// Construct the standard write-query result set (columns: created,
+/// properties_set, deleted, relationships_created). `created` counts nodes;
+/// `relationships_created` is last so a reader of the first three by position
+/// is unaffected.
+pub(crate) fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
         "created".into(),
         "properties_set".into(),
         "deleted".into(),
+        "relationships_created".into(),
     ])
 }
 
-fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Result<Value> {
+/// The one-row write result: nodes created, properties set, deleted, and
+/// relationships created.
+pub(crate) fn write_counts(
+    created: i64,
+    props_set: i64,
+    deleted: i64,
+    relationships_created: i64,
+) -> ResultSet {
+    let mut rs = write_result_set();
+    rs.push_row(vec![
+        Some(Value::Int(created)),
+        Some(Value::Int(props_set)),
+        Some(Value::Int(deleted)),
+        Some(Value::Int(relationships_created)),
+    ]);
+    rs
+}
+
+/// What a `CREATE` statement wrote: its nodes, each with its label and its
+/// properties, and its relationships.
+pub(crate) fn create_stats(stmt: &core_query::cypher::CreateStmt) -> WriteStats {
+    let nodes = stmt.nodes.len() as i64;
+    WriteStats {
+        nodes_created: nodes,
+        labels_added: nodes,
+        properties_set: stmt.nodes.iter().map(|n| n.props.len() as i64).sum(),
+        relationships_created: stmt.edges.len() as i64,
+        ..WriteStats::default()
+    }
+}
+
+/// A query result as its caller receives it: with the graph element behind
+/// each bare node, relationship and path cell when the caller asked for them
+/// (Bolt, through [`core_query::cypher::with_entity_detail`]), read from the
+/// `view` the result came from. Every entry point that hands a query result
+/// to its caller passes it through here; nothing else changes.
+pub(crate) fn finish_result(view: &GraphView<'_>, mut rs: ResultSet) -> ResultSet {
+    core_query::cypher::attach_requested_entities(view, &mut rs);
+    rs
+}
+
+pub(crate) fn resolve_merge_set_value(
+    op: &Operand,
+    params: &BTreeMap<String, Value>,
+) -> Result<Value> {
     match op {
         Operand::Lit(v) => Ok(v.clone()),
         Operand::Param(name) => params
@@ -842,11 +1111,49 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(base, out);
             operand_node_vars(index, out);
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                operand_node_vars(item, out);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                operand_node_vars(value, out);
+            }
+        }
+        Operand::ListComprehension { list, .. } | Operand::ListPredicate { list, .. } => {
+            operand_node_vars(list, out)
+        }
+        Operand::Reduce { init, list, .. } => {
+            operand_node_vars(init, out);
+            operand_node_vars(list, out);
+        }
+        Operand::Pred(expr) => expr_node_vars(expr, out),
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
 
-fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
+/// [`operand_node_vars`] for every operand of a predicate.
+fn expr_node_vars(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_node_vars(a, out);
+            expr_node_vars(b, out);
+        }
+        Expr::Not(e) => expr_node_vars(e, out),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_node_vars(lhs, out);
+            operand_node_vars(rhs, out);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_node_vars(o, out),
+        Expr::In { expr, list } => {
+            operand_node_vars(expr, out);
+            operand_node_vars(list, out);
+        }
+    }
+}
+
+pub(crate) fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
         match &item.value {
@@ -867,13 +1174,13 @@ fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     out
 }
 
-fn add_var(out: &mut Vec<String>, v: &str) {
+pub(crate) fn add_var(out: &mut Vec<String>, v: &str) {
     if !out.iter().any(|x| x == v) {
         out.push(v.to_string());
     }
 }
 
-fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         if let Some(v) = &p.start.var {
@@ -888,7 +1195,7 @@ fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         for (rel, _) in &p.chain {
@@ -902,8 +1209,13 @@ fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn rel_type_alias(var: &str) -> String {
+pub(crate) fn rel_type_alias(var: &str) -> String {
     format!("__rt_{var}")
+}
+
+/// The read-part column that holds relationship `var` itself.
+pub(crate) fn rel_value_alias(var: &str) -> String {
+    format!("__rv_{var}")
 }
 
 fn ret_column_name(item: &RetItem) -> String {
@@ -917,8 +1229,76 @@ fn ret_column_name(item: &RetItem) -> String {
     ret_val_label(&item.value).unwrap_or_else(|| "<agg>".to_string())
 }
 
-fn eval_set_return_operand<F: Fs>(
-    db: &GraphDb<F>,
+/// The refusal for a list comprehension in a write statement's RETURN.
+const COMPREHENSION_IN_WRITE_RETURN: &str =
+    "a list comprehension is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and filter it afterwards";
+
+/// The refusal for a list predicate in a write statement's RETURN.
+const LIST_PREDICATE_IN_WRITE_RETURN: &str =
+    "a list predicate is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and test it afterwards";
+
+/// The refusal for `reduce()` in a write statement's RETURN.
+const REDUCE_IN_WRITE_RETURN: &str =
+    "reduce() is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and fold it afterwards";
+
+/// The refusal for the first scoped-variable construct (a list comprehension
+/// or `reduce()`) found in an expression, if any.
+fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
+        }
+        Expr::Not(e) => expr_write_return_refusal(e),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
+        Expr::In { expr, list } => {
+            operand_write_return_refusal(expr).or_else(|| operand_write_return_refusal(list))
+        }
+    }
+}
+
+fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
+    match op {
+        Operand::ListComprehension { .. } => Some(COMPREHENSION_IN_WRITE_RETURN),
+        Operand::Reduce { .. } => Some(REDUCE_IN_WRITE_RETURN),
+        Operand::ListPredicate { .. } => Some(LIST_PREDICATE_IN_WRITE_RETURN),
+        Operand::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
+        Operand::BinArith { left, right, .. } => {
+            operand_write_return_refusal(left).or_else(|| operand_write_return_refusal(right))
+        }
+        Operand::Index { base, index } => {
+            operand_write_return_refusal(base).or_else(|| operand_write_return_refusal(index))
+        }
+        Operand::ListLit(items) => items.iter().find_map(operand_write_return_refusal),
+        Operand::MapLit(entries) => entries
+            .iter()
+            .find_map(|(_, v)| operand_write_return_refusal(v)),
+        Operand::Case { branches, default } => branches
+            .iter()
+            .find_map(|(c, v)| {
+                expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
+            })
+            .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Pred(expr) => expr_write_return_refusal(expr),
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
+    }
+}
+
+fn returns_write_return_refusal(returns: &[RetItem]) -> Option<&'static str> {
+    returns.iter().find_map(|item| match &item.value {
+        RetVal::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
+        RetVal::ScalarExpr(op) => operand_write_return_refusal(op),
+        _ => None,
+    })
+}
+
+fn eval_set_return_operand<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -926,15 +1306,21 @@ fn eval_set_return_operand<F: Fs>(
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
     match op {
+        // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
+        Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
-        Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
-            detail: format!("missing parameter `{name}`"),
-        }).map(Some),
-        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
-            detail: format!(
-                "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
-            ),
-        }),
+        Operand::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GraphError::QueryError {
+                detail: format!("missing parameter `{name}`"),
+            })
+            .map(core_query::value_ops::element),
+        // The relationship as the read part captured it: its
+        // `{type, start, end}` map.
+        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => {
+            Ok(match_rs.get(row, &rel_value_alias(name)).cloned())
+        }
         Operand::Var(name) => Ok(match_rs.get(row, name).cloned()),
         Operand::Prop { var, field } => {
             if rel_vars.iter().any(|r| r == var) {
@@ -943,16 +1329,14 @@ fn eval_set_return_operand<F: Fs>(
             let Some(Value::Str(key)) = match_rs.get(row, var) else {
                 return Ok(None);
             };
-            if let Some(v) = db.get_prop(key, field) {
+            if let Some(v) = db.row_prop(key, field) {
                 return Ok(Some(v));
             }
             // Same stored-wins identity fallback as the read path:
             // n.key / n.id / n.label, not only get_prop.
             Ok(match field.as_str() {
                 "key" | "id" => Some(Value::Str(key.clone())),
-                "label" => db
-                    .node_ref(key)
-                    .map(|n| Value::Str(n.label().to_owned())),
+                "label" => db.row_label(key).map(Value::Str),
                 _ => None,
             })
         }
@@ -966,7 +1350,7 @@ fn eval_set_return_operand<F: Fs>(
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params, 0)? {
+                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params)? {
                     return eval_set_return_operand(db, match_rs, row, rel_vars, value, params);
                 }
             }
@@ -978,97 +1362,90 @@ fn eval_set_return_operand<F: Fs>(
         Operand::Index { base, index } => {
             let base_val = eval_set_return_operand(db, match_rs, row, rel_vars, base, params)?;
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
-            Ok(core_query::value_ops::index_list(base_val, idx_val))
+            // A variable here is a matched node or relationship; a subscript
+            // of one reads nothing, as in a read query. Any other base is
+            // held to the read query's type errors (QL-VE).
+            if matches!(base.as_ref(), Operand::Var(_)) {
+                return Ok(core_query::value_ops::index_list(base_val, idx_val));
+            }
+            core_query::value_ops::index_value(base_val, idx_val)
+                .map_err(|detail| GraphError::QueryError { detail })
+        }
+        // A null element or value is kept, as `Value::Null`.
+        Operand::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, item, params)?;
+                out.push(core_query::value_ops::into_element(v));
+            }
+            Ok(Some(Value::List(out)))
+        }
+        // Refused by name before the write commits (`exec_match_set`); this
+        // arm is only a backstop and never sees a comprehension.
+        Operand::ListComprehension { .. } => Err(GraphError::QueryError {
+            detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+        }),
+        Operand::Reduce { .. } => Err(GraphError::QueryError {
+            detail: REDUCE_IN_WRITE_RETURN.into(),
+        }),
+        Operand::ListPredicate { .. } => Err(GraphError::QueryError {
+            detail: LIST_PREDICATE_IN_WRITE_RETURN.into(),
+        }),
+        Operand::MapLit(entries) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in entries {
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, value, params)?;
+                out.insert(key.clone(), core_query::value_ops::into_element(v));
+            }
+            Ok(Some(Value::Map(out)))
+        }
+        Operand::Pred(expr) => {
+            let value = core_query::cypher::eval_predicate(
+                expr,
+                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+                &|detail| GraphError::QueryError { detail },
+            )?;
+            Ok(value.map(Value::Bool))
         }
     }
 }
 
-fn eval_set_return_expr<F: Fs>(
-    db: &GraphDb<F>,
+/// The start of the error a write gets when a property value holds a null.
+const NULL_PROPERTY_ERROR: &str = "a property value cannot contain null";
+
+/// A stored property is never null, at any depth: `[1, null]` and
+/// `{a: null}` exist only as query results. Checked on the dense-rewrite
+/// seam every node insert and property write passes through (contract C2),
+/// before anything reaches the WAL. Storing a list or map property that holds
+/// a null is not supported in 0.10.
+fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
+    if value.contains_null() {
+        return Err(GraphError::QueryError {
+            detail: format!(
+                "{NULL_PROPERTY_ERROR}: property `{field}` of node `{key}` holds a null \
+                 (a list or map property with a null element cannot be stored)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// A CASE WHEN condition in a write statement's RETURN: true takes the
+/// branch; false and null do not. Three-valued, as in a read query.
+fn eval_set_return_expr<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
     expr: &Expr,
     params: &BTreeMap<String, Value>,
-    depth: u32,
 ) -> Result<bool> {
-    if depth > 256 {
-        return Err(GraphError::QueryError {
-            detail: "expression nesting too deep".into(),
-        });
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        Expr::Not(inner) => Ok(!eval_set_return_expr(
-            db,
-            match_rs,
-            row,
-            rel_vars,
-            inner,
-            params,
-            depth + 1,
-        )?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = eval_set_return_operand(db, match_rs, row, rel_vars, lhs, params)?;
-            let r = eval_set_return_operand(db, match_rs, row, rel_vars, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => {
-            let Some(needle) = eval_set_return_operand(db, match_rs, row, rel_vars, expr, params)?
-            else {
-                return Ok(false);
-            };
-            for item_op in list {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item_op, params)? {
-                    None => {}
-                    Some(Value::List(items)) => {
-                        for item in items {
-                            if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Some(item) if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) => {
-                        return Ok(true);
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(false)
-        }
-    }
+    let value = core_query::cypher::eval_predicate(
+        expr,
+        &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+        &|detail| GraphError::QueryError { detail },
+    )?;
+    Ok(value == Some(true))
 }
 
 fn eval_set_return_arith(
@@ -1091,10 +1468,24 @@ fn eval_set_return_arith(
                     }
                     a.checked_div(b).unwrap_or(i64::MAX)
                 }
+                ArithOp::Mod => {
+                    if b == 0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a.checked_rem(b).unwrap_or(0)
+                }
+                ArithOp::Pow => return Ok(Some(Value::Float((a as f64).powf(b as f64)))),
             };
             Ok(Some(Value::Int(result)))
         }
         (Some(lv), Some(rv)) => {
+            if matches!(op, ArithOp::Add) {
+                if let Some(joined) = core_query::value_ops::plus_non_numeric(&lv, &rv) {
+                    return Ok(Some(joined));
+                }
+            }
             let a = match &lv {
                 Value::Float(f) => *f,
                 Value::Int(i) => *i as f64,
@@ -1125,14 +1516,16 @@ fn eval_set_return_arith(
                     }
                     a / b
                 }
+                ArithOp::Mod => a % b,
+                ArithOp::Pow => a.powf(b),
             };
             Ok(Some(Value::Float(result)))
         }
     }
 }
 
-fn eval_set_return_func<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_func<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1140,6 +1533,23 @@ fn eval_set_return_func<F: Fs>(
     args: &[Operand],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
+    if name == core_query::cypher::LABEL_TEST_FN {
+        // `x:Label`: the node's label, or the relationship's captured type.
+        let [Operand::Var(var), Operand::Lit(Value::Str(label))] = args else {
+            return Err(GraphError::QueryError {
+                detail: "a label test (x:Label) needs a node or relationship variable".into(),
+            });
+        };
+        let actual = if rel_vars.iter().any(|r| r == var) {
+            match_rs.get(row, &rel_type_alias(var)).cloned()
+        } else {
+            match match_rs.get(row, var) {
+                Some(Value::Str(key)) => db.row_label(key).map(Value::Str),
+                _ => None,
+            }
+        };
+        return Ok(actual.map(|a| Value::Bool(a == Value::Str(label.clone()))));
+    }
     let norm = name.to_ascii_lowercase();
     if norm == "type" {
         if args.len() != 1 {
@@ -1263,8 +1673,8 @@ fn eval_set_return_func<F: Fs>(
     }
 }
 
-fn eval_set_return_item<F: Fs>(
-    db: &GraphDb<F>,
+fn eval_set_return_item<S: RowSource + ?Sized>(
+    db: &S,
     match_rs: &ResultSet,
     row: usize,
     rel_vars: &[String],
@@ -1302,8 +1712,8 @@ fn eval_set_return_item<F: Fs>(
 }
 
 /// Project user RETURN from original MATCH rows after SET. No rematch.
-fn project_set_return_rows<F: Fs>(
-    db: &GraphDb<F>,
+fn project_set_return_rows<S: RowSource + ?Sized>(
+    db: &S,
     rel_vars: &[String],
     match_rs: &ResultSet,
     returns: &[RetItem],
@@ -1385,23 +1795,26 @@ fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
     }
 }
 
+/// The engine's view of the store. Pass the store's `&mut Arc`s, not
+/// `Arc::make_mut` of them: the engine copies a structure the fold shares
+/// only when it writes to it (ledger row 126).
 fn make_graph_mut<'a>(
     ids: &'a IdMap,
-    syms: &'a mut Interner,
+    syms: impl Into<core_rules::CowMut<'a, Interner>>,
     labels: &'a [u32],
     props: core_storage::v8::seam::ColumnsView<'a>,
-    topo: &'a mut Topology,
+    topo: impl Into<core_rules::CowMut<'a, Topology>>,
     base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
-    edge_props: &'a mut EdgeProps,
+    edge_props: impl Into<core_rules::CowMut<'a, EdgeProps>>,
 ) -> GraphMut<'a> {
     GraphMut {
         ids,
-        syms,
+        syms: syms.into(),
         labels,
         props,
-        topo,
+        topo: topo.into(),
         base_topo: base_csr(base),
-        edge_props,
+        edge_props: edge_props.into(),
     }
 }
 
@@ -1571,7 +1984,7 @@ pub struct GraphDb<F: Fs> {
     /// Opt-in equality index over scalar node properties.
     /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
     /// open end (mirrors `fulltext`).
-    prop_index: PropertyIndex,
+    prop_index: Arc<PropertyIndex>,
     /// Whether this store records insert-count multiplicity (§5.13).
     ///
     /// Declared like `prop_index`'s enabled pairs — a WAL record replayed at
@@ -1580,6 +1993,37 @@ pub struct GraphDb<F: Fs> {
     /// (discriminant 23) is written only when this is `true`, so a store that
     /// never opts in stays readable by a binary that predates the record.
     multiplicity: bool,
+    /// Declared unique constraints, in declaration order.
+    ///
+    /// Declared like `prop_index`'s enabled pairs — a `CreateConstraint` /
+    /// `DropConstraint` record replayed at open, re-emitted into the baseline
+    /// by a truncating snapshot — and enforced on new writes only, in
+    /// [`rewrite_wal_dense_planned`](Self::rewrite_wal_dense_planned). Replay
+    /// never checks them.
+    constraints: Vec<UniqueConstraint>,
+    /// The `(label, field)` equality indexes this open dropped because a view
+    /// owns the property (ledger row 123). Empty for every store written
+    /// since the refusal. Not persisted: a reopen finds the same pairs again
+    /// until a snapshot stops re-emitting their declarations.
+    dropped_view_indexes: Vec<(String, String)>,
+    /// The store has opted in to the V11 format: it has written, or holds, a
+    /// V11-only record — a value of one of the five 0.10 types, a unique
+    /// constraint or a range index (contract C9).
+    ///
+    /// Set at open when the snapshot is V11 or the WAL replays such a record,
+    /// and on the first write of one, in
+    /// [`rewrite_wal_dense_planned`](Self::rewrite_wal_dense_planned), which
+    /// writes the V11 snapshot before the record is appended. Never cleared:
+    /// dropping the last constraint or range index does not move the store
+    /// back, because its WAL and archives still hold V11 records.
+    v11_features: bool,
+    /// Set while a submission of a group commit is applied without its own
+    /// fsync. The V11 upgrade must not run then: its snapshot would hold the
+    /// group's earlier submissions before their fsync, and a failed group
+    /// fsync would leave them durable after their submitters were told `Err`.
+    /// The group upgrades ahead of its first append instead
+    /// ([`upgrade_to_v11_for_ops`](Self::upgrade_to_v11_for_ops)).
+    in_nosync_group: bool,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -1620,6 +2064,10 @@ pub struct GraphDb<F: Fs> {
     /// it opened and nothing replayed over it since has spoiled it, so the
     /// open did not build it.
     fulltext_loaded: bool,
+    /// `true` when a declaration was applied since the last fold built its
+    /// `SchemaListing`, so the next fold builds it again instead of sharing
+    /// the previous fold's.
+    schema_stale: bool,
     /// Set by the insert arms of `apply` when they index a node that is
     /// already indexed under that field. `add_tokens` appends, so that node's
     /// postings are now doubled: the WAL being replayed holds writes the
@@ -1700,8 +2148,18 @@ pub struct GraphDb<F: Fs> {
     /// `open_at_with`; refreshed every `FOLD_EVERY_K` commits.
     /// `None` only between struct creation and the first fold.
     fold_overlay: Option<Arc<crate::reader::FrozenOverlay>>,
+    /// Whether the engine's provenance began as the snapshot base's PROVENANCE
+    /// section (`restore_v8_base`) — so the base can serve as the root of the
+    /// reader's derived edges — rather than as a decoded legacy snapshot's.
+    engine_from_base: bool,
+    /// The derived-edge changes of `delta_tail`, indexed by node.
+    tail_derived: Arc<crate::reader::TailDerived>,
     /// Per-commit deltas accumulated since the last fold.
     delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
+    /// The materialised effective state shared by every reader snapshot of
+    /// the same fold and delta tail, so a snapshot per request does not apply
+    /// the tail once per request. See [`crate::reader::SharedEffective`].
+    shared_effective: std::sync::Mutex<Option<crate::reader::SharedEffective>>,
     /// How many commits have occurred since the last fold.
     commits_since_fold: usize,
     /// When true, `log_then_apply_with` buffers event notifications instead of
@@ -1775,7 +2233,7 @@ pub struct GraphDb<F: Fs> {
     slow_query_threshold_ms: u64,
     /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
     /// can record entries without requiring `&mut self`).
-    slow_queries: std::sync::Mutex<SlowQueryLog>,
+    slow_queries: Arc<std::sync::Mutex<SlowQueryLog>>,
     /// `(field, label, caller)` triples whose exact-versus-approximate
     /// ambiguity this handle has already explained once. See
     /// [`note_ambiguous_exactness`](GraphDb::note_ambiguous_exactness).
@@ -1818,10 +2276,21 @@ pub struct GraphDb<F: Fs> {
     /// the same appends advance both, one in frames and one in bytes — so the
     /// two are seeded and rewound at exactly the same places. Keep it that way.
     wal_frames_written: u64,
+    /// How much of the live WAL is known fsynced, for readers outside the
+    /// engine (the backup worker). Set right after each successful WAL fsync
+    /// and when a snapshot replaces `wal.bin`; never read by the engine
+    /// itself. Shared, so a [`SharedDb`](crate::SharedDb) reads it without
+    /// taking the handle's lock. See [`WalPosition`].
+    durable_wal: DurableWal,
     /// Identity of the snapshot this handle's base state came from, as
     /// `(len, mtime_nanos)`. A different value means another process replaced
     /// the snapshot and the WAL no longer continues our state: refresh reloads.
     snapshot_ident: Option<(u64, u64)>,
+    /// Identity of the `wal.bin` file this handle's cursor describes
+    /// ([`Fs::wal_ident`]). A different file under the name — another
+    /// process's snapshot replaced it — makes [`refresh`](GraphDb::refresh)
+    /// reload, even when the new file is longer than the cursor.
+    wal_ident: Option<u64>,
     /// The options this handle was opened with. Replayed verbatim when
     /// `refresh` has to rebuild from disk.
     open_opts: OpenOptions,
@@ -1833,6 +2302,11 @@ pub struct GraphDb<F: Fs> {
     /// that failed. Makes every WAL-appending mutation in that scope return
     /// [`GraphError::Busy`] instead of writing.
     lock_denied: bool,
+    /// Set with `lock_denied` when the lock attempt failed with an I/O error
+    /// rather than because a peer holds it (a refused permission, or any other
+    /// fault opening `LOCK`). Makes those mutations report the real cause, never
+    /// `Busy`, which is reserved for a lock another process holds.
+    lock_failure: Option<GraphError>,
     /// True for an as-of view opened via [`GraphDb::open_at`]. Such a view is
     /// pinned to one commit, so it is never stale and never refreshes — later
     /// commits by any process are deliberately invisible to it.
@@ -1856,6 +2330,54 @@ pub struct GraphDb<F: Fs> {
     /// `delete_node` to count via-hop derived edges that `provenance_touching`
     /// cannot see (ledger row 50).
     last_apply_retraction_count: u64,
+}
+
+/// A handle's WAL cursor and snapshot identity at one moment: what
+/// [`GraphDb::is_stale`] compares the files on disk against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskMark {
+    pinned: bool,
+    wal_consumed: u64,
+    snapshot_ident: Option<(u64, u64)>,
+}
+
+impl DiskMark {
+    /// Whether the store under `fs` has moved on from this mark: the WAL's
+    /// length differs from the cursor, or the snapshot file was replaced.
+    /// Metadata only; never true for an as-of view.
+    pub(crate) fn is_stale_on<F: Fs>(&self, fs: &F) -> Result<bool> {
+        if self.pinned {
+            return Ok(false);
+        }
+        if fs.wal_len().map_err(GraphError::Io)? != self.wal_consumed {
+            return Ok(true);
+        }
+        Ok(fs.snapshot_ident().map_err(GraphError::Io)? != self.snapshot_ident)
+    }
+
+    /// [`Self::is_stale_on`], against files already looked at.
+    pub(crate) fn is_stale_at(&self, disk: &DiskState) -> bool {
+        !self.pinned
+            && (disk.wal_len != self.wal_consumed || disk.snapshot_ident != self.snapshot_ident)
+    }
+}
+
+/// What a staleness check reads off the store's files: the WAL's length and
+/// the snapshot file's identity. Metadata only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskState {
+    wal_len: u64,
+    snapshot_ident: Option<(u64, u64)>,
+}
+
+impl DiskState {
+    /// Look at `fs`'s files, the WAL first, as [`DiskMark::is_stale_on`] does.
+    pub(crate) fn read<F: Fs>(fs: &F) -> Result<Self> {
+        Ok(Self {
+            wal_len: fs.wal_len().map_err(GraphError::Io)?,
+            snapshot_ident: fs.snapshot_ident().map_err(GraphError::Io)?,
+        })
+    }
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -2048,7 +2570,8 @@ pub struct SnapshotOptions {
 /// Derive the scan-label sym for the commit-skip fast-path.
 ///
 /// Walks `ops` to find the plan's leading scan op (`ScanLabel`, `IndexScan`,
-/// or `IndexIntersect`) with a concrete label string, then interns it.
+/// `IndexIntersect` or `IndexRangeScan`) with a concrete label string, then
+/// interns it.
 ///
 /// Returns `None` in all cases where skipping is unsafe:
 /// - Any `Expand` op is present (edge traversal; edges change results regardless
@@ -2074,6 +2597,7 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
             PlanOp::IndexIntersect {
                 label: Some(label), ..
             } => return Some(syms.intern(label)),
+            PlanOp::IndexRangeScan { label, .. } => return Some(syms.intern(label)),
             _ => {}
         }
     }
@@ -2107,6 +2631,11 @@ pub enum AsOfScope<'a> {
 }
 
 impl GraphDb<RealFs> {
+    /// The directory this handle's store lives in.
+    pub(crate) fn store_dir(&self) -> std::path::PathBuf {
+        self.fs.dir().to_path_buf()
+    }
+
     /// Open the database at `dir` with default options.
     ///
     /// Equivalent to `open_with_options(dir, OpenOptions::default())`.
@@ -2151,6 +2680,7 @@ impl GraphDb<RealFs> {
     }
 
     fn open_dir(dir: &std::path::Path, opts: OpenOptions, hold_lock: bool) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
@@ -2221,6 +2751,7 @@ impl GraphDb<RealFs> {
     /// - [`GraphError::CommitOutOfRange`] if `commit >= wal_commit_count` (including
     ///   when the WAL is empty after a snapshot).
     pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
+        crate::restore::refuse_half_installed(dir)?;
         Self::open_at_with(RealFs::new(dir)?, commit)
     }
 
@@ -2364,6 +2895,43 @@ impl GraphDb<RealFs> {
     }
 }
 
+/// How many conflicting nodes `GraphError::ConstraintCreationConflict` lists.
+const CONSTRAINT_CONFLICTS_LISTED: usize = 100;
+
+/// Where two values the scan can find equal always share a bucket: numbers by
+/// the bit pattern of their `f64` (so `Int` 2, `Float` 2.0, and both zeros
+/// meet), every other indexable value by its index key. `None` for a value
+/// that equals nothing a constraint could hold — `NaN`, or one with no index
+/// key (list, map, duration).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum EqualityBucket {
+    Number(u64),
+    Key(ValueKey),
+}
+
+///
+/// The create-time scan over existing data
+/// (`GraphDb::existing_unique_violations`) groups values with this and
+/// compares each bucket with `values_equal`, never by `ValueKey`: a
+/// `ValueKey` keeps `Int` 2 and `Float` 2.0 apart, so a scan keyed on it would
+/// accept a store the write path then refuses.
+pub(crate) fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
+    let number = |f: f64| {
+        if f.is_nan() {
+            None
+        } else if f == 0.0 {
+            Some(EqualityBucket::Number(0.0_f64.to_bits()))
+        } else {
+            Some(EqualityBucket::Number(f.to_bits()))
+        }
+    };
+    match value {
+        Value::Int(i) => number(*i as f64),
+        Value::Float(f) => number(*f),
+        other => ValueKey::from_value(other).map(EqualityBucket::Key),
+    }
+}
+
 impl<F: Fs> GraphDb<F> {
     /// Open over an arbitrary [`Fs`], repairing a torn WAL tail as usual.
     pub fn open_with(fs: F) -> Result<Self> {
@@ -2423,8 +2991,12 @@ impl<F: Fs> GraphDb<F> {
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
             fulltext: Arc::new(FulltextIndex::new()),
-            prop_index: PropertyIndex::new(),
+            prop_index: Arc::new(PropertyIndex::new()),
             multiplicity: false,
+            constraints: Vec::new(),
+            dropped_view_indexes: Vec::new(),
+            v11_features: false,
+            in_nosync_group: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -2432,6 +3004,7 @@ impl<F: Fs> GraphDb<F> {
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
             fulltext_loaded: false,
+            schema_stale: true,
             fulltext_reindexed_a_node: false,
             base_wal_truncated: false,
             fulltext_reindexed_at_open: 0,
@@ -2449,7 +3022,10 @@ impl<F: Fs> GraphDb<F> {
             total_wal_commits: 0,
             base: None,
             fold_overlay: None,
+            engine_from_base: false,
+            tail_derived: Arc::default(),
             delta_tail: Vec::new(),
+            shared_effective: std::sync::Mutex::new(None),
             commits_since_fold: 0,
             defer_events: false,
             deferred_events: Vec::new(),
@@ -2467,18 +3043,21 @@ impl<F: Fs> GraphDb<F> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
-            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+            slow_queries: Arc::new(std::sync::Mutex::new(SlowQueryLog {
                 entries: std::collections::VecDeque::new(),
                 total: 0,
-            }),
+            })),
             warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
             wal_frames_written: 0,
+            durable_wal: DurableWal::default(),
             snapshot_ident: None,
+            wal_ident: None,
             open_opts: opts,
             holds_lifetime_lock: false,
             lock_denied: false,
+            lock_failure: None,
             pinned: false,
             base_edge_count_from_rows: None,
             last_apply_retraction_count: 0,
@@ -2502,12 +3081,18 @@ impl<F: Fs> GraphDb<F> {
         self.node_ns = Vec::new();
         self.edge_props = Arc::new(EdgeProps::new());
         self.engine = RuleEngine::new();
+        self.engine_from_base = false;
         self.view_store = ViewStore::new();
         self.fulltext = Arc::new(FulltextIndex::new());
-        self.prop_index = PropertyIndex::new();
+        self.prop_index = Arc::new(PropertyIndex::new());
+        self.schema_stale = true;
         // Cleared like every other declaration: a reload replays the store's own
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
+        // Like the multiplicity opt-in: the snapshot and the WAL say it again.
+        self.v11_features = false;
+        self.constraints = Vec::new();
+        self.dropped_view_indexes = Vec::new();
         self.commit_seq = 0;
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
@@ -2533,6 +3118,7 @@ impl<F: Fs> GraphDb<F> {
         self.base = None;
         self.fold_overlay = None;
         self.delta_tail = Vec::new();
+        self.tail_derived = Arc::default();
         self.commits_since_fold = 0;
         self.deferred_events = Vec::new();
         self.v8_sections_loaded
@@ -2546,6 +3132,7 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = 0;
         self.wal_frames_written = 0;
         self.snapshot_ident = None;
+        self.wal_ident = None;
         self.base_edge_count_from_rows = None;
     }
 
@@ -2601,6 +3188,15 @@ impl<F: Fs> GraphDb<F> {
         } else {
             None
         };
+        // A V11 snapshot is the store's own word that it has opted in (C9);
+        // the replay below finds the same from any V11-only record it meets.
+        if snapshot_version.is_some_and(|v| v >= core_storage::snapshot::VERSION_11) {
+            db.v11_features = true;
+        }
+        // The declarations a V11 snapshot carries itself (section 18), applied
+        // at the `held` boundary of the replay below — the point of the WAL
+        // the snapshot was taken at. `None` for every earlier snapshot.
+        let mut snapshot_declarations = None;
         // No snapshot means no snapshot has ever truncated the WAL, so this
         // handle can prove the history is whole. Once a snapshot exists that
         // this handle did not take, it cannot: see `snapshot_preserved_history`.
@@ -2635,6 +3231,12 @@ impl<F: Fs> GraphDb<F> {
             }
             db.load_fulltext_from_base();
             trace_open!("full-text index read from the snapshot", _t0);
+            snapshot_declarations = db
+                .base
+                .as_ref()
+                .map(|b| b.declarations())
+                .transpose()?
+                .flatten();
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -2672,6 +3274,9 @@ impl<F: Fs> GraphDb<F> {
         if let Some(&max_seq) = db.last_change.values().max() {
             db.commit_seq = db.commit_seq.max(max_seq);
         }
+        // Taken before the read: a file replaced between the two then reads
+        // as a different identity later, which reloads — the safe direction.
+        db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         // The valid prefix is replayed either way; `repair_wal` only decides
@@ -2679,6 +3284,7 @@ impl<F: Fs> GraphDb<F> {
         // appender must not persist a truncation the writer never asked for.
         if valid_len < bytes.len() && repair_wal {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+            db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
@@ -2738,7 +3344,20 @@ impl<F: Fs> GraphDb<F> {
         db.fulltext_rebuild_follows = !db.fulltext_loaded;
         db.fulltext_reindexed_a_node = false;
         db.replaying_at_open = true;
-        let replayed = db.apply_frames_over(records, held);
+        // The declarations a V11 snapshot carries (section 18) are the state at
+        // the point of the WAL the snapshot was taken at, so they are applied
+        // there: after the `held` frames, before the first frame the snapshot
+        // does not hold. Earlier would let a held declaration that was later
+        // replaced be skipped as already declared, and the reopened store
+        // would differ from the never-closed one. For a WAL that was replaced
+        // (`held == 0`) the WAL repeats them as its baseline, and for one
+        // archived away before its baseline was written they are all there is.
+        // A declaration is never checked against the data.
+        let section_recs = snapshot_declarations
+            .as_ref()
+            .map(declarations_as_records)
+            .unwrap_or_default();
+        let replayed = db.apply_frames_at(records, held, section_recs);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
         let replayed = replayed?;
@@ -2794,10 +3413,17 @@ impl<F: Fs> GraphDb<F> {
         //
         // What this recovery cannot do is make the opt-in atomic; it is not,
         // and `enable_multiplicity` says so. See defects #32-#34.
-        if !db.multiplicity
-            && snapshot_version == Some(core_storage::snapshot::VERSION_10)
-            && !db.fs.list_archives()?.is_empty()
-        {
+        //
+        // A V11 store says it in section 18 rather than with its version: V11
+        // is above V10, and a store with any V11 feature writes V11 whether it
+        // counts multiplicity or not. The section's flag is written from the
+        // same `self.multiplicity` the V10 stamp is, so it carries exactly the
+        // fact the stamp did, and the recovery is the same one.
+        let stamped_multiplicity = snapshot_version == Some(core_storage::snapshot::VERSION_10)
+            || snapshot_declarations
+                .as_ref()
+                .is_some_and(|d: &core_storage::v8::SnapshotDeclarations| d.multiplicity);
+        if !db.multiplicity && stamped_multiplicity && !db.fs.list_archives()?.is_empty() {
             db.multiplicity = true;
         }
         // The cursor sits at the end of the valid prefix, not the end of the
@@ -2811,6 +3437,15 @@ impl<F: Fs> GraphDb<F> {
         // every open, and costs nothing on a store that has never archived.
         db.wal_frames_written = db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
         db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
+        // What was just replayed is not this handle's fsync to vouch for: a
+        // reader of the durable position fsyncs it once before counting it.
+        db.durable_wal.loaded(
+            db.snapshot_ident,
+            db.wal_ident,
+            db.wal_frames_written - decoded_frames,
+            db.wal_consumed,
+            db.wal_frames_written,
+        );
         trace_open!("wal replay done", _t0);
         // Rebuild view values after WAL replay only when there is no V8 base.
         // With a V8 base, view values are correct in the snapshot and are updated
@@ -2859,7 +3494,8 @@ impl<F: Fs> GraphDb<F> {
             );
         }
         trace_open!("full-text index ready", _t0);
-        db.prop_index.rebuild_all(
+        db.drop_indexes_over_view_properties();
+        Arc::make_mut(&mut db.prop_index).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -2899,6 +3535,32 @@ impl<F: Fs> GraphDb<F> {
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
         self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames_over`], applying `at_held` — the declarations a
+    /// snapshot carries — at the `held` boundary, the point of the WAL the
+    /// snapshot was taken at.
+    fn apply_frames_at(
+        &mut self,
+        records: Vec<WalRecord>,
+        held: usize,
+        at_held: Vec<WalRecord>,
+    ) -> Result<usize> {
+        if at_held.is_empty() {
+            return self.apply_frames_over(records, held);
+        }
+        let held = held.min(records.len());
+        let mut records = records;
+        let after = records.split_off(held);
+        let before_count = records.len();
+        // The held prefix is numbered and its declarations applied, exactly
+        // as `apply_frames_over` would; nothing in it is otherwise applied.
+        let mut applied = self.apply_frames_over(records, before_count)?;
+        for rec in &at_held {
+            self.apply(rec)?;
+        }
+        applied += self.apply_frames_over(after, 0)?;
+        Ok(applied)
     }
 
     /// [`Self::apply_frames`] over a base that already holds the first `held`
@@ -2997,13 +3659,19 @@ impl<F: Fs> GraphDb<F> {
     /// Always false for an as-of view from [`GraphDb::open_at`]: such a view is
     /// pinned to one commit and later commits are deliberately invisible to it.
     pub fn is_stale(&self) -> Result<bool> {
-        if self.pinned {
-            return Ok(false);
+        self.disk_mark().is_stale_on(&self.fs)
+    }
+
+    /// What [`Self::is_stale`] compares the store on disk against, as of now.
+    ///
+    /// Taken under the lock with a published snapshot, it lets a reader ask
+    /// "is that snapshot still the store's state?" with no lock held.
+    pub(crate) fn disk_mark(&self) -> DiskMark {
+        DiskMark {
+            pinned: self.pinned,
+            wal_consumed: self.wal_consumed,
+            snapshot_ident: self.snapshot_ident,
         }
-        if self.fs.wal_len().map_err(GraphError::Io)? != self.wal_consumed {
-            return Ok(true);
-        }
-        Ok(self.fs.snapshot_ident().map_err(GraphError::Io)? != self.snapshot_ident)
     }
 
     /// Bring this handle up to date with every commit other processes have made,
@@ -3035,16 +3703,58 @@ impl<F: Fs> GraphDb<F> {
     /// the handle must be reopened. Nothing on disk was damaged — the store
     /// itself is fine, and a fresh open recovers it.
     pub fn refresh(&mut self) -> Result<u64> {
+        self.refresh_checking(false)
+    }
+
+    /// [`refresh`](GraphDb::refresh), with `before_append` set when a write
+    /// scope is about to append at this handle's cursor.
+    ///
+    /// The case the WAL file's identity catches: the file was replaced while
+    /// the snapshot this handle already saw stayed — it reloaded while another
+    /// process was between writing its snapshot and replacing the WAL. Its
+    /// cursor describes the old file. A tail read at that offset in the new
+    /// one would apply frames that are not the next ones; an append there
+    /// would write frames encoded against the wrong state, and the store would
+    /// no longer open.
+    ///
+    /// A read follows a tail only when the WAL is longer than the cursor, so a
+    /// read-only refresh checks the identity only then. An append happens at
+    /// any length — a replacement of exactly the cursor's length included,
+    /// which no length check can see — so before an append it is always
+    /// checked: one stat per cross-process write scope.
+    fn refresh_checking(&mut self, before_append: bool) -> Result<u64> {
         if self.pinned {
             return Ok(0);
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
-        let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
-        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed {
+        // Before an append the WAL's identity is always checked, so both come
+        // from one look at the file; otherwise only when the WAL grew.
+        let (wal_len, appending_ident) = if before_append {
+            let (len, ident) = self.fs.wal_len_and_ident().map_err(GraphError::Io)?;
+            (len, Some(ident))
+        } else {
+            (self.fs.wal_len().map_err(GraphError::Io)?, None)
+        };
+        let wal_replaced = || -> Result<bool> {
+            let ident = match appending_ident {
+                Some(ident) => ident,
+                None if wal_len > self.wal_consumed => {
+                    self.fs.wal_ident().map_err(GraphError::Io)?
+                }
+                None => return Ok(false),
+            };
+            Ok(ident != self.wal_ident)
+        };
+        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
             // The WAL no longer continues our state: rebuild from disk. State
             // is cleared first, so a failed load leaves an empty handle — mark
             // it degraded rather than let a caller read an empty graph as if
             // it were the store's contents.
+            //
+            // The WAL this handle was reading is not the one on disk any more,
+            // so the durable position starts a new generation; what a peer
+            // fsynced is not this handle's to vouch for.
+            self.durable_wal.replaced();
             self.reset_for_reload();
             return match self.load_from_disk(LoadOrigin::Reload) {
                 Ok(frames) => Ok(frames as u64),
@@ -3078,6 +3788,10 @@ impl<F: Fs> GraphDb<F> {
         // incomplete trailing frame stays unconsumed for the next refresh.
         self.wal_consumed += valid_len as u64;
         self.wal_frames_written += decoded_frames;
+        // Another process wrote these frames; whether it fsynced them is not
+        // this handle's to say.
+        self.durable_wal
+            .absorbed(self.wal_consumed, self.wal_frames_written);
         // The peer that wrote those frames also stamped them. Absorbing the
         // frames without the stamps leaves this handle resolving dates from a
         // prefix of the store's history, and — while our own map is still
@@ -3108,6 +3822,34 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = len;
     }
 
+    /// The global frame index the next appended frame will occupy. The frame
+    /// twin of [`wal_consumed`](GraphDb::wal_consumed).
+    pub(crate) fn wal_frames_written(&self) -> u64 {
+        self.wal_frames_written
+    }
+
+    /// How much of the live WAL is known to be on stable storage — only bytes
+    /// an fsync has covered, ending on a frame boundary. See [`WalPosition`].
+    ///
+    /// Under [`FsyncPolicy::Relaxed`] nothing is fsynced between snapshots, so
+    /// the position advances only when a snapshot replaces the WAL; under
+    /// [`FsyncPolicy::Batched`] it advances at the next batch fsync.
+    pub fn durable_wal_position(&self) -> WalPosition {
+        self.durable_wal.get()
+    }
+
+    /// The shared cell behind [`durable_wal_position`](GraphDb::durable_wal_position),
+    /// for a [`SharedDb`](crate::SharedDb) to read without the handle's lock.
+    pub(crate) fn durable_wal(&self) -> DurableWal {
+        self.durable_wal.clone()
+    }
+
+    /// Record that everything this handle has appended is now fsynced.
+    fn note_wal_synced(&self) {
+        self.durable_wal
+            .synced(self.wal_consumed, self.wal_frames_written);
+    }
+
     /// One non-blocking attempt at the cross-process write lock.
     ///
     /// Takes `&self` so a caller can poll for the lock *before* it acquires the
@@ -3119,7 +3861,25 @@ impl<F: Fs> GraphDb<F> {
         if self.holds_lifetime_lock {
             return Ok(true);
         }
-        self.fs.try_lock_exclusive().map_err(GraphError::Io)
+        self.fs.try_lock_exclusive().map_err(|e| {
+            // A filesystem that refuses to create or open `LOCK` is a deployment
+            // fault, not a peer holding the lock: say which, so the caller never
+            // reports it as `Busy`.
+            match (
+                core_storage::fs::is_permission_refusal(&e),
+                self.fs.wal_path(),
+            ) {
+                (true, Some(wal)) => match wal.parent() {
+                    Some(dir) => core_storage::fs::unwritable_error(
+                        dir,
+                        &dir.join(core_storage::fs::LOCK_FILE),
+                        &e,
+                    ),
+                    None => GraphError::Io(e),
+                },
+                _ => GraphError::Io(e),
+            }
+        })
     }
 
     /// Poll for the cross-process write lock until `wait` elapses.
@@ -3161,10 +3921,11 @@ impl<F: Fs> GraphDb<F> {
     /// no other process can have written, so there is nothing to pick up.
     pub(crate) fn enter_write_scope(&mut self, acquired: bool) -> Result<()> {
         self.lock_denied = !acquired;
+        self.lock_failure = None;
         if !acquired || self.holds_lifetime_lock {
             return Ok(());
         }
-        if let Err(e) = self.refresh() {
+        if let Err(e) = self.refresh_checking(true) {
             // Do not hold a lock we cannot use: release it and let the caller
             // see the underlying failure.
             let _ = self.fs.unlock();
@@ -3174,11 +3935,27 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Record why a lock attempt failed, for the scope [`enter_write_scope`]
+    /// (with `false`) is about to open: an [`GraphError::Unwritable`] or
+    /// [`GraphError::Io`] is kept and reported instead of [`GraphError::Busy`].
+    pub(crate) fn note_lock_failure(&mut self, err: &GraphError) {
+        self.lock_failure = copy_lock_failure(err);
+    }
+
+    /// The error a mutation returns while the write scope is denied.
+    fn lock_denied_error(&self) -> GraphError {
+        self.lock_failure
+            .as_ref()
+            .and_then(copy_lock_failure)
+            .unwrap_or(GraphError::Busy { holder: None })
+    }
+
     /// Close a cross-process write scope opened by
     /// [`enter_write_scope`](GraphDb::enter_write_scope): release the lock and
     /// clear the Busy latch. Safe to call when the lock was never taken.
     pub(crate) fn end_write_lock(&mut self) {
         self.lock_denied = false;
+        self.lock_failure = None;
         if !self.holds_lifetime_lock {
             // Releasing a lock we do not hold is a no-op; a failure to release
             // is reported by the OS closing the descriptor at handle drop.
@@ -3251,6 +4028,7 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()?;
         self.engine =
             RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
+        self.engine_from_base = false;
         // Candidate indexes are rebuilt lazily on the first mutation (see
         // RuleEngine::on_node_changed).  HNSW blobs and IVF centroids from the
         // snapshot are retained without deserializing so that:
@@ -3383,6 +4161,7 @@ impl<F: Fs> GraphDb<F> {
             })
             .collect::<Result<Vec<_>>>()?;
         self.engine = RuleEngine::from_persist(defs, BTreeMap::new(), rule_tripped, rule_fires);
+        self.engine_from_base = true;
         // C4+C5: provenance, HNSW, and IVF sections are NOT read here.
         // `ensure_v8_base_sections_loaded` reads them on first use from
         // `self.base` (set by the caller immediately after this returns).
@@ -3540,6 +4319,44 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// The rule that derives edges of `edge_type`, if one does.
+    pub(crate) fn rule_owning_edge_type(&self, edge_type: &str) -> Option<String> {
+        self.engine
+            .rules()
+            .find(|r| r.edge_type == edge_type)
+            .map(|r| r.name.clone())
+    }
+
+    /// The name an edge-property record's interned `field` stands for.
+    fn edge_prop_field(&self, field: u32) -> Result<String> {
+        self.syms
+            .resolve(field)
+            .map(str::to_string)
+            .ok_or_else(|| GraphError::Corrupt {
+                detail: format!("wal edge-property record: unknown field intern {field}"),
+            })
+    }
+
+    /// Whether the store (before the batch being judged) holds the edge
+    /// `src_key -[edge_type]-> dst_key`.
+    fn edge_in_store(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        match (
+            self.syms.get(edge_type),
+            self.ids.get(src_key),
+            self.ids.get(dst_key),
+        ) {
+            (Some(etype), Some(src), Some(dst)) => self.edge_is_live(etype, src, dst),
+            _ => false,
+        }
+    }
+
+    /// Whether the edge `etype` from `src` to `dst` is in the topology.
+    fn edge_is_live(&self, etype: u32, src: u32, dst: u32) -> bool {
+        self.topo_view()
+            .neighbors(etype, Direction::Out, src)
+            .contains(&dst)
+    }
+
     /// Return an `EdgePropsView` that merges the mmap'd base edge-props section
     /// (when a V8 snapshot is open) with the in-memory WAL overlay.
     ///
@@ -3668,6 +4485,15 @@ impl<F: Fs> GraphDb<F> {
             let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal)?.0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+            // A V11 stamp makes the as-of handle V11 like a live one (C9),
+            // whether or not the replayed prefix holds a V11 record.
+            if snap_header.len() >= 6
+                && &snap_header[0..4] == b"GDB1"
+                && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                    >= core_storage::snapshot::VERSION_11
+            {
+                db.v11_features = true;
+            }
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
                 && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
@@ -3753,7 +4579,8 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
-        db.prop_index.rebuild_all(
+        db.drop_indexes_over_view_properties();
+        Arc::make_mut(&mut db.prop_index).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -3782,6 +4609,56 @@ impl<F: Fs> GraphDb<F> {
     /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
     /// the end of `open_with` / `open_at_with` to prime the reader.
     fn fold_now(&mut self) {
+        // What the engine's provenance has done since the last fold, each triple
+        // netted to its final state. Taken on every fold, so it never holds more
+        // than one fold's worth.
+        let changes = self.engine.take_derived_changes();
+        let derived = match &self.fold_overlay {
+            // The previous fold, moved on by what changed since: a fold on the
+            // write path, a refresh, a change of roles. Costs the changes, not
+            // the size of the store's provenance.
+            Some(previous) => previous.derived.extended(changes, &self.base),
+            // A load whose engine began as the snapshot base's provenance: that
+            // section, read where it lies, and replay's changes over it.
+            None if self.engine_from_base && self.base.is_some() => {
+                crate::reader::DerivedEdges::from_base().extended(changes, &self.base)
+            }
+            // Any other load (a store with no snapshot, an as-of view): take
+            // the engine's provenance whole.
+            None => crate::reader::DerivedEdges::from_triples(self.engine.derived_triples()),
+        };
+        self.fold_with(derived);
+    }
+
+    /// The fold after a snapshot: the engine's provenance is exactly the
+    /// section just written, so the reader reads that and nothing is layered.
+    fn fold_after_snapshot(&mut self) {
+        let _ = self.engine.take_derived_changes();
+        let derived = if self.base.is_some() {
+            crate::reader::DerivedEdges::from_base()
+        } else {
+            crate::reader::DerivedEdges::from_triples(self.engine.derived_triples())
+        };
+        self.fold_with(derived);
+    }
+
+    /// The listing the next fold carries: the previous fold's when no
+    /// declaration was applied since, else built afresh.
+    fn fold_schema(&mut self) -> Arc<SchemaListing> {
+        let listing = match &self.fold_overlay {
+            Some(previous) if !self.schema_stale => Arc::clone(&previous.schema),
+            _ => Arc::new(self.schema_listing()),
+        };
+        self.schema_stale = false;
+        listing
+    }
+
+    fn fold_with(&mut self, derived: crate::reader::DerivedEdges) {
+        // The fold holds every edge property as it stands, so nothing written
+        // so far (replay, a refresh, a commit's own writes) is owed to a delta.
+        if self.edge_props.has_touched() {
+            Arc::make_mut(&mut self.edge_props).take_touched();
+        }
         // Eight `Arc::clone`s — refcount bumps, O(1). This used to deep-copy the
         // whole overlay: `IdMap` alone is a `HashMap<String, u32>` plus a
         // `Vec<String>`, so every node key was copied twice, on every open,
@@ -3792,7 +4669,9 @@ impl<F: Fs> GraphDb<F> {
         // `props` and `topo` were already cheap for a different reason: on a
         // snapshotted store `restore_v8_base` leaves them as empty overlays over
         // the zero-copy mmap. `ids`, `syms` and `fulltext` were not, and that
-        // inconsistency was the defect.
+        // inconsistency was the defect. The full-text index is no longer
+        // shared at all: no reader reads it, and a shared `Arc` made the next
+        // full-text write copy it whole under the write guard.
         let frozen = crate::reader::FrozenOverlay {
             ids: std::sync::Arc::clone(&self.ids),
             syms: std::sync::Arc::clone(&self.syms),
@@ -3801,10 +4680,14 @@ impl<F: Fs> GraphDb<F> {
             labels: std::sync::Arc::clone(&self.labels),
             edge_props: std::sync::Arc::clone(&self.edge_props),
             roles: self.roles.clone().map(std::sync::Arc::new),
-            fulltext: std::sync::Arc::clone(&self.fulltext),
+            prop_index: std::sync::Arc::clone(&self.prop_index),
+            derived,
+            schema: self.fold_schema(),
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
+        // The tail's derived changes moved into the fold's layers.
+        self.tail_derived = Arc::new(crate::reader::TailDerived::default());
         self.commits_since_fold = 0;
         // The fold holds every view value as it stands; what replay or a
         // refresh touched on the way here is not owed to any delta.
@@ -3890,17 +4773,41 @@ impl<F: Fs> GraphDb<F> {
     /// handful of `Arc` handles). Subsequent query operations run without any
     /// lock.
     pub fn reader(&self) -> crate::reader::ReaderSnapshot {
-        crate::reader::ReaderSnapshot::new(
-            self.fold_overlay
-                .clone()
-                .expect("fold_overlay is always Some after open_with; call reader() after open"),
-            self.base.clone(),
-            self.delta_tail.clone(),
+        self.try_reader()
+            .expect("fold_overlay is always Some after open_with; call reader() after open")
+    }
+
+    /// [`Self::reader`], or `None` while the handle has no fold (between a
+    /// reload's reset and its fold) — when there is no state to publish.
+    pub(crate) fn try_reader(&self) -> Option<crate::reader::ReaderSnapshot> {
+        let frozen = self.fold_overlay.clone()?;
+        let effective = crate::reader::SharedEffective::cell_for(
+            &self.shared_effective,
+            &frozen,
+            &self.base,
+            &self.delta_tail,
+        );
+        let snap = crate::reader::ReaderSnapshot::new(crate::reader::SnapshotParts {
+            frozen,
+            base: self.base.clone(),
+            deltas: Arc::from(self.delta_tail.as_slice()),
+            tail_derived: Arc::clone(&self.tail_derived),
             // The snapshot's effective state is exactly this handle's state at
             // this commit, so it shares the memo and its version key.
-            self.commit_seq,
-            Arc::clone(&self.role_masks),
-        )
+            version: self.commit_seq,
+            role_masks: Arc::clone(&self.role_masks),
+            context: crate::reader::ReadContext {
+                slow: self.slow_query_sink(),
+                counts: (
+                    self.ids.live_len(),
+                    self.ids.len() - self.ids.live_len(),
+                    self.corrected_edge_count(),
+                ),
+                wal_path: self.fs.wal_path(),
+            },
+            shared: effective,
+        });
+        Some(snap)
     }
 
     /// Append a delta the reader cannot apply, so that a corrupt overlay is
@@ -3914,10 +4821,10 @@ impl<F: Fs> GraphDb<F> {
     /// `#[cfg(test)]` — because its only callers are in `crates/server/tests`,
     /// a different crate, exactly as `core_rules`'s index counters are.
     ///
-    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) folds the
-    /// delta tail into a clone of the frozen overlay and answers
+    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) lays the
+    /// delta tail over the frozen overlay and answers
     /// [`GraphError::Corrupt`] when a record will not apply. Nothing a caller
-    /// can do produces that state — `apply_one`'s failures are disagreements
+    /// can do produces that state — `DeltaLayer::apply`'s failures are disagreements
     /// between the tail and the fold it is applied to, which the write path
     /// cannot create — so the `Corrupt` arm of every scoped reader method was
     /// reachable only by inspection until this hook existed. An `Intern` record
@@ -3939,6 +4846,7 @@ impl<F: Fs> GraphDb<F> {
             derived_inserts: Vec::new(),
             derived_deletes: Vec::new(),
             view_values: Vec::new(),
+            edge_props: Vec::new(),
         }));
     }
 
@@ -4025,8 +4933,17 @@ impl<F: Fs> GraphDb<F> {
         //
         // A declaration writes no node and no edge, and its arm reads no rule
         // index, so it does not start the scan.
-        if !is_declaration(rec) {
+        if is_declaration(rec) {
+            self.schema_stale = true;
+        } else {
             self.populate_indexes_before_write();
+        }
+        // A V11-only record makes the store V11 however it arrives: a live
+        // write has already been upgraded at the choke point, so this is for
+        // replay — at open, on refresh and in `open_at` — of a WAL that holds
+        // one (contract C9). A `Batch` is checked through its inner records.
+        if !self.v11_features && !matches!(rec, WalRecord::Batch(_)) && rec_is_v11(rec) {
+            self.v11_features = true;
         }
         match rec {
             WalRecord::InsertNode { label, key, props } => {
@@ -4059,12 +4976,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -4102,7 +5019,7 @@ impl<F: Fs> GraphDb<F> {
                 // Property (equality) index maintenance.
                 if self.prop_index.has_label(label) {
                     for (field, value) in props {
-                        self.prop_index.set(label, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, field, id, value);
                     }
                 }
             }
@@ -4150,12 +5067,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -4185,6 +5102,13 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // What the full-text index holds for `id`, so the rewrite
+                // below removes that value's words, not the whole vocabulary.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
@@ -4192,12 +5116,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
@@ -4244,8 +5168,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, field) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(id, field, indexed.as_ref());
+                            fulltext.add_tokens(id, field, value);
                         }
                     }
                 }
@@ -4259,7 +5184,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                     });
                     if let Some(label) = label_opt {
-                        self.prop_index.set(label, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, field, id, value);
                     }
                 }
             }
@@ -4323,12 +5248,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -4369,7 +5294,7 @@ impl<F: Fs> GraphDb<F> {
                         let Some(field) = self.syms.resolve(*field_sym) else {
                             continue;
                         };
-                        self.prop_index.set(&label_str, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(&label_str, field, id, value);
                     }
                 }
             }
@@ -4416,12 +5341,12 @@ impl<F: Fs> GraphDb<F> {
                     {
                         let mut gm = make_graph_mut(
                             &self.ids,
-                            Arc::make_mut(&mut self.syms),
+                            &mut self.syms,
                             &self.labels,
                             build_props_view(&self.props, &self.base),
-                            Arc::make_mut(&mut self.topo),
+                            &mut self.topo,
                             &self.base,
-                            Arc::make_mut(&mut self.edge_props),
+                            &mut self.edge_props,
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
                     }
@@ -4459,18 +5384,24 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(*id, &field_str)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text rewrite removes the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(&field_str)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
                 }
@@ -4514,8 +5445,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, &field_str) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(*id, &field_str);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(*id, &field_str, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(*id, &field_str, indexed.as_ref());
+                            fulltext.add_tokens(*id, &field_str, value);
                         }
                     }
                 }
@@ -4528,7 +5460,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                     });
                     if let Some(label) = label_opt {
-                        self.prop_index.set(label, &field_str, *id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, &field_str, *id, value);
                     }
                 }
             }
@@ -4548,12 +5480,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.create_rule(def, &mut gm)
                 };
@@ -4594,12 +5526,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.delete_rule(name, &mut gm)
                 };
@@ -4637,6 +5569,12 @@ impl<F: Fs> GraphDb<F> {
                 let old = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text removal walks the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).remove(id, field);
                 // If the base still supplies the value after the overlay removal,
                 // record a tombstone so ColumnsView::get does not resurrect it.
@@ -4658,12 +5596,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
                 }
@@ -4701,14 +5639,18 @@ impl<F: Fs> GraphDb<F> {
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
-                    Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
+                    Arc::make_mut(&mut self.fulltext).remove_node_value(
+                        id,
+                        field,
+                        indexed.as_ref(),
+                    );
                 }
                 // Property (equality) index maintenance: drop this node's entry.
                 if self.prop_index.field_indexed(field) {
                     if let Some(label) = self.labels.get(id as usize).and_then(|&sym| {
                         (sym != u32::MAX).then(|| self.syms.resolve(sym)).flatten()
                     }) {
-                        self.prop_index.remove_node(label, field, id);
+                        Arc::make_mut(&mut self.prop_index).remove_node(label, field, id);
                     }
                 }
             }
@@ -4762,12 +5704,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -4809,12 +5751,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.on_node_removed(n, &mut gm);
                 }
@@ -4895,7 +5837,7 @@ impl<F: Fs> GraphDb<F> {
                 // Full-text index maintenance: remove all tokens for this node.
                 Arc::make_mut(&mut self.fulltext).remove_node(n);
                 // Property (equality) index maintenance: drop all entries for n.
-                self.prop_index.remove_node_all(n);
+                Arc::make_mut(&mut self.prop_index).remove_node_all(n);
 
                 // (4) Retire the dense id and stamp the label sentinel.
                 Arc::make_mut(&mut self.ids).delete(key);
@@ -4921,12 +5863,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        Arc::make_mut(&mut self.syms),
+                        &mut self.syms,
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        Arc::make_mut(&mut self.topo),
+                        &mut self.topo,
                         &self.base,
-                        Arc::make_mut(&mut self.edge_props),
+                        &mut self.edge_props,
                     );
                     eng.rebuild(name, &mut gm)
                 };
@@ -5070,36 +6012,63 @@ impl<F: Fs> GraphDb<F> {
                 Arc::make_mut(&mut self.fulltext).disable(label, field);
             }
             WalRecord::EnableIndex { label, field } => {
-                // Replay-over-snapshot idempotency: already enabled → skip.
-                if self.prop_index.is_enabled(label, field) {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.is_equality_declared(label, field) {
                     return Ok(());
                 }
-                self.prop_index.enable(label, field);
-                // Backfill: index all live nodes of this label that have the field.
-                let n = self.ids.len() as u32;
-                for id in 0..n {
-                    let Some(&sym) = self.labels.get(id as usize) else {
-                        continue;
-                    };
-                    if sym == u32::MAX {
-                        continue; // tombstoned
-                    }
-                    let Some(lbl) = self.syms.resolve(sym) else {
-                        continue;
-                    };
-                    if lbl != label {
-                        continue;
-                    }
-                    if let Some(value) = build_props_view(&self.props, &self.base)
-                        .get(id, field)
-                        .map(|vr| vr.into_value())
-                    {
-                        self.prop_index.set(label, field, id, &value);
-                    }
+                // A pair a range index maintains already has its postings.
+                let maintained = self.prop_index.is_enabled(label, field);
+                Arc::make_mut(&mut self.prop_index).enable(label, field);
+                if !maintained {
+                    self.backfill_prop_index(label, field);
                 }
             }
             WalRecord::DisableIndex { label, field } => {
-                self.prop_index.disable(label, field);
+                Arc::make_mut(&mut self.prop_index).disable(label, field);
+            }
+            // A declaration: the postings come from the backfill here on a live
+            // or refreshed handle, and from `rebuild_all` at the end of an open.
+            WalRecord::EnableRangeIndex { name, label, field } => {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.range_index(name).is_some() {
+                    return Ok(());
+                }
+                let maintained = self.prop_index.is_enabled(label, field);
+                Arc::make_mut(&mut self.prop_index).enable_range(name, label, field);
+                // The open rebuilds every declared pair once replay is done, so
+                // a scan here would be thrown away.
+                if !maintained && !self.replaying_at_open {
+                    self.backfill_prop_index(label, field);
+                }
+            }
+            WalRecord::DisableRangeIndex { name } => {
+                Arc::make_mut(&mut self.prop_index).disable_range(name);
+            }
+            // A declaration only: the data it covers is never checked here.
+            // Replay must not fail on duplicates written before the constraint
+            // was declared; the check is for new writes, at the dense rewrite.
+            WalRecord::CreateConstraint { name, label, field } => {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.constraints.iter().any(|c| &c.name == name) {
+                    return Ok(());
+                }
+                // The backing index comes with the declaration. It is an
+                // equality declaration even over a range-indexed pair, so that
+                // dropping the range index leaves the constraint its index.
+                if !self.prop_index.is_equality_declared(label, field) {
+                    self.apply(&WalRecord::EnableIndex {
+                        label: label.clone(),
+                        field: field.clone(),
+                    })?;
+                }
+                self.constraints.push(UniqueConstraint {
+                    name: name.clone(),
+                    label: label.clone(),
+                    field: field.clone(),
+                });
+            }
+            WalRecord::DropConstraint { name } => {
+                self.constraints.retain(|c| &c.name != name);
             }
             // ── insert-count multiplicity (§5.13) ────────────────────────────
             //
@@ -5127,6 +6096,44 @@ impl<F: Fs> GraphDb<F> {
                     );
                 }
             }
+            // ── relationship properties (QL-RP) ──────────────────────────────
+            //
+            // Absolute, like the count: a frame replayed over a snapshot that
+            // already folded it in lands on the same value. An edge that is
+            // not there (a later frame deleted it, and the snapshot holds the
+            // deletion) takes nothing.
+            WalRecord::SetEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+                value,
+            } => {
+                let name = self.edge_prop_field(*field)?;
+                if self.edge_is_live(*etype, *src, *dst) {
+                    Arc::make_mut(&mut self.edge_props).set(
+                        *etype,
+                        *src,
+                        *dst,
+                        &name,
+                        value.clone(),
+                    );
+                }
+            }
+            WalRecord::RemoveEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+            } => {
+                let name = self.edge_prop_field(*field)?;
+                // The base may hold the field, so the edge's whole map is
+                // written back without it, hiding the base for the key.
+                let mut props = self.edge_props_view().props_of(*etype, *src, *dst);
+                if props.remove(&name).is_some() {
+                    Arc::make_mut(&mut self.edge_props).replace(*etype, *src, *dst, props);
+                }
+            }
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
@@ -5148,6 +6155,33 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         Ok(())
+    }
+
+    /// Index every live node of `label` that holds `field` under the declared
+    /// pair `(label, field)`: the scan a new declaration needs on a handle
+    /// whose open has already rebuilt its indexes.
+    fn backfill_prop_index(&mut self, label: &str, field: &str) {
+        let n = self.ids.len() as u32;
+        for id in 0..n {
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(lbl) = self.syms.resolve(sym) else {
+                continue;
+            };
+            if lbl != label {
+                continue;
+            }
+            if let Some(value) = build_props_view(&self.props, &self.base)
+                .get(id, field)
+                .map(|vr| vr.into_value())
+            {
+                Arc::make_mut(&mut self.prop_index).set(label, field, id, &value);
+            }
+        }
     }
 
     /// Intern `s` in `syms` and emit a WAL `Intern` record so `*Id` records
@@ -5181,9 +6215,92 @@ impl<F: Fs> GraphDb<F> {
     /// carries [`PlannedRec::DuplicateCount`] entries — the shape a batch
     /// produces, where a duplicate's count can only be named once this pass has
     /// assigned the frame's own ids.
+    ///
+    /// This is the one function every value-carrying WAL record passes through
+    /// on its way to the WAL — `insert_node` and `set_prop` via `log_dense`,
+    /// every batch, ingest and Cypher write via `commit_logged_batch` — so it
+    /// is where the store moves to the V11 format (contract C9): the first
+    /// frame carrying a V11-only record (see [`rec_is_v11`]) writes a V11
+    /// snapshot, keeping the WAL, before anything is interned or appended. A
+    /// 0.9.x reader then stops at `snapshot: unsupported version 11` and
+    /// never reaches the frame it could not decode. Replay never comes here.
+    ///
+    /// The upgrade runs before the frame's other checks that need the dense
+    /// ids — a unique-constraint violation found after it still refuses the
+    /// write, and leaves the store V11 with nothing V11 written. That is the
+    /// safe direction: the stamp costs an older reader a refusal, never a
+    /// commit.
+    ///
+    /// It is also where unique constraints are enforced (0.10 TY-5), for the
+    /// same reason: it sees every frame a write produces, whole, after its keys
+    /// have been resolved to the dense ids the frame will give them. A
+    /// duplicate — against committed state or inside the frame — refuses the
+    /// whole frame before anything is appended.
     fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
+        let mut carries_v11 = false;
+        for rec in &recs {
+            if let PlannedRec::EdgeProp { field, value, .. } = rec {
+                // Checked as the node-property write of the same value is.
+                if let Some(value) = value {
+                    let probe = WalRecord::SetProp {
+                        key: String::new(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    };
+                    if let Some((field, size)) = oversized_binary(&probe, &self.syms) {
+                        return Err(GraphError::ValueTooLarge {
+                            field,
+                            size,
+                            limit: BINARY_MAX_BYTES,
+                        });
+                    }
+                    if let Some(offset_seconds) = out_of_range_offset(&probe) {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "DateTime offset of {offset_seconds} s is outside ±18:00; a \
+                                 DateTime cannot be stored with it"
+                            ),
+                        });
+                    }
+                }
+                carries_v11 = carries_v11 || !self.v11_features;
+            }
+            if let PlannedRec::Rec(rec) = rec {
+                if let Some((field, size)) = oversized_binary(rec, &self.syms) {
+                    return Err(GraphError::ValueTooLarge {
+                        field,
+                        size,
+                        limit: BINARY_MAX_BYTES,
+                    });
+                }
+                if let Some(offset_seconds) = out_of_range_offset(rec) {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "DateTime offset of {offset_seconds} s is outside ±18:00; a \
+                             DateTime cannot be stored with it"
+                        ),
+                    });
+                }
+                carries_v11 = carries_v11 || (!self.v11_features && rec_is_v11(rec));
+            }
+        }
+        if carries_v11 {
+            if self.in_nosync_group {
+                // Unreachable through `commit_group` and the drain, which
+                // upgrade ahead of the group; refused rather than snapshot a
+                // state the group has not made durable.
+                return Err(GraphError::QueryError {
+                    detail: "the V11 format upgrade cannot run inside a group commit; the \
+                             group did not upgrade ahead of its first write"
+                        .into(),
+                });
+            }
+            self.upgrade_to_v11()?;
+        }
         let syms_checkpoint = self.syms.len();
-        let result = self.rewrite_wal_dense_inner(recs);
+        let result = self
+            .rewrite_wal_dense_inner(recs)
+            .and_then(|out| self.check_unique_constraints(&out).map(|()| out));
         if result.is_err() {
             Arc::make_mut(&mut self.syms).truncate(syms_checkpoint);
         }
@@ -5198,6 +6315,11 @@ impl<F: Fs> GraphDb<F> {
         // on a node this frame created is measured against the namespace it was
         // created in rather than against the store, where it does not exist yet.
         let mut pending_ns: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Whether each node this frame has inserted, renamed or set `id` on has
+        // `id == key` at that point of the frame. The store alone cannot say:
+        // it does not have the frame's own writes.
+        let mut pending_id_mirrors_key: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut interned = std::collections::HashSet::<u32>::new();
         let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
@@ -5271,9 +6393,69 @@ impl<F: Fs> GraphDb<F> {
                     });
                     continue;
                 }
+                PlannedRec::EdgeProp {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    field,
+                    value,
+                } => {
+                    if value.as_ref().is_some_and(Value::contains_null) {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "{NULL_PROPERTY_ERROR}: property `{field}` of relationship \
+                                 ({src_key})-[:{edge_type}]->({dst_key}) holds a null (a list \
+                                 or map property with a null element cannot be stored)"
+                            ),
+                        });
+                    }
+                    let (etype, intern) = self.intern_wal(&edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    let (field_id, intern) = self.intern_wal(&field);
+                    if interned.insert(field_id) {
+                        out.push(intern);
+                    }
+                    let src = lookup(&self.ids, &pending, &freed, &src_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing src {src_key}"),
+                        }
+                    })?;
+                    let dst = lookup(&self.ids, &pending, &freed, &dst_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing dst {dst_key}"),
+                        }
+                    })?;
+                    out.push(match value {
+                        Some(value) => WalRecord::SetEdgePropId {
+                            etype,
+                            src,
+                            dst,
+                            field: field_id,
+                            value,
+                        },
+                        None => WalRecord::RemoveEdgePropId {
+                            etype,
+                            src,
+                            dst,
+                            field: field_id,
+                        },
+                    });
+                    continue;
+                }
             };
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
+                    for (field, value) in &props {
+                        refuse_null_property(&key, field, value)?;
+                    }
+                    pending_id_mirrors_key.insert(
+                        key.clone(),
+                        props
+                            .iter()
+                            .any(|(f, v)| f == "id" && id_mirrors_key(&key, Some(v))),
+                    );
                     // Namespace validation and normalisation, on the one seam
                     // every user-visible node insert passes through: insert_node,
                     // a batch, ingest, Cypher CREATE and MERGE all arrive here
@@ -5305,6 +6487,20 @@ impl<F: Fs> GraphDb<F> {
                     });
                 }
                 WalRecord::SetProp { key, field, value } => {
+                    refuse_null_property(&key, &field, &value)?;
+                    // `id` mirrors the key: a write may restate the key, never
+                    // change it (ledger row 128). Rename moves it with the key.
+                    if field == "id" {
+                        let mirrors = match pending_id_mirrors_key.get(&key) {
+                            Some(&m) => m,
+                            None => id_mirrors_key(&key, self.get_prop(&key, "id").as_ref()),
+                        };
+                        if mirrors && !id_mirrors_key(&key, Some(&value)) {
+                            return Err(key_property_error(&key));
+                        }
+                        pending_id_mirrors_key
+                            .insert(key.clone(), id_mirrors_key(&key, Some(&value)));
+                    }
                     // A namespace is set at insert and fixed after: the write is
                     // refused when it would move the node, and dropped when it
                     // names the namespace the node is already in. Checked here
@@ -5386,6 +6582,10 @@ impl<F: Fs> GraphDb<F> {
                     pending.remove(old_key.as_str());
                     freed.insert(old_key.clone());
                     pending.insert(new_key.clone(), id);
+                    // The node keeps its `id` value, which was the old key at
+                    // most, so it no longer mirrors the new key.
+                    pending_id_mirrors_key.remove(old_key.as_str());
+                    pending_id_mirrors_key.insert(new_key.clone(), false);
                     out.push(rec);
                 }
                 // # Symbol-order invariant (load-bearing)
@@ -5433,6 +6633,7 @@ impl<F: Fs> GraphDb<F> {
                     out.push(rec);
                 }
                 WalRecord::DeleteNode { ref key } => {
+                    pending_id_mirrors_key.remove(key.as_str());
                     pending.remove(key.as_str());
                     freed.insert(key.clone());
                     out.push(rec);
@@ -5441,6 +6642,201 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         Ok(out)
+    }
+
+    /// Refuse a frame that would leave two live nodes of a constrained label
+    /// holding equal values for the constrained field.
+    ///
+    /// `out` is the frame as [`rewrite_wal_dense_inner`](Self::rewrite_wal_dense_inner)
+    /// produced it. Keys are resolved here exactly as that pass resolved them —
+    /// a node the frame inserts takes the next free id, and a deleted or
+    /// renamed-away key names nothing until the frame inserts it again — and
+    /// every label and field the frame names is already interned. What is
+    /// judged is the state after the frame: each node the frame touches by its
+    /// final label and value, every other node by what the equality index
+    /// holds. So a frame that swaps two values, or frees a value and takes it
+    /// in one commit, passes; one that writes a value twice, or a value an
+    /// untouched node holds, does not.
+    ///
+    /// The error names the constraint and the field only — never the node
+    /// already holding the value, nor whether the caller could see it — so it
+    /// reads the same for a visible node, a hidden one and another node in the
+    /// same write (spec §4.6).
+    fn check_unique_constraints(&self, out: &[WalRecord]) -> Result<()> {
+        if self.constraints.is_empty() {
+            return Ok(());
+        }
+        // Every field the frame names is interned by now, so a constrained
+        // field with no symbol is one the frame cannot write.
+        let field_syms: Vec<Option<u32>> = self
+            .constraints
+            .iter()
+            .map(|c| self.syms.get(&c.field))
+            .collect();
+        let constrained = |sym: u32| field_syms.contains(&Some(sym));
+        let constrained_name = |name: &str| self.constraints.iter().any(|c| c.field == name);
+
+        let mut pending: HashMap<&str, u32> = HashMap::new();
+        let mut freed: HashSet<&str> = HashSet::new();
+        let mut next = self.ids.len() as u32;
+        let lookup = |pending: &HashMap<&str, u32>, freed: &HashSet<&str>, key: &str| match pending
+            .get(key)
+        {
+            Some(&id) => Some(id),
+            None if freed.contains(key) => None,
+            None => self.ids.get(key),
+        };
+        // What the frame leaves behind, for the nodes it touches.
+        let mut touched: BTreeSet<u32> = BTreeSet::new();
+        let mut dead: HashSet<u32> = HashSet::new();
+        let mut final_label: HashMap<u32, u32> = HashMap::new();
+        let mut final_value: HashMap<(u32, u32), Option<&Value>> = HashMap::new();
+        for rec in out {
+            match rec {
+                WalRecord::InsertNodeId { label, key, props } => {
+                    let id = match lookup(&pending, &freed, key) {
+                        Some(id) => id,
+                        None => {
+                            pending.insert(key.as_str(), next);
+                            next = next.saturating_add(1);
+                            next - 1
+                        }
+                    };
+                    touched.insert(id);
+                    final_label.insert(id, *label);
+                    for (field, value) in props {
+                        if constrained(*field) {
+                            final_value.insert((id, *field), Some(value));
+                        }
+                    }
+                }
+                WalRecord::SetPropId { id, field, value } if constrained(*field) => {
+                    touched.insert(*id);
+                    final_value.insert((*id, *field), Some(value));
+                }
+                WalRecord::RemoveProp { key, field } if constrained_name(field) => {
+                    if let (Some(id), Some(sym)) =
+                        (lookup(&pending, &freed, key), self.syms.get(field))
+                    {
+                        touched.insert(id);
+                        final_value.insert((id, sym), None);
+                    }
+                }
+                WalRecord::DeleteNode { key } => {
+                    if let Some(id) = lookup(&pending, &freed, key) {
+                        touched.insert(id);
+                        dead.insert(id);
+                    }
+                    pending.remove(key.as_str());
+                    freed.insert(key.as_str());
+                }
+                WalRecord::RenameNode { old_key, new_key } => {
+                    if let Some(id) = lookup(&pending, &freed, old_key) {
+                        pending.remove(old_key.as_str());
+                        freed.insert(old_key.as_str());
+                        pending.insert(new_key.as_str(), id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let committed = self.ids.len();
+        let props_view = build_props_view(&self.props, &self.base);
+        // What earlier nodes of this frame hold, per constraint, in the
+        // bucket `equality_bucket` gives; values in one bucket are compared
+        // with `values_equal`, the scan's own equality.
+        let mut claimed: HashMap<(usize, EqualityBucket), Vec<Value>> = HashMap::new();
+        for &id in &touched {
+            if dead.contains(&id) {
+                continue;
+            }
+            let label = final_label
+                .get(&id)
+                .or_else(|| self.labels.get(id as usize))
+                .copied()
+                .filter(|&sym| sym != u32::MAX)
+                .and_then(|sym| self.syms.resolve(sym));
+            let Some(label) = label else {
+                continue;
+            };
+            // A node the frame moves into a constrained label brings the
+            // value it holds with it; that is a claim like any other.
+            let relabelled = (id as usize) < committed
+                && final_label
+                    .get(&id)
+                    .is_some_and(|sym| self.labels.get(id as usize) != Some(sym));
+            for (ci, c) in self.constraints.iter().enumerate() {
+                if c.label != label {
+                    continue;
+                }
+                let stored = || {
+                    if (id as usize) < committed {
+                        props_view.get(id, &c.field).map(|vr| vr.into_value())
+                    } else {
+                        None
+                    }
+                };
+                let written = field_syms[ci].and_then(|sym| final_value.get(&(id, sym)));
+                let value = match written {
+                    Some(Some(v)) => {
+                        // Only a value the frame changes is judged. One it
+                        // leaves as it was — a rewrite of the same value, or a
+                        // change reverted inside the frame — is not a claim,
+                        // so a duplicate that already exists is not refused
+                        // for being written again.
+                        if !relabelled && stored().is_some_and(|old| values_equal(&old, v)) {
+                            continue;
+                        }
+                        (*v).clone()
+                    }
+                    Some(None) => continue,
+                    // Not written: the node keeps what it holds, and judging
+                    // that is only owed when it has just arrived in the label.
+                    None if relabelled => match stored() {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                // A value no scan can find equal to another — one with no
+                // index key, or a NaN — never conflicts.
+                let Some(bucket) = equality_bucket(&value) else {
+                    continue;
+                };
+                let violation = || GraphError::ConstraintViolation {
+                    constraint: c.name.clone(),
+                    field: c.field.clone(),
+                };
+                // A holder keeps its value unless the frame deletes it or
+                // writes the field to something else. The index answers as
+                // the scan does: an `Int` finds the equal `Float`, and the
+                // reverse.
+                let leaves = |holder: u32| {
+                    dead.contains(&holder)
+                        || field_syms[ci]
+                            .and_then(|sym| final_value.get(&(holder, sym)))
+                            .is_some_and(|now| match now {
+                                Some(v) => !values_equal(v, &value),
+                                None => true,
+                            })
+                };
+                if self
+                    .prop_index
+                    .lookup(&c.label, &c.field, &value)
+                    .into_iter()
+                    .any(|holder| holder != id && !leaves(holder))
+                {
+                    return Err(violation());
+                }
+                let held = claimed.entry((ci, bucket)).or_default();
+                if held.iter().any(|other| values_equal(other, &value)) {
+                    return Err(violation());
+                }
+                held.push(value);
+            }
+        }
+        Ok(())
     }
 
     fn log_dense(&mut self, recs: Vec<WalRecord>) -> Result<()> {
@@ -5736,12 +7132,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.reconcile_lost_provenance(&mut gm);
         }
@@ -5866,7 +7262,7 @@ impl<F: Fs> GraphDb<F> {
         // lock and did not get it. Writing anyway would append frames on top of
         // a WAL another process is extending, so refuse instead.
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
         // Ensure retained provenance bytes are decoded into the live mutable
         // fields before any mutation touches self.engine.provenance.  This is a
@@ -5889,14 +7285,30 @@ impl<F: Fs> GraphDb<F> {
         if self.intent_unsettled {
             self.settle_snapshot_intent()?;
         }
-        let frame = encode_record(&rec);
+        // Backstop for the upgrade in `rewrite_wal_dense_planned`: a path that
+        // reached the WAL without passing through it would show up here.
+        debug_assert!(
+            self.v11_features || !rec_is_v11(&rec),
+            "a format-V11 value or record reached the WAL append without the V11 upgrade"
+        );
+        // Fallible only for a record that carries a null property value, which
+        // `rewrite_wal_dense` has already refused; nothing is appended then.
+        let frame = try_encode_record(&rec)?;
         self.fs.append(FileId::Wal, &frame)?;
+        // The first append to a store with no WAL creates the file: learn
+        // which one it is. One stat, once (where a file identity exists).
+        if cfg!(unix) && self.wal_ident.is_none() {
+            self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+            self.durable_wal
+                .snapshot_is(self.snapshot_ident, self.wal_ident);
+        }
         // The cursor advances by exactly the bytes appended: these frames are
         // ours and already applied, so a later refresh must not replay them.
         self.wal_consumed += frame.len() as u64;
         self.wal_frames_written += 1;
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
+            self.note_wal_synced();
         }
         // Marker writing always needs the engine deltas, but the engine only
         // accumulates them when emit_deltas is true (normally gated on subscribers
@@ -6030,27 +7442,58 @@ impl<F: Fs> GraphDb<F> {
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
         // stored as-is (including any nested Batch / Intern records); the
-        // ReaderSnapshot's apply_one function handles all variants.
+        // reader's `DeltaLayer::apply` handles all variants.
         {
-            let derived_inserts = engine_deltas
+            // Each triple in the state the commit left it. The engine reports a
+            // retraction and a re-derivation of one edge as two deltas, in
+            // order; reading them as two lists lost that order and made the
+            // edge disappear (or stay) wrongly.
+            let mut net: std::collections::HashMap<(u32, u32, u32), bool> =
+                std::collections::HashMap::new();
+            for d in &engine_deltas {
+                net.insert((d.etype_sym, d.src_id, d.dst_id), d.fired);
+            }
+            let derived_inserts = net
                 .iter()
-                .filter(|d| d.fired)
-                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .filter(|(_, &fired)| fired)
+                .map(|(&triple, _)| triple)
                 .collect();
-            let derived_deletes = engine_deltas
+            let derived_deletes = net
                 .iter()
-                .filter(|d| !d.fired)
-                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .filter(|(_, &fired)| !fired)
+                .map(|(&triple, _)| triple)
                 .collect();
+            // Only when there is something to add: the published snapshot
+            // shares the tail's index, so touching it copies it.
+            if !net.is_empty() {
+                Arc::make_mut(&mut self.tail_derived)
+                    .append(&crate::reader::DerivedChanges::from_net(&net));
+            }
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
-            let fold = view_values.is_none();
+            // A commit that declares or drops an index or a constraint folds
+            // too: a snapshot answers indexed lookups from the fold's index,
+            // and `SHOW` from the fold's listing, so both must be the store's
+            // (see `ReaderSnapshot::query_index`).
+            let fold = view_values.is_none() || declares_schema(&rec);
+            // Every edge whose properties this commit wrote — a rule's weights
+            // above all, which no record carries — as the commit left it.
+            let edge_props = if self.edge_props.has_touched() {
+                let touched = Arc::make_mut(&mut self.edge_props).take_touched();
+                touched
+                    .into_iter()
+                    .map(|(et, s, d)| ((et, s, d), self.edge_props.entry(et, s, d)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let delta = Arc::new(crate::reader::CommitDelta {
                 records: vec![rec.clone()],
                 derived_inserts,
                 derived_deletes,
                 view_values: view_values.unwrap_or_default(),
+                edge_props,
             });
             self.delta_tail.push(delta);
             self.commits_since_fold += 1;
@@ -6368,6 +7811,9 @@ impl<F: Fs> GraphDb<F> {
         if self.subscriptions.is_empty() && self.query_subscriptions.is_empty() {
             return;
         }
+        // A subscription's query is a statement of its own, whichever commit
+        // path (direct or group-commit drain) delivers the event.
+        let _clock = core_query::cypher::StatementClock::fresh();
 
         if !self.subscriptions.is_empty() {
             // Build write events from the WAL record.
@@ -6606,6 +8052,10 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DisableFulltext { .. }
             | WalRecord::EnableIndex { .. }
             | WalRecord::DisableIndex { .. }
+            | WalRecord::CreateConstraint { .. }
+            | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
             | WalRecord::Intern { .. }
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
@@ -6614,6 +8064,9 @@ impl<F: Fs> GraphDb<F> {
             // A count is not an edge event: the pair it counts already fired one
             // when it was first inserted.
             | WalRecord::SetEdgeCount { .. }
+            // A relationship property has no write event of its own (0.10).
+            | WalRecord::SetEdgePropId { .. }
+            | WalRecord::RemoveEdgePropId { .. }
             | WalRecord::RenameNode { .. } => vec![],
         }
     }
@@ -6932,8 +8385,32 @@ impl<F: Fs> GraphDb<F> {
         let authz_opt = param_authz.or_else(|| self.pending_write_authz.clone());
         if let Some(ref authz) = authz_opt {
             let mut batch_created: BTreeMap<String, String> = BTreeMap::new();
+            // Edges an earlier op of this batch creates: a property written on
+            // one in the same batch is part of its creation (create scope),
+            // as a node's own `SetProp` after its `InsertNode` is. Only a pair
+            // the store does not already hold counts, as `batch_created` takes
+            // only keys absent from the store: re-inserting an existing pair
+            // (`MATCH (a), (b) CREATE (a)-[r:T]->(b) SET r.w = …`) binds the
+            // stored edge, and a write to it is an update.
+            let mut batch_edges: HashSet<EdgeKey> = HashSet::new();
             for op in &ops {
-                self.check_single_op_authz(authz, op, &batch_created)?;
+                self.check_single_op_authz(authz, op, &batch_created, &batch_edges)?;
+                if let BatchOp::InsertEdge {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                }
+                | BatchOp::InsertEdgeUpsert {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    ..
+                } = op
+                {
+                    if !self.edge_in_store(edge_type, src_key, dst_key) {
+                        batch_edges.insert((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                    }
+                }
                 // Update batch_created after a passing authz check so that
                 // subsequent ops in this batch see the nodes as "about to exist".
                 match op {
@@ -6993,7 +8470,7 @@ impl<F: Fs> GraphDb<F> {
             // dense rewrite and not here: a duplicate's endpoints and edge type
             // may all be created by earlier ops in this same frame, and nothing
             // in the frame has a dense id yet. See [`PlannedRec`].
-            let mut deferred_counts: Vec<(usize, String, String, String)> = Vec::new();
+            let mut deferred: Vec<(usize, PlannedRec)> = Vec::new();
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
@@ -7087,7 +8564,14 @@ impl<F: Fs> GraphDb<F> {
                             // This is the one gate on discriminant 23 from the
                             // batch path: a store that never opted in queues
                             // nothing here and so writes no such record.
-                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
+                            deferred.push((
+                                recs.len(),
+                                PlannedRec::DuplicateCount {
+                                    edge_type,
+                                    src_key,
+                                    dst_key,
+                                },
+                            ));
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
@@ -7197,35 +8681,68 @@ impl<F: Fs> GraphDb<F> {
                             // Same choke-point, same gate as `BatchOp::InsertEdge`
                             // above: an upsert that finds the pair already there
                             // is a duplicate insert and counts as one.
-                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
+                            deferred.push((
+                                recs.len(),
+                                PlannedRec::DuplicateCount {
+                                    edge_type,
+                                    src_key,
+                                    dst_key,
+                                },
+                            ));
                         }
                     }
-                }
-            }
-            // Splice the deferred counts back into the positions they were
-            // raised at, so a count still sits exactly where the duplicate did
-            // — before any later op in the frame that deletes the pair.
-            let mut planned: Vec<PlannedRec> =
-                Vec::with_capacity(recs.len() + deferred_counts.len());
-            let mut deferred = deferred_counts.into_iter().peekable();
-            for (i, rec) in recs.into_iter().enumerate() {
-                while deferred.peek().is_some_and(|(at, ..)| *at == i) {
-                    let (_, edge_type, src_key, dst_key) = deferred.next().expect("just peeked");
-                    planned.push(PlannedRec::DuplicateCount {
+                    BatchOp::SetEdgeProp {
                         edge_type,
                         src_key,
                         dst_key,
-                    });
+                        field,
+                        value,
+                    } => {
+                        preview.check_edge_prop_write(&edge_type, &src_key, &dst_key, &field)?;
+                        deferred.push((
+                            recs.len(),
+                            PlannedRec::EdgeProp {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                                field,
+                                value: Some(value),
+                            },
+                        ));
+                    }
+                    BatchOp::RemoveEdgeProp {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                        field,
+                    } => {
+                        preview.check_edge_prop_write(&edge_type, &src_key, &dst_key, &field)?;
+                        deferred.push((
+                            recs.len(),
+                            PlannedRec::EdgeProp {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                                field,
+                                value: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            // Splice the deferred entries (counts, relationship properties)
+            // back into the positions they were raised at, so each still sits
+            // exactly where its op did — before any later op in the frame that
+            // deletes the pair.
+            let mut planned: Vec<PlannedRec> = Vec::with_capacity(recs.len() + deferred.len());
+            let mut deferred = deferred.into_iter().peekable();
+            for (i, rec) in recs.into_iter().enumerate() {
+                while deferred.peek().is_some_and(|(at, _)| *at == i) {
+                    planned.push(deferred.next().expect("just peeked").1);
                 }
                 planned.push(PlannedRec::Rec(rec));
             }
-            for (_, edge_type, src_key, dst_key) in deferred {
-                planned.push(PlannedRec::DuplicateCount {
-                    edge_type,
-                    src_key,
-                    dst_key,
-                });
-            }
+            planned.extend(deferred.map(|(_, entry)| entry));
             planned
         };
         // A frame that is nothing but skips or refused rows writes no WAL, but
@@ -7287,7 +8804,10 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None, None).map(inserted_pair)
+        self.in_nosync_group = true;
+        let result = self.commit_logged_batch(ops, None, None).map(inserted_pair);
+        self.in_nosync_group = false;
+        result
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -7322,16 +8842,24 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> (Vec<Result<(usize, usize)>>, Option<GraphError>) {
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return (group_refusal(e, groups.len()), None);
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
         }
         let any_ok = results.iter().any(|r| r.is_ok());
         let sync_err = if self.fsync != FsyncPolicy::Relaxed && any_ok {
-            self.fs
+            let r = self
+                .fs
                 .sync(core_storage::fs::FileId::Wal)
                 .map_err(GraphError::Io)
-                .err()
+                .err();
+            if r.is_none() {
+                self.note_wal_synced();
+            }
+            r
         } else {
             None
         };
@@ -7348,6 +8876,12 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         groups: Vec<Vec<BatchOp>>,
     ) -> Vec<Result<(usize, usize)>> {
+        // Ahead of the first append, as `commit_group` and the drain do: the
+        // upgrade fsyncs the WAL before its snapshot, so the snapshot holds
+        // only durable state, never a submission of this group.
+        if let Err(e) = self.upgrade_to_v11_for_ops(groups.iter().map(Vec::as_slice)) {
+            return group_refusal(e, groups.len());
+        }
         let mut results = Vec::with_capacity(groups.len());
         for ops in groups {
             results.push(self.commit_batch_nosync(ops));
@@ -7520,10 +9054,15 @@ impl<F: Fs> GraphDb<F> {
             .filter(|&(_, etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
             .count() as u64;
 
+        // A self-loop is in both the Out and the In list of `id`, and is one
+        // edge: it is counted from the Out side only (ledger row 147).
         let mut total_topo = 0u64;
         for et in tv.etypes() {
             total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
-                + tv.neighbors(et, Direction::In, id).len() as u64;
+                + tv.neighbors(et, Direction::In, id)
+                    .iter()
+                    .filter(|&&src| src != id)
+                    .count() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
@@ -7691,12 +9230,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.populate_indexes(&gm);
         }
@@ -7721,12 +9260,12 @@ impl<F: Fs> GraphDb<F> {
         let finished = {
             let mut gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.pump_index_build(&mut gm)
         };
@@ -7748,12 +9287,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                Arc::make_mut(&mut self.syms),
+                &mut self.syms,
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                Arc::make_mut(&mut self.topo),
+                &mut self.topo,
                 &self.base,
-                Arc::make_mut(&mut self.edge_props),
+                &mut self.edge_props,
             );
             eng.register_incomplete_hnsw_builds(&extra, &gm);
         }
@@ -7897,6 +9436,8 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - `ReadOnly`: called on an as-of instance.
     /// - `RuleInvalid`: name collision, view_prop collision, or invalid def.
+    /// - `QueryError`: a unique constraint, an equality index or a range index
+    ///   covers `(label, view_prop)`.
     pub fn create_view(&mut self, def: ViewDef) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -7907,6 +9448,46 @@ impl<F: Fs> GraphDb<F> {
         if self.view_store.has_view(&def.name) {
             return Err(GraphError::RuleInvalid {
                 detail: format!("view {:?} already exists", def.name),
+            });
+        }
+        // A view writes its property inside `apply`, after the unique-constraint
+        // check has run, so a constraint over it could not hold.
+        if let Some(c) = self
+            .constraints
+            .iter()
+            .find(|c| c.label == def.label && c.field == def.view_prop)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is declared unique by constraint '{}'; a view \
+                     cannot own it",
+                    def.view_prop, def.label, c.name
+                ),
+            });
+        }
+        // A view writes its property without passing the property index, so a
+        // range index over it would answer from stale postings until the next
+        // open rebuilt them.
+        if let Some(index) = self.prop_index.range_index_on(&def.label, &def.view_prop) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by range index '{index}'; a view \
+                     cannot own it",
+                    def.view_prop, def.label
+                ),
+            });
+        }
+        // The same for an equality index (ledger row 123).
+        if self
+            .prop_index
+            .is_equality_declared(&def.label, &def.view_prop)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by an equality index; a view cannot \
+                     own it",
+                    def.view_prop, def.label
+                ),
             });
         }
         if let Some(existing) = self.view_store.view_for_prop(&def.view_prop) {
@@ -8089,6 +9670,7 @@ impl<F: Fs> GraphDb<F> {
         match core_storage::fulltext::FulltextIndex::from_blob(bytes) {
             Some((index, node_count)) if node_count as usize == self.ids.len() => {
                 self.fulltext = Arc::new(index);
+                self.schema_stale = true;
                 self.fulltext_loaded = true;
             }
             _ => eprintln!(
@@ -8252,12 +9834,39 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed.
+    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed, by
+    ///   an equality index or by a range index (named in the error).
+    /// - [`GraphError::QueryError`]: a view owns `(label, field)`.
     pub fn enable_index(&mut self, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // A view writes its property inside `apply` without passing the
+        // property index, so an equality index over it would answer from
+        // stale postings until the next open rebuilt them (ledger row 123).
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; an equality \
+                     index cannot cover it",
+                    view.name
+                ),
+            });
+        }
         if self.prop_index.is_enabled(label, field) {
+            // A range index already answers equality on the pair.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "property index for ({label:?}, {field:?}) already enabled: range index \
+                         '{index}' covers it"
+                    ),
+                });
+            }
             return Err(GraphError::RuleInvalid {
                 detail: format!("property index for ({label:?}, {field:?}) already enabled"),
             });
@@ -8277,15 +9886,344 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        if !self.prop_index.is_enabled(label, field) {
+        if !self.prop_index.is_equality_declared(label, field) {
+            // A pair only a range index covers is withdrawn by that index's name.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "the index on ({label}, {field}) is range index '{index}'; drop it with \
+                         disable_range_index"
+                    ),
+                });
+            }
             return Err(GraphError::RuleNotFound {
                 name: format!("index({label},{field})"),
+            });
+        }
+        // The index is what a unique constraint is checked against: dropping
+        // it under a constraint would let duplicates in silently.
+        if let Some(c) = self
+            .constraints
+            .iter()
+            .find(|c| c.label == label && c.field == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "the index on ({label}, {field}) backs unique constraint '{}'; drop the \
+                     constraint first",
+                    c.name
+                ),
             });
         }
         self.log_then_apply(WalRecord::DisableIndex {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Declare the range index `name` on `(label, field)`.
+    ///
+    /// A range index answers range (`<`, `<=`, `>`, `>=`), `STARTS WITH` and
+    /// exact-match lookups over the field's scalar values, for nodes of
+    /// `label`. Existing nodes are indexed at once; the declaration is one WAL
+    /// record, and the postings are rebuilt from the stored values at every
+    /// open. An equality index on the same pair shares the postings and is
+    /// unaffected by this or by [`disable_range_index`](Self::disable_range_index).
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: a range index named `name` already
+    ///   exists; `name` begins with `eq_` or `ft_` (reserved for the names
+    ///   `SHOW INDEXES` lists equality and full-text indexes under);
+    ///   `(label, field)` already has a range index; or a view owns
+    ///   `(label, field)`.
+    ///
+    /// # Format
+    /// An `EnableRangeIndex` record is format-V11: the first declaration on a
+    /// store that is not V11 yet writes a V11 snapshot first, and from then on
+    /// the store cannot be read by 0.9.x (see [`is_v11`](Self::is_v11)).
+    pub fn enable_range_index(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if let Some(err) = ddl::reserved_index_name(name) {
+            return Err(err);
+        }
+        if self.prop_index.range_index(name).is_some() {
+            return Err(GraphError::QueryError {
+                detail: format!("a range index named '{name}' already exists"),
+            });
+        }
+        if let Some(existing) = self.prop_index.range_index_on(label, field) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' already has range index '{existing}'"
+                ),
+            });
+        }
+        // A view writes its property inside `apply` without passing the
+        // property index, so the postings would go stale under it.
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; a range index \
+                     cannot cover it",
+                    view.name
+                ),
+            });
+        }
+        self.log_dense(vec![WalRecord::EnableRangeIndex {
+            name: name.into(),
+            label: label.into(),
+            field: field.into(),
+        }])
+    }
+
+    /// Withdraw the range index `name`. An equality index on the same pair —
+    /// from [`enable_index`](Self::enable_index) or a unique constraint —
+    /// stays; otherwise the pair is no longer indexed.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: no range index is named `name`.
+    pub fn disable_range_index(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.range_index(name).is_none() {
+            return Err(GraphError::QueryError {
+                detail: format!("no range index named '{name}'"),
+            });
+        }
+        self.log_dense(vec![WalRecord::DisableRangeIndex { name: name.into() }])
+    }
+
+    /// The declared range indexes as `(name, label, field)`, sorted by name.
+    pub fn range_indexes(&self) -> Vec<(String, String, String)> {
+        self.prop_index
+            .range_indexes()
+            .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+            .collect()
+    }
+
+    /// The node keys the range index on `(label, field)` holds between `lo`
+    /// and `hi`, in index order — the answer
+    /// [`UnifiedIndex::lookup_range`](core_storage::UnifiedIndex::lookup_range)
+    /// gives, by key. Lets tests compare the postings across a reopen, a
+    /// snapshot and `open_at` until the planner reads them (0.10 TY-10).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn range_lookup_keys_for_test(
+        &self,
+        label: &str,
+        field: &str,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Vec<String> {
+        self.prop_index
+            .lookup_range(label, field, lo, hi)
+            .filter_map(|id| self.ids.key_of(id).map(str::to_string))
+            .collect()
+    }
+
+    /// Declare a unique constraint: no two live nodes of `label` may hold equal
+    /// values for `field`.
+    ///
+    /// The equality index on `(label, field)` that the check runs against is
+    /// created with it when absent — by the replay of the one
+    /// `CreateConstraint` record this logs, so the declaration and its index
+    /// are one commit. From then on every write that would give a second node
+    /// of `label` a value already held fails with
+    /// [`GraphError::ConstraintViolation`] and writes nothing. Values compare
+    /// as a query's `=` does: `Int` 2 and `Float` 2.0 are one value, so are the two zeros
+    /// and every `Int` that rounds to a `Float`, `NaN` equals nothing, two `DateTime`s at one
+    /// UTC instant are equal whatever their offsets, and a list, map or `Duration` never
+    /// conflicts.
+    ///
+    /// The existing data is checked first: every live node of `label` is read,
+    /// and if two hold equal values for `field` nothing is logged and the error
+    /// lists the first 100 nodes involved, in node-id order, and counts them all.
+    /// Declaring blocks writers for a time proportional to the label's node
+    /// count (the scan, then the index build); readers are unaffected.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::ConstraintCreationConflict`]: live nodes of `label` already
+    ///   hold equal values for `field`; `violations` is each `(node_key, value)`.
+    /// - [`GraphError::QueryError`]: a constraint named `name` already exists;
+    ///   or a view owns `(label, field)`.
+    ///
+    /// # Format
+    /// A `CreateConstraint` record is format-V11: the first declaration on a
+    /// store that is not V11 yet writes a V11 snapshot first, and from then on
+    /// the store cannot be read by 0.9.x (see [`is_v11`](Self::is_v11)).
+    pub fn create_constraint(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.constraints.iter().any(|c| c.name == name) {
+            return Err(GraphError::QueryError {
+                detail: format!("a constraint named '{name}' already exists"),
+            });
+        }
+        // A view writes its property inside `apply`, after the check has run,
+        // so the constraint could not hold over it.
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; a unique \
+                     constraint cannot cover it",
+                    view.name
+                ),
+            });
+        }
+        let (violations, total) = self.existing_unique_violations(label, field);
+        if total > 0 {
+            return Err(GraphError::ConstraintCreationConflict { violations, total });
+        }
+        self.log_dense(vec![WalRecord::CreateConstraint {
+            name: name.into(),
+            label: label.into(),
+            field: field.into(),
+        }])
+    }
+
+    /// The first [`CONSTRAINT_CONFLICTS_LISTED`] `(node_key, value)` of live
+    /// nodes of `label` whose `field` equals another live node's, in node-id
+    /// order, and the count of all of them.
+    ///
+    /// One pass over the label column and one props read per node of `label`;
+    /// nodes are grouped by [`equality_bucket`] and compared with
+    /// `values_equal` inside a bucket, the equality the write path judges
+    /// by, so `Int` 2 beside `Float` 2.0 is reported. A bucket holds only
+    /// values that round to one `f64` or share an index key, so the
+    /// distinct values per bucket are few and the comparison does not go
+    /// quadratic on a heavily duplicated value.
+    fn existing_unique_violations(
+        &self,
+        label: &str,
+        field: &str,
+    ) -> (Vec<(String, Value)>, usize) {
+        let Some(label_sym) = self.syms.get(label) else {
+            return (Vec::new(), 0);
+        };
+        let props = self.props_view();
+        // Per bucket: the distinct values seen (each with the ids holding a
+        // value equal to it), kept as classes so a duplicate is one lookup
+        // against a handful of representatives, not against every holder.
+        // `forms` is every distinct stored form of the class's value (an `Int`
+        // and the `Float` it equals), for the cross-class check below.
+        struct Class {
+            forms: Vec<Value>,
+            holders: Vec<u32>,
+        }
+        let mut buckets: HashMap<EqualityBucket, Vec<Class>> = HashMap::new();
+        for (id, &sym) in self.labels.iter().enumerate() {
+            if sym != label_sym {
+                continue;
+            }
+            let id = id as u32;
+            if self.ids.key_of(id).is_none() {
+                continue;
+            }
+            let Some(value) = props.get(id, field).map(|vr| vr.into_value()) else {
+                continue;
+            };
+            let Some(bucket) = equality_bucket(&value) else {
+                continue;
+            };
+            let classes = buckets.entry(bucket).or_default();
+            match classes
+                .iter_mut()
+                .find(|class| values_equal(&class.forms[0], &value))
+            {
+                Some(class) => {
+                    class.holders.push(id);
+                    if !class.forms.contains(&value) {
+                        class.forms.push(value);
+                    }
+                }
+                None => classes.push(Class {
+                    forms: vec![value],
+                    holders: vec![id],
+                }),
+            }
+        }
+        let mut conflicting: Vec<u32> = Vec::new();
+        for classes in buckets.values() {
+            for (i, class) in classes.iter().enumerate() {
+                // Equality past 2^53 is not transitive: `Int` 2^53 and
+                // 2^53 + 1 are unequal, yet both equal `Float` 2^53. A class
+                // whose any form equals any form of another conflicts with it.
+                let crosses = classes.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && class
+                            .forms
+                            .iter()
+                            .any(|a| other.forms.iter().any(|b| values_equal(a, b)))
+                });
+                if class.holders.len() > 1 || crosses {
+                    conflicting.extend(&class.holders);
+                }
+            }
+        }
+        conflicting.sort_unstable();
+        let total = conflicting.len();
+        // Only the returned list is capped; the count above is of them all.
+        let listed = conflicting
+            .into_iter()
+            .take(CONSTRAINT_CONFLICTS_LISTED)
+            .filter_map(|id| {
+                let key = self.ids.key_of(id)?.to_string();
+                let value = props.get(id, field)?.into_value();
+                Some((key, value))
+            })
+            .collect();
+        (listed, total)
+    }
+
+    /// Withdraw the unique constraint `name`. Its backing equality index stays
+    /// in place; [`disable_index`](Self::disable_index) drops it once no
+    /// constraint uses it.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: no constraint is named `name`.
+    pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if !self.constraints.iter().any(|c| c.name == name) {
+            return Err(GraphError::QueryError {
+                detail: format!("no constraint named '{name}'"),
+            });
+        }
+        self.log_dense(vec![WalRecord::DropConstraint { name: name.into() }])
+    }
+
+    /// The declared unique constraints, in declaration order.
+    pub fn constraints(&self) -> &[UniqueConstraint] {
+        &self.constraints
+    }
+
+    /// Whether this store has opted in to the V11 snapshot format — it has
+    /// written a value of one of the five 0.10 types, a unique constraint or
+    /// a range index, at any point in its history.
+    ///
+    /// `false` on every store that has not, which keeps writing the snapshot
+    /// version 0.9.x reads (V9, or V10 after
+    /// [`enable_multiplicity`](Self::enable_multiplicity)). Once `true` it
+    /// stays `true`: see `docs/format-stability.md`.
+    pub fn is_v11(&self) -> bool {
+        self.v11_features
     }
 
     /// Whether `(label, field)` currently has an equality index.
@@ -8450,6 +10388,100 @@ impl<F: Fs> GraphDb<F> {
             self.multiplicity = false;
         }
         forced
+    }
+
+    /// Move this store to the V11 snapshot format, ahead of the first V11-only
+    /// record it appends (contract C9).
+    ///
+    /// The same move [`enable_multiplicity`](Self::enable_multiplicity) makes
+    /// for V10, for the same reason: a 0.9.x reader does not refuse a WAL
+    /// frame it cannot decode, it truncates the WAL there. So the V11 snapshot
+    /// goes first, keeping the WAL (`keep_wal: true` — moving to V11 is not a
+    /// compaction, and `open_at` keeps its history), and the record follows.
+    /// At no interruption point does the store hold the record without the
+    /// stamp. On a large store the first V11 write therefore costs one full
+    /// snapshot write.
+    ///
+    /// An `Err` appends nothing V11. If the V11 snapshot did not reach disk,
+    /// this handle goes on believing the store is not V11; if it did, the store
+    /// is V11 from then on (C9) and later snapshots stay V11, which costs an
+    /// older reader a refusal and nothing else.
+    fn upgrade_to_v11(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        // What the snapshot holds must be durable first: under a batched
+        // fsync policy the WAL may hold acknowledged frames not yet synced,
+        // and the snapshot is durable the moment it is written.
+        match self.fs.sync(FileId::Wal) {
+            Ok(()) => self.note_wal_synced(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(GraphError::Io(e)),
+        }
+        self.v11_features = true;
+        let snapshot = self.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        });
+        if snapshot.is_err() {
+            // Once a V11 stamp is on disk the store stays V11 (C9), even
+            // though nothing V11 was written: a later snapshot from this handle
+            // must not write V9 over it.
+            let on_disk = self
+                .fs
+                .read_prefix(FileId::Snapshot, 6)
+                .ok()
+                .filter(|h| h.len() >= 6 && &h[0..4] == b"GDB1")
+                .map(|h| u16::from_le_bytes([h[4], h[5]]));
+            self.v11_features = on_disk == Some(core_storage::snapshot::VERSION_11);
+        }
+        snapshot
+    }
+
+    /// Move the store to V11 ahead of a group commit whose submissions carry a
+    /// V11-only value, so the upgrade snapshot holds only state that is
+    /// already durable — never a submission of the group itself.
+    ///
+    /// Called by [`commit_group`](Self::commit_group) and by the
+    /// [`SharedDb`](crate::SharedDb) drain before the group's first append.
+    /// `BatchOp` cannot declare a constraint or range index, so a value and a
+    /// relationship-property write are the V11-only records a group can carry.
+    pub(crate) fn upgrade_to_v11_for_ops<'a>(
+        &mut self,
+        groups: impl IntoIterator<Item = &'a [BatchOp]>,
+    ) -> Result<()> {
+        if self.v11_features || self.read_only {
+            return Ok(());
+        }
+        let carries = |op: &BatchOp| match op {
+            BatchOp::InsertNode { props, .. } | BatchOp::InsertNodeOnConflict { props, .. } => {
+                props
+                    .iter()
+                    .any(|(_, v)| core_storage::v11_only_type(v).is_some())
+            }
+            BatchOp::SetProp { value, .. } => core_storage::v11_only_type(value).is_some(),
+            // A relationship-property write is a V11 record whatever its value.
+            BatchOp::SetEdgeProp { .. } | BatchOp::RemoveEdgeProp { .. } => true,
+            _ => false,
+        };
+        if groups.into_iter().any(|ops| ops.iter().any(carries)) {
+            self.upgrade_to_v11()?;
+        }
+        Ok(())
+    }
+
+    /// What a V11 snapshot's section 18 carries for this store.
+    fn snapshot_declarations(&self) -> core_storage::v8::SnapshotDeclarations {
+        core_storage::v8::SnapshotDeclarations {
+            multiplicity: self.multiplicity,
+            constraints: self.constraints.clone(),
+            indexes: self.prop_index.equality_pairs().cloned().collect(),
+            range_indexes: self
+                .prop_index
+                .range_indexes()
+                .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+                .collect(),
+        }
     }
 
     /// Whether this store records insert-count multiplicity.
@@ -8928,16 +10960,7 @@ impl<F: Fs> GraphDb<F> {
     /// `config.converged` is `true` only when the power iteration converged
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::pagerank(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::pagerank(&self.view(), config)
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -8946,16 +10969,7 @@ impl<F: Fs> GraphDb<F> {
     /// Component IDs are the key of the smallest member in the component
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::wcc(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::wcc(&self.view(), config)
     }
 
     /// Degree centrality for every live node.
@@ -8969,16 +10983,7 @@ impl<F: Fs> GraphDb<F> {
         &self,
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::degree_centrality(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::degree_centrality(&self.view(), config)
     }
 
     /// Louvain community detection over the unified topology (undirected).
@@ -9544,6 +11549,8 @@ impl<F: Fs> GraphDb<F> {
         cypher: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         // Resolve scope (fails fast if role has no write scope).
         // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
         let scope =
@@ -9584,6 +11591,51 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` runs nothing: it plans the statement for any role, naming
+        // only the indexes the role could list.
+        {
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            let view = self.view();
+            if let Some(plan) = explain_answer(
+                &tokens,
+                &self.schema_listing(),
+                Seen::Masked(&view, &authz.mask.visible),
+            )? {
+                return Ok(plan);
+            }
+        }
+        // A role's write scope names labels and edge types; the schema is
+        // outside every scope, so a role never changes it. `SHOW` is a read.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(ddl::schema_change_for_a_role());
+            }
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            return Ok(self.schema_listing().show_visible(
+                &stmt,
+                &self.view(),
+                &authz.mask.visible,
+            ));
+        }
+        // `CALL` is a read: it sees what the role's mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            let authz = self
+                .pending_write_authz
+                .as_ref()
+                .expect("set above for the length of this call");
+            return run_call(
+                &call,
+                &self.view_masked(&authz.mask),
+                &self.schema_listing(),
+                params,
+            );
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -9694,6 +11746,7 @@ impl<F: Fs> GraphDb<F> {
         authz: &WriteAuthz,
         op: &BatchOp,
         batch_created: &BTreeMap<String, String>,
+        batch_edges: &HashSet<EdgeKey>,
     ) -> Result<()> {
         // Helper: 3-way node status under the authz mask.
         //
@@ -9842,6 +11895,44 @@ impl<F: Fs> GraphDb<F> {
                                 label
                             ),
                         });
+                    }
+                }
+            }
+
+            // ── UPDATE-class: SetEdgeProp, RemoveEdgeProp ────────────────────
+            //
+            // An edge this batch inserts takes its properties under the create
+            // gate it already passed. Any other needs the edge type in
+            // `update_edge_types` (checked before the endpoint lookup, as the
+            // create-class checks are) and both endpoints visible.
+            BatchOp::SetEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                ..
+            }
+            | BatchOp::RemoveEdgeProp {
+                edge_type,
+                src_key,
+                dst_key,
+                ..
+            } => {
+                let edge = (edge_type.clone(), src_key.clone(), dst_key.clone());
+                if !batch_edges.contains(&edge) {
+                    if !authz.scope.update_edge_types.contains(edge_type) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: edge type '{edge_type}' not in write scope \
+                                 (update_edge_types)"
+                            ),
+                        });
+                    }
+                    for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                        if !matches!(node_status(ep_key), NodeAuthzStatus::Visible(_)) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
                     }
                 }
             }
@@ -10052,6 +12143,45 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Forget the equality indexes that cover a property a view owns.
+    ///
+    /// A view writes its property without passing the property index, so such
+    /// an index answers from stale postings while the handle lives (ledger row
+    /// 123). Declaring one is refused now (`enable_index`, `create_view`), but
+    /// a store written before the refusal can hold both, and must still open
+    /// and answer correctly: the pair is dropped in memory, so a query on it
+    /// scans, and the next snapshot no longer re-emits the declaration. Runs
+    /// once, after replay, before the postings are built.
+    fn drop_indexes_over_view_properties(&mut self) {
+        let owned: Vec<(String, String)> = self
+            .view_store
+            .views()
+            .filter(|v| self.prop_index.is_equality_declared(&v.label, &v.view_prop))
+            .map(|v| (v.label.clone(), v.view_prop.clone()))
+            .collect();
+        for (label, field) in owned {
+            Arc::make_mut(&mut self.prop_index).disable(&label, &field);
+            self.schema_stale = true;
+            // Once per pair per open: the only signal that a query on it now
+            // scans, where the declaration said it would not.
+            eprintln!(
+                "[mushroomdb] dropped the equality index on ({label}, {field}): a view owns \
+                 property '{field}' on label '{label}', so the index would answer from stale \
+                 values. Queries on it are answered by scan; the next snapshot no longer \
+                 carries the declaration."
+            );
+            self.dropped_view_indexes.push((label, field));
+        }
+    }
+
+    /// The `(label, field)` equality indexes the open of this handle dropped
+    /// because a view owns the property (ledger row 123), in view order. Empty
+    /// unless the store was written before `enable_index` and `create_view`
+    /// refused the combination.
+    pub fn dropped_view_indexes(&self) -> &[(String, String)] {
+        &self.dropped_view_indexes
+    }
+
     fn view(&self) -> GraphView<'_> {
         GraphView {
             ids: &self.ids,
@@ -10062,6 +12192,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: self.edge_props_view(),
             mask: None,
             prop_index: Some(&self.prop_index),
+            layer: None,
         }
     }
 
@@ -10075,6 +12206,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: self.edge_props_view(),
             mask: Some(&mask.visible),
             prop_index: Some(&self.prop_index),
+            layer: None,
         }
     }
 
@@ -10092,6 +12224,8 @@ impl<F: Fs> GraphDb<F> {
         params: &std::collections::BTreeMap<String, Value>,
         mask: &crate::mask::NodeMask,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         // Reject write statements up front.
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
@@ -10099,16 +12233,43 @@ impl<F: Fs> GraphDb<F> {
         if is_write_tokens(&tokens) {
             return Err(GraphError::MaskedReadOnly);
         }
+        // `EXPLAIN` names only the indexes the mask lets the caller see.
+        if let Some(plan) = explain_answer(
+            &tokens,
+            &self.schema_listing(),
+            Seen::Masked(&self.view(), &mask.visible),
+        )? {
+            return Ok(plan);
+        }
+        // `SHOW …` lists only the labels the mask lets the caller see.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return Ok(self
+                .schema_listing()
+                .show_visible(&stmt, &self.view(), &mask.visible));
+        }
+        // `CALL` sees only what the mask lets through.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(
+                &call,
+                &self.view_masked(mask),
+                &self.schema_listing(),
+                params,
+            );
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
         // Each UNION part executes against the same masked view, so the mask
         // applies uniformly across the chain.
-        execute_union(&self.view_masked(mask), &union, &Params(params)).map_err(|e| {
-            GraphError::QueryError {
+        let view = self.view_masked(mask);
+        execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
+            .map(|rs| finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
-            }
-        })
+            })
     }
 
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
@@ -10514,6 +12675,8 @@ impl<F: Fs> GraphDb<F> {
         try_copy("wal.bin")?;
         try_copy("wal.floor")?;
         try_copy("wal.genesis")?;
+        // A V11 store's genesis marker (see `Fs::use_v11_genesis_marker`).
+        try_copy("wal.genesis.v11")?;
         try_copy("roles.json")?;
         // The map from commit to wall-clock time. Without it the copy cannot
         // resolve a date to a commit, and answers `NoRecordedTime` for history
@@ -10677,6 +12840,155 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.dst.cmp(&b.dst))
         });
         edges
+    }
+
+    /// All directed edges with their complete property maps, in the same
+    /// order as [`all_edges_for_export`](Self::all_edges_for_export).
+    ///
+    /// Reads each proven-live exported identity's composite snapshot and WAL
+    /// properties, including removals and tombstones, without collecting its
+    /// source's neighbors again. An edge with no properties has an empty map.
+    pub fn all_edges_with_props_for_export(&self) -> Vec<(ExportEdge, BTreeMap<String, Value>)> {
+        let edges = self.all_edges_for_export();
+        let properties = self.edge_props_view();
+        edges
+            .into_iter()
+            .map(|edge| {
+                let props = match (
+                    self.syms.get(&edge.edge_type),
+                    self.ids.get(&edge.src),
+                    self.ids.get(&edge.dst),
+                ) {
+                    (Some(etype), Some(src), Some(dst)) => properties.props_of(etype, src, dst),
+                    _ => BTreeMap::new(),
+                };
+                (edge, props)
+            })
+            .collect()
+    }
+
+    /// [`all_nodes_for_export`](Self::all_nodes_for_export), one node at a time.
+    ///
+    /// Calls `each` with every live node in key order, and stops at its first
+    /// `Err`. Only the sorted list of node ids (four bytes a node) is held; a
+    /// node's property map is built when it is handed over and dropped when
+    /// `each` returns, so an export's memory does not grow with the properties
+    /// of the store.
+    pub fn for_each_node_for_export<E>(
+        &self,
+        mut each: impl FnMut(NodeInfo) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let pv = self.props_view();
+        let fields = pv.field_names();
+        let mut ids: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX && self.syms.resolve(sym).is_some())
+            })
+            .collect();
+        ids.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+        for id in ids {
+            let (Some(key), Some(&sym)) = (self.ids.key_of(id), self.labels.get(id as usize))
+            else {
+                continue;
+            };
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            let mut props = BTreeMap::new();
+            for field in &fields {
+                if let Some(vr) = pv.get(id, field) {
+                    props.insert(field.clone(), vr.into_value());
+                }
+            }
+            each(NodeInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                props,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// [`all_edges_for_export`](Self::all_edges_for_export), one edge at a
+    /// time, in the same `(edge_type, src, dst)` order.
+    ///
+    /// Held at once: the sorted node ids, the edge types, and the derived-edge
+    /// provenance as borrowed rule names (twelve bytes and a pointer per derived
+    /// edge, none for a store with no rules). One source node's out-edges at a
+    /// time are materialised.
+    pub fn for_each_edge_for_export<E>(
+        &self,
+        mut each: impl FnMut(ExportEdge) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.ensure_v8_base_sections_loaded();
+        let mut prov: HashMap<(u32, u32, u32), &str> = HashMap::new();
+        for (rule_name, triples) in self.engine.provenance() {
+            for &triple in triples {
+                prov.insert(triple, rule_name.as_str());
+            }
+        }
+        let weight_props: HashMap<&str, Option<&str>> = self
+            .engine
+            .rules()
+            .map(|r| (r.name.as_str(), r.weight_prop.as_deref()))
+            .collect();
+        let tv = self.topo_view();
+        let ep = self.edge_props_view();
+
+        let mut etypes: Vec<(&str, u32)> = tv
+            .etypes()
+            .filter_map(|sym| self.syms.resolve(sym).map(|name| (name, sym)))
+            .collect();
+        etypes.sort();
+        let mut srcs: Vec<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| {
+                self.ids.key_of(id).is_some()
+                    && self
+                        .labels
+                        .get(id as usize)
+                        .is_some_and(|&sym| sym != u32::MAX)
+            })
+            .collect();
+        srcs.sort_by(|&a, &b| self.ids.key_of(a).cmp(&self.ids.key_of(b)));
+
+        for (edge_type, etype_sym) in etypes {
+            for &id in &srcs {
+                let Some(src) = self.ids.key_of(id) else {
+                    continue;
+                };
+                let mut out: Vec<(&str, u32)> = tv
+                    .neighbors(etype_sym, Direction::Out, id)
+                    .as_ref()
+                    .iter()
+                    .filter_map(|&nbr| self.ids.key_of(nbr).map(|k| (k, nbr)))
+                    .collect();
+                out.sort();
+                for (dst, nbr) in out {
+                    let rule = prov.get(&(etype_sym, id, nbr)).copied();
+                    let weight = rule
+                        .and_then(|rn| weight_props.get(rn).copied().flatten())
+                        .and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                            Some(Value::Float(f)) => Some(f),
+                            Some(Value::Int(i)) => Some(i as f64),
+                            _ => None,
+                        });
+                    each(ExportEdge {
+                        edge_type: edge_type.to_string(),
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                        derived: rule.is_some(),
+                        rule: rule.map(str::to_string),
+                        weight,
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What each edge type *is*, without building one record per edge.
@@ -11505,9 +13817,10 @@ impl<F: Fs> GraphDb<F> {
     /// Read a single property from an edge.
     ///
     /// Returns `None` when the edge does not exist, the field is absent, or any
-    /// of the string keys cannot be resolved to interned ids.  Only edge props
-    /// written by rules (weight fields) are accessible without a `set_edge_prop`
-    /// binding; topology-only edges (no props set) return `None` for every field.
+    /// of the string keys cannot be resolved to interned ids. Edge properties
+    /// are a rule's weights, the reserved insert `count`, and what Cypher
+    /// writes (`CREATE (a)-[:T {k: v}]->(b)`, `SET r.k = v`); an edge with
+    /// none returns `None` for every field.
     pub fn get_edge_prop(
         &self,
         edge_type: &str,
@@ -11525,36 +13838,51 @@ impl<F: Fs> GraphDb<F> {
     /// Every pipeline `Err(String)` becomes `GraphError::QueryError` with a
     /// stage prefix (`lex:` / `parse:` / `plan:` / `execute:`).
     pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` is a read of the plan alone: nothing runs.
+        if let Some(plan) = explain_answer(&tokens, &self.schema_listing(), Seen::All)? {
+            return Ok(plan);
+        }
+        // `SHOW INDEXES` / `SHOW CONSTRAINTS` are reads; a statement that
+        // changes the schema is a write, and this entry point does not write.
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(schema_change_on_a_read());
+            }
+            return Ok(self.schema_listing().show(&stmt));
+        }
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
+        }
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
         let t0 = std::time::Instant::now();
-        let result = execute_union(&self.view(), &union, &Params(params)).map_err(|e| {
-            GraphError::QueryError {
+        let plans = plan_union(&union).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let view = self.view();
+        let result = execute_planned_union(&view, &plans, &union.all_flags, &Params(params))
+            .map(|rs| finish_result(&view, rs))
+            .map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
-            }
-        });
+            });
         let elapsed_ms = t0.elapsed().as_millis() as u64;
-        let threshold = self.slow_query_threshold_ms;
-        if threshold > 0 && elapsed_ms >= threshold {
-            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
-            let entry = SlowQueryEntry {
-                ms: elapsed_ms,
-                query: cypher.to_string(),
-                at_commit: self.commit_seq,
-            };
-            if let Ok(mut log) = self.slow_queries.lock() {
-                if log.entries.len() == SLOW_QUERY_RING_CAP {
-                    log.entries.pop_front();
-                }
-                log.entries.push_back(entry);
-                log.total += 1;
-            }
-        }
+        self.slow_query_sink()
+            .record(elapsed_ms, cypher, self.commit_seq);
         result
+    }
+
+    /// This handle's slow-query threshold and ring, shareable with a snapshot.
+    pub(crate) fn slow_query_sink(&self) -> SlowQuerySink {
+        SlowQuerySink {
+            threshold_ms: self.slow_query_threshold_ms,
+            log: Arc::clone(&self.slow_queries),
+        }
     }
 
     /// Convenience entry-point that accepts a slice of `(name, value)` pairs
@@ -11593,9 +13921,22 @@ impl<F: Fs> GraphDb<F> {
         cypher: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // Before anything parses: a constant property map folds at parse time.
+        let _clock = core_query::cypher::StatementClock::enter();
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
+        // `EXPLAIN` plans the statement after it and runs none of it.
+        if let Some(plan) = explain_answer(&tokens, &self.schema_listing(), Seen::All)? {
+            return Ok(plan);
+        }
+        if let Some(stmt) = ddl_statement(&tokens)? {
+            return self.exec_ddl(stmt);
+        }
+        // `CALL` is a read; the write entry point answers it as `query` does.
+        if let Some(call) = call_statement(&tokens)? {
+            return run_call(&call, &self.view(), &self.schema_listing(), params);
+        }
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
@@ -11607,12 +13948,17 @@ impl<F: Fs> GraphDb<F> {
         stmt: WriteStatement,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        // One instant for every clock call in the statement, per row included.
+        let _clock = core_query::cypher::StatementClock::enter();
         match stmt {
             WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
+            WriteStatement::MatchSetMap(s) => self.exec_match_set_map(s, params),
+            WriteStatement::MatchRemove(s) => self.exec_match_remove(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s, params),
+            WriteStatement::UnwindWrite(s) => self.exec_unwind_write(*s, params),
         }
     }
 
@@ -11667,6 +14013,7 @@ impl<F: Fs> GraphDb<F> {
             batch.insert_edge(&edge.etype, src_key, dst_key);
         }
         batch.commit()?;
+        let stats = create_stats(&stmt);
 
         // Optional RETURN clause: project created bindings as a read result.
         if let Some(returns) = stmt.returns {
@@ -11687,6 +14034,8 @@ impl<F: Fs> GraphDb<F> {
                         },
                         chain: vec![],
                         shortest: false,
+                        path_var: None,
+                        continues_match: false,
                     }
                 })
                 .collect();
@@ -11706,20 +14055,21 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-                GraphError::QueryError {
+            // Masked for a role-scoped write, as the MERGE and MATCH … SET
+            // projections are.
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
                     detail: format!("execute: {e}"),
-                }
-            });
+                });
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created as i64)),
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(created as i64, 0, 0, stmt.edges.len() as i64).with_stats(stats))
     }
 
     fn exec_match_set(
@@ -11727,165 +14077,56 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchSetStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        let project_returns = stmt.returns.clone();
-        // Collect unique node vars targeted by SET clauses, plus RETURN bindings
-        // so the post-write projection can look them up by key.
-        let mut set_vars: Vec<String> = Vec::new();
-        for s in &stmt.sets {
-            if !set_vars.contains(&s.var) {
-                set_vars.push(s.var.clone());
-            }
-        }
-        let rel_vars = pattern_rel_vars(&stmt.matches);
-        // `count` is the engine's, on an edge: it is the insert-count §5.13
-        // maintains, and a `SET` that overwrote it would make the number mean
-        // whatever the last writer said rather than how many times the pair was
-        // inserted. Refused by name here, before the match runs, so the caller
-        // is told what is actually wrong instead of meeting the executor's
-        // generic "did not resolve to a node key" — and so the answer does not
-        // depend on whether the pattern happened to match a row. The same name
-        // on a *node* is an ordinary property and is untouched.
-        for s in &stmt.sets {
-            if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
-                return Err(GraphError::QueryError {
-                    detail: format!(
-                        "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
-                         property holding the pair's insert count",
-                        s.var
-                    ),
-                });
-            }
-        }
-        let mut lookup_vars = set_vars.clone();
-        for v in pattern_node_vars(&stmt.matches) {
-            add_var(&mut lookup_vars, &v);
-        }
-        if let Some(ref returns) = project_returns {
-            for v in ret_node_vars(returns) {
-                if !rel_vars.iter().any(|r| r == &v) {
-                    add_var(&mut lookup_vars, &v);
-                }
-            }
-        }
+        let write = match_write::match_set_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
+    }
 
-        // Synthesize a read query: MATCH … WHERE … RETURN <lookup_vars>, <set_values…>
-        // SET values are projected as ScalarExpr items so that arithmetic expressions
-        // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
-        let mut set_returns: Vec<RetItem> = lookup_vars
-            .iter()
-            .map(|v| RetItem {
-                value: RetVal::Var(v.clone()),
-                alias: None,
-            })
-            .collect();
-        // One computed column per SET clause; alias is `__sv_<i>`.
-        let set_val_cols: Vec<String> = stmt
-            .sets
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("__sv_{i}"))
-            .collect();
-        for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
-            set_returns.push(RetItem {
-                value: RetVal::ScalarExpr(sc.value.clone()),
-                alias: Some(col.clone()),
-            });
-        }
-        // Capture relationship types while r is bound; SET does not change them.
-        for r in &rel_vars {
-            set_returns.push(RetItem {
-                value: RetVal::FuncCall {
-                    name: "type".into(),
-                    args: vec![Operand::Var(r.clone())],
-                },
-                alias: Some(rel_type_alias(r)),
-            });
-        }
+    /// `MATCH … [WHERE …] SET n = {…}` and `SET n += {…}`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write); each map value
+    /// is evaluated per matched row by the same executor that evaluates
+    /// `SET n.f = expr`. The resulting `SetProp`/`RemoveProp` ops commit as one
+    /// batch, so they meet the same choke-point as every other write: TY-5
+    /// constraints, `ns` immutability, the view-owned refusal, and rule
+    /// re-evaluation for each removal. See [`plan_map_write`] for which
+    /// properties each form touches.
+    fn exec_match_set_map(
+        &mut self,
+        stmt: core_query::cypher::MatchSetMapStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let write = match_write::match_set_map_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
+    }
 
-        let read_q = Query {
-            matches: stmt.matches.clone(),
-            optional_clauses: vec![],
-            where_expr: stmt.where_expr.clone(),
-            unwinds: vec![],
-            post_unwind_where: None,
-            stages: vec![],
-            returns: set_returns,
-            distinct: false,
-            order_by: vec![],
-            skip: None,
-            limit: None,
-        };
-        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        // MATCH phase is read-only; borrow ends before batch opens.
-        //
-        // When a role-scoped write is in flight, run the MATCH read through
-        // view_masked so hidden nodes are invisible → hidden ≡ absent ≡
-        // zero-rows (no SetProp ops generated, no existence-oracle 403).
-        // Full-authority writes (pending_write_authz=None) keep view().
-        let match_rs = {
-            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            }
-        }
-        .map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })?;
+    /// `MATCH … [WHERE …] REMOVE n.f [, …] [RETURN …]`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write, so a hidden node
+    /// is absent and nothing is removed from it); the removals then commit as
+    /// one batch of `RemoveProp` ops, which meet the same `prepare_remove_prop`
+    /// choke-point as `remove_prop`: view-owned fields and `ns` are refused there,
+    /// a field the node lacks is a no-op, and rules re-evaluate each removal.
+    /// The result row's `properties_set` slot counts the properties that existed
+    /// and were removed.
+    fn exec_match_remove(
+        &mut self,
+        stmt: core_query::cypher::MatchRemoveStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let write = match_write::match_remove_ops(&*self, stmt, params)?;
+        self.commit_match_write(write, params)
+    }
 
-        // Collect (key, field, value) for each matched row × each SET clause.
-        let mut set_ops: Vec<(String, String, Value)> = Vec::new();
-        for row_i in 0..match_rs.len() {
-            for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
-                let key = match match_rs.get(row_i, &sc.var) {
-                    Some(Value::Str(k)) => k.clone(),
-                    _ => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET variable '{}' did not resolve to a node key",
-                                sc.var
-                            ),
-                        })
-                    }
-                };
-                // The SET value was already evaluated by the executor.
-                let value = match match_rs.get(row_i, col) {
-                    Some(v) => v.clone(),
-                    None => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET value for {}.{} evaluated to null",
-                                sc.var, sc.field
-                            ),
-                        })
-                    }
-                };
-                set_ops.push((key, sc.field.clone(), value));
-            }
-        }
-
-        // Apply as one atomic batch.
-        let props_set = set_ops.len();
-        let mut batch = self.batch();
-        for (key, field, value) in set_ops {
-            batch.set_prop(&key, &field, value);
-        }
-        batch.commit()?;
-
-        if let Some(returns) = project_returns {
-            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
-        }
-
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(props_set as i64)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+    /// Commit a `MATCH … SET` / `REMOVE` statement's ops as one batch, then
+    /// project its `RETURN` from the written store.
+    fn commit_match_write(
+        &mut self,
+        mut write: match_write::MatchWrite,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let ops = std::mem::take(&mut write.ops);
+        self.commit_batch(ops)?;
+        write.result(&*self, params)
     }
 
     fn exec_match_delete(
@@ -11986,13 +14227,12 @@ impl<F: Fs> GraphDb<F> {
             other => other,
         })?;
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-            Some(Value::Int(deleted as i64)),
-        ]);
-        Ok(rs)
+        Ok(
+            write_counts(0, 0, deleted as i64, 0).with_stats(WriteStats {
+                relationships_deleted: deleted as i64,
+                ..WriteStats::default()
+            }),
+        )
     }
 
     /// Execute `MATCH … [DETACH] DELETE <node_var> [, …]`.
@@ -12094,13 +14334,13 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-            Some(Value::Int(nodes_deleted + edges_deleted)),
-        ]);
-        Ok(rs)
+        Ok(
+            write_counts(0, 0, nodes_deleted + edges_deleted, 0).with_stats(WriteStats {
+                nodes_deleted,
+                relationships_deleted: edges_deleted,
+                ..WriteStats::default()
+            }),
+        )
     }
 
     /// Props the MERGE create arm inserts: the identifying key, plus `ns` when
@@ -12144,12 +14384,304 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Whether the MERGE node `key` exists, after the role-scope check (when
+    /// the write is role-scoped). See the comments inside for the oracle rules.
+    /// Scope-before-lookup for a role-scoped MERGE: `Err` when the role may
+    /// neither create nor update nodes of `label`, before any node is looked
+    /// at (timing oracle closure — see test_merge_unscoped_no_key_lookup).
+    /// `Ok` for an unscoped write.
+    pub(crate) fn merge_label_scope(&self, label: &str) -> Result<()> {
+        let Some(authz) = self.pending_write_authz.as_ref() else {
+            return Ok(());
+        };
+        let has_create = authz.scope.create_labels.iter().any(|l| l == label);
+        let has_update = authz.scope.update_labels.iter().any(|l| l == label);
+        if !has_create && !has_update {
+            return Err(GraphError::RoleWriteDenied {
+                reason: format!(
+                    "role-bound token: label '{}' not in write scope (create_labels)",
+                    label
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn merge_node_existed(&self, label: &str, key: &str) -> Result<bool> {
+        if let Some(authz) = self.pending_write_authz.clone() {
+            self.merge_label_scope(label)?;
+            let has_create = authz.scope.create_labels.iter().any(|l| l == label);
+            let has_update = authz.scope.update_labels.iter().any(|l| l == label);
+            // Key lookup under mask.
+            match self.ids.get(key) {
+                Some(id) if authz.mask.contains_id(id) => {
+                    // Visible: must have update scope to proceed to match arm.
+                    if !has_update {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                label
+                            ),
+                        });
+                    }
+                    Ok(true) // existed = true → match arm
+                }
+                Some(_) => {
+                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
+                    Err(GraphError::RoleWriteDenied {
+                        reason: "role-bound token: target node not visible".into(),
+                    })
+                }
+                None => {
+                    // Absent: must have create scope to proceed to the create arm.
+                    //
+                    // Update-only roles (create_labels empty, update_labels set):
+                    // return the SAME "not visible" error as the hidden-key branch
+                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
+                    // "confirm existence of hidden nodes: No").
+                    //
+                    // Create-scoped roles (has_create=true): absent → create arm
+                    // as before.  The accepted structural key-existence disclosure
+                    // (§THREAT-MODEL) applies only when the role holds create scope.
+                    if !has_create {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    Ok(false) // existed = false → create arm
+                }
+            }
+        } else {
+            // Full authority: use the existing non-masked has_node check.
+            Ok(self.has_node(key))
+        }
+    }
+
+    /// Whether the manual-or-derived edge `src -[etype]-> dst` is in the applied state.
+    fn merge_edge_present(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        self.ensure_v8_base_sections_loaded();
+        let (Some(src), Some(dst), Some(sym)) = (
+            self.ids.get(src_key),
+            self.ids.get(dst_key),
+            self.syms.get(edge_type),
+        ) else {
+            return false;
+        };
+        self.topo_view()
+            .neighbors(sym, Direction::Out, src)
+            .binary_search(&dst)
+            .is_ok()
+    }
+
+    /// `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`.
+    ///
+    /// Find-or-create each end node by key, then the edge between them. The
+    /// pattern matched as a whole (both nodes and the edge existed) → `ON
+    /// MATCH`; otherwise the missing nodes and the edge are created and `ON
+    /// CREATE` runs. One batch, so one commit and one WAL frame; every write
+    /// meets the usual commit-time checks.
+    fn exec_merge_edge(
+        &mut self,
+        stmt: core_query::cypher::MergeStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let Some(edge) = stmt.edge.clone() else {
+            return Err(GraphError::QueryError {
+                detail: "MERGE relationship pattern missing".into(),
+            });
+        };
+        let key_of = |v: &Value| match v {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(GraphError::QueryError {
+                detail: format!("MERGE key value must be a string (got {other:?})"),
+            }),
+        };
+        let start_key = key_of(&stmt.key_value)?;
+        let end_key = key_of(&edge.end_key_value)?;
+        if start_key == end_key && stmt.label != edge.end_label {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
+                    stmt.label, edge.end_label
+                ),
+            });
+        }
+        // A SET item names the start node or the end node, never the relationship.
+        let set_target = |var: &str| -> Result<&str> {
+            if stmt.var.as_deref() == Some(var) {
+                Ok(start_key.as_str())
+            } else if edge.end_var.as_deref() == Some(var) {
+                Ok(end_key.as_str())
+            } else {
+                Err(GraphError::QueryError {
+                    detail: format!(
+                        "SET variable '{var}' does not match a MERGE node or relationship \
+                         variable"
+                    ),
+                })
+            }
+        };
+        let mut create_sets = Vec::new();
+        for sc in &stmt.on_create {
+            create_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+        let mut match_sets = Vec::new();
+        for sc in &stmt.on_match {
+            match_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+
+        // Scope checks on both nodes before either key is looked up beyond them.
+        let start_existed = self.merge_node_existed(&stmt.label, &start_key)?;
+        let end_existed = if end_key == start_key {
+            start_existed
+        } else {
+            self.merge_node_existed(&edge.end_label, &end_key)?
+        };
+        let (src_key, dst_key) = match edge.dir {
+            core_query::cypher::RelDir::Left => (end_key.as_str(), start_key.as_str()),
+            _ => (start_key.as_str(), end_key.as_str()),
+        };
+        let edge_existed =
+            start_existed && end_existed && self.merge_edge_present(&edge.etype, src_key, dst_key);
+
+        let start_create = if start_existed {
+            None
+        } else {
+            Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
+        };
+        let end_create = if end_existed || end_key == start_key {
+            None
+        } else {
+            Some(self.merge_create_props(
+                &edge.end_key_field,
+                &edge.end_key_value,
+                edge.end_ns.as_ref(),
+            )?)
+        };
+        let mut created = 0i64;
+        let mut relationships_created = 0i64;
+        let mut created_props = 0i64;
+        let mut batch = self.batch();
+        if let Some(props) = start_create {
+            created_props += props.len() as i64;
+            batch.insert_node(&stmt.label, &start_key, props);
+            created += 1;
+        }
+        if let Some(props) = end_create {
+            created_props += props.len() as i64;
+            batch.insert_node(&edge.end_label, &end_key, props);
+            created += 1;
+        }
+        let sets = if edge_existed {
+            &match_sets
+        } else {
+            batch.insert_edge(&edge.etype, src_key, dst_key);
+            relationships_created = 1;
+            &create_sets
+        };
+        // The `ON CREATE` / `ON MATCH` items applied: the write row's
+        // `properties_set` (ledger row 150).
+        let sets_applied = sets.len() as i64;
+        let mut properties_set = sets_applied;
+        for (key, field, value) in sets {
+            batch.set_prop(key, field, resolve_merge_set_value(value, params)?);
+        }
+        batch.commit()?;
+        properties_set += created_props;
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            relationships_created,
+            properties_set,
+            ..WriteStats::default()
+        };
+
+        // Refresh the role mask so created nodes are visible to this
+        // statement's RETURN (read-after-write); see `exec_merge`.
+        if created > 0 {
+            if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
+                let new_mask = self.mask_for_role(&role)?;
+                if let Some(a) = self.pending_write_authz.as_mut() {
+                    a.mask = new_mask;
+                }
+            }
+        }
+
+        if let Some(returns) = stmt.returns {
+            let node =
+                |var: Option<&String>, default: &str, label: &str, field: &str, key: &str| {
+                    NodePat {
+                        var: Some(var.cloned().unwrap_or_else(|| default.to_string())),
+                        label: Some(label.to_string()),
+                        props: vec![(field.to_string(), Operand::Lit(Value::Str(key.to_string())))],
+                    }
+                };
+            let q = Query {
+                matches: vec![Pattern {
+                    start: node(
+                        stmt.var.as_ref(),
+                        "_mn0",
+                        &stmt.label,
+                        &stmt.key_field,
+                        &start_key,
+                    ),
+                    chain: vec![(
+                        core_query::cypher::RelPat {
+                            var: edge.rel_var.clone(),
+                            etypes: vec![edge.etype.clone()],
+                            dir: edge.dir,
+                            hops: None,
+                        },
+                        node(
+                            edge.end_var.as_ref(),
+                            "_mn1",
+                            &edge.end_label,
+                            &edge.end_key_field,
+                            &end_key,
+                        ),
+                    )],
+                    shortest: false,
+                    path_var: None,
+                    continues_match: false,
+                }],
+                optional_clauses: vec![],
+                where_expr: None,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                distinct: false,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                });
+        }
+
+        Ok(write_counts(created, sets_applied, 0, relationships_created).with_stats(stats))
+    }
+
     fn exec_merge(
         &mut self,
         stmt: core_query::cypher::MergeStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         // MERGE: check if a node with the given key already exists.
+        if stmt.edge.is_some() {
+            return self.exec_merge_edge(stmt, params);
+        }
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
             _ => {
@@ -12184,62 +14716,7 @@ impl<F: Fs> GraphDb<F> {
         //
         // Clone to avoid holding a borrow on `self.pending_write_authz` while
         // also calling `self.ids.get(key)`.
-        let merge_existed: bool = if let Some(authz) = self.pending_write_authz.clone() {
-            let has_create = authz.scope.create_labels.contains(&stmt.label);
-            let has_update = authz.scope.update_labels.contains(&stmt.label);
-            if !has_create && !has_update {
-                // Scope-before-lookup: 403 without has_node call (timing oracle
-                // closure — see test_merge_unscoped_no_key_lookup).
-                return Err(GraphError::RoleWriteDenied {
-                    reason: format!(
-                        "role-bound token: label '{}' not in write scope (create_labels)",
-                        stmt.label
-                    ),
-                });
-            }
-            // Key lookup under mask.
-            match self.ids.get(key.as_str()) {
-                Some(id) if authz.mask.contains_id(id) => {
-                    // Visible: must have update scope to proceed to match arm.
-                    if !has_update {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: format!(
-                                "role-bound token: label '{}' not in write scope (update_labels)",
-                                stmt.label
-                            ),
-                        });
-                    }
-                    true // existed = true → match arm
-                }
-                Some(_) => {
-                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
-                    return Err(GraphError::RoleWriteDenied {
-                        reason: "role-bound token: target node not visible".into(),
-                    });
-                }
-                None => {
-                    // Absent: must have create scope to proceed to the create arm.
-                    //
-                    // Update-only roles (create_labels empty, update_labels set):
-                    // return the SAME "not visible" error as the hidden-key branch
-                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
-                    // "confirm existence of hidden nodes: No").
-                    //
-                    // Create-scoped roles (has_create=true): absent → create arm
-                    // as before.  The accepted structural key-existence disclosure
-                    // (§THREAT-MODEL) applies only when the role holds create scope.
-                    if !has_create {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: "role-bound token: target node not visible".into(),
-                        });
-                    }
-                    false // existed = false → create arm
-                }
-            }
-        } else {
-            // Full authority: use the existing non-masked has_node check.
-            self.has_node(&key)
-        };
+        let merge_existed: bool = self.merge_node_existed(&stmt.label, &key)?;
 
         let existed = merge_existed;
         let create_props = if existed {
@@ -12248,9 +14725,15 @@ impl<F: Fs> GraphDb<F> {
             Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
         };
         let mut created = 0i64;
+        let mut properties_set = 0i64;
+        // The `ON CREATE` / `ON MATCH` items applied: the write row's
+        // `properties_set` (ledger row 150).
+        let mut sets_applied = 0i64;
         if create_props.is_some() || !stmt.on_match.is_empty() {
             let mut batch = self.batch();
             if let Some(props) = create_props {
+                sets_applied = stmt.on_create.len() as i64;
+                properties_set += (props.len() + stmt.on_create.len()) as i64;
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;
@@ -12258,6 +14741,8 @@ impl<F: Fs> GraphDb<F> {
                 }
                 created = 1;
             } else {
+                sets_applied = stmt.on_match.len() as i64;
+                properties_set += stmt.on_match.len() as i64;
                 for sc in &stmt.on_match {
                     let value = resolve_merge_set_value(&sc.value, params)?;
                     batch.set_prop(&key, &sc.field, value);
@@ -12265,6 +14750,12 @@ impl<F: Fs> GraphDb<F> {
             }
             batch.commit()?;
         }
+        let stats = WriteStats {
+            nodes_created: created,
+            labels_added: created,
+            properties_set,
+            ..WriteStats::default()
+        };
 
         // Refresh the role mask so the just-created node is visible to this
         // statement's RETURN (read-after-write). Safe: create_labels ⊆ read labels
@@ -12291,6 +14782,8 @@ impl<F: Fs> GraphDb<F> {
                     },
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 }],
                 optional_clauses: vec![],
                 where_expr: None,
@@ -12309,23 +14802,18 @@ impl<F: Fs> GraphDb<F> {
             // Use view_masked when a role-scoped write is in flight so the
             // post-merge projection is consistent with the masked read phase.
             let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
-            return (if let Some(ref mask) = mask_opt {
-                execute(&self.view_masked(mask), &ops, &Params(params))
-            } else {
-                execute(&self.view(), &ops, &Params(params))
-            })
-            .map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            });
+            let view = match mask_opt {
+                Some(ref mask) => self.view_masked(mask),
+                None => self.view(),
+            };
+            return execute(&view, &ops, &Params(params))
+                .map(|rs| finish_result(&view, rs).with_stats(stats))
+                .map_err(|e| GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                });
         }
 
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created)),
-            Some(Value::Int(0)),
-            Some(Value::Int(0)),
-        ]);
-        Ok(rs)
+        Ok(write_counts(created, sets_applied, 0, 0).with_stats(stats))
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),
@@ -13029,6 +15517,49 @@ impl<F: Fs> GraphDb<F> {
         self.last_change.get(&id).copied()
     }
 
+    /// The `last_change` commit `key` had in the reader snapshot a transaction
+    /// began from, worked out from this live handle.
+    ///
+    /// Used by [`crate::Transaction`] to build its conflict set lazily, when it
+    /// first touches a key, without copying the whole `last_change` map at
+    /// BEGIN. `base_version` and `base_store` are the snapshot's `commit_seq`
+    /// and store identity; `in_base` says whether the key was live in it.
+    ///
+    /// The answer is exact whenever the key has not changed since the
+    /// snapshot: no commit after `base_version` touched it, so its live entry
+    /// is the snapshot's. When it has changed — a commit after `base_version`
+    /// touched it, it was deleted, or it was inserted — the snapshot's value
+    /// is no longer recoverable, and the answer is [`TX_CHANGED_SINCE_BEGIN`],
+    /// which no live entry ever equals, so the commit fails as a conflict. A
+    /// handle that reloaded from disk since the snapshot (another process
+    /// snapshotted) renumbers nothing that persisted but can reseed
+    /// `commit_seq`, so a reload answers "changed" for every key: conservative,
+    /// never a missed conflict.
+    pub(crate) fn tx_base_last_change(
+        &self,
+        key: &str,
+        base_version: u64,
+        base_store: crate::mask::StoreId,
+        in_base: bool,
+    ) -> u64 {
+        if self.store_id != base_store {
+            return TX_CHANGED_SINCE_BEGIN;
+        }
+        match self.ids.get(key) {
+            // Absent now and at BEGIN: `NodeUnchangedSince { expected: 0 }`
+            // conflicts with any insert that lands before the commit.
+            None if !in_base => 0,
+            // Deleted since BEGIN.
+            None => TX_CHANGED_SINCE_BEGIN,
+            // Inserted since BEGIN.
+            Some(_) if !in_base => TX_CHANGED_SINCE_BEGIN,
+            Some(id) => match self.last_change.get(&id).copied().unwrap_or(0) {
+                seq if seq > base_version => TX_CHANGED_SINCE_BEGIN,
+                seq => seq,
+            },
+        }
+    }
+
     /// Which loaded store this handle is.
     ///
     /// Paired with [`commit_seq`](GraphDb::commit_seq) it identifies a graph
@@ -13155,6 +15686,13 @@ impl<F: Fs> GraphDb<F> {
                 self.last_change.insert(*dst, seq);
             }
             WalRecord::SetEdgeCount { .. } => {}
+            // A relationship-property write touches the pair, so both ends, as
+            // an edge insert does: a transaction that read the edge conflicts.
+            WalRecord::SetEdgePropId { src, dst, .. }
+            | WalRecord::RemoveEdgePropId { src, dst, .. } => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
             // DeleteNode: node is tombstoned; last_changed(key) returns None for
             // deleted keys (ids.get() returns None post-tombstone), so no update needed.
             // History markers: state no-ops; the underlying mutation already
@@ -13171,7 +15709,11 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. }
             | WalRecord::EnableIndex { .. }
-            | WalRecord::DisableIndex { .. } => {}
+            | WalRecord::DisableIndex { .. }
+            | WalRecord::CreateConstraint { .. }
+            | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. } => {}
             // RenameNode: node id is stable; update last_change via the new key.
             // Called after apply(), so ids already reflects new_key.
             WalRecord::RenameNode { new_key, .. } => {
@@ -14426,13 +16968,16 @@ impl<F: Fs> GraphDb<F> {
                 lost.insert(edge);
             }
         }
-        // An edge retracted and re-derived within the same re-derivation (top-k
-        // churn) is not a change the caller would see.
-        let churn: Vec<EdgeAt> = lost.intersection(&gained).cloned().collect();
-        for e in churn {
-            lost.remove(&e);
-            gained.remove(&e);
-        }
+        // Net on the edge, not the rule that owns it (ledger row 85). A top-k
+        // retraction that the same rule puts back, and an edge that changes
+        // owner inside this re-derivation, are both still there afterwards.
+        // `EdgeAt` orders the rule name too, so comparing the whole value
+        // reports that owner change as one loss and one gain.
+        let key_of = |e: &EdgeAt| (e.edge_type.clone(), e.src_key.clone(), e.dst_key.clone());
+        let lost_keys: BTreeSet<_> = lost.iter().map(key_of).collect();
+        let gained_keys: BTreeSet<_> = gained.iter().map(key_of).collect();
+        lost.retain(|e| !gained_keys.contains(&key_of(e)));
+        gained.retain(|e| !lost_keys.contains(&key_of(e)));
 
         Ok(WhatIf {
             lost: lost.into_iter().collect(),
@@ -14567,10 +17112,10 @@ impl<F: Fs> GraphDb<F> {
     /// writes — the **floor**, not the whole answer.
     ///
     /// It is not "the version this binary writes", and it is not "the version
-    /// this binary reads". Since v0.6.10 this binary writes 9 **or** 10
-    /// depending on the store — [`snapshot::version_for`] decides, and a store
-    /// that has called [`enable_multiplicity`](Self::enable_multiplicity)
-    /// writes 10 — and it reads 5 through 10. A caller comparing a store's
+    /// this binary reads". This binary writes 9, 10 or 11 depending on the
+    /// store — [`snapshot::version_for`] decides: a store that has called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) writes 10, and one
+    /// that is [V11](Self::is_v11) writes 11 — and it reads 5 through 11. A caller comparing a store's
     /// stamp against this value must use `>=`, not `==`, or it will report an
     /// opted-in store as needing a migration *down*; `cli::run_migrate` is the
     /// worked example.
@@ -14645,8 +17190,19 @@ impl<F: Fs> GraphDb<F> {
             )));
         }
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
+        // A V11 store keeps its genesis marker under a name 0.9.x does not
+        // read, before any snapshot can archive a WAL that holds V11 records
+        // (see `Fs::use_v11_genesis_marker`).
+        if self.v11_features {
+            self.fs.use_v11_genesis_marker()?;
+        }
+        // From here `snapshot.bin` and `wal.bin` may be between states on disk.
+        // A reader outside the engine pairing the two (the backup worker) waits
+        // until the mark drops, on every exit from this function.
+        let _snapshot_mark = self.durable_wal.begin_snapshot();
+        let generation_at_start = self.durable_wal.get().generation;
         // Capture whether snapshot.bin already existed BEFORE this snapshot write.
         // Used by the archive path's conservative genesis-chain check: if a prior
         // snapshot exists but wal.truncated does not, we cannot distinguish a
@@ -14694,11 +17250,19 @@ impl<F: Fs> GraphDb<F> {
             self.archive_genesis_chain = true;
         }
         // Which version this store writes. V9 unless it has opted in to
-        // multiplicity, in which case V10 — the stamp that makes a reader which
+        // something: V10 for multiplicity — the stamp that makes a reader which
         // does not know WAL discriminant 23 refuse the open instead of
-        // truncating the WAL at the first such frame. The container is
-        // identical either way; only these two header bytes move.
-        let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
+        // truncating the WAL at the first such frame — and V11 for any V11
+        // feature. V9 and V10 share every byte but these two header bytes; V11
+        // adds section 18 and may hold the 0.10 value types in its columns.
+        let snapshot_version =
+            core_storage::snapshot::version_for(core_storage::snapshot::StoreFeatures {
+                multiplicity: self.multiplicity,
+                has_v11_types: self.v11_features,
+                has_constraints: !self.constraints.is_empty(),
+                has_range_indexes: self.prop_index.has_range_indexes(),
+            });
+        let v11 = snapshot_version == core_storage::snapshot::VERSION_11;
         // A snapshot that leaves the WAL where it is records how much of it
         // it holds, so the next open does not apply those writes again on top
         // of the state they produced. This handle holds the write lock, so
@@ -14792,6 +17356,8 @@ impl<F: Fs> GraphDb<F> {
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
+                v11,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -14922,6 +17488,8 @@ impl<F: Fs> GraphDb<F> {
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
                 prov_reconciled: self.engine.lost_provenance_reconciled(),
+                v11,
+                declarations: self.snapshot_declarations(),
             };
             let mut buf = Vec::new();
             let encoded = encode_v8(
@@ -15049,10 +17617,31 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
                     label: label.clone(),
                     field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // After the indexes, so each constraint finds its backing index
+            // already declared. Only a store that holds `CreateConstraint`
+            // records has any, so a store without them gets no V11 record here.
+            for c in &self.constraints {
+                let rec = WalRecord::CreateConstraint {
+                    name: c.name.clone(),
+                    label: c.label.clone(),
+                    field: c.field.clone(),
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
@@ -15074,12 +17663,18 @@ impl<F: Fs> GraphDb<F> {
             // the replacement leaves, and on a store with a declaration it is
             // not the replacement. The rewrite below puts the declarations
             // back.
-            let nothing_to_archive = (live_frames_for_name.is_empty()
-                || live_frames_for_name == baseline_frames)
-                && !self.fs.list_archives()?.is_empty();
+            //
+            // A WAL with no bytes at all has nothing to archive even with no
+            // archive yet: a store that has never committed has no `wal.bin`,
+            // and renaming it failed with "No such file" after the snapshot
+            // intent was written (ledger row 119).
+            let nothing_to_archive = live_wal_bytes_for_name.is_empty()
+                || ((live_frames_for_name.is_empty() || live_frames_for_name == baseline_frames)
+                    && !self.fs.list_archives()?.is_empty());
             stopped(SnapshotStop::BeforeWalReplacement)?;
             if nothing_to_archive {
                 if live_wal_bytes_for_name != baseline_wal {
+                    self.durable_wal.replaced();
                     self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
                 }
             } else {
@@ -15094,6 +17689,7 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     });
                 }
+                self.durable_wal.replaced();
                 self.fs.archive_wal(archive_n)?;
 
                 // The replacement WAL goes in **immediately**, with no fallible call
@@ -15244,14 +17840,36 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
                     label: label.clone(),
                     field: field.clone(),
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // After the indexes, so each constraint finds its backing index
+            // already declared. Only a store that holds `CreateConstraint`
+            // records has any, so a store without them gets no V11 record here.
+            for c in &self.constraints {
+                let rec = WalRecord::CreateConstraint {
+                    name: c.name.clone(),
+                    label: c.label.clone(),
+                    field: c.field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
             stopped(SnapshotStop::BeforeWalReplacement)?;
+            self.durable_wal.replaced();
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
             // Every archive now ends at or below the floor. They are the
             // history this snapshot was asked to discard; removing them here is
@@ -15281,7 +17899,7 @@ impl<F: Fs> GraphDb<F> {
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers
         // see the post-snapshot state rather than stale overlay data.
-        self.fold_now();
+        self.fold_after_snapshot();
         // We wrote the snapshot and (unless keep_wal) replaced the WAL, so both
         // markers this handle uses to detect other processes' work must be
         // re-taken from disk. Skipping this would make our own snapshot look
@@ -15296,6 +17914,14 @@ impl<F: Fs> GraphDb<F> {
         // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+        self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+        self.durable_wal
+            .snapshot_is(self.snapshot_ident, self.wal_ident);
+        // A replacement WAL went in through `write_atomic`, which fsyncs it:
+        // all of it is durable.
+        if self.durable_wal.get().generation != generation_at_start {
+            self.note_wal_synced();
+        }
         Ok(())
     }
 }
@@ -15384,6 +18010,174 @@ fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
     (outcome.nodes_inserted, outcome.edges_inserted)
 }
 
+/// The first format-V11 value type (`Date`, `LocalDateTime`, `DateTime`,
+/// `Duration`, `Binary`) a WAL record would write, at any depth.
+///
+/// A 0.9.x reader cannot decode a frame carrying one and stops replaying
+/// there, so such a value reaches the WAL only behind a V11 snapshot (see
+/// [`rec_is_v11`]). The match names every record kind so a new kind that
+/// carries a value cannot be added without deciding here.
+fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
+    match rec {
+        WalRecord::InsertNode { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::InsertNodeId { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::SetProp { value, .. }
+        | WalRecord::SetPropId { value, .. }
+        | WalRecord::SetEdgePropId { value, .. } => core_storage::v11_only_type(value),
+        WalRecord::Batch(inner) => inner.iter().find_map(v11_only_value),
+        WalRecord::InsertEdge { .. }
+        | WalRecord::CreateRule { .. }
+        | WalRecord::DeleteRule { .. }
+        | WalRecord::RemoveProp { .. }
+        | WalRecord::DeleteEdge { .. }
+        | WalRecord::DeleteNode { .. }
+        | WalRecord::RebuildRule { .. }
+        | WalRecord::CreateView { .. }
+        | WalRecord::DeleteView { .. }
+        | WalRecord::EnableFulltext { .. }
+        | WalRecord::DisableFulltext { .. }
+        | WalRecord::InsertEdgeId { .. }
+        | WalRecord::Intern { .. }
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. }
+        | WalRecord::RenameNode { .. }
+        | WalRecord::EnableIndex { .. }
+        | WalRecord::DisableIndex { .. }
+        | WalRecord::SetEdgeCount { .. }
+        | WalRecord::CreateConstraint { .. }
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
+        | WalRecord::RemoveEdgePropId { .. } => None,
+    }
+}
+
+/// One `Err` per submission of a group refused as a whole by `e`: the first
+/// submission gets `e` itself, the rest its text.
+pub(crate) fn group_refusal<T>(e: GraphError, n: usize) -> Vec<Result<T>> {
+    let detail = format!("group refused: {e}");
+    let mut out = Vec::with_capacity(n);
+    out.push(Err(e));
+    for _ in 1..n {
+        out.push(Err(GraphError::Io(std::io::Error::other(detail.clone()))));
+    }
+    out.truncate(n);
+    out
+}
+
+/// The declarations a snapshot's section 18 carries, as the records that make
+/// them, in the order a baseline WAL writes them: equality indexes, range
+/// indexes, then constraints, so each constraint finds its index declared.
+fn declarations_as_records(d: &core_storage::v8::SnapshotDeclarations) -> Vec<WalRecord> {
+    let mut recs = Vec::new();
+    for (label, field) in &d.indexes {
+        recs.push(WalRecord::EnableIndex {
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for (name, label, field) in &d.range_indexes {
+        recs.push(WalRecord::EnableRangeIndex {
+            name: name.clone(),
+            label: label.clone(),
+            field: field.clone(),
+        });
+    }
+    for c in &d.constraints {
+        recs.push(WalRecord::CreateConstraint {
+            name: c.name.clone(),
+            label: c.label.clone(),
+            field: c.field.clone(),
+        });
+    }
+    recs
+}
+
+/// Whether `rec` is a V11-only record: it carries a format-V11 value (see
+/// [`v11_only_value`]), or it is a format-V11 record — a unique-constraint
+/// declaration or withdrawal (discriminants 24 and 25) or a range-index one
+/// (26 and 27), or a relationship-property write (28 and 29). A 0.9.x reader
+/// can decode none of them, so the first one a store writes moves it to the
+/// V11 snapshot format (contract C9).
+fn rec_is_v11(rec: &WalRecord) -> bool {
+    match rec {
+        WalRecord::CreateConstraint { .. }
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
+        | WalRecord::SetEdgePropId { .. }
+        | WalRecord::RemoveEdgePropId { .. } => true,
+        WalRecord::Batch(inner) => recs_are_v11(inner),
+        _ => v11_only_value(rec).is_some(),
+    }
+}
+
+/// Whether any of `recs` is a V11-only record ([`rec_is_v11`]), recursing into
+/// `Batch` inners.
+fn recs_are_v11(recs: &[WalRecord]) -> bool {
+    recs.iter().any(rec_is_v11)
+}
+
+/// The first `DateTime` offset in `rec`, at any depth, outside the ±18:00 a
+/// `DateTime` holds. Every surface that parses one refuses it already; this
+/// is the write-path check for a value built directly.
+fn out_of_range_offset(rec: &WalRecord) -> Option<i32> {
+    fn bad(v: &Value) -> Option<i32> {
+        match v {
+            Value::DateTime { offset_seconds, .. }
+                if offset_seconds.unsigned_abs()
+                    > core_storage::MAX_OFFSET_SECONDS.unsigned_abs() =>
+            {
+                Some(*offset_seconds)
+            }
+            Value::List(items) => items.iter().find_map(bad),
+            Value::Map(m) => m.values().find_map(bad),
+            _ => None,
+        }
+    }
+    match rec {
+        WalRecord::InsertNode { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
+        WalRecord::InsertNodeId { props, .. } => props.iter().find_map(|(_, v)| bad(v)),
+        WalRecord::SetProp { value, .. }
+        | WalRecord::SetPropId { value, .. }
+        | WalRecord::SetEdgePropId { value, .. } => bad(value),
+        WalRecord::Batch(inner) => inner.iter().find_map(out_of_range_offset),
+        _ => None,
+    }
+}
+
+/// The first [`Value::Binary`] in `rec` longer than [`BINARY_MAX_BYTES`], at any
+/// depth, as the property it is written to and its length.
+fn oversized_binary(rec: &WalRecord, syms: &Interner) -> Option<(String, usize)> {
+    fn too_big(v: &Value) -> Option<usize> {
+        match v {
+            Value::Binary(b) if b.len() > BINARY_MAX_BYTES => Some(b.len()),
+            Value::List(items) => items.iter().find_map(too_big),
+            Value::Map(m) => m.values().find_map(too_big),
+            _ => None,
+        }
+    }
+    match rec {
+        WalRecord::InsertNode { props, .. } => props
+            .iter()
+            .find_map(|(f, v)| too_big(v).map(|n| (f.clone(), n))),
+        WalRecord::InsertNodeId { props, .. } => props.iter().find_map(|(f, v)| {
+            too_big(v).map(|n| (syms.resolve(*f).unwrap_or_default().to_string(), n))
+        }),
+        WalRecord::SetProp { field, value, .. } => too_big(value).map(|n| (field.clone(), n)),
+        WalRecord::SetPropId { field, value, .. }
+        | WalRecord::SetEdgePropId { field, value, .. } => {
+            too_big(value).map(|n| (syms.resolve(*field).unwrap_or_default().to_string(), n))
+        }
+        WalRecord::Batch(inner) => inner.iter().find_map(|r| oversized_binary(r, syms)),
+        _ => None,
+    }
+}
+
 /// One entry of a frame the validate pass has decided on, before
 /// [`GraphDb::rewrite_wal_dense_planned`] turns it into dense-id records.
 ///
@@ -15393,12 +18187,23 @@ fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
 /// *same* frame, so no id for them exists until the dense rewrite allocates it.
 /// Carrying the keys this far and resolving them there is what lets the count
 /// survive the shape a mirror rebuild writes (defect #24).
+///
+/// A relationship-property write is the other: it names the edge by dense
+/// triple and its field by an interned id, for the same reason.
 enum PlannedRec {
     Rec(WalRecord),
     DuplicateCount {
         edge_type: String,
         src_key: String,
         dst_key: String,
+    },
+    /// Set (`Some`) or remove (`None`) property `field` of the edge.
+    EdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+        value: Option<Value>,
     },
 }
 
@@ -15463,6 +18268,45 @@ pub enum BatchOp {
         props: Vec<(String, Value)>,
         on_conflict: OnConflict,
     },
+    /// Set property `field` of the edge `src_key -[edge_type]-> dst_key`
+    /// (Cypher relationship maps and `SET r…`, QL-RP). The edge must exist at
+    /// that point of the batch; `count` is reserved and a rule-owned edge type
+    /// takes no user property write.
+    SetEdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+        value: Value,
+    },
+    /// Remove property `field` of the edge; a no-op when it lacks it. Refused
+    /// as [`BatchOp::SetEdgeProp`] is.
+    RemoveEdgeProp {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        field: String,
+    },
+}
+
+/// The refusal for a user write to the reserved edge property [`EDGE_COUNT_PROP`].
+pub(crate) fn edge_count_reserved_error(var: &str) -> GraphError {
+    GraphError::QueryError {
+        detail: format!(
+            "cannot SET {var}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
+             property holding the pair's insert count"
+        ),
+    }
+}
+
+/// The refusal for a user property write to an edge type a rule derives.
+pub(crate) fn rule_owned_edge_type_error(edge_type: &str, rule: &str) -> GraphError {
+    GraphError::RuleOwned {
+        detail: format!(
+            "relationship type {edge_type} is derived by rule '{rule}'; a rule-owned edge \
+             type takes no user property write"
+        ),
+    }
 }
 
 /// Three-way node visibility status used by `check_single_op_authz`.
@@ -15473,6 +18317,78 @@ enum NodeAuthzStatus {
     Hidden,
     /// Node does not exist in the store.
     Absent,
+}
+
+/// An edge as a batch names it: `(edge type, source key, destination key)`.
+type EdgeKey = (String, String, String);
+
+/// A set of batch edges that can also be found by either endpoint.
+///
+/// A node delete or rename in a batch has to find the edges the batch
+/// already added or deleted at that node. Filtering the whole set for them
+/// made a batch of N edge inserts and M node deletes cost O(N × M) (ledger
+/// row 130); the endpoint index finds them in O(log N + edges at the node).
+#[derive(Default)]
+struct EdgeKeys {
+    edges: BTreeSet<EdgeKey>,
+    /// `(endpoint key, edge)` for each endpoint of each edge in `edges`: once
+    /// for a self-loop.
+    by_endpoint: BTreeSet<(String, EdgeKey)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries [`EdgeKeys::take_touching`] visited, for the test that pins it
+    /// to the edges at the node.
+    static EDGE_KEYS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl EdgeKeys {
+    fn contains(&self, k: &EdgeKey) -> bool {
+        self.edges.contains(k)
+    }
+
+    fn insert(&mut self, k: EdgeKey) {
+        if self.edges.contains(&k) {
+            return;
+        }
+        self.by_endpoint.insert((k.1.clone(), k.clone()));
+        if k.2 != k.1 {
+            self.by_endpoint.insert((k.2.clone(), k.clone()));
+        }
+        self.edges.insert(k);
+    }
+
+    fn remove(&mut self, k: &EdgeKey) {
+        if !self.edges.remove(k) {
+            return;
+        }
+        self.by_endpoint.remove(&(k.1.clone(), k.clone()));
+        self.by_endpoint.remove(&(k.2.clone(), k.clone()));
+    }
+
+    /// Remove and return every edge with `key` at either end.
+    fn take_touching(&mut self, key: &str) -> Vec<EdgeKey> {
+        let start = (
+            key.to_string(),
+            (String::new(), String::new(), String::new()),
+        );
+        let touching: Vec<EdgeKey> = self
+            .by_endpoint
+            .range(start..)
+            // Counts every entry the walk reads, the one that ends it too.
+            .inspect(|_| {
+                #[cfg(test)]
+                EDGE_KEYS_VISITED.with(|v| v.set(v.get() + 1));
+            })
+            .take_while(|(endpoint, _)| endpoint == key)
+            .map(|(_, edge)| edge.clone())
+            .collect();
+        for edge in &touching {
+            self.remove(edge);
+        }
+        touching
+    }
 }
 
 /// Overlay of ops already accepted earlier in the same batch. Never written
@@ -15492,8 +18408,8 @@ struct Overlay {
     renamed_from: BTreeMap<String, String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
-    extra_edges: BTreeSet<(String, String, String)>,
-    deleted_edges: BTreeSet<(String, String, String)>,
+    extra_edges: EdgeKeys,
+    deleted_edges: EdgeKeys,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
     /// `rule name → (via_edge, edge_type)` for every via-hop rule accepted
@@ -15501,6 +18417,44 @@ struct Overlay {
     /// sees only the rules already committed to the engine. Keyed by name so a
     /// later `DeleteRule` in the same batch drops the arc with the rule.
     extra_rule_arcs: BTreeMap<String, (String, String)>,
+}
+
+impl Overlay {
+    /// Remove and return every overlay prop of `key`.
+    ///
+    /// A range lookup on the ordered `(key, field)` pairs, not a `retain`:
+    /// `retain` walks every overlay entry, so a batch of N ops cost O(N²)
+    /// (ledger row 118). Same entries, O(log N + entries of this key).
+    fn take_props_of(&mut self, key: &str) -> Vec<(String, Value)> {
+        let pairs: Vec<(String, String)> = self
+            .extra_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|((k, _), _)| k == key)
+            .map(|(pair, _)| pair.clone())
+            .collect();
+        pairs
+            .into_iter()
+            .filter_map(|pair| {
+                let value = self.extra_props.remove(&pair)?;
+                Some((pair.1, value))
+            })
+            .collect()
+    }
+
+    /// Remove and return every removed-prop tombstone of `key` (range lookup;
+    /// see [`Overlay::take_props_of`]).
+    fn take_removed_props_of(&mut self, key: &str) -> Vec<String> {
+        let pairs: Vec<(String, String)> = self
+            .removed_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|(k, _)| k == key)
+            .cloned()
+            .collect();
+        for pair in &pairs {
+            self.removed_props.remove(pair);
+        }
+        pairs.into_iter().map(|(_, field)| field).collect()
+    }
 }
 
 /// Read-only view of live db state plus a batch overlay. Shared by single-op
@@ -15744,7 +18698,46 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         Ok(!self.has_edge(edge_type, src_key, dst_key))
     }
 
+    /// The refusals a relationship-property write makes, in order: the
+    /// reserved `count`, a rule-owned edge type (a rule's edges carry the
+    /// rule's properties), and an edge that is not there at this point of the
+    /// batch.
+    fn check_edge_prop_write(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+    ) -> Result<()> {
+        if field == EDGE_COUNT_PROP {
+            return Err(edge_count_reserved_error(&format!(
+                "({src_key})-[:{edge_type}]->({dst_key})"
+            )));
+        }
+        let owner =
+            self.db.engine.rules().find(|r| {
+                r.edge_type == edge_type && !self.overlay.deleted_rules.contains(&r.name)
+            });
+        if let Some(rule) = owner {
+            return Err(rule_owned_edge_type_error(edge_type, &rule.name));
+        }
+        if !self.has_edge(edge_type, src_key, dst_key) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "no relationship ({src_key})-[:{edge_type}]->({dst_key}) to write property \
+                     `{field}` on"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        // `id` is not removable from a node whose `id` is its key (ledger row 128).
+        // Stated first so the answer does not depend on any view.
+        if field == "id" {
+            check_key_property_removal(key, self.prop_value(key, "id").as_ref())?;
+        }
         // A view owns its property, and the refusal has to live here rather
         // than on `GraphDb::remove_prop`: `BatchOp::RemoveProp` never meets
         // that one, and it is what the HTTP `DELETE /node/{key}/prop/{field}`
@@ -15790,6 +18783,11 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // Provenance-owned OR a live rule would derive this pair. User-first
         // edges that a later rule matches are not in `owned`, but deleting
         // them would leave a hole `rebuild_rule` immediately fills.
+        // An edge the graph does not hold is absent, not rule-owned (ledger
+        // row 67). The rule checks below are for an edge a delete would remove.
+        if !self.has_edge(edge_type, src_key, dst_key) {
+            return Ok(false);
+        }
         if self.is_rule_owned(edge_type, src_key, dst_key) {
             return Err(GraphError::RuleOwned {
                 detail: format!(
@@ -15806,7 +18804,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 ),
             });
         }
-        Ok(self.has_edge(edge_type, src_key, dst_key))
+        Ok(true)
     }
 
     /// True if any live rule (minus overlay-deleted names) would derive
@@ -15814,19 +18812,26 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     /// CreateRule names in `extra_rules` are ignored — same documented
     /// same-batch rule-window as [`Self::is_rule_owned`].
     ///
-    /// Mirrored by `guard_matches` in `memory/forget.rs`, which names the
-    /// rules this refused for: change the two together (ledger row 67).
+    /// The same questions `memory/forget.rs`'s `would_derive` asks: namespace,
+    /// the via hop, and whether the cap can bind. A cap that can bind answers
+    /// no, which lets the delete through rather than refuse for a pair the
+    /// rule might not keep (ledger row 67). Labels come from
+    /// [`Self::label_in_batch`], so a key this batch freed and reused is the
+    /// new node, not the one the store still holds the key on (ledger row 90).
     fn would_derive(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
         if src_key == dst_key {
             return false;
         }
-        let Some(src_label) = self.label_of(src_key) else {
+        let Some(src_label) = self.label_in_batch(src_key) else {
             return false;
         };
-        let Some(dst_label) = self.label_of(dst_key) else {
+        let Some(dst_label) = self.label_in_batch(dst_key) else {
             return false;
         };
-        for rule in self.db.engine.rules() {
+        // Owned copies: a via hop asks `self.db` for neighbours, which cannot
+        // borrow the engine the rule iterator already holds.
+        let rules: Vec<RuleDef> = self.db.engine.rules().cloned().collect();
+        for rule in &rules {
             if self.overlay.deleted_rules.contains(&rule.name) {
                 continue;
             }
@@ -15836,17 +18841,64 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             if rule.src_label != src_label || rule.dst_label != dst_label {
                 continue;
             }
-            let src_props = |f: &str| self.prop_value(src_key, f);
-            let dst_props = |f: &str| self.prop_value(dst_key, f);
-            let src_view = NodeView {
-                key: src_key,
-                props: &src_props,
+            if !self.in_rule_namespace(rule, src_key) || !self.in_rule_namespace(rule, dst_key) {
+                continue;
+            }
+            let sources = self.db.nodes_with_label(&rule.src_label).len() as u64;
+            let targets = self.db.nodes_with_label(&rule.dst_label).len() as u64;
+            let cap_cannot_bind = match rule.max_edges {
+                Some(k) => targets <= k,
+                None => sources.saturating_mul(targets) <= core_rules::engine::DEFAULT_MAX_EDGES,
             };
-            let dst_view = NodeView {
-                key: dst_key,
-                props: &dst_props,
+            if !cap_cannot_bind {
+                continue;
+            }
+            let holds = match (rule.via_label.as_deref(), rule.via_edge.as_deref()) {
+                (Some(via_label), Some(via_edge)) => {
+                    let dir = rule.via_dir.unwrap_or(Direction::Out);
+                    self.db
+                        .neighbors(src_key, via_edge, dir)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|via| {
+                            self.label_in_batch(via).as_deref() == Some(via_label)
+                                && self.in_rule_namespace(rule, via)
+                                && {
+                                    let via_props = |f: &str| self.prop_value(via, f);
+                                    let dst_props = |f: &str| self.prop_value(dst_key, f);
+                                    evaluate(
+                                        &rule.predicate,
+                                        &NodeView {
+                                            key: via,
+                                            props: &via_props,
+                                        },
+                                        &NodeView {
+                                            key: dst_key,
+                                            props: &dst_props,
+                                        },
+                                    )
+                                    .is_some()
+                                }
+                        })
+                }
+                _ => {
+                    let src_props = |f: &str| self.prop_value(src_key, f);
+                    let dst_props = |f: &str| self.prop_value(dst_key, f);
+                    evaluate(
+                        &rule.predicate,
+                        &NodeView {
+                            key: src_key,
+                            props: &src_props,
+                        },
+                        &NodeView {
+                            key: dst_key,
+                            props: &dst_props,
+                        },
+                    )
+                    .is_some()
+                }
             };
-            if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
+            if holds {
                 return true;
             }
         }
@@ -15871,6 +18923,15 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return None;
         }
         self.db.syms.resolve(sym).map(str::to_string)
+    }
+
+    /// Whether `key` is in `rule`'s namespace, as this batch sees the node.
+    /// A rule with no namespace sees every node.
+    fn in_rule_namespace(&self, rule: &RuleDef, key: &str) -> bool {
+        match rule.namespace.as_deref() {
+            None => true,
+            Some(ns) => namespace_of_value(self.prop_value(key, NS_PROP).as_ref()) == ns,
+        }
     }
 
     /// The label `key` carries as this batch sees it — including a node
@@ -15976,7 +19037,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .map(String::as_str)
             .chain(overlay_fields)
             .filter(|field| {
-                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+                *field != NS_PROP
+                    && !(*field == "id" && id_mirrors_key(key, self.prop_value(key, "id").as_ref()))
+                    && !supplied.contains(field)
+                    && self.has_prop(key, field)
             })
             .collect();
         // The view-owned half is kept, and counted: the row still commits and
@@ -16081,8 +19145,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay
             .extra_labels
             .insert(key.to_string(), label.to_string());
-        self.overlay.extra_props.retain(|(k, _), _| k != key);
-        self.overlay.removed_props.retain(|(k, _)| k != key);
+        self.overlay.take_props_of(key);
+        self.overlay.take_removed_props_of(key);
         for (field, value) in props {
             self.overlay
                 .extra_props
@@ -16126,14 +19190,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.extra_keys.remove(key);
         self.overlay.renamed_from.remove(key);
         self.overlay.deleted_keys.insert(key.to_string());
-        self.overlay.extra_props.retain(|(k, _), _| k != key);
-        self.overlay.removed_props.retain(|(k, _)| k != key);
-        self.overlay
-            .extra_edges
-            .retain(|(_, s, d)| s != key && d != key);
-        self.overlay
-            .deleted_edges
-            .retain(|(_, s, d)| s != key && d != key);
+        self.overlay.take_props_of(key);
+        self.overlay.take_removed_props_of(key);
+        self.overlay.extra_edges.take_touching(key);
+        self.overlay.deleted_edges.take_touching(key);
     }
 
     fn note_create_rule(&mut self, def: &RuleDef) {
@@ -16174,48 +19234,30 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // Mark new as extra so subsequent batch ops can reference it.
         self.overlay.deleted_keys.remove(new);
         self.overlay.extra_keys.insert(new.to_string());
-        // Migrate any overlay props from old key to new key.
         let new_str = new.to_string();
-        let transferred: Vec<((String, String), Value)> = self
-            .overlay
-            .extra_props
-            .iter()
-            .filter(|((k, _), _)| k.as_str() == old)
-            .map(|((_, f), v)| ((new_str.clone(), f.clone()), v.clone()))
-            .collect();
-        self.overlay
-            .extra_props
-            .retain(|(k, _), _| k.as_str() != old);
-        for (k, v) in transferred {
-            self.overlay.extra_props.insert(k, v);
+        // Migrate any overlay props from old key to new key.
+        for (field, value) in self.overlay.take_props_of(old) {
+            self.overlay
+                .extra_props
+                .insert((new.to_string(), field), value);
         }
         // Migrate removed_props.
-        let transferred_removed: Vec<(String, String)> = self
-            .overlay
-            .removed_props
-            .iter()
-            .filter(|(k, _)| k.as_str() == old)
-            .map(|(_, f)| (new_str.clone(), f.clone()))
-            .collect();
-        self.overlay
-            .removed_props
-            .retain(|(k, _)| k.as_str() != old);
-        for k in transferred_removed {
-            self.overlay.removed_props.insert(k);
+        for field in self.overlay.take_removed_props_of(old) {
+            self.overlay.removed_props.insert((new.to_string(), field));
         }
         if let Some(label) = self.overlay.extra_labels.remove(old) {
             self.overlay.extra_labels.insert(new_str.clone(), label);
         }
         // Edges the batch added or deleted follow the node to its new key.
         let follow = |k: String| if k == old { new_str.clone() } else { k };
-        self.overlay.extra_edges = std::mem::take(&mut self.overlay.extra_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
-        self.overlay.deleted_edges = std::mem::take(&mut self.overlay.deleted_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
+        for set in [
+            &mut self.overlay.extra_edges,
+            &mut self.overlay.deleted_edges,
+        ] {
+            for (t, s, d) in set.take_touching(old) {
+                set.insert((t, follow(s), follow(d)));
+            }
+        }
         if let Some(origin) = origin {
             self.overlay.renamed_from.insert(new_str, origin);
         }
@@ -16528,10 +19570,108 @@ impl<'a, F: Fs> NodeRef<'a, F> {
     }
 }
 
+/// A copy of a lock-attempt failure that a denied write scope can return more
+/// than once. Only the two I/O-derived kinds are kept; `GraphError` is not
+/// `Clone`, and an `io::Error` is rebuilt from its kind and text.
+fn copy_lock_failure(err: &GraphError) -> Option<GraphError> {
+    match err {
+        GraphError::Unwritable {
+            path,
+            detail,
+            read_only_filesystem,
+        } => Some(GraphError::Unwritable {
+            path: path.clone(),
+            detail: detail.clone(),
+            read_only_filesystem: *read_only_filesystem,
+        }),
+        GraphError::Io(e) => Some(GraphError::Io(std::io::Error::new(e.kind(), e.to_string()))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core_rules::Predicate;
+
+    /// Ledger row 126: a property write that derives nothing leaves the
+    /// topology, edge properties and interner shared with the fold, on a
+    /// store with no snapshot (every edge in the overlay) and with a rule
+    /// installed, so the engine runs. A write that derives an edge copies the
+    /// topology, and the fold keeps its own.
+    #[test]
+    fn a_write_that_derives_nothing_copies_no_topology() {
+        let dir = tmp_dir("row126-topo");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(fk_rule()).unwrap();
+        let mut b = db.batch();
+        for i in 0..50 {
+            b.insert_node("Person", &format!("p{i}"), vec![]);
+        }
+        b.insert_node("Org", "acme", vec![]);
+        for i in 0..49 {
+            b.insert_edge("KNOWS", &format!("p{i}"), &format!("p{}", i + 1));
+        }
+        b.commit().unwrap();
+        // The field's name is interned here, before the fold: a write that
+        // names a new symbol writes the interner, and copies it.
+        db.set_prop("p3", "age", Value::Int(6)).unwrap();
+        db.fold_now();
+        let fold = Arc::clone(db.fold_overlay.as_ref().unwrap());
+        db.set_prop("p3", "age", Value::Int(7)).unwrap();
+        assert!(Arc::ptr_eq(&db.topo, &fold.topo), "topology copied");
+        assert!(
+            Arc::ptr_eq(&db.edge_props, &fold.edge_props),
+            "edge props copied"
+        );
+        assert!(Arc::ptr_eq(&db.syms, &fold.syms), "interner copied");
+        // A write the rule derives from: the writer copies, the fold does not move.
+        db.set_prop("p4", "org_id", Value::Str("acme".into()))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&db.topo, &fold.topo));
+        assert_eq!(
+            db.neighbors("p4", "WORKS_AT", Direction::Out).unwrap(),
+            ["acme"]
+        );
+        let org = fold.ids.get("acme").unwrap();
+        let p4 = fold.ids.get("p4").unwrap();
+        let et = fold.syms.get("WORKS_AT");
+        assert!(et.is_none_or(|et| !fold.topo.neighbors(et, Direction::Out, p4).contains(&org)));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ledger row 130: a node delete in a batch finds the batch's edges at
+    /// that node through the endpoint index. 201 deletes, each looking in the
+    /// added and the deleted edge sets, read at most the edges at the node and
+    /// the one entry that ends each walk (403 here), not the 200 × 200 a full
+    /// walk reads (20,300 with the old `retain`).
+    #[test]
+    fn a_batch_node_delete_visits_only_the_batch_edges_at_that_node() {
+        let dir = tmp_dir("row130-visits");
+        let mut db = GraphDb::open(&dir).unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("Old", &format!("old{i}"), vec![]);
+        }
+        b.commit().unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("P", &format!("s{i}"), vec![])
+                .insert_node("P", &format!("d{i}"), vec![])
+                .insert_edge("KNOWS", &format!("s{i}"), &format!("d{i}"))
+                .delete_node(&format!("old{i}"));
+        }
+        b.delete_node("s0");
+        EDGE_KEYS_VISITED.with(|v| v.set(0));
+        b.commit().unwrap();
+        let visited = EDGE_KEYS_VISITED.with(|v| v.get());
+        assert!(visited <= 2 * 201 + 1, "{visited} entries read");
+        assert_eq!(db.edge_count(), 199);
+        assert!(db.node_info("s0").is_none() && db.node_info("old7").is_none());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let d =

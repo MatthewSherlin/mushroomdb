@@ -1,0 +1,73 @@
+# mushroomdb with a local S3-compatible store, for development and small
+# self-hosted installs.
+#
+#   MUSHROOMDB_TOKEN=<set-me> docker compose up
+#
+# SINGLE WRITER - replicas must be 1. Do not use `docker compose up --scale
+# mushroomdb=N`: a second writer on the same /data volume fails to take the
+# write lock.
+services:
+  mushroomdb:
+    image: ghcr.io/matthewsherlin/mushroomdb:latest
+    ports:
+      - "8080:8080"
+      # Bolt, on this machine only: bound to 127.0.0.1 so it is not exposed to
+      # the network by accident. To expose it, change the left side to
+      # "7687:7687" and put TLS in front (--tls-cert/--tls-key, or a TCP proxy
+      # that terminates TLS); Bolt takes the same token as HTTP.
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - mushroomdb-data:/data
+    environment:
+      # Required. The server refuses a non-loopback bind without a token.
+      MUSHROOMDB_TOKEN: ${MUSHROOMDB_TOKEN:?set MUSHROOMDB_TOKEN to a strong secret}
+      MUSHROOMDB_LOG_FORMAT: json
+      MUSHROOMDB_BOLT_PORT: "7687"
+      # A wildcard bind cannot be handed to a driver; this is the host clients use.
+      MUSHROOMDB_BOLT_ADVERTISED_HOST: localhost
+      # S3 settings the backup worker reads, wired to the bundled object store;
+      # backup itself stays off until MUSHROOMDB_BACKUP_S3_URL is set below.
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # Continuous backup to the bundled object store (docs/site/deployment.md):
+      # MUSHROOMDB_BACKUP_S3_URL: minio://mushroomdb/backup
+      # Restore on boot: an empty volume restores the newest backup there before serving.
+      # MUSHROOMDB_RESTORE_FROM_S3: minio://mushroomdb/backup
+      # Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+      # settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.
+    # Local development: explicit command, no --demo-if-empty. For a throwaway
+    # demo store, append "--demo-if-empty" here. Production never does.
+    restart: unless-stopped
+    # Time between SIGTERM and SIGKILL. serve drains, snapshots, then flushes
+    # the backup and deletes its bucket lease; 60 s covers that at the defaults.
+    stop_grace_period: 60s
+    command: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # Local S3-compatible storage. In production, point at a managed bucket and
+  # remove this service. The default credentials below are for local use only;
+  # override them with MINIO_ROOT_USER / MINIO_ROOT_PASSWORD in the environment.
+  minio:
+    image: minio/minio:latest   # dev-only default; pin a tag for anything shared
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mushroomdb-data:
+  minio-data:

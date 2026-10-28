@@ -1,0 +1,182 @@
+# mushroomdb on Kubernetes: ConfigMap, Services, StatefulSet.
+#
+# SINGLE WRITER - replicas must be 1. mushroomdb is single-writer: a second pod
+# on the same store contends for the write lock, and a ReadWriteOnce volume
+# attaches to one node anyway. Do not scale the StatefulSet.
+#
+# No HorizontalPodAutoscaler is shipped on purpose: autoscaling would add
+# writers. Do not add one.
+#
+# The token lives in a Secret that is NOT part of this file, so no secret value
+# is ever committed and the pod fails closed: it stays in
+# CreateContainerConfigError until the Secret exists. Create it first:
+#   kubectl create secret generic mushroomdb-token \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# PIN THE IMAGE: :latest is only the default. A store has one-way format
+# opt-ins, so set a version tag (for example ghcr.io/matthewsherlin/mushroomdb:0.10.0)
+# before you rely on this, or a restart can pull a different version.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mushroomdb
+data:
+  # Non-secret settings only.
+  MUSHROOMDB_LOG_FORMAT: json
+  # Bolt, in-cluster only (the `bolt` port on the ClusterIP Service below). Bolt
+  # takes the same token as HTTP. The advertised host is what a routing URI
+  # hands drivers: the Service's in-cluster DNS name. If you expose Bolt outside
+  # the cluster (see the Service), change it to the public name.
+  MUSHROOMDB_BOLT_PORT: "7687"
+  MUSHROOMDB_BOLT_ADVERTISED_HOST: mushroomdb
+  # Continuous backup (docs/site/deployment.md); the AWS_* credentials go in a
+  # Secret you create, never here:
+  # MUSHROOMDB_BACKUP_S3_URL: s3://<bucket>/<prefix>
+  # Restore on boot: an empty volume restores the newest backup there before serving.
+  # MUSHROOMDB_RESTORE_FROM_S3: s3://<bucket>/<prefix>
+  # Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+  # settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # Governing Service for the StatefulSet (stable pod DNS); no virtual IP.
+  name: mushroomdb-headless
+spec:
+  clusterIP: None
+  selector:
+    app: mushroomdb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # What clients connect to.
+  name: mushroomdb
+spec:
+  type: ClusterIP
+  selector:
+    app: mushroomdb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    # Bolt: ClusterIP, so reachable inside the cluster only. To reach it from
+    # outside, put a TLS-terminating TCP load balancer in front (a Service of
+    # type LoadBalancer on its own, with your cloud's TLS annotation, or serve
+    # TLS yourself with --tls-cert/--tls-key). Never publish Bolt as plaintext
+    # on the internet.
+    - name: bolt
+      port: 7687
+      targetPort: bolt
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mushroomdb
+spec:
+  serviceName: mushroomdb-headless
+  # SINGLE WRITER - replicas must be 1. Do NOT scale to more than one.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mushroomdb
+  template:
+    metadata:
+      labels:
+        app: mushroomdb
+    spec:
+      securityContext:
+        # The image runs as uid 65532 and has no shell, so it cannot chown its
+        # own volume. fsGroup makes Kubernetes give the volume to that group and
+        # set it group-writable at mount time.
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        # Only re-own the volume when the root directory's owner is wrong, so a
+        # large store does not pay a recursive chown on every pod start.
+        fsGroupChangePolicy: OnRootMismatch
+      # On SIGTERM the server drains, writes a shutdown snapshot (which grows
+      # with the store), flushes the backup and deletes its bucket lease, within
+      # serve's default 55 s budget (docs/site/deployment.md, "Stopping cleanly,
+      # and the grace period"). 120 s covers that with room to spare.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: mushroomdb
+          image: ghcr.io/matthewsherlin/mushroomdb:latest
+          # Explicit command: no --demo-if-empty, so a production volume is
+          # never seeded. The image ENTRYPOINT is the mushroomdb binary.
+          args: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: bolt
+              containerPort: 7687
+          envFrom:
+            - configMapRef:
+                name: mushroomdb
+          env:
+            - name: MUSHROOMDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  # Created by you, see the header. Not optional on purpose.
+                  name: mushroomdb-token
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # Requests keep the pod out of BestEffort; the memory limit bounds a
+          # runaway query. Defaults suit a small store: size memory to your data
+          # (the graph is held in memory) and drop the limit only knowingly.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          # Slow opens of a large store (and a restore on boot): no liveness or
+          # readiness check runs until this passes, up to 30 x 10s = 5 minutes.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # The server writes only under /data; /tmp is scratch for the
+            # read-only root filesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

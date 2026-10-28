@@ -8,13 +8,44 @@ from __future__ import annotations
 
 from os import PathLike
 from types import TracebackType
+from datetime import date, datetime
 from typing import Any, Literal, Sequence
 
-Scalar = int | float | str | bool | list[Any] | dict[str, Any]
-"""A value the store can hold: int, float, str, bool, list, or dict."""
+class Duration:
+    """A span of time as calendar months, days and nanoseconds, kept apart.
 
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
-"""Query parameters: a name→value dict, a list of (name, value) tuples, or None."""
+    The three parts are independent and never normalised against each other: a
+    month is not 30 days and a day is not 24 hours, which is why this is not a
+    `datetime.timedelta`. A `timedelta` is refused as a value, with a message
+    that points here. Immutable and hashable; equal when all three parts are.
+    `months` and `days` are 32-bit and `nanos` 64-bit signed integers; a part
+    that does not fit raises `OverflowError`.
+    """
+
+    months: int
+    days: int
+    nanos: int
+    def __init__(self, months: int = 0, days: int = 0, nanos: int = 0) -> None: ...
+
+Scalar = int | float | str | bool | bytes | date | datetime | Duration | list[Any] | dict[str, Any]
+"""A value the store can hold: int, float, str, bool, bytes, date, datetime, Duration, list, or dict.
+
+`bytes` (a `bytearray` or `memoryview` is accepted on the way in) is a binary
+blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
+is a local date-time; an aware one is a date-time that keeps its UTC offset
+(within +-18:00, whole seconds). A value that cannot be held exactly, such as an
+offset with a fractional second or a `pandas.Timestamp` with a nonzero
+`nanosecond`, raises `ValueError` rather than being rounded. Reading one back
+gives the same Python type; a stored date outside Python's years 1 to 9999
+raises `ValueError`. The first write of a `bytes`, `date`, `datetime` or
+`Duration` value moves the store to the V11 snapshot format, which 0.9.x cannot
+read.
+"""
+
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
+"""Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value."""
 
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
@@ -131,6 +162,21 @@ class CasConflict(MushroomError):
     expected: int
     actual: int
 
+class TransactionConflict(CasConflict):
+    """A commit found that another writer changed a node the transaction read or wrote.
+
+    Nothing was written, so running the transaction again from the start is
+    always safe. It is a `CasConflict` and carries its `key`, `expected` and
+    `actual`.
+    """
+
+    code: str
+
+class TransactionClosed(MushroomError):
+    """The transaction is finished: it was already committed or rolled back."""
+
+    code: str
+
 class MaskedReadOnly(MushroomError):
     """A write statement reached a scoped or masked query path, which is read-only."""
 
@@ -158,6 +204,23 @@ class MushroomBusy(MushroomError):
 
     code: str
     holder: int | None
+
+class Unwritable(MushroomError):
+    """The store's data directory is not writable by this process.
+
+    The filesystem refused permission (`EACCES`, `EPERM` or a read-only mount)
+    on the directory or a file the store must create in it. This is a
+    deployment fault, not contention: it is not `MushroomBusy`, and retrying
+    cannot help until the directory's ownership or mount changes. The message
+    names the path, the effective uid, the directory's owner and mode, and what
+    to change.
+
+    `path` is the file or directory refused; `detail` is also the message.
+    """
+
+    code: str
+    path: str
+    detail: str
 
 class NamespaceImmutable(MushroomError):
     """A namespace is set at insert and fixed for the node's lifetime.
@@ -223,6 +286,305 @@ class TimeBeforeFloor(MushroomError):
     code: str
     floor_ms: int
     floor_commit: int
+
+class ConstraintViolation(MushroomError):
+    """A write would give two live nodes the same value under a unique constraint.
+
+    Nothing was written.
+    """
+
+    code: str
+    constraint: str
+    field: str
+
+class ConstraintCreationConflict(MushroomError):
+    """A unique constraint cannot be declared: live nodes already share a value.
+
+    `violations` lists the first 100 `(node_key, value)` in conflict, in node-id
+    order; `total` counts all of them.
+    """
+
+    code: str
+    violations: list[tuple[str, Any]]
+    total: int
+
+class ValueTooLarge(MushroomError):
+    """A value is larger than the store accepts; `size` and `limit` are bytes.
+
+    Nothing was written.
+    """
+
+    code: str
+    field: str
+    size: int
+    limit: int
+
+class Transaction:
+    """An open interactive transaction, from `db.begin_transaction()` or `with db.transaction() as tx:`.
+
+    Reads see the store as it was when the transaction began plus the
+    transaction's own writes; nothing reaches the store, or any other handle,
+    until `commit()`. One transaction used from two threads is serialised.
+    Dropping it unfinished is a rollback.
+    """
+
+    def execute(self, cypher: str, params: Params = None) -> list[Row]:
+        """Run one Cypher statement and return its rows, shaped as `query` and `query_write` return them.
+
+        A statement that fails changes nothing and leaves the transaction
+        usable. Schema changes are refused inside a transaction. Raises
+        `TransactionClosed` once the transaction is finished.
+        """
+
+    def commit(self) -> int:
+        """Write the transaction as one commit and return that commit's number.
+
+        A transaction that wrote nothing writes nothing and returns the number
+        of the commit it began on. The transaction is finished afterwards,
+        whether or not this raised. Raises `TransactionConflict` when another
+        writer changed a node it read or wrote.
+        """
+
+    def rollback(self) -> None:
+        """Discard the transaction's changes. Raises `TransactionClosed` if it is already finished."""
+
+class TransactionContext:
+    """What `db.transaction()` returns: begins on entering the block, commits on a clean exit, rolls back and re-raises on an exception."""
+
+    def __enter__(self) -> Transaction: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
+
+class MemoryAccessor:
+    """The agent-memory methods of a handle: what `db.memory` returns.
+
+    A plain `GraphDb` is a general-purpose graph store and imposes none of
+    these behaviours on ordinary nodes; this namespace is the memory API only.
+    It shares the handle's store and scope, so on a `scoped()` handle it is
+    scoped the same way. Each `db.memory` access returns a new, cheap accessor
+    (`db.memory is db.memory` is `False`). An accessor you keep holds the store
+    open, as a `scoped()` handle does; the store is released when the handle
+    and every accessor are dropped.
+    """
+
+    def remember(
+        self,
+        text: str,
+        about: Sequence[str] | None = None,
+        kind: Literal["note", "decision", "todo"] | None = None,
+        ts: int | None = None,
+        source: str | None = None,
+        entities: Sequence[dict[str, Any]] | None = None,
+        facts: Sequence[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Write a note the store can later `recall`, and whatever it names.
+
+        `about` is the keys the note is about. A key that does not exist is
+        created as a provisional `Entity` rather than refusing the call, and
+        listed under `provisional` in the report.
+
+        `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
+        dicts — entities you recognised in the text, created or updated in the
+        same commit. `facts` is a list of `{"subject", "predicate", "object"}`
+        dicts — relationships among them, written as edges. Either may be a
+        tuple or any other sequence, as `about` may.
+
+        `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
+        Unix seconds and defaults to now; it is part of the note's key, so the
+        same text at the same `ts` is the same note. `source` defaults to
+        `"agent"`.
+
+        Returns the report as a dict: `note` (the note's key — **not** `key`,
+        which is what the MCP tool's JSON reply calls it), `created`,
+        `matched`, `derived`, `provisional`, `provisional_capped` (keys past
+        the per-call cap of 20, **not** created), `fulltext_declared`,
+        `labels_not_applied` (a list of `{"key", "requested", "stored"}`: an
+        `entities` entry whose label disagreed with the stored node's, so the
+        label went unused), `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+        the identity links this call made, and the ones it retracted), and
+        `same_as_unread` (`None`, or the error text when the write committed
+        but its links could not be read back, so both lists are empty because
+        nothing was read). A `score` is the raw float (`0.6666666666666666`);
+        the MCP tool prints the same score to two decimals.
+
+        Raises `IngestError` when the text is empty or over 4,000 characters,
+        the `kind` is unknown, an entity's `props` carry `aliases` or
+        `alias_keys`, a name is empty, only whitespace or only invisible
+        characters — a key in
+        `about`, an entity's `key` or `label`, or a fact's `subject`,
+        `predicate` or `object`; nothing is written. Its `.detail` is the
+        bare sentence; the message carries an `ingest error: ` prefix in
+        front of it.
+
+        A store this binding creates has no memory schema. `remember`
+        declares full-text on `Note.text` and on each new entity label's
+        `name` itself, so `recall` works after the first call.
+
+        ```python
+        r = db.memory.remember("Matthew is driving 0.7", about=["matthew"],
+                               entities=[{"key": "v0.7", "label": "Release"}],
+                               facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+        r["note"]         # "note:…"
+        r["provisional"]  # ["matthew"]
+        ```
+        """
+
+    def recall(self, topic: str) -> dict[str, Any]:
+        """What the store holds about a topic, as rows.
+
+        Returns `{"indexed": bool, "terms": int, "hits": [...]}`. Each hit is
+        `{"key", "label", "summary", "covered", "score"}`, best first:
+        `covered` is how many of the topic's `terms` the node's own text
+        holds, and it leads the ranking — the fused `score` is nearly flat.
+        A hit covers at least half the terms. At most six hits. `terms == 0`
+        with hits present means the topic was all stopwords: its words were
+        searched together and every hit's `covered` is `0`. `summary` is
+        the first 120 characters of the node's `text`, `summary` or `name`,
+        or `None` when it has none of them.
+
+        `indexed` is `False` when the store declares no full-text index at
+        all, so no topic can match — a different answer from an empty `hits`.
+        `remember` declares `Note.text` on its first call.
+
+        This is the MCP `recall` tool's ranking, as data; the tool renders the
+        same rows as a digest, and this method does not offer the digest.
+
+        **The rows are raw stored content.** `key`, `label` and `summary` are
+        unsanitized: only the digest renderer replaces control characters,
+        line separators and bidi or zero-width characters with spaces. If you
+        render a row into an assistant's context, that sanitisation is yours
+        to do — a stored line break can otherwise forge a line of your
+        prompt. This binding exposes no helper for it.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def upsert_entity(
+        self,
+        key: str,
+        props: dict[str, Scalar],
+        label: str | None = None,
+        aliases: Sequence[str] | None = None,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update one entity by key, the way the memory tools do.
+
+        Unlike `upsert_node`, this maintains the entity's two identity lists:
+        `aliases`, which the store derives from the current key and `name` and
+        recomputes on every call — never accumulated, never yours to set — and
+        `alias_keys`, the `aliases` you pass, kept as written and accumulating.
+        It also sets `id` to the key and clears a `provisional` mark
+        `remember` left.
+
+        `label` is required to create and optional to update. **An update
+        never changes a label**: one that differs from the stored label
+        raises `IngestError` and nothing in `props` is written.
+
+        `namespace` is the namespace a created node lands in. On an existing
+        node its own namespace is a no-op and another raises
+        `NamespaceImmutable`. A `props["ns"]` that disagrees with `namespace`
+        is a `ValueError`.
+
+        Returns `{"key", "label", "created", "updated_fields",
+        "same_as_lost", "same_as_unread"}`. `same_as_lost` lists the identity
+        links this update retracted, as `{"a", "b", "score"}`: a changed `name`
+        can take a full-name link below the floor. `same_as_unread` is `None`,
+        or the error text when the update committed but the links could not be
+        read back afterwards, so `same_as_lost` is empty because nothing was
+        read. A `score` is the raw float (`0.6666666666666666`); the MCP tool
+        prints it to two decimals.
+
+        `aliases` or `alias_keys` inside `props` raise `IngestError`: the
+        store maintains both. So does a `key` that is empty or only
+        whitespace, and a create under such a `label`. An `IngestError`'s
+        `.detail` is the bare sentence; its message carries an
+        `ingest error: ` prefix.
+
+        ```python
+        db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+        ```
+        """
+
+    def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]:
+        """What the store holds and how it is wired.
+
+        Returns a dict: `brief` (`nodes` and `edges` counts, `labels` each
+        with its fields, `edge_types` each with its endpoints, `commits`,
+        `roles`, `recipes`, `partial`), `rules` (each with its predicate in
+        one clause and its namespace), `fulltext` and `indexes` (`[label,
+        field]` lists), `provisional` (how many nodes `remember` named and
+        nothing has described) and `provisional_sample` (the first ten keys).
+
+        `budget_ms` bounds the counting; a spent budget sets
+        `brief["partial"]` and the counts are then lower bounds. **`0` is not
+        "no limit" here**, as it is for the graph algorithms: it is a budget
+        already spent, and returns a partial report. For an unhurried report
+        pass a large value, such as `60_000`.
+
+        The MCP `schema` tool renders this same report. The names under
+        `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
+        content, unsanitized, as `recall`'s rows are.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def forget(
+        self,
+        key: str | None = None,
+        prop: str | None = None,
+        fact: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Forget a node, one property, or one fact — exactly one of the three.
+
+        - `forget(key=k)` tombstones the node and every edge on it.
+        - `forget(key=k, prop=p)` removes one property.
+        - `forget(fact={"subject", "predicate", "object"})` retracts one
+          hand-written edge.
+
+        Returns the report as a dict: `mode` (`"node"`, `"prop"` or
+        `"fact"`), `target`, `changed` (`False` when there was nothing to
+        forget), `manual_edges`, `derived_edges`, `notes` and `notes_total`
+        (notes that still say it — **listed, never deleted**), `history_floor`,
+        `prop` in prop mode, `aliases_rewritten` (a forgotten `name` took its
+        words out of `aliases` in the same commit) and `alias_keys_remain`
+        (forgotten `aliases` left declared aliases behind in `alias_keys`).
+
+        **This is a tombstone, not a redaction.** `node_history`,
+        `edge_history`, `edges_at` and `was_linked` still read what was
+        forgotten, from `history_floor` on, until the log is pruned.
+
+        Raises `ValueError` for any other combination of arguments,
+        `KeyNotFound` for an unknown key or fact endpoint, and `RuleOwned` for
+        a fact a rule derived. That refusal's message and its `.detail` are
+        the same whole sentence — which rule owns the edge and the fields it
+        reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
+        is written in any of the three.
+        """
+
+    def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]:
+        """Which keys are one entity: `SAME_AS` links resolved into identities.
+
+        Returns `{"clusters": [...], "linked": int, "claims": int, "floor":
+        float}`. Each cluster is `{"canonical", "members", "weakest"}`: every
+        pair of `members` is linked at `floor` or above, `canonical` is the
+        oldest member and `members[0]`, and `weakest` is the lowest pairwise
+        score inside it. `claims` counts unordered pairs — both directions of
+        a link are one claim. `weakest` is the raw float
+        (`0.6666666666666666`); the MCP tool prints it to two decimals.
+
+        Empty on a store with no `SAME_AS` edges. The identity preset that
+        derives them is applied with `mushroomdb schema apply <db>
+        --memory-identity`, on the command line, with this handle closed; a
+        `SAME_AS` rule made with `create_rule` is the other way.
+
+        Raises `ValueError` for a `floor` that is not a finite number.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
 
 class GraphDb:
     """An embedded mushroomdb store.
@@ -416,7 +778,7 @@ class GraphDb:
     ) -> list[Row]:
         """Execute a read query and return one dict per row, keyed by RETURN alias.
 
-        Values must be `int`, `float`, `str`, `bool`, `list` or `dict`.
+        Values must be `int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, `list` or `dict`.
         Parameters are bound, never interpolated, so string values are safe
         against injection.
 
@@ -431,23 +793,24 @@ class GraphDb:
         """
 
     def query_with_params(
-        self, cypher: str, params: Sequence[tuple[str, Scalar]]
+        self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
     ) -> list[Row]:
         """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 
         Each element of `params` is a `(name, value)` tuple. Values must be
-        `int`, `float`, `str`, `bool`, or a `list` of those. Prefer `query`,
+        `int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, or a `list` of those. Prefer `query`,
         which accepts the same tuple list and a dict besides.
         """
 
     def query_write(self, cypher: str, params: Params = None) -> list[Row]:
         """Execute a Cypher write statement.
 
-        CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
+        CREATE / MATCH…SET / MATCH…REMOVE / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
 
-        Returns a one-row result dict with keys `created`, `properties_set` and
-        `deleted`, unless the statement carries its own `RETURN` projection, in
-        which case the projected rows are returned instead.
+        Returns a one-row result dict with keys `created` (nodes),
+        `properties_set`, `deleted` and `relationships_created`, unless the
+        statement carries its own `RETURN` projection, in which case the
+        projected rows are returned instead.
 
         `params` takes the same shapes as `query`: `None`, a dict, or a list of
         `(name, value)` tuples.
@@ -519,6 +882,30 @@ class GraphDb:
 
         `node_info` answers `None` on the same miss, because Rust returns
         `Option` there and `Result` here. The asymmetry is the core API.
+        """
+
+    def to_arrow_tables(self) -> dict[str, Any]:
+        """The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
+
+        `nodes` has columns `key`, `label`, `properties` (string: a JSON
+        object with sorted keys, each value written as the HTTP API writes it: a
+        non-finite float is `null`, a date, time, duration or binary value is a
+        tagged object such as `{"$date": "2024-01-15"}`), sorted by key. `edges` has `source`, `type`, `target`,
+        `derived` (bool), `rule` (string, null for a manual edge), `weight`
+        (float, null unless the creating rule declares a numeric
+        `weight_prop`) and `properties` (string, the same sorted JSON form as
+        node properties; `{}` when absent), sorted by `(type, source, target)`.
+        An empty store gives empty tables with the same columns.
+
+        It materialises every node and edge in memory at once. `pyarrow` is an
+        optional dependency, imported here: without it this raises
+        `ImportError` naming `pip install pyarrow`. Refused (`ValueError`) on a
+        scoped handle.
+
+        ```python
+        tables = db.to_arrow_tables()
+        df = tables["nodes"].to_pandas()
+        ```
         """
 
     def node_history(self, key: str) -> Row:
@@ -1104,6 +1491,24 @@ class GraphDb:
         Refused on a `scoped()` handle with `ValueError`.
         """
 
+    @property
+    def memory(self) -> MemoryAccessor:
+        """The agent-memory methods: `remember`, `recall`, `upsert_entity`,
+        `forget`, `schema_report` and `identity_clusters`.
+
+        A plain handle is a general-purpose graph store and imposes none of
+        these behaviours on ordinary nodes. This namespace is the memory API
+        only. It shares this handle's store and scope: on a `scoped()` handle
+        it is scoped the same way. Each method takes the arguments and returns
+        what its docstring says; the old top-level names are deprecated
+        aliases of these.
+
+        ```python
+        db.memory.remember("Matthew is driving 0.10", about=["matthew"])
+        db.memory.recall("who is driving the release")["hits"]
+        ```
+        """
+
     def remember(
         self,
         text: str,
@@ -1114,83 +1519,12 @@ class GraphDb:
         entities: Sequence[dict[str, Any]] | None = None,
         facts: Sequence[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        """Write a note the store can later `recall`, and whatever it names.
-
-        `about` is the keys the note is about. A key that does not exist is
-        created as a provisional `Entity` rather than refusing the call, and
-        listed under `provisional` in the report.
-
-        `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
-        dicts — entities you recognised in the text, created or updated in the
-        same commit. `facts` is a list of `{"subject", "predicate", "object"}`
-        dicts — relationships among them, written as edges. Either may be a
-        tuple or any other sequence, as `about` may.
-
-        `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
-        Unix seconds and defaults to now; it is part of the note's key, so the
-        same text at the same `ts` is the same note. `source` defaults to
-        `"agent"`.
-
-        Returns the report as a dict: `note` (the note's key — **not** `key`,
-        which is what the MCP tool's JSON reply calls it), `created`,
-        `matched`, `derived`, `provisional`, `provisional_capped` (keys past
-        the per-call cap of 20, **not** created), `fulltext_declared`,
-        `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-        the identity links this call made, and the ones it retracted). A
-        `score` is the raw float (`0.6666666666666666`); the MCP tool prints
-        the same score to two decimals.
-
-        Raises `IngestError` when the text is empty or over 4,000 characters,
-        the `kind` is unknown, an entity's `props` carry `aliases` or
-        `alias_keys`, a name is empty, only whitespace or only invisible
-        characters — a key in
-        `about`, an entity's `key` or `label`, or a fact's `subject`,
-        `predicate` or `object`; nothing is written. Its `.detail` is the
-        bare sentence; the message carries an `ingest error: ` prefix in
-        front of it.
-
-        A store this binding creates has no memory schema. `remember`
-        declares full-text on `Note.text` and on each new entity label's
-        `name` itself, so `recall` works after the first call.
-
-        ```python
-        r = db.remember("Matthew is driving 0.7", about=["matthew"],
-                        entities=[{"key": "v0.7", "label": "Release"}],
-                        facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
-        r["note"]         # "note:…"
-        r["provisional"]  # ["matthew"]
-        ```
-        """
+        """Deprecated: use `db.memory.remember`, which takes the same arguments
+        and returns the same report. Emits a `DeprecationWarning`."""
 
     def recall(self, topic: str) -> dict[str, Any]:
-        """What the store holds about a topic, as rows.
-
-        Returns `{"indexed": bool, "terms": int, "hits": [...]}`. Each hit is
-        `{"key", "label", "summary", "covered", "score"}`, best first:
-        `covered` is how many of the topic's `terms` the node's own text
-        holds, and it leads the ranking — the fused `score` is nearly flat.
-        A hit covers at least half the terms. At most six hits. `terms == 0`
-        with hits present means the topic was all stopwords: its words were
-        searched together and every hit's `covered` is `0`. `summary` is
-        the first 120 characters of the node's `text`, `summary` or `name`,
-        or `None` when it has none of them.
-
-        `indexed` is `False` when the store declares no full-text index at
-        all, so no topic can match — a different answer from an empty `hits`.
-        `remember` declares `Note.text` on its first call.
-
-        This is the MCP `recall` tool's ranking, as data; the tool renders the
-        same rows as a digest, and this method does not offer the digest.
-
-        **The rows are raw stored content.** `key`, `label` and `summary` are
-        unsanitized: only the digest renderer replaces control characters,
-        line separators and bidi or zero-width characters with spaces. If you
-        render a row into an assistant's context, that sanitisation is yours
-        to do — a stored line break can otherwise forge a line of your
-        prompt. This binding exposes no helper for it.
-
-        Refused on a `scoped()` handle with `ValueError`.
-        """
+        """Deprecated: use `db.memory.recall`, which takes the same arguments and
+        returns the same rows. Emits a `DeprecationWarning`."""
 
     def upsert_entity(
         self,
@@ -1200,63 +1534,12 @@ class GraphDb:
         aliases: Sequence[str] | None = None,
         namespace: str | None = None,
     ) -> dict[str, Any]:
-        """Create or update one entity by key, the way the memory tools do.
-
-        Unlike `upsert_node`, this maintains the entity's two identity lists:
-        `aliases`, which the store derives from the current key and `name` and
-        recomputes on every call — never accumulated, never yours to set — and
-        `alias_keys`, the `aliases` you pass, kept as written and accumulating.
-        It also sets `id` to the key and clears a `provisional` mark
-        `remember` left.
-
-        `label` is required to create and optional to update. **An update
-        never changes a label**: one that differs from the stored label
-        raises `IngestError` and nothing in `props` is written.
-
-        `namespace` is the namespace a created node lands in. On an existing
-        node its own namespace is a no-op and another raises
-        `NamespaceImmutable`. A `props["ns"]` that disagrees with `namespace`
-        is a `ValueError`.
-
-        Returns `{"key", "label", "created", "updated_fields",
-        "same_as_lost"}`. `same_as_lost` lists the identity links this update
-        retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-        full-name link below the floor. A `score` is the raw float
-        (`0.6666666666666666`); the MCP tool prints it to two decimals.
-
-        `aliases` or `alias_keys` inside `props` raise `IngestError`: the
-        store maintains both. So does a `key` that is empty or only
-        whitespace, and a create under such a `label`. An `IngestError`'s
-        `.detail` is the bare sentence; its message carries an
-        `ingest error: ` prefix.
-
-        ```python
-        db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
-        ```
-        """
+        """Deprecated: use `db.memory.upsert_entity`, which takes the same
+        arguments and returns the same report. Emits a `DeprecationWarning`."""
 
     def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]:
-        """What the store holds and how it is wired.
-
-        Returns a dict: `brief` (`nodes` and `edges` counts, `labels` each
-        with its fields, `edge_types` each with its endpoints, `commits`,
-        `roles`, `recipes`, `partial`), `rules` (each with its predicate in
-        one clause and its namespace), `fulltext` and `indexes` (`[label,
-        field]` lists), `provisional` (how many nodes `remember` named and
-        nothing has described) and `provisional_sample` (the first ten keys).
-
-        `budget_ms` bounds the counting; a spent budget sets
-        `brief["partial"]` and the counts are then lower bounds. **`0` is not
-        "no limit" here**, as it is for the graph algorithms: it is a budget
-        already spent, and returns a partial report. For an unhurried report
-        pass a large value, such as `60_000`.
-
-        The MCP `schema` tool renders this same report. The names under
-        `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
-        content, unsanitized, as `recall`'s rows are.
-
-        Refused on a `scoped()` handle with `ValueError`.
-        """
+        """Deprecated: use `db.memory.schema_report`, which takes the same
+        arguments and returns the same report. Emits a `DeprecationWarning`."""
 
     def forget(
         self,
@@ -1264,53 +1547,12 @@ class GraphDb:
         prop: str | None = None,
         fact: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Forget a node, one property, or one fact — exactly one of the three.
-
-        - `forget(key=k)` tombstones the node and every edge on it.
-        - `forget(key=k, prop=p)` removes one property.
-        - `forget(fact={"subject", "predicate", "object"})` retracts one
-          hand-written edge.
-
-        Returns the report as a dict: `mode` (`"node"`, `"prop"` or
-        `"fact"`), `target`, `changed` (`False` when there was nothing to
-        forget), `manual_edges`, `derived_edges`, `notes` and `notes_total`
-        (notes that still say it — **listed, never deleted**), `history_floor`,
-        `prop` in prop mode, `aliases_rewritten` (a forgotten `name` took its
-        words out of `aliases` in the same commit) and `alias_keys_remain`
-        (forgotten `aliases` left declared aliases behind in `alias_keys`).
-
-        **This is a tombstone, not a redaction.** `node_history`,
-        `edge_history`, `edges_at` and `was_linked` still read what was
-        forgotten, from `history_floor` on, until the log is pruned.
-
-        Raises `ValueError` for any other combination of arguments,
-        `KeyNotFound` for an unknown key or fact endpoint, and `RuleOwned` for
-        a fact a rule derived. That refusal's message and its `.detail` are
-        the same whole sentence — which rule owns the edge and the fields it
-        reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
-        is written in any of the three.
-        """
+        """Deprecated: use `db.memory.forget`, which takes the same arguments and
+        returns the same report. Emits a `DeprecationWarning`."""
 
     def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]:
-        """Which keys are one entity: `SAME_AS` links resolved into identities.
-
-        Returns `{"clusters": [...], "linked": int, "claims": int, "floor":
-        float}`. Each cluster is `{"canonical", "members", "weakest"}`: every
-        pair of `members` is linked at `floor` or above, `canonical` is the
-        oldest member and `members[0]`, and `weakest` is the lowest pairwise
-        score inside it. `claims` counts unordered pairs — both directions of
-        a link are one claim. `weakest` is the raw float
-        (`0.6666666666666666`); the MCP tool prints it to two decimals.
-
-        Empty on a store with no `SAME_AS` edges. The identity preset that
-        derives them is applied with `mushroomdb schema apply <db>
-        --memory-identity`, on the command line, with this handle closed; a
-        `SAME_AS` rule made with `create_rule` is the other way.
-
-        Raises `ValueError` for a `floor` that is not a finite number.
-
-        Refused on a `scoped()` handle with `ValueError`.
-        """
+        """Deprecated: use `db.memory.identity_clusters`, which takes the same
+        arguments and returns the same report. Emits a `DeprecationWarning`."""
 
     def stats(self) -> dict[str, Any]:
         """Node and edge counts, `history_floor`, `namespaces`, and per-rule figures.
@@ -1403,10 +1645,37 @@ class GraphDb:
         on an interval is cheap. See `docs/site/multiprocess.md`.
         """
 
+    def begin_transaction(self) -> Transaction:
+        """Begin an interactive transaction and return it.
+
+        Reads see the store as it was at this call plus the transaction's own
+        writes; `commit()` writes them as one commit, `rollback()` or dropping
+        the transaction discards them. Prefer `with db.transaction() as tx:`.
+
+        Raises `ReadOnly` on a `read_only=True` handle. A transaction on a
+        `scoped()` handle is read-only: reads go through the scope, writes
+        raise `ReadOnly`, and its commit writes nothing. `close()` raises while
+        a transaction is open.
+        """
+
+    def transaction(self) -> TransactionContext:
+        """Run a block as one transaction: commit on a clean exit, roll back and re-raise on an exception.
+
+        ```python
+        with db.transaction() as tx:
+            tx.execute("CREATE (n:Person {id: 'alice'})")
+        ```
+
+        Calling `tx.commit()` or `tx.rollback()` inside the block ends the
+        transaction early; leaving the block then does nothing more. Refused
+        with `ReadOnly` on a `read_only=True` handle.
+        """
+
     def close(self) -> None:
         """Close the handle and release the store.
 
         A `scoped()` child shares the one store, so either name closes both.
+        Raises `RuntimeError` while a transaction is open on the store.
         """
 
     def __enter__(self) -> GraphDb: ...

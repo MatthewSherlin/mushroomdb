@@ -1,0 +1,1651 @@
+//! Unique constraints (0.10 TY-5).
+//!
+//! A unique constraint on `(label, field)` refuses any write that would leave
+//! two live nodes of `label` with equal values for `field`. The check runs at
+//! the one function every WAL append passes through — the dense rewrite — so
+//! every write path gets it, and these tests prove it path by path: the write
+//! fails with `ConstraintViolation`, `wal.bin` is byte-for-byte unchanged, and
+//! the store reads the same live as after a reopen.
+//!
+//! `CreateConstraint` / `DropConstraint` are format-V11 WAL records, which a
+//! 0.9.x reader cannot decode, so the first declaration moves the store to
+//! the V11 snapshot format before its record is appended (TY-12) — the first
+//! test below holds that.
+
+use mushroomdb::{GraphError, RealFs, Value};
+use std::path::{Path, PathBuf};
+
+type GraphDb = mushroomdb::GraphDb<RealFs>;
+
+fn tmp(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "graphdb-constraints-{}-{}-{}",
+        name,
+        std::process::id(),
+        nanos,
+    ))
+}
+
+fn wal_bytes(dir: &Path) -> Vec<u8> {
+    std::fs::read(dir.join("wal.bin")).unwrap_or_default()
+}
+
+#[test]
+fn create_constraint_moves_the_store_to_v11_before_its_record() {
+    let dir = tmp("upgrade");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "User",
+        "alice",
+        vec![("email".into(), Value::Str("a@x".into()))],
+    )
+    .unwrap();
+    let before = wal_bytes(&dir);
+    assert!(!db.is_v11());
+    db.create_constraint("uniq_email", "User", "email").unwrap();
+    assert!(db.is_v11());
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    let after = wal_bytes(&dir);
+    assert!(
+        after.starts_with(&before) && after.len() > before.len(),
+        "the upgrade keeps the WAL and the declaration is appended to it"
+    );
+    assert!(db.is_index_enabled("User", "email"));
+    match db.insert_node(
+        "User",
+        "bob",
+        vec![("email".into(), Value::Str("a@x".into()))],
+    ) {
+        Err(GraphError::ConstraintViolation { .. }) => {}
+        other => panic!("expected a violation, got {other:?}"),
+    }
+    drop(db);
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(reopened.constraints().len(), 1);
+    assert_eq!(reopened.node_count(), 1);
+}
+
+mod unlocked {
+    use super::*;
+    use mushroomdb::{
+        BatchBuilder, BatchOp, Direction, IngestOptions, OnConflict, Precondition, PropPredicate,
+        RoleDef, SharedDb, SnapshotOptions, UniqueConstraint, ViewDef, ViewSource, WriteAuthz,
+        WriteScope, BINARY_MAX_BYTES,
+    };
+    use std::collections::BTreeMap;
+
+    type Batch<'a> = BatchBuilder<'a, RealFs>;
+
+    const VIOLATION: &str = "constraint violation: property 'email' is declared unique by \
+                             constraint 'uniq_email'; a node with that value already exists";
+
+    fn open_temp(name: &str) -> (PathBuf, GraphDb) {
+        let dir = tmp(name);
+        let db = GraphDb::open(&dir).unwrap();
+        (dir, db)
+    }
+
+    fn email(s: &str) -> Vec<(String, Value)> {
+        vec![("email".into(), Value::Str(s.into()))]
+    }
+
+    /// A store with `uniq_email` on `(User, email)` and alice holding `a@x`.
+    fn constrained(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        (dir, db)
+    }
+
+    fn assert_violation<T: std::fmt::Debug>(result: Result<T, GraphError>) {
+        match result {
+            Err(e @ GraphError::ConstraintViolation { .. }) => {
+                let GraphError::ConstraintViolation {
+                    ref constraint,
+                    ref field,
+                } = e
+                else {
+                    unreachable!()
+                };
+                assert_eq!(constraint, "uniq_email");
+                assert_eq!(field, "email");
+                assert_eq!(e.to_string(), VIOLATION);
+            }
+            other => panic!("expected ConstraintViolation, got {other:?}"),
+        }
+    }
+
+    /// After a refused write: nothing appended, alice is the only holder, and a
+    /// reopened store answers exactly as the never-closed one does.
+    fn assert_nothing_written(dir: &Path, db: GraphDb, wal_before: &[u8]) {
+        assert_eq!(
+            wal_bytes(dir),
+            wal_before,
+            "a refused write appended to the WAL"
+        );
+        let alice = db.node_info("alice").expect("alice survives");
+        assert_eq!(alice.props.get("email"), Some(&Value::Str("a@x".into())));
+        assert!(db.node_info("bob").is_none(), "bob must not exist");
+        let count = db.node_count();
+        drop(db);
+        let reopened = GraphDb::open(dir).unwrap();
+        assert_eq!(reopened.node_info("alice"), Some(alice));
+        assert!(reopened.node_info("bob").is_none());
+        assert_eq!(reopened.node_count(), count);
+    }
+
+    // ── The brief's cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_constraint_single_insert_succeeds() {
+        let (_dir, mut db) = open_temp("single");
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("User", "alice", email("alice@x.com"));
+        })
+        .unwrap();
+        assert_eq!(
+            db.constraints(),
+            &[UniqueConstraint {
+                name: "uniq_email".into(),
+                label: "User".into(),
+                field: "email".into(),
+            }]
+        );
+        assert!(
+            db.is_index_enabled("User", "email"),
+            "the backing index is created"
+        );
+    }
+
+    #[test]
+    fn test_constraint_duplicate_cross_batch() {
+        let (dir, mut db) = constrained("cross-batch");
+        let before = wal_bytes(&dir);
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("User", "bob", email("a@x"));
+        }));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn test_constraint_duplicate_within_batch() {
+        let (dir, mut db) = open_temp("within-batch");
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        let before = wal_bytes(&dir);
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("User", "carol", email("dup@x.com"));
+            b.insert_node("User", "bob", email("dup@x.com"));
+        }));
+        assert!(
+            db.node_info("carol").is_none(),
+            "the whole batch is refused"
+        );
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn test_unique_constraint_datetime_offset_equality() {
+        // Review Focus #1: same UTC instant, different offset → conflict.
+        let (_dir, mut db) = open_temp("datetime");
+        db.create_constraint("uniq_ts", "Event", "at").unwrap();
+        let dt_utc = Value::DateTime {
+            micros_utc: 1_000_000,
+            offset_seconds: 0,
+        };
+        let dt_est = Value::DateTime {
+            micros_utc: 1_000_000,
+            offset_seconds: -18_000,
+        };
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("Event", "e1", vec![("at".into(), dt_utc)]);
+        })
+        .unwrap();
+        let err = db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("Event", "e2", vec![("at".into(), dt_est)]);
+        });
+        assert!(
+            matches!(err, Err(GraphError::ConstraintViolation { ref constraint, .. }) if constraint == "uniq_ts"),
+            "{err:?}"
+        );
+        // A different instant is a different value.
+        db.insert_node(
+            "Event",
+            "e3",
+            vec![(
+                "at".into(),
+                Value::DateTime {
+                    micros_utc: 1_000_001,
+                    offset_seconds: -18_000,
+                },
+            )],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_binary_size_limit() {
+        // Review Focus #2.
+        let (dir, mut db) = open_temp("binary");
+        let ok_val = Value::Binary(vec![0u8; BINARY_MAX_BYTES]);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("X", "k1", vec![("data".into(), ok_val)]);
+        })
+        .unwrap();
+        let before = wal_bytes(&dir);
+        let big_val = Value::Binary(vec![0u8; BINARY_MAX_BYTES + 1]);
+        let err = db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("X", "k2", vec![("data".into(), big_val.clone())]);
+        });
+        match err {
+            Err(GraphError::ValueTooLarge { field, size, limit }) => {
+                assert_eq!(field, "data");
+                assert_eq!(size, BINARY_MAX_BYTES + 1);
+                assert_eq!(limit, BINARY_MAX_BYTES);
+            }
+            other => panic!("expected ValueTooLarge, got {other:?}"),
+        }
+        // set_prop, and a blob nested in a list, are held to the same limit.
+        assert!(matches!(
+            db.set_prop("k1", "data", big_val.clone()),
+            Err(GraphError::ValueTooLarge { .. })
+        ));
+        assert!(matches!(
+            db.set_prop("k1", "blobs", Value::List(vec![big_val])),
+            Err(GraphError::ValueTooLarge { ref field, .. }) if field == "blobs"
+        ));
+        assert_eq!(wal_bytes(&dir), before, "a refused write appended");
+        assert!(db.node_info("k2").is_none());
+    }
+
+    /// Differential probe: the same writes give the same answers whether they
+    /// are separate commits or one batch, on a never-closed handle or a
+    /// reopened one, with or without a snapshot in between.
+    #[test]
+    fn test_constraint_behavior_across_axes() {
+        #[derive(Debug, Clone, Copy)]
+        enum Axis {
+            Live,
+            Reopened,
+            Snapshotted,
+            SnapshotKeepWal,
+        }
+        let mut seen = Vec::new();
+        for axis in [
+            Axis::Live,
+            Axis::Reopened,
+            Axis::Snapshotted,
+            Axis::SnapshotKeepWal,
+        ] {
+            for batched in [false, true] {
+                let (dir, mut db) = open_temp("axes");
+                db.create_constraint("uniq_email", "User", "email").unwrap();
+                if batched {
+                    db.write_batch(|b: &mut Batch<'_>| {
+                        b.insert_node("User", "alice", email("a@x"));
+                        b.insert_node("User", "carol", email("c@x"));
+                        b.insert_node("Admin", "root", email("a@x"));
+                    })
+                    .unwrap();
+                } else {
+                    db.insert_node("User", "alice", email("a@x")).unwrap();
+                    db.insert_node("User", "carol", email("c@x")).unwrap();
+                    // Another label is another constraint's business.
+                    db.insert_node("Admin", "root", email("a@x")).unwrap();
+                }
+                match axis {
+                    Axis::Live => {}
+                    Axis::Reopened => {
+                        drop(db);
+                        db = GraphDb::open(&dir).unwrap();
+                    }
+                    Axis::Snapshotted => {
+                        db.snapshot().unwrap();
+                        drop(db);
+                        db = GraphDb::open(&dir).unwrap();
+                    }
+                    Axis::SnapshotKeepWal => {
+                        db.snapshot_with(SnapshotOptions {
+                            keep_wal: true,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                        drop(db);
+                        db = GraphDb::open(&dir).unwrap();
+                    }
+                }
+                assert_eq!(db.constraints().len(), 1, "{axis:?} batched={batched}");
+                assert!(db.is_index_enabled("User", "email"));
+                let before = wal_bytes(&dir);
+                assert_violation(db.insert_node("User", "bob", email("a@x")));
+                assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+                assert_eq!(wal_bytes(&dir), before, "{axis:?} batched={batched}");
+                db.insert_node("User", "bob", email("b@x")).unwrap();
+                let mut state: Vec<_> = ["alice", "bob", "carol", "root"]
+                    .iter()
+                    .map(|k| {
+                        db.node_info(k)
+                            .map(|n| (n.label, n.props.get("email").cloned()))
+                    })
+                    .collect();
+                state.push(None);
+                seen.push((format!("{axis:?} batched={batched}"), state));
+            }
+        }
+        let first = &seen[0].1;
+        for (name, state) in &seen {
+            assert_eq!(state, first, "{name} disagrees with {}", seen[0].0);
+        }
+    }
+
+    // ── One test per write path ──────────────────────────────────────────────
+
+    #[test]
+    fn insert_node_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-insert-node");
+        let before = wal_bytes(&dir);
+        assert_violation(db.insert_node("User", "bob", email("a@x")));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn set_prop_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-set-prop");
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let before = wal_bytes(&dir);
+        assert_violation(db.set_prop("bob", "email", Value::Str("a@x".into())));
+        assert_eq!(wal_bytes(&dir), before);
+        assert_eq!(
+            db.node_info("bob").unwrap().props.get("email"),
+            Some(&Value::Str("b@x".into()))
+        );
+    }
+
+    #[test]
+    fn set_props_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-set-props");
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let before = wal_bytes(&dir);
+        assert_violation(db.set_props(
+            "bob",
+            vec![
+                ("name".into(), Value::Str("Bob".into())),
+                ("email".into(), Value::Str("a@x".into())),
+            ],
+        ));
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(!db.node_info("bob").unwrap().props.contains_key("name"));
+    }
+
+    #[test]
+    fn upsert_refuses_a_duplicate() {
+        // insert_node_on_conflict(Replace) is the upsert: it inserts a new key
+        // and rewrites an existing one. Both shapes are checked.
+        for existing in [false, true] {
+            let (dir, mut db) = constrained("p-upsert");
+            if existing {
+                db.insert_node("User", "bob", email("b@x")).unwrap();
+            }
+            let before = wal_bytes(&dir);
+            assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+                b.insert_node_on_conflict("User", "bob", email("a@x"), OnConflict::Replace);
+            }));
+            assert_eq!(wal_bytes(&dir), before, "existing={existing}");
+        }
+        // Re-supplying a node's own value is not a conflict with itself.
+        let (_dir, mut db) = constrained("p-upsert-self");
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "alice", email("a@x"), OnConflict::Replace);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn write_batch_refuses_the_whole_batch() {
+        let (dir, mut db) = constrained("p-write-batch");
+        let before = wal_bytes(&dir);
+        // The duplicate is the last op: the plain ops before it must not land.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node("User", "carol", email("c@x"));
+            b.insert_edge("KNOWS", "alice", "carol");
+            b.insert_node("User", "bob", vec![]);
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        }));
+        assert!(db.node_info("carol").is_none());
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn ingest_rows_refuse_a_duplicate() {
+        let (dir, mut db) = constrained("p-ingest");
+        let before = wal_bytes(&dir);
+        let rows = vec![
+            BTreeMap::from([
+                ("id".to_string(), Value::Str("carol".into())),
+                ("email".to_string(), Value::Str("c@x".into())),
+            ]),
+            BTreeMap::from([
+                ("id".to_string(), Value::Str("bob".into())),
+                ("email".to_string(), Value::Str("a@x".into())),
+            ]),
+        ];
+        assert_violation(db.ingest("User", rows, &IngestOptions::default()));
+        assert!(db.node_info("carol").is_none());
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn ingest_json_refuses_a_duplicate_inside_the_payload() {
+        let (dir, mut db) = constrained("p-ingest-json");
+        let before = wal_bytes(&dir);
+        let json = r#"[{"id": "bob", "email": "z@x"}, {"id": "carol", "email": "z@x"}]"#;
+        assert_violation(db.ingest_json("User", json, &IngestOptions::default()));
+        assert!(db.node_info("carol").is_none());
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn cypher_create_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-cypher-create");
+        let before = wal_bytes(&dir);
+        assert_violation(db.query_write(
+            "CREATE (n:User {id: 'bob', email: 'a@x'})",
+            &BTreeMap::new(),
+        ));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn cypher_set_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-cypher-set");
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let before = wal_bytes(&dir);
+        let params = BTreeMap::from([("e".to_string(), Value::Str("a@x".into()))]);
+        assert_violation(db.query_write(
+            "MATCH (n:User) WHERE n.email = 'b@x' SET n.email = $e",
+            &params,
+        ));
+        assert_eq!(wal_bytes(&dir), before);
+        assert_eq!(
+            db.node_info("bob").unwrap().props.get("email"),
+            Some(&Value::Str("b@x".into()))
+        );
+    }
+
+    #[test]
+    fn cypher_merge_on_create_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-cypher-merge");
+        let before = wal_bytes(&dir);
+        assert_violation(db.query_write(
+            "MERGE (n:User {id: 'bob'}) ON CREATE SET n.email = 'a@x'",
+            &BTreeMap::new(),
+        ));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    #[test]
+    fn cypher_merge_matching_the_holder_is_not_a_conflict() {
+        // The match leg finds the holder, so ON CREATE SET does not run, and
+        // ON MATCH SET writing the holder's own value is no clash.
+        let (_dir, mut db) = open_temp("p-cypher-merge-match");
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        let mut props = email("a@x");
+        props.push(("id".into(), Value::Str("alice".into())));
+        db.insert_node("User", "alice", props).unwrap();
+        db.query_write(
+            "MERGE (n:User {id: 'alice'}) ON CREATE SET n.email = 'a@x' \
+             ON MATCH SET n.email = 'a@x'",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(db.node_count(), 1);
+    }
+
+    #[test]
+    fn shared_db_submit_batch_refuses_a_duplicate() {
+        let dir = tmp("p-shared");
+        let db = SharedDb::open(&dir).unwrap();
+        {
+            let mut w = db.write();
+            w.create_constraint("uniq_email", "User", "email").unwrap();
+            w.insert_node("User", "alice", email("a@x")).unwrap();
+        }
+        let before = wal_bytes(&dir);
+        assert_violation(db.submit_batch(vec![BatchOp::InsertNode {
+            label: "User".into(),
+            key: "bob".into(),
+            props: email("a@x"),
+        }]));
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(db.read().node_info("bob").is_none());
+    }
+
+    #[test]
+    fn a_role_scoped_write_gets_the_same_error_for_a_hidden_holder() {
+        // Spec §4.6: the check is global, and its error does not say whether
+        // the node holding the value is one the writer can see.
+        let (dir, mut db) = open_temp("p-hidden");
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        let mut hidden = email("hidden@x");
+        hidden.push(("tier".into(), Value::Str("private".into())));
+        db.insert_node("User", "alice", hidden).unwrap();
+        let mut visible = email("seen@x");
+        visible.push(("tier".into(), Value::Str("public".into())));
+        db.insert_node("User", "carol", visible).unwrap();
+        db.apply_schema(&mushroomdb::schema::Schema {
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                keys: vec![],
+                labels: vec!["User".into()],
+                visible_where: Some(PropPredicate {
+                    field: "tier".into(),
+                    eq: Some(Value::Str("public".into())),
+                    in_: None,
+                }),
+                namespaces: None,
+                write: Some(WriteScope {
+                    create_labels: vec!["User".into()],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let roles = db.roles();
+        let scope = roles[0].write.clone().unwrap();
+        let authz = WriteAuthz {
+            role: "writer".into(),
+            scope,
+            mask: db.mask_for_role("writer").unwrap(),
+        };
+        let before = wal_bytes(&dir);
+        let insert = |value: &str| {
+            let mut props = email(value);
+            props.push(("tier".into(), Value::Str("public".into())));
+            vec![BatchOp::InsertNode {
+                label: "User".into(),
+                key: "bob".into(),
+                props,
+            }]
+        };
+        let against_hidden = db
+            .write_batch_authz(Some(&authz), insert("hidden@x"))
+            .unwrap_err();
+        let against_visible = db
+            .write_batch_authz(Some(&authz), insert("seen@x"))
+            .unwrap_err();
+        assert!(matches!(
+            against_hidden,
+            GraphError::ConstraintViolation { .. }
+        ));
+        assert_eq!(against_hidden.to_string(), against_visible.to_string());
+        let text = against_hidden.to_string();
+        for leak in ["alice", "carol", "User", "private", "hidden@x"] {
+            assert!(!text.contains(leak), "{text:?} names {leak:?}");
+        }
+        assert_eq!(wal_bytes(&dir), before);
+    }
+
+    #[test]
+    fn write_batch_cas_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-cas");
+        let before = wal_bytes(&dir);
+        assert_violation(db.write_batch_cas(
+            vec![Precondition::NodeAbsent { key: "bob".into() }],
+            vec![BatchOp::InsertNode {
+                label: "User".into(),
+                key: "bob".into(),
+                props: email("a@x"),
+            }],
+        ));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    // ── Views write their property after the check, so the two never meet ───
+
+    fn deg_view() -> ViewDef {
+        ViewDef {
+            name: "deg".into(),
+            label: "User".into(),
+            view_prop: "deg".into(),
+            source: ViewSource::Degree {
+                edge_type: "KNOWS".into(),
+                direction: Direction::Out,
+            },
+        }
+    }
+
+    #[test]
+    fn create_constraint_refuses_a_view_owned_property() {
+        let (dir, mut db) = open_temp("view-then-constraint");
+        db.create_view(deg_view()).unwrap();
+        let before = wal_bytes(&dir);
+        match db.create_constraint("uniq_deg", "User", "deg") {
+            Err(GraphError::QueryError { detail }) => assert_eq!(
+                detail,
+                "property 'deg' on label 'User' is owned by view 'deg'; a unique constraint \
+                 cannot cover it"
+            ),
+            other => panic!("expected a QueryError, got {other:?}"),
+        }
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(db.constraints().is_empty());
+        // Another label's `deg` is not the view's.
+        db.create_constraint("uniq_admin_deg", "Admin", "deg")
+            .unwrap();
+    }
+
+    #[test]
+    fn create_view_refuses_a_constrained_property() {
+        let (dir, mut db) = open_temp("constraint-then-view");
+        db.create_constraint("uniq_deg", "User", "deg").unwrap();
+        let before = wal_bytes(&dir);
+        match db.create_view(deg_view()) {
+            Err(GraphError::QueryError { detail }) => assert_eq!(
+                detail,
+                "property 'deg' on label 'User' is declared unique by constraint 'uniq_deg'; a \
+                 view cannot own it"
+            ),
+            other => panic!("expected a QueryError, got {other:?}"),
+        }
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(db.views().is_empty());
+    }
+
+    /// The review's scenario: a Degree view on User and a constraint on its
+    /// property. Each new User got `deg = 0` inside `apply`, after the check,
+    /// so two Users held the same constrained value with no error. In either
+    /// declaration order the second declaration is now refused, so whatever
+    /// constraint exists holds over the nodes written afterwards.
+    #[test]
+    fn a_view_and_a_constraint_cannot_combine_into_duplicates() {
+        for view_first in [true, false] {
+            let (_dir, mut db) = open_temp("view-dups");
+            if view_first {
+                db.create_view(deg_view()).unwrap();
+                assert!(db.create_constraint("uniq_deg", "User", "deg").is_err());
+            } else {
+                db.create_constraint("uniq_deg", "User", "deg").unwrap();
+                assert!(db.create_view(deg_view()).is_err());
+            }
+            db.insert_node("User", "u1", vec![]).unwrap();
+            db.insert_node("User", "u2", vec![]).unwrap();
+            let degs: Vec<_> = ["u1", "u2"]
+                .iter()
+                .map(|k| db.node_info(k).unwrap().props.get("deg").cloned())
+                .collect();
+            let constrained = db
+                .constraints()
+                .iter()
+                .any(|c| c.label == "User" && c.field == "deg");
+            if constrained {
+                assert!(
+                    degs.iter().all(Option::is_none),
+                    "view_first={view_first}: no view may write the constrained property"
+                );
+            } else {
+                assert_eq!(degs, vec![Some(Value::Int(0)), Some(Value::Int(0))]);
+            }
+        }
+    }
+
+    // ── Replay never checks ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_wal_with_duplicates_before_the_constraint_reopens() {
+        // House rule: a check for new writes never runs on replay. Old records
+        // may violate a constraint declared after them, and replay must not
+        // fail on them.
+        let (dir, mut db) = open_temp("replay-dups");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        drop(db);
+        // `create_constraint` now refuses this store, so the record is appended
+        // by hand, as a WAL written by a build without the scan holds it.
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(&dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+        let mut db = GraphDb::open(&dir).expect("replay must never fail");
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        let live_count = db.node_count();
+        drop(db);
+
+        let mut reopened = GraphDb::open(&dir).expect("replay must never fail");
+        assert_eq!(reopened.node_count(), live_count);
+        assert_eq!(reopened.constraints().len(), 1);
+        assert_eq!(
+            reopened.node_info("bob").unwrap().props.get("email"),
+            Some(&Value::Str("a@x".into()))
+        );
+        // New writes are still held to it.
+        assert_violation(reopened.insert_node("User", "dave", email("c@x")));
+        assert_violation(reopened.insert_node("User", "dave", email("a@x")));
+        drop(reopened);
+
+        // As-of reads replay the same records and are not refused either.
+        for commit in 0..4 {
+            GraphDb::open_at(&dir, commit).expect("open_at must never fail");
+        }
+        let before = GraphDb::open_at(&dir, 1).unwrap();
+        assert!(before.constraints().is_empty(), "declared at commit 2");
+        assert_eq!(GraphDb::open_at(&dir, 2).unwrap().constraints().len(), 1);
+    }
+
+    // ── A store whose data predates its constraint ─────────────────────────
+    //
+    // The decision (TY-7): such a store opens, and the constraint is in force.
+    // Existing duplicates are kept as they are — nothing deletes or rewrites
+    // data, and replay never re-checks a frame. A new write is judged by what
+    // it leaves behind for the nodes it touches: it may not give a node a value
+    // another live node holds, but a write that leaves a duplicate's value as
+    // it was, or moves it somewhere free, or removes the node, is allowed.
+
+    /// A store holding `alice` and `bob` with one email, `carol` with another,
+    /// and a `uniq_email` declaration appended by hand (no create-time scan).
+    fn store_with_grandfathered_duplicates(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        drop(db);
+        append_constraint_record(&dir);
+        let db = GraphDb::open(&dir).expect("replay must never fail");
+        assert_eq!(db.constraints().len(), 1);
+        assert!(db.is_v11(), "the replayed declaration makes the handle V11");
+        (dir, db)
+    }
+
+    fn append_constraint_record(dir: &Path) {
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+    }
+
+    #[test]
+    fn test_constraint_replay_does_not_enforce_old_data() {
+        let (dir, db) = store_with_grandfathered_duplicates("grandfather-replay");
+        drop(db);
+        let reopened = GraphDb::open(&dir).expect("replay must never fail");
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.constraints().len(), 1);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_at_before_constraint_declaration() {
+        let (dir, mut db) = open_temp("open-at-before");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        // `open_at` takes a 0-based commit index; the last commit made is one less
+        // than the count.
+        let before_commit = db.commit_seq() - 1;
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let after_commit = db.commit_seq() - 1;
+        drop(db);
+        let historical = GraphDb::open_at(&dir, before_commit).unwrap();
+        assert!(historical.constraints().is_empty());
+        assert!(
+            !historical.is_index_enabled("User", "email"),
+            "the backing index comes with the declaration"
+        );
+        assert_eq!(historical.node_count(), 1);
+        let later = GraphDb::open_at(&dir, after_commit).unwrap();
+        assert_eq!(later.constraints().len(), 1);
+        assert_eq!(later.node_count(), 2);
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_survives_a_snapshot_and_a_reopen() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-snapshot");
+        db.snapshot().unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).expect("a snapshot of such a store opens");
+        assert_eq!(reopened.constraints().len(), 1);
+        assert_eq!(reopened.node_count(), 3);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+        assert_violation(reopened.insert_node("User", "dave", email("a@x")));
+        reopened.insert_node("User", "dave", email("d@x")).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_leaves_a_duplicates_value_alone_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-unrelated");
+        // Another property, through each path that can touch the node.
+        db.set_prop("bob", "age", Value::Int(3)).unwrap();
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "age", Value::Int(5));
+            b.set_prop("bob", "age", Value::Int(6));
+        })
+        .unwrap();
+        cypher(&mut db, "MATCH (n:User) WHERE n.id = 'bob' SET n.age = 7").unwrap();
+        assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A new node still may not join them.
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Nor may a frame that touches a duplicate and takes its value.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "age", Value::Int(8));
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // Nor may carol take it.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn an_upsert_that_resends_a_duplicates_value_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-upsert");
+        let before_resend = |name: &str| {
+            vec![
+                ("name".to_string(), Value::Str(name.into())),
+                ("email".to_string(), Value::Str("a@x".into())),
+            ]
+        };
+        // A client that re-sends the full property set of a duplicate.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("Bob"), OnConflict::Replace);
+        })
+        .unwrap();
+        // A MERGE that matches it and sets another property.
+        cypher(
+            &mut db,
+            "MERGE (n:User {id: 'bob'}) ON MATCH SET n.name = 'Robert'",
+        )
+        .unwrap();
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n += {name: 'Al'}",
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A rewrite beside a new claim on the same value is still refused: the
+        // rewritten duplicate holds it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("B"), OnConflict::Replace);
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // An upsert that adds the field to a node without one is a claim.
+        db.insert_node("User", "erin", vec![]).unwrap();
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "erin", before_resend("E"), OnConflict::Replace);
+        }));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_changed_value_is_judged() {
+        let (_dir, mut db) = store_with_grandfathered_duplicates("grandfather-changed");
+        // Carol may not take the shared value, and a Float equal to it is the
+        // same value.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        // A batch that changes bob's value and puts it back leaves it as it was.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Changed away and back across two frames in one batch of ops, with a
+        // claim in between by another node, is judged on the end state: bob
+        // holds a@x again, so carol cannot have it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        }));
+        // Bob moving away lets carol have it only while alice does not hold it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        }));
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_prop("carol", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_can_be_fixed_or_removed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-fix");
+        // Re-asserting the value it shares changes nothing.
+        db.set_prop("bob", "email", Value::Str("a@x".into()))
+            .unwrap();
+        // Moving it somewhere free fixes it, and alice is then the only holder.
+        db.set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Deleting a holder frees its value.
+        db.delete_node("alice").unwrap();
+        db.insert_node("User", "dave", email("a@x")).unwrap();
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("dave", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("b@x".into()))
+        );
+    }
+
+    #[test]
+    fn replay_is_the_same_live_reopened_and_as_of() {
+        // Every frame was valid when written, and the sequence leans on the
+        // order: a value handed on, swapped, freed by a delete.
+        let (dir, mut db) = constrained("replay-differential");
+        let mut live: Vec<Vec<(String, Option<Value>)>> = Vec::new();
+        let mut seqs = Vec::new();
+        let observe = |db: &GraphDb| -> Vec<(String, Option<Value>)> {
+            ["alice", "bob", "carol"]
+                .iter()
+                .map(|k| (k.to_string(), db.get_prop(k, "email")))
+                .collect()
+        };
+        let mut record = |db: &GraphDb| {
+            live.push(observe(db));
+            seqs.push(db.commit_seq() - 1);
+        };
+        record(&db);
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "email", Value::Str("b@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.insert_node("User", "carol", email("b@x"));
+        })
+        .unwrap();
+        record(&db);
+        db.drop_constraint("uniq_email").unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        record(&db);
+        drop(db);
+
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(&observe(&reopened), live.last().unwrap());
+        assert!(reopened.constraints().is_empty());
+        for (seq, expected) in seqs.iter().zip(&live) {
+            let at = GraphDb::open_at(&dir, *seq).unwrap();
+            assert_eq!(&observe(&at), expected, "open_at {seq}");
+        }
+    }
+
+    // ── What the frame leaves behind is what is judged ──────────────────────
+
+    #[test]
+    fn a_frame_that_frees_a_value_may_take_it() {
+        let (_dir, mut db) = constrained("frees");
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        // Swap two values in one commit.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "email", Value::Str("b@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        // Delete the holder and give its value to a new node.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.insert_node("User", "carol", email("b@x"));
+        })
+        .unwrap();
+        // Remove a value and hand it on.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.remove_prop("carol", "email");
+            b.set_prop("bob", "email", Value::Str("b@x".into()));
+        })
+        .unwrap();
+        // Writing a node's own value again is no conflict.
+        db.set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        // A rename keeps the node, and so its value.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.rename_node("bob", "robert");
+            b.set_prop("robert", "email", Value::Str("b@x".into()));
+        })
+        .unwrap();
+        assert_violation(db.insert_node("User", "eve", email("b@x")));
+        // Deleting and re-inserting a key in one frame is a new node, which
+        // still may not take a value another node keeps.
+        db.insert_node("User", "frank", email("f@x")).unwrap();
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("frank");
+            b.insert_node("User", "frank", email("b@x"));
+        }));
+    }
+
+    // ── Uniqueness means what the query language's equality means (TY-5b) ───
+
+    fn num(v: Value) -> Vec<(String, Value)> {
+        vec![("v".into(), v)]
+    }
+
+    fn is_violation<T: std::fmt::Debug>(r: &Result<T, GraphError>) -> bool {
+        matches!(r, Err(GraphError::ConstraintViolation { constraint, field })
+            if constraint == "uniq_v" && field == "v")
+    }
+
+    fn numeric_store(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+        (dir, db)
+    }
+
+    /// `Int` 2 and `Float` 2.0 are one value to `MATCH (n {v: 2})`, so they are
+    /// one value to the constraint, in either order and by every route.
+    #[test]
+    fn an_int_and_the_equal_float_conflict() {
+        for (first, second) in [
+            (Value::Int(2), Value::Float(2.0)),
+            (Value::Float(2.0), Value::Int(2)),
+            (Value::Int(0), Value::Float(-0.0)),
+            (Value::Float(-0.0), Value::Int(0)),
+            (Value::Float(0.0), Value::Float(-0.0)),
+        ] {
+            // Across commits.
+            let (dir, mut db) = numeric_store("int-float");
+            db.insert_node("N", "a", num(first.clone())).unwrap();
+            let before = wal_bytes(&dir);
+            let r = db.insert_node("N", "b", num(second.clone()));
+            assert!(is_violation(&r), "{first:?} then {second:?}: {r:?}");
+            assert_eq!(wal_bytes(&dir), before);
+            // By set_prop on an existing node.
+            db.insert_node("N", "c", num(Value::Str("free".into())))
+                .unwrap();
+            let r = db.set_prop("c", "v", second.clone());
+            assert!(is_violation(&r), "{first:?} then set {second:?}: {r:?}");
+            // Inside one batch.
+            let (_dir, mut db) = numeric_store("int-float-batch");
+            let r = db.write_batch(|b: &mut Batch<'_>| {
+                b.insert_node("N", "a", num(first.clone()));
+                b.insert_node("N", "b", num(second.clone()));
+            });
+            assert!(is_violation(&r), "batch {first:?} + {second:?}: {r:?}");
+            assert_eq!(db.node_count(), 0);
+            // The query language agrees that they are equal.
+            let (_dir, mut db) = open_temp("int-float-scan");
+            db.insert_node("N", "a", num(first.clone())).unwrap();
+            db.insert_node("N", "b", num(second.clone())).unwrap();
+            let rows = db
+                .query(
+                    &format!("MATCH (n:N {{v: {}}}) RETURN n", cypher_literal(&first)),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{first:?} and {second:?} are equal in a scan"
+            );
+        }
+    }
+
+    fn cypher_literal(v: &Value) -> String {
+        match v {
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => format!("{f:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Different numbers, and `NaN` (equal to nothing), never conflict.
+    #[test]
+    fn unequal_numbers_and_nan_do_not_conflict() {
+        let (_dir, mut db) = numeric_store("distinct");
+        db.insert_node("N", "a", num(Value::Int(2))).unwrap();
+        db.insert_node("N", "b", num(Value::Float(2.5))).unwrap();
+        db.insert_node("N", "c", num(Value::Int(3))).unwrap();
+        db.insert_node("N", "d", num(Value::Float(f64::NAN)))
+            .unwrap();
+        db.insert_node("N", "e", num(Value::Float(f64::NAN)))
+            .unwrap();
+        // The same value written again by its own node is no conflict.
+        db.set_prop("a", "v", Value::Float(2.0)).unwrap();
+        db.set_prop("a", "v", Value::Int(2)).unwrap();
+    }
+
+    /// Past 2^53 the scan's equality is `i as f64 == f`: two `Int`s differ
+    /// whenever their values do, and an `Int` equals the `Float` it rounds to.
+    /// The constraint follows exactly that, as the index does (TY-8).
+    #[test]
+    fn large_integers_follow_the_scans_equality() {
+        let big = 1_i64 << 53;
+        let (_dir, mut db) = numeric_store("large");
+        db.insert_node("N", "a", num(Value::Int(big))).unwrap();
+        // Another Int is another value, even though both convert to one f64.
+        db.insert_node("N", "b", num(Value::Int(big + 1))).unwrap();
+        // The Float 2^53 equals Int(2^53) (and Int(2^53 + 1) too).
+        let r = db.insert_node("N", "c", num(Value::Float(big as f64)));
+        assert!(is_violation(&r), "{r:?}");
+        // The next Float up equals no stored value.
+        db.insert_node("N", "d", num(Value::Float((big as f64).next_up())))
+            .unwrap();
+        // And the reverse: a Float first, then each Int that rounds to it.
+        let (_dir, mut db) = numeric_store("large-float-first");
+        db.insert_node("N", "f", num(Value::Float(big as f64)))
+            .unwrap();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "a",
+            num(Value::Int(big))
+        )));
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Int(big + 1))
+        )));
+        // i64::MAX rounds to 2^63 as a float.
+        let (_dir, mut db) = numeric_store("large-max");
+        db.insert_node("N", "a", num(Value::Int(i64::MAX))).unwrap();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Float(9_223_372_036_854_775_808.0))
+        )));
+    }
+
+    /// The same answer after a reopen, where the index is rebuilt from columns.
+    #[test]
+    fn numeric_uniqueness_survives_a_reopen() {
+        let (dir, mut db) = numeric_store("numeric-reopen");
+        db.insert_node("N", "a", num(Value::Int(2))).unwrap();
+        drop(db);
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Float(2.0))
+        )));
+    }
+
+    #[test]
+    fn values_without_an_index_key_and_other_labels_never_conflict() {
+        let (_dir, mut db) = constrained("no-key");
+        let list = Value::List(vec![Value::Int(1)]);
+        db.insert_node("User", "l1", vec![("email".into(), list.clone())])
+            .unwrap();
+        db.insert_node("User", "l2", vec![("email".into(), list)])
+            .unwrap();
+        db.insert_node("Admin", "root", email("a@x")).unwrap();
+        // An Int and a Str are different keys.
+        db.insert_node("User", "n", vec![("email".into(), Value::Int(1))])
+            .unwrap();
+        db.insert_node("User", "s", email("1")).unwrap();
+    }
+
+    #[test]
+    fn a_refused_write_leaves_no_interned_name_behind() {
+        // The refused insert names a field nothing else uses. If it were
+        // interned without its `Intern` record reaching the WAL, the next
+        // successful write would log ids that replay does not reproduce.
+        let (dir, mut db) = constrained("intern-rollback");
+        let mut props = email("a@x");
+        props.push(("fresh_field".into(), Value::Int(1)));
+        assert_violation(db.insert_node("User", "bob", props));
+        db.insert_node(
+            "Later",
+            "carol",
+            vec![("fresh_field".into(), Value::Int(7))],
+        )
+        .unwrap();
+        let live = db.node_info("carol").unwrap();
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.node_info("carol"), Some(live));
+    }
+
+    // ── Declaration lifecycle ────────────────────────────────────────────────
+
+    #[test]
+    fn dropping_a_constraint_keeps_its_index_and_stops_the_check() {
+        let (dir, mut db) = constrained("drop");
+        assert!(matches!(
+            db.disable_index("User", "email"),
+            Err(GraphError::QueryError { ref detail }) if detail.contains("uniq_email")
+        ));
+        assert!(matches!(
+            db.create_constraint("uniq_email", "User", "email"),
+            Err(GraphError::QueryError { .. })
+        ));
+        db.drop_constraint("uniq_email").unwrap();
+        assert!(db.constraints().is_empty());
+        assert!(db.is_index_enabled("User", "email"), "the index stays");
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        assert!(matches!(
+            db.drop_constraint("uniq_email"),
+            Err(GraphError::QueryError { .. })
+        ));
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        assert!(reopened.constraints().is_empty());
+        assert!(reopened.is_index_enabled("User", "email"));
+        reopened.disable_index("User", "email").unwrap();
+    }
+
+    #[test]
+    fn a_reopened_handle_enforces_a_replayed_constraint_and_can_drop_it() {
+        // A store whose WAL already holds a constraint: the reopened handle is
+        // V11 already, enforces the constraint, and withdrawing it — another
+        // V11 record — needs no second upgrade.
+        let (dir, db) = constrained("reopen-drop");
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        assert!(reopened.is_v11());
+        let before = wal_bytes(&dir);
+        assert_violation(reopened.insert_node("User", "bob", email("a@x")));
+        assert_eq!(wal_bytes(&dir), before);
+        let snapshot_before = std::fs::read(dir.join("snapshot.bin")).unwrap();
+        reopened.drop_constraint("uniq_email").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("snapshot.bin")).unwrap(),
+            snapshot_before,
+            "a V11 store is not snapshotted again for its next V11 record"
+        );
+        assert!(reopened.constraints().is_empty());
+        reopened.insert_node("User", "bob", email("a@x")).unwrap();
+    }
+
+    #[test]
+    fn a_truncating_snapshot_re_emits_the_declaration() {
+        let (dir, mut db) = constrained("snapshot-truncate");
+        db.snapshot().unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.constraints().len(), 1);
+        assert_violation(reopened.insert_node("User", "bob", email("a@x")));
+    }
+    // ── Cypher REMOVE and SET maps (QL-05, QL-06) ────────────────────────────
+
+    fn cypher(db: &mut GraphDb, q: &str) -> Result<mushroomdb::ResultSet, GraphError> {
+        db.query_write(q, &BTreeMap::new())
+    }
+
+    #[test]
+    fn cypher_remove_of_a_unique_property_frees_the_value_for_another_node() {
+        let (dir, mut db) = constrained("cypher-remove");
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' REMOVE n.email",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'a@x'})").unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Alice can no longer take it back.
+        assert_violation(cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n.email = 'a@x'",
+        ));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.get_prop("alice", "email"), None);
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn cypher_set_maps_meet_the_unique_constraint_and_write_nothing_when_refused() {
+        let (dir, mut db) = constrained("cypher-set-map");
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'b@x', age: 3})").unwrap();
+        let before = wal_bytes(&dir);
+        for q in [
+            "MATCH (n:User) WHERE n.id = 'bob' SET n = {email: 'a@x'}",
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x', age: 4}",
+        ] {
+            assert_violation(cypher(&mut db, q));
+            assert_eq!(wal_bytes(&dir), before, "{q}: a refused write appended");
+            assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("b@x".into())));
+            assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(3)), "{q}");
+        }
+        // A replace that drops the property frees its value in the same store.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n = {name: 'A'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // `+= {email: null}` frees it again.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: null}",
+        )
+        .unwrap();
+        cypher(&mut db, "CREATE (n:User {id: 'carol', email: 'a@x'})").unwrap();
+    }
+
+    #[test]
+    fn unwind_create_meets_the_unique_constraint_and_writes_nothing_when_a_row_violates_it() {
+        let (dir, mut db) = constrained("cypher-unwind-create");
+        let before = wal_bytes(&dir);
+        let row = |id: &str, mail: &str| {
+            Value::Map(BTreeMap::from([
+                ("id".to_string(), Value::Str(id.into())),
+                ("email".to_string(), Value::Str(mail.into())),
+            ]))
+        };
+        // Row 3 repeats alice's email.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![
+                row("u1", "1@x"),
+                row("u2", "2@x"),
+                row("u3", "a@x"),
+                row("u4", "4@x"),
+            ]),
+        )]);
+        let q = "UNWIND $rows AS r CREATE (:User {id: r.id, email: r.email})";
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before, "a refused statement appended");
+        for key in ["u1", "u2", "u3", "u4"] {
+            assert!(!db.has_node(key), "{key} was written");
+        }
+        // Two rows of one statement that share a value are refused too.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("v1", "same@x"), row("v2", "same@x")]),
+        )]);
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before);
+        // Rows that are distinct commit as one frame.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("w1", "w1@x"), row("w2", "w2@x")]),
+        )]);
+        db.query_write(q, &params).unwrap();
+        assert!(db.has_node("w1") && db.has_node("w2"));
+    }
+
+    // ── The scan over existing data (TY-6) ───────────────────────────────────
+
+    fn conflict(result: Result<(), GraphError>) -> Vec<(String, Value)> {
+        match result {
+            Err(GraphError::ConstraintCreationConflict { violations, total }) => {
+                assert_eq!(total, violations.len(), "an uncapped conflict lists all");
+                violations
+            }
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        }
+    }
+
+    fn sorted(mut v: Vec<(String, Value)>) -> Vec<(String, Value)> {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    #[test]
+    fn test_constraint_creation_conflict() {
+        let (dir, mut db) = open_temp("scan-conflict");
+        db.insert_node("User", "alice", email("dup@x.com")).unwrap();
+        db.insert_node("User", "bob", email("dup@x.com")).unwrap();
+        db.insert_node("User", "carol", email("c@x.com")).unwrap();
+        let before = wal_bytes(&dir);
+        let violations = conflict(db.create_constraint("uniq_email", "User", "email"));
+        assert_eq!(
+            sorted(violations),
+            vec![
+                ("alice".to_string(), Value::Str("dup@x.com".into())),
+                ("bob".to_string(), Value::Str("dup@x.com".into())),
+            ]
+        );
+        assert_eq!(
+            wal_bytes(&dir),
+            before,
+            "a refused declaration was appended"
+        );
+        assert!(db.constraints().is_empty());
+        assert!(!db.is_index_enabled("User", "email"));
+        // Nothing is enforced, and removing the duplicate lets it through.
+        db.delete_node("bob").unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        assert_eq!(db.constraints().len(), 1);
+    }
+
+    #[test]
+    fn the_scan_compares_with_the_query_languages_equality() {
+        // Int 2 and Float 2.0 are one value; so are the zeros; NaN equals nothing.
+        let (dir, mut db) = open_temp("scan-numbers");
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        put(&mut db, "int2", Value::Int(2));
+        put(&mut db, "float2", Value::Float(2.0));
+        put(&mut db, "zero", Value::Int(0));
+        put(&mut db, "negzero", Value::Float(-0.0));
+        put(&mut db, "nan1", Value::Float(f64::NAN));
+        put(&mut db, "nan2", Value::Float(f64::NAN));
+        put(&mut db, "three", Value::Int(3));
+        put(&mut db, "list1", Value::List(vec![Value::Int(1)]));
+        put(&mut db, "list2", Value::List(vec![Value::Int(1)]));
+        let before = wal_bytes(&dir);
+        let violations = sorted(conflict(db.create_constraint("uniq_v", "N", "v")));
+        let keys: Vec<&str> = violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["float2", "int2", "negzero", "zero"]);
+        assert_eq!(violations[0].1, Value::Float(2.0));
+        assert_eq!(violations[1].1, Value::Int(2));
+        assert_eq!(wal_bytes(&dir), before);
+    }
+
+    #[test]
+    fn the_scan_reads_only_live_nodes_of_the_label() {
+        let (_dir, mut db) = open_temp("scan-scope");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("Admin", "root", email("a@x")).unwrap();
+        db.insert_node("User", "gone", email("a@x")).unwrap();
+        db.delete_node("gone").unwrap();
+        db.insert_node("User", "noemail", vec![]).unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+    }
+
+    #[test]
+    fn the_scan_sees_values_held_in_a_snapshot_and_after_a_reopen() {
+        let (dir, mut db) = open_temp("scan-snapshot");
+        db.insert_node("User", "alice", email("dup@x")).unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        db.snapshot().unwrap();
+        // A value moved by the overlay, and a node written after the snapshot.
+        db.set_prop("bob", "email", Value::Str("dup@x".into()))
+            .unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        let live = sorted(conflict(db.create_constraint(
+            "uniq_email",
+            "User",
+            "email",
+        )));
+        assert_eq!(live.len(), 2);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            sorted(conflict(reopened.create_constraint(
+                "uniq_email",
+                "User",
+                "email"
+            ))),
+            live
+        );
+        reopened
+            .set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        reopened
+            .create_constraint("uniq_email", "User", "email")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_constraint_drop_and_recreate_same_field() {
+        // Review Focus #4.
+        let (_dir, mut db) = open_temp("recreate");
+        db.insert_node("User", "alice", email("a@x.com")).unwrap();
+        db.insert_node("User", "bob", email("b@x.com")).unwrap();
+        db.create_constraint("c1", "User", "email").unwrap();
+        db.drop_constraint("c1").unwrap();
+        db.create_constraint("c2", "User", "email").unwrap();
+        assert!(db.constraints().iter().any(|c| c.name == "c2"));
+        assert!(!db.constraints().iter().any(|c| c.name == "c1"));
+    }
+
+    #[test]
+    fn a_view_owned_property_is_refused_before_the_scan() {
+        let (_dir, mut db) = open_temp("scan-view-first");
+        db.insert_node("User", "u1", vec![]).unwrap();
+        db.insert_node("User", "u2", vec![]).unwrap();
+        // Both nodes hold the view's `deg = 0`, so a scan would find a conflict.
+        db.create_view(deg_view()).unwrap();
+        match db.create_constraint("uniq_deg", "User", "deg") {
+            Err(GraphError::QueryError { detail }) => assert!(detail.contains("owned by view")),
+            other => panic!("expected the view refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_conflict_list_is_capped_in_node_id_order_and_counts_them_all() {
+        let (dir, mut db) = open_temp("scan-cap");
+        for i in 0..150 {
+            db.insert_node("User", &format!("u{i:03}"), email("dup@x"))
+                .unwrap();
+        }
+        // Id order is insertion order, which is not key order here.
+        db.insert_node("User", "a-last", email("dup@x")).unwrap();
+        let check = |db: &mut GraphDb| match db.create_constraint("uniq_email", "User", "email") {
+            Err(e @ GraphError::ConstraintCreationConflict { .. }) => {
+                let text = e.to_string();
+                let GraphError::ConstraintCreationConflict { violations, total } = e else {
+                    unreachable!()
+                };
+                assert_eq!(total, 151);
+                assert_eq!(violations.len(), 100);
+                let keys: Vec<String> = violations.iter().map(|(k, _)| k.clone()).collect();
+                let expected: Vec<String> = (0..100).map(|i| format!("u{i:03}")).collect();
+                assert_eq!(keys, expected, "node-id order, not sorted");
+                assert!(violations
+                    .iter()
+                    .all(|(_, v)| v == &Value::Str("dup@x".into())));
+                assert_eq!(
+                    text,
+                    "cannot create the constraint: 151 existing nodes hold duplicate values \
+                     (first 100 listed)"
+                );
+            }
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        };
+        check(&mut db);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        check(&mut reopened);
+    }
+
+    /// Past 2^53 an `Int` equals the `Float` it rounds to and two `Int`s are
+    /// equal only when they are the same integer, so equality is not
+    /// transitive: the scan must report a pair of unequal `Int`s that a `Float`
+    /// ties together, and not report the `Int`s alone.
+    #[test]
+    fn the_scan_follows_the_large_integer_equality() {
+        let big = 1_i64 << 53;
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        let (_dir, mut db) = open_temp("scan-large-ints-alone");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        let (_dir, mut db) = open_temp("scan-large-ints-tied");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "c", Value::Float(big as f64));
+        let keys: Vec<String> = conflict(db.create_constraint("uniq_v", "N", "v"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+
+        // The next float up equals none of them.
+        let (_dir, mut db) = open_temp("scan-large-ints-next-up");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "d", Value::Float((big as f64).next_up()));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        // i64::MAX rounds to 2^63 as a float.
+        let (_dir, mut db) = open_temp("scan-large-ints-max");
+        put(&mut db, "a", Value::Int(i64::MAX));
+        put(&mut db, "b", Value::Float(9_223_372_036_854_775_808.0));
+        assert_eq!(conflict(db.create_constraint("uniq_v", "N", "v")).len(), 2);
+    }
+
+    #[test]
+    fn a_declaration_the_data_refuses_does_not_move_the_store_to_v11() {
+        // Duplicates present: the conflict, found before any record is built,
+        // so the store is not upgraded for a declaration that never lands.
+        let dir = tmp("conflict-no-upgrade");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        assert!(matches!(
+            db.create_constraint("uniq_email", "User", "email"),
+            Err(GraphError::ConstraintCreationConflict { .. })
+        ));
+        assert!(!db.is_v11());
+        assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), None);
+    }
+}

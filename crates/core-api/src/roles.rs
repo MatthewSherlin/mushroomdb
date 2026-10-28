@@ -47,7 +47,8 @@ use serde::{Deserialize, Serialize};
 /// Subset rule (enforced at `apply_schema` time):
 /// - `create_labels`, `update_labels`, and `delete_labels` must each be a
 ///   subset of the role's read `labels`.
-/// - `create_edge_types` and `delete_edge_types` have no subset requirement
+/// - `create_edge_types`, `update_edge_types` and `delete_edge_types` have no
+///   subset requirement
 ///   (edge types are not read-scoped).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct WriteScope {
@@ -69,6 +70,13 @@ pub struct WriteScope {
     /// edges cannot be directly deleted by any token, including Full).
     #[serde(default)]
     pub delete_edge_types: Vec<String>,
+    /// Edge types whose relationships the role may SET or REMOVE properties
+    /// on (Cypher `SET r.p`, `SET r += …`, `REMOVE r.p`). Both endpoints must
+    /// be read-visible. Creating a relationship with its property map needs
+    /// only `create_edge_types`, as a node's properties need only
+    /// `create_labels`.
+    #[serde(default)]
+    pub update_edge_types: Vec<String>,
 }
 
 /// One property test a role's visibility may carry, beside `labels`.
@@ -115,8 +123,14 @@ pub struct PropPredicate {
 ///
 /// The tagged form is tried first, so `{"Str": "x"}` never falls through to the
 /// scalar branch and is never mistaken for a map-valued property.
+///
+/// A format-V11 value (`{"Date": 19737}` and the like) is refused: a
+/// predicate is persisted in `roles.json`, which a 0.9.x reader would then
+/// report as corrupt. The JSON tagged forms (`{"$date": …}`) are not accepted
+/// here at all.
 fn value_from_json(j: serde_json::Value) -> std::result::Result<Value, String> {
     if let Ok(v) = serde_json::from_value::<Value>(j.clone()) {
+        refuse_v11_value(&v)?;
         return Ok(v);
     }
     match j {
@@ -131,6 +145,16 @@ fn value_from_json(j: serde_json::Value) -> std::result::Result<Value, String> {
             "visible_where: {other} is not a value — use a string, number or boolean, \
              or the tagged form such as {{\"Str\": \"published\"}}"
         )),
+    }
+}
+
+fn refuse_v11_value(v: &Value) -> std::result::Result<(), String> {
+    match core_storage::v11_only_type(v) {
+        Some(type_name) => Err(format!(
+            "visible_where: {}",
+            core_storage::v11_type_refusal(type_name)
+        )),
+        None => Ok(()),
     }
 }
 
@@ -206,8 +230,18 @@ impl PropPredicate {
     }
 
     /// Reject a predicate that does not name exactly one test of one field.
+    ///
+    /// Also refuses a format-V11 value, however the predicate was built: this
+    /// is the predicate a role persists to `roles.json`.
     pub fn validate(&self) -> std::result::Result<(), String> {
-        self.validate_named("visible_where")
+        self.validate_named("visible_where")?;
+        if let Some(v) = &self.eq {
+            refuse_v11_value(v)?;
+        }
+        for v in self.in_.iter().flatten() {
+            refuse_v11_value(v)?;
+        }
+        Ok(())
     }
 }
 

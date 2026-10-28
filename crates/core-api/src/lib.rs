@@ -1,11 +1,16 @@
+pub mod access_keys;
 pub mod algo;
 mod db;
 pub mod digest;
+mod durable_wal;
 mod exact_knn;
 pub mod explain_digest;
 pub mod history;
 mod ingest;
+mod layer;
 pub mod mask;
+/// All functions in this module are memory-API. A plain `GraphDb` with no memory
+/// schema applied imposes none of these behaviours on ordinary nodes.
 pub mod memory;
 pub mod memory_schema;
 pub mod reader;
@@ -14,12 +19,17 @@ pub mod roles;
 pub mod schema;
 mod shared;
 pub mod subscription;
+mod transaction;
 
 pub use algo::{
     AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
     PageRankReport, WccConfig, WccReport,
 };
-pub use core_query::{CmpOp, Dir, Filter, ResultSet};
+pub use core_query::cypher::{clock_micros, with_entity_detail};
+pub use core_query::{
+    node_element_id, relationship_element_id, CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity,
+    PathEntity, RelationshipEntity, ResultSet, WriteStats,
+};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
     default_max_edges, is_keymatch_rooted, AggFn, BuildProgress, Predicate, RuleDef,
@@ -27,19 +37,24 @@ pub use core_rules::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, HNSW_BUILD_BATCH, MAX_CHAIN_DEPTH,
 };
 pub use core_storage::fs::RealFs;
-pub use core_storage::{Direction, GraphError, Result, Value};
+pub use core_storage::{
+    tagged_text, v11_display_text, value_from_tagged_text, Direction, GraphError, Result,
+    UniqueConstraint, Value, BINARY_MAX_BYTES,
+};
 pub use db::{
     ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,
 };
-pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
+pub use db::{explain_plan_value, is_explain_query};
 pub use db::{
-    snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,
-    BatchBuilder, BatchOp, BatchOutcome, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge,
-    FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo,
-    NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry,
-    SlowQuerySnapshot, SnapshotOptions, SnapshotStop, Stats, WhatIf, WriteAuthz,
-    MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
+    is_generated_key, snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope,
+    BackupReport, BatchBuilder, BatchOp, BatchOutcome, DeleteReport, EdgeAt, EdgeInfo, Explanation,
+    ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats,
+    NodeInfo, NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats,
+    SchemaError, SchemaErrorKind, SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, SnapshotStop,
+    Stats, WhatIf, WriteAuthz, GENERATED_KEY_PREFIX, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
+    NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
+pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
 
 /// The similarity floor `find_similar` applies when the caller names none.
@@ -60,15 +75,19 @@ pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 /// Exposed so CLI and tooling can print `V<SNAPSHOT_VERSION>` without depending
 /// directly on `core-storage`.
 ///
-/// Since v0.6.10 this build writes 9 **or** 10 depending on the store
+/// This build writes 9, 10 or 11 depending on the store
 /// (`core_storage::snapshot::version_for`: a store that has called
-/// `GraphDb::enable_multiplicity` writes 10) and reads 5 through 10. Compare a
-/// store's stamp against this with `>=`, never `==` — see `cli::run_migrate`,
-/// which would otherwise report an opted-in store as `V10 -> V9`.
+/// `GraphDb::enable_multiplicity` writes 10, and one that has used a 0.10
+/// value type, unique constraint or range index writes 11) and reads 5
+/// through 11. Compare a store's stamp against this with `>=`, never `==` —
+/// see `cli::run_migrate`, which would otherwise report an opted-in store as
+/// `V10 -> V9`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
+pub use access_keys::{add_key, hash_token, AccessKeys, AccessKeysError, KeyTier, MIN_TOKEN_BYTES};
+pub use durable_wal::{disk_snapshot_ident, disk_wal_ident, WalPosition};
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{
-    json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
+    json_to_rows, json_to_value, tagged_json, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use mask::{MaskMode, NodeMask, RoleMaskCache, Scope};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
@@ -76,6 +95,7 @@ pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
 pub use shared::{SharedDb, WriteGuard};
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
+pub use transaction::Transaction;
 
 /// One verification entry per section: `(section_id, section_name, bytes_checked, result)`.
 ///
@@ -111,6 +131,13 @@ pub fn verify_snapshot(dir: &std::path::Path) -> crate::Result<Vec<SectionVerify
 pub fn is_write_query(cypher: &str) -> std::result::Result<bool, String> {
     let toks = core_query::cypher::lex(cypher).map_err(|e| format!("lex: {e}"))?;
     Ok(core_query::cypher::is_write_tokens(&toks))
+}
+
+/// Whether `cypher` is a schema statement (`CREATE INDEX`, `DROP CONSTRAINT`,
+/// `SHOW INDEXES`, …).
+pub fn is_schema_query(cypher: &str) -> std::result::Result<bool, String> {
+    let toks = core_query::cypher::lex(cypher).map_err(|e| format!("lex: {e}"))?;
+    Ok(core_query::cypher::is_ddl_tokens(&toks))
 }
 
 /// Return the number of valid frames in the live WAL of the database at `dir`.

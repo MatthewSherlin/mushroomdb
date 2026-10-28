@@ -11,6 +11,36 @@ use super::ast::{
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
 
+/// One hop of a named path: the relationship binding and the node it lands
+/// on. A variable-length or shortest-path hop also names the hidden variable
+/// that holds the walk, since its `rel_var` only carries a hop count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathHop {
+    pub rel_var: String,
+    pub to_var: String,
+    pub trail_var: Option<String>,
+}
+
+/// One end of an [`PlanOp::IndexRangeScan`] range: `field > value` (or `>=`
+/// when `inclusive`) for a lower bound, `field < value` (or `<=`) for an
+/// upper one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeBound {
+    pub value: Operand,
+    pub inclusive: bool,
+}
+
+/// The `ORDER BY n.field [DESC] [SKIP s] LIMIT k` that follows an
+/// [`PlanOp::IndexRangeScan`] over `field`: the scan need only produce the
+/// candidates for the first `s + k` sorted rows. The `OrderBy`, `Skip` and
+/// `Limit` ops stay in the plan and do the sorting and slicing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeOrder {
+    pub descending: bool,
+    pub skip: Option<LimitSkip>,
+    pub limit: LimitSkip,
+}
+
 /// One operator in the logical plan. Patterns compile left-to-right into
 /// scan / join / expand ops; WHERE is a single `Filter`; then `Project`,
 /// rewritten `OrderBy`, `Skip`, `Limit` in that order.
@@ -54,6 +84,32 @@ pub enum PlanOp {
         label: Option<String>,
         equalities: Vec<(String, Operand)>,
     },
+    /// Range-index lookup: seed rows from the nodes of `label` whose `field`
+    /// lies within `lo`/`hi`, or starts with `prefix`; with `order`, only
+    /// the ones an `ORDER BY` over `field` followed by `LIMIT` can keep.
+    ///
+    /// Emitted by [`fold_range_predicates`] for a `WHERE` conjunct
+    /// `n.field < | <= | > | >= <literal or $param>` (either side) or
+    /// `n.field STARTS WITH <literal or $param>`, and by
+    /// [`fold_index_order`] for `ORDER BY n.field … LIMIT`. The `Filter` the
+    /// bounds came from stays in the plan, whole, so the op only narrows the
+    /// candidates: the rows are those of `ScanLabel` + that `Filter`.
+    ///
+    /// The executor answers from the range index when one is declared on
+    /// `(label, field)` and the view carries it, and the bounds are of a
+    /// class the index orders (numbers, strings, the temporal types except
+    /// `Duration`, binary); otherwise it scans the label. Either way the
+    /// candidates come out in node-id order, the order a label scan gives, so
+    /// the rows and their order do not depend on whether an index exists.
+    IndexRangeScan {
+        var: String,
+        label: String,
+        field: String,
+        lo: Option<RangeBound>,
+        hi: Option<RangeBound>,
+        prefix: Option<Operand>,
+        order: Option<RangeOrder>,
+    },
     /// Retain rows whose `var` node matches the pattern-map props.
     LookupProps {
         var: String,
@@ -65,6 +121,10 @@ pub enum PlanOp {
     /// If `to` is already bound in the row, the executor keeps only edges
     /// that land on that bound id (JoinBound semantics *inside* Expand).
     /// `rel_var` is always `Some` after planning: user name or `_rN`.
+    ///
+    /// `distinct_from` names the relationship bindings of the earlier hops
+    /// of the same MATCH clause (see [`PlanOp::VarExpand`]); an edge any of
+    /// them holds is skipped.
     Expand {
         from: String,
         rel_var: Option<String>,
@@ -73,6 +133,7 @@ pub enum PlanOp {
         to: String,
         to_label: Option<String>,
         to_props: Vec<(String, Operand)>,
+        distinct_from: Vec<String>,
     },
     /// Pattern-*start* node whose var is already bound: label/prop re-check only.
     JoinBound {
@@ -93,8 +154,13 @@ pub enum PlanOp {
     /// After `plan`, every item's `target` is `OrderTarget::Alias(column)`
     /// where `column` is a projected column name. The executor resolves
     /// ORDER BY against the post-Project table only.
+    ///
+    /// A key that is not a RETURN item is projected as a trailing hidden
+    /// column; `visible_columns` is then the number of leading columns the
+    /// result keeps once the sort is done. `None` keeps every column.
     OrderBy {
         items: Vec<OrderItem>,
+        visible_columns: Option<usize>,
     },
     Skip(LimitSkip),
     Limit(LimitSkip),
@@ -139,6 +205,16 @@ pub enum PlanOp {
     /// allowed.  `rel_var`, when present, is bound to a virtual path cell
     /// whose sole accessible property is `length` (hop count as `Int`).
     ///
+    /// The destination's label and inline properties (`to_label` /
+    /// `to_props`) are checked on the node a walk ends at, never on the nodes
+    /// it passes through: a walk may continue through a node that fails them.
+    ///
+    /// Relationship uniqueness spans the whole MATCH clause (openCypher): a
+    /// walk also skips every edge bound by an earlier hop of the same clause,
+    /// all comma-separated parts included. `distinct_from` names those
+    /// bindings: a fixed hop's relationship variable, or a variable-length or
+    /// shortest-path hop's trail variable. Earlier clauses are not listed.
+    ///
     /// Always executes via the **staged path** regardless of LIMIT.
     /// The 1 M intermediate-row budget applies to the output row count.
     VarExpand {
@@ -147,8 +223,15 @@ pub enum PlanOp {
         etypes: Vec<String>,
         dir: RelDir,
         to: String,
+        to_label: Option<String>,
+        to_props: Vec<(String, Operand)>,
         min: u8,
         max: u8,
+        /// When set, the hidden variable that receives the nodes and
+        /// relationships this hop walked: the pattern is a named path, or a
+        /// later hop of the same MATCH clause must not reuse those edges.
+        trail_var: Option<String>,
+        distinct_from: Vec<String>,
     },
     /// Shortest path between two already-bound nodes via BFS.
     ///
@@ -168,6 +251,19 @@ pub enum PlanOp {
         dir: RelDir,
         to: String,
         max_hops: u8,
+        /// As on `VarExpand`: the hidden variable that receives the walk.
+        trail_var: Option<String>,
+        /// As on `VarExpand`: the search never uses an edge these hold.
+        distinct_from: Vec<String>,
+    },
+    /// Bind a named path (`MATCH p = (a)-[r]->(b)`): assemble the nodes and
+    /// relationships the pattern's other ops bound, in pattern order, into
+    /// one path value bound to `path_var`. Emitted after the pattern's last
+    /// hop. A zero-hop pattern (`p = (a)`) has no `hops`.
+    BindPath {
+        path_var: String,
+        start_var: String,
+        hops: Vec<PathHop>,
     },
     /// Non-aggregate WITH: apply filter / order / skip / limit to the current
     /// row set without projecting. Node bindings in the row survive as-is so
@@ -187,6 +283,7 @@ pub enum PlanOp {
     /// - `list: UnwindExpr::Lit(v)` → use a literal list.
     /// - `list: UnwindExpr::Prop { var, field }` → resolve the list from a node property.
     /// - `list: UnwindExpr::Var(name)` → look up a scalar binding from a prior WITH.
+    /// - `list: UnwindExpr::Expr(op)` → evaluate a list expression per row.
     ///
     /// null / empty list → 0 output rows (openCypher).
     /// Non-list → named error at execution time.
@@ -272,6 +369,10 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     {
         return None;
     }
+    // A named path is assembled from the whole binding table.
+    if ops.iter().any(|op| matches!(op, PlanOp::BindPath { .. })) {
+        return None;
+    }
     // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
     // path so that intermediate rows are correctly bounded and sequenced.
     if ops.iter().any(|op| {
@@ -330,6 +431,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
                 | PlanOp::ScanKey { .. }
                 | PlanOp::IndexScan { .. }
                 | PlanOp::IndexIntersect { .. }
+                | PlanOp::IndexRangeScan { order: None, .. }
                 | PlanOp::LookupProps { .. }
                 | PlanOp::Expand { .. }
                 | PlanOp::Filter { .. }
@@ -345,6 +447,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
                 | PlanOp::ScanKey { .. }
                 | PlanOp::IndexScan { .. }
                 | PlanOp::IndexIntersect { .. }
+                | PlanOp::IndexRangeScan { .. }
         )
     })
     // Exactly one Project (ensures it is a RETURN query).
@@ -365,16 +468,14 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     let mut node_anon = 0u32;
     let mut rel_anon = 0u32;
 
-    for pat in &q.matches {
-        compile_pattern(
-            pat,
-            &mut ops,
-            &mut bound,
-            &mut rel_bound,
-            &mut node_anon,
-            &mut rel_anon,
-        )?;
-    }
+    compile_match_clauses(
+        &q.matches,
+        &mut ops,
+        &mut bound,
+        &mut rel_bound,
+        &mut node_anon,
+        &mut rel_anon,
+    )?;
 
     // OPTIONAL MATCH clauses (after required MATCHes).
     for oc in &q.optional_clauses {
@@ -405,6 +506,8 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     // Fold WHERE single-equality predicates into IndexScan ops before any
     // aggregate or project ops are appended.
     ops = fold_where_equalities(ops);
+    ops = fold_key_anchor_after_expand(ops);
+    ops = fold_range_predicates(ops);
 
     // Post-UNWIND WHERE: filter expanded rows using UNWIND alias bindings.
     if let Some(expr) = &q.post_unwind_where {
@@ -458,9 +561,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             _ => unreachable!(),
         };
         // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
-        if let (AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max, AggArg::Star) =
-            (&func, &arg)
-        {
+        if needs_property_arg(&func) && matches!(arg, AggArg::Star) {
             return Err(format!(
                 "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                 name = func_name(&func),
@@ -485,11 +586,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             match &item.value {
                 RetVal::Agg { func, arg } => {
                     // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
-                    if let (
-                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
-                        AggArg::Star,
-                    ) = (func, arg)
-                    {
+                    if needs_property_arg(func) && matches!(arg, AggArg::Star) {
                         return Err(format!(
                             "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                             name = func_name(func),
@@ -509,11 +606,11 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::GroupAggregate { keys, aggs });
         // ORDER BY + SKIP + LIMIT apply to the finished group result table.
         if !q.order_by.is_empty() {
-            let mut items = Vec::with_capacity(q.order_by.len());
-            for item in &q.order_by {
-                items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
-            }
-            ops.push(PlanOp::OrderBy { items });
+            let resolved = resolve_order_items(&q.order_by, &q.returns, &bound, &rel_bound, false)?;
+            ops.push(PlanOp::OrderBy {
+                items: resolved.items,
+                visible_columns: None,
+            });
         }
         if let Some(ls) = &q.skip {
             ops.push(PlanOp::Skip(ls.clone()));
@@ -524,19 +621,37 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         return Ok(ops);
     }
 
+    // ORDER BY keys that are not RETURN items ride along as hidden trailing
+    // columns of the projection. DISTINCT forbids them: a hidden column would
+    // change which rows are duplicates.
+    let resolved = if q.order_by.is_empty() {
+        None
+    } else {
+        Some(resolve_order_items(
+            &q.order_by,
+            &q.returns,
+            &bound,
+            &rel_bound,
+            !q.distinct,
+        )?)
+    };
+    let mut project_items = q.returns.clone();
+    if let Some(r) = &resolved {
+        project_items.extend(r.hidden.iter().cloned());
+    }
     ops.push(PlanOp::Project {
-        items: q.returns.clone(),
+        items: project_items,
     });
     if q.distinct {
         ops.push(PlanOp::Distinct);
     }
 
-    if !q.order_by.is_empty() {
-        let mut items = Vec::with_capacity(q.order_by.len());
-        for item in &q.order_by {
-            items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
-        }
-        ops.push(PlanOp::OrderBy { items });
+    if let Some(r) = resolved {
+        let visible_columns = (!r.hidden.is_empty()).then_some(q.returns.len());
+        ops.push(PlanOp::OrderBy {
+            items: r.items,
+            visible_columns,
+        });
     }
 
     if let Some(ls) = &q.skip {
@@ -546,7 +661,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::Limit(ls.clone()));
     }
 
-    Ok(ops)
+    Ok(fold_index_order(ops, q))
 }
 
 /// Compile one WITH pipeline stage.
@@ -571,11 +686,7 @@ fn compile_with_stage(
         for item in &stage.items {
             match &item.value {
                 RetVal::Agg { func, arg } => {
-                    if let (
-                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
-                        AggArg::Star,
-                    ) = (func, arg)
-                    {
+                    if needs_property_arg(func) && matches!(arg, AggArg::Star) {
                         return Err(format!(
                             "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
                             name = func_name(func),
@@ -623,10 +734,14 @@ fn compile_with_stage(
                     OrderTarget::Alias(name) => {
                         require_bound(name, bound, "ORDER BY in aggregate WITH")?;
                     }
+                    OrderTarget::Expr(op) => {
+                        check_operand_bound(op, bound, "ORDER BY in aggregate WITH")?;
+                    }
                 }
             }
             ops.push(PlanOp::OrderBy {
                 items: stage.order_by.clone(),
+                visible_columns: None,
             });
         }
         if let Some(ls) = &stage.skip {
@@ -670,6 +785,9 @@ fn compile_with_stage(
                         return Err(format!("unbound variable `{name}` in ORDER BY in WITH"));
                     }
                 }
+                OrderTarget::Expr(op) => {
+                    check_operand_bound(op, &with_scope, "ORDER BY in WITH")?;
+                }
             }
         }
         ops.push(PlanOp::With {
@@ -699,9 +817,7 @@ fn compile_with_stage(
     }
 
     // MATCH clauses that follow this WITH.
-    for pat in &stage.matches {
-        compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon)?;
-    }
+    compile_match_clauses(&stage.matches, ops, bound, rel_bound, node_anon, rel_anon)?;
     // OPTIONAL MATCH clauses that follow those MATCHes.
     for oc in &stage.optional_clauses {
         compile_optional_clause(oc, ops, bound, rel_bound, node_anon, rel_anon)?;
@@ -725,7 +841,11 @@ fn compile_with_stage(
 }
 
 fn id_lookup(props: &[(String, Operand)]) -> Option<&Operand> {
-    if props.len() == 1 && props[0].0 == "id" {
+    // A literal that is not a string names no key: a node whose key was
+    // generated may store `{id: 1}` as an ordinary property (QL-NM), which the
+    // property match finds.
+    let not_a_key = matches!(&props.first(), Some((_, Operand::Lit(v))) if !matches!(v, core_storage::Value::Str(_)));
+    if props.len() == 1 && props[0].0 == "id" && !not_a_key {
         Some(&props[0].1)
     } else {
         None
@@ -967,6 +1087,387 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     ops
 }
 
+/// Post-pass: turn `ScanLabel -> Expand.. -> Filter(key(n) = v)` into
+/// `ScanKey -> Expand..` so a key-anchored traversal is a point lookup rather
+/// than a scan of the whole label (ledger row 102).
+///
+/// `fold_where_equalities` refuses to fold across an `Expand`. This pass
+/// handles only the `key(n)` / `id(n)` function form (a plain id-map point
+/// lookup that `ScanKey` already restricts by label and visibility), and only
+/// when every op between the scan and the first `Filter` is an `Expand`,
+/// `LookupProps` or `JoinBound`: those neither rebind the scan variable nor
+/// change which scan rows survive, so applying the equality before them yields
+/// the same rows. Any other op (`With`, aggregate, optional, a second scan,
+/// `VarExpand`...) leaves the plan unchanged. Remaining AND terms stay as a
+/// residual `Filter` in place.
+pub(super) fn fold_key_anchor_after_expand(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
+    let Some(scan_pos) = ops
+        .iter()
+        .position(|op| matches!(op, PlanOp::ScanLabel { .. }))
+    else {
+        return ops;
+    };
+    let (scan_var, scan_label) = match &ops[scan_pos] {
+        PlanOp::ScanLabel { var, label } => (var.clone(), label.clone()),
+        _ => unreachable!(),
+    };
+    let mut saw_expand = false;
+    let mut filter_pos = None;
+    for (i, op) in ops.iter().enumerate().skip(scan_pos + 1) {
+        match op {
+            PlanOp::Expand { .. } => saw_expand = true,
+            PlanOp::LookupProps { .. } | PlanOp::JoinBound { .. } => {}
+            PlanOp::Filter { .. } => {
+                filter_pos = Some(i);
+                break;
+            }
+            _ => return ops,
+        }
+    }
+    // Without an Expand this is `fold_where_equalities`' case.
+    let Some(filter_pos) = filter_pos.filter(|_| saw_expand) else {
+        return ops;
+    };
+    let PlanOp::Filter { expr } = &ops[filter_pos] else {
+        unreachable!()
+    };
+    let mut terms = split_and(expr.clone());
+    let Some((idx, IdentityEqForm::Func, value)) = find_identity_eq(&terms, &scan_var) else {
+        return ops;
+    };
+    terms.remove(idx);
+    ops[scan_pos] = PlanOp::ScanKey {
+        var: scan_var,
+        key: value,
+        label: scan_label,
+    };
+    match join_and(terms) {
+        Some(residual) => ops[filter_pos] = PlanOp::Filter { expr: residual },
+        None => {
+            ops.remove(filter_pos);
+        }
+    }
+    ops
+}
+
+/// One `WHERE` conjunct a range index can answer, on `field` of the scan
+/// variable.
+#[derive(Debug, Clone)]
+enum RangeTerm {
+    Lower(String, RangeBound),
+    Upper(String, RangeBound),
+    Prefix(String, Operand),
+}
+
+impl RangeTerm {
+    fn field(&self) -> &str {
+        match self {
+            RangeTerm::Lower(f, _) | RangeTerm::Upper(f, _) | RangeTerm::Prefix(f, _) => f,
+        }
+    }
+}
+
+/// A bound operand an index lookup can take: a `$param` (checked when it is
+/// resolved), or a literal of a class the index orders. A `Bool`, list, map,
+/// `Duration` or `null` literal never ranges over the index; its conjunct is
+/// left to the scan, which answers it.
+fn range_operand(op: &Operand) -> bool {
+    match op {
+        Operand::Param(_) => true,
+        Operand::Lit(v) => matches!(
+            v,
+            core_storage::Value::Int(_)
+                | core_storage::Value::Float(_)
+                | core_storage::Value::Str(_)
+                | core_storage::Value::Date(_)
+                | core_storage::Value::LocalDateTime(_)
+                | core_storage::Value::DateTime { .. }
+                | core_storage::Value::Binary(_)
+        ),
+        _ => false,
+    }
+}
+
+/// A stored property a range index can hold: not the node identity that
+/// `n.key`, `n.id` and `n.label` fall back to when nothing is stored.
+fn range_field(field: &str) -> bool {
+    !matches!(field, "key" | "id" | "label")
+}
+
+/// `term` as a [`RangeTerm`] on `scan_var`, if it is one.
+fn range_term(term: &Expr, scan_var: &str) -> Option<RangeTerm> {
+    match term {
+        Expr::Cmp { lhs, op, rhs } => {
+            // `n.f > x` as written, or `x < n.f` turned around.
+            let (field, op, value) = match (lhs, rhs) {
+                (Operand::Prop { var, field }, value) if var == scan_var => {
+                    (field, op.clone(), value)
+                }
+                (value, Operand::Prop { var, field }) if var == scan_var => (
+                    field,
+                    match op {
+                        CmpOp::Lt => CmpOp::Gt,
+                        CmpOp::Le => CmpOp::Ge,
+                        CmpOp::Gt => CmpOp::Lt,
+                        CmpOp::Ge => CmpOp::Le,
+                        other => other.clone(),
+                    },
+                    value,
+                ),
+                _ => return None,
+            };
+            if !range_field(field) || !range_operand(value) {
+                return None;
+            }
+            let bound = |inclusive| RangeBound {
+                value: value.clone(),
+                inclusive,
+            };
+            let field = field.clone();
+            match op {
+                CmpOp::Gt => Some(RangeTerm::Lower(field, bound(false))),
+                CmpOp::Ge => Some(RangeTerm::Lower(field, bound(true))),
+                CmpOp::Lt => Some(RangeTerm::Upper(field, bound(false))),
+                CmpOp::Le => Some(RangeTerm::Upper(field, bound(true))),
+                CmpOp::Eq | CmpOp::Ne => None,
+            }
+        }
+        Expr::Truthy(Operand::FuncCall { name, args })
+            if name.eq_ignore_ascii_case("startsWith") && args.len() == 2 =>
+        {
+            match (&args[0], &args[1]) {
+                (Operand::Prop { var, field }, prefix)
+                    if var == scan_var
+                        && range_field(field)
+                        && matches!(
+                            prefix,
+                            Operand::Param(_) | Operand::Lit(core_storage::Value::Str(_))
+                        ) =>
+                {
+                    Some(RangeTerm::Prefix(field.clone(), prefix.clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The bounds a range scan over one field takes from a `WHERE`'s conjuncts:
+/// the field of the first range conjunct, its first lower and first upper
+/// bound — or, when that first conjunct is a `STARTS WITH`, that prefix
+/// alone. `consumed` counts the conjuncts the bounds stand for.
+struct RangeSpec {
+    field: String,
+    lo: Option<RangeBound>,
+    hi: Option<RangeBound>,
+    prefix: Option<Operand>,
+    consumed: usize,
+}
+
+fn range_spec(terms: &[Expr], scan_var: &str) -> Option<RangeSpec> {
+    let found: Vec<RangeTerm> = terms
+        .iter()
+        .filter_map(|t| range_term(t, scan_var))
+        .collect();
+    let first = found.first()?;
+    let mut spec = RangeSpec {
+        field: first.field().to_string(),
+        lo: None,
+        hi: None,
+        prefix: None,
+        consumed: 0,
+    };
+    if let RangeTerm::Prefix(_, prefix) = first {
+        spec.prefix = Some(prefix.clone());
+        spec.consumed = 1;
+        return Some(spec);
+    }
+    for term in found.iter().filter(|t| t.field() == spec.field) {
+        match term {
+            RangeTerm::Lower(_, b) if spec.lo.is_none() => spec.lo = Some(b.clone()),
+            RangeTerm::Upper(_, b) if spec.hi.is_none() => spec.hi = Some(b.clone()),
+            _ => continue,
+        }
+        spec.consumed += 1;
+    }
+    Some(spec)
+}
+
+/// Post-pass: seed a label scan from a range index when its `WHERE` holds a
+/// range or `STARTS WITH` conjunct on the scanned node (see
+/// [`PlanOp::IndexRangeScan`]).
+///
+/// Eligibility mirrors [`fold_where_equalities`]: the plan's first scan op is
+/// a labelled `ScanLabel` (an equality fold, which is more selective, already
+/// took it otherwise), and no op that walks relationships or runs a pipeline
+/// stands between it and the first `Filter`. The `Filter` is kept whole: the
+/// op narrows the candidates and the filter still decides every row, so the
+/// rows are the scan's. Candidates come in node-id order, as the scan's do.
+///
+/// As with the equality fold, a residual conjunct that would raise an error
+/// on a node outside the range is not evaluated on that node.
+pub(super) fn fold_range_predicates(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
+    let Some(scan_pos) = ops.iter().position(|op| {
+        matches!(
+            op,
+            PlanOp::ScanLabel { .. }
+                | PlanOp::ScanKey { .. }
+                | PlanOp::IndexScan { .. }
+                | PlanOp::IndexIntersect { .. }
+        )
+    }) else {
+        return ops;
+    };
+    let PlanOp::ScanLabel {
+        var,
+        label: Some(label),
+    } = &ops[scan_pos]
+    else {
+        return ops;
+    };
+    let mut filter = None;
+    for op in &ops[scan_pos + 1..] {
+        match op {
+            PlanOp::Filter { expr } => {
+                filter = Some(expr);
+                break;
+            }
+            PlanOp::ScanLabel { .. }
+            | PlanOp::ScanKey { .. }
+            | PlanOp::IndexScan { .. }
+            | PlanOp::IndexIntersect { .. }
+            | PlanOp::LookupProps { .. }
+            | PlanOp::JoinBound { .. } => {}
+            _ => return ops,
+        }
+    }
+    let Some(expr) = filter else {
+        return ops;
+    };
+    let Some(spec) = range_spec(&split_and(expr.clone()), var) else {
+        return ops;
+    };
+    ops[scan_pos] = PlanOp::IndexRangeScan {
+        var: var.clone(),
+        label: label.clone(),
+        field: spec.field,
+        lo: spec.lo,
+        hi: spec.hi,
+        prefix: spec.prefix,
+        order: None,
+    };
+    ops
+}
+
+/// The `(var, field)` an `ORDER BY` item sorts by, when it is a node property
+/// read directly or through a `RETURN` alias.
+fn order_prop<'a>(item: &'a OrderItem, returns: &'a [RetItem]) -> Option<(&'a str, &'a str)> {
+    match &item.target {
+        OrderTarget::Prop { var, field } | OrderTarget::Expr(Operand::Prop { var, field }) => {
+            Some((var, field))
+        }
+        OrderTarget::Alias(name) => {
+            let ret = returns
+                .iter()
+                .find(|r| r.alias.as_deref() == Some(name.as_str()))?;
+            match &ret.value {
+                RetVal::Prop { var, field } | RetVal::ScalarExpr(Operand::Prop { var, field }) => {
+                    Some((var, field))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Post-pass: let a range index produce only the candidates of an
+/// `ORDER BY n.field [DESC] … LIMIT` top-k (see [`RangeOrder`]).
+///
+/// Only the plain shape qualifies — one labelled scan of `n`, then at most a
+/// `Filter`, `Project`, `OrderBy`, an optional `Skip`, and `Limit` — with a
+/// single sort key that is `n.field`, and no `DISTINCT`. A `Filter` is
+/// allowed only when every one of its conjuncts is a bound the scan already
+/// takes on that same field: any other conjunct could drop rows of the top
+/// k, so the k sorted first would not be the k returned.
+pub(super) fn fold_index_order(mut ops: Vec<PlanOp>, q: &Query) -> Vec<PlanOp> {
+    if q.distinct || q.order_by.len() != 1 {
+        return ops;
+    }
+    let Some(limit) = q.limit.clone() else {
+        return ops;
+    };
+    let Some((order_var, order_field)) = order_prop(&q.order_by[0], &q.returns) else {
+        return ops;
+    };
+    if !range_field(order_field) {
+        return ops;
+    }
+    let has_filter = matches!(ops.get(1), Some(PlanOp::Filter { .. }));
+    let tail = &ops[1 + usize::from(has_filter)..];
+    let shape_ok = matches!(
+        tail,
+        [
+            PlanOp::Project { .. },
+            PlanOp::OrderBy { .. },
+            PlanOp::Limit(_)
+        ] | [
+            PlanOp::Project { .. },
+            PlanOp::OrderBy { .. },
+            PlanOp::Skip(_),
+            PlanOp::Limit(_)
+        ]
+    );
+    if !shape_ok {
+        return ops;
+    }
+    let order = RangeOrder {
+        descending: q.order_by[0].descending,
+        skip: q.skip.clone(),
+        limit,
+    };
+    match &ops[0] {
+        PlanOp::ScanLabel {
+            var,
+            label: Some(label),
+        } if var == order_var && !has_filter => {
+            ops[0] = PlanOp::IndexRangeScan {
+                var: var.clone(),
+                label: label.clone(),
+                field: order_field.to_string(),
+                lo: None,
+                hi: None,
+                prefix: None,
+                order: Some(order),
+            };
+        }
+        PlanOp::IndexRangeScan {
+            var,
+            field,
+            lo,
+            hi,
+            prefix,
+            ..
+        } if var == order_var && field == order_field => {
+            let bounds = usize::from(lo.is_some())
+                + usize::from(hi.is_some())
+                + usize::from(prefix.is_some());
+            let conjuncts = match ops.get(1) {
+                Some(PlanOp::Filter { expr }) => split_and(expr.clone()).len(),
+                _ => 0,
+            };
+            if conjuncts == bounds {
+                if let PlanOp::IndexRangeScan { order: slot, .. } = &mut ops[0] {
+                    *slot = Some(order);
+                }
+            }
+        }
+        _ => {}
+    }
+    ops
+}
+
 /// `n.key` / `n.id` (and `key(n)` / `id(n)`) equality against a literal or
 /// `$param`. `n.label` / `labels(n)` are not identity-eq (not a key).
 fn is_identity_eq_field(field: &str) -> bool {
@@ -1043,6 +1544,103 @@ fn invert_dir(d: RelDir) -> RelDir {
     }
 }
 
+/// Relationship uniqueness for one MATCH clause: the bindings of the hops
+/// compiled so far, and the relationship types of the hops still to come.
+///
+/// Two hops can only bind the same edge when their type sets overlap (an
+/// untyped hop overlaps every hop), so a hop lists only the earlier bindings
+/// it overlaps, and a walk keeps its edges only for a later hop it overlaps.
+/// Directions are not pruned: one edge can be walked by a `->` hop and a
+/// `<-` hop.
+struct ClauseScope {
+    /// A fixed hop's relationship variable, or a variable-length or
+    /// shortest-path hop's trail variable, with that hop's types.
+    earlier: Vec<(String, Vec<String>)>,
+    /// The types of every hop of the clause, in pattern order.
+    hop_types: Vec<Vec<String>>,
+    /// How many hops have been compiled.
+    done: usize,
+    /// Relationship variables the user named in this clause so far.
+    named: Vec<String>,
+}
+
+/// Whether two hops' type lists can match one edge.
+fn types_overlap(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t))
+}
+
+impl ClauseScope {
+    fn new(parts: &[Pattern]) -> Self {
+        ClauseScope {
+            earlier: Vec::new(),
+            hop_types: parts
+                .iter()
+                .flat_map(|p| p.chain.iter().map(|(rel, _)| rel.etypes.clone()))
+                .collect(),
+            done: 0,
+            named: Vec::new(),
+        }
+    }
+
+    /// Start compiling the next hop, `rel`: the earlier bindings it must not
+    /// reuse, and whether a later hop of the clause could bind one of its
+    /// edges. A relationship variable named twice in one clause is the
+    /// openCypher error, not a pattern that never matches.
+    fn next_hop(&mut self, rel: &RelPat) -> Result<(Vec<String>, bool), String> {
+        if let Some(name) = &rel.var {
+            if self.named.contains(name) {
+                return Err(format!(
+                    "relationship variable `{name}` is used for more than one relationship \
+                     in the same MATCH"
+                ));
+            }
+            self.named.push(name.clone());
+        }
+        self.done += 1;
+        let distinct_from = self
+            .earlier
+            .iter()
+            .filter(|(_, types)| types_overlap(types, &rel.etypes))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let later_overlaps = self.hop_types[self.done.min(self.hop_types.len())..]
+            .iter()
+            .any(|types| types_overlap(types, &rel.etypes));
+        Ok((distinct_from, later_overlaps))
+    }
+
+    /// Record the binding a later hop checks this hop's edges against.
+    fn bound(&mut self, binding: String, rel: &RelPat) {
+        self.earlier.push((binding, rel.etypes.clone()));
+    }
+}
+
+/// Compile a run of MATCH patterns, one uniqueness scope per MATCH clause:
+/// a pattern with `continues_match` joins the clause of the one before it.
+fn compile_match_clauses(
+    patterns: &[Pattern],
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    rel_bound: &mut BTreeSet<String>,
+    node_anon: &mut u32,
+    rel_anon: &mut u32,
+) -> Result<(), String> {
+    let mut start = 0;
+    while start < patterns.len() {
+        let len = 1 + patterns[start + 1..]
+            .iter()
+            .take_while(|p| p.continues_match)
+            .count();
+        let clause = &patterns[start..start + len];
+        let mut scope = ClauseScope::new(clause);
+        for pat in clause {
+            compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon, &mut scope)?;
+        }
+        start += len;
+    }
+    Ok(())
+}
+
 fn compile_pattern(
     pat: &Pattern,
     ops: &mut Vec<PlanOp>,
@@ -1050,6 +1648,7 @@ fn compile_pattern(
     rel_bound: &mut BTreeSet<String>,
     node_anon: &mut u32,
     rel_anon: &mut u32,
+    scope: &mut ClauseScope,
 ) -> Result<(), String> {
     let start = name_node(&pat.start, node_anon, bound);
     if pat.shortest {
@@ -1081,13 +1680,15 @@ fn compile_pattern(
     {
         // Expand-from-bound: leftmost unbound, rightmost dest already bound,
         // single-rel *fixed-hop* pattern. Start from dest, invert dir, expand
-        // toward start. Variable-length (`*min..max`) is not reversed: VarExpand
-        // has no dest label/prop filter, so reversing would drop start checks.
+        // toward start. Variable-length (`*min..max`) is not reversed: the walk
+        // runs in pattern order and the start's filter is applied by its scan.
         let (rel, dest) = &pat.chain[0];
         let dest_name = name_node(dest, node_anon, bound);
+        let dest_name_for_path = dest_name.clone();
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
-        rel_bound.insert(rel_name.clone());
+        let (distinct_from, _) = scope.next_hop(rel)?;
+        scope.bound(rel_name.clone(), rel);
         if dest.label.is_some() || !dest.props.is_empty() {
             ops.push(PlanOp::JoinBound {
                 var: dest_name.clone(),
@@ -1097,14 +1698,24 @@ fn compile_pattern(
         }
         ops.push(PlanOp::Expand {
             from: dest_name,
-            rel_var: Some(rel_name),
+            rel_var: Some(rel_name.clone()),
             etypes: rel.etypes.clone(),
             dir: invert_dir(rel.dir),
             to: start.clone(),
             to_label: pat.start.label.clone(),
             to_props: pat.start.props.clone(),
+            distinct_from,
         });
-        bound.insert(start);
+        bound.insert(start.clone());
+        if let Some(path_var) = &pat.path_var {
+            // The walk reads start -> dest, the order the pattern is written in.
+            let hops = vec![PathHop {
+                rel_var: rel_name.clone(),
+                to_var: dest_name_for_path,
+                trail_var: None,
+            }];
+            bind_path(ops, bound, path_var, start, hops)?;
+        }
         return Ok(());
     } else if let Some(key) = id_lookup(&pat.start.props) {
         ops.push(PlanOp::ScanKey {
@@ -1142,12 +1753,29 @@ fn compile_pattern(
         bound.insert(start.clone());
     }
 
+    let path_start = start.clone();
+    let mut path_hops: Vec<PathHop> = Vec::new();
     let mut from = start;
     for (rel, dest) in &pat.chain {
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
-        rel_bound.insert(rel_name.clone());
+        // Only a variable-length relationship is refused bare: it is bound to
+        // a hop count, not to one relationship.
+        if rel.hops.is_some() {
+            rel_bound.insert(rel_name.clone());
+        }
         let to = name_node(dest, node_anon, bound);
+        let (distinct_from, later_hops) = scope.next_hop(rel)?;
+        // A variable-length or shortest-path hop's edges travel in a hidden
+        // trail when a named path needs them or a later hop must avoid them.
+        let trail_var = (rel.hops.is_some() && (pat.path_var.is_some() || later_hops))
+            .then(|| format!("{rel_name}#trail"));
+        scope.bound(trail_var.clone().unwrap_or_else(|| rel_name.clone()), rel);
+        path_hops.push(PathHop {
+            rel_var: rel_name.clone(),
+            to_var: to.clone(),
+            trail_var: trail_var.clone(),
+        });
 
         if let Some(hops) = rel.hops {
             if pat.shortest {
@@ -1169,6 +1797,15 @@ fn compile_pattern(
                         hops.min
                     ));
                 }
+                // The destination is already bound; its pattern label and
+                // properties still have to hold (defect-ledger row 132).
+                if dest.label.is_some() || !dest.props.is_empty() {
+                    ops.push(PlanOp::JoinBound {
+                        var: to.clone(),
+                        label: dest.label.clone(),
+                        props: dest.props.clone(),
+                    });
+                }
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
@@ -1176,6 +1813,8 @@ fn compile_pattern(
                     dir: rel.dir,
                     to: to.clone(),
                     max_hops: hops.max,
+                    trail_var,
+                    distinct_from,
                 });
             } else {
                 ops.push(PlanOp::VarExpand {
@@ -1184,8 +1823,12 @@ fn compile_pattern(
                     etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
+                    to_label: dest.label.clone(),
+                    to_props: dest.props.clone(),
                     min: hops.min,
                     max: hops.max,
+                    trail_var,
+                    distinct_from,
                 });
                 bound.insert(to.clone());
             }
@@ -1198,11 +1841,39 @@ fn compile_pattern(
                 to: to.clone(),
                 to_label: dest.label.clone(),
                 to_props: dest.props.clone(),
+                distinct_from,
             });
             bound.insert(to.clone());
         }
         from = to;
     }
+    if let Some(path_var) = &pat.path_var {
+        bind_path(ops, bound, path_var, path_start, path_hops)?;
+    }
+    Ok(())
+}
+
+/// Emit the `BindPath` op for a named path and put its name in scope.
+///
+/// A path name is a new variable: one already bound (an earlier path, a node
+/// or relationship of this or an earlier pattern, an alias) is an error, as
+/// openCypher has it, rather than a silent rebinding.
+fn bind_path(
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    path_var: &str,
+    start_var: String,
+    hops: Vec<PathHop>,
+) -> Result<(), String> {
+    if bound.contains(path_var) {
+        return Err(format!("variable `{path_var}` is already bound"));
+    }
+    bound.insert(path_var.to_owned());
+    ops.push(PlanOp::BindPath {
+        path_var: path_var.to_owned(),
+        start_var,
+        hops,
+    });
     Ok(())
 }
 
@@ -1225,6 +1896,9 @@ fn compile_optional_clause(
     let mut inner_rel_bound = rel_bound.clone();
     let mut inner_ops: Vec<PlanOp> = Vec::new();
 
+    // One OPTIONAL MATCH is one clause: its parts share one uniqueness scope,
+    // and it does not share it with the clauses before it.
+    let mut scope = ClauseScope::new(&oc.patterns);
     for pat in &oc.patterns {
         compile_pattern(
             pat,
@@ -1233,6 +1907,7 @@ fn compile_optional_clause(
             &mut inner_rel_bound,
             node_anon,
             rel_anon,
+            &mut scope,
         )?;
     }
     if let Some(expr) = &oc.where_expr {
@@ -1295,29 +1970,32 @@ fn fresh(prefix: &str, counter: &mut u32, bound: &BTreeSet<String>) -> String {
 }
 
 fn check_expr_bound(expr: &Expr, bound: &BTreeSet<String>) -> Result<(), String> {
+    check_expr_bound_in(expr, bound, "WHERE")
+}
+
+/// [`check_expr_bound`] for a predicate in `clause` (a predicate used as a
+/// value names the clause it sits in).
+fn check_expr_bound_in(expr: &Expr, bound: &BTreeSet<String>, clause: &str) -> Result<(), String> {
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
-            check_expr_bound(lhs, bound)?;
-            check_expr_bound(rhs, bound)
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
+            check_expr_bound_in(lhs, bound, clause)?;
+            check_expr_bound_in(rhs, bound, clause)
         }
-        Expr::Not(inner) => check_expr_bound(inner, bound),
+        Expr::Not(inner) => check_expr_bound_in(inner, bound, clause),
         Expr::Cmp { lhs, rhs, .. } => {
-            check_operand_bound(lhs, bound, "WHERE")?;
-            check_operand_bound(rhs, bound, "WHERE")
+            check_operand_bound(lhs, bound, clause)?;
+            check_operand_bound(rhs, bound, clause)
         }
-        Expr::Truthy(op) => check_operand_bound(op, bound, "WHERE"),
-        Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, "WHERE"),
+        Expr::Truthy(op) => check_operand_bound(op, bound, clause),
+        Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, clause),
         Expr::In { expr, list } => {
-            check_operand_bound(expr, bound, "WHERE")?;
-            for item in list {
-                check_operand_bound(item, bound, "WHERE")?;
-            }
-            Ok(())
+            check_operand_bound(expr, bound, clause)?;
+            check_operand_bound(list, bound, clause)
         }
     }
 }
 
-fn check_operand_bound(
+pub(crate) fn check_operand_bound(
     operand: &Operand,
     bound: &BTreeSet<String>,
     clause: &str,
@@ -1333,6 +2011,58 @@ fn check_operand_bound(
         Operand::Index { base, index } => {
             check_operand_bound(base, bound, clause)?;
             check_operand_bound(index, bound, clause)
+        }
+        Operand::ListLit(items) => {
+            for item in items {
+                check_operand_bound(item, bound, clause)?;
+            }
+            Ok(())
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                check_operand_bound(value, bound, clause)?;
+            }
+            Ok(())
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            check_operand_bound(list, bound, clause)?;
+            // The variable is bound inside the filter and the map only.
+            let mut inner = bound.clone();
+            inner.insert(var.clone());
+            if let Some(f) = filter {
+                check_expr_bound(f, &inner)?;
+            }
+            check_operand_bound(map, &inner, clause)
+        }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            check_operand_bound(list, bound, clause)?;
+            // The variable is bound inside the predicate only.
+            let mut inner = bound.clone();
+            inner.insert(var.clone());
+            check_expr_bound(pred, &inner)
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // The init and the list see the enclosing scope; the body also
+            // sees the accumulator and the element.
+            check_operand_bound(init, bound, clause)?;
+            check_operand_bound(list, bound, clause)?;
+            let mut inner = bound.clone();
+            inner.insert(acc_var.clone());
+            inner.insert(iter_var.clone());
+            check_operand_bound(body, &inner, clause)
         }
         Operand::FuncCall { args, .. } => {
             for arg in args {
@@ -1350,6 +2080,7 @@ fn check_operand_bound(
             }
             Ok(())
         }
+        Operand::Pred(expr) => check_expr_bound_in(expr, bound, clause),
     }
 }
 
@@ -1357,6 +2088,7 @@ fn check_operand_bound(
 fn check_unwind_bound(expr: &UnwindExpr, bound: &BTreeSet<String>) -> Result<(), String> {
     match expr {
         UnwindExpr::Lit(_) => Ok(()),
+        UnwindExpr::Expr(op) => check_operand_bound(op, bound, "UNWIND"),
         UnwindExpr::Prop { var, .. } => require_bound(var, bound, "UNWIND"),
         UnwindExpr::Var(name) => require_bound(name, bound, "UNWIND"),
     }
@@ -1370,10 +2102,13 @@ fn require_bound(var: &str, bound: &BTreeSet<String>, clause: &str) -> Result<()
     }
 }
 
+/// `rel_bound` holds the variable-length relationship variables in scope:
+/// each is bound to a walk's hop count, not to one relationship, so it is not
+/// a value to return or sort by. A fixed relationship variable is (TX-NS).
 fn reject_bare_rel(var: &str, rel_bound: &BTreeSet<String>) -> Result<(), String> {
     if rel_bound.contains(var) {
         Err(format!(
-            "cannot return relationship variable '{var}' bare; return its properties ({var}.field) instead"
+            "cannot return variable-length relationship variable '{var}' bare; return {var}.length, or name the path (p = …) and return p"
         ))
     } else {
         Ok(())
@@ -1458,7 +2193,27 @@ fn check_agg_arg_bound(arg: &AggArg, bound: &BTreeSet<String>) -> Result<(), Str
 /// `SUM(n.age)`, `COUNT(DISTINCT t)`.
 fn agg_column_name(func: &AggFunc, arg: &AggArg) -> String {
     let f = func_name(func);
-    format!("{f}({})", agg_arg_name(arg))
+    match func {
+        AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } => {
+            format!("{f}({}, {})", agg_arg_name(arg), percentile_label(p))
+        }
+        _ => format!("{f}({})", agg_arg_name(arg)),
+    }
+}
+
+/// How a percentile's `p` reads in a default column name.
+fn percentile_label(p: &Operand) -> String {
+    match p {
+        Operand::Lit(core_storage::Value::Int(n)) => n.to_string(),
+        Operand::Lit(core_storage::Value::Float(x)) => x.to_string(),
+        Operand::Param(name) => format!("${name}"),
+        _ => "p".to_string(),
+    }
+}
+
+/// Aggregates that cannot take `*`: they read a value, not a row count.
+fn needs_property_arg(func: &AggFunc) -> bool {
+    !matches!(func, AggFunc::Count | AggFunc::Collect)
 }
 
 fn agg_arg_name(arg: &AggArg) -> String {
@@ -1478,62 +2233,299 @@ fn func_name(func: &AggFunc) -> &'static str {
         AggFunc::Min => "MIN",
         AggFunc::Max => "MAX",
         AggFunc::Collect => "COLLECT",
+        AggFunc::StDev => "stDev",
+        AggFunc::StDevP => "stDevP",
+        AggFunc::PercentileCont { .. } => "percentileCont",
+        AggFunc::PercentileDisc { .. } => "percentileDisc",
     }
 }
 
-fn rewrite_order_item(
-    item: &OrderItem,
+/// The ORDER BY items of one RETURN, in the form the executor sorts by.
+struct ResolvedOrder {
+    /// Every item targets `OrderTarget::Alias(column)` of the projection.
+    items: Vec<OrderItem>,
+    /// Keys that are not RETURN items, to be projected after the RETURN items
+    /// under their generated column names.
+    hidden: Vec<RetItem>,
+}
+
+/// Column-name prefix of a hidden ORDER BY key. It cannot be typed as an
+/// identifier, so it cannot collide with a RETURN column.
+const HIDDEN_ORDER_COLUMN: &str = "\u{1}order_by_";
+
+/// The expression a RETURN item computes, when it is a plain value.
+fn ret_val_operand(value: &RetVal) -> Option<Operand> {
+    match value {
+        RetVal::Var(v) => Some(Operand::Var(v.clone())),
+        RetVal::Prop { var, field } => Some(Operand::Prop {
+            var: var.clone(),
+            field: field.clone(),
+        }),
+        RetVal::FuncCall { name, args } => Some(Operand::FuncCall {
+            name: name.clone(),
+            args: args.clone(),
+        }),
+        RetVal::ScalarExpr(op) => Some(op.clone()),
+        RetVal::Agg { .. } => None,
+    }
+}
+
+fn operand_ret_val(op: Operand) -> RetVal {
+    match op {
+        Operand::Var(name) => RetVal::Var(name),
+        Operand::Prop { var, field } => RetVal::Prop { var, field },
+        Operand::FuncCall { name, args } => RetVal::FuncCall { name, args },
+        other => RetVal::ScalarExpr(other),
+    }
+}
+
+/// Replace every bare reference to a RETURN alias inside `op` with the
+/// expression the alias names, so the key can be evaluated on the rows before
+/// projection.
+fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
+    let go = |o: &Operand| inline_aliases(o, returns);
+    match op {
+        Operand::Var(name) => returns
+            .iter()
+            .find(|r| r.alias.as_deref() == Some(name.as_str()))
+            .and_then(|r| ret_val_operand(&r.value))
+            .unwrap_or_else(|| op.clone()),
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) => op.clone(),
+        Operand::FuncCall { name, args } => Operand::FuncCall {
+            name: name.clone(),
+            args: args.iter().map(go).collect(),
+        },
+        Operand::BinArith {
+            op: arith,
+            left,
+            right,
+        } => Operand::BinArith {
+            op: arith.clone(),
+            left: Box::new(go(left)),
+            right: Box::new(go(right)),
+        },
+        Operand::Index { base, index } => Operand::Index {
+            base: Box::new(go(base)),
+            index: Box::new(go(index)),
+        },
+        Operand::ListLit(items) => Operand::ListLit(items.iter().map(go).collect()),
+        Operand::MapLit(entries) => {
+            Operand::MapLit(entries.iter().map(|(k, v)| (k.clone(), go(v))).collect())
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            // A RETURN alias named like the variable does not reach inside:
+            // the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| r.alias.as_deref() != Some(var.as_str()))
+                .cloned()
+                .collect();
+            Operand::ListComprehension {
+                var: var.clone(),
+                list: Box::new(go(list)),
+                filter: filter
+                    .as_ref()
+                    .map(|f| Box::new(inline_aliases_expr(f, &inner))),
+                map: Box::new(inline_aliases(map, &inner)),
+            }
+        }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            // A RETURN alias named like the variable does not reach inside:
+            // the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| r.alias.as_deref() != Some(var.as_str()))
+                .cloned()
+                .collect();
+            Operand::ListPredicate {
+                kind: *kind,
+                var: var.clone(),
+                list: Box::new(go(list)),
+                pred: Box::new(inline_aliases_expr(pred, &inner)),
+            }
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // A RETURN alias named like either variable does not reach into
+            // the body: the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| {
+                    let alias = r.alias.as_deref();
+                    alias != Some(acc_var.as_str()) && alias != Some(iter_var.as_str())
+                })
+                .cloned()
+                .collect();
+            Operand::Reduce {
+                acc_var: acc_var.clone(),
+                init: Box::new(go(init)),
+                iter_var: iter_var.clone(),
+                list: Box::new(go(list)),
+                body: Box::new(inline_aliases(body, &inner)),
+            }
+        }
+        Operand::Case { branches, default } => Operand::Case {
+            branches: branches
+                .iter()
+                .map(|(cond, value)| (inline_aliases_expr(cond, returns), go(value)))
+                .collect(),
+            default: default.as_ref().map(|d| Box::new(go(d))),
+        },
+        Operand::Pred(expr) => Operand::Pred(Box::new(inline_aliases_expr(expr, returns))),
+    }
+}
+
+fn inline_aliases_expr(expr: &Expr, returns: &[RetItem]) -> Expr {
+    let go = |o: &Operand| inline_aliases(o, returns);
+    match expr {
+        Expr::And(l, r) => Expr::And(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Or(l, r) => Expr::Or(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Xor(l, r) => Expr::Xor(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(inline_aliases_expr(inner, returns))),
+        Expr::Cmp { lhs, op, rhs } => Expr::Cmp {
+            lhs: go(lhs),
+            op: op.clone(),
+            rhs: go(rhs),
+        },
+        Expr::Truthy(o) => Expr::Truthy(go(o)),
+        Expr::IsNull(o) => Expr::IsNull(go(o)),
+        Expr::IsNotNull(o) => Expr::IsNotNull(go(o)),
+        Expr::In { expr, list } => Expr::In {
+            expr: go(expr),
+            list: go(list),
+        },
+    }
+}
+
+/// The projected column an ORDER BY item already names, if any.
+fn projected_order_column(item: &OrderItem, returns: &[RetItem]) -> Option<String> {
+    match &item.target {
+        OrderTarget::Alias(name) => returns
+            .iter()
+            .any(|r| r.alias.as_deref() == Some(name.as_str()))
+            .then(|| name.clone()),
+        OrderTarget::Var(v) => returns
+            .iter()
+            .find(|r| matches!(&r.value, RetVal::Var(x) if x == v))
+            .map(column_name),
+        OrderTarget::Prop { var, field } => returns
+            .iter()
+            .find(
+                |r| matches!(&r.value, RetVal::Prop { var: v, field: f } if v == var && f == field),
+            )
+            .map(column_name),
+        OrderTarget::Expr(op) => returns
+            .iter()
+            .find(|r| {
+                matches!(&r.value, RetVal::FuncCall { .. } | RetVal::ScalarExpr(_))
+                    && ret_val_operand(&r.value).as_ref() == Some(op)
+            })
+            .map(column_name),
+    }
+}
+
+/// Resolve ORDER BY against a RETURN: a key that is a RETURN item (or alias)
+/// sorts by that column; any other expression over the variables in scope
+/// becomes a hidden projected column when `allow_hidden`, and is the named
+/// error otherwise (DISTINCT and aggregation sort only what they project).
+fn resolve_order_items(
+    order_by: &[OrderItem],
     returns: &[RetItem],
     bound: &BTreeSet<String>,
     rel_bound: &BTreeSet<String>,
-) -> Result<OrderItem, String> {
-    let column = match &item.target {
-        OrderTarget::Alias(name) => {
-            if returns
-                .iter()
-                .any(|r| r.alias.as_deref() == Some(name.as_str()))
-            {
-                name.clone()
-            } else {
+    allow_hidden: bool,
+) -> Result<ResolvedOrder, String> {
+    let mut items = Vec::with_capacity(order_by.len());
+    let mut hidden: Vec<RetItem> = Vec::new();
+    for item in order_by {
+        let value = match &item.target {
+            OrderTarget::Alias(name) if projected_order_column(item, returns).is_none() => {
                 return Err(format!("ORDER BY target `{name}` is not present in RETURN"));
             }
-        }
-        OrderTarget::Var(v) => {
-            require_bound(v, bound, "ORDER BY")?;
-            reject_bare_rel(v, rel_bound)?;
-            match returns
-                .iter()
-                .find(|r| matches!(&r.value, RetVal::Var(x) if x == v))
-            {
-                Some(r) => column_name(r),
-                None => {
-                    return Err(format!("ORDER BY target `{v}` is not present in RETURN"));
-                }
+            OrderTarget::Alias(_) => None,
+            OrderTarget::Var(v) => {
+                require_bound(v, bound, "ORDER BY")?;
+                reject_bare_rel(v, rel_bound)?;
+                Some(RetVal::Var(v.clone()))
             }
-        }
-        OrderTarget::Prop { var, field } => {
-            require_bound(var, bound, "ORDER BY")?;
-            match returns.iter().find(
-                |r| matches!(&r.value, RetVal::Prop { var: v, field: f } if v == var && f == field),
-            ) {
-                Some(r) => column_name(r),
-                None => {
-                    return Err(format!(
-                        "ORDER BY target `{var}.{field}` is not present in RETURN"
-                    ));
-                }
+            OrderTarget::Prop { var, field } => {
+                require_bound(var, bound, "ORDER BY")?;
+                Some(RetVal::Prop {
+                    var: var.clone(),
+                    field: field.clone(),
+                })
             }
-        }
-    };
-    Ok(OrderItem {
-        target: OrderTarget::Alias(column),
-        descending: item.descending,
-    })
+            OrderTarget::Expr(op) => {
+                let op = inline_aliases(op, returns);
+                check_operand_bound(&op, bound, "ORDER BY")?;
+                Some(operand_ret_val(op))
+            }
+        };
+        let projected_item = OrderItem {
+            target: match (&item.target, &value) {
+                (OrderTarget::Expr(_), Some(v)) => {
+                    OrderTarget::Expr(ret_val_operand(v).expect("a scalar RetVal"))
+                }
+                _ => item.target.clone(),
+            },
+            descending: item.descending,
+        };
+        let column = match projected_order_column(&projected_item, returns) {
+            Some(column) => column,
+            None => {
+                let Some(value) = value else {
+                    return Err("internal: ORDER BY alias lost its column".to_string());
+                };
+                if !allow_hidden {
+                    return Err(
+                        "ORDER BY over a non-projected expression is not allowed with \
+                         DISTINCT/aggregation"
+                            .to_string(),
+                    );
+                }
+                let column = format!("{HIDDEN_ORDER_COLUMN}{}", hidden.len());
+                hidden.push(RetItem {
+                    value,
+                    alias: Some(column.clone()),
+                });
+                column
+            }
+        };
+        items.push(OrderItem {
+            target: OrderTarget::Alias(column),
+            descending: item.descending,
+        });
+    }
+    Ok(ResolvedOrder { items, hidden })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{plan, PlanOp};
+    use super::{plan, split_and, PlanOp, RangeBound};
     use crate::cypher::ast::{Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
     use crate::cypher::{lex, parse, RelDir};
     use crate::filter::CmpOp;
@@ -1586,6 +2578,7 @@ LIMIT 10";
                 to: "c".into(),
                 to_label: Some("Company".into()),
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::JoinBound {
                 var: "c".into(),
@@ -1600,6 +2593,7 @@ LIMIT 10";
                 to: "t".into(),
                 to_label: None,
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::Filter {
                 expr: Expr::And(
@@ -1654,6 +2648,7 @@ LIMIT 10";
                         descending: true,
                     },
                 ],
+                visible_columns: None,
             },
             PlanOp::Limit(LimitSkip::Exact(10)),
         ];
@@ -1682,6 +2677,7 @@ LIMIT 10";
                     to: "a".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Expand {
                     from: "a".into(),
@@ -1691,6 +2687,7 @@ LIMIT 10";
                     to: "_n1".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {
@@ -1750,6 +2747,101 @@ LIMIT 10";
         );
     }
 
+    fn count_ops(ops: &[PlanOp], pred: impl Fn(&PlanOp) -> bool) -> usize {
+        ops.iter().filter(|op| pred(op)).count()
+    }
+
+    /// Ledger row 102: `WHERE key(p) = $k` after an `Expand` anchors on
+    /// `ScanKey`; no label scan and no `Filter` remain.
+    #[test]
+    fn key_anchor_after_expand_becomes_scan_key() {
+        let ops =
+            plan_src("MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q)").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::ScanKey { var, label, key }
+                if var == "p" && label.as_deref() == Some("Person")
+                    && matches!(key, Operand::Param(n) if n == "k")),
+            "{ops:?}"
+        );
+        assert_eq!(
+            count_ops(&ops, |o| matches!(o, PlanOp::ScanLabel { .. })),
+            0
+        );
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })), 0);
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Expand { .. })), 1);
+    }
+
+    #[test]
+    fn key_anchor_after_expand_accepts_a_literal_and_id_func() {
+        for src in [
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = 'k0' RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE id(p) = $k RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE $k = key(p) RETURN key(q)",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let folded = matches!(&ops[0], PlanOp::ScanKey { .. });
+            // `$k = key(p)` (value on the left) is not a recognised form; it
+            // must simply stay a correct label scan plus filter.
+            if src.contains("$k = key") {
+                assert!(!folded && count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })) == 1);
+            } else {
+                assert!(folded, "{src}: {ops:?}");
+            }
+        }
+    }
+
+    /// The residual predicates stay as a `Filter` after the key term is lifted.
+    #[test]
+    fn key_anchor_after_expand_keeps_residual_terms() {
+        let ops = plan_src(
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k AND q.score > 5 RETURN key(q)",
+        )
+        .unwrap();
+        assert!(matches!(&ops[0], PlanOp::ScanKey { .. }), "{ops:?}");
+        let filters: Vec<&PlanOp> = ops
+            .iter()
+            .filter(|o| matches!(o, PlanOp::Filter { .. }))
+            .collect();
+        assert_eq!(filters.len(), 1, "{ops:?}");
+        let PlanOp::Filter { expr } = filters[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(expr, Expr::Cmp { op: CmpOp::Gt, .. }),
+            "only q.score > 5 may remain: {expr:?}"
+        );
+    }
+
+    /// Not a plain key equality: an OR, the stored-wins `p.key` form, or a key
+    /// on a node that is not the scan variable all keep the label scan.
+    #[test]
+    fn key_anchor_after_expand_does_not_fold_other_shapes() {
+        for src in [
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k OR q.score > 5 RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(q) = $k RETURN key(p)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) <> $k RETURN key(q)",
+        ] {
+            let ops = plan_src(src).unwrap();
+            assert!(
+                matches!(&ops[0], PlanOp::ScanLabel { .. }),
+                "{src} must keep ScanLabel: {ops:?}"
+            );
+            assert_eq!(
+                count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })),
+                1,
+                "{src}: {ops:?}"
+            );
+        }
+    }
+
+    /// Without an Expand the earlier pass owns the fold, and still does.
+    #[test]
+    fn key_anchor_without_expand_still_folds() {
+        let ops = plan_src("MATCH (p:Person) WHERE key(p) = $k RETURN key(p)").unwrap();
+        assert!(matches!(&ops[0], PlanOp::ScanKey { .. }), "{ops:?}");
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })), 0);
+    }
+
     #[test]
     fn plan_id_map_is_scan_key() {
         let toks = crate::cypher::lex("MATCH (n:Person {id: $k}) RETURN n").unwrap();
@@ -1775,9 +2867,9 @@ LIMIT 10";
         }
     }
 
-    /// VarExpand has no dest label/prop filter. Reversing
-    /// `MATCH (c:Company)-[*1..2]->(t)` would drop `:Company` and bind
-    /// non-Company `c`. Keep LTR: ScanLabel Company then VarExpand.
+    /// A variable-length hop is not reversed onto a bound end:
+    /// `MATCH (c:Company)-[*1..2]->(t)` stays LTR, ScanLabel Company then
+    /// VarExpand, so `:Company` is applied by the start scan.
     #[test]
     fn plan_does_not_reverse_variable_length_from_bound() {
         let cy = "MATCH (t {id: $tid}) MATCH (c:Company)-[*1..2]->(t) RETURN c";
@@ -1860,13 +2952,40 @@ LIMIT 10";
     }
 
     #[test]
-    fn order_by_target_absent_from_return_is_err() {
-        // `a` is bound, but `a.x` is not a RETURN item.
-        let err = assert_plan_err("MATCH (a) RETURN a ORDER BY a.x", "a.x");
-        assert!(
-            err.to_ascii_lowercase().contains("return"),
-            "expected ORDER BY target-not-in-RETURN context, got: {err}"
+    fn order_by_target_absent_from_distinct_return_is_named_error() {
+        // `a.x` is not a RETURN item, and DISTINCT sorts only what it projects.
+        let err = assert_plan_err("MATCH (a) RETURN DISTINCT a ORDER BY a.x", "non-projected");
+        assert!(err.contains("DISTINCT/aggregation"), "got: {err}");
+    }
+
+    #[test]
+    fn order_by_target_absent_from_aggregate_return_is_named_error() {
+        let err = assert_plan_err(
+            "MATCH (a:P) RETURN a.city, count(*) AS c ORDER BY a.age",
+            "non-projected",
         );
+        assert!(err.contains("DISTINCT/aggregation"), "got: {err}");
+    }
+
+    /// A key that is not a RETURN item is projected as a hidden trailing
+    /// column, and the sort drops it again.
+    #[test]
+    fn order_by_target_absent_from_return_becomes_a_hidden_column() {
+        let ops = plan_src("MATCH (a) RETURN a ORDER BY a.x").unwrap();
+        let PlanOp::Project { items } = &ops[1] else {
+            panic!("expected Project, got {:?}", ops[1]);
+        };
+        assert_eq!(items.len(), 2, "one RETURN item plus one hidden key");
+        match &ops[2] {
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                assert_eq!(*visible_columns, Some(1));
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("expected OrderBy, got {other:?}"),
+        }
     }
 
     /// Alias → that alias's column; bare var → its RETURN column (alias if
@@ -1882,7 +3001,7 @@ LIMIT 10";
         let order = got
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .expect("plan must contain OrderBy");
@@ -1908,7 +3027,7 @@ LIMIT 10";
         let order = aliased_var
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .expect("plan must contain OrderBy");
@@ -1944,6 +3063,7 @@ LIMIT 10";
                     to: "b".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![
@@ -1984,6 +3104,7 @@ LIMIT 10";
                     to: "c".into(),
                     to_label: None,
                     to_props: vec![],
+                    distinct_from: vec![],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {
@@ -2041,7 +3162,7 @@ LIMIT 10";
         let order = got
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .unwrap();
@@ -2083,6 +3204,8 @@ LIMIT 10";
                 },
                 chain: vec![],
                 shortest: false,
+                path_var: None,
+                continues_match: false,
             }],
             optional_clauses: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
@@ -2108,11 +3231,14 @@ LIMIT 10";
     }
 
     #[test]
-    fn bare_relationship_var_in_return_is_err() {
-        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r", "r");
+    fn bare_relationship_var_in_return_plans_and_a_variable_length_one_is_err() {
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r").expect("a bare relationship returns (TX-NS)");
+        plan_src("MATCH (a)-[r:T]->(b) WITH r RETURN r").expect("and is carried by WITH");
+        let err = assert_plan_err("MATCH (a)-[r:T*1..2]->(b) RETURN r", "r");
         assert!(
-            err.to_ascii_lowercase().contains("relationship"),
-            "expected bare-rel RETURN guidance, got: {err}"
+            err.to_ascii_lowercase()
+                .contains("variable-length relationship"),
+            "expected variable-length RETURN guidance, got: {err}"
         );
     }
 
@@ -2122,10 +3248,11 @@ LIMIT 10";
     }
 
     #[test]
-    fn bare_relationship_var_in_order_by_is_err() {
-        // RETURN r.w is legal; ORDER BY r is a bare rel var (defense, not just
-        // "not in RETURN").
-        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r", "r");
+    fn bare_variable_length_relationship_var_in_order_by_is_err() {
+        // A fixed relationship sorts by its map, as a path does; a
+        // variable-length one is a hop count, refused by name.
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r").expect("sorts by the map");
+        let err = assert_plan_err("MATCH (a)-[r:T*1..2]->(b) RETURN b ORDER BY r", "r");
         assert!(
             err.to_ascii_lowercase().contains("relationship"),
             "expected bare-rel ORDER BY guidance, got: {err}"
@@ -2421,5 +3548,135 @@ LIMIT 10";
             !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
             "all three equalities fully consumed; no residual Filter expected"
         );
+    }
+
+    // ── TY-10: range predicates, STARTS WITH, ORDER BY over a range index ──
+
+    fn first(src: &str) -> PlanOp {
+        plan_src(src).unwrap().remove(0)
+    }
+
+    fn range_parts(op: &PlanOp) -> (String, Option<RangeBound>, Option<RangeBound>, bool, bool) {
+        match op {
+            PlanOp::IndexRangeScan {
+                field,
+                lo,
+                hi,
+                prefix,
+                order,
+                ..
+            } => (
+                field.clone(),
+                lo.clone(),
+                hi.clone(),
+                prefix.is_some(),
+                order.is_some(),
+            ),
+            other => panic!("expected IndexRangeScan, got {other:?}"),
+        }
+    }
+
+    fn bound(value: Operand, inclusive: bool) -> Option<RangeBound> {
+        Some(RangeBound { value, inclusive })
+    }
+
+    #[test]
+    fn range_conjuncts_become_bounds_and_the_filter_stays_whole() {
+        let ops =
+            plan_src("MATCH (n:S) WHERE n.v >= 1 AND n.v < $hi AND n.w <> 2 RETURN n").unwrap();
+        let (field, lo, hi, prefix, order) = range_parts(&ops[0]);
+        assert_eq!(field, "v");
+        assert_eq!(lo, bound(Operand::Lit(core_storage::Value::Int(1)), true));
+        assert_eq!(hi, bound(Operand::Param("hi".into()), false));
+        assert!(!prefix && !order);
+        // The bounds' conjuncts stay in the filter with the rest.
+        assert!(matches!(&ops[1], PlanOp::Filter { expr } if split_and(expr.clone()).len() == 3));
+    }
+
+    #[test]
+    fn a_reversed_comparison_is_turned_around() {
+        let (_, lo, hi, _, _) = range_parts(&first("MATCH (n:S) WHERE 5 > n.v RETURN n"));
+        assert_eq!(lo, None);
+        assert_eq!(hi, bound(Operand::Lit(core_storage::Value::Int(5)), false));
+    }
+
+    #[test]
+    fn starts_with_becomes_a_prefix() {
+        let (field, lo, hi, prefix, _) =
+            range_parts(&first("MATCH (n:S) WHERE n.name STARTS WITH 'al' RETURN n"));
+        assert_eq!(field, "name");
+        assert!(prefix && lo.is_none() && hi.is_none());
+    }
+
+    #[test]
+    fn what_a_range_index_cannot_answer_stays_a_scan() {
+        for src in [
+            // An equality anchor wins.
+            "MATCH (n:S) WHERE n.v = 1 AND n.v > 0 RETURN n",
+            // Node identity is not a stored property.
+            "MATCH (n:S) WHERE n.key > 'a' RETURN n",
+            "MATCH (n:S) WHERE n.id >= 'a' RETURN n",
+            // No label, no index.
+            "MATCH (n) WHERE n.v > 1 RETURN n",
+            // Literals of classes the index does not order.
+            "MATCH (n:S) WHERE n.v > true RETURN n",
+            "MATCH (n:S) WHERE n.v > null RETURN n",
+            // A disjunction, a negation, a property of another node.
+            "MATCH (n:S) WHERE n.v > 1 OR n.v < 0 RETURN n",
+            "MATCH (n:S) WHERE NOT n.v > 1 RETURN n",
+            "MATCH (n:S) WHERE n.v > n.w RETURN n",
+            // Across a relationship.
+            "MATCH (n:S)-[:R]->(m) WHERE n.v > 1 RETURN m",
+        ] {
+            let ops = plan_src(src).unwrap();
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(op, PlanOp::IndexRangeScan { .. })),
+                "{src}: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_by_limit_over_the_field_is_a_top_k() {
+        for src in [
+            "MATCH (n:S) RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) RETURN n.v AS v ORDER BY v DESC SKIP 1 LIMIT 3",
+            "MATCH (n:S) WHERE n.v > 1 AND n.v <= 9 RETURN n ORDER BY n.v LIMIT $k",
+            "MATCH (n:S) WHERE n.v STARTS WITH 'a' RETURN n ORDER BY n.v LIMIT 3",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let (_, _, _, _, order) = range_parts(&ops[0]);
+            assert!(order, "{src}: {ops:?}");
+            assert!(
+                ops.iter().any(|op| matches!(op, PlanOp::OrderBy { .. })),
+                "the sort stays: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_by_that_another_op_could_reorder_or_thin_is_not_a_top_k() {
+        for src in [
+            // No LIMIT: every row is sorted anyway.
+            "MATCH (n:S) RETURN n ORDER BY n.v",
+            // A second key, DISTINCT, a sort key that is not a property.
+            "MATCH (n:S) RETURN n ORDER BY n.v, n.w LIMIT 3",
+            "MATCH (n:S) RETURN n ORDER BY n.v + 1 LIMIT 3",
+            "MATCH (n:S) RETURN DISTINCT n.v AS v ORDER BY v LIMIT 3",
+            // A conjunct that is not a bound on the sorted field.
+            "MATCH (n:S) WHERE n.v > 1 AND n.w = 2 RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WHERE n.v > 1 AND n.v > 2 RETURN n ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WHERE n.u > 1 RETURN n ORDER BY n.v LIMIT 3",
+            // More than the scan between it and the sort.
+            "MATCH (n:S)-[:R]->(m) RETURN m ORDER BY n.v LIMIT 3",
+            "MATCH (n:S) WITH n RETURN n ORDER BY n.v LIMIT 3",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let top_k = ops
+                .iter()
+                .any(|op| matches!(op, PlanOp::IndexRangeScan { order: Some(_), .. }));
+            assert!(!top_k, "{src}: {ops:?}");
+        }
     }
 }

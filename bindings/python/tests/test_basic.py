@@ -820,3 +820,47 @@ def test_what_if_set_prop_previews_without_writing(tmp_path):
     with pytest.raises(RuntimeError, match="not found"):
         db.what_if_set_prop("nope", "team", "red")
     db.close()
+
+
+# ── QL-17: null inside a list or map, queries without MATCH ──────────────────
+
+def test_null_list_element_is_none(tmp_path):
+    """A null element comes back as None, inside the list it belongs to."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    rows = db.query("RETURN [1, null] AS l, {a: null, b: 1} AS m, null AS v")
+    assert rows == [{"l": [1, None], "m": {"a": None, "b": 1}, "v": None}]
+    db.close()
+
+
+def test_query_params_none_binds_as_null(tmp_path):
+    """QL-17i: a Python None parameter is a null, as a JSON null is over HTTP."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("NP", "a", {"n": 1})
+    rows = db.query("MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", {"p": None})
+    assert rows == [{"k": "a"}]
+    rows = db.query(
+        "MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", [("p", None)]
+    )
+    assert rows == [{"k": "a"}]
+    rows = db.query_with_params(
+        "MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", [("p", None)]
+    )
+    assert rows == [{"k": "a"}]
+    # Inside a list and a map the null stays an element.
+    rows = db.query(
+        "RETURN size($ids) AS n, $ids AS ids, $m AS m",
+        {"ids": [1, None], "m": {"a": None}},
+    )
+    assert rows == [{"n": 2, "ids": [1, None], "m": {"a": None}}]
+    db.close()
+
+
+def test_query_null_map_param_in_set_removes_the_key(tmp_path):
+    """QL-17i: a None inside a dict parameter reaches SET, so `+=` removes the key."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("NP", "a", {"p": 1, "y": 2})
+    db.query_write("MATCH (n:NP) SET n += $m", {"m": {"y": None}})
+    assert db.query("MATCH (n:NP) RETURN n.p AS p, n.y AS y") == [{"p": 1, "y": None}]
+    db.query_write("MATCH (n:NP) SET n = $m", {"m": {"z": None, "w": 1}})
+    assert db.query("MATCH (n:NP) RETURN n.p AS p, n.w AS w") == [{"p": None, "w": 1}]
+    db.close()

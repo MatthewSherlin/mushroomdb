@@ -636,6 +636,7 @@ fn v2_write_scope_round_trips() {
             delete_labels: vec!["AgentNote".into()],
             create_edge_types: vec!["RECALLS".into()],
             delete_edge_types: vec!["RECALLS".into()],
+            update_edge_types: vec![],
         }),
     };
 
@@ -687,6 +688,7 @@ fn version_written_is_v2_when_write_present() {
             delete_labels: vec![],
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
     };
     let schema = Schema {
@@ -758,6 +760,7 @@ fn subset_violation_create_labels_not_in_read_labels_rejected() {
             delete_labels: vec![],
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
     };
     let schema = Schema {
@@ -798,6 +801,7 @@ fn subset_violation_update_labels_not_in_read_labels_rejected() {
             delete_labels: vec![],
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
     };
     let schema = Schema {
@@ -838,6 +842,7 @@ fn subset_violation_delete_labels_not_in_read_labels_rejected() {
             delete_labels: vec!["AdminDoc".into()], // not in labels
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
     };
     let schema = Schema {
@@ -879,6 +884,7 @@ fn edge_types_not_subset_validated() {
             delete_labels: vec![],
             create_edge_types: vec!["LINKS_TO".into(), "ANYTHING".into()], // arbitrary
             delete_edge_types: vec!["WHATEVER".into()],                    // arbitrary
+            update_edge_types: vec![],
         }),
     };
     let schema = Schema {
@@ -938,6 +944,7 @@ fn write_scope_only_change_produces_updated_diff() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         }],
     };
@@ -1127,6 +1134,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                     delete_labels: vec![],
                     create_edge_types: vec![],
                     delete_edge_types: vec![],
+                    update_edge_types: vec![],
                 }),
             },
         ],

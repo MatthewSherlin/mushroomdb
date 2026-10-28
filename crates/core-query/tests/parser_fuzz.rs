@@ -51,7 +51,26 @@ const VALID: &[&str] = &[
      RETURN a, r.since AS since, b.name \
      ORDER BY since DESC, b.name ASC \
      SKIP 1 LIMIT 5",
+    // list + map literals: null element, backtick key with a space, nesting
+    "MATCH (n) RETURN [1, null, n.x] AS l, {`a b`: 1, k: [2, {c: null}]} AS m",
+    // query without MATCH: UNWIND first, null element
+    "UNWIND [1, null, 3] AS x RETURN x",
+    // query without MATCH: RETURN first; `null` as a backtick-quoted key
+    "RETURN {`null`: null, `x``y`: [true, false]} AS m, null AS v",
+    // predicates as values (QL-BX): comparison, NOT, XOR, IS NULL, IN, parens
+    "MATCH (n) RETURN n.a > 1 AS a, NOT n.b AS b, [x IN [1, 2] | x = 1 XOR (x IS NULL)] AS c, \
+     coalesce(n.c IN [1, null], false) AS d ORDER BY n.a <> 2",
 ];
+
+/// An identifier as source text: bare when it lexes back to itself, otherwise
+/// backtick-quoted (a doubled backtick is one literal backtick).
+fn render_ident(s: &str) -> String {
+    if matches!(lex(s).as_deref(), Ok([Tok::Ident(back)]) if back == s) {
+        s.to_string()
+    } else {
+        format!("`{}`", s.replace('`', "``"))
+    }
+}
 
 fn render_tok(t: &Tok) -> String {
     match t {
@@ -68,8 +87,8 @@ fn render_tok(t: &Tok) -> String {
         Tok::Not => "NOT".into(),
         Tok::Asc => "ASC".into(),
         Tok::Desc => "DESC".into(),
-        Tok::Ident(s) => s.clone(),
-        Tok::Str(s) => format!("'{}'", s.replace('\'', "\\'")),
+        Tok::Ident(s) => render_ident(s),
+        Tok::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
         Tok::Int(n) => n.to_string(),
         Tok::Float(f) => f.to_string(),
         Tok::Param(s) => format!("${s}"),
@@ -93,6 +112,8 @@ fn render_tok(t: &Tok) -> String {
         Tok::Star => "*".into(),
         Tok::Plus => "+".into(),
         Tok::Slash => "/".into(),
+        Tok::Percent => "%".into(),
+        Tok::Caret => "^".into(),
         Tok::Create => "CREATE".into(),
         Tok::Set => "SET".into(),
         Tok::Delete => "DELETE".into(),
@@ -195,7 +216,7 @@ fn str_like() -> impl Strategy<Value = String> {
 
 /// Every unit `Tok` variant, uniformly.
 fn unit_tok() -> impl Strategy<Value = Tok> {
-    (0u8..29).prop_map(|i| match i {
+    (0u8..31).prop_map(|i| match i {
         0 => Tok::Match,
         1 => Tok::Where,
         2 => Tok::Return,
@@ -224,6 +245,8 @@ fn unit_tok() -> impl Strategy<Value = Tok> {
         25 => Tok::Le,
         26 => Tok::Gt,
         27 => Tok::Ge,
+        28 => Tok::Percent,
+        29 => Tok::Caret,
         _ => Tok::Dash,
     })
 }
@@ -233,6 +256,8 @@ fn tok_strategy() -> impl Strategy<Value = Tok> {
     prop_oneof![
         29 => unit_tok(),
         1 => ident_like().prop_map(Tok::Ident),
+        1 => proptest::sample::select(vec!["REMOVE", "foreach", "Exists", "call", "EXPLAIN"])
+            .prop_map(|w| Tok::Ident(w.to_string())),
         1 => str_like().prop_map(Tok::Str),
         1 => any::<i64>().prop_map(Tok::Int),
         1 => any::<f64>().prop_map(Tok::Float),
@@ -250,6 +275,18 @@ fn valid_pool_has_at_least_ten_and_each_parses() {
     for src in VALID {
         let toks = lex(src).unwrap_or_else(|e| panic!("VALID query must lex: {src:?}: {e}"));
         parse(&toks).unwrap_or_else(|e| panic!("VALID query must parse: {src:?}: {e}"));
+    }
+}
+
+#[test]
+fn rendered_tokens_lex_back_to_the_same_tokens() {
+    // A backtick-quoted name (`a b`, `null`) must survive render + lex, or
+    // the mutation block would fuzz a different query than it names.
+    for src in VALID {
+        let toks = lex(src).expect("VALID query must lex");
+        let rendered: Vec<String> = toks.iter().map(render_tok).collect();
+        let back = lex(&rendered.join(" ")).expect("rendered query must lex");
+        assert_eq!(back, toks, "{src}");
     }
 }
 

@@ -1,9 +1,12 @@
 # mushroomdb
 
-mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
-database in which a relationship is a schema declaration: write a rule once, and every write
+mushroomdb is an embedded graph database for any app that needs a graph — and a memory layer for AI
+agents. A relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
 the values that produced it.
+
+It speaks [Cypher](query.md), keeps [time-travel history](timetravel.md), and searches by
+[full text](fulltext.md) and [vector similarity](vector.md).
 
 ---
 
@@ -52,28 +55,26 @@ roadmap, is in [Architecture](architecture.md).
 ## Status
 
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
-writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
+writer; multi-statement transactions are snapshot-isolated. Toolchain pinned to Rust 1.92.0.
 
 The current release is on the [releases page](https://github.com/MatthewSherlin/mushroomdb/releases).
-The shortest way in is the Claude Code plugin — `claude plugin marketplace add
-MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
-`/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
-`/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
-or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
-(`pip install mushroomdb`) packages are published at the same version; which path gives you what
-is in the [Install](install.md) table.
 
 ---
 
 ## Pages in this section
 
+- [Get started](get-started.md) — pick a language: [Rust](get-started-rust.md), [Python](get-started-python.md), [TypeScript](get-started-typescript.md), [Docker](get-started-docker.md), or [an existing Cypher app over Bolt](get-started-bolt.md)
+- [Drivers and Bolt](drivers-bolt.md) — connect the official graph-database drivers over Bolt, and which of their features work
+- [Transactions](transactions.md) — several statements as one atomic commit, under snapshot isolation, from every surface
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
+- [Property value types](types.md) — date/time, duration and binary representations and limits
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — which page covers which surface
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
 - [Python guide](python.md) — the binding, with worked examples
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
+- [Arrow, pandas and polars](arrow.md) — the whole graph as two Arrow tables, and how to read them in pandas or polars
 - [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
@@ -93,16 +94,35 @@ Reference:
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
 - [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
 - [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
+- [Upgrade from 0.9](upgrade-from-0.9.md) — what changes for a 0.9 caller, and what stays
 - [Cypher Query Reference](query.md)
+- [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
+- [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it
+- [Bolt protocol](bolt.md) — the versions the server negotiates and the driver audit behind them
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
 - [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
-- [Property (equality) indexes](indexes.md)
+- [Property indexes](indexes.md)
+- [Unique constraints](constraints.md) — declare single-property uniqueness and understand write refusals
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
 - [Live Subscriptions](subscriptions.md)
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
+- [Data safety and evidence](data-safety.md) — recovery, compatibility, sync policy and backup checks
 - [Running several processes against one store](multiprocess.md)
+- [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)
 - [Testing](testing.md)
+
+---
+
+## Install for an AI agent
+
+The shortest way in is the Claude Code plugin — `claude plugin marketplace add
+MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
+`/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
+`/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
+or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
+(`pip install mushroomdb`) packages are published at the same version; which path gives you what
+is in the [Install](install.md) table.

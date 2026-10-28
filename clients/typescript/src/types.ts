@@ -17,7 +17,17 @@
  *   Str(String)     → string
  *   Bool(bool)      → boolean
  *   List(Vec<Value>) → CellValue[]
- *   null cell       → null
+ *   null cell       → null (also a null element inside a list, `[1, null]`)
+ *   Date            → {@link DateValue}          `{ "$date": "2024-01-15" }`
+ *   LocalDateTime   → {@link LocalDateTimeValue} `{ "$ldt": "2024-01-15T12:34:56.789012" }`
+ *   DateTime        → {@link DateTimeValue}      `{ "$dt": "2024-01-15T12:34:56.789012+05:30" }`
+ *   Duration        → {@link DurationValue}      `{ "$dur": "P1Y2M3DT4H5M6.789S" }`
+ *   Binary          → {@link BinaryValue}        `{ "$binary": "<base64>" }`
+ *
+ * The five tagged forms are the server's JSON for the format-V11 types; the
+ * text inside each is ISO 8601 (or base64). The server both emits and accepts
+ * them. Narrow a cell with {@link asDate}, {@link asLocalDateTime},
+ * {@link asDateTime}, {@link asDuration} and {@link asBinary}.
  *
  * **Precision warning (Int / i64):** JavaScript `number` (IEEE 754 double)
  * safely represents integers only up to ±2^53 − 1 (~9×10^15). Rust `i64`
@@ -26,7 +36,80 @@
  * use a string representation in the graph instead. A future release will
  * offer a BigInt-aware parsing mode.
  */
-export type CellValue = number | string | boolean | null | CellValue[];
+export type CellValue =
+  | number
+  | string
+  | boolean
+  | null
+  | CellValue[]
+  | DateValue
+  | LocalDateTimeValue
+  | DateTimeValue
+  | DurationValue
+  | BinaryValue;
+
+/** A calendar date, `YYYY-MM-DD` (ISO 8601). */
+export type DateValue = { readonly $date: string };
+
+/** A date and time with no time zone, `YYYY-MM-DDTHH:MM:SS[.ffffff]`. */
+export type LocalDateTimeValue = { readonly $ldt: string };
+
+/**
+ * An instant with the UTC offset it was written with, for example
+ * `2024-01-15T12:34:56.789012+05:30` or `...Z`. The offset is within ±18:00.
+ * Two values at the same instant are equal whatever their offsets.
+ */
+export type DateTimeValue = { readonly $dt: string };
+
+/**
+ * An ISO 8601 duration, `PnYnMnDTnHnMn.nS`. Months, days and the time part are
+ * independent: a month is not 30 days.
+ */
+export type DurationValue = { readonly $dur: string };
+
+/** A byte blob, standard base64 with padding. At most 1 MiB decoded. */
+export type BinaryValue = { readonly $binary: string };
+
+/** The string under `tag` when `v` is a one-key object `{ [tag]: string }`. */
+function taggedText(v: CellValue, tag: string): string | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const keys = Object.keys(v);
+  if (keys.length !== 1 || keys[0] !== tag) return undefined;
+  const text: unknown = (v as Record<string, unknown>)[tag];
+  return typeof text === "string" ? text : undefined;
+}
+
+/** The ISO 8601 date text of a {@link DateValue}, else `undefined`. */
+export function asDate(v: CellValue): string | undefined {
+  return taggedText(v, "$date");
+}
+
+/** The ISO 8601 text of a {@link LocalDateTimeValue}, else `undefined`. */
+export function asLocalDateTime(v: CellValue): string | undefined {
+  return taggedText(v, "$ldt");
+}
+
+/** The ISO 8601 text, with its offset, of a {@link DateTimeValue}, else `undefined`. */
+export function asDateTime(v: CellValue): string | undefined {
+  return taggedText(v, "$dt");
+}
+
+/** The ISO 8601 duration text of a {@link DurationValue}, else `undefined`. */
+export function asDuration(v: CellValue): string | undefined {
+  return taggedText(v, "$dur");
+}
+
+/** The base64 text of a {@link BinaryValue}, else `undefined`. */
+export function asBinary(v: CellValue): string | undefined {
+  return taggedText(v, "$binary");
+}
+
+/** The bytes of a {@link BinaryValue}, else `undefined`. */
+export function binaryBytes(v: CellValue): Uint8Array | undefined {
+  const text = asBinary(v);
+  if (text === undefined) return undefined;
+  return Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+}
 
 // ---------------------------------------------------------------------------
 // Query result
@@ -269,6 +352,8 @@ export interface PageRankConfig {
   edge_type?: string | null;
   direction?: AlgoDir;
   budget_ms?: number;
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
@@ -291,6 +376,9 @@ export interface PageRankReport {
 export interface WccConfig {
   edge_type?: string | null;
   budget_ms?: number;
+  /** Edge weight used for min_weight filtering; components stay unweighted. */
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
@@ -313,6 +401,9 @@ export interface DegreeConfig {
   edge_type?: string | null;
   direction?: AlgoDir;
   budget_ms?: number;
+  /** Edge weight used for min_weight filtering; degree stays an edge count. */
+  weight_prop?: string | null;
+  min_weight?: number | null;
 }
 
 /**
@@ -788,8 +879,94 @@ export interface SubscribeMessage {
  * WebSocket handshake fails.
  */
 export class MushroomError extends Error {
-  constructor(public readonly detail: string) {
+  constructor(
+    public readonly detail: string,
+    /** HTTP status of the response that caused the error, when there was one. */
+    public readonly status?: number,
+    /** The server's machine-readable `code` for the error, when it sent one (`conflict`, `busy`, `constraint`). */
+    public readonly code?: string,
+  ) {
     super(detail);
     this.name = "MushroomError";
   }
+}
+
+/**
+ * A transaction commit failed because a node it read or wrote changed after
+ * the transaction began (HTTP 409). The transaction is over; retry the whole
+ * unit of work from `begin`. {@link MushroomClient.transaction} does not
+ * retry for you.
+ */
+export class TransactionConflictError extends MushroomError {
+  constructor(detail: string, status?: number, code?: string) {
+    super(detail, status, code);
+    this.name = "TransactionConflictError";
+  }
+}
+
+/**
+ * A write was refused by a unique constraint (HTTP 409 with `code`
+ * `"constraint"`): it would give two live nodes the same value. Nothing was
+ * written. Thrown by any write, including a transaction's commit, which ends
+ * the transaction. Unlike {@link TransactionConflictError}, retrying the same
+ * writes fails again until the clashing value changes.
+ */
+export class ConstraintViolationError extends MushroomError {
+  constructor(detail: string, status?: number, code?: string) {
+    super(detail, status, code);
+    this.name = "ConstraintViolationError";
+  }
+}
+
+/**
+ * The server no longer knows the transaction: its time to live ran out, it was
+ * already finished, or the server restarted (HTTP 404 or 410 on a `/tx/{id}`
+ * route). Nothing the transaction buffered was committed.
+ */
+export class TransactionExpiredError extends MushroomError {
+  constructor(detail: string, status?: number) {
+    super(detail, status);
+    this.name = "TransactionExpiredError";
+  }
+}
+
+/** Response of `POST /tx/begin`. */
+export interface TxBeginResponse {
+  tx_id: string;
+  /** Expiry time as the server reports it (opaque to the client). */
+  expires_at: string | number;
+}
+
+/** Response of `POST /tx/{tx_id}/commit`. */
+export interface TxCommitResponse {
+  /** The commit number of the transaction's one WAL frame. */
+  bookmark: number;
+}
+
+/**
+ * One row of `GET /schema/indexes` — the columns `SHOW INDEXES` lists.
+ * `type` is `"range"`, `"equality"` or `"fulltext"`.
+ */
+export interface IndexInfo {
+  name: string;
+  type: "range" | "equality" | "fulltext";
+  label: string;
+  property: string;
+  state: "online";
+}
+
+/** Options for {@link MushroomClient.createIndex}. */
+export interface CreateIndexOptions {
+  /** Range index name; `idx_<label>_<property>` when omitted. An equality index is always `eq_<label>_<property>`. */
+  name?: string;
+  /** `"range"` (default) or `"equality"`. */
+  kind?: "range" | "equality";
+}
+
+/** One row of `GET /schema/constraints` — the columns `SHOW CONSTRAINTS` lists. */
+export interface ConstraintInfo {
+  name: string;
+  type: "unique";
+  label: string;
+  property: string;
 }

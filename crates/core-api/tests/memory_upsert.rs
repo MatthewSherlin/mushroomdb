@@ -198,7 +198,7 @@ fn an_update_that_changes_a_name_reports_the_identity_link_it_lost() {
         score: 0.6,
     }];
     assert_eq!(
-        same_as_pairs(&db, &["john-smith-sf".to_string()]),
+        same_as_pairs(&db, &["john-smith-sf".to_string()]).unwrap(),
         the_pair,
         "fixture: the two are linked before the rename"
     );
@@ -229,7 +229,9 @@ fn an_update_that_changes_a_name_reports_the_identity_link_it_lost() {
         "the link, with the score it had"
     );
     assert!(
-        same_as_pairs(&db, &["john-smith-sf".to_string()]).is_empty(),
+        same_as_pairs(&db, &["john-smith-sf".to_string()])
+            .unwrap()
+            .is_empty(),
         "and it is gone from the store"
     );
 }

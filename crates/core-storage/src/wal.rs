@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::types::{GraphError, Result, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +184,76 @@ pub enum WalRecord {
         dst: u32,
         count: u64,
     },
+    // ── Unique-constraint variants (appended after multiplicity; 24, 25) ─────
+    //
+    // Declarations only, like `EnableIndex`: replay registers or withdraws the
+    // constraint and never checks the data it covers — a WAL may hold
+    // duplicates written before the constraint was declared, and replay must
+    // never fail on them. The check runs at write time only.
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (0.10 TY-12, contract C9).
+    /// Declare a unique constraint on `(label, field)`. Replay also enables the
+    /// backing equality index for the pair if it is not already enabled.
+    /// Discriminant 24.
+    CreateConstraint {
+        name: String,
+        label: String,
+        field: String,
+    },
+    /// Withdraw the unique constraint `name`. Its backing equality index stays.
+    /// Discriminant 25.
+    DropConstraint {
+        name: String,
+    },
+    // ── Range-index variants (appended after the constraints; 26, 27) ────────
+    //
+    // Declarations only, like `EnableIndex`: the postings are rebuilt from
+    // live data at open, never persisted. A range index is a named index on
+    // `(label, field)` that answers range and prefix lookups as well as exact
+    // ones; it shares its postings with an `EnableIndex` on the same pair.
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (0.10 TY-12, contract C9).
+    /// Declare the range index `name` on `(label, field)`. Discriminant 26.
+    EnableRangeIndex {
+        name: String,
+        label: String,
+        field: String,
+    },
+    /// Withdraw the range index `name`. An `EnableIndex` on the same pair
+    /// stays. Discriminant 27.
+    DisableRangeIndex {
+        name: String,
+    },
+    // ── Relationship-property variants (appended after range indexes; 28, 29) ─
+    //
+    // A user write to one property of the edge `(etype, src, dst)` — Cypher
+    // `CREATE`/`MERGE` relationship maps, `SET r.p`, `SET r += …`, `SET r = …`,
+    // `REMOVE r.p` (0.10 QL-RP). Absolute, last write wins, like
+    // `SetEdgeCount`: a pre-snapshot frame replayed over a base that already
+    // folded it in lands on the same value. The properties live where a
+    // rule's weights do (the edge-property overlay, snapshot section 5).
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so a store's
+    // first one is preceded by a V11 snapshot (contract C9).
+    /// Set property `field` (an interned name) of the edge to `value`.
+    /// Discriminant 28.
+    SetEdgePropId {
+        etype: u32,
+        src: u32,
+        dst: u32,
+        field: u32,
+        value: Value,
+    },
+    /// Remove property `field` (an interned name) of the edge; a no-op when
+    /// the edge lacks it. Discriminant 29.
+    RemoveEdgePropId {
+        etype: u32,
+        src: u32,
+        dst: u32,
+        field: u32,
+    },
 }
 
 /// The opt-in declaration: this store records insert-count multiplicity.
@@ -206,19 +276,61 @@ impl WalRecord {
     }
 }
 
+impl WalRecord {
+    /// True if a property value this record carries is, or holds, a
+    /// [`Value::Null`]. A stored property is never null, so such a record is
+    /// never framed.
+    pub fn carries_null(&self) -> bool {
+        match self {
+            WalRecord::InsertNode { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
+            WalRecord::InsertNodeId { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
+            WalRecord::SetProp { value, .. }
+            | WalRecord::SetPropId { value, .. }
+            | WalRecord::SetEdgePropId { value, .. } => value.contains_null(),
+            WalRecord::Batch(inner) => inner.iter().any(WalRecord::carries_null),
+            _ => false,
+        }
+    }
+}
+
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
+///
+/// A record that carries a null property value is refused with an error: the
+/// write path refuses it first (`rewrite_wal_dense` in core-api), and this is
+/// the backstop that keeps one off disk if that check is ever bypassed.
 ///
 /// # Panics (debug builds)
 /// Panics if `rec` is a `Batch` that contains a nested `Batch` — nested batches
 /// are semantically invalid.
-pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
+pub fn try_encode_record(rec: &WalRecord) -> Result<Vec<u8>> {
     if let WalRecord::Batch(inner) = rec {
         debug_assert!(
             !inner.iter().any(|r| matches!(r, WalRecord::Batch(_))),
             "nested Batch is invalid: a Batch may not contain another Batch"
         );
     }
-    let payload = bincode::serialize(rec).expect("walrecord serialize cannot fail");
+    if rec.carries_null() {
+        return Err(GraphError::Corrupt {
+            detail: "refusing to write a WAL frame whose property value holds a null".into(),
+        });
+    }
+    let payload = bincode::serialize(rec).map_err(|e| GraphError::Corrupt {
+        detail: format!("WAL record failed to encode: {e}"),
+    })?;
+    Ok(frame(payload))
+}
+
+/// [`try_encode_record`] for a record known to carry no property value that
+/// holds a null: every record the engine builds itself, and tests.
+///
+/// # Panics
+/// Panics if the record carries a null. The user write path calls
+/// [`try_encode_record`].
+pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
+    try_encode_record(rec).expect("walrecord encode")
+}
+
+fn frame(payload: Vec<u8>) -> Vec<u8> {
     let crc = crc32fast::hash(&payload);
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend((payload.len() as u32).to_le_bytes());
@@ -878,6 +990,53 @@ mod tests {
         );
     }
 
+    fn set_prop_id(value: Value) -> WalRecord {
+        WalRecord::SetPropId {
+            id: 0,
+            field: 0,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_null_value_is_refused_by_the_frame_encoder() {
+        // The write path refuses a null before it reaches the encoder; if one
+        // ever got this far the encoder returns an error rather than write a
+        // frame holding a value that can never be stored.
+        let null_list = Value::List(vec![Value::Int(1), Value::Null]);
+        for rec in [
+            set_prop_id(null_list.clone()),
+            WalRecord::InsertNode {
+                label: "L".into(),
+                key: "k".into(),
+                props: vec![("p".into(), Value::Null)],
+            },
+            WalRecord::Batch(vec![
+                WalRecord::DeleteNode { key: "x".into() },
+                WalRecord::SetProp {
+                    key: "k".into(),
+                    field: "p".into(),
+                    value: null_list.clone(),
+                },
+            ]),
+        ] {
+            assert!(rec.carries_null(), "{rec:?}");
+            let err = try_encode_record(&rec).expect_err("a null is never framed");
+            assert!(err.to_string().contains("null"), "{err}");
+        }
+        assert!(!set_prop_id(Value::Int(1)).carries_null());
+    }
+
+    #[test]
+    fn every_storable_value_variant_round_trips_through_a_frame() {
+        for v in crate::types::pinned::storable_values() {
+            let frame = try_encode_record(&set_prop_id(v.clone())).unwrap();
+            let (recs, used) = decode_all(&frame);
+            assert_eq!(used, frame.len());
+            assert_eq!(recs, vec![set_prop_id(v)]);
+        }
+    }
+
     /// Pin discriminant 23 (SetEdgeCount).
     ///
     /// **If this test fails you have broken every existing database file.**
@@ -902,6 +1061,119 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0], r);
+    }
+
+    /// Pin discriminants 24 (CreateConstraint) and 25 (DropConstraint).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn constraint_discriminants_pinned() {
+        let create = WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        };
+        let cp = bincode::serialize(&create).unwrap();
+        assert_eq!(
+            &cp[0..4],
+            &[24, 0, 0, 0],
+            "CreateConstraint discriminant changed — a variant was inserted before position 24"
+        );
+        let drop = WalRecord::DropConstraint {
+            name: "uniq_email".into(),
+        };
+        let dp = bincode::serialize(&drop).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[25, 0, 0, 0],
+            "DropConstraint discriminant changed — a variant was inserted before position 25"
+        );
+        let mut bytes = encode_record(&create);
+        bytes.extend(encode_record(&drop));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![create, drop]);
+    }
+
+    /// Pin discriminants 26 (EnableRangeIndex) and 27 (DisableRangeIndex).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn range_index_discriminants_pinned() {
+        let enable = WalRecord::EnableRangeIndex {
+            name: "idx_score".into(),
+            label: "Score".into(),
+            field: "val".into(),
+        };
+        let ep = bincode::serialize(&enable).unwrap();
+        assert_eq!(
+            &ep[0..4],
+            &[26, 0, 0, 0],
+            "EnableRangeIndex discriminant changed — a variant was inserted before position 26"
+        );
+        let disable = WalRecord::DisableRangeIndex {
+            name: "idx_score".into(),
+        };
+        let dp = bincode::serialize(&disable).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[27, 0, 0, 0],
+            "DisableRangeIndex discriminant changed — a variant was inserted before position 27"
+        );
+        let mut bytes = encode_record(&enable);
+        bytes.extend(encode_record(&disable));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![enable, disable]);
+    }
+
+    /// QL-RP's relationship-property records are discriminants 28 and 29.
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn edge_property_discriminants_pinned() {
+        let set = WalRecord::SetEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+            value: Value::Int(5),
+        };
+        let sp = bincode::serialize(&set).unwrap();
+        assert_eq!(
+            &sp[0..4],
+            &[28, 0, 0, 0],
+            "SetEdgePropId discriminant changed — a variant was inserted before position 28"
+        );
+        let remove = WalRecord::RemoveEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+        };
+        let rp = bincode::serialize(&remove).unwrap();
+        assert_eq!(
+            &rp[0..4],
+            &[29, 0, 0, 0],
+            "RemoveEdgePropId discriminant changed — a variant was inserted before position 29"
+        );
+        let mut bytes = encode_record(&set);
+        bytes.extend(encode_record(&remove));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![set, remove]);
+        // A null edge-property value is never framed.
+        assert!(try_encode_record(&WalRecord::SetEdgePropId {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            field: 4,
+            value: Value::Null,
+        })
+        .is_err());
     }
 
     /// The opt-in declaration and a real count share the discriminant and are

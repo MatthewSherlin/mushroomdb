@@ -11,15 +11,18 @@ members = [
     "crates/cli",
     "crates/core-bench",
     "crates/code-extract",
+    "crates/bolt",
+    "crates/backup",
+    "crates/tck-runner",
 ]
 
 [workspace.package]
-version = "0.9.4"
+version = "0.10.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MatthewSherlin/mushroomdb"
 rust-version = "1.92.0"
-keywords = ["graph", "embedded", "database", "mcp", "agent-memory"]
+keywords = ["graph", "embedded", "database", "cypher", "graph-database"]
 categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]

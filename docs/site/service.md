@@ -25,6 +25,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
 | `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a store without it cannot resolve a date to a commit until new commits build a fresh one |
 | `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent, which is its usual state — content that names the snapshot and the WAL on disk marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot; any other content is left over and is emptied at the next write |
+| `keys.json` | access-key hashes, created private (mode 0600); never tokens | every access key — reissue them. `mushroomdb backup` and `POST /backup` do not copy it; the continuous S3 backup does |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -211,8 +212,14 @@ aborted outright, which severed in-flight responses and subscriptions
 mid-stream. Nothing was ever lost — the WAL holds every commit and the next
 open replays it — but a rolling restart cut off work it did not need to.
 
-A TLS server gets 30 seconds of grace before the listener closes regardless, so
-one stuck request cannot hold a restart open indefinitely.
+The drain is bounded (25 s at the default timeout; a stuck request or an open
+subscriber is cut off then, over plain HTTP and TLS alike), then comes the shutdown snapshot, then, with
+continuous backup on, a final flush to the bucket that deletes the bucket lease
+so a successor starts at once. The whole sequence finishes within
+`--shutdown-timeout-secs` (default 55), and a second SIGTERM or SIGINT exits
+immediately. Give the platform's stop timeout room for all of it (60 s at the
+defaults); see
+[Stopping cleanly](deployment.md#stopping-cleanly-and-the-grace-period).
 
 **The log is quiet when the server is healthy.** A line per request is what
 makes a server log unreadable, so the level follows what happened:
@@ -242,6 +249,10 @@ wrong place for a credential.
 `MUSHROOMDB_LOG=server=debug` gives a line per request while someone is
 debugging, with no rebuild. Logs go to **stderr**; the `listening on http://…`
 line stays on stdout, where it has always been.
+
+`MUSHROOMDB_LOG_FORMAT=json` writes one JSON object per line on stderr instead
+of text, for a log collector. Unset, empty or `text` keeps the text output; any
+other value stops `serve` at startup with an error naming the accepted values.
 
 ## 8. A worked container command line
 

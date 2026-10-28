@@ -276,6 +276,14 @@ class ReviewFindings(unittest.TestCase):
             gen.parse_stub(source)
         self.assertIn("Report", str(raised.exception))
 
+    def test_a_value_class_is_listed_under_types_with_its_constructor(self):
+        source = 'class Duration:\n    """A span."""\n\n    months: int\n    def __init__(self, months: int = 0) -> None: ...\n\nclass GraphDb:\n    def close(self) -> None: ...\n'
+        stub = gen.parse_stub(source)
+        self.assertEqual(stub["classes"], [("Duration", "A span.", [("months", "int")], "months: int = 0")])
+        page = gen.render_python("{{types}}\n{{methods}}\n{{errors}}", stub, {"All": ["close"]})
+        self.assertIn("```python\nclass Duration(months: int = 0)\n```", page)
+        self.assertIn("Fields: `months: int`.", page)
+
     def test_an_error_two_levels_down_is_still_an_error(self):
         source = 'class MushroomError(RuntimeError):\n    """Base."""\n\nclass Busy(MushroomError):\n    """Busy."""\n\nclass VeryBusy(Busy):\n    """Very."""\n'
         self.assertEqual([e[0] for e in gen.parse_stub(source)["errors"]], ["MushroomError", "Busy", "VeryBusy"])
@@ -326,9 +334,29 @@ class ReviewFindings(unittest.TestCase):
 class RealTree(unittest.TestCase):
     def test_every_method_in_the_real_stub_has_a_group(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
-        names = [m[0] for m in stub["methods"]]
+        names = [m[0] for m in stub["methods"]] + [m[0] for m in stub["memory_methods"]]
         grouped = [n for members in gen.GROUPS.values() for n in members]
         self.assertEqual(sorted(names), sorted(grouped))
+
+    def test_the_transaction_object_is_listed_under_the_methods_that_begin_one(self):
+        stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(m[0] for m in stub["transaction_methods"]), ["commit", "execute", "rollback"]
+        )
+        page = gen.generate("python-api", None)
+        for heading in ("### `begin_transaction`", "### `transaction`", "### `Transaction.execute`"):
+            self.assertIn(heading, page)
+        self.assertIn("| `TransactionConflict` |", page)
+
+    def test_the_memory_methods_come_from_the_accessor_and_the_aliases_are_a_table(self):
+        stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
+        memory = [m[0] for m in stub["memory_methods"]]
+        self.assertEqual(sorted(memory), sorted(gen.GROUPS["Memory"]))
+        self.assertEqual(sorted(m[0] for m in stub["deprecated"]), sorted(memory))
+        page = gen.generate("python-api", None)
+        self.assertIn("### `memory.remember`", page)
+        self.assertIn("| `remember` | `memory.remember` |", page)
+        self.assertNotIn("### `remember`", page)
 
     def test_the_committed_python_page_is_current(self):
         self.assertEqual(gen.main(["--check", "python-api"]), 0)

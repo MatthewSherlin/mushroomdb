@@ -1648,7 +1648,11 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let Some(raw) = args.get("value").filter(|v| !v.is_null()) else {
         return CallOutcome::ToolErr("missing value".into());
     };
-    let Some(value) = json_to_value(raw.clone()) else {
+    let parsed = match json_to_value(raw.clone()) {
+        Ok(parsed) => parsed,
+        Err(e) => return CallOutcome::ToolErr(format!("value: {e}")),
+    };
+    let Some(value) = parsed else {
         return CallOutcome::ToolErr(format!(
             "value is not a supported value type: {}",
             digest::sanitize(&raw.to_string())
@@ -1823,14 +1827,15 @@ fn entities_arg(args: &Js) -> Result<Vec<EntityIn>, String> {
         if let Some(props_obj) = obj.get("props").and_then(Js::as_object) {
             for (field, json_val) in props_obj {
                 match json_to_value(json_val.clone()) {
-                    Some(v) => {
+                    Ok(Some(v)) => {
                         props.insert(field.clone(), v);
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(format!(
                             "entities[].props.{field} is not a supported value type"
                         ))
                     }
+                    Err(e) => return Err(format!("entities[].props.{field}: {e}")),
                 }
             }
         }
@@ -1988,6 +1993,18 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             if let Some(line) = same_as_lost_line(&report.same_as_lost) {
                 rendered.push_str(&line);
             }
+            if let Some(unread) = &report.same_as_unread {
+                rendered.push_str(&format!(
+                    "unread   identity links not checked after commit: {}\n",
+                    digest::sanitize(unread)
+                ));
+            }
+            for unused in &report.labels_not_applied {
+                rendered.push_str(&format!(
+                    "label    {}\n",
+                    digest::sanitize(&unused.to_string())
+                ));
+            }
             if !report.fulltext_declared.is_empty() {
                 rendered.push_str(&format!(
                     "indexed  {} — full-text search enabled for the first time\n",
@@ -2006,6 +2023,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     "provisional": report.provisional,
                     "provisional_capped": report.provisional_capped,
                     "fulltext_declared": report.fulltext_declared,
+                    "labels_not_applied": report.labels_not_applied,
                     // Fixed precision, as the text's `{:.2}`; the report
                     // itself keeps the raw score.
                     "same_as": report
@@ -2019,6 +2037,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                         .collect::<Vec<_>>(),
                     "same_as_lost": same_as_lost_json(&report.same_as_lost),
                     "same_as_lost_total": report.same_as_lost.len(),
+                    "same_as_unread": report.same_as_unread,
                 }),
                 |_| rendered,
             )

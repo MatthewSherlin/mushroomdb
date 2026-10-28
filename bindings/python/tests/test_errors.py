@@ -69,11 +69,17 @@ def _error_classes() -> dict[str, type]:
     return out
 
 
+# Classes the binding raises for its own refusals, with no `GraphError` variant
+# behind them (the transaction surface, 0.10 TX-2b).
+_BINDING_ONLY_CODES = {"transaction_closed", "transaction_conflict"}
+
+
 def test_every_graph_error_variant_maps_to_a_distinct_class():
     variants = _graph_error_variants()
     want = {_snake(v) for v in variants}
     assert len(want) == len(variants), "two variants would share a code"
-    assert set(_error_classes()) == want
+    assert set(_error_classes()) - _BINDING_ONLY_CODES == want
+    assert _BINDING_ONLY_CODES <= set(_error_classes())
 
 
 # ---------------------------------------------------------------------------
@@ -296,4 +302,50 @@ def test_type_stub_declares_every_error_class():
     stub = (pathlib.Path(spec.origin).parent / "__init__.pyi").read_text()
     assert "class MushroomError(RuntimeError):" in stub
     for cls in _error_classes().values():
-        assert f"class {cls.__name__}(MushroomError):" in stub, cls.__name__
+        base = cls.__mro__[1].__name__
+        assert f"class {cls.__name__}({base}):" in stub, cls.__name__
+
+
+def test_constraint_and_size_errors_have_their_own_classes():
+    # Raised by unique constraints and the value-size limit (0.10). The Python
+    # API that declares a constraint arrives later; the classes and codes are
+    # the compatibility surface now.
+    for name, code in [
+        ("ConstraintViolation", "constraint_violation"),
+        ("ConstraintCreationConflict", "constraint_creation_conflict"),
+        ("ValueTooLarge", "value_too_large"),
+    ]:
+        cls = getattr(mushroomdb, name)
+        assert issubclass(cls, mushroomdb.MushroomError), name
+        assert cls.code == code
+
+
+def test_constraint_creation_conflict_carries_the_conflicting_pairs(tmp_path):
+    # Python has no constraint API of its own yet, so this runs only on a build
+    # with the `test-hooks` feature (maturin develop --features test-hooks) and
+    # is skipped on a wheel.
+    db = GraphDb.open(str(tmp_path / "db"))
+    if not hasattr(db, "_declare_constraint_for_test"):
+        pytest.skip("built without the test-hooks feature")
+    db.insert_node("N", "a", {"v": 2})
+    db.insert_node("N", "b", {"v": 2.0})
+    db.insert_node("N", "c", {"v": 3})
+    with pytest.raises(mushroomdb.ConstraintCreationConflict) as raised:
+        db._declare_constraint_for_test("uniq_v", "N", "v")
+    pairs = sorted(raised.value.violations, key=lambda pair: pair[0])
+    assert pairs == [("a", 2), ("b", 2.0)]
+    assert isinstance(pairs[0][1], int) and isinstance(pairs[1][1], float)
+    assert raised.value.total == 2
+    assert raised.value.code == "constraint_creation_conflict"
+    # Removing one of the pair lets the declaration through.
+    db.delete_node("b")
+    db._declare_constraint_for_test("uniq_v", "N", "v")
+
+
+def test_an_unwritable_directory_has_its_own_class_not_busy():
+    # A permission refusal on the data directory is a deployment fault, not a
+    # peer holding the lock (HO-12b). It must not be `MushroomBusy`.
+    cls = mushroomdb.Unwritable
+    assert issubclass(cls, mushroomdb.MushroomError)
+    assert not issubclass(cls, mushroomdb.MushroomBusy)
+    assert cls.code == "unwritable"

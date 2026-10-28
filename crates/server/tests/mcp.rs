@@ -7171,3 +7171,28 @@ fn a_key_of_only_invisible_characters_is_a_tool_error_and_writes_nothing() {
         assert!(!db.read().has_node(key), "no node keyed {key:?}");
     }
 }
+
+/// QL-17i: a JSON null in the `query` tool's `params` binds as a null, the same
+/// as over HTTP `/query`.
+#[test]
+fn query_tool_binds_a_null_param_as_null() {
+    let db = open("null-param");
+    {
+        let mut w = db.write();
+        w.insert_node("NP", "a", vec![]).unwrap();
+    }
+    let res = call_tool(
+        &db,
+        false,
+        "query",
+        &json!({
+            "cypher": "MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k",
+            "params": {"p": null}
+        }),
+    );
+    assert!(res.get("error").is_none(), "{res}");
+    assert_ne!(res["result"]["isError"], json!(true), "{res}");
+    let text = res["result"]["content"][0]["text"].as_str().expect("text");
+    let body: Js = serde_json::from_str(text).expect("json body");
+    assert_eq!(body["rows"], json!([["a"]]), "{res}");
+}

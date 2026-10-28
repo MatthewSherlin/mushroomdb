@@ -15,21 +15,25 @@ name = "server"
 [features]
 default = []
 embed-ui = ["dep:include_dir"]
-tls = ["dep:axum-server"]
+tls = ["dep:axum-server", "dep:rustls"]
 
 [dependencies]
-mushroomdb = { path = "../core-api", version = "0.9.4" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.9.4" }
+mushroomdb = { path = "../core-api", version = "0.10.0" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.10.0" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+# The one TLS config HTTP and Bolt both serve (`tls::load_server_config`).
+# Already in the tree through axum-server; `aws-lc-rs` is the provider that
+# feature brings, used when the process has not installed one.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `fs` serves the embedded UI. `timeout` and `limit` are the 0.6.12 hardening:
 # before it the server had no request timeout, no concurrency limit and no rate
 # limit of any kind — the only backstop was a 64 MiB body cap.
-tower-http = { version = "0.6", default-features = false, features = ["fs", "timeout", "limit"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs", "timeout", "limit", "cors"] }
 # Concurrency limiting and load shedding live in `tower`, not `tower-http`.
 # It was already here as a dev-dependency for the oneshot `ServiceExt`; 0.6.12
 # needs it in the shipped build.
@@ -45,15 +49,20 @@ include_dir = { version = "0.7", optional = true }
 # RSS memory metric — already in the transitive tree at 0.2.189; direct dep
 # so the cfg(target_os) blocks compile without an indirect version pin.
 libc = { version = "0.2", default-features = false }
+# Transaction ids: 128 random bits from the thread's CSPRNG.
+rand = "0.9"
 
 [dev-dependencies]
 # `test-hooks` exposes `GraphDb::push_unapplyable_delta_for_test`, which
 # `tests/http.rs` uses to reach the `Corrupt` arm of the scoped reader on both
 # HTTP role branches. The hook corrupts every snapshot the handle hands out, so
 # it is gated out of the published crate and turned on here only.
-mushroomdb = { path = "../core-api", version = "0.9.4", features = [
+mushroomdb = { path = "../core-api", version = "0.10.0", features = [
     "test-hooks",
 ] }
+# `tests/bolt_parity.rs` (TX-17): the same identity over HTTP `/query` and over
+# Bolt must see and change the same things. Path only, so publishing drops it.
+bolt = { package = "mushroomdb-bolt", path = "../bolt" }
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 arrow-ipc = { version = "59", default-features = false }
@@ -66,5 +75,6 @@ proptest = { workspace = true }
 tempfile = "3"
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
-# Install an explicit crypto provider when both ring and aws-lc-rs are compiled in.
+# `tests/tls.rs` installs ring as a test convenience; `tests/tls_no_provider.rs`
+# installs none and is the test of what the shipped binary does.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

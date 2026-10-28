@@ -1,0 +1,25 @@
+[package]
+name = "tck-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Runs the vendored openCypher TCK against mushroomdb and holds its pass rate"
+# A test harness for this repository, never a published crate.
+publish = false
+
+[lib]
+name = "tck_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tck-runner"
+path = "src/main.rs"
+
+[dependencies]
+# Parses the TCK's `.feature` files. Approved for this crate alone (0.10 spec §9.1).
+gherkin = "0.15"
+mushroomdb = { path = "../core-api" }
+
+[dev-dependencies]

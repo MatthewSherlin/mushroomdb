@@ -13,6 +13,9 @@ use std::path::PathBuf;
 /// `doc` is a basename under `docs/site/`. `source` is relative to `crates/`.
 const PAIRS: &[(&str, &str, &str)] = &[
     // docs/site/http.md and docs/site/python.md
+    ("http.md", "transaction busy", "server/src/tx.rs"),
+    ("http.md", "too many open transactions", "server/src/tx.rs"),
+    ("http.md", "transaction expired", "server/src/tx.rs"),
     (
         "http.md",
         "role-bound token: MERGE create requires the role to name one namespace",
@@ -164,6 +167,7 @@ fn source_text(path: &str) -> &'static str {
         "server/src/http.rs" => include_str!("../src/http.rs"),
         "server/src/json.rs" => include_str!("../src/json.rs"),
         "server/src/mcp_tasks.rs" => include_str!("../src/mcp_tasks.rs"),
+        "server/src/tx.rs" => include_str!("../src/tx.rs"),
         other => panic!("unmapped source file {other}"),
     }
 }

@@ -67,6 +67,9 @@ pub enum UnwindExpr {
     Prop { var: String, field: String },
     /// A previously bound alias (from a prior WITH): `alias`.
     Var(String),
+    /// A list expression that is not a plain literal list: `[n.x, 1 + 1]`,
+    /// `[{a: 1}, {a: 2}]`'s non-constant forms.
+    Expr(Operand),
 }
 
 /// One WITH stage in a pipeline:
@@ -104,6 +107,22 @@ pub enum AggFunc {
     /// `collect(x)` — gather each row's value of `x` into a list, skipping
     /// nulls. Per group when grouping keys are present.
     Collect,
+    /// `stDev(x)` — sample standard deviation (n - 1) of the non-null
+    /// numeric values; `0.0` with fewer than two values.
+    StDev,
+    /// `stDevP(x)` — population standard deviation (n) of the non-null
+    /// numeric values; `0.0` with none.
+    StDevP,
+    /// `percentileCont(x, p)` — the `p`th percentile (`p` in `[0,1]`) with
+    /// linear interpolation between the two nearest ranks; always a float.
+    PercentileCont {
+        p: Operand,
+    },
+    /// `percentileDisc(x, p)` — the nearest-rank `p`th percentile
+    /// (`p` in `[0,1]`); an input value, with its own type.
+    PercentileDisc {
+        p: Operand,
+    },
 }
 
 /// Argument to an aggregate function.
@@ -141,6 +160,13 @@ pub struct Pattern {
     pub chain: Vec<(RelPat, NodePat)>,
     /// True when parsed as `MATCH shortestPath(...)`.
     pub shortest: bool,
+    /// The name bound before `=` in `MATCH p = (a)-[r]->(b)`.
+    pub path_var: Option<String>,
+    /// True for the second and later comma-separated parts of one MATCH
+    /// clause (`MATCH (a)-[r]->(b), (c)-[s]->(d)`). The parts of one clause
+    /// share relationship uniqueness: no relationship is bound twice across
+    /// them. A pattern that starts a new MATCH clause has `false`.
+    pub continues_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +199,8 @@ pub struct RelPat {
 pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// `a XOR b`: true when exactly one side is true.
+    Xor(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Cmp {
         lhs: Operand,
@@ -189,11 +217,34 @@ pub enum Expr {
     IsNull(Operand),
     /// `operand IS NOT NULL` — true iff the operand is non-null.
     IsNotNull(Operand),
-    /// `expr IN [a, b, $p]` or `expr IN $list` (`$list` is `Value::List`).
+    /// `expr IN list`: `list` is one list-valued expression, `[a, b, $p]`,
+    /// `$list`, `n.tags` or `[1] + [2]`. Its elements are compared whole, so
+    /// `[1, 2] IN [[1, 2]]` is true and `1 IN [[1]]` is false. A `list` that
+    /// is not a list at all is compared as one element.
     In {
         expr: Operand,
-        list: Vec<Operand>,
+        list: Operand,
     },
+}
+
+/// Which quantifier a `ListPredicate` applies. Over the predicate's
+/// per-element answers (true, false or null):
+///
+/// - `All`: false if any is false, else null if any is null, else true
+///   (true over an empty list).
+/// - `Any`: true if any is true, else null if any is null, else false.
+/// - `None`: false if any is true, else null if any is null, else true.
+/// - `Single`: false if more than one is true, else null if any is null,
+///   else true exactly when one is true (false over an empty list).
+///
+/// These are the openCypher TCK's quantifier tables (Quantifier1-4,
+/// "lists containing nulls").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,17 +276,69 @@ pub enum Operand {
         left: Box<Operand>,
         right: Box<Operand>,
     },
-    /// List subscript: `n.tags[0]`, `n.location[1]`, `$list[$i]`.
+    /// Subscript: `n.tags[0]`, `n.location[1]`, `$list[$i]`, and a map entry
+    /// `$p['id']` (which `$p.id` parses to).
     ///
-    /// Evaluates `base`, which must be a `Value::List`, and returns the
-    /// element at `index`. A negative index counts from the end
-    /// (openCypher §3.4.4). An out-of-range index, a non-list base, or a
-    /// non-integer index all evaluate to null rather than erroring, so a
-    /// subscript behaves like a missing property.
+    /// Evaluates `base`: a `Value::List` gives the element at an integer
+    /// `index`, where a negative index counts from the end (openCypher
+    /// §3.4.4); a `Value::Map` gives the entry at a string `index`. An
+    /// out-of-range index, an absent key, or a null base or index evaluate
+    /// to null. Any other base, or an index of the wrong type, is a type
+    /// error (QL-VE); a node, relationship or path variable as the base reads
+    /// nothing.
     Index {
         base: Box<Operand>,
         index: Box<Operand>,
     },
+    /// List literal with at least one non-constant element: `[n.x, 1 + 1]`.
+    /// A list whose elements are all constants is folded to
+    /// `Operand::Lit(Value::List(..))` at parse time. Evaluates to
+    /// `Value::List`; an element that evaluates to null is an error because
+    /// `Value` has no null variant.
+    ListLit(Vec<Operand>),
+    /// List comprehension: `[x IN list WHERE pred | expr]`.
+    ///
+    /// `var` is bound to each element of `list` inside `filter` and `map`
+    /// only; it shadows an outer variable of the same name there. A null
+    /// `list` (or a non-list) yields null. An element for which `filter` is
+    /// false or null is dropped. `map` is `Operand::Var(var)` when the source
+    /// has no `| expr` part. A null mapped value stays in the list as null.
+    ListComprehension {
+        var: String,
+        list: Box<Operand>,
+        filter: Option<Box<Expr>>,
+        map: Box<Operand>,
+    },
+    /// `all|any|none|single(x IN list WHERE pred)`.
+    ///
+    /// `var` is bound to each element of `list` inside `pred` only and shadows
+    /// an outer variable of the same name there. Evaluates to true, false or
+    /// null (see `ListPredKind`); a null or non-list `list` yields null.
+    ListPredicate {
+        kind: ListPredKind,
+        var: String,
+        list: Box<Operand>,
+        pred: Box<Expr>,
+    },
+    /// `reduce(acc = init, x IN list | body)`.
+    ///
+    /// `init` and `list` are evaluated in the enclosing scope; `acc_var` and
+    /// `iter_var` are bound inside `body` only and shadow outer names there.
+    /// Each element of `list` is bound to `iter_var`, the accumulator to
+    /// `acc_var`, and the value of `body` becomes the next accumulator. A null
+    /// or non-list `list` yields null; a null `body` value makes the
+    /// accumulator null for the next step.
+    Reduce {
+        acc_var: String,
+        init: Box<Operand>,
+        iter_var: String,
+        list: Box<Operand>,
+        body: Box<Operand>,
+    },
+    /// Map literal with at least one non-constant value: `{k: n.x}`. Keys are
+    /// unique (a duplicate is a parse error). All-constant maps fold to
+    /// `Operand::Lit(Value::Map(..))`. Evaluates to `Value::Map`.
+    MapLit(Vec<(String, Operand)>),
     /// Generic `CASE WHEN <cond> THEN <value> [WHEN …] [ELSE <value>] END`.
     /// Evaluates each branch's condition in order, returning the first matching
     /// value; the `default` (ELSE) or null if none match.
@@ -243,7 +346,35 @@ pub enum Operand {
         branches: Vec<(Expr, Operand)>,
         default: Option<Box<Operand>>,
     },
+    /// A predicate in a value position: `RETURN n.age > 18 AS adult`,
+    /// `[x IN l | x > 1]`, `SET n.flag = NOT n.done`. Evaluates three-valued
+    /// to `Bool(true)`, `Bool(false)` or null: a comparison or `IN` with a
+    /// null side is null, `NOT null` is null, `null AND false` is false and
+    /// `null OR true` is true. A WHERE never holds one at its top: the parser
+    /// unwraps it to the `Expr` itself, which WHERE evaluates the same
+    /// three-valued way, keeping a row only when it is true.
+    Pred(Box<Expr>),
 }
+
+/// The function a label predicate `x:Label` is parsed to:
+/// `FuncCall { name: LABEL_TEST_FN, args: [Var(x), Lit(Str(Label))] }`. It is
+/// true when `x` is a node with that label or a relationship of that type,
+/// false when it is not, and null when `x` is null. The leading space keeps the
+/// name out of reach of a written function call.
+pub const LABEL_TEST_FN: &str = " hasLabel";
+
+/// The internal function a write statement reads a relationship's identity
+/// with: `FuncCall { name: REL_ENDS_FN, args: [Var(r)] }` evaluates to the
+/// list `[type, start key, end key]`, in the edge's own direction whatever the
+/// pattern's, or null for a null binding. The leading space keeps it out of
+/// any name a query can spell.
+pub const REL_ENDS_FN: &str = " relEnds";
+
+/// The UNWIND alias of the one-row `UNWIND [1] AS …` a statement that begins
+/// with `MATCH … CREATE/MERGE` or with `OPTIONAL MATCH` is read as. The
+/// leading space keeps it out of reach of a written name, and `RETURN *` does
+/// not list it.
+pub const ONE_ROW_VAR: &str = " one row";
 
 /// The column name an operand gets in a RETURN or WITH item that has no
 /// `AS` alias.
@@ -267,6 +398,12 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::FuncCall { name, .. } => format!("{name}(...)"),
         Operand::BinArith { .. } => "<arith>".to_string(),
         Operand::Case { .. } => "<case>".to_string(),
+        Operand::ListLit(_) => "<list>".to_string(),
+        Operand::MapLit(_) => "<map>".to_string(),
+        Operand::ListComprehension { .. } => "<listcomp>".to_string(),
+        Operand::Reduce { .. } => "<reduce>".to_string(),
+        Operand::ListPredicate { .. } => "<listpred>".to_string(),
+        Operand::Pred(_) => "<pred>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }
@@ -310,6 +447,8 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Mod,
+    Pow,
 }
 
 /// RETURN item value: bare variable, `var.field`, an aggregate call, a
@@ -346,12 +485,14 @@ pub struct RetItem {
 }
 
 /// ORDER BY target. Bare identifiers that match a RETURN alias become `Alias`;
-/// otherwise they stay `Var`. `var.field` is always `Prop`.
+/// otherwise they stay `Var`. `var.field` is always `Prop`. Anything else — an
+/// arithmetic expression, a function call, a subscript, a `CASE` — is `Expr`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     Alias(String),
     Var(String),
     Prop { var: String, field: String },
+    Expr(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -368,9 +509,107 @@ pub struct OrderItem {
 pub enum WriteStatement {
     Create(CreateStmt),
     MatchSet(MatchSetStmt),
+    MatchSetMap(MatchSetMapStmt),
+    MatchRemove(MatchRemoveStmt),
     MatchDelete(MatchDeleteStmt),
     MatchDeleteNode(MatchDeleteNodeStmt),
     Merge(MergeStmt),
+    /// `UNWIND … [MATCH|WITH …]* <write clause>+ [RETURN …]`: the write clauses
+    /// run once per row the read part produces.
+    UnwindWrite(Box<UnwindWriteStmt>),
+}
+
+// ─── Schema (DDL) statement AST ──────────────────────────────────────────────
+
+/// A schema statement: an index or a unique constraint declared, withdrawn or
+/// listed. Produced by `parse_ddl`; executed by `GraphDb::query_write` (and,
+/// for the two `Show…` forms, by every read entry point). A DDL statement is
+/// the whole statement — no clause may precede or follow it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DdlStatement {
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.field)` — a
+    /// range index. With no name it is `idx_<Label>_<field>`.
+    CreateIndex {
+        name: Option<String>,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX name [IF EXISTS]`.
+    DropIndex { name: String, if_exists: bool },
+    /// `SHOW INDEXES` (or `SHOW INDEX`).
+    ShowIndexes,
+    /// `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:Label) REQUIRE n.field IS UNIQUE`.
+    CreateConstraint {
+        name: String,
+        label: String,
+        field: String,
+        if_not_exists: bool,
+    },
+    /// `DROP CONSTRAINT name [IF EXISTS]`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SHOW CONSTRAINTS` (or `SHOW CONSTRAINT`).
+    ShowConstraints,
+}
+
+impl DdlStatement {
+    /// Whether the statement only lists the schema (`SHOW …`) and so is a read.
+    pub fn is_show(&self) -> bool {
+        matches!(
+            self,
+            DdlStatement::ShowIndexes | DdlStatement::ShowConstraints
+        )
+    }
+}
+
+// ─── Procedure call AST ──────────────────────────────────────────────────────
+
+/// `CALL ns.name(args) [YIELD f [AS a], …] [WHERE …] [RETURN …]`: a call of a
+/// built-in procedure, a read statement of its own. Produced by
+/// [`parse_call`](super::parse_call); executed by
+/// [`execute_call`](super::proc::execute_call) on every read entry point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcCallStmt {
+    /// Every part of the dotted name but the last, joined by `.`: `db` in
+    /// `db.ping`, `db.schema` in `db.schema.visualization`.
+    pub ns: String,
+    /// The last part of the dotted name.
+    pub name: String,
+    /// The arguments: any expressions that read no variable (`$param`s and
+    /// literals), evaluated before the call.
+    pub args: Vec<Operand>,
+    /// The `YIELD` items. `None` for no `YIELD`, or `YIELD *`: every column
+    /// the procedure returns, under its own name.
+    pub yields: Option<Vec<YieldItem>>,
+    /// `WHERE` after `YIELD`, over the yielded names.
+    pub where_expr: Option<Expr>,
+    /// The `RETURN` that follows, if any. Without one the statement returns
+    /// the yielded columns.
+    pub ret: Option<CallReturn>,
+}
+
+/// One `field [AS alias]` of a `YIELD`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldItem {
+    pub field: String,
+    pub alias: Option<String>,
+}
+
+impl YieldItem {
+    /// The name the yielded column is bound to.
+    pub fn name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.field)
+    }
+}
+
+/// `RETURN [DISTINCT] items [ORDER BY …] [SKIP n] [LIMIT n]` after a `CALL`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallReturn {
+    pub distinct: bool,
+    pub items: Vec<RetItem>,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
 }
 
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
@@ -399,11 +638,21 @@ pub struct CreateNode {
 }
 
 /// One edge in a CREATE pattern, referencing vars from `CreateStmt.nodes`.
+///
+/// `rel_var`, `props` and `props_map` are the per-row form's (QL-RP): a plain
+/// `CREATE` whose relationship names a variable or carries a map is parsed as
+/// the per-row form, so the plain form's edges leave them empty.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdge {
     pub src_var: String,
     pub etype: String,
     pub dst_var: String,
+    /// `-[r:T]->`: the relationship's variable.
+    pub rel_var: Option<String>,
+    /// `-[:T {k: expr, …}]->`: the relationship's properties.
+    pub props: Vec<(String, Operand)>,
+    /// `-[:T $props]->`: the whole map is this operand; `props` is then empty.
+    pub props_map: Option<Operand>,
 }
 
 /// `MATCH patterns [WHERE expr] SET var.field = literal [, …] [RETURN …]`
@@ -412,6 +661,41 @@ pub struct MatchSetStmt {
     pub matches: Vec<Pattern>,
     pub where_expr: Option<Expr>,
     pub sets: Vec<SetClause>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] SET var = {…} | SET var += {…} [RETURN …]`
+///
+/// `merge` is `true` for `+=` (set the listed keys, leave every other property,
+/// a null value removes that property) and `false` for `=` (the node's user
+/// properties become exactly the map; the key `id`, the namespace `ns` and view
+/// owned properties are never removed, and a null value is an absent key).
+/// `var` is a node variable bound by `matches` (the parser checks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchSetMapStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    pub merge: bool,
+    pub var: String,
+    pub map: Vec<(String, Operand)>,
+    /// `SET n = $param` / `SET n += $param`: the parameter holding the map, with
+    /// `map` empty. The parameter must be a `Value::Map` at execution time.
+    pub param: Option<String>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] REMOVE var.field [, …] [RETURN …]`
+///
+/// Every `var` is a node variable bound by `matches` (the parser checks).
+/// Removing a property a node does not have is a no-op, not an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchRemoveStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    /// `(var, field)` in source order.
+    pub removals: Vec<(String, String)>,
     /// Optional RETURN clause: project matched bindings from post-write state.
     pub returns: Option<Vec<RetItem>>,
 }
@@ -491,4 +775,184 @@ pub struct MergeStmt {
     pub on_match: Vec<SetClause>,
     /// Optional RETURN clause: project the node after commit.
     pub returns: Option<Vec<RetItem>>,
+    /// `Some` for `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})`: the one
+    /// relationship and its end node. The fields above describe the start node.
+    pub edge: Option<MergeEdgePat>,
+}
+
+/// The relationship and end node of a `MERGE (a)-[:T]->(b)` pattern. Exactly
+/// one relationship is allowed in 0.10; the start node is the `MergeStmt`'s own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeEdgePat {
+    /// The single relationship type.
+    pub etype: String,
+    /// `Right`: start -> end. `Left`: end -> start. Undirected is refused at parse time.
+    pub dir: RelDir,
+    pub end_label: String,
+    /// The end node's single identifying property.
+    pub end_key_field: String,
+    pub end_key_value: core_storage::Value,
+    /// Optional `ns` named on the end node, as `MergeStmt::ns` is for the start.
+    pub end_ns: Option<core_storage::Value>,
+    /// Bound variable of the end node (`ON … SET b.x = …`, `RETURN b`).
+    pub end_var: Option<String>,
+    /// Bound variable of the relationship (`RETURN r`). A MERGE that sets
+    /// or maps its relationship's properties is the per-row form instead.
+    pub rel_var: Option<String>,
+}
+
+// ─── UNWIND-led write statements (QL-09b) ─────────────────────────────────────
+
+/// `UNWIND <expr> AS x [MATCH … | WITH … | UNWIND …]* <write clause>+ [RETURN …]`
+///
+/// The `read` part (everything before the first write clause) produces one row
+/// per iteration; each write clause then runs for each row, in order, and all
+/// of it commits as one batch. A read clause after a write clause is refused at
+/// parse time, so every read sees the state before the statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindWriteStmt {
+    /// The read part. Its `returns` are empty: the executor projects what the
+    /// write clauses need.
+    pub read: Query,
+    /// Names in scope at the end of the read part that hold a node or a value
+    /// (not a relationship); a `RETURN` after the writes is evaluated with them.
+    pub scope: Vec<String>,
+    /// Every name that holds a node at the end of the statement: the nodes of
+    /// the read part and the ones the write clauses create or merge.
+    pub node_vars: Vec<String>,
+    /// Every name that holds a relationship at the end of the statement: the
+    /// read part's, and the ones a `MERGE` pattern binds.
+    pub rel_vars: Vec<String>,
+    /// The write clauses, in source order.
+    pub writes: Vec<RowWrite>,
+    /// Optional `RETURN [DISTINCT] … [ORDER BY …] [SKIP …] [LIMIT …]`.
+    pub returns: Option<RowReturn>,
+}
+
+/// The RETURN clause of an UNWIND-led write statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowReturn {
+    pub items: Vec<RetItem>,
+    pub distinct: bool,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
+}
+
+/// One write clause of an UNWIND-led statement. Every `Operand` is evaluated
+/// per row by the read part, so it may name the UNWIND alias, a matched node's
+/// property, a `$parameter` or any expression over them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowWrite {
+    /// `CREATE (a:L {…})[-[:T]->(b:L {…})]`
+    Create {
+        nodes: Vec<RowCreateNode>,
+        edges: Vec<CreateEdge>,
+    },
+    /// `MERGE (a:L {key: …}) [-[:T]->(b:L {key: …})] [ON CREATE SET …] [ON MATCH SET …]`
+    Merge(Box<RowMerge>),
+    /// `SET n.f = expr [, …]`
+    Set(Vec<SetClause>),
+    /// `SET n = <map>` / `SET n += <map>`; `value` evaluates to a map per row.
+    SetMap {
+        var: String,
+        merge: bool,
+        value: Operand,
+    },
+    /// `REMOVE n.f [, …]`
+    Remove(Vec<(String, String)>),
+    /// `[DETACH] DELETE n [, …]`. `rels` holds the relationship variables of
+    /// the clause, accepted only in a statement with an `OPTIONAL MATCH` (QL-ON):
+    /// a null one is skipped, and one that holds a relationship is an error,
+    /// as this form does not delete relationships.
+    Delete {
+        vars: Vec<String>,
+        rels: Vec<String>,
+        detach: bool,
+    },
+}
+
+/// One node of a per-row CREATE. `var` is always set (the parser names an
+/// anonymous node).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowCreateNode {
+    pub var: String,
+    pub label: String,
+    pub props: Vec<(String, Operand)>,
+    /// `(n:L $props)`: the whole property map is this operand (a
+    /// `$parameter`), evaluated per row; `props` is then empty. A value that is
+    /// not a map is an error naming the parameter, and a null entry is not
+    /// stored.
+    pub props_map: Option<Operand>,
+}
+
+/// A per-row MERGE: one node, or two nodes and the relationship between them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMerge {
+    pub start: RowMergeNode,
+    pub edge: Option<RowMergeEdge>,
+    pub on_create: Vec<MergeSet>,
+    pub on_match: Vec<MergeSet>,
+}
+
+/// One item of a per-row MERGE's `ON CREATE SET` / `ON MATCH SET`, in source
+/// order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeSet {
+    /// `n.f = expr`
+    Prop(SetClause),
+    /// `n = <map>` (`merge` false) or `n += <map>` (`merge` true); `value`
+    /// evaluates to a map per row, with the semantics of `SET n = …` /
+    /// `SET n += …`.
+    Map {
+        var: String,
+        merge: bool,
+        value: Operand,
+    },
+}
+
+impl MergeSet {
+    /// The node variable the item sets.
+    pub fn var(&self) -> &str {
+        match self {
+            MergeSet::Prop(sc) => &sc.var,
+            MergeSet::Map { var, .. } => var,
+        }
+    }
+}
+
+/// A MERGE node pattern: a key pattern (a label and `id` alone, whose value
+/// is the key when it is a string), or a pattern matched by its label
+/// and properties (QL-NM).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMergeNode {
+    /// Always set (the parser names an anonymous node).
+    pub var: String,
+    /// Empty for a pattern with no label.
+    pub label: String,
+    /// The key pattern's property; empty, with `key` null, when the pattern
+    /// is not a key pattern.
+    pub key_field: String,
+    pub key: Operand,
+    /// Every property of the pattern but `ns` (for a key pattern, the key).
+    /// What a pattern that is not a key MERGE matches on.
+    pub props: Vec<(String, Operand)>,
+    /// Whether this is a key pattern.
+    pub key_pattern: bool,
+    pub ns: Option<Operand>,
+    /// `(v)` naming a node an earlier clause bound (`MATCH (a) MERGE
+    /// (a)-[:T]->(b:L {id: …})`): the MERGE uses that node and never creates
+    /// it. `label` is empty, and `key_field` and `key` are not read.
+    pub bound: bool,
+}
+
+/// The relationship and end node of a per-row `MERGE (a)-[:T]->(b)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowMergeEdge {
+    pub etype: String,
+    pub dir: RelDir,
+    pub rel_var: Option<String>,
+    pub end: RowMergeNode,
+    /// `-[:T {k: expr, …}]->`: part of what the MERGE matches (QL-RP).
+    pub props: Vec<(String, Operand)>,
 }

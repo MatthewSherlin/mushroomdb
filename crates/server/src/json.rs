@@ -4,8 +4,8 @@
 //! not `Value`'s internally-tagged serde form.
 
 use mushroomdb::{
-    default_max_edges, json_to_value, EdgeEvent, EdgeHistoryEvent, EdgeInfo, HistoryChange,
-    HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
+    default_max_edges, json_to_value, tagged_json, EdgeEvent, EdgeHistoryEvent, EdgeInfo,
+    HistoryChange, HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -26,6 +26,16 @@ pub(crate) fn value_to_json(v: &Value) -> Js {
                 .collect();
             Js::Object(obj)
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        // `Err` is a DateTime offset outside ±18:00, which no value reaching
+        // the server can carry: params are parsed from JSON, which refuses one,
+        // and the store holds no format-V11 value. No tag is written for it.
+        | Value::Binary(_) => tagged_json(v).ok().flatten().unwrap_or(Js::Null),
+        // A null list element or map value.
+        Value::Null => Js::Null,
     }
 }
 
@@ -101,8 +111,9 @@ pub(crate) fn result_set_json(rs: &ResultSet) -> Js {
     json!({ "columns": columns, "rows": rows })
 }
 
-/// Map JSON object values through [`json_to_value`]. Scalars, arrays, and
-/// objects are all accepted; `null` params are silently dropped.
+/// Map JSON object values to query parameters. Scalars, arrays and objects are
+/// all accepted, and a JSON `null` binds as [`Value::Null`] at the top level and
+/// inside lists and maps, matching Bolt (QL-17i).
 pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>, String> {
     let Some(v) = v else {
         return Ok(BTreeMap::new());
@@ -112,16 +123,47 @@ pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>
         .ok_or_else(|| "params must be an object".to_string())?;
     let mut out = BTreeMap::new();
     for (k, val) in obj {
-        match json_to_value(val.clone()) {
-            Some(mapped) => {
-                out.insert(k.clone(), mapped);
-            }
-            None => {
-                // null params are silently omitted
-            }
-        }
+        let mapped = param_from_json(val).map_err(|e| format!("param {k:?}: {e}"))?;
+        out.insert(k.clone(), mapped);
     }
     Ok(out)
+}
+
+/// One parameter value. [`json_to_value`] drops nulls (right for stored
+/// fields), so only the shapes that can hold a null are walked here; a typed
+/// object (`{"$date": …}`) and every scalar go through [`json_to_value`].
+fn param_from_json(v: &Js) -> Result<Value, String> {
+    match v {
+        Js::Null => Ok(Value::Null),
+        Js::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| param_from_json(item).map_err(|e| format!("item {i}: {e}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        Js::Object(obj) => {
+            // A single `$`-keyed object may be a typed value; any other result
+            // is a map, which is rebuilt below so its nulls are kept.
+            if obj.len() == 1 && obj.keys().all(|k| k.starts_with('$')) {
+                if let Some(typed) = json_to_value(v.clone())? {
+                    if !matches!(typed, Value::Map(_)) {
+                        return Ok(typed);
+                    }
+                }
+            }
+            obj.iter()
+                .map(|(k, item)| {
+                    param_from_json(item)
+                        .map(|val| (k.clone(), val))
+                        .map_err(|e| format!("key {k:?}: {e}"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map(Value::Map)
+        }
+        scalar => {
+            json_to_value(scalar.clone())?.ok_or_else(|| "value cannot be a parameter".to_string())
+        }
+    }
 }
 
 /// User edges for POST /ingest and MCP `ingest_json`.
@@ -316,4 +358,53 @@ pub(crate) fn rule_def_from_json(v: Js) -> Result<RuleDef, String> {
         def.weight_prop = Some("weight".into());
     }
     Ok(def)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_to_json;
+    use mushroomdb::{json_to_value, Value};
+    use serde_json::json;
+
+    /// Every format-V11 type prints in its tagged wire form, and that form
+    /// parses back to the same value.
+    #[test]
+    fn test_value_json_roundtrip() {
+        let cases = [
+            (Value::Date(19_737), json!({"$date": "2024-01-15"})),
+            (
+                Value::LocalDateTime(1_705_322_096_789_012),
+                json!({"$ldt": "2024-01-15T12:34:56.789012"}),
+            ),
+            (
+                Value::DateTime {
+                    micros_utc: 1_705_302_296_789_012,
+                    offset_seconds: 19_800,
+                },
+                json!({"$dt": "2024-01-15T12:34:56.789012+05:30"}),
+            ),
+            (
+                Value::Duration {
+                    months: 14,
+                    days: 3,
+                    nanos: 14_706_789_000_000,
+                },
+                json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
+            ),
+            (
+                Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                json!({"$binary": "3q2+7w=="}),
+            ),
+        ];
+        for (value, wire) in cases {
+            assert_eq!(value_to_json(&value), wire);
+            assert_eq!(json_to_value(wire), Ok(Some(value)));
+        }
+        // Nested in a list, each keeps its form.
+        let list = Value::List(vec![Value::Date(0), Value::Binary(vec![])]);
+        assert_eq!(
+            value_to_json(&list),
+            json!([{"$date": "1970-01-01"}, {"$binary": ""}])
+        );
+    }
 }

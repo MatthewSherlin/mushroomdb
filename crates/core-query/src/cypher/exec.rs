@@ -1,28 +1,34 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
 use crate::cypher::ast::{
-    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem,
-    RetVal, UnwindExpr,
+    operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
+    OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN, REL_ENDS_FN,
 };
-use crate::cypher::plan::PlanOp;
+use crate::cypher::entity::{merge_kinds, output_kinds};
+use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
+use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
 use crate::result::ResultSet;
 use crate::traverse::{expand, Dir, EdgeRef};
 use crate::value_ops::{cmp_optional, values_equal};
 use crate::view::GraphView;
-use core_storage::{Value, ValueKey};
+use core_storage::{UnifiedIndex, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Test-only counter incremented each time the fused ScanLabel+Filter arm
-/// executes.  Lets property tests assert the fast path actually fires for
-/// matching query shapes (and does NOT fire for fallback shapes).
+// Test-only counter incremented each time the fused ScanLabel+Filter arm
+// executes.  Lets property tests assert the fast path actually fires for
+// matching query shapes (and does NOT fire for fallback shapes). Per thread,
+// so a test that runs the fused path in parallel cannot move another test's
+// count.
 #[cfg(test)]
-static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static FUSED_SCAN_FIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Test-only counter incremented each time a `ScanKey` arm executes.
 /// Lets tests assert the point-lookup path actually fires (and does not
-/// walk `view.labels`).
+/// walk `view.label_syms()`).
 #[cfg(test)]
 static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -39,6 +45,50 @@ pub static INDEX_SCAN_FIRES: std::sync::atomic::AtomicUsize =
 pub static INDEX_INTERSECT_FIRES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+thread_local! {
+    static RANGE_INDEX_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an `IndexRangeScan` was answered by a range
+/// index rather than by its label-scan fallback. Per thread, so a test can
+/// read it around its own queries while other tests run; not a metric.
+#[doc(hidden)]
+pub fn range_index_scans() -> u64 {
+    RANGE_INDEX_SCANS.with(|c| c.get())
+}
+
+fn count_range_index_scan() {
+    RANGE_INDEX_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    static RANGE_TOP_K_STOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an `ORDER BY … LIMIT` over a range index
+/// stopped reading the index before its end. Per thread, for tests.
+#[doc(hidden)]
+pub fn range_top_k_stops() -> u64 {
+    RANGE_TOP_K_STOPS.with(|c| c.get())
+}
+
+thread_local! {
+    static PULL_PROBE_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(4096) };
+}
+
+/// How many node slots a bounded (`LIMIT`, no `ORDER BY`) `IndexRangeScan`
+/// scans before it reads the range index.
+fn pull_probe_slots() -> usize {
+    PULL_PROBE_SLOTS.with(|c| c.get())
+}
+
+/// Set [`pull_probe_slots`] for this thread and return the previous value.
+/// For tests that need the index path on graphs smaller than the probe.
+#[doc(hidden)]
+pub fn set_pull_probe_slots(slots: usize) -> usize {
+    PULL_PROBE_SLOTS.with(|c| c.replace(slots))
+}
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -52,6 +102,112 @@ enum Cell {
     Path(u8),
     /// Scalar value produced by a WITH projection (property alias, aggregate result, etc.).
     Scalar(Value),
+}
+
+/// The nodes and relationships of a path, in walk order: `nodes.len()` is
+/// `rels.len() + 1`.
+#[derive(Clone, Debug, PartialEq)]
+struct PathVal {
+    nodes: Vec<u32>,
+    rels: Vec<EdgeRef>,
+}
+
+impl PathVal {
+    /// The hidden binding that carries one variable-length or shortest-path
+    /// hop's walk to `BindPath` and to the later hops of its MATCH clause:
+    /// the relationships in walk order, flat as `[etype, src, dst, ...]`.
+    /// The nodes are not stored; `BindPath` derives them from the hop's start
+    /// (see `walk_nodes`), which keeps the binding small on the hot path. An
+    /// ordinary scalar cell, so the binding table gains no variant (a `Box`
+    /// variant stopped the row clone and drop from inlining and cost the
+    /// two-hop aggregate about 9 %).
+    fn to_trail(rels: &[EdgeRef]) -> Cell {
+        Self::to_trail_then(rels, None)
+    }
+
+    /// `to_trail` of `rels` followed by `last`, built in one allocation.
+    fn to_trail_then(rels: &[EdgeRef], last: Option<&EdgeRef>) -> Cell {
+        let mut flat = Vec::with_capacity(3 * (rels.len() + 1));
+        for e in rels.iter().chain(last) {
+            flat.extend([e.etype, e.src, e.dst].map(|x| Value::Int(x.into())));
+        }
+        Cell::Scalar(Value::List(flat))
+    }
+
+    /// Whether a trail (see `to_trail`) walked `e`, read in place.
+    fn trail_has_edge(cell: &Cell, e: &EdgeRef) -> bool {
+        let Cell::Scalar(Value::List(rels)) = cell else {
+            return false;
+        };
+        let (etype, src, dst) = (i64::from(e.etype), i64::from(e.src), i64::from(e.dst));
+        rels.chunks_exact(3).any(|c| {
+            matches!(c, [Value::Int(t), Value::Int(s), Value::Int(d)]
+                if *t == etype && *s == src && *d == dst)
+        })
+    }
+
+    fn from_trail(cell: &Cell) -> Option<Vec<EdgeRef>> {
+        let Cell::Scalar(Value::List(rels)) = cell else {
+            return None;
+        };
+        let id = |v: &Value| match v {
+            Value::Int(n) => u32::try_from(*n).ok(),
+            _ => None,
+        };
+        rels.chunks_exact(3)
+            .map(|c| {
+                Some(EdgeRef {
+                    etype: id(&c[0])?,
+                    src: id(&c[1])?,
+                    dst: id(&c[2])?,
+                })
+            })
+            .collect()
+    }
+
+    /// Extend `nodes` (ending at the walk's start) along `rels`: each
+    /// relationship leads to its other end, whichever way it was walked; a
+    /// self-loop stays put.
+    fn walk_nodes(nodes: &mut Vec<u32>, rels: &[EdgeRef]) {
+        for e in rels {
+            let at = nodes.last().copied().unwrap_or(e.src);
+            nodes.push(if e.src == at { e.dst } else { e.src });
+        }
+    }
+}
+
+/// A path as a query result: a map, so it renders on every surface (Rust,
+/// HTTP JSON, Python, TypeScript, Arrow) as the existing `Value::Map` does,
+/// with no new `Value` variant. Nodes are their keys, as a bare node variable
+/// is. Bolt sends a Path structure, built from this map (see
+/// [`entity`](crate::cypher::entity)).
+fn path_value(view: &GraphView, path: &PathVal) -> Value {
+    let key = |id: u32| Value::Str(view.try_key_of(id).unwrap_or_default().to_owned());
+    let rels = path.rels.iter().map(|e| rel_value(view, e)).collect();
+    Value::Map(BTreeMap::from([
+        (
+            "nodes".to_owned(),
+            Value::List(path.nodes.iter().map(|id| key(*id)).collect()),
+        ),
+        ("relationships".to_owned(), Value::List(rels)),
+        ("length".to_owned(), Value::Int(path.rels.len() as i64)),
+    ]))
+}
+
+/// A relationship as a query result: the map `{type, start, end}` with the
+/// keys of its stored direction, the form a path's relationships take. It
+/// renders on every surface as a map does; Bolt sends the relationship
+/// itself (see [`entity`](crate::cypher::entity)).
+fn rel_value(view: &GraphView, e: &EdgeRef) -> Value {
+    let key = |id: u32| Value::Str(view.try_key_of(id).unwrap_or_default().to_owned());
+    Value::Map(BTreeMap::from([
+        (
+            "type".to_owned(),
+            Value::Str(view.sym_name(e.etype).unwrap_or_default().to_owned()),
+        ),
+        ("start".to_owned(), key(e.src)),
+        ("end".to_owned(), key(e.dst)),
+    ]))
 }
 
 /// Binding-table row: one slot per interned variable. Cheaper to clone than
@@ -209,17 +365,118 @@ fn group_cap_err() -> String {
 ///
 /// `Int(n)` and `Float(n as f64)` produce the same `FloatBits` key so that
 /// nodes with `score = 1` (Int) and `score = 1.0` (Float) land in the same
-/// group, matching openCypher's `1 = 1.0` equality rule.
-///
-/// Note: integers whose magnitude exceeds 2^53 lose precision when cast to
-/// `f64`, so two large integers that differ only beyond the float mantissa
-/// width could be incorrectly unified. This is a known limitation documented
-/// in `docs/site/query.md`.
+/// group, matching openCypher's `1 = 1.0` equality rule, and the two zeros
+/// are one value. An `Int` that no `f64` holds exactly (beyond 2^53) keeps an
+/// exact key, so two such `Int`s that differ stay two groups, as `=` says.
 fn group_key_normalize(v: &Value) -> Option<ValueKey> {
     match v {
-        Value::Int(n) => Some(ValueKey::FloatBits((*n as f64).to_bits())),
-        Value::Float(f) => Some(ValueKey::FloatBits(f.to_bits())),
+        Value::Int(n) => Some(match exact_float(*n) {
+            Some(f) => ValueKey::FloatBits(float_key_bits(f)),
+            None => ValueKey::Int(*n),
+        }),
+        Value::Float(f) => Some(ValueKey::FloatBits(float_key_bits(*f))),
+        // A list or map has no index key, but it is a real value: two
+        // different ones must not share the null group. A path renders as a
+        // map, so `RETURN DISTINCT p` and `count(p)` per group rely on this.
+        Value::List(_) | Value::Map(_) => {
+            let mut bytes = COMPOSITE_KEY_PREFIX.to_vec();
+            encode_composite_key(v, &mut bytes);
+            Some(ValueKey::BinaryBytes(bytes))
+        }
         _ => ValueKey::from_value(v),
+    }
+}
+
+/// `n` as an `f64`, when the `f64` is exactly `n`.
+fn exact_float(n: i64) -> Option<f64> {
+    let f = n as f64;
+    (f as i128 == i128::from(n)).then_some(f)
+}
+
+/// The bit pattern two numbers that `=` finds equal share: `-0.0` is `0.0`.
+fn float_key_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
+/// Marks a [`ValueKey::BinaryBytes`] that stands for a list or a map. A real
+/// binary value would have to begin with these exact bytes to share a group
+/// with one.
+const COMPOSITE_KEY_PREFIX: &[u8] = b"\xFFcomposite\x00";
+
+/// A canonical byte form of `v` for grouping, equal exactly when the scan's
+/// equality (`values_equal`) says two values are, recursively: numbers follow
+/// [`group_key_normalize`] (`2` and `2.0` meet, the zeros meet, `Int`s past
+/// 2^53 stay apart), a `DateTime` is its UTC instant whatever its offset, and
+/// a null is equal to a null (grouping, as openCypher has it). Every element
+/// is length-prefixed so two different values never encode alike.
+fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
+    let text = |out: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
+        out.push(tag);
+        out.extend((bytes.len() as u64).to_le_bytes());
+        out.extend(bytes);
+    };
+    match v {
+        Value::Int(n) => match exact_float(*n) {
+            Some(f) => {
+                out.push(1);
+                out.extend(float_key_bits(f).to_le_bytes());
+            }
+            None => {
+                out.push(7);
+                out.extend(n.to_le_bytes());
+            }
+        },
+        Value::Float(f) => {
+            out.push(1);
+            out.extend(float_key_bits(*f).to_le_bytes());
+        }
+        Value::Str(s) => text(out, 2, s.as_bytes()),
+        Value::Bool(b) => out.extend([3, u8::from(*b)]),
+        Value::List(items) => {
+            out.push(4);
+            out.extend((items.len() as u64).to_le_bytes());
+            for item in items {
+                encode_composite_key(item, out);
+            }
+        }
+        Value::Map(entries) => {
+            out.push(5);
+            out.extend((entries.len() as u64).to_le_bytes());
+            for (key, value) in entries {
+                out.extend((key.len() as u64).to_le_bytes());
+                out.extend(key.as_bytes());
+                encode_composite_key(value, out);
+            }
+        }
+        Value::Null => out.push(0),
+        Value::Date(d) => {
+            out.push(8);
+            out.extend(d.to_le_bytes());
+        }
+        Value::LocalDateTime(us) => {
+            out.push(9);
+            out.extend(us.to_le_bytes());
+        }
+        // The offset is display-only: one instant is one value.
+        Value::DateTime { micros_utc, .. } => {
+            out.push(10);
+            out.extend(micros_utc.to_le_bytes());
+        }
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            out.push(11);
+            out.extend(months.to_le_bytes());
+            out.extend(days.to_le_bytes());
+            out.extend(nanos.to_le_bytes());
+        }
+        Value::Binary(bytes) => text(out, 12, bytes),
     }
 }
 
@@ -234,9 +491,16 @@ fn group_key_normalize(v: &Value) -> Option<ValueKey> {
 /// as `SKIP + LIMIT` final rows have been collected.  No intermediate table is
 /// ever fully materialised for the bounded path — the 1 M cap is the safety
 /// net for unbounded queries only.
+///
+/// The result's [`column_kinds`](ResultSet::column_kinds) say which columns
+/// are bare node, relationship and path variables (see
+/// [`entity`](crate::cypher::entity)); no entity details are attached here.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     use crate::cypher::plan::row_bound;
-    execute_inner(view, plan, params, row_bound(plan))
+    let _clock = crate::cypher::temporal::StatementClock::enter();
+    let mut rs = execute_inner(view, plan, params, row_bound(plan))?;
+    rs.set_column_kinds(output_kinds(plan));
+    Ok(rs)
 }
 
 /// Execute a read query that may be a `UNION` / `UNION ALL` chain. Each part is
@@ -248,10 +512,30 @@ pub fn execute_union(
     union: &crate::cypher::parser::UnionQuery,
     params: &Params,
 ) -> Result<ResultSet, String> {
+    let plans = plan_union(union)?;
+    execute_planned_union(view, &plans, &union.all_flags, params)
+}
+
+/// Plan every part of a read query. Planning reads no row and no parameter,
+/// so its errors (an unbound variable, a duplicate column) are compile-time
+/// errors; callers report them as `plan:` before anything executes.
+pub fn plan_union(union: &crate::cypher::parser::UnionQuery) -> Result<Vec<Vec<PlanOp>>, String> {
+    union.parts.iter().map(crate::cypher::plan::plan).collect()
+}
+
+/// Execute the parts [`plan_union`] planned and combine them as
+/// [`execute_union`] does; `all_flags` is the query's `UnionQuery::all_flags`.
+pub fn execute_planned_union(
+    view: &GraphView,
+    plans: &[Vec<PlanOp>],
+    all_flags: &[bool],
+    params: &Params,
+) -> Result<ResultSet, String> {
+    // Every part of a `UNION` is one statement, so one instant.
+    let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut acc: Option<ResultSet> = None;
-    for (i, part) in union.parts.iter().enumerate() {
-        let ops = crate::cypher::plan::plan(part)?;
-        let rs = execute(view, &ops, params)?;
+    for (i, ops) in plans.iter().enumerate() {
+        let rs = execute(view, ops, params)?;
         acc = Some(match acc {
             None => rs,
             Some(prev) => {
@@ -264,13 +548,16 @@ pub fn execute_union(
                     ));
                 }
                 // all_flags has one entry per boundary; index i-1 for part i.
-                let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
-                combine_result_sets(prev, rs, all)
+                let all = all_flags.get(i - 1).copied().unwrap_or(false);
+                let kinds = merge_kinds(prev.column_kinds(), rs.column_kinds());
+                let mut combined = combine_result_sets(prev, rs, all);
+                combined.set_column_kinds(kinds);
+                combined
             }
         });
     }
     // `parse_read` guarantees at least one part.
-    Ok(acc.expect("UNION query has at least one part"))
+    acc.ok_or_else(|| "a read query has at least one part".to_string())
 }
 
 fn combine_result_sets(mut acc: ResultSet, other: ResultSet, all: bool) -> ResultSet {
@@ -395,7 +682,7 @@ fn execute_inner(
     // executor can emit the final ResultSet from `rows` when no Project follows.
     let mut pipeline_group_columns: Option<Vec<String>> = None;
 
-    for op in plan {
+    for (op_index, op) in plan.iter().enumerate() {
         match op {
             PlanOp::ScanLabel { var, label } => {
                 rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
@@ -419,6 +706,9 @@ fn execute_inner(
                     value,
                     params,
                 )?;
+            }
+            PlanOp::IndexRangeScan { .. } => {
+                rows = scan_range(view, &vars, &rows, op, params)?;
             }
             PlanOp::IndexIntersect {
                 var,
@@ -444,30 +734,18 @@ fn execute_inner(
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, &vars, &rows, op, params)?;
             }
-            PlanOp::VarExpand {
-                from,
-                rel_var,
-                etypes,
-                dir,
-                to,
-                min,
-                max,
-            } => {
-                rows = exec_var_expand(
-                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *min, *max,
-                )?;
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, &vars, &rows, op, params)?;
             }
-            PlanOp::ShortestPath {
-                from,
-                rel_var,
-                etypes,
-                dir,
-                to,
-                max_hops,
+            PlanOp::ShortestPath { .. } => {
+                rows = exec_shortest_path(view, &vars, &rows, op)?;
+            }
+            PlanOp::BindPath {
+                path_var,
+                start_var,
+                hops,
             } => {
-                rows = exec_shortest_path(
-                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *max_hops,
-                )?;
+                rows = exec_bind_path(view, &vars, &rows, path_var, start_var, hops)?;
             }
             PlanOp::Filter { expr } => {
                 rows = exec_filter(view, &vars, &rows, expr, params)?;
@@ -482,12 +760,16 @@ fn execute_inner(
                     return Err("DISTINCT requires a Project".into());
                 }
             }
-            PlanOp::OrderBy { items } => {
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                let keep = order_keep_bound(&plan[op_index + 1..], params);
                 if let Some(table) = projected.as_mut() {
-                    exec_order_by(table, items)?;
+                    exec_order_by(table, items, *visible_columns, keep)?;
                 } else {
                     // Pipeline mode: ORDER BY on raw rows (before any Project).
-                    exec_order_by_rows(&vars, &mut rows, items, view);
+                    exec_order_by_rows(&vars, &mut rows, items, view, params, keep)?;
                 }
             }
             PlanOp::Skip(ls) => {
@@ -538,7 +820,9 @@ fn execute_inner(
                             gk.clone(),
                             (
                                 display_vals,
-                                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                                aggs.iter()
+                                    .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                                    .collect::<Result<Vec<_>, _>>()?,
                             ),
                         );
                     }
@@ -556,7 +840,9 @@ fn execute_inner(
                         empty_key,
                         (
                             vec![],
-                            aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                            aggs.iter()
+                                .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                                .collect::<Result<Vec<_>, _>>()?,
                         ),
                     );
                 }
@@ -599,10 +885,21 @@ fn execute_inner(
                 // Project each input row through the WITH items first so that
                 // output aliases (e.g. `p.age AS age`) are available for the
                 // subsequent WHERE filter, ORDER BY, SKIP, and LIMIT.
+                //
+                // ORDER BY may name a variable the WITH does not carry
+                // (`WITH n.name AS name ORDER BY n.score`), so each projected
+                // row starts as a copy of its input row and the WITH items are
+                // written over it; the columns the WITH does not name are
+                // cleared once the sort is done.
                 let row_len = vars.names.len();
+                let keep_input = !order_by.is_empty();
                 let mut new_rows: Vec<Row> = Vec::with_capacity(rows.len());
                 for row in &rows {
-                    let mut new_row: Row = vec![None; row_len];
+                    let mut new_row: Row = if keep_input {
+                        row.clone()
+                    } else {
+                        vec![None; row_len]
+                    };
                     for item in items {
                         let col = column_name(item);
                         let Some(dst_slot) = vars.slot(&col) else {
@@ -611,9 +908,9 @@ fn execute_inner(
                         match &item.value {
                             RetVal::Var(v) => {
                                 // Carry the existing cell (node binding or scalar alias).
-                                if let Some(src_slot) = vars.slot(v) {
-                                    new_row[dst_slot] = row.get(src_slot).cloned().flatten();
-                                }
+                                new_row[dst_slot] = vars
+                                    .slot(v)
+                                    .and_then(|src_slot| row.get(src_slot).cloned().flatten());
                             }
                             RetVal::Prop { var, field } => {
                                 let val = resolve_prop(view, &vars, row, var, field)?;
@@ -639,7 +936,8 @@ fn execute_inner(
                 }
                 // ORDER BY / SKIP / LIMIT on projected rows.
                 if !order_by.is_empty() {
-                    exec_order_by_rows(&vars, &mut rows, order_by, view);
+                    let keep = skip_limit_bound(skip.as_ref(), limit.as_ref(), params);
+                    exec_order_by_rows(&vars, &mut rows, order_by, view, params, keep)?;
                 }
                 if let Some(ls) = skip {
                     let n = resolve_ls(ls, params)?;
@@ -648,6 +946,19 @@ fn execute_inner(
                 if let Some(ls) = limit {
                     let n = resolve_ls(ls, params)?;
                     apply_limit(&mut rows, n);
+                }
+                if keep_input {
+                    let carried: Vec<usize> = items
+                        .iter()
+                        .filter_map(|item| vars.slot(&column_name(item)))
+                        .collect();
+                    for row in &mut rows {
+                        let mut cleared: Row = vec![None; row_len];
+                        for &slot in &carried {
+                            cleared[slot] = row[slot].take();
+                        }
+                        *row = cleared;
+                    }
                 }
             }
             // UNWIND: expand each input row into N rows by iterating a list value.
@@ -660,6 +971,7 @@ fn execute_inner(
                 for row in &rows {
                     let list_val: Option<Value> = match expr {
                         UnwindExpr::Lit(vals) => Some(Value::List(vals.clone())),
+                        UnwindExpr::Expr(op) => resolve_operand(view, &vars, row, op, params)?,
                         UnwindExpr::Prop { var, field } => {
                             resolve_prop(view, &vars, row, var, field)?
                         }
@@ -679,7 +991,7 @@ fn execute_inner(
                         }
                     };
                     match list_val {
-                        None => {} // null → 0 rows (openCypher)
+                        None | Some(Value::Null) => {} // null → 0 rows (openCypher)
                         Some(Value::List(items_list)) => {
                             // Empty list → 0 rows (openCypher)
                             for item_val in items_list {
@@ -687,7 +999,9 @@ fn execute_inner(
                                     return Err(row_cap_err(cap));
                                 }
                                 let mut new_row = row.clone();
-                                new_row[alias_slot] = Some(Cell::Scalar(item_val));
+                                // A null element binds the alias to null.
+                                new_row[alias_slot] =
+                                    crate::value_ops::element(item_val).map(Cell::Scalar);
                                 new_rows.push(new_row);
                             }
                         }
@@ -697,8 +1011,13 @@ fn execute_inner(
                                 Value::Float(_) => "Float",
                                 Value::Str(_) => "Str",
                                 Value::Bool(_) => "Bool",
-                                Value::List(_) => unreachable!(),
+                                Value::List(_) | Value::Null => unreachable!(),
                                 Value::Map(_) => "Map",
+                                Value::Date(_) => "Date",
+                                Value::LocalDateTime(_) => "LocalDateTime",
+                                Value::DateTime { .. } => "DateTime",
+                                Value::Duration { .. } => "Duration",
+                                Value::Binary(_) => "Binary",
                             };
                             return Err(format!(
                                 "UNWIND requires a list; got {type_name} value for `{alias}`"
@@ -719,8 +1038,9 @@ fn execute_inner(
                     params,
                     func,
                     arg,
+                    op_edges: OpEdges::new(&[], &vars),
                 };
-                let mut acc = AggAcc::for_arg(func, arg);
+                let mut acc = AggAcc::for_arg(func, arg, params)?;
                 for row in &rows {
                     // agg_stream with empty ops hits the terminal branch (accumulate).
                     agg_stream(&ctx, &[], row, &mut acc)?;
@@ -791,10 +1111,10 @@ fn execute_inner(
                                 .and_then(|c| match c {
                                     Cell::Scalar(v) => Some(v.clone()),
                                     Cell::Node(id) => {
-                                        view.ids.key_of(*id).map(|k| Value::Str(k.to_owned()))
+                                        view.try_key_of(*id).map(|k| Value::Str(k.to_owned()))
                                     }
                                     Cell::Path(h) => Some(Value::Int(*h as i64)),
-                                    Cell::Rel(_) => None,
+                                    Cell::Rel(e) => Some(rel_value(view, e)),
                                 })
                         })
                         .collect();
@@ -815,7 +1135,7 @@ fn execute_inner(
 /// without the routing checks, aggregate fast-paths, or `check_params` (those
 /// are handled by the outer call).  Only the ops that can appear inside an
 /// OPTIONAL MATCH inner plan are needed: ScanLabel, JoinBound, LookupProps,
-/// Expand, Filter.
+/// Expand, VarExpand, BindPath, Filter.
 fn exec_left_outer_inner(
     view: &GraphView,
     vars: &VarTable,
@@ -839,6 +1159,16 @@ fn exec_left_outer_inner(
             }
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::BindPath {
+                path_var,
+                start_var,
+                hops,
+            } => {
+                rows = exec_bind_path(view, vars, &rows, path_var, start_var, hops)?;
             }
             PlanOp::Filter { expr } => {
                 rows = exec_filter(view, vars, &rows, expr, params)?;
@@ -884,6 +1214,9 @@ fn collect_params_from_ops(
             PlanOp::LookupProps { props, .. }
             | PlanOp::JoinBound { props, .. }
             | PlanOp::Expand {
+                to_props: props, ..
+            }
+            | PlanOp::VarExpand {
                 to_props: props, ..
             } => {
                 for (_, operand) in props {
@@ -968,6 +1301,42 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             collect_operand(left, names, seen);
             collect_operand(right, names, seen);
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                collect_operand(item, names, seen);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                collect_operand(value, names, seen);
+            }
+        }
+        Operand::ListComprehension {
+            list, filter, map, ..
+        } => {
+            collect_operand(list, names, seen);
+            if let Some(f) = filter {
+                // Depth is bounded by the parser's nesting limit.
+                let _ = collect_expr(f, names, seen, 0);
+            }
+            collect_operand(map, names, seen);
+        }
+        Operand::ListPredicate { list, pred, .. } => {
+            collect_operand(list, names, seen);
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(pred, names, seen, 0);
+        }
+        Operand::Reduce {
+            init, list, body, ..
+        } => {
+            collect_operand(init, names, seen);
+            collect_operand(list, names, seen);
+            collect_operand(body, names, seen);
+        }
+        Operand::Pred(expr) => {
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(expr, names, seen, 0);
+        }
         _ => {}
     }
 }
@@ -982,7 +1351,7 @@ fn collect_expr(
         return Err("expression nesting too deep".into());
     }
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             collect_expr(lhs, names, seen, depth + 1)?;
             collect_expr(rhs, names, seen, depth + 1)
         }
@@ -1002,9 +1371,7 @@ fn collect_expr(
         }
         Expr::In { expr, list } => {
             collect_operand(expr, names, seen);
-            for item in list {
-                collect_operand(item, names, seen);
-            }
+            collect_operand(list, names, seen);
             Ok(())
         }
     }
@@ -1024,6 +1391,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
             PlanOp::IndexScan { var, value, .. } => {
                 vars.intern(var);
                 intern_operand(&mut vars, value);
+            }
+            PlanOp::IndexRangeScan { var, .. } => {
+                vars.intern(var);
             }
             PlanOp::IndexIntersect {
                 var, equalities, ..
@@ -1056,22 +1426,43 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             }
             PlanOp::VarExpand {
-                from, rel_var, to, ..
+                from,
+                rel_var,
+                to,
+                to_props,
+                trail_var,
+                ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
                 if let Some(r) = rel_var {
                     vars.intern(r);
+                }
+                if let Some(t) = trail_var {
+                    vars.intern(t);
+                }
+                for (_, operand) in to_props {
+                    intern_operand(&mut vars, operand);
                 }
             }
             PlanOp::ShortestPath {
-                from, rel_var, to, ..
+                from,
+                rel_var,
+                to,
+                trail_var,
+                ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
                 if let Some(r) = rel_var {
                     vars.intern(r);
                 }
+                if let Some(t) = trail_var {
+                    vars.intern(t);
+                }
+            }
+            PlanOp::BindPath { path_var, .. } => {
+                vars.intern(path_var);
             }
             PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
             PlanOp::Project { items } => {
@@ -1161,6 +1552,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         OrderTarget::Prop { var, .. } => {
                             vars.intern(var);
                         }
+                        OrderTarget::Expr(op) => intern_operand(&mut vars, op),
                     }
                 }
             }
@@ -1173,6 +1565,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     UnwindExpr::Var(name) => {
                         vars.intern(name);
                     }
+                    UnwindExpr::Expr(op) => intern_operand(&mut vars, op),
                     UnwindExpr::Lit(_) => {}
                 }
             }
@@ -1214,8 +1607,24 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 vars.intern(r);
                             }
                         }
+                        PlanOp::VarExpand {
+                            from,
+                            rel_var,
+                            to,
+                            trail_var,
+                            ..
+                        } => {
+                            vars.intern(from);
+                            vars.intern(to);
+                            for name in rel_var.iter().chain(trail_var) {
+                                vars.intern(name);
+                            }
+                        }
                         PlanOp::JoinBound { var, .. } | PlanOp::LookupProps { var, .. } => {
                             vars.intern(var);
+                        }
+                        PlanOp::BindPath { path_var, .. } => {
+                            vars.intern(path_var);
                         }
                         PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
                         _ => {}
@@ -1259,6 +1668,53 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             intern_operand(vars, base);
             intern_operand(vars, index);
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                intern_operand(vars, item);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                intern_operand(vars, value);
+            }
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            if let Some(f) = filter {
+                intern_expr(vars, f);
+            }
+            intern_operand(vars, map);
+        }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            intern_expr(vars, pred);
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // Both variables need a row slot to be bound in.
+            vars.intern(acc_var);
+            vars.intern(iter_var);
+            intern_operand(vars, init);
+            intern_operand(vars, list);
+            intern_operand(vars, body);
+        }
+        Operand::Pred(expr) => intern_expr(vars, expr),
     }
 }
 
@@ -1288,7 +1744,7 @@ fn agg_arg_label(arg: &AggArg) -> String {
 
 fn intern_expr(vars: &mut VarTable, expr: &Expr) {
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             intern_expr(vars, lhs);
             intern_expr(vars, rhs);
         }
@@ -1301,9 +1757,7 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
         Expr::IsNull(op) | Expr::IsNotNull(op) => intern_operand(vars, op),
         Expr::In { expr, list } => {
             intern_operand(vars, expr);
-            for item in list {
-                intern_operand(vars, item);
-            }
+            intern_operand(vars, list);
         }
     }
 }
@@ -1312,7 +1766,7 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     let ids = match label {
         Some(label) => view.nodes_with_label(label),
         // Real nodes always have labels; sentinel slots are gaps.
-        None => (0..view.ids.len() as u32)
+        None => (0..view.id_bound())
             .filter(|&id| view.label_of(id).is_some())
             .collect(),
     };
@@ -1450,6 +1904,228 @@ fn index_scan_ids(
     Ok(out)
 }
 
+/// An `IndexRangeScan`'s operands, borrowed from the op.
+struct RangeScan<'a> {
+    label: &'a str,
+    field: &'a str,
+    lo: Option<&'a RangeBound>,
+    hi: Option<&'a RangeBound>,
+    prefix: Option<&'a Operand>,
+    order: Option<&'a RangeOrder>,
+}
+
+impl<'a> RangeScan<'a> {
+    fn of(op: &'a PlanOp) -> Option<(&'a str, RangeScan<'a>)> {
+        match op {
+            PlanOp::IndexRangeScan {
+                var,
+                label,
+                field,
+                lo,
+                hi,
+                prefix,
+                order,
+            } => Some((
+                var.as_str(),
+                RangeScan {
+                    label,
+                    field,
+                    lo: lo.as_ref(),
+                    hi: hi.as_ref(),
+                    prefix: prefix.as_ref(),
+                    order: order.as_ref(),
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a range bound is of a class the index orders (numbers, strings,
+/// the temporal types except `Duration`, binary). Any other bound — `Bool`,
+/// list, map, `Duration` — the scan answers.
+fn orderable_bound(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Binary(_)
+    )
+}
+
+/// Whether two values of one class sort as one run for a top-k cut: equal as
+/// `ORDER BY` compares them, except that `DateTime`s at one instant are one
+/// run whatever their offsets, since the index yields such a run by node id
+/// rather than by offset.
+fn same_run(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::DateTime { micros_utc: x, .. }, Value::DateTime { micros_utc: y, .. }) => x == y,
+        _ => crate::value_ops::cmp_values(a, b) == std::cmp::Ordering::Equal,
+    }
+}
+
+/// The candidate node ids of an `IndexRangeScan`, ascending — a superset of
+/// the nodes its `Filter` keeps, and, with an `order`, of the first `s + k`
+/// rows its `ORDER BY` sorts.
+///
+/// Answered by the range index when [`GraphView::range_index`] gives one and
+/// every bound resolves to a value of a class the index orders. `None` when
+/// it is not: the caller then scans the label exactly as `ScanLabel` does.
+fn range_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    scan: &RangeScan<'_>,
+    params: &Params,
+) -> Result<Option<Vec<u32>>, String> {
+    let Some(index) = view.range_index(scan.label, scan.field) else {
+        return Ok(None);
+    };
+    let Some(sym) = view.sym(scan.label) else {
+        return Ok(Some(Vec::new()));
+    };
+    let bound = |b: Option<&RangeBound>| -> Result<Option<Option<(Value, bool)>>, String> {
+        let Some(b) = b else {
+            return Ok(Some(None));
+        };
+        Ok(resolve_operand(view, vars, row, &b.value, params)?
+            .filter(orderable_bound)
+            .map(|v| Some((v, b.inclusive))))
+    };
+    // `None`: a bound the index cannot take (null, Bool, Duration, …).
+    let (Some(lo), Some(hi)) = (bound(scan.lo)?, bound(scan.hi)?) else {
+        return Ok(None);
+    };
+    let prefix = match scan.prefix {
+        None => None,
+        Some(op) => match resolve_operand(view, vars, row, op, params)? {
+            Some(Value::Str(s)) => Some(s),
+            _ => return Ok(None),
+        },
+    };
+    let keeps = |id: u32| view.visible(id) && view.label_sym(id) == Some(sym);
+    let bounded = lo.is_some() || hi.is_some() || prefix.is_some();
+    let lo = lo.as_ref().map(|(v, incl)| (v, *incl));
+    let hi = hi.as_ref().map(|(v, incl)| (v, *incl));
+    let keep = scan
+        .order
+        .and_then(|o| skip_limit_bound(o.skip.as_ref(), Some(&o.limit), params));
+    let mut ids: Vec<u32> = match (scan.order, keep) {
+        (Some(order), Some(keep)) => {
+            let desc = order.descending;
+            let walk: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) if desc => {
+                    // A prefix's matches are one run of keys, read forwards.
+                    let mut all: Vec<u32> =
+                        index.lookup_prefix(scan.label, scan.field, p).collect();
+                    all.reverse();
+                    Box::new(all.into_iter())
+                }
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_ordered(scan.label, scan.field, lo, hi, desc)),
+            };
+            let (mut ids, cut) = top_k(view, scan.field, walk, keep, &keeps);
+            // With a range, a node with no index entry fails it. Without
+            // one, such nodes (no property, or a list, map or `Duration`)
+            // sort among the rows: descending, nulls come first; ascending,
+            // after numbers, strings and Bools — so only a cut past those
+            // can need them.
+            let settled_before_unindexed = !desc
+                && matches!(
+                    cut,
+                    Some(Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_))
+                );
+            if !bounded && !settled_before_unindexed {
+                ids.extend(unindexed_ids(view, index, scan));
+            }
+            ids.sort_unstable();
+            ids
+        }
+        _ if !bounded => return Ok(None),
+        _ => {
+            let source: Box<dyn Iterator<Item = u32>> = match &prefix {
+                Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
+                None => Box::new(index.lookup_range(scan.label, scan.field, lo, hi)),
+            };
+            let mut ids: Vec<u32> = source.filter(|&id| keeps(id)).collect();
+            ids.sort_unstable();
+            ids
+        }
+    };
+    ids.dedup();
+    count_range_index_scan();
+    Ok(Some(ids))
+}
+
+/// [`range_scan_ids`], or the label scan when the index cannot answer.
+fn range_or_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    scan: &RangeScan<'_>,
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    Ok(range_scan_ids(view, vars, row, scan, params)?
+        .unwrap_or_else(|| scan_ids(view, Some(scan.label))))
+}
+
+/// The first `keep` of `ids` — given in the order `ORDER BY field` sorts
+/// them — that pass `keeps`, plus every later one in the same run as the
+/// last of them: every row a stable sort could put at position `keep` or
+/// before. Stops reading `ids` there. Also returns the value the cut fell on
+/// (`None` when fewer than `keep` came).
+fn top_k(
+    view: &GraphView,
+    field: &str,
+    ids: impl Iterator<Item = u32>,
+    keep: usize,
+    keeps: &dyn Fn(u32) -> bool,
+) -> (Vec<u32>, Option<Value>) {
+    let mut out = Vec::new();
+    if keep == 0 {
+        return (out, None);
+    }
+    let value = |id: u32| view.prop(id, field).map(|v| v.into_value());
+    let mut cut: Option<Option<Value>> = None;
+    for id in ids.filter(|&id| keeps(id)) {
+        if let Some(last) = &cut {
+            let in_run = match (last, value(id)) {
+                (Some(a), Some(b)) => same_run(a, &b),
+                // Not readable as a value: keep it, a candidate too many is
+                // harmless.
+                _ => true,
+            };
+            if !in_run {
+                RANGE_TOP_K_STOPS.with(|c| c.set(c.get() + 1));
+                break;
+            }
+        }
+        out.push(id);
+        if cut.is_none() && out.len() >= keep {
+            cut = Some(value(id));
+        }
+    }
+    (out, cut.flatten())
+}
+
+/// The visible nodes of the label with no index entry — no property, or a
+/// list, map or `Duration` — by one merge walk of two ascending id lists.
+fn unindexed_ids(view: &GraphView, index: &UnifiedIndex, scan: &RangeScan<'_>) -> Vec<u32> {
+    let mut indexed = index.indexed_ids(scan.label, scan.field).peekable();
+    let mut out = Vec::new();
+    for id in view.nodes_with_label(scan.label) {
+        while indexed.next_if(|&e| e < id).is_some() {}
+        if indexed.next_if_eq(&id).is_none() && view.visible(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Tagged `IndexScan` mode for `field ∈ {key, id}` (`IdentityEq`).
 ///
 /// ScanKey the resolved string, keep the node only if stored-wins identity
@@ -1530,6 +2206,40 @@ fn scan_index(
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
     let mut out = Vec::new();
+    for row in rows {
+        for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            let mut next = row.clone();
+            next[slot] = Some(Cell::Node(id));
+            out.push(next);
+        }
+    }
+    Ok(out)
+}
+
+/// Execute an `IndexRangeScan`: seed rows from its candidates (see
+/// [`range_scan_ids`]). The bounds are row-independent.
+fn scan_range(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    op: &PlanOp,
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let Some((var, scan)) = RangeScan::of(op) else {
+        return Err(format!("not a range scan: {op:?}"));
+    };
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let ids = range_or_scan_ids(view, vars, first, &scan, params)?;
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
     for row in rows {
         for &id in &ids {
             if out.len() >= cap {
@@ -1702,8 +2412,79 @@ const SCALAR_FUNCS: &[&str] = &[
     "decay",
     "key",
     "id",
+    "elementId",
+    "startNode",
+    "endNode",
+    "nodes",
+    "relationships",
+    "length",
     "labels",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "split",
+    "left",
+    "right",
+    "substring",
+    "reverse",
+    "floor",
+    "ceil",
+    "sign",
+    "sqrt",
+    "log",
+    "log10",
+    "exp",
+    "sin",
+    "cos",
+    "tan",
+    "atan",
+    "atan2",
+    "pi",
+    "e",
+    "rand",
+    "toBoolean",
+    "toBooleanOrNull",
+    "toIntegerOrNull",
+    "toFloatOrNull",
+    "head",
+    "tail",
+    "last",
+    "range",
+    "keys",
+    "properties",
+    "date",
+    "localdatetime",
+    "datetime",
+    "duration",
+    "time",
+    "localtime",
 ];
+
+/// The error for a call of a function that does not exist, listing every
+/// one that does.
+pub(crate) fn unknown_function_message(name: &str) -> String {
+    format!(
+        "unknown function `{name}`; supported: {}, {}",
+        SCALAR_FUNCS.join(", "),
+        temporal::namespaced_names().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Whether `name` (any case) names a function [`eval_func`] evaluates: a
+/// [`SCALAR_FUNCS`] name, a namespaced temporal function, a `time.` /
+/// `localtime.` name (refused by name when called), or an internal one. The
+/// compile-time check refuses any other call (QL-VE); aggregates are not
+/// function calls and are not listed.
+pub(crate) fn is_known_function(name: &str) -> bool {
+    if name == LABEL_TEST_FN || name == REL_ENDS_FN {
+        return true;
+    }
+    let norm = name.to_ascii_lowercase();
+    SCALAR_FUNCS.iter().any(|f| f.eq_ignore_ascii_case(&norm))
+        || temporal::namespaced(&norm).is_some()
+        || temporal::is_time_type_namespace(&norm)
+}
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
 /// `endsWith`). Null in either argument → null; non-string args → null.
@@ -1731,6 +2512,128 @@ fn eval_string_predicate(
     }
 }
 
+/// `x:Label`, parsed to `LABEL_TEST_FN(x, 'Label')`: whether the node `x`
+/// has the label, or the relationship `x` the type; null when `x` is null.
+fn label_test(
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    let [Operand::Var(var), Operand::Lit(Value::Str(label))] = args else {
+        return Err("a label test (x:Label) needs a node or relationship variable".to_string());
+    };
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let holds = match row.get(slot).and_then(|c| c.as_ref()) {
+        None | Some(Cell::Scalar(Value::Null)) => return Ok(None),
+        Some(Cell::Node(id)) => view.label_of(*id) == Some(label.as_str()),
+        Some(Cell::Rel(e)) => view.sym_name(e.etype) == Some(label.as_str()),
+        Some(Cell::Scalar(_) | Cell::Path(_)) => {
+            return Err(format!(
+                "{var}:{label}: `{var}` is not a node or a relationship"
+            ))
+        }
+    };
+    Ok(Some(Value::Bool(holds)))
+}
+
+/// `elementId(x)`, `startNode(r)` and `endNode(r)`: the argument must be a
+/// node or relationship variable (null in gives null). `elementId` is the id
+/// Bolt sends; `startNode` and `endNode` give the end's key, null when the end
+/// is hidden by the mask.
+fn entity_func(
+    fname: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "{fname}() requires exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let var_name = match &args[0] {
+        Operand::Var(var_name) => var_name,
+        Operand::Lit(Value::Null) => return Ok(None),
+        _ => {
+            return Err(format!(
+                "{fname}() argument must be a {} variable (e.g. {fname}(x))",
+                if fname == "elementId" {
+                    "node or relationship"
+                } else {
+                    "relationship"
+                }
+            ))
+        }
+    };
+    let slot = vars
+        .slot(var_name)
+        .ok_or_else(|| format!("unbound variable `{var_name}` in {fname}()"))?;
+    let cell = match row.get(slot).and_then(|c| c.as_ref()) {
+        None | Some(Cell::Scalar(Value::Null)) => return Ok(None), // null binding
+        Some(cell) => cell,
+    };
+    let end_key = |id: u32| {
+        view.visible(id)
+            .then(|| view.try_key_of(id))
+            .flatten()
+            .map(|key| Value::Str(key.to_owned()))
+    };
+    match (fname, cell) {
+        ("elementId", Cell::Node(id)) => Ok(Some(Value::Str(crate::result::node_element_id(
+            view.key_of(*id),
+        )))),
+        ("elementId", Cell::Rel(e)) => {
+            let key = |id: u32| view.try_key_of(id).unwrap_or_default();
+            Ok(Some(Value::Str(crate::result::relationship_element_id(
+                view.sym_name(e.etype).unwrap_or_default(),
+                key(e.src),
+                key(e.dst),
+            ))))
+        }
+        ("startNode", Cell::Rel(e)) => Ok(end_key(e.src)),
+        ("endNode", Cell::Rel(e)) => Ok(end_key(e.dst)),
+        ("elementId", _) => Err(format!(
+            "elementId() argument `{var_name}` is not a node or a relationship"
+        )),
+        (_, _) => Err(format!(
+            "{fname}() argument `{var_name}` is not a relationship"
+        )),
+    }
+}
+
+/// `nodes(p)`, `relationships(p)` and `length(p)`: the field of the path map
+/// that `p.nodes`, `p.relationships` and `p.length` read. Null in gives null;
+/// anything that is not a path is a type error.
+fn path_func(
+    fname: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "{fname}() requires exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    match resolve_operand(view, vars, row, &args[0], params)? {
+        None => Ok(None),
+        Some(Value::Map(mut map)) if map.contains_key("nodes") && map.contains_key("length") => {
+            Ok(map.remove(fname))
+        }
+        Some(_) => Err(format!(
+            "{fname}() argument must be a path (e.g. {fname}(p))"
+        )),
+    }
+}
+
 /// Evaluate one of the supported scalar functions.  Unknown function names
 /// produce a named error listing the supported set.  Null propagation:
 /// null in → null out, EXCEPT `coalesce` (which skips nulls).
@@ -1742,6 +2645,12 @@ fn eval_func(
     row: &Row,
     params: &Params,
 ) -> Result<Option<Value>, String> {
+    if name == LABEL_TEST_FN {
+        return label_test(args, view, vars, row);
+    }
+    if name == REL_ENDS_FN {
+        return rel_ends(args, view, vars, row);
+    }
     let norm = name.to_ascii_lowercase();
     match norm.as_str() {
         "tolower" => {
@@ -1813,7 +2722,7 @@ fn eval_func(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Rel(e)) => {
                     // Look up the etype string from the symbol table.
-                    let etype = view.syms.resolve(e.etype).unwrap_or("").to_owned();
+                    let etype = view.sym_name(e.etype).unwrap_or("").to_owned();
                     Ok(Some(Value::Str(etype)))
                 }
                 Some(Cell::Node(_)) => Err(format!(
@@ -1852,6 +2761,22 @@ fn eval_func(
                 None => Ok(None), // null binding → null (optional match scenario)
             }
         }
+        "elementid" | "startnode" | "endnode" => {
+            let fname = match norm.as_str() {
+                "elementid" => "elementId",
+                "startnode" => "startNode",
+                _ => "endNode",
+            };
+            entity_func(fname, args, view, vars, row)
+        }
+        "nodes" | "relationships" | "length" => {
+            let fname = match norm.as_str() {
+                "nodes" => "nodes",
+                "relationships" => "relationships",
+                _ => "length",
+            };
+            path_func(fname, args, view, vars, row, params)
+        }
         "labels" => {
             if args.len() != 1 {
                 return Err(format!(
@@ -1860,8 +2785,10 @@ fn eval_func(
                 ));
             }
             // openCypher returns a list because a node may carry several
-            // labels; this store gives a node exactly one, so the list holds
-            // one element. `n.label` is the scalar spelling of the same thing.
+            // labels; this store gives a node at most one, so the list holds
+            // one element, or none for a node with no label (stored under the
+            // empty label, QL-NM). `n.label` is the scalar spelling of the
+            // same thing.
             let Operand::Var(var_name) = &args[0] else {
                 return Err(
                     "labels() argument must be a node variable (e.g. labels(n))".to_string()
@@ -1873,6 +2800,7 @@ fn eval_func(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Ok(Some(Value::List(
                     view.label_of(*id)
+                        .filter(|l| !l.is_empty())
                         .map(|l| vec![Value::Str(l.to_owned())])
                         .unwrap_or_default(),
                 ))),
@@ -1995,7 +2923,12 @@ fn eval_func(
                 None => None,
                 Some(Value::Float(f)) => Some(Value::Float(f)),
                 Some(Value::Int(n)) => Some(Value::Float(n as f64)),
-                Some(Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                Some(Value::Str(s)) => s
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(Value::Float),
                 Some(_) => None,
             })
         }
@@ -2013,7 +2946,7 @@ fn eval_func(
                 Some(Value::Int(n)) => Some(Value::Str(n.to_string())),
                 Some(Value::Float(f)) => Some(Value::Str(f.to_string())),
                 Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
-                Some(_) => None, // list/map have no scalar string form
+                Some(other) => temporal::to_text(&other).map(Value::Str), // list/map: null
             })
         }
         "decay" => {
@@ -2046,11 +2979,657 @@ fn eval_func(
                 }
             }
         }
-        _ => Err(format!(
-            "unknown function `{name}`; supported: {}",
-            SCALAR_FUNCS.join(", ")
+        "trim" | "ltrim" | "rtrim" | "replace" | "split" | "left" | "right" | "substring"
+        | "reverse" => eval_string_scalar(&norm, name, args, view, vars, row, params),
+        "floor" | "ceil" | "sign" | "sqrt" | "log" | "log10" | "exp" | "sin" | "cos" | "tan"
+        | "atan" | "atan2" | "pi" | "e" | "rand" => {
+            eval_math_scalar(&norm, name, args, view, vars, row, params)
+        }
+        "toboolean" | "tobooleanornull" | "tointegerornull" | "tofloatornull" => {
+            eval_convert_scalar(&norm, name, args, view, vars, row, params)
+        }
+        "head" | "tail" | "last" | "range" | "keys" | "properties" => {
+            eval_list_scalar(&norm, name, args, view, vars, row, params)
+        }
+        // QL-13: the time-of-day types are not in 0.10 (contract C3).
+        "time" | "localtime" => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        "date" | "localdatetime" | "datetime" | "duration" => {
+            // A duration has no "now": it needs its argument.
+            let arity = if norm == "duration" { 1..=1 } else { 0..=1 };
+            let [arg, _, _] = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+            // A null argument is null; no argument is the current instant.
+            if args.len() == 1 && arg.is_none() {
+                return Ok(None);
+            }
+            temporal::construct(&norm, arg)
+        }
+        // QL-TF: `date.truncate`, `duration.between`, … (QL-13 refuses the
+        // `time` and `localtime` namespaces with the types).
+        n if temporal::is_time_type_namespace(n) => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        n => match temporal::namespaced(n) {
+            Some((canonical, arity)) => {
+                let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+                temporal::call_namespaced(canonical, a, args.len())
+            }
+            None => Err(unknown_function_message(name)),
+        },
+    }
+}
+
+/// The most elements `range()` will build. A bound this size is a caller bug,
+/// and the list would otherwise be allocated before anything could stop it.
+const RANGE_MAX_ELEMENTS: u128 = 10_000_000;
+
+/// `range(start, end, step)` with an inclusive end. Null or non-integer
+/// arguments are null; a zero step is an error.
+fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, String> {
+    // An argument that is not an integer is an error (QL-VE, the TCK's
+    // List11); a null one is null.
+    let given = if has_step { &a[..] } else { &a[..2] };
+    if let Some(bad) = given
+        .iter()
+        .flatten()
+        .find(|v| !matches!(v, Value::Int(_) | Value::Null))
+    {
+        return Err(format!(
+            "range() expects integer arguments, got {}",
+            crate::value_ops::type_name_of(bad)
+        ));
+    }
+    let (Some(Value::Int(start)), Some(Value::Int(end))) = (&a[0], &a[1]) else {
+        return Ok(None);
+    };
+    let step = match (&a[2], has_step) {
+        (_, false) => 1,
+        (Some(Value::Int(step)), true) => *step,
+        (_, true) => return Ok(None),
+    };
+    if step == 0 {
+        return Err("range step must be non-zero".to_string());
+    }
+    let (start, end, step) = (i128::from(*start), i128::from(*end), i128::from(step));
+    let span = if step > 0 { end - start } else { start - end };
+    if span < 0 {
+        return Ok(Some(Value::List(Vec::new())));
+    }
+    let count = span as u128 / step.unsigned_abs() + 1;
+    if count > RANGE_MAX_ELEMENTS {
+        return Err(format!(
+            "range() would build {count} elements; the limit is {RANGE_MAX_ELEMENTS}"
+        ));
+    }
+    // Every element lies between the two i64 ends, so the narrowing is exact.
+    let items = (0..count as i128)
+        .map(|k| Value::Int((start + k * step) as i64))
+        .collect();
+    Ok(Some(Value::List(items)))
+}
+
+/// [`REL_ENDS_FN`]: the relationship bound to the one variable argument, as
+/// `[type, start key, end key]`.
+fn rel_ends(
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+) -> Result<Option<Value>, String> {
+    let [Operand::Var(var)] = args else {
+        return Err("internal: relEnds takes one relationship variable".into());
+    };
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    match row.get(slot).and_then(|c| c.as_ref()) {
+        Some(Cell::Rel(e)) => {
+            let etype = view.sym_name(e.etype).unwrap_or("").to_owned();
+            Ok(Some(Value::List(vec![
+                Value::Str(etype),
+                Value::Str(view.key_of(e.src).to_owned()),
+                Value::Str(view.key_of(e.dst).to_owned()),
+            ])))
+        }
+        None => Ok(None),
+        Some(_) => Err(format!(
+            "`{var}` is not a single relationship; a property write names one relationship"
         )),
     }
+}
+
+/// The properties of a node, relationship or map, in key order. Nothing is
+/// left out: a vector-valued property (an embedding) is a list of floats like
+/// any other and appears like any other list. `None` is null: a null or unmatched binding, a node the scope's
+/// mask hides, or an argument that has no properties.
+fn properties_of_arg(
+    arg: &Operand,
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<BTreeMap<String, Value>>, String> {
+    if let Operand::Var(var) = arg {
+        let cell = vars
+            .slot(var)
+            .ok_or_else(|| format!("unbound variable `{var}`"))
+            .map(|slot| row.get(slot).and_then(|c| c.as_ref()))?;
+        match cell {
+            Some(Cell::Node(id)) => {
+                if !view.visible(*id) {
+                    return Ok(None);
+                }
+                // One pass over the columns; only fields this node has are
+                // allocated, and tombstoned ones do not show.
+                let props = view.props.props_of(*id);
+                return Ok(Some(props));
+            }
+            Some(Cell::Rel(e)) => {
+                return Ok(Some(view.edge_props.props_of(e.etype, e.src, e.dst)));
+            }
+            Some(Cell::Path(_)) | None => return Ok(None),
+            Some(Cell::Scalar(_)) => {}
+        }
+    }
+    Ok(match resolve_operand(view, vars, row, arg, params)? {
+        Some(Value::Map(map)) => Some(map),
+        _ => None,
+    })
+}
+
+/// `properties(x)` of a value that is not a node, relationship, map or null
+/// is an error (QL-VE, the TCK's Graph9); `keys` keeps its null.
+fn check_properties_arg(
+    arg: &Operand,
+    vars: &VarTable,
+    row: &Row,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    if bound_to_graph_element(vars, row, arg) {
+        return Ok(());
+    }
+    match value {
+        None | Some(Value::Null) | Some(Value::Map(_)) => Ok(()),
+        Some(other) => Err(format!(
+            "properties() expects a node, a relationship or a map, got {}",
+            crate::value_ops::type_name_of(other)
+        )),
+    }
+}
+
+/// List and map functions (QL-03c). Null in → null out; an argument of the
+/// wrong type → null, except `range()` with a non-integer argument and
+/// `properties()` of a non-map value (QL-VE: type errors). A wrong argument
+/// count, a zero `range` step and an oversized `range` are errors too.
+fn eval_list_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    if matches!(norm, "keys" | "properties") {
+        if args.len() != 1 {
+            return Err(format!(
+                "{name}() requires exactly 1 argument(s), got {}",
+                args.len()
+            ));
+        }
+        if norm == "properties" && !bound_to_graph_element(vars, row, &args[0]) {
+            let value = resolve_operand(view, vars, row, &args[0], params)?;
+            check_properties_arg(&args[0], vars, row, value.as_ref())?;
+        }
+        let props = properties_of_arg(&args[0], view, vars, row, params)?;
+        return Ok(props.map(|map| {
+            if norm == "keys" {
+                Value::List(map.into_keys().map(Value::Str).collect())
+            } else {
+                Value::Map(map)
+            }
+        }));
+    }
+    if norm == "range" {
+        let a = resolve_fn_args(name, args, 2..=3, view, vars, row, params)?;
+        return eval_range(&a, args.len() == 3);
+    }
+    let [first, _, _] = resolve_fn_args(name, args, 1..=1, view, vars, row, params)?;
+    let Some(Value::List(list)) = first else {
+        return Ok(None);
+    };
+    Ok(match norm {
+        "head" => list.into_iter().next().and_then(crate::value_ops::element),
+        "last" => list
+            .into_iter()
+            .next_back()
+            .and_then(crate::value_ops::element),
+        _ => Some(Value::List(list.into_iter().skip(1).collect())), // tail
+    })
+}
+
+/// Resolve a function's arguments, checking the arity range. The caller
+/// applies null / type-mismatch → null.
+fn resolve_fn_args(
+    name: &str,
+    args: &[Operand],
+    arity: std::ops::RangeInclusive<usize>,
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<[Option<Value>; 3], String> {
+    if !arity.contains(&args.len()) {
+        let want = if arity.start() == arity.end() {
+            format!("exactly {}", arity.start())
+        } else {
+            format!("{} to {}", arity.start(), arity.end())
+        };
+        return Err(format!(
+            "{name}() requires {want} argument(s), got {}",
+            args.len()
+        ));
+    }
+    // No heap allocation: these run per row and no function takes over 3.
+    let mut out = [None, None, None];
+    for (slot, arg) in out.iter_mut().zip(args) {
+        *slot = resolve_operand(view, vars, row, arg, params)?;
+    }
+    Ok(out)
+}
+
+/// String functions that only take a string; anything else is null.
+fn string_arg(v: &Option<Value>) -> Option<&str> {
+    match v {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// `len` characters of `s` from character `start`, as one exact allocation.
+fn char_slice(s: &str, start: usize, len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    let mut offsets = s.char_indices().map(|(i, _)| i).skip(start);
+    let from = offsets.next().unwrap_or(s.len());
+    let to = offsets.nth(len - 1).unwrap_or(s.len());
+    s[from..to].to_owned()
+}
+
+/// A non-negative integer argument; negative, null or non-integer is null.
+fn count_arg(v: &Option<Value>) -> Option<usize> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// String functions (QL-03a). Null in → null out; an argument of the wrong
+/// type or out of range → null, never an error. Only a wrong argument count
+/// is an error.
+fn eval_string_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "trim" | "ltrim" | "rtrim" | "reverse" => 1..=1,
+        "substring" => 2..=3,
+        "replace" => 3..=3,
+        _ => 2..=2, // split, left, right
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    Ok(match norm {
+        "trim" => string_arg(&a[0]).map(|s| Value::Str(s.trim().to_owned())),
+        "ltrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_start().to_owned())),
+        "rtrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_end().to_owned())),
+        "replace" => match (string_arg(&a[0]), string_arg(&a[1]), string_arg(&a[2])) {
+            (Some(s), Some(from), Some(to)) => Some(Value::Str(s.replace(from, to))),
+            _ => None,
+        },
+        "split" => match (string_arg(&a[0]), string_arg(&a[1])) {
+            (Some(s), Some("")) => Some(Value::List(
+                s.chars().map(|c| Value::Str(c.to_string())).collect(),
+            )),
+            (Some(s), Some(d)) => Some(Value::List(
+                s.split(d).map(|p| Value::Str(p.to_owned())).collect(),
+            )),
+            _ => None,
+        },
+        "left" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => Some(Value::Str(char_slice(s, 0, n))),
+            _ => None,
+        },
+        "right" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => {
+                let skip = s.chars().count().saturating_sub(n);
+                Some(Value::Str(char_slice(s, skip, n)))
+            }
+            _ => None,
+        },
+        "substring" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(start)) if start <= s.chars().count() => {
+                match (args.len() > 2).then_some(&a[2]) {
+                    None => Some(Value::Str(char_slice(s, start, usize::MAX))),
+                    Some(l) => count_arg(l).map(|n| Value::Str(char_slice(s, start, n))),
+                }
+            }
+            _ => None,
+        },
+        "reverse" => match &a[0] {
+            Some(Value::Str(s)) => Some(Value::Str(s.chars().rev().collect())),
+            Some(Value::List(items)) => Some(Value::List(items.iter().rev().cloned().collect())),
+            _ => None,
+        },
+        _ => return Err(format!("unknown string function `{name}`")),
+    })
+}
+
+/// Math functions (QL-03b). Null in → null out; a non-numeric argument or one
+/// outside the function's domain → null.
+fn eval_math_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "pi" | "e" | "rand" => 0..=0,
+        "atan2" => 2..=2,
+        _ => 1..=1,
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    let float_fn = |f: fn(f64) -> f64| {
+        a[0].as_ref()
+            .and_then(numeric_val)
+            .map(|x| Value::Float(f(x)))
+    };
+    Ok(match norm {
+        "floor" | "ceil" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(if norm == "floor" {
+                f.floor() as i64
+            } else {
+                f.ceil() as i64
+            })),
+            _ => None,
+        },
+        "sign" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(n.signum())),
+            Some(Value::Float(f)) if !f.is_nan() => Some(Value::Int(if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            })),
+            _ => None,
+        },
+        "sqrt" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x >= 0.0 => Some(Value::Float(x.sqrt())),
+            _ => None,
+        },
+        "log" | "log10" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x > 0.0 => {
+                Some(Value::Float(if norm == "log" { x.ln() } else { x.log10() }))
+            }
+            _ => None,
+        },
+        "exp" => float_fn(f64::exp),
+        "sin" => float_fn(f64::sin),
+        "cos" => float_fn(f64::cos),
+        "tan" => float_fn(f64::tan),
+        "atan" => float_fn(f64::atan),
+        "atan2" => match (
+            a[0].as_ref().and_then(numeric_val),
+            a[1].as_ref().and_then(numeric_val),
+        ) {
+            (Some(y), Some(x)) => Some(Value::Float(y.atan2(x))),
+            _ => None,
+        },
+        "pi" => Some(Value::Float(std::f64::consts::PI)),
+        "e" => Some(Value::Float(std::f64::consts::E)),
+        "rand" => Some(Value::Float(rand::random::<f64>())),
+        _ => return Err(format!("unknown math function `{name}`")),
+    })
+}
+
+/// Type-conversion functions (QL-03d). Every failure to convert is null.
+fn eval_convert_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let a = resolve_fn_args(name, args, 1..=1, view, vars, row, params)?;
+    Ok(match norm {
+        "toboolean" | "tobooleanornull" => match &a[0] {
+            Some(Value::Bool(b)) => Some(Value::Bool(*b)),
+            Some(Value::Int(n)) => Some(Value::Bool(*n != 0)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("true") => Some(Value::Bool(true)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("false") => Some(Value::Bool(false)),
+            _ => None,
+        },
+        "tointegerornull" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(*f as i64)),
+            Some(Value::Str(s)) => s.parse::<i64>().ok().map(Value::Int),
+            _ => None,
+        },
+        "tofloatornull" => match &a[0] {
+            Some(Value::Float(f)) => Some(Value::Float(*f)),
+            Some(Value::Int(n)) => Some(Value::Float(*n as f64)),
+            Some(Value::Str(s)) => s
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float),
+            _ => None,
+        },
+        _ => return Err(format!("unknown conversion function `{name}`")),
+    })
+}
+
+/// What a name holds when an operand is evaluated outside a query: a value, or
+/// a stored node (by dense id), so `key(n)` and `labels(n)` read the node.
+pub enum Binding {
+    Value(Value),
+    Node(u32),
+    /// A relationship: its type symbol and its two ends' ids.
+    Rel {
+        etype: u32,
+        src: u32,
+        dst: u32,
+    },
+}
+
+/// Evaluate one operand against named bindings, with the same evaluator a
+/// `RETURN` uses. A property of a node binding reads the store's value; a
+/// caller that needs another source for it substitutes the read first.
+pub fn eval_operand(
+    view: &GraphView,
+    operand: &Operand,
+    params: &Params,
+    bindings: &[(&str, Binding)],
+) -> Result<Option<Value>, String> {
+    let mut vars = VarTable { names: Vec::new() };
+    let mut row: Row = Vec::new();
+    for (name, binding) in bindings {
+        let slot = vars.intern(name);
+        if row.len() <= slot {
+            row.resize(slot + 1, None);
+        }
+        row[slot] = Some(match binding {
+            Binding::Value(v) => Cell::Scalar(v.clone()),
+            Binding::Node(id) => Cell::Node(*id),
+            Binding::Rel { etype, src, dst } => Cell::Rel(crate::traverse::EdgeRef {
+                etype: *etype,
+                src: *src,
+                dst: *dst,
+            }),
+        });
+    }
+    // A list comprehension or `reduce` binds its own variables in a row slot,
+    // which the planner allocates inside a query; here they are allocated
+    // alone, so an unbound outer name still errors as it does in a query.
+    intern_local_vars(&mut vars, operand);
+    row.resize(row.len().max(vars.names.len()), None);
+    resolve_operand(view, &vars, &row, operand, params)
+}
+
+/// Why an expression could not be folded to a constant.
+#[derive(Debug)]
+pub(crate) enum FoldError {
+    /// It names a `$parameter`.
+    Param,
+    /// It reads a variable or a property.
+    Variable,
+    /// Evaluating it failed.
+    Eval(String),
+}
+
+/// Evaluate an expression that reads nothing but itself (no variable, no
+/// property, no `$parameter`): `1 > 0`, `'a' + 'b'`, `[1, 2 * 3]`. A plain
+/// `CREATE` or `MERGE` property map folds its values with this, so the store
+/// sees the evaluated value and a MERGE matches against it.
+pub(crate) fn fold_constant(operand: &Operand) -> Result<Option<Value>, FoldError> {
+    if crate::cypher::plan::check_operand_bound(operand, &BTreeSet::new(), "CREATE").is_err() {
+        return Err(FoldError::Variable);
+    }
+    let ids = core_storage::IdMap::new();
+    let syms = core_storage::Interner::new();
+    let props = core_storage::ColumnStore::new();
+    let topo = core_storage::Topology::new();
+    let edge_props = core_storage::EdgeProps::new();
+    let view = GraphView {
+        ids: &ids,
+        syms: &syms,
+        labels: &[],
+        props: core_storage::v8::seam::ColumnsView::owned(&props),
+        topo: core_storage::v8::seam::TopologyView::owned(&topo),
+        edge_props: core_storage::v8::seam::EdgePropsView::owned(&edge_props),
+        mask: None,
+        prop_index: None,
+        layer: None,
+    };
+    let no_params = BTreeMap::new();
+    eval_operand(&view, operand, &Params(&no_params), &[]).map_err(|e| {
+        if e.starts_with("missing parameter") {
+            FoldError::Param
+        } else {
+            FoldError::Eval(e)
+        }
+    })
+}
+
+/// Intern the variables the list comprehensions and `reduce`s in `operand`
+/// bind, and nothing else.
+fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
+    match operand {
+        Operand::Prop { .. } | Operand::Var(_) | Operand::Lit(_) | Operand::Param(_) => {}
+        Operand::BinArith { left, right, .. } => {
+            intern_local_vars(vars, left);
+            intern_local_vars(vars, right);
+        }
+        Operand::Index { base, index } => {
+            intern_local_vars(vars, base);
+            intern_local_vars(vars, index);
+        }
+        Operand::FuncCall { args: items, .. } | Operand::ListLit(items) => {
+            for item in items {
+                intern_local_vars(vars, item);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                intern_local_vars(vars, value);
+            }
+        }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                intern_local_vars_expr(vars, cond);
+                intern_local_vars(vars, value);
+            }
+            if let Some(d) = default {
+                intern_local_vars(vars, d);
+            }
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            vars.intern(var);
+            intern_local_vars(vars, list);
+            if let Some(f) = filter {
+                intern_local_vars_expr(vars, f);
+            }
+            intern_local_vars(vars, map);
+        }
+        Operand::ListPredicate {
+            var, list, pred, ..
+        } => {
+            vars.intern(var);
+            intern_local_vars(vars, list);
+            intern_local_vars_expr(vars, pred);
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            vars.intern(acc_var);
+            vars.intern(iter_var);
+            intern_local_vars(vars, init);
+            intern_local_vars(vars, list);
+            intern_local_vars(vars, body);
+        }
+        Operand::Pred(expr) => intern_local_vars_expr(vars, expr),
+    }
+}
+
+fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            intern_local_vars_expr(vars, a);
+            intern_local_vars_expr(vars, b);
+        }
+        Expr::Not(a) => intern_local_vars_expr(vars, a),
+        Expr::Cmp { lhs, rhs, .. } => {
+            intern_local_vars(vars, lhs);
+            intern_local_vars(vars, rhs);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => intern_local_vars(vars, o),
+        Expr::In { expr, list } => {
+            intern_local_vars(vars, expr);
+            intern_local_vars(vars, list);
+        }
+    }
+}
+
+/// Whether `op` is a variable bound, in this row, to a node, relationship
+/// or path.
+fn bound_to_graph_element(vars: &VarTable, row: &Row, op: &Operand) -> bool {
+    let Operand::Var(name) = op else {
+        return false;
+    };
+    matches!(
+        vars.slot(name)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref()),
+        Some(Cell::Node(_) | Cell::Rel(_) | Cell::Path(_))
+    )
 }
 
 fn resolve_operand(
@@ -2061,26 +3640,29 @@ fn resolve_operand(
     params: &Params,
 ) -> Result<Option<Value>, String> {
     match operand {
+        // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
+        Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
         Operand::Param(name) => match params.0.get(name) {
-            Some(v) => Ok(Some(v.clone())),
+            Some(v) => Ok(crate::value_ops::element(v.clone())),
             None => Err(format!("missing parameter `{name}`")),
         },
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
         Operand::Var(name) => {
-            // Bare variable reference: resolve from Cell (scalar alias or node key).
+            // Bare variable reference: resolve from Cell (scalar alias, node
+            // key, relationship map).
             match vars
                 .slot(name)
                 .and_then(|s| row.get(s))
                 .and_then(|c| c.as_ref())
             {
                 Some(Cell::Scalar(v)) => Ok(Some(v.clone())),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Ok(None),
                 },
                 Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
-                Some(Cell::Rel(_)) => Err(format!("variable `{name}` is a relationship")),
+                Some(Cell::Rel(e)) => Ok(Some(rel_value(view, e))),
                 None => Ok(None),
             }
         }
@@ -2088,11 +3670,138 @@ fn resolve_operand(
         Operand::Index { base, index } => {
             let base_val = resolve_operand(view, vars, row, base, params)?;
             let idx_val = resolve_operand(view, vars, row, index, params)?;
-            Ok(crate::value_ops::index_list(base_val, idx_val))
+            // A node, relationship or path variable resolves to its key, map
+            // or hop count; a subscript of one reads nothing, as before.
+            if bound_to_graph_element(vars, row, base) {
+                return Ok(crate::value_ops::index_list(base_val, idx_val));
+            }
+            crate::value_ops::index_value(base_val, idx_val)
+        }
+        // A null element or value is kept, as `Value::Null`.
+        Operand::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let v = resolve_operand(view, vars, row, item, params)?;
+                out.push(crate::value_ops::into_element(v));
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list comprehension variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the comprehension.
+            let mut scoped = row.clone();
+            let mut out = Vec::with_capacity(source.len());
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                if let Some(f) = filter {
+                    if !eval_expr(view, vars, &scoped, f, params)? {
+                        continue;
+                    }
+                }
+                let v = resolve_operand(view, vars, &scoped, map, params)?;
+                out.push(crate::value_ops::into_element(v));
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list predicate variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the predicate.
+            let mut scoped = row.clone();
+            let (mut trues, mut falses, mut nulls) = (0usize, 0usize, 0usize);
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                let answer = super::predicate::eval_predicate(
+                    pred,
+                    &mut |op| resolve_operand(view, vars, &scoped, op, params),
+                    &|e| e,
+                )?;
+                match answer {
+                    Some(true) => trues += 1,
+                    Some(false) => falses += 1,
+                    None => nulls += 1,
+                }
+            }
+            Ok(super::predicate::quantify(*kind, trues, falses, nulls).map(Value::Bool))
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // The init and the list are read in the enclosing scope.
+            let mut acc = resolve_operand(view, vars, row, init, params)?;
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot_of = |name: &str| {
+                vars.slot(name)
+                    .filter(|s| *s < row.len())
+                    .ok_or_else(|| format!("reduce variable `{name}` has no slot"))
+            };
+            let acc_slot = slot_of(acc_var)?;
+            let iter_slot = slot_of(iter_var)?;
+            // One copy of the row; the outer row keeps its own bindings, so
+            // the shadowing ends with the reduce.
+            let mut scoped = row.clone();
+            for item in source {
+                scoped[iter_slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                scoped[acc_slot] = acc.take().map(Cell::Scalar);
+                acc = resolve_operand(view, vars, &scoped, body, params)?;
+            }
+            Ok(acc)
+        }
+        Operand::MapLit(entries) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in entries {
+                let v = resolve_operand(view, vars, row, value, params)?;
+                out.insert(key.clone(), crate::value_ops::into_element(v));
+            }
+            Ok(Some(Value::Map(out)))
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_expr(view, vars, row, cond, params, 0)? {
+                if eval_expr(view, vars, row, cond, params)? {
                     return resolve_operand(view, vars, row, value, params);
                 }
             }
@@ -2100,6 +3809,14 @@ fn resolve_operand(
                 Some(d) => resolve_operand(view, vars, row, d, params),
                 None => Ok(None),
             }
+        }
+        Operand::Pred(expr) => {
+            let value = super::predicate::eval_predicate(
+                expr,
+                &mut |op| resolve_operand(view, vars, row, op, params),
+                &|e| e,
+            )?;
+            Ok(value.map(Value::Bool))
         }
         Operand::BinArith { op, left, right } => {
             use super::ast::ArithOp;
@@ -2118,10 +3835,29 @@ fn resolve_operand(
                             }
                             a.checked_div(b).unwrap_or(i64::MAX)
                         }
+                        ArithOp::Mod => {
+                            if b == 0 {
+                                return Err("division by zero".into());
+                            }
+                            a.checked_rem(b).unwrap_or(0)
+                        }
+                        ArithOp::Pow => {
+                            return Ok(Some(Value::Float((a as f64).powf(b as f64))));
+                        }
                     };
                     Ok(Some(Value::Int(result)))
                 }
                 (Some(lv), Some(rv)) => {
+                    if let Some(temporal_result) = temporal::arith(op, &lv, &rv) {
+                        return Ok(temporal_result);
+                    }
+                    // `+` also joins strings and lists; every other operator
+                    // on them is a type error below.
+                    if matches!(op, ArithOp::Add) {
+                        if let Some(joined) = crate::value_ops::plus_non_numeric(&lv, &rv) {
+                            return Ok(Some(joined));
+                        }
+                    }
                     let a = match &lv {
                         Value::Float(f) => *f,
                         Value::Int(i) => *i as f64,
@@ -2142,6 +3878,8 @@ fn resolve_operand(
                             }
                             a / b
                         }
+                        ArithOp::Mod => a % b,
+                        ArithOp::Pow => a.powf(b),
                     };
                     Ok(Some(Value::Float(result)))
                 }
@@ -2170,8 +3908,12 @@ fn is_identity_eq_field(field: &str) -> bool {
 /// or `key` field keeps it. `n.id` is an alias of `n.key`.
 fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
     match field {
-        "key" | "id" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
-        "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
+        "key" | "id" => view.try_key_of(id).map(|k| Value::Str(k.to_owned())),
+        // A node with no label (the empty label) has no `n.label`.
+        "label" => view
+            .label_of(id)
+            .filter(|l| !l.is_empty())
+            .map(|l| Value::Str(l.to_owned())),
         _ => None,
     }
 }
@@ -2207,7 +3949,12 @@ fn resolve_prop(
                 Ok(None)
             }
         }
-        // Scalar alias: has no properties.
+        // A scalar alias holding a map (`UNWIND $rows AS r` → `r.id`): the entry,
+        // null when the key is absent. Any other scalar has no properties.
+        Cell::Scalar(Value::Map(entries)) => Ok(entries
+            .get(field)
+            .cloned()
+            .and_then(crate::value_ops::element)),
         Cell::Scalar(_) => Ok(None),
     }
 }
@@ -2284,9 +4031,71 @@ fn neighbor(from: u32, e: &EdgeRef, dir: RelDir) -> u32 {
     }
 }
 
-fn row_has_edge(row: &Row, e: &EdgeRef) -> bool {
-    row.iter()
-        .any(|c| matches!(c, Some(Cell::Rel(existing)) if existing == e))
+/// The edges one hop must not use: those bound by the earlier hops of its
+/// MATCH clause (openCypher relationship uniqueness, across every hop and
+/// every comma-separated part of the clause, and never across clauses).
+///
+/// Each slot holds a fixed hop's `Cell::Rel` or a variable-length or
+/// shortest-path hop's trail. A first hop has none, so it checks nothing.
+#[derive(Default)]
+struct ClauseEdges {
+    slots: Vec<usize>,
+}
+
+impl ClauseEdges {
+    fn resolve(vars: &VarTable, names: &[String]) -> Self {
+        ClauseEdges {
+            slots: names.iter().filter_map(|n| vars.slot(n)).collect(),
+        }
+    }
+
+    /// True when `row` already binds `e` to an earlier hop of the clause.
+    fn holds(&self, row: &Row, e: &EdgeRef) -> bool {
+        self.slots.iter().any(|&slot| match row.get(slot) {
+            Some(Some(Cell::Rel(bound))) => bound == e,
+            Some(Some(cell @ Cell::Scalar(_))) => PathVal::trail_has_edge(cell, e),
+            _ => false,
+        })
+    }
+}
+
+/// Every `Expand` of a producer slice with its `ClauseEdges`, resolved once
+/// before a streaming executor recurses through the slice, so that a fixed
+/// hop looks no variable up per row. The executors pass suffixes of the
+/// slice, and an op is found by the length of the suffix it heads.
+struct OpEdges<'a> {
+    ops: &'a [PlanOp],
+    edges: Vec<ClauseEdges>,
+}
+
+impl<'a> OpEdges<'a> {
+    fn new(ops: &'a [PlanOp], vars: &VarTable) -> Self {
+        let edges = ops
+            .iter()
+            .map(|op| match op {
+                PlanOp::Expand { distinct_from, .. } => ClauseEdges::resolve(vars, distinct_from),
+                _ => ClauseEdges::default(),
+            })
+            .collect();
+        OpEdges { ops, edges }
+    }
+
+    /// The entry of the op that heads `suffix`.
+    fn at(&self, suffix: &[PlanOp]) -> &ClauseEdges {
+        let i = self.ops.len() - suffix.len();
+        debug_assert!(std::ptr::eq(&self.ops[i], &suffix[0]));
+        &self.edges[i]
+    }
+}
+
+/// The relationship a fixed hop's variable already holds when the hop runs:
+/// an earlier clause bound it, so this hop must match that relationship
+/// rather than rebind the name.
+fn bound_rel(row: &Row, rel_slot: Option<usize>) -> Option<EdgeRef> {
+    match rel_slot.and_then(|slot| row.get(slot)) {
+        Some(Some(Cell::Rel(e))) => Some(*e),
+        _ => None,
+    }
 }
 
 fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
@@ -2295,7 +4104,7 @@ fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
     } else {
         // Resolve each named type to its symbol, skipping any not interned
         // (a named type with no edges contributes nothing).
-        Some(etypes.iter().filter_map(|n| view.syms.get(n)).collect())
+        Some(etypes.iter().filter_map(|n| view.sym(n)).collect())
     }
 }
 
@@ -2314,10 +4123,12 @@ fn exec_expand(
         to,
         to_label,
         to_props,
+        distinct_from,
     } = op
     else {
         return Err("internal: expected Expand".into());
     };
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(*dir);
     let to_slot = vars
@@ -2335,8 +4146,9 @@ fn exec_expand(
             }
             None => None,
         };
+        let bound_rel = bound_rel(row, rel_slot);
         for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
-            if row_has_edge(row, &e) {
+            if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                 continue;
             }
             let nbr = neighbor(from_id, &e, *dir);
@@ -2369,31 +4181,49 @@ fn exec_expand(
     Ok(out)
 }
 
-/// BFS variable-length expand with per-path edge-uniqueness (Cypher
-/// relationship isomorphism).  A single path never reuses the same `EdgeRef`;
-/// node revisits are allowed.
+/// BFS variable-length expand with relationship uniqueness (Cypher
+/// relationship isomorphism). A walk never reuses an `EdgeRef`, neither one
+/// it walked already nor one an earlier hop of its MATCH clause bound; node
+/// revisits are allowed.
 ///
-/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`.
+/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`
+/// and the end node passes the destination's label and inline properties.
+/// Nodes a walk passes through are not filtered.
 /// The 1 M intermediate-row budget applies to `out.len()`.
-#[allow(clippy::too_many_arguments)]
 fn exec_var_expand(
     view: &GraphView,
     vars: &VarTable,
     rows: &[Row],
-    from: &str,
-    rel_var: &Option<String>,
-    etypes: &[String],
-    dir: RelDir,
-    to: &str,
-    min: u8,
-    max: u8,
+    op: &PlanOp,
+    params: &Params,
 ) -> Result<Vec<Row>, String> {
+    let PlanOp::VarExpand {
+        from,
+        rel_var,
+        etypes,
+        dir,
+        to,
+        to_label,
+        to_props,
+        min,
+        max,
+        trail_var,
+        distinct_from,
+    } = op
+    else {
+        return Err("internal: expected VarExpand".into());
+    };
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
+    let (dir, min, max) = (*dir, *min, *max);
+    // Checked once so an unfiltered hop pays nothing per emitted row.
+    let dest_filtered = to_label.is_some() || !to_props.is_empty();
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let to_slot = vars
         .slot(to)
         .ok_or_else(|| format!("unbound variable `{to}`"))?;
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let trail_slot = trail_var.as_ref().and_then(|tv| vars.slot(tv));
     let cap = max_intermediate_rows();
     let mut out: Vec<Row> = Vec::new();
 
@@ -2427,8 +4257,9 @@ fn exec_var_expand(
             let mut next_frontier: Vec<PathState> = Vec::new();
             for state in &frontier {
                 for e in expand(view, state.node, etypes.as_deref(), exp_dir) {
-                    // Per-path edge-uniqueness: reject edges already used in this path.
-                    if state.edges.contains(&e) {
+                    // Relationship uniqueness: an edge this walk already used,
+                    // or one an earlier hop of the clause bound, is skipped.
+                    if state.edges.contains(&e) || clause_edges.holds(row, &e) {
                         continue;
                     }
                     let nbr = neighbor(state.node, &e, dir);
@@ -2444,7 +4275,16 @@ fn exec_var_expand(
                         let dest_matches = match bound_to {
                             Some(want) => nbr == want,
                             None => true,
-                        };
+                        } && (!dest_filtered
+                            || node_matches(
+                                view,
+                                vars,
+                                row,
+                                nbr,
+                                to_label.as_deref(),
+                                to_props,
+                                params,
+                            )?);
                         if dest_matches {
                             if out.len() >= cap {
                                 return Err(row_cap_err(cap));
@@ -2454,6 +4294,9 @@ fn exec_var_expand(
                                 next[slot] = Some(Cell::Path(depth));
                             }
                             next[to_slot] = Some(Cell::Node(nbr));
+                            if let Some(slot) = trail_slot {
+                                next[slot] = Some(PathVal::to_trail_then(&state.edges, Some(&e)));
+                            }
                             out.push(next);
                         }
                     }
@@ -2488,22 +4331,33 @@ fn exec_var_expand(
 ///
 /// Uses standard BFS with a visited-node set for efficiency.  Since BFS
 /// expands nodes level-by-level, the first time `to` is reached is the
-/// shortest path.  Emits exactly 0 or 1 rows.
-#[allow(clippy::too_many_arguments)]
+/// shortest path.  Emits exactly 0 or 1 rows. The search never uses an edge
+/// an earlier hop of its MATCH clause bound.
 fn exec_shortest_path(
     view: &GraphView,
     vars: &VarTable,
     rows: &[Row],
-    from: &str,
-    rel_var: &Option<String>,
-    etypes: &[String],
-    dir: RelDir,
-    to: &str,
-    max_hops: u8,
+    op: &PlanOp,
 ) -> Result<Vec<Row>, String> {
+    let PlanOp::ShortestPath {
+        from,
+        rel_var,
+        etypes,
+        dir,
+        to,
+        max_hops,
+        trail_var,
+        distinct_from,
+    } = op
+    else {
+        return Err("internal: expected ShortestPath".into());
+    };
+    let (dir, max_hops) = (*dir, *max_hops);
+    let clause_edges = ClauseEdges::resolve(vars, distinct_from);
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let trail_slot = trail_var.as_ref().and_then(|tv| vars.slot(tv));
     let mut out: Vec<Row> = Vec::new();
 
     for row in rows {
@@ -2514,11 +4368,16 @@ fn exec_shortest_path(
         let mut visited = std::collections::BTreeSet::new();
         visited.insert(from_id);
         let mut frontier: Vec<u32> = vec![from_id];
+        // How each visited node was first reached, to rebuild the path.
+        let mut reached_by: BTreeMap<u32, (u32, EdgeRef)> = BTreeMap::new();
 
         'bfs: for depth in 1u8..=max_hops {
             let mut next_frontier: Vec<u32> = Vec::new();
             for &node in &frontier {
                 for e in expand(view, node, etypes.as_deref(), exp_dir) {
+                    if clause_edges.holds(row, &e) {
+                        continue;
+                    }
                     let nbr = neighbor(node, &e, dir);
                     // Hidden nodes are non-existent under the mask — do not traverse
                     // through them (paths through hidden nodes do not exist).
@@ -2532,11 +4391,25 @@ fn exec_shortest_path(
                         if let Some(slot) = rel_slot {
                             next[slot] = Some(Cell::Path(depth));
                         }
+                        if let Some(slot) = trail_slot {
+                            let mut rels = vec![e];
+                            let mut at = node;
+                            while at != from_id {
+                                let (prev, edge) = reached_by[&at];
+                                rels.push(edge);
+                                at = prev;
+                            }
+                            rels.reverse();
+                            next[slot] = Some(PathVal::to_trail(&rels));
+                        }
                         out.push(next);
                         break 'bfs;
                     }
                     if !visited.contains(&nbr) {
                         visited.insert(nbr);
+                        if trail_slot.is_some() {
+                            reached_by.insert(nbr, (node, e));
+                        }
                         next_frontier.push(nbr);
                     }
                 }
@@ -2550,6 +4423,49 @@ fn exec_shortest_path(
     Ok(out)
 }
 
+/// Assemble a named path from the cells the pattern's ops bound. A row whose
+/// path would touch a node the mask hides is dropped whole: the mask is
+/// checked here, at materialisation, as well as inside the expansions.
+fn exec_bind_path(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    path_var: &str,
+    start_var: &str,
+    hops: &[PathHop],
+) -> Result<Vec<Row>, String> {
+    let path_slot = vars
+        .slot(path_var)
+        .ok_or_else(|| format!("unbound variable `{path_var}`"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    'rows: for row in rows {
+        let mut nodes = vec![require_node(row, vars, start_var)?];
+        let mut rels: Vec<EdgeRef> = Vec::new();
+        for hop in hops {
+            if let Some(trail_var) = &hop.trail_var {
+                let Some(walk) = PathVal::from_trail(require_cell(row, vars, trail_var)?) else {
+                    return Err(format!("internal: `{trail_var}` holds no walk"));
+                };
+                PathVal::walk_nodes(&mut nodes, &walk);
+                rels.extend_from_slice(&walk);
+            } else {
+                match require_cell(row, vars, &hop.rel_var)? {
+                    Cell::Rel(e) => rels.push(*e),
+                    _ => return Err(format!("variable `{}` is not a relationship", hop.rel_var)),
+                }
+                nodes.push(require_node(row, vars, &hop.to_var)?);
+            }
+        }
+        if nodes.iter().any(|id| !view.visible(*id)) {
+            continue 'rows;
+        }
+        let mut next = row.clone();
+        next[path_slot] = Some(Cell::Scalar(path_value(view, &PathVal { nodes, rels })));
+        out.push(next);
+    }
+    Ok(out)
+}
+
 fn exec_filter(
     view: &GraphView,
     vars: &VarTable,
@@ -2559,7 +4475,7 @@ fn exec_filter(
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if eval_expr(view, vars, row, expr, params, 0)? {
+        if eval_expr(view, vars, row, expr, params)? {
             out.push(row.clone());
         }
     }
@@ -2587,6 +4503,7 @@ struct PullCtx<'a> {
     project_items: &'a [RetItem],
     params: &'a Params<'a>,
     bound: usize,
+    op_edges: OpEdges<'a>,
 }
 
 fn execute_pull(
@@ -2615,6 +4532,7 @@ fn execute_pull(
         project_items,
         params,
         bound,
+        op_edges: OpEdges::new(producers, &vars),
     };
     let mut initial_row: Row = vec![None; vars.names.len()];
     let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
@@ -2653,7 +4571,7 @@ fn execute_pull(
 enum AggAcc {
     Count(u64),
     /// `sum`: integers add exactly as `i64` (an overflow is an error); once a
-    /// float is seen the result is a float (row 158).
+    /// float is seen the result is a float.
     Sum {
         ints: i64,
         floats: f64,
@@ -2667,6 +4585,22 @@ enum AggAcc {
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// `stDev` / `stDevP`: Welford's running mean and sum of squared
+    /// deviations, so the deviation is stable and memory is O(1).
+    StDev {
+        population: bool,
+        n: u64,
+        mean: f64,
+        m2: f64,
+    },
+    /// `percentileCont` / `percentileDisc`: every numeric input, with the
+    /// `p` the query asked for (already validated to lie in `[0,1]`).
+    Percentile {
+        name: &'static str,
+        continuous: bool,
+        p: f64,
+        values: Vec<(f64, Value)>,
+    },
     /// `DISTINCT` wrapper: forwards to `inner` the first time a value is
     /// seen in this group and drops every repeat.
     Distinct {
@@ -2678,18 +4612,45 @@ enum AggAcc {
 impl AggAcc {
     /// The accumulator an aggregate needs given the argument it was written
     /// with — a `DISTINCT` argument adds the seen-set around the plain one.
-    fn for_arg(func: &AggFunc, arg: &AggArg) -> Self {
-        match arg {
+    fn for_arg(func: &AggFunc, arg: &AggArg, params: &Params) -> Result<Self, String> {
+        let plain = AggAcc::new(func, params)?;
+        Ok(match arg {
             AggArg::Distinct(_) => AggAcc::Distinct {
                 seen: HashSet::new(),
-                inner: Box::new(AggAcc::new(func)),
+                inner: Box::new(plain),
             },
-            _ => AggAcc::new(func),
-        }
+            _ => plain,
+        })
     }
 
-    fn new(func: &AggFunc) -> Self {
-        match func {
+    /// Fails when a percentile's `p` is not a number in `[0,1]`, so a bad `p`
+    /// is an error on an empty match as well.
+    fn new(func: &AggFunc, params: &Params) -> Result<Self, String> {
+        Ok(match func {
+            AggFunc::StDev => AggAcc::StDev {
+                population: false,
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            AggFunc::StDevP => AggAcc::StDev {
+                population: true,
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            AggFunc::PercentileCont { p } => AggAcc::Percentile {
+                name: "percentileCont",
+                continuous: true,
+                p: percentile_arg("percentileCont", p, params)?,
+                values: Vec::new(),
+            },
+            AggFunc::PercentileDisc { p } => AggAcc::Percentile {
+                name: "percentileDisc",
+                continuous: false,
+                p: percentile_arg("percentileDisc", p, params)?,
+                values: Vec::new(),
+            },
             AggFunc::Count => AggAcc::Count(0),
             AggFunc::Sum => AggAcc::Sum {
                 ints: 0,
@@ -2701,7 +4662,7 @@ impl AggAcc {
             AggFunc::Min => AggAcc::Min(None),
             AggFunc::Max => AggAcc::Max(None),
             AggFunc::Collect => AggAcc::Collect(Vec::new()),
-        }
+        })
     }
 
     fn finish(self) -> Option<Value> {
@@ -2736,8 +4697,109 @@ impl AggAcc {
             AggAcc::Max(v) => v,
             // Empty collect() yields an empty list (never null), matching openCypher.
             AggAcc::Collect(items) => Some(Value::List(items)),
+            AggAcc::StDev {
+                population, n, m2, ..
+            } => {
+                // Fewer than two values (none, for stDevP) have no spread: 0.0,
+                // as openCypher has it, never null.
+                let divisor = if population { n } else { n.saturating_sub(1) };
+                if divisor == 0 {
+                    Some(Value::Float(0.0))
+                } else {
+                    Some(Value::Float((m2 / divisor as f64).sqrt()))
+                }
+            }
+            AggAcc::Percentile {
+                continuous,
+                p,
+                mut values,
+                ..
+            } => {
+                if values.is_empty() {
+                    return None;
+                }
+                values.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let last = values.len() - 1;
+                if continuous {
+                    let rank = p * last as f64;
+                    let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+                    let frac = rank - lo as f64;
+                    let (a, b) = (values[lo].0, values[hi.min(last)].0);
+                    Some(Value::Float(a + (b - a) * frac))
+                } else {
+                    // Nearest rank: the ⌈p·N⌉-th smallest, the smallest for p = 0.
+                    let rank = nearest_rank(p, values.len());
+                    let (_, value) = values.swap_remove(rank - 1);
+                    Some(value)
+                }
+            }
             AggAcc::Distinct { inner, .. } => inner.finish(),
         }
+    }
+}
+
+/// The 1-based nearest rank `⌈p·n⌉`, clamped to `[1, n]`. `p·n` is snapped to
+/// the nearest integer when it is within float error of one, so `0.07 * 100`
+/// (7.000000000000001) is rank 7, not 8.
+fn nearest_rank(p: f64, n: usize) -> usize {
+    let exact = p * n as f64;
+    let nearest = exact.round();
+    let snapped = if (exact - nearest).abs() <= 1e-9 * nearest.max(1.0) {
+        nearest
+    } else {
+        exact.ceil()
+    };
+    (snapped as usize).clamp(1, n)
+}
+
+/// The `p` of a percentile aggregate: a number in `[0,1]`, given as a
+/// literal or a parameter (so it is the same for every row).
+fn percentile_arg(name: &str, p: &Operand, params: &Params) -> Result<f64, String> {
+    let value = match p {
+        Operand::Lit(v) => v.clone(),
+        Operand::Param(n) => params
+            .0
+            .get(n)
+            .cloned()
+            .ok_or_else(|| format!("{name}(): missing parameter ${n} for p"))?,
+        _ => return Err(format!("{name}(): p must be a literal or a parameter")),
+    };
+    let p = numeric_val(&value).ok_or_else(|| format!("{name}(): p must be a number in [0,1]"))?;
+    if !(0.0..=1.0).contains(&p) {
+        return Err(format!("{name}(): p must be in [0,1], got {p}"));
+    }
+    Ok(p)
+}
+
+/// The numeric input of a statistical aggregate on one row: `None` for null,
+/// an error for a value that is not a number (these aggregates do not
+/// silently skip what they cannot read).
+fn stat_input(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    arg: &AggArg,
+    name: &str,
+) -> Result<Option<(f64, Value)>, String> {
+    let value = match arg {
+        AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
+        AggArg::Var(v) => match vars
+            .slot(v)
+            .and_then(|s| row.get(s))
+            .and_then(|c| c.as_ref())
+        {
+            Some(Cell::Scalar(x)) => Some(x.clone()),
+            None => None,
+            Some(_) => return Err(format!("{name}(): expected a number, got a graph element")),
+        },
+        _ => return Ok(None),
+    };
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match numeric_val(&v) {
+            Some(x) => Ok(Some((x, v))),
+            None => Err(format!("{name}(): expected a number, got {v:?}")),
+        },
     }
 }
 
@@ -2758,6 +4820,7 @@ struct AggStreamCtx<'a> {
     params: &'a Params<'a>,
     func: &'a AggFunc,
     arg: &'a AggArg,
+    op_edges: OpEdges<'a>,
 }
 
 /// Streaming accumulator executor for a single aggregate.
@@ -2788,9 +4851,10 @@ fn execute_aggregate(
         params,
         func,
         arg,
+        op_edges: OpEdges::new(producers, &vars),
     };
     let initial_row: Row = vec![None; vars.names.len()];
-    let mut acc = AggAcc::for_arg(func, arg);
+    let mut acc = AggAcc::for_arg(func, arg, params)?;
     agg_stream(&ctx, producers, &initial_row, &mut acc)?;
 
     let value = acc.finish();
@@ -2835,7 +4899,7 @@ fn distinct_value(
                 return Ok(None);
             };
             Ok(match row.get(slot).and_then(|c| c.as_ref()) {
-                Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                Some(Cell::Node(id)) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                 Some(Cell::Scalar(val)) => Some(val.clone()),
                 Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
                 Some(Cell::Rel(e)) => Some(Value::Str(format!(
@@ -2851,17 +4915,29 @@ fn distinct_value(
     }
 }
 
+/// The openCypher name of an aggregate, for messages.
+fn agg_name(func: &AggFunc) -> &'static str {
+    match func {
+        AggFunc::Sum => "sum",
+        AggFunc::Avg => "avg",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
+        _ => "aggregate",
+    }
+}
+
 /// The value one row feeds a `sum` / `avg` / `min` / `max`: the property, or
-/// the scalar a bare variable is bound to. Null, an unbound variable and a
-/// node, relationship or path variable give `None` and contribute nothing, as
-/// every non-property argument did before row 157.
+/// the scalar a bare variable is bound to. Null and an unbound variable give
+/// `None` (contributes nothing); a node, relationship or path is not a value
+/// these aggregates can read and is an error, as for `stDev`.
 fn scalar_agg_input(
     view: &GraphView,
     vars: &VarTable,
     row: &Row,
     arg: &AggArg,
+    name: &str,
 ) -> Result<Option<Value>, String> {
-    Ok(match arg {
+    let value = match arg {
         AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
         AggArg::Var(v) => match vars
             .slot(v)
@@ -2869,19 +4945,17 @@ fn scalar_agg_input(
             .and_then(|c| c.as_ref())
         {
             Some(Cell::Scalar(x)) => Some(x.clone()),
-            _ => None,
+            None => None,
+            Some(_) => return Err(format!("{name}(): expected a value, got a graph element")),
         },
         _ => None,
-    })
+    };
+    Ok(value.filter(|v| !matches!(v, Value::Null)))
 }
 
 /// Keep the smaller (`largest == false`) or larger of the running extreme and
-/// the next value. A number or a boolean counts (row 160: `false` before
-/// `true`); any other value is skipped.
+/// the next value. Any orderable value counts, strings included.
 fn fold_extreme(current: &mut Option<Value>, next: Value, largest: bool) {
-    if numeric_val(&next).is_none() && !matches!(next, Value::Bool(_)) {
-        return;
-    }
     *current = Some(match current.take() {
         None => next,
         Some(prev) => {
@@ -2959,7 +5033,7 @@ fn update_acc(
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
             AggArg::Prop { .. } | AggArg::Var(_),
         ) => {
-            let Some(v) = scalar_agg_input(view, vars, row, arg)? else {
+            let Some(v) = scalar_agg_input(view, vars, row, arg, agg_name(func))? else {
                 return Ok(());
             };
             match acc {
@@ -2995,16 +5069,16 @@ fn update_acc(
         }
         (AggFunc::Collect, AggArg::Var(v)) => {
             // Gather each row's value of `v` — node → key, scalar alias → value,
-            // path → hop count. Nulls (unbound / relationship) are skipped.
+            // path → hop count, relationship → its map. Nulls are skipped.
             let val = vars
                 .slot(v)
                 .and_then(|s| row.get(s))
                 .and_then(|c| c.as_ref())
                 .and_then(|cell| match cell {
                     Cell::Scalar(x) => Some(x.clone()),
-                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                    Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                     Cell::Path(h) => Some(Value::Int(*h as i64)),
-                    Cell::Rel(_) => None,
+                    Cell::Rel(e) => Some(rel_value(view, e)),
                 });
             if let Some(val) = val {
                 if let AggAcc::Collect(items) = acc {
@@ -3016,6 +5090,30 @@ fn update_acc(
             if let Some(val) = resolve_prop(view, vars, row, var, field)? {
                 if let AggAcc::Collect(items) = acc {
                     items.push(val);
+                }
+            }
+        }
+        (AggFunc::StDev | AggFunc::StDevP, _) => {
+            if let AggAcc::StDev {
+                population,
+                n,
+                mean,
+                m2,
+            } = acc
+            {
+                let name = if *population { "stDevP" } else { "stDev" };
+                if let Some((x, _)) = stat_input(view, vars, row, arg, name)? {
+                    *n += 1;
+                    let delta = x - *mean;
+                    *mean += delta / *n as f64;
+                    *m2 += delta * (x - *mean);
+                }
+            }
+        }
+        (AggFunc::PercentileCont { .. } | AggFunc::PercentileDisc { .. }, _) => {
+            if let AggAcc::Percentile { name, values, .. } = acc {
+                if let Some(entry) = stat_input(view, vars, row, arg, name)? {
+                    values.push(entry);
                 }
             }
         }
@@ -3046,6 +5144,21 @@ fn agg_stream(
     match op {
         PlanOp::ScanLabel { var, label } => {
             let ids = scan_ids(ctx.view, label.as_deref());
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let ids = range_or_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)?;
             let slot = ctx
                 .vars
                 .slot(var)
@@ -3125,8 +5238,10 @@ fn agg_stream(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -3141,8 +5256,9 @@ fn agg_stream(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -3176,7 +5292,7 @@ fn agg_stream(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 agg_stream(ctx, rest, row, acc)?;
             }
         }
@@ -3200,50 +5316,37 @@ fn agg_stream(
                 agg_stream(ctx, rest, row, acc)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
         }
-        PlanOp::ShortestPath {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            max_hops,
+        PlanOp::BindPath {
+            path_var,
+            start_var,
+            hops,
         } => {
-            let new_rows = exec_shortest_path(
+            let new_rows = exec_bind_path(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *max_hops,
+                path_var,
+                start_var,
+                hops,
             )?;
+            for nr in &new_rows {
+                agg_stream(ctx, rest, nr, acc)?;
+            }
+        }
+        PlanOp::ShortestPath { .. } => {
+            let new_rows = exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), op)?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
@@ -3321,6 +5424,7 @@ struct GroupStreamCtx<'a> {
     params: &'a Params<'a>,
     keys: &'a [(String, RetItem)],
     aggs: &'a [(AggFunc, AggArg, String)],
+    op_edges: OpEdges<'a>,
 }
 
 /// Build the `Projected` output table from a finished group map.
@@ -3410,7 +5514,14 @@ fn group_result_to_rows(
 /// for example, inside a non-aggregate WITH stage or after a pipeline
 /// GroupAggregate.  `OrderTarget::Prop` is resolved by looking up the node
 /// property; `Alias` / `Var` are resolved from `Cell::Scalar` in the row.
-fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem], view: &GraphView) {
+fn exec_order_by_rows(
+    vars: &VarTable,
+    rows: &mut Vec<Row>,
+    items: &[OrderItem],
+    view: &GraphView,
+    params: &Params,
+    keep: Option<usize>,
+) -> Result<(), String> {
     // Pre-compute sort-key values for all rows.  This avoids re-resolving
     // inside the comparator (the closure cannot return Err, so we pre-compute).
     let mut key_table: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
@@ -3424,9 +5535,9 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
                         Cell::Scalar(v) => Some(v.clone()),
-                        Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                        Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                         Cell::Path(hops) => Some(Value::Int(*hops as i64)),
-                        Cell::Rel(_) => None,
+                        Cell::Rel(e) => Some(rel_value(view, e)),
                     }),
                 OrderTarget::Prop { var, field } => vars
                     .slot(var)
@@ -3440,14 +5551,15 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field),
                         _ => None,
                     }),
+                OrderTarget::Expr(op) => resolve_operand(view, vars, row, op, params)?,
             };
             row_key.push(val);
         }
         key_table.push(row_key);
     }
-    // Sort using a stable, index-based sort to keep equal rows in encounter order.
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|&a, &b| {
+    // Stable: equal keys keep encounter order; with a bound only the rows a
+    // following SKIP/LIMIT can reach are selected and sorted.
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for (ki, item) in items.iter().enumerate() {
             let c = cmp_optional(
                 key_table[a].get(ki).and_then(|x| x.as_ref()),
@@ -3460,8 +5572,12 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
         }
         std::cmp::Ordering::Equal
     });
-    let sorted: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
+    let sorted: Vec<Row> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
     *rows = sorted;
+    Ok(())
 }
 
 /// Streaming grouped-aggregate executor.
@@ -3494,6 +5610,7 @@ fn execute_group_aggregate(
         params,
         keys,
         aggs,
+        op_edges: OpEdges::new(producers, &vars),
     };
     group_stream(&ctx, producers, &initial_row, &mut groups, &mut key_order)?;
     // openCypher: aggregates with no group-key items on empty input must
@@ -3506,15 +5623,23 @@ fn execute_group_aggregate(
             empty_key,
             (
                 vec![],
-                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
+                aggs.iter()
+                    .map(|(f, a, _)| AggAcc::for_arg(f, a, params))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
         );
     }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
     // Apply OrderBy / Skip / Limit from the tail of the plan.
-    for op in tail {
+    for (tail_index, op) in tail.iter().enumerate() {
         match op {
-            PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                let keep = order_keep_bound(&tail[tail_index + 1..], params);
+                exec_order_by(&mut projected, items, *visible_columns, keep)?;
+            }
             PlanOp::Skip(ls) => {
                 let n = resolve_ls(ls, params)?;
                 apply_skip(&mut projected.rows, n);
@@ -3562,8 +5687,8 @@ fn group_stream(
                 let init: Vec<AggAcc> = ctx
                     .aggs
                     .iter()
-                    .map(|(f, a, _)| AggAcc::for_arg(f, a))
-                    .collect();
+                    .map(|(f, a, _)| AggAcc::for_arg(f, a, ctx.params))
+                    .collect::<Result<_, _>>()?;
                 groups.insert(gk.clone(), (display_vals, init));
             }
             let (_, accs) = groups.get_mut(&gk).unwrap();
@@ -3577,6 +5702,21 @@ fn group_stream(
     match op {
         PlanOp::ScanLabel { var, label } => {
             let ids = scan_ids(ctx.view, label.as_deref());
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let ids = range_or_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)?;
             let slot = ctx
                 .vars
                 .slot(var)
@@ -3656,8 +5796,10 @@ fn group_stream(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -3672,8 +5814,9 @@ fn group_stream(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -3707,7 +5850,7 @@ fn group_stream(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 group_stream(ctx, rest, row, groups, key_order)?;
             }
         }
@@ -3731,50 +5874,37 @@ fn group_stream(
                 group_stream(ctx, rest, row, groups, key_order)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 group_stream(ctx, rest, nr, groups, key_order)?;
             }
         }
-        PlanOp::ShortestPath {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            max_hops,
+        PlanOp::BindPath {
+            path_var,
+            start_var,
+            hops,
         } => {
-            let new_rows = exec_shortest_path(
+            let new_rows = exec_bind_path(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *max_hops,
+                path_var,
+                start_var,
+                hops,
             )?;
+            for nr in &new_rows {
+                group_stream(ctx, rest, nr, groups, key_order)?;
+            }
+        }
+        PlanOp::ShortestPath { .. } => {
+            let new_rows = exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), op)?;
             for nr in &new_rows {
                 group_stream(ctx, rest, nr, groups, key_order)?;
             }
@@ -3836,6 +5966,154 @@ fn group_stream(
     Ok(())
 }
 
+/// `pull_rows` for a `ScanLabel` of `var` over `label`, then `rest`: a lazy
+/// walk of the label array, with a `Prop op Lit` filter that follows fused
+/// into it unless `fuse` is false. Only the node slots in `window`
+/// (`start..end`) are walked; a whole scan passes `0..usize::MAX`.
+#[allow(clippy::too_many_arguments)]
+fn pull_scan_label(
+    ctx: &PullCtx<'_>,
+    var: &str,
+    label: Option<&str>,
+    window: std::ops::Range<usize>,
+    fuse: bool,
+    rest: &[PlanOp],
+    row: &mut Row,
+    result: &mut Vec<Vec<Option<Value>>>,
+) -> Result<(), String> {
+    let slot = ctx
+        .vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    // Resolve the label to an interned symbol once. If the label is
+    // specified but unknown, there are no matching nodes — return early.
+    let want_sym = label.and_then(|l| ctx.view.sym(l));
+    if label.is_some() && want_sym.is_none() {
+        return Ok(());
+    }
+    // Save the slot value so we can restore it after the loop.
+    let prev = row[slot].clone();
+
+    // Fast path: if the immediately following op is a simple
+    // `Prop op Lit` comparison on this scan variable, fuse the filter
+    // into the scan loop.  Pre-resolving the property column once
+    // (hashing the field name once instead of per-node) eliminates the
+    // outer HashMap string-hash on every candidate row.
+    let fused_filter = rest.first().and_then(|next_op| {
+        if let PlanOp::Filter {
+            expr:
+                Expr::Cmp {
+                    lhs:
+                        Operand::Prop {
+                            var: ref fv,
+                            field: ref f,
+                        },
+                    op: ref cmp_op_ref,
+                    rhs: Operand::Lit(ref lit),
+                },
+        } = *next_op
+        {
+            if fv == var {
+                return Some((f.as_str(), cmp_op_ref, lit));
+            }
+        }
+        None
+    });
+
+    // `n.key` / `n.id` / `n.label` are not columns, so the fused path
+    // would see an empty column and drop every row. Fall through to
+    // the generic path, which goes through `resolve_prop`.
+    let fused_filter = fused_filter.filter(|(f, _, _)| fuse && !is_identity_field(f));
+    if let Some((field, cmp_op_ref, lit)) = fused_filter {
+        // Fused scan+filter: column resolved once, comparison done
+        // inline — no recursive call into pull_rows for the Filter arm.
+        // The column reads layer, overlay and snapshot base, as
+        // `resolve_prop` does (ledger row 139).
+        #[cfg(test)]
+        FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
+        let col = ctx.view.props.column(field);
+        let rest_after_filter = &rest[1..];
+        macro_rules! fused_scan {
+            ($syms:expr) => {
+                for (i, sym) in $syms
+                    .enumerate()
+                    .skip(window.start)
+                    .take(window.end.saturating_sub(window.start))
+                {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
+                    if col.test(id, |v| eval_cmp(cmp_op_ref, v, lit)) {
+                        row[slot] = Some(Cell::Node(id));
+                        pull_rows(ctx, rest_after_filter, row, result)?;
+                    }
+                }
+            };
+        }
+        // Without a layer the label array is the whole answer: walk
+        // it as a plain slice, the scan's hot loop unchanged.
+        match ctx.view.layer {
+            None => fused_scan!(ctx.view.labels.iter().copied()),
+            Some(_) => fused_scan!(ctx.view.label_syms()),
+        }
+    } else {
+        // Generic path: iterate label array lazily, no Vec allocation,
+        // with early exit when the row bound is satisfied.
+        macro_rules! scan {
+            ($syms:expr) => {
+                for (i, sym) in $syms
+                    .enumerate()
+                    .skip(window.start)
+                    .take(window.end.saturating_sub(window.start))
+                {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    // Skip tombstone / gap slots (u32::MAX sentinel).
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    // Filter by label symbol when a label is requested.
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
+                    row[slot] = Some(Cell::Node(id));
+                    pull_rows(ctx, rest, row, result)?;
+                }
+            };
+        }
+        match ctx.view.layer {
+            None => scan!(ctx.view.labels.iter().copied()),
+            Some(_) => scan!(ctx.view.label_syms()),
+        }
+    }
+    // SAFETY: the `?` inside both scan loops propagates Err directly to
+    // `execute_pull`, which drops `initial_row` — the skipped restore is
+    // unobservable.  This invariant MUST stay true: no call site between
+    // here and `execute_pull` may catch an Err and re-use the row.
+    // Future refactors adding mid-stream error recovery must audit this site.
+    row[slot] = prev;
+    Ok(())
+}
+
 /// Recursively pull rows through `ops`, projecting into `result` until
 /// `result.len() >= ctx.bound`.
 ///
@@ -3846,7 +6124,7 @@ fn group_stream(
 /// restores it around the recursive call so the caller sees no net change.
 /// This eliminates the per-row `Vec` clone that the staged path requires.
 ///
-/// ScanLabel iterates `view.labels` directly (lazy, no intermediate `Vec<u32>`)
+/// ScanLabel iterates `view.label_syms()` directly (lazy, no intermediate `Vec<u32>`)
 /// so the bound truncates the scan itself — scanning stops as soon as enough
 /// result rows have been collected.
 fn pull_rows(
@@ -3872,110 +6150,16 @@ fn pull_rows(
     };
     match op {
         PlanOp::ScanLabel { var, label } => {
-            let slot = ctx
-                .vars
-                .slot(var)
-                .ok_or_else(|| format!("unbound variable `{var}`"))?;
-            // Resolve the label to an interned symbol once. If the label is
-            // specified but unknown, there are no matching nodes — return early.
-            let want_sym = label.as_deref().and_then(|l| ctx.view.syms.get(l));
-            if label.is_some() && want_sym.is_none() {
-                return Ok(());
-            }
-            // Save the slot value so we can restore it after the loop.
-            let prev = row[slot].clone();
-
-            // Fast path: if the immediately following op is a simple
-            // `Prop op Lit` comparison on this scan variable, fuse the filter
-            // into the scan loop.  Pre-resolving the property column once
-            // (hashing the field name once instead of per-node) eliminates the
-            // outer HashMap string-hash on every candidate row.
-            let fused_filter = rest.first().and_then(|next_op| {
-                if let PlanOp::Filter {
-                    expr:
-                        Expr::Cmp {
-                            lhs:
-                                Operand::Prop {
-                                    var: ref fv,
-                                    field: ref f,
-                                },
-                            op: ref cmp_op_ref,
-                            rhs: Operand::Lit(ref lit),
-                        },
-                } = *next_op
-                {
-                    if fv == var {
-                        return Some((f.as_str(), cmp_op_ref, lit));
-                    }
-                }
-                None
-            });
-
-            // `n.key` / `n.id` / `n.label` are not columns, so the fused path
-            // would see an empty column and drop every row. Fall through to
-            // the generic path, which goes through `resolve_prop`.
-            let fused_filter = fused_filter.filter(|(f, _, _)| !is_identity_field(f));
-            if let Some((field, cmp_op_ref, lit)) = fused_filter {
-                // Fused scan+filter: column resolved once, comparison done
-                // inline — no recursive call into pull_rows for the Filter arm.
-                // The column reads overlay and snapshot base, as
-                // `resolve_prop` does (ledger row 139).
-                #[cfg(test)]
-                FUSED_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let col = ctx.view.props.view_column(field);
-                let rest_after_filter = &rest[1..];
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
-                        }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    if col.test(id, |v| eval_cmp(cmp_op_ref, v, lit)) {
-                        row[slot] = Some(Cell::Node(id));
-                        pull_rows(ctx, rest_after_filter, row, result)?;
-                    }
-                }
-            } else {
-                // Generic path: iterate label array lazily, no Vec allocation,
-                // with early exit when the row bound is satisfied.
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    // Skip tombstone / gap slots (u32::MAX sentinel).
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    // Filter by label symbol when a label is requested.
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
-                        }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    row[slot] = Some(Cell::Node(id));
-                    pull_rows(ctx, rest, row, result)?;
-                }
-            }
-            // SAFETY: the `?` inside both scan loops propagates Err directly to
-            // `execute_pull`, which drops `initial_row` — the skipped restore is
-            // unobservable.  This invariant MUST stay true: no call site between
-            // here and `execute_pull` may catch an Err and re-use the row.
-            // Future refactors adding mid-stream error recovery must audit this site.
-            row[slot] = prev;
+            pull_scan_label(
+                ctx,
+                var,
+                label.as_deref(),
+                0..usize::MAX,
+                true,
+                rest,
+                row,
+                result,
+            )?;
         }
         PlanOp::ScanKey { var, key, label } => {
             let slot = ctx
@@ -3990,6 +6174,52 @@ fn pull_rows(
                 pull_rows(ctx, rest, row, result)?;
                 row[slot] = prev;
             }
+        }
+        PlanOp::IndexRangeScan { .. } => {
+            let Some((var, scan)) = RangeScan::of(op) else {
+                unreachable!("matched an IndexRangeScan")
+            };
+            let label = Some(scan.label);
+            // A `LIMIT` with no `ORDER BY`: a range that most nodes satisfy
+            // fills the bound within the first few nodes of a scan, sooner
+            // than the index lists the range. So the first slots are scanned
+            // first, and the index answers only for the nodes after them —
+            // in id order either way, as the scan gives them.
+            let probe = if ctx.view.range_index(scan.label, scan.field).is_some() {
+                pull_probe_slots()
+            } else {
+                usize::MAX
+            };
+            //
+            // The probe does not fuse the filter into the walk: the fused
+            // walk reads the column overlay only, and with an index there is a
+            // snapshot base under it.
+            if probe == usize::MAX {
+                // No index to read: the lazy label walk, with its fused filter.
+                return pull_scan_label(ctx, var, label, 0..probe, true, rest, row, result);
+            }
+            pull_scan_label(ctx, var, label, 0..probe, false, rest, row, result)?;
+            if result.len() >= ctx.bound {
+                return Ok(());
+            }
+            let Some(ids) = range_scan_ids(ctx.view, ctx.vars, row, &scan, ctx.params)? else {
+                // A bound the index cannot take: scan the rest.
+                let rest_of_label = probe..usize::MAX;
+                return pull_scan_label(ctx, var, label, rest_of_label, false, rest, row, result);
+            };
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            let prev = row[slot].clone();
+            for id in ids.into_iter().filter(|&id| id as usize >= probe) {
+                if result.len() >= ctx.bound {
+                    break;
+                }
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+            }
+            row[slot] = prev;
         }
         PlanOp::IndexScan {
             var,
@@ -4055,8 +6285,10 @@ fn pull_rows(
             to,
             to_label,
             to_props,
+            distinct_from: _,
         } => {
             let etypes = resolve_etypes(ctx.view, etypes);
+            let clause_edges = ctx.op_edges.at(ops);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -4071,11 +6303,12 @@ fn pull_rows(
                 }
                 None => None,
             };
+            let bound_rel = bound_rel(row, rel_slot);
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
                 if result.len() >= ctx.bound {
                     break;
                 }
-                if row_has_edge(row, &e) {
+                if clause_edges.holds(row, &e) || bound_rel.is_some_and(|b| b != e) {
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
@@ -4111,7 +6344,7 @@ fn pull_rows(
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params)? {
                 pull_rows(ctx, rest, row, result)?;
             }
         }
@@ -4189,6 +6422,13 @@ fn pull_rows(
                     .to_string(),
             );
         }
+        PlanOp::BindPath { .. } => {
+            return Err(
+                "pull executor: BindPath reached pull_rows — named-path plans must use \
+                 the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
         PlanOp::ShortestPath { .. } => {
             return Err(
                 "pull executor: ShortestPath reached pull_rows — shortestPath plans \
@@ -4228,89 +6468,23 @@ fn pull_rows(
     Ok(())
 }
 
+/// A WHERE predicate (or a CASE WHEN condition, or a comprehension filter):
+/// true keeps the row; false and null both drop it. Evaluated three-valued,
+/// exactly as the same predicate is as a value, so `NOT (null)` is null and
+/// drops the row.
 fn eval_expr(
     view: &GraphView,
     vars: &VarTable,
     row: &Row,
     expr: &Expr,
     params: &Params,
-    depth: u32,
 ) -> Result<bool, String> {
-    if depth > 256 {
-        return Err("expression nesting too deep".into());
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        Expr::Not(inner) => Ok(!eval_expr(view, vars, row, inner, params, depth + 1)?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = resolve_operand(view, vars, row, lhs, params)?;
-            let r = resolve_operand(view, vars, row, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = resolve_operand(view, vars, row, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => eval_in(view, vars, row, expr, list, params),
-    }
-}
-
-fn eval_in(
-    view: &GraphView,
-    vars: &VarTable,
-    row: &Row,
-    expr: &Operand,
-    list: &[Operand],
-    params: &Params,
-) -> Result<bool, String> {
-    let Some(needle) = resolve_operand(view, vars, row, expr, params)? else {
-        return Ok(false);
-    };
-    for item_op in list {
-        match resolve_operand(view, vars, row, item_op, params)? {
-            None => {}
-            Some(Value::List(items)) => {
-                for item in items {
-                    if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) {
-                        return Ok(true);
-                    }
-                }
-            }
-            Some(item) if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) => {
-                return Ok(true);
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(false)
+    let value = super::predicate::eval_predicate(
+        expr,
+        &mut |op| resolve_operand(view, vars, row, op, params),
+        &|e| e,
+    )?;
+    Ok(value == Some(true))
 }
 
 /// Deduplicate projected rows. Numeric Int/Float unify matches grouping.
@@ -4350,6 +6524,10 @@ fn column_name(item: &RetItem) -> String {
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
                 AggFunc::Collect => "COLLECT",
+                AggFunc::StDev => "stDev",
+                AggFunc::StDevP => "stDevP",
+                AggFunc::PercentileCont { .. } => "percentileCont",
+                AggFunc::PercentileDisc { .. } => "percentileDisc",
             };
             format!("{f}({})", agg_arg_label(arg))
         }
@@ -4393,15 +6571,13 @@ fn project_item(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 // Cell is None — variable is optionally null (from OPTIONAL MATCH).
                 None => Ok(None),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Err(format!("unknown node id {id}")),
                 },
                 // Scalar alias produced by a prior WITH stage.
                 Some(Cell::Scalar(val)) => Ok(Some(val.clone())),
-                Some(Cell::Rel(_)) => Err(format!(
-                    "variable `{v}` is a relationship; return its properties ({v}.field) instead"
-                )),
+                Some(Cell::Rel(e)) => Ok(Some(rel_value(view, e))),
                 Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
             }
         }
@@ -4421,10 +6597,72 @@ fn order_column(item: &OrderItem) -> String {
     match &item.target {
         OrderTarget::Alias(name) | OrderTarget::Var(name) => name.clone(),
         OrderTarget::Prop { var, field } => format!("{var}.{field}"),
+        // `plan()` never leaves an expression key on an OrderBy over a
+        // projection; it rewrites it to the column that carries its value.
+        OrderTarget::Expr(op) => operand_label(op),
     }
 }
 
-fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), String> {
+/// How many leading rows of the sorted result the ops after an `OrderBy` can
+/// still see: `SKIP s LIMIT k` reads only the first `s + k`. `None` when no
+/// `LIMIT` follows (every row is needed) or a parameter cannot be resolved
+/// (the later `Limit` op reports that error itself).
+fn order_keep_bound(following: &[PlanOp], params: &Params) -> Option<usize> {
+    let mut skip = None;
+    let mut limit = None;
+    for op in following {
+        match op {
+            PlanOp::Skip(ls) => skip = Some(ls),
+            PlanOp::Limit(ls) => limit = Some(ls),
+            _ => break,
+        }
+    }
+    skip_limit_bound(skip, limit, params)
+}
+
+fn skip_limit_bound(
+    skip: Option<&LimitSkip>,
+    limit: Option<&LimitSkip>,
+    params: &Params,
+) -> Option<usize> {
+    let skip = match skip {
+        Some(ls) => resolve_ls(ls, params).ok()?,
+        None => 0,
+    };
+    let total = skip.checked_add(resolve_ls(limit?, params).ok()?)?;
+    usize::try_from(total).ok()
+}
+
+/// The first `keep` positions (all when `None`) of `0..len` in the order
+/// `cmp` gives, ties broken by position so the result is exactly the prefix of
+/// a stable full sort. With a bound this is a partition (`select_nth_unstable`)
+/// plus a sort of the prefix, O(n + k log k), instead of an O(n log n) sort.
+fn sorted_prefix(
+    len: usize,
+    keep: Option<usize>,
+    cmp: impl Fn(usize, usize) -> std::cmp::Ordering,
+) -> Vec<usize> {
+    let total = |a: &usize, b: &usize| cmp(*a, *b).then(a.cmp(b));
+    let mut indices: Vec<usize> = (0..len).collect();
+    match keep {
+        Some(k) if k < len => {
+            if k > 0 {
+                indices.select_nth_unstable_by(k - 1, total);
+            }
+            indices.truncate(k);
+            indices.sort_unstable_by(total);
+        }
+        _ => indices.sort_unstable_by(total),
+    }
+    indices
+}
+
+fn exec_order_by(
+    table: &mut Projected,
+    items: &[OrderItem],
+    visible_columns: Option<usize>,
+    keep: Option<usize>,
+) -> Result<(), String> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
         let name = order_column(item);
@@ -4435,11 +6673,12 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
             .ok_or_else(|| format!("ORDER BY target `{name}` is not a projected column"))?;
         keys.push((idx, item.descending));
     }
-    table.rows.sort_by(|a, b| {
+    let rows = &mut table.rows;
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for &(idx, desc) in &keys {
             let c = cmp_optional(
-                a.get(idx).and_then(|x| x.as_ref()),
-                b.get(idx).and_then(|x| x.as_ref()),
+                rows[a].get(idx).and_then(|x| x.as_ref()),
+                rows[b].get(idx).and_then(|x| x.as_ref()),
                 desc,
             );
             if c != std::cmp::Ordering::Equal {
@@ -4448,6 +6687,18 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
         }
         std::cmp::Ordering::Equal
     });
+    let sorted: Vec<_> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
+    *rows = sorted;
+    // Drop the hidden columns that only carried sort keys.
+    if let Some(n) = visible_columns {
+        table.columns.truncate(n);
+        for row in &mut table.rows {
+            row.truncate(n);
+        }
+    }
     Ok(())
 }
 
@@ -4491,6 +6742,78 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 }
 
 #[cfg(test)]
+#[path = "tests/ql_04.rs"]
+mod ql_04;
+
+#[cfg(test)]
+#[path = "tests/ql_13.rs"]
+mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_cl.rs"]
+mod ql_cl;
+
+#[cfg(test)]
+#[path = "tests/ql_tf.rs"]
+mod ql_tf;
+
+#[cfg(test)]
+#[path = "tests/ql_ve.rs"]
+mod ql_ve;
+
+#[cfg(test)]
+#[path = "tests/ql_14.rs"]
+mod ql_14;
+
+#[cfg(test)]
+#[path = "tests/ql_15.rs"]
+mod ql_15;
+
+#[cfg(test)]
+#[path = "tests/ql_07.rs"]
+mod ql_07;
+
+#[cfg(test)]
+#[path = "tests/ql_03e.rs"]
+mod ql_03e;
+
+#[cfg(test)]
+#[path = "tests/ql_vl.rs"]
+mod ql_vl;
+
+#[cfg(test)]
+#[path = "tests/ql_ru.rs"]
+mod ql_ru;
+
+#[cfg(test)]
+#[path = "tests/ql_bx.rs"]
+mod ql_bx;
+
+#[cfg(test)]
+#[path = "tests/ql_12.rs"]
+mod ql_12;
+
+#[cfg(test)]
+#[path = "tests/ql_11.rs"]
+mod ql_11;
+
+#[cfg(test)]
+#[path = "tests/ql_cx.rs"]
+mod ql_cx;
+
+#[cfg(test)]
+#[path = "tests/ql_ag.rs"]
+mod ql_ag;
+
+#[cfg(test)]
+#[path = "tests/tx_15.rs"]
+mod tx_15;
+
+#[cfg(test)]
+#[path = "tests/tx_ns.rs"]
+mod tx_ns;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -4505,8 +6828,8 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
-    struct Fx {
-        ids: IdMap,
+    pub(super) struct Fx {
+        pub(super) ids: IdMap,
         syms: Interner,
         labels: Vec<u32>,
         props: ColumnStore,
@@ -4515,7 +6838,7 @@ mod tests {
     }
 
     impl Fx {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Fx {
                 ids: IdMap::new(),
                 syms: Interner::new(),
@@ -4526,7 +6849,7 @@ mod tests {
             }
         }
 
-        fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
+        pub(super) fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
             let id = self.ids.get_or_insert(key);
             let sym = self.syms.intern(label);
             self.labels.resize(id as usize + 1, u32::MAX);
@@ -4537,7 +6860,7 @@ mod tests {
             id
         }
 
-        fn edge(&mut self, etype: &str, src: u32, dst: u32, props: Vec<(&str, Value)>) {
+        pub(super) fn edge(&mut self, etype: &str, src: u32, dst: u32, props: Vec<(&str, Value)>) {
             let et = self.syms.intern(etype);
             self.topo.add_edge(et, src, dst);
             for (f, v) in props {
@@ -4545,7 +6868,7 @@ mod tests {
             }
         }
 
-        fn view(&self) -> GraphView<'_> {
+        pub(super) fn view(&self) -> GraphView<'_> {
             GraphView {
                 ids: &self.ids,
                 syms: &self.syms,
@@ -4555,10 +6878,11 @@ mod tests {
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
                 prop_index: None,
+                layer: None,
             }
         }
 
-        fn view_indexed<'a>(
+        pub(super) fn view_indexed<'a>(
             &'a self,
             index: &'a core_storage::property_index::PropertyIndex,
         ) -> GraphView<'a> {
@@ -4573,12 +6897,15 @@ mod tests {
         plan(&parse(&lex(src).expect("lex")).expect("parse")).expect("plan")
     }
 
-    fn run(
+    /// Lex, parse (with the compile-time check), plan and execute `src`; an
+    /// error from any stage is the `Err`.
+    pub(super) fn run(
         view: &GraphView,
         src: &str,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet, String> {
-        execute(view, &compile(src), &Params(params))
+        let ops = plan(&parse(&lex(src)?)?)?;
+        execute(view, &ops, &Params(params))
     }
 
     fn s(v: &str) -> Value {
@@ -4946,8 +7273,414 @@ LIMIT 10";
         assert!(err.contains("tid"), "got: {err}");
     }
 
+    /// Ten people with a score each; `ada`..`jan` score 10..100 shuffled so
+    /// that scan order is not score order.
+    fn scored_people() -> Fx {
+        let mut fx = Fx::new();
+        for (name, score) in [
+            ("ada", 40),
+            ("bob", 90),
+            ("cam", 10),
+            ("dan", 70),
+            ("eve", 100),
+            ("fay", 20),
+            ("gus", 60),
+            ("hal", 30),
+            ("ivy", 80),
+            ("jan", 50),
+        ] {
+            fx.add("Person", name, vec![("name", s(name)), ("score", i(score))]);
+        }
+        fx
+    }
+
+    fn plan_error(src: &str) -> String {
+        plan(&parse(&lex(src).expect("lex")).expect("parse")).expect_err("plan must fail")
+    }
+
+    fn names(rs: &ResultSet) -> Vec<String> {
+        (0..rs.len())
+            .map(|r| match rs.row(r)[0].clone() {
+                Some(Value::Str(v)) => v,
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
-    fn order_by_none_last_then_skip_limit() {
+    fn ql_ob_order_by_a_property_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score DESC LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "ivy"]);
+        assert_eq!(rs.columns(), ["n.name"], "the hidden key column is dropped");
+        assert_eq!(rs.row(0).len(), 1);
+    }
+
+    #[test]
+    fn ql_ob_order_by_a_bare_node_variable_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.score ORDER BY n LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Node keys sort as strings: ada, bob.
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(40))], vec![Some(i(90))]]);
+    }
+
+    #[test]
+    fn ql_ob_expression_and_function_keys() {
+        let fx = scored_people();
+        let v = fx.view();
+        // Distance from 55: jan(5) gus(5)... use a score that has a unique order.
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY abs(n.score - 55), n.name LIMIT 4",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // |score-55|: jan 5, gus 5, ada 15, dan 15 -> ties broken by name.
+        assert_eq!(names(&rs), ["gus", "jan", "ada", "dan"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score + n.score DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY toUpper(n.name) DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["jan", "ivy"]);
+    }
+
+    #[test]
+    fn ql_ob_projected_alias_inside_an_expression() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name AS who, n.score AS s ORDER BY s * -1 LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["who", "s"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("eve")), Some(i(100))],
+                vec![Some(s("bob")), Some(i(90))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_mixed_keys_with_mixed_directions() {
+        let mut fx = Fx::new();
+        for (name, team, score) in [
+            ("a", "red", 3),
+            ("b", "blue", 5),
+            ("c", "red", 5),
+            ("d", "blue", 1),
+            ("e", "red", 3),
+        ] {
+            fx.add(
+                "P",
+                name,
+                vec![("name", s(name)), ("team", s(team)), ("score", i(score))],
+            );
+        }
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.team ASC, n.score DESC, n.name DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // blue: b(5) d(1); red: c(5) then the two 3s by name descending: e, a.
+        assert_eq!(names(&rs), ["b", "d", "c", "e", "a"]);
+    }
+
+    /// Null (a missing property) is the largest value: last ascending, first
+    /// descending (openCypher). A hidden key must agree with a projected column.
+    #[test]
+    fn ql_ob_null_keys_place_like_a_projected_column() {
+        let mut fx = Fx::new();
+        fx.add("P", "ada", vec![("name", s("ada")), ("age", i(30))]);
+        fx.add("P", "bob", vec![("name", s("bob"))]);
+        fx.add("P", "cam", vec![("name", s("cam")), ("age", i(10))]);
+        let v = fx.view();
+        let asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let projected_asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&asc), ["cam", "ada", "bob"]);
+        let projected_desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&desc), ["bob", "ada", "cam"]);
+        assert_eq!(names(&asc), names(&projected_asc));
+        assert_eq!(names(&desc), names(&projected_desc));
+    }
+
+    #[test]
+    fn ql_ob_skip_limit_apply_after_the_hidden_sort() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score SKIP 2 LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["hal", "ada", "jan"]);
+    }
+
+    #[test]
+    fn ql_ob_distinct_and_aggregate_need_projected_keys() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("city", s("x")), ("age", i(1))]);
+        fx.add("P", "b", vec![("city", s("y")), ("age", i(2))]);
+        fx.add("P", "c", vec![("city", s("x")), ("age", i(3))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        for q in [
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.age",
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY n.age",
+        ] {
+            let err = plan_error(q);
+            assert!(
+                err.contains("ORDER BY over a non-projected expression is not allowed with DISTINCT/aggregation"),
+                "{q}: {err}"
+            );
+        }
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.city DESC",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["y", "x"]);
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY c DESC, n.city",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("x")), Some(i(2))],
+                vec![Some(s("y")), Some(i(1))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_and_limits_per_stage() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n ORDER BY n.score LIMIT 2 RETURN n.name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["cam", "fay"]);
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_by_a_variable_it_does_not_carry() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score DESC LIMIT 2 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+        // The dropped variable is out of scope for what follows.
+        let err = plan_error(
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score LIMIT 2 RETURN n.score",
+        );
+        assert!(err.contains("unbound variable `n`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_with_stage_expression_over_a_projected_alias() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name, n.score AS s ORDER BY s % 30, name LIMIT 3 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // s % 30: ada 10, bob 0, cam 10, dan 10, eve 10, fay 20, gus 0, hal 0, ivy 20, jan 20
+        assert_eq!(names(&rs), ["bob", "gus", "hal"]);
+    }
+
+    #[test]
+    fn ql_ob_unbound_variable_in_an_expression_is_an_error() {
+        let err = plan_error("MATCH (n:Person) RETURN n.name ORDER BY nope.score + 1");
+        assert!(err.contains("unbound variable `nope`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_union_branches_each_order_by_their_own_key() {
+        let fx = scored_people();
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let union = crate::cypher::parse_read(
+            &lex(
+                "MATCH (n:Person) WHERE n.score >= 90 RETURN n.name ORDER BY n.score DESC \
+                  UNION ALL \
+                  MATCH (n:Person) WHERE n.score <= 20 RETURN n.name ORDER BY n.score",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rs = super::execute_union(&v, &union, &Params(&params)).unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "cam", "fay"]);
+    }
+
+    /// Deterministic pseudo-random stream (xorshift), so a failure reproduces.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The bounded selection is exactly the prefix of a stable full sort,
+    /// ties and nulls included, for every bound.
+    #[test]
+    fn ql_ob_sorted_prefix_equals_a_stable_full_sort() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..200 {
+            let len = (xorshift(&mut state) % 60) as usize;
+            // Few distinct keys, so ties are everywhere; None is a key too.
+            let keys: Vec<Option<Value>> = (0..len)
+                .map(|_| match xorshift(&mut state) % 6 {
+                    0 => None,
+                    n => Some(i(n as i64)),
+                })
+                .collect();
+            for descending in [false, true] {
+                let cmp = |a: usize, b: usize| {
+                    crate::cmp_optional(keys[a].as_ref(), keys[b].as_ref(), descending)
+                };
+                let mut reference: Vec<usize> = (0..len).collect();
+                reference.sort_by(|&a, &b| cmp(a, b)); // std sort_by is stable
+                for keep in [
+                    None,
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(5),
+                    Some(17),
+                    Some(len),
+                    Some(len + 3),
+                ] {
+                    let got = super::sorted_prefix(len, keep, cmp);
+                    let want = match keep {
+                        Some(k) => reference[..k.min(len)].to_vec(),
+                        None => reference.clone(),
+                    };
+                    assert_eq!(
+                        got, want,
+                        "round {round} len {len} keep {keep:?} desc {descending}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whole-query differential: `ORDER BY … SKIP s LIMIT k` returns the
+    /// slice `[s, s + k)` of the same query without SKIP/LIMIT, for ties,
+    /// nulls, both directions, a hidden key and a WITH stage.
+    #[test]
+    fn ql_ob_top_k_equals_full_sort_then_slice() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut fx = Fx::new();
+        for n in 0..120 {
+            let mut props = vec![("name", s(&format!("p{n:03}")))];
+            // Heavy ties on `a`, 1 in 5 missing; `b` breaks some ties.
+            if !xorshift(&mut state).is_multiple_of(5) {
+                props.push(("a", i((xorshift(&mut state) % 7) as i64)));
+            }
+            props.push(("b", i((xorshift(&mut state) % 3) as i64)));
+            fx.add("P", &format!("p{n:03}"), props);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let shapes = [
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a", ""),
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a DESC, n.b", ""),
+            ("MATCH (n:P) RETURN n.name, n.a AS a ORDER BY a DESC", ""),
+            (
+                "MATCH (n:P) RETURN n.name ORDER BY n.b + n.a DESC, n.name DESC",
+                "",
+            ),
+            (
+                "MATCH (n:P) WITH n ORDER BY n.a DESC, n.b",
+                " RETURN n.name",
+            ),
+        ];
+        for (head, tail) in shapes {
+            let full = names(&run(&v, &format!("{head}{tail}"), &params).unwrap());
+            assert_eq!(full.len(), 120);
+            for skip in [0usize, 1, 7, 119, 130] {
+                for limit in [0usize, 1, 2, 10, 50, 119, 120, 500] {
+                    let q = format!("{head} SKIP {skip} LIMIT {limit}{tail}");
+                    let got = names(&run(&v, &q, &params).unwrap());
+                    let want: Vec<String> = full.iter().skip(skip).take(limit).cloned().collect();
+                    assert_eq!(got, want, "{q}");
+                }
+            }
+            // LIMIT alone, and a LIMIT parameter.
+            let got = names(&run(&v, &format!("{head} LIMIT 10{tail}"), &params).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head}");
+            let mut with_param = BTreeMap::new();
+            with_param.insert("k".to_string(), i(10));
+            let got = names(&run(&v, &format!("{head} LIMIT $k{tail}"), &with_param).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head} (param)");
+        }
+    }
+
+    #[test]
+    fn order_by_null_is_largest_then_skip_limit() {
         let mut fx = Fx::new();
         fx.add("Person", "ada", vec![("age", i(30))]);
         fx.add("Person", "bob", vec![]); // missing age → None
@@ -4980,10 +7713,10 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc),
             vec![
+                vec![Some(s("bob")), None],
                 vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
                 vec![Some(s("cam")), Some(i(10))],
-                vec![Some(s("bob")), None],
             ]
         );
 
@@ -5010,8 +7743,8 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc_sl),
             vec![
+                vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
-                vec![Some(s("cam")), Some(i(10))],
             ]
         );
     }
@@ -5087,6 +7820,7 @@ LIMIT 10";
                 to: "b".into(),
                 to_label: None,
                 to_props: vec![],
+                distinct_from: vec![],
             },
             PlanOp::Project {
                 items: vec![RetItem {
@@ -5207,6 +7941,7 @@ LIMIT 10";
                     target: OrderTarget::Alias("nope".into()),
                     descending: false,
                 }],
+                visible_columns: None,
             }],
             vec![PlanOp::Filter {
                 expr: crate::cypher::ast::Expr::Cmp {
@@ -5467,10 +8202,10 @@ LIMIT 10";
 
             // Snapshot counter before executing the fused-shape query.
             let fires_before =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
             let bounded = run(&v, &bounded_q, &params).expect("fused bounded must not error");
             let fires_after =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
 
             // The planner must have emitted ScanLabel→Filter{Cmp} for this shape;
             // assert the fused arm actually executed (counter advanced).
@@ -5510,11 +8245,11 @@ LIMIT 10";
                 op_str, threshold, skip, limit
             );
             let fires_before_compound =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
             let compound_bounded =
                 run(&v, &compound_q, &params).expect("compound-AND bounded must not error");
             let fires_after_compound =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
 
             // Compound AND must NOT activate the fused arm.
             prop_assert_eq!(
@@ -6037,7 +8772,7 @@ LIMIT 10";
         let params = BTreeMap::new();
         let rs = run(&v, "MATCH (n:N) RETURN SUM(n.v)", &params).expect("SUM");
         assert_eq!(rs.columns(), &["SUM(n.v)".to_string()]);
-        // 10 + 20 = 30 (null skipped); integers sum to an integer (row 158)
+        // 10 + 20 = 30 (null skipped)
         assert_eq!(rs.row(0), &[Some(i(30))]);
 
         // All props null → result is null.
@@ -6318,7 +9053,7 @@ LIMIT 10";
         assert_eq!(rs.row(a2)[2], Some(i(5)), "(A,2) SUM must be 5");
 
         let b1 = find(&s("B"), &s("1")).expect("group (B,1) must exist");
-        assert_eq!(rs.row(b1)[2], Some(i(100)), "(B,1) SUM must be 100");
+        assert_eq!(rs.row(b1)[2], Some(i(100)), "(B,1) SUM must be 100.0");
         assert_eq!(rs.row(b1)[3], Some(f(100.0)), "(B,1) AVG must be 100.0");
     }
 
@@ -6739,6 +9474,7 @@ LIMIT 10";
             project_items: &project_items,
             params: &params,
             bound: 100,
+            op_edges: super::OpEdges::new(&[], &vars),
         };
         let ops = vec![PlanOp::VarExpand {
             from: "a".into(),
@@ -6746,8 +9482,12 @@ LIMIT 10";
             etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
+            to_label: None,
+            to_props: vec![],
             min: 1,
             max: 3,
+            trail_var: None,
+            distinct_from: vec![],
         }];
         let mut row = vec![None; vars.names.len()];
         let mut result = Vec::new();
@@ -6775,6 +9515,7 @@ LIMIT 10";
             project_items: &project_items,
             params: &params,
             bound: 100,
+            op_edges: super::OpEdges::new(&[], &vars),
         };
         let ops = vec![PlanOp::ShortestPath {
             from: "a".into(),
@@ -6783,6 +9524,8 @@ LIMIT 10";
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             max_hops: 5,
+            trail_var: None,
+            distinct_from: vec![],
         }];
         let mut row = vec![None; vars.names.len()];
         let mut result = Vec::new();
@@ -8297,6 +11040,42 @@ LIMIT 10";
         assert_eq!(rows_of(&rs), vec![vec![Some(s("alice"))]]);
     }
 
+    /// Ledger row 102: a key-anchored hop seeds from a point lookup, not a
+    /// label scan, and still returns the label scan's rows.
+    #[test]
+    fn key_anchored_hop_uses_scan_key_not_a_label_scan() {
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "a", vec![("score", Value::Int(1))]);
+        let b = fx.add("Person", "b", vec![("score", Value::Int(7))]);
+        let c = fx.add("Person", "c", vec![("score", Value::Int(2))]);
+        fx.edge("KNOWS", a, b, vec![]);
+        fx.edge("KNOWS", a, c, vec![]);
+        fx.edge("KNOWS", b, c, vec![]);
+        let mut params = BTreeMap::new();
+        params.insert("k".to_string(), s("a"));
+        let fires_before = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        let rs = run(
+            &fx.view(),
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst ORDER BY dst",
+            &params,
+        )
+        .unwrap();
+        let fires_after = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fires_after > fires_before,
+            "SCAN_KEY_FIRES must increment; before={fires_before} after={fires_after}"
+        );
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("b"))], vec![Some(s("c"))]]);
+        // The residual on the destination survives the fold.
+        let rs = run(
+            &fx.view(),
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k AND q.score > 5 RETURN key(q)",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("b"))]]);
+    }
+
     /// `WHERE n.key = $k` uses ScanKey.
     #[test]
     fn where_n_key_eq_param_uses_scan_key() {
@@ -8418,11 +11197,11 @@ LIMIT 10";
         let fx = assoc_graph();
         let err = run(
             &fx.view(),
-            "MATCH (n:Company) RETURN nodes(n)",
+            "MATCH (n:Company) RETURN nosuchfn(n)",
             &BTreeMap::new(),
         )
         .expect_err("unknown function must error");
-        assert!(err.contains("unknown function `nodes`"), "{err}");
+        assert!(err.contains("unknown function `nosuchfn`"), "{err}");
         assert!(
             err.contains("labels"),
             "error must list what is supported: {err}"
@@ -8496,20 +11275,22 @@ LIMIT 10";
             &fx.view(),
             "MATCH (t:Talent) WHERE t.key = 't1' \
              RETURN t.location[0] AS lat, t.location[1] AS lon, \
-                    t.location[-1] AS last, t.location[7] AS oob, t.status[0] AS notalist",
+                    t.location[-1] AS last, t.location[7] AS oob",
             &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
             rows_of(&rs),
-            vec![vec![
-                Some(f(40.71)),
-                Some(f(-74.01)),
-                Some(f(-74.01)),
-                None,
-                None
-            ]]
+            vec![vec![Some(f(40.71)), Some(f(-74.01)), Some(f(-74.01)), None]]
         );
+        // QL-VE: a subscript of a string was null and is a type error now.
+        let err = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.key = 't1' RETURN t.status[0] AS notalist",
+            &BTreeMap::new(),
+        )
+        .expect_err("a string cannot be indexed");
+        assert!(err.contains("a string cannot be indexed"), "{err}");
     }
 
     /// `n.key` filters, orders and matches — not only projects. Each of
@@ -8698,7 +11479,8 @@ LIMIT 10";
     }
 
     /// Comma-separated patterns and a run of separate MATCH clauses parse to
-    /// the same query.
+    /// the same patterns; only the clause boundary differs, which decides how
+    /// far relationship uniqueness reaches (QL-RU).
     #[test]
     fn comma_patterns_equal_separate_match_clauses() {
         let commas =
@@ -8706,7 +11488,11 @@ LIMIT 10";
         let clauses =
             parse(&lex("MATCH (a:A)-[:X]->(b:B) MATCH (a)-[:Y]->(b) RETURN a.key").unwrap())
                 .unwrap();
-        assert_eq!(commas.matches, clauses.matches);
+        assert!(commas.matches[1].continues_match);
+        assert!(!clauses.matches[1].continues_match);
+        let mut joined = commas.matches.clone();
+        joined[1].continues_match = false;
+        assert_eq!(joined, clauses.matches);
     }
 
     // ── Task 17 fix round 1 ──────────────────────────────────────────────
@@ -9036,6 +11822,1097 @@ LIMIT 10";
                 vec![Some(s("a1")), Some(s("b1"))],
                 vec![Some(s("a2")), Some(s("b1"))],
             ]
+        );
+    }
+
+    /// There is no null or list literal in the grammar: `n.nope` is a null
+    /// (missing property) and `$l` is the list [1, 2, 3].
+    fn eval_params() -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (
+                "l".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
+            ("empty".to_string(), Value::List(vec![])),
+            ("one".to_string(), Value::List(vec![Value::Int(1)])),
+            (
+                "m".to_string(),
+                Value::Map(BTreeMap::from([
+                    ("b".to_string(), Value::Int(2)),
+                    ("a".to_string(), Value::Int(1)),
+                ])),
+            ),
+        ])
+    }
+
+    /// Evaluate one expression through the full lex/parse/plan/execute path.
+    pub(super) fn eval(expr: &str) -> Option<Value> {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let rs = run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .unwrap_or_else(|e| panic!("`{expr}` failed: {e}"));
+        rs.get(0, "r").cloned()
+    }
+
+    pub(super) fn eval_err(expr: &str) -> String {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .expect_err("must fail")
+    }
+
+    #[test]
+    fn ql03a_string_functions_values() {
+        assert_eq!(eval("trim(\"  hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi\")"), Some(s("hi")));
+        assert_eq!(eval("rtrim(\"hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi  \")"), Some(s("hi  ")));
+        assert_eq!(eval("rtrim(\"  hi  \")"), Some(s("  hi")));
+        assert_eq!(eval("replace(\"abcabc\", \"b\", \"X\")"), Some(s("aXcaXc")));
+        assert_eq!(
+            eval("split(\"a,b,c\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(
+            eval("split(\"a,b\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b")]))
+        );
+        assert_eq!(
+            eval("split(\"abc\", \"\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(eval("left(\"hello\", 3)"), Some(s("hel")));
+        assert_eq!(eval("left(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("right(\"hello\", 3)"), Some(s("llo")));
+        assert_eq!(eval("right(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("substring(\"hello\", 1, 3)"), Some(s("ell")));
+        assert_eq!(eval("substring(\"hello\", 1)"), Some(s("ello")));
+        assert_eq!(eval("substring(\"hello\", 5)"), Some(s("")));
+        assert_eq!(eval("substring(\"hello\", 3, 99)"), Some(s("lo")));
+        assert_eq!(eval("left(\"h\u{e9}llo\", 2)"), Some(s("h\u{e9}")));
+        assert_eq!(eval("right(\"h\u{e9}llo\", 4)"), Some(s("\u{e9}llo")));
+        assert_eq!(eval("substring(\"h\u{e9}llo\", 1, 2)"), Some(s("\u{e9}l")));
+        assert_eq!(eval("left(\"abc\", 0)"), Some(s("")));
+        assert_eq!(eval("reverse(\"abc\")"), Some(s("cba")));
+        assert_eq!(
+            eval("reverse($l)"),
+            Some(Value::List(vec![
+                Value::Int(3),
+                Value::Int(2),
+                Value::Int(1)
+            ]))
+        );
+    }
+
+    #[test]
+    fn ql03a_string_functions_null_and_type_mismatch_are_null() {
+        for f in ["trim", "ltrim", "rtrim", "reverse"] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+        }
+        assert_eq!(eval("trim(42)"), None);
+        assert_eq!(eval("ltrim(42)"), None);
+        assert_eq!(eval("rtrim(42)"), None);
+        assert_eq!(eval("reverse(42)"), None);
+        assert_eq!(eval("replace(n.nope, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(42, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(\"a\", 1, \"b\")"), None);
+        assert_eq!(eval("split(n.nope, \",\")"), None);
+        assert_eq!(eval("split(42, \",\")"), None);
+        assert_eq!(eval("split(\"a\", 1)"), None);
+        assert_eq!(eval("left(n.nope, 1)"), None);
+        assert_eq!(eval("left(42, 1)"), None);
+        assert_eq!(eval("left(\"x\", -1)"), None);
+        assert_eq!(eval("left(\"x\", \"1\")"), None);
+        assert_eq!(eval("right(n.nope, 1)"), None);
+        assert_eq!(eval("right(42, 1)"), None);
+        assert_eq!(eval("right(\"x\", -1)"), None);
+        assert_eq!(eval("substring(n.nope, 1)"), None);
+        assert_eq!(eval("substring(42, 1)"), None);
+        assert_eq!(eval("substring(\"x\", 5, 1)"), None);
+        assert_eq!(eval("substring(\"x\", -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03a_string_functions_wrong_arity_errors_and_are_listed() {
+        assert!(eval_err("trim()").contains("trim() requires"));
+        assert!(eval_err("left(\"a\")").contains("left() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "trim",
+            "ltrim",
+            "rtrim",
+            "replace",
+            "split",
+            "left",
+            "right",
+            "substring",
+            "reverse",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    fn float_of(expr: &str) -> f64 {
+        match eval(expr) {
+            Some(Value::Float(f)) => f,
+            other => panic!("`{expr}` gave {other:?}, want a float"),
+        }
+    }
+
+    #[test]
+    fn ql03b_math_values() {
+        assert_eq!(eval("floor(2.9)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(2.0)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(-2.1)"), Some(Value::Int(-3)));
+        assert_eq!(eval("floor(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("ceil(2.1)"), Some(Value::Int(3)));
+        assert_eq!(eval("ceil(-2.9)"), Some(Value::Int(-2)));
+        assert_eq!(eval("ceil(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("sign(-5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0)"), Some(Value::Int(0)));
+        assert_eq!(eval("sign(3)"), Some(Value::Int(1)));
+        assert_eq!(eval("sign(-2.5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0.0)"), Some(Value::Int(0)));
+        assert_eq!(float_of("sqrt(4.0)"), 2.0);
+        assert_eq!(float_of("sqrt(9)"), 3.0);
+        assert_eq!(float_of("log(1.0)"), 0.0);
+        assert_eq!(float_of("log10(100.0)"), 2.0);
+        assert_eq!(float_of("exp(0.0)"), 1.0);
+        assert_eq!(float_of("sin(0.0)"), 0.0);
+        assert_eq!(float_of("cos(0.0)"), 1.0);
+        assert_eq!(float_of("tan(0.0)"), 0.0);
+        assert_eq!(float_of("atan(0.0)"), 0.0);
+        assert!((float_of("atan2(1.0, 1.0)") - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+        assert!((float_of("pi()") - std::f64::consts::PI).abs() < 1e-15);
+        assert!((float_of("e()") - std::f64::consts::E).abs() < 1e-15);
+    }
+
+    #[test]
+    fn ql03b_math_domain_errors_are_null() {
+        assert_eq!(eval("sqrt(-1.0)"), None);
+        assert_eq!(eval("log(0.0)"), None);
+        assert_eq!(eval("log(-1.0)"), None);
+        assert_eq!(eval("log10(0.0)"), None);
+        assert_eq!(eval("log10(-1)"), None);
+    }
+
+    #[test]
+    fn ql03b_math_null_and_type_mismatch_are_null() {
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}(\"x\")")), None, "{f}(\"x\")");
+        }
+        assert_eq!(eval("atan2(n.nope, 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, n.nope)"), None);
+        assert_eq!(eval("atan2(\"x\", 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, \"x\")"), None);
+    }
+
+    #[test]
+    fn ql03b_rand_is_a_float_in_unit_interval() {
+        for _ in 0..200 {
+            let r = float_of("rand()");
+            assert!((0.0..1.0).contains(&r), "rand() gave {r}");
+        }
+    }
+
+    #[test]
+    fn ql03b_zero_arg_functions_reject_arguments_and_names_are_listed() {
+        assert!(eval_err("pi(1)").contains("pi() requires"));
+        assert!(eval_err("rand(1)").contains("rand() requires"));
+        assert!(eval_err("atan2(1.0)").contains("atan2() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+            "atan2", "pi", "e", "rand",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    #[test]
+    fn ql03b_percent_and_caret_operators() {
+        assert_eq!(eval("7 % 3"), Some(Value::Int(1)));
+        assert_eq!(eval("7.5 % 2"), Some(Value::Float(1.5)));
+        assert_eq!(eval("2 ^ 10"), Some(Value::Float(1024.0)));
+        assert_eq!(eval("n.nope % 3"), None);
+        assert_eq!(eval("2 ^ n.nope"), None);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is the brief's literal, not an attempt at pi
+    fn ql03d_conversion_values() {
+        assert_eq!(eval("toBoolean(\"true\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBoolean(\"TRUE\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(true)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(0)"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toIntegerOrNull(\"42\")"), Some(Value::Int(42)));
+        assert_eq!(eval("toIntegerOrNull(7)"), Some(Value::Int(7)));
+        assert_eq!(eval("toIntegerOrNull(3.9)"), Some(Value::Int(3)));
+        assert_eq!(eval("toFloatOrNull(\"3.14\")"), Some(Value::Float(3.14)));
+        assert_eq!(eval("toFloatOrNull(2)"), Some(Value::Float(2.0)));
+        assert_eq!(eval("toFloatOrNull(2.5)"), Some(Value::Float(2.5)));
+    }
+
+    #[test]
+    fn ql03d_conversion_failures_null_and_type_mismatch_are_null() {
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}($l)")), None, "{f}(list)");
+        }
+        assert_eq!(eval("toBoolean(\"maybe\")"), None);
+        assert_eq!(eval("toBooleanOrNull(\"x\")"), None);
+        assert_eq!(eval("toBooleanOrNull(1.5)"), None);
+        assert_eq!(eval("toIntegerOrNull(\"abc\")"), None);
+        assert_eq!(eval("toIntegerOrNull(true)"), None);
+        assert_eq!(eval("toFloatOrNull(\"x\")"), None);
+        for bad in ["NaN", "inf", "infinity", "-inf"] {
+            assert_eq!(eval(&format!("toFloatOrNull(\"{bad}\")")), None, "{bad}");
+            assert_eq!(eval(&format!("toFloat(\"{bad}\")")), None, "toFloat {bad}");
+        }
+        assert_eq!(eval("toFloatOrNull(true)"), None);
+    }
+
+    #[test]
+    fn ql03d_arity_errors_and_names_are_listed() {
+        assert!(eval_err("toBoolean()").contains("toBoolean() requires"));
+        assert!(eval_err("toFloatOrNull(1, 2)").contains("toFloatOrNull() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    fn int_list(items: &[i64]) -> Option<Value> {
+        Some(Value::List(items.iter().map(|n| Value::Int(*n)).collect()))
+    }
+
+    #[test]
+    fn ql03c_head_tail_last() {
+        assert_eq!(eval("head($l)"), Some(i(1)));
+        assert_eq!(eval("head($empty)"), None);
+        assert_eq!(eval("head(n.nope)"), None);
+        assert_eq!(eval("tail($l)"), int_list(&[2, 3]));
+        assert_eq!(eval("tail($one)"), int_list(&[]));
+        assert_eq!(eval("tail($empty)"), int_list(&[]));
+        assert_eq!(eval("tail(n.nope)"), None);
+        assert_eq!(eval("last($l)"), Some(i(3)));
+        assert_eq!(eval("last($empty)"), None);
+        assert_eq!(eval("last(n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03c_range() {
+        assert_eq!(eval("range(1, 5)"), int_list(&[1, 2, 3, 4, 5]));
+        assert_eq!(eval("range(1, 5, 2)"), int_list(&[1, 3, 5]));
+        assert_eq!(eval("range(5, 1, -1)"), int_list(&[5, 4, 3, 2, 1]));
+        assert_eq!(eval("range(1, 6, 2)"), int_list(&[1, 3, 5]));
+        assert_eq!(eval("range(3, 3)"), int_list(&[3]));
+        assert_eq!(eval("range(5, 1)"), int_list(&[]));
+        assert_eq!(eval("range(1, 5, -1)"), int_list(&[]));
+        assert_eq!(eval("range(0, -4, -2)"), int_list(&[0, -2, -4]));
+        let msg = eval_err("range(1, 1, 0)");
+        assert!(msg.contains("step must be non-zero"), "{msg}");
+        let msg = eval_err("range(0, 9223372036854775807)");
+        assert!(msg.contains("range()"), "{msg}");
+        // The ends of the i64 range do not overflow.
+        assert_eq!(
+            eval("range(9223372036854775806, 9223372036854775807)"),
+            int_list(&[i64::MAX - 1, i64::MAX])
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_values() {
+        assert_eq!(eval("keys($m)"), Some(Value::List(vec![s("a"), s("b")])));
+        assert_eq!(eval("keys($empty)"), None);
+        assert_eq!(eval("keys(n.nope)"), None);
+        assert_eq!(
+            eval("properties($m)"),
+            Some(Value::Map(BTreeMap::from([
+                ("a".to_string(), i(1)),
+                ("b".to_string(), i(2)),
+            ])))
+        );
+        assert_eq!(eval("properties(n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03c_null_and_type_mismatch_give_null() {
+        for expr in [
+            "head(42)",
+            "head(\"abc\")",
+            "tail(42)",
+            "last(42)",
+            "last($m)",
+            "range(n.nope, 5)",
+            "range(1, n.nope)",
+            "range(1, 5, n.nope)",
+            "keys(42)",
+            "keys(\"abc\")",
+        ] {
+            assert_eq!(eval(expr), None, "{expr}");
+        }
+        // QL-VE: these were null and are type errors now.
+        for (expr, want) in [
+            (
+                "range(\"a\", 5)",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "range(1, 2.5)",
+                "range() expects integer arguments, got a float",
+            ),
+            (
+                "range(1, 5, \"2\")",
+                "range() expects integer arguments, got a string",
+            ),
+            (
+                "properties($l)",
+                "properties() expects a node, a relationship or a map, got a list",
+            ),
+        ] {
+            let err = eval_err(expr);
+            assert!(err.contains(want), "{expr}: {err}");
+        }
+        // A literal argument is refused before the query runs.
+        assert!(eval_err("properties(42)").starts_with("InvalidArgumentType: "));
+    }
+
+    #[test]
+    fn ql03c_wrong_arity_errors_and_names_are_listed() {
+        assert!(eval_err("head()").contains("head() requires"));
+        assert!(eval_err("tail($l, 1)").contains("tail() requires"));
+        assert!(eval_err("last()").contains("last() requires"));
+        assert!(eval_err("range(1)").contains("range() requires"));
+        assert!(eval_err("range(1, 2, 3, 4)").contains("range() requires"));
+        assert!(eval_err("keys()").contains("keys() requires"));
+        assert!(eval_err("properties(n, n)").contains("properties() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in ["head", "tail", "last", "range", "keys", "properties"] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    fn props_fixture() -> Fx {
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "P",
+            "a",
+            vec![
+                ("name", s("x")),
+                ("age", i(30)),
+                ("embedding", Value::List(vec![f(0.5), f(1.5)])),
+                ("tags", Value::List(vec![s("t"), i(1)])),
+            ],
+        );
+        let b = fx.add("P", "b", vec![("name", s("y"))]);
+        fx.edge(
+            "KNOWS",
+            a,
+            b,
+            vec![("since", i(2020)), ("vec", Value::List(vec![f(1.0)]))],
+        );
+        fx
+    }
+
+    fn run_one(view: &GraphView, query: &str) -> Vec<Vec<Option<Value>>> {
+        rows_of(&run(view, query, &BTreeMap::new()).unwrap_or_else(|e| panic!("{query}: {e}")))
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_a_node() {
+        let fx = props_fixture();
+        let view = fx.view();
+        // Every property shows, a vector-valued one like any other list.
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) WHERE n.name = \"x\" RETURN keys(n)"),
+            vec![vec![Some(Value::List(vec![
+                s("age"),
+                s("embedding"),
+                s("name"),
+                s("tags")
+            ]))]]
+        );
+        assert_eq!(
+            run_one(
+                &view,
+                "MATCH (n:P) WHERE n.name = \"x\" RETURN properties(n)"
+            ),
+            vec![vec![Some(Value::Map(BTreeMap::from([
+                ("age".to_string(), i(30)),
+                ("embedding".to_string(), Value::List(vec![f(0.5), f(1.5)])),
+                ("name".to_string(), s("x")),
+                ("tags".to_string(), Value::List(vec![s("t"), i(1)])),
+            ])))]]
+        );
+    }
+
+    #[test]
+    fn ql03c_an_all_float_list_appears_in_keys_and_properties() {
+        let mut fx = Fx::new();
+        fx.add(
+            "P",
+            "a",
+            vec![("coords", Value::List(vec![f(1.5), f(2.5)]))],
+        );
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN keys(n), properties(n), n.coords"),
+            vec![vec![
+                Some(Value::List(vec![s("coords")])),
+                Some(Value::Map(BTreeMap::from([(
+                    "coords".to_string(),
+                    Value::List(vec![f(1.5), f(2.5)])
+                )]))),
+                Some(Value::List(vec![f(1.5), f(2.5)])),
+            ]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_a_relationship() {
+        let fx = props_fixture();
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
+            vec![vec![Some(Value::List(vec![s("since"), s("vec")]))]]
+        );
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN properties(r)"),
+            vec![vec![Some(Value::Map(BTreeMap::from([
+                ("since".to_string(), i(2020)),
+                ("vec".to_string(), Value::List(vec![f(1.0)])),
+            ])))]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_of_an_unmatched_optional_binding_is_null() {
+        let fx = props_fixture();
+        let view = fx.view();
+        assert_eq!(
+            run_one(
+                &view,
+                "MATCH (a:P) WHERE a.name = \"y\" OPTIONAL MATCH (a)-[r:KNOWS]->(z) \
+                 RETURN keys(z), properties(z), keys(r)"
+            ),
+            vec![vec![None, None, None]]
+        );
+    }
+
+    #[test]
+    fn ql03c_node_with_no_properties_has_empty_keys() {
+        let mut fx = Fx::new();
+        fx.add("P", "bare", vec![]);
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN keys(n), properties(n)"),
+            vec![vec![
+                Some(Value::List(vec![])),
+                Some(Value::Map(BTreeMap::new()))
+            ]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_respect_the_visibility_mask() {
+        let fx = props_fixture();
+        let visible: crate::visible::VisibleSet = [fx.ids.get("b").unwrap()].into_iter().collect();
+        let view = GraphView {
+            mask: Some(&visible),
+            ..fx.view()
+        };
+        // Only `b` is visible: `a`'s keys cannot be reached by any route.
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN n.name, keys(n)"),
+            vec![vec![Some(s("y")), Some(Value::List(vec![s("name")]))]]
+        );
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
+            Vec::<Vec<Option<Value>>>::new()
+        );
+    }
+
+    // ── QL-16: list and map literals ─────────────────────────────────────────
+
+    fn map_of(entries: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    }
+
+    fn list_of(items: Vec<Value>) -> Value {
+        Value::List(items)
+    }
+
+    #[test]
+    fn ql16_list_literal_values() {
+        assert_eq!(
+            eval("[1, 'a', 2.5, [1, 2], {k: 1}]"),
+            Some(list_of(vec![
+                i(1),
+                s("a"),
+                f(2.5),
+                list_of(vec![i(1), i(2)]),
+                map_of(vec![("k", i(1))]),
+            ]))
+        );
+        assert_eq!(eval("[]"), Some(list_of(vec![])));
+        assert_eq!(eval("[[]]"), Some(list_of(vec![list_of(vec![])])));
+        assert_eq!(
+            eval("[true, false]"),
+            Some(list_of(vec![Value::Bool(true), Value::Bool(false)]))
+        );
+    }
+
+    #[test]
+    fn ql16_map_literal_values() {
+        assert_eq!(
+            eval("{a: 1, b: [1, 2], `c d`: 'x'}"),
+            Some(map_of(vec![
+                ("a", i(1)),
+                ("b", list_of(vec![i(1), i(2)])),
+                ("c d", s("x")),
+            ]))
+        );
+        assert_eq!(eval("{}"), Some(map_of(vec![])));
+        assert_eq!(
+            eval("{a: {b: {c: 1}}}"),
+            Some(map_of(vec![(
+                "a",
+                map_of(vec![("b", map_of(vec![("c", i(1))]))])
+            )]))
+        );
+    }
+
+    #[test]
+    fn ql16_literals_as_function_arguments() {
+        assert_eq!(eval("head([1, 2, 3])"), Some(i(1)));
+        assert_eq!(eval("last([1, 2, 3])"), Some(i(3)));
+        assert_eq!(eval("tail([1, 2, 3])"), int_list(&[2, 3]));
+        assert_eq!(eval("size([1, 2, 3])"), Some(i(3)));
+        assert_eq!(eval("size([])"), Some(i(0)));
+        assert_eq!(
+            eval("keys({a: 1, b: 2})"),
+            Some(list_of(vec![s("a"), s("b")]))
+        );
+        assert_eq!(eval("properties({a: 1})"), Some(map_of(vec![("a", i(1))])));
+        assert_eq!(eval("range(0, 2)"), eval("[0, 1, 2]"));
+        assert_eq!(eval("head([[1, 2], [3]])"), int_list(&[1, 2]));
+    }
+
+    #[test]
+    fn ql16_literal_elements_are_expressions() {
+        // `n.x` is the fixture's bound node; it has no `x`, so use arithmetic,
+        // functions and parameters as the elements.
+        assert_eq!(
+            eval("[1 + 2, toUpper('a'), head($l), size($l) * 2]"),
+            Some(list_of(vec![i(3), s("A"), i(1), i(6)]))
+        );
+        assert_eq!(
+            eval("{sum: 1 + 2, up: toUpper('a'), l: $l}"),
+            Some(map_of(vec![
+                ("sum", i(3)),
+                ("up", s("A")),
+                ("l", list_of(vec![i(1), i(2), i(3)])),
+            ]))
+        );
+        // A literal can be subscripted.
+        assert_eq!(eval("[10, 20, 30][1]"), Some(i(20)));
+        assert_eq!(eval("[10, 20, 30][-1]"), Some(i(30)));
+    }
+
+    #[test]
+    fn ql16_literal_elements_read_bound_properties() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(5))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN [n.x, n.x + 1, toUpper('a')] AS l, {v: n.x} AS m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(5), i(6), s("A")])));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("v", i(5))])));
+    }
+
+    #[test]
+    fn ql17_null_inside_a_literal_is_kept() {
+        // Replaces QL-16's refusal: a missing property is a null element.
+        assert_eq!(eval("[1, n.nope]"), Some(list_of(vec![i(1), Value::Null])));
+        assert_eq!(eval("{a: n.nope}"), Some(map_of(vec![("a", Value::Null)])));
+    }
+
+    fn five_node_fixture() -> Fx {
+        let mut fx = Fx::new();
+        for n in 1..=5 {
+            fx.add("L", &format!("n{n}"), vec![("x", i(n))]);
+        }
+        fx
+    }
+
+    #[test]
+    fn ql16_in_a_literal_list_filters_rows() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [1, 3] RETURN n.x AS x ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(3))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [1 + 1, 2 * 2] RETURN n.x AS x ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(2)), Some(i(4))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [] RETURN n.x AS x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 0);
+    }
+
+    #[test]
+    fn ql16_unwind_a_literal_list() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [1, 2, 3] AS x RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2)), Some(i(3))]);
+        // Elements that are not plain literals, and map elements.
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [1 + 1, 2 * 3] AS x RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(2)), Some(i(6))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [{a: 1}, {a: 2}] AS m RETURN m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&rs, "m"),
+            vec![
+                Some(map_of(vec![("a", i(1))])),
+                Some(map_of(vec![("a", i(2))]))
+            ]
+        );
+    }
+
+    #[test]
+    fn ql16_unwind_a_list_reading_a_binding() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 2 UNWIND [n.x, n.x + 1] AS y RETURN y",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "y"), vec![Some(i(2)), Some(i(3))]);
+    }
+
+    #[test]
+    fn ql16_literals_in_with_order_by_and_case() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 WITH [n.x, 9] AS l RETURN head(l) AS h, l",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "h"), vec![Some(i(1))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN n.x AS x, CASE WHEN n.x > 3 THEN [1] ELSE [] END AS c ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "c")[4], Some(list_of(vec![i(1)])));
+        assert_eq!(col(&rs, "c")[0], Some(list_of(vec![])));
+    }
+
+    #[test]
+    fn ql16_literal_parameters_are_collected() {
+        // A `$p` read only inside a literal must still be reported missing.
+        let msg = eval_err("[$nope]");
+        assert!(msg.contains("nope"), "{msg}");
+    }
+
+    // ── QL-17: null literal, nulls in lists and maps, MATCH-less queries ─────
+
+    /// Run a whole query against an empty graph.
+    fn run_empty(src: &str) -> ResultSet {
+        let fx = Fx::new();
+        run(&fx.view(), src, &BTreeMap::new()).unwrap_or_else(|e| panic!("`{src}` failed: {e}"))
+    }
+
+    #[test]
+    fn ql17_null_literal() {
+        assert_eq!(eval("null"), None);
+        assert_eq!(eval("NULL"), None);
+        assert_eq!(eval("Null"), None);
+        let rs = run_empty("RETURN null AS v");
+        assert_eq!(rows_of(&rs), vec![vec![None]]);
+    }
+
+    #[test]
+    fn ql17_null_as_a_list_element_and_map_value() {
+        assert_eq!(
+            eval("[1, null, 'a']"),
+            Some(list_of(vec![i(1), Value::Null, s("a")]))
+        );
+        assert_eq!(
+            eval("{a: null, b: 1}"),
+            Some(map_of(vec![("a", Value::Null), ("b", i(1))]))
+        );
+        // A non-constant list keeps its null too.
+        assert_eq!(
+            eval("[1 + 1, null]"),
+            Some(list_of(vec![i(2), Value::Null]))
+        );
+        assert_eq!(
+            eval("[[null]]"),
+            Some(list_of(vec![list_of(vec![Value::Null])]))
+        );
+    }
+
+    #[test]
+    fn ql17_list_functions_see_null_elements() {
+        assert_eq!(eval("size([null])"), Some(i(1)));
+        assert_eq!(eval("size([null, null])"), Some(i(2)));
+        assert_eq!(eval("head([null, 1])"), None);
+        assert_eq!(eval("last([1, null])"), None);
+        assert_eq!(eval("tail([null, 1])"), int_list(&[1]));
+        assert_eq!(eval("[null, 1][0]"), None);
+        assert_eq!(eval("[null, 1][1]"), Some(i(1)));
+        assert_eq!(eval("keys({a: null})"), Some(list_of(vec![s("a")])));
+        assert_eq!(
+            eval("properties({a: null})"),
+            Some(map_of(vec![("a", Value::Null)]))
+        );
+    }
+
+    #[test]
+    fn ql17_keys_of_a_map_literal_are_sorted() {
+        // `Value::Map` is a BTreeMap: keys come back in key order, not in the
+        // order the literal wrote them.
+        assert_eq!(
+            eval("keys({b: 1, a: 2})"),
+            Some(list_of(vec![s("a"), s("b")]))
+        );
+    }
+
+    #[test]
+    fn ql17_null_in_null_out_still_holds() {
+        for expr in [
+            "null + 1",
+            "1 - null",
+            "toUpper(null)",
+            "size(null)",
+            "head(null)",
+            "abs(null)",
+            "coalesce(null, null)",
+            "null[0]",
+            "[1, 2][null]",
+        ] {
+            assert_eq!(eval(expr), None, "{expr}");
+        }
+        assert_eq!(eval("coalesce(null, 2)"), Some(i(2)));
+    }
+
+    #[test]
+    fn ql17_is_null_on_literals_and_elements() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let count = |src: &str| run(&fx.view(), src, &BTreeMap::new()).unwrap().len();
+        assert_eq!(count("MATCH (n:N) WHERE null IS NULL RETURN n"), 1);
+        assert_eq!(count("MATCH (n:N) WHERE null IS NOT NULL RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE [null, 1][0] IS NULL RETURN n"), 1);
+        assert_eq!(
+            count("MATCH (n:N) WHERE [null, 1][1] IS NOT NULL RETURN n"),
+            1
+        );
+        assert_eq!(count("MATCH (n:N) WHERE head([null]) IS NULL RETURN n"), 1);
+        // Three-valued comparison: null = null is null, which WHERE drops.
+        assert_eq!(count("MATCH (n:N) WHERE null = null RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE null <> null RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE 1 IN [null, 1] RETURN n"), 1);
+        assert_eq!(count("MATCH (n:N) WHERE 2 IN [null, 1] RETURN n"), 0);
+    }
+
+    #[test]
+    fn ql17_missing_property_inside_a_returned_list() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(5))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN [n.x, n.missing] AS l",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(5), Value::Null])));
+    }
+
+    #[test]
+    fn ql17_unwind_binds_a_null_element_to_null() {
+        let rs = run_empty("UNWIND [1, null, 3] AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), None, Some(i(3))]);
+        let rs = run_empty("UNWIND [1, null] AS x WITH x WHERE x IS NULL RETURN x");
+        assert_eq!(rs.len(), 1);
+        let rs = run_empty("UNWIND null AS x RETURN x");
+        assert_eq!(rs.len(), 0);
+    }
+
+    #[test]
+    fn ql17_queries_without_match() {
+        let rs = run_empty("RETURN 1 + 1 AS x");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(2))]]);
+        let rs = run_empty("UNWIND [1, 2, 3] AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2)), Some(i(3))]);
+        let rs = run_empty("WITH 1 AS a RETURN a");
+        assert_eq!(col(&rs, "a"), vec![Some(i(1))]);
+        let rs = run_empty("UNWIND [] AS x RETURN x");
+        assert_eq!(rs.len(), 0);
+        let rs = run_empty("RETURN [1, null] AS l, {a: null} AS m");
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(1), Value::Null])));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("a", Value::Null)])));
+    }
+
+    #[test]
+    fn ql17_match_less_queries_compose() {
+        let rs = run_empty("UNWIND [3, 1, 2] AS x RETURN x ORDER BY x DESC LIMIT 2");
+        assert_eq!(col(&rs, "x"), vec![Some(i(3)), Some(i(2))]);
+        // count(x) skips the null element; count(*) does not.
+        let rs = run_empty("UNWIND [1, null, 3] AS x RETURN count(*) AS c, count(x) AS n");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(3)), Some(i(2))]]);
+        let rs = run_empty("RETURN count(*) AS c");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(1))]]);
+        let rs = run_empty("UNWIND [1, 2, 2] AS x RETURN DISTINCT x");
+        assert_eq!(rs.len(), 2);
+        let rs = run_empty("WITH [1, 2] AS l UNWIND l AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2))]);
+        let rs = run_empty("RETURN 1 AS x LIMIT 1");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1))]);
+        let rs = run_empty("RETURN 1 AS x SKIP 1");
+        assert_eq!(rs.len(), 0);
+        // A MATCH-less query can still read the graph after a WITH.
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(7))]);
+        let rs = run(
+            &fx.view(),
+            "WITH 7 AS v MATCH (n:L) WHERE n.x = v RETURN n.x AS x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(7))]);
+    }
+
+    #[test]
+    fn ql17_a_match_less_query_ignores_the_graph() {
+        // One row, not one row per node.
+        let mut fx = Fx::new();
+        for n in 0..5 {
+            fx.add("L", &format!("n{n}"), vec![]);
+        }
+        let rs = run(&fx.view(), "RETURN 1 AS x", &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1);
+    }
+
+    #[test]
+    fn ql17_null_cannot_name_a_variable() {
+        for src in [
+            "MATCH (null:L) RETURN 1 AS x",
+            "UNWIND [1] AS null RETURN 1 AS x",
+            "RETURN 1 AS null",
+        ] {
+            let err = parse(&lex(src).unwrap()).expect_err(src);
+            assert!(err.contains("null literal"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn ql17_null_as_a_property_name_still_works() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("null", i(1))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN n.null AS a, n.`null` AS b, {`null`: n.null} AS m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "a"), Some(&i(1)));
+        assert_eq!(rs.get(0, "b"), Some(&i(1)));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("null", i(1))])));
+    }
+
+    // ── QL-17 fix round 1: comparisons against null are three-valued ────────
+
+    /// Keys a WHERE keeps, through the staged path, the bounded (fused
+    /// scan+filter) path and an indexed view; all three must agree.
+    fn where_keys(
+        fx: &Fx,
+        pi: &core_storage::property_index::PropertyIndex,
+        w: &str,
+    ) -> Vec<String> {
+        let keys = |rs: ResultSet| {
+            let mut k: Vec<String> = col(&rs, "k")
+                .into_iter()
+                .map(|v| match v {
+                    Some(Value::Str(s)) => s,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            k.sort();
+            k
+        };
+        let p = BTreeMap::new();
+        let staged = keys(
+            run(
+                &fx.view(),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k"),
+                &p,
+            )
+            .unwrap(),
+        );
+        let bounded = keys(
+            run(
+                &fx.view(),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k LIMIT 100"),
+                &p,
+            )
+            .unwrap(),
+        );
+        let indexed = keys(
+            run(
+                &fx.view_indexed(pi),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k LIMIT 100"),
+                &p,
+            )
+            .unwrap(),
+        );
+        assert_eq!(staged, bounded, "LIMIT changed the answer for `{w}`");
+        assert_eq!(staged, indexed, "an index changed the answer for `{w}`");
+        staged
+    }
+
+    #[test]
+    fn ql17_comparisons_with_null_agree_with_and_without_limit() {
+        use core_storage::property_index::PropertyIndex;
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "L",
+            "a",
+            vec![("x", i(1)), ("tags", list_of(vec![i(1), i(2)]))],
+        );
+        let b = fx.add("L", "b", vec![("x", i(2))]);
+        fx.add("L", "c", vec![]);
+        let mut pi = PropertyIndex::new();
+        pi.enable("L", "x");
+        pi.set("L", "x", a, &i(1));
+        pi.set("L", "x", b, &i(2));
+
+        let none: Vec<String> = vec![];
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            // A null operand: every comparison is null, so the row is dropped.
+            ("n.x = null", none.clone()),
+            ("n.x <> null", none.clone()),
+            ("null <> n.x", none.clone()),
+            ("n.x < null", none.clone()),
+            ("n.x >= null", none.clone()),
+            ("null = null", none.clone()),
+            // IN: a null element never matches; a real one still does.
+            ("n.x IN [null]", none.clone()),
+            ("n.x IN [1, null]", k(&["a"])),
+            ("null IN [1, 2]", none.clone()),
+            ("n.x IS NULL", k(&["c"])),
+            ("n.x IS NOT NULL", k(&["a", "b"])),
+            ("[n.x, null][1] IS NULL", k(&["a", "b", "c"])),
+            // Ordinary comparisons are unchanged.
+            ("n.x = 1", k(&["a"])),
+            ("n.x <> 1", k(&["b"])),
+            ("n.x >= 2", k(&["b"])),
+            // A null element and a missing property agree.
+            ("[n.x] = [1]", k(&["a"])),
+            ("[n.x] <> [1]", k(&["b"])),
+            // List equality is three-valued.
+            ("[n.x, null] = [1, null]", none.clone()),
+            ("[n.x, null] <> [2, null]", k(&["a"])),
+            ("[1, null] <> [1, null]", none.clone()),
+            ("[1, null] = [1, null]", none.clone()),
+            ("[1, null] <> [2, null]", k(&["a", "b", "c"])),
+            ("[1, null] <> [1]", k(&["a", "b", "c"])),
+            ("{a: null} = {a: null}", none.clone()),
+            ("{a: null} <> {b: null}", k(&["a", "b", "c"])),
+            ("n.tags = [1, null]", none.clone()),
+            ("n.tags <> [1, null]", none.clone()),
+            ("n.tags <> [3, null]", k(&["a"])),
+            ("n.tags IN [[1, null]]", none.clone()),
+        ];
+        for (w, want) in cases {
+            assert_eq!(where_keys(&fx, &pi, w), want, "`{w}`");
+        }
+    }
+
+    #[test]
+    fn ql17_list_equality_in_a_write_return_is_three_valued() {
+        // The review's examples, through RETURN with CASE (the same eval_cmp).
+        assert_eq!(
+            eval("CASE WHEN [1, null] = [1, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] <> [1, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] <> [2, null] THEN 't' ELSE 'f' END"),
+            Some(s("t"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] = [2, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
         );
     }
 }

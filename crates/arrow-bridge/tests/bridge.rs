@@ -200,3 +200,96 @@ fn empty_result_set_preserves_schema() {
     assert_eq!(ipc.schema().field(0).data_type(), &DataType::Utf8);
     assert_eq!(ipc.schema().field(1).data_type(), &DataType::Utf8);
 }
+
+/// Until typed Arrow columns exist, format-V11 values are a Utf8 column of
+/// their ISO 8601 / base64 text — never a panic.
+#[test]
+fn v11_values_are_utf8_text() {
+    let mut rs = ResultSet::new(vec!["v".into()]);
+    for v in [
+        Value::Date(19_737),
+        Value::LocalDateTime(1_705_322_096_789_012),
+        Value::DateTime {
+            micros_utc: 1_705_302_296_789_012,
+            offset_seconds: 19_800,
+        },
+        Value::Duration {
+            months: 14,
+            days: 3,
+            nanos: 14_706_789_000_000,
+        },
+        Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+    ] {
+        rs.push_row(vec![cell(v)]);
+    }
+    let batch = to_record_batch(&rs).unwrap();
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(
+        got,
+        [
+            "2024-01-15",
+            "2024-01-15T12:34:56.789012",
+            "2024-01-15T12:34:56.789012+05:30",
+            "P1Y2M3DT4H5M6.789S",
+            "3q2+7w==",
+        ]
+    );
+}
+
+/// A null element inside a list (or a null map value) renders as `null` in
+/// the list's canonical text; the cell itself is not null.
+#[test]
+fn null_list_element_renders_as_null() {
+    let mut rs = ResultSet::new(vec!["l".into(), "m".into()]);
+    rs.push_row(vec![
+        cell(Value::List(vec![Value::Int(1), Value::Null])),
+        cell(Value::Map(
+            [("a".to_string(), Value::Null)].into_iter().collect(),
+        )),
+    ]);
+    let batch = to_record_batch(&rs).unwrap();
+    let l = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(!l.is_null(0));
+    assert_eq!(l.value(0), "[1, null]");
+    let m = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(m.value(0), "{a: null}");
+}
+
+/// A `Value::Null` cell is an Arrow null, not the text "null", and does not
+/// change the column's type: an Int column stays Int64.
+#[test]
+fn a_null_value_cell_is_an_arrow_null() {
+    let mut rs = ResultSet::new(vec!["n".into()]);
+    rs.push_row(vec![cell(Value::Int(1))]);
+    rs.push_row(vec![cell(Value::Null)]);
+    rs.push_row(vec![None]);
+    let batch = to_record_batch(&rs).unwrap();
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(col.value(0), 1);
+    assert!(col.is_null(1));
+    assert!(col.is_null(2));
+    // And through the IPC stream.
+    let bytes = to_ipc_bytes(&rs).unwrap();
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
+    let back = reader.next().unwrap().unwrap();
+    assert_eq!(back.column(0).null_count(), 2);
+}

@@ -67,3 +67,31 @@ writer, and only ~2.3 µs of its own work per read, so the two added `stat` call
 (~2.7 µs per read) are most of what is measured. The contended rows are
 dominated by the writer's fsyncs and absorb the same cost — `16r1w`'s delta sits
 inside the base's own 69.2–73.3 ms run-to-run spread.
+
+## Cypher query shapes (PF-02a)
+
+**PROVISIONAL.** Measured on a heavily loaded machine (parallel builds running); the 0.10
+release gate re-measures these on a quiet machine. Not comparable to the table above.
+
+**Machine:** Apple M4 Pro (12 cores), macOS 24.6 (Darwin), arm64
+**Date:** 2026-10-20
+**Rust:** default toolchain, release build
+**Harness:** `cargo bench -p core-bench --bench engine -- bench_query` (criterion 0.8.2, sample_size=12)
+
+Dataset: the 10k dataset above (`bench_db(10_000, 0xA5A5_5A5A_C0DE_4B1D)` rows), no rules, plus a
+seeded `KNOWS` ring (each person knows the next three) and a numeric `score` on every person,
+because the shared dataset carries neither. `$k` is one person key drawn once from the seed.
+Value is the median of five full runs of each bench's criterion point estimate.
+
+| Bench | Median of 5 runs | Query |
+|---|---|---|
+| `bench_query_point_key` | 2.69 µs | `MATCH (n) WHERE key(n) = $k RETURN n` |
+| `bench_query_key_1hop` | 4.89 µs | `MATCH (n:Person)-[:KNOWS]->(m) WHERE key(n) = $k RETURN m` |
+| `bench_query_key_2hop` | 9.45 µs | `MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE key(a) = $k RETURN c` |
+| `bench_query_label_agg` | 145 µs | `MATCH (n:Person) RETURN count(n)` |
+| `bench_query_order_limit` | 722 µs | `MATCH (n:Person) RETURN n ORDER BY n.score DESC LIMIT 10` |
+
+Run-to-run spread under load was large (one run was ~3x slower on every shape), so read these as
+order-of-magnitude until re-measured. `bench_query_order_limit` was re-measured on 2026-10-21 (same machine, five runs, default
+sample size) after `ORDER BY … LIMIT` became a bounded top-k selection and a key no longer had to be
+a `RETURN` column; its earlier 1.45 ms timed `RETURN n, n.score` with a full sort.

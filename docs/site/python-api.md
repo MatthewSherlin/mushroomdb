@@ -27,18 +27,31 @@ exit.
 ### `Scalar`
 
 ```python
-Scalar = int | float | str | bool | list[Any] | dict[str, Any]
+Scalar = int | float | str | bool | bytes | date | datetime | Duration | list[Any] | dict[str, Any]
 ```
 
-A value the store can hold: int, float, str, bool, list, or dict.
+A value the store can hold: int, float, str, bool, bytes, date, datetime, Duration, list, or dict.
+
+`bytes` (a `bytearray` or `memoryview` is accepted on the way in) is a binary
+blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
+is a local date-time; an aware one is a date-time that keeps its UTC offset
+(within +-18:00, whole seconds). A value that cannot be held exactly, such as an
+offset with a fractional second or a `pandas.Timestamp` with a nonzero
+`nanosecond`, raises `ValueError` rather than being rounded. Reading one back
+gives the same Python type; a stored date outside Python's years 1 to 9999
+raises `ValueError`. The first write of a `bytes`, `date`, `datetime` or
+`Duration` value moves the store to the V11 snapshot format, which 0.9.x cannot
+read.
 
 ### `Params`
 
 ```python
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
 ```
 
 Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value.
 
 ### `Row`
 
@@ -47,6 +60,23 @@ Row = dict[str, Any]
 ```
 
 One result row, keyed by RETURN alias.
+
+### `Duration`
+
+```python
+class Duration(months: int = 0, days: int = 0, nanos: int = 0)
+```
+
+Fields: `months: int`, `days: int`, `nanos: int`.
+
+A span of time as calendar months, days and nanoseconds, kept apart.
+
+The three parts are independent and never normalised against each other: a
+month is not 30 days and a day is not 24 hours, which is why this is not a
+`datetime.timedelta`. A `timedelta` is refused as a value, with a message
+that points here. Immutable and hashable; equal when all three parts are.
+`months` and `days` are 32-bit and `nanos` 64-bit signed integers; a part
+that does not fit raises `OverflowError`.
 
 ## Opening and closing
 
@@ -197,6 +227,7 @@ def close(self) -> None
 Close the handle and release the store.
 
 A `scoped()` child shares the one store, so either name closes both.
+Raises `RuntimeError` while a transaction is open on the store.
 
 ## Writing
 
@@ -445,7 +476,7 @@ def query(
 
 Execute a read query and return one dict per row, keyed by RETURN alias.
 
-Values must be `int`, `float`, `str`, `bool`, `list` or `dict`.
+Values must be `int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, `list` or `dict`.
 Parameters are bound, never interpolated, so string values are safe
 against injection.
 
@@ -462,14 +493,14 @@ this one call; these arguments are its per-call form.
 
 ```python
 def query_with_params(
-    self, cypher: str, params: Sequence[tuple[str, Scalar]]
+    self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
 ) -> list[Row]
 ```
 
 Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 
 Each element of `params` is a `(name, value)` tuple. Values must be
-`int`, `float`, `str`, `bool`, or a `list` of those. Prefer `query`,
+`int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, or a `list` of those. Prefer `query`,
 which accepts the same tuple list and a dict besides.
 
 ### `query_write`
@@ -480,11 +511,12 @@ def query_write(self, cypher: str, params: Params = None) -> list[Row]
 
 Execute a Cypher write statement.
 
-CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
+CREATE / MATCH…SET / MATCH…REMOVE / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
 
-Returns a one-row result dict with keys `created`, `properties_set` and
-`deleted`, unless the statement carries its own `RETURN` projection, in
-which case the projected rows are returned instead.
+Returns a one-row result dict with keys `created` (nodes),
+`properties_set`, `deleted` and `relationships_created`, unless the
+statement carries its own `RETURN` projection, in which case the
+projected rows are returned instead.
 
 `params` takes the same shapes as `query`: `None`, a dict, or a list of
 `(name, value)` tuples.
@@ -651,6 +683,34 @@ scoped handle is caller misuse, the same kind of thing as `scoped()`'s
 empty-scope `ValueError`. So a sidecar wrapping its boot-time role
 check in `except MushroomError` will not catch this one: catch
 `ValueError` too, or call `roles()` before narrowing the handle.
+
+### `to_arrow_tables`
+
+```python
+def to_arrow_tables(self) -> dict[str, Any]
+```
+
+The whole graph as two `pyarrow.Table`s: `{"nodes": ..., "edges": ...}`.
+
+`nodes` has columns `key`, `label`, `properties` (string: a JSON
+object with sorted keys, each value written as the HTTP API writes it: a
+non-finite float is `null`, a date, time, duration or binary value is a
+tagged object such as `{"$date": "2024-01-15"}`), sorted by key. `edges` has `source`, `type`, `target`,
+`derived` (bool), `rule` (string, null for a manual edge), `weight`
+(float, null unless the creating rule declares a numeric
+`weight_prop`) and `properties` (string, the same sorted JSON form as
+node properties; `{}` when absent), sorted by `(type, source, target)`.
+An empty store gives empty tables with the same columns.
+
+It materialises every node and edge in memory at once. `pyarrow` is an
+optional dependency, imported here: without it this raises
+`ImportError` naming `pip install pyarrow`. Refused (`ValueError`) on a
+scoped handle.
+
+```python
+tables = db.to_arrow_tables()
+df = tables["nodes"].to_pandas()
+```
 
 ## Rules
 
@@ -1289,7 +1349,9 @@ Refused on a `scoped()` handle with `ValueError`.
 
 ## Memory
 
-### `remember`
+The agent-memory methods live under `db.memory`. A plain `GraphDb` is a general-purpose graph store and imposes none of these behaviours on ordinary nodes. `db.memory` shares the handle's store and scope. Each access returns a new accessor; one you keep holds the store open, as a `scoped()` handle does, and the store is released when the handle and every accessor are dropped.
+
+### `memory.remember`
 
 ```python
 def remember(
@@ -1325,10 +1387,14 @@ Returns the report as a dict: `note` (the note's key — **not** `key`,
 which is what the MCP tool's JSON reply calls it), `created`,
 `matched`, `derived`, `provisional`, `provisional_capped` (keys past
 the per-call cap of 20, **not** created), `fulltext_declared`,
-`same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-the identity links this call made, and the ones it retracted). A
-`score` is the raw float (`0.6666666666666666`); the MCP tool prints
-the same score to two decimals.
+`labels_not_applied` (a list of `{"key", "requested", "stored"}`: an
+`entities` entry whose label disagreed with the stored node's, so the
+label went unused), `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+the identity links this call made, and the ones it retracted), and
+`same_as_unread` (`None`, or the error text when the write committed
+but its links could not be read back, so both lists are empty because
+nothing was read). A `score` is the raw float (`0.6666666666666666`);
+the MCP tool prints the same score to two decimals.
 
 Raises `IngestError` when the text is empty or over 4,000 characters,
 the `kind` is unknown, an entity's `props` carry `aliases` or
@@ -1344,14 +1410,14 @@ declares full-text on `Note.text` and on each new entity label's
 `name` itself, so `recall` works after the first call.
 
 ```python
-r = db.remember("Matthew is driving 0.7", about=["matthew"],
-                entities=[{"key": "v0.7", "label": "Release"}],
-                facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+r = db.memory.remember("Matthew is driving 0.7", about=["matthew"],
+                       entities=[{"key": "v0.7", "label": "Release"}],
+                       facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
 r["note"]         # "note:…"
 r["provisional"]  # ["matthew"]
 ```
 
-### `recall`
+### `memory.recall`
 
 ```python
 def recall(self, topic: str) -> dict[str, Any]
@@ -1385,7 +1451,7 @@ prompt. This binding exposes no helper for it.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `upsert_entity`
+### `memory.upsert_entity`
 
 ```python
 def upsert_entity(
@@ -1417,10 +1483,13 @@ node its own namespace is a no-op and another raises
 is a `ValueError`.
 
 Returns `{"key", "label", "created", "updated_fields",
-"same_as_lost"}`. `same_as_lost` lists the identity links this update
-retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-full-name link below the floor. A `score` is the raw float
-(`0.6666666666666666`); the MCP tool prints it to two decimals.
+"same_as_lost", "same_as_unread"}`. `same_as_lost` lists the identity
+links this update retracted, as `{"a", "b", "score"}`: a changed `name`
+can take a full-name link below the floor. `same_as_unread` is `None`,
+or the error text when the update committed but the links could not be
+read back afterwards, so `same_as_lost` is empty because nothing was
+read. A `score` is the raw float (`0.6666666666666666`); the MCP tool
+prints it to two decimals.
 
 `aliases` or `alias_keys` inside `props` raise `IngestError`: the
 store maintains both. So does a `key` that is empty or only
@@ -1429,10 +1498,10 @@ whitespace, and a create under such a `label`. An `IngestError`'s
 `ingest error: ` prefix.
 
 ```python
-db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+db.memory.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
 ```
 
-### `forget`
+### `memory.forget`
 
 ```python
 def forget(
@@ -1469,7 +1538,7 @@ the same whole sentence — which rule owns the edge and the fields it
 reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
 is written in any of the three.
 
-### `schema_report`
+### `memory.schema_report`
 
 ```python
 def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]
@@ -1496,7 +1565,7 @@ content, unsanitized, as `recall`'s rows are.
 
 Refused on a `scoped()` handle with `ValueError`.
 
-### `identity_clusters`
+### `memory.identity_clusters`
 
 ```python
 def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]
@@ -1521,6 +1590,88 @@ Raises `ValueError` for a `floor` that is not a finite number.
 
 Refused on a `scoped()` handle with `ValueError`.
 
+### Deprecated aliases
+
+The old top-level names still work on `GraphDb`. Each takes the same arguments, returns the same result and emits a `DeprecationWarning` that names the caller's line. New code should use `db.memory`.
+
+| Old name | Use instead |
+|---|---|
+| `remember` | `memory.remember` |
+| `recall` | `memory.recall` |
+| `upsert_entity` | `memory.upsert_entity` |
+| `schema_report` | `memory.schema_report` |
+| `forget` | `memory.forget` |
+| `identity_clusters` | `memory.identity_clusters` |
+
+## Transactions
+
+### `begin_transaction`
+
+```python
+def begin_transaction(self) -> Transaction
+```
+
+Begin an interactive transaction and return it.
+
+Reads see the store as it was at this call plus the transaction's own
+writes; `commit()` writes them as one commit, `rollback()` or dropping
+the transaction discards them. Prefer `with db.transaction() as tx:`.
+
+Raises `ReadOnly` on a `read_only=True` handle. A transaction on a
+`scoped()` handle is read-only: reads go through the scope, writes
+raise `ReadOnly`, and its commit writes nothing. `close()` raises while
+a transaction is open.
+
+### `transaction`
+
+```python
+def transaction(self) -> TransactionContext
+```
+
+Run a block as one transaction: commit on a clean exit, roll back and re-raise on an exception.
+
+```python
+with db.transaction() as tx:
+    tx.execute("CREATE (n:Person {id: 'alice'})")
+```
+
+Calling `tx.commit()` or `tx.rollback()` inside the block ends the
+transaction early; leaving the block then does nothing more. Refused
+with `ReadOnly` on a `read_only=True` handle.
+
+### `Transaction.execute`
+
+```python
+def execute(self, cypher: str, params: Params = None) -> list[Row]
+```
+
+Run one Cypher statement and return its rows, shaped as `query` and `query_write` return them.
+
+A statement that fails changes nothing and leaves the transaction
+usable. Schema changes are refused inside a transaction. Raises
+`TransactionClosed` once the transaction is finished.
+
+### `Transaction.commit`
+
+```python
+def commit(self) -> int
+```
+
+Write the transaction as one commit and return that commit's number.
+
+A transaction that wrote nothing writes nothing and returns the number
+of the commit it began on. The transaction is finished afterwards,
+whether or not this raised. Raises `TransactionConflict` when another
+writer changed a node it read or wrote.
+
+### `Transaction.rollback`
+
+```python
+def rollback(self) -> None
+```
+
+Discard the transaction's changes. Raises `TransactionClosed` if it is already finished.
+
 ## Errors
 
 Every error the engine raises is a subclass of `MushroomError`, which subclasses
@@ -1543,11 +1694,17 @@ attributes. Classes may be added; a `code` is never respelled.
 | `CommitOutOfRange` | `commit: int`, `total: int`, `floor: int` | The commit is outside the retained range `floor..total`. |
 | `ViewPropReadOnly` | `view_name: str` | The property is managed by a view and cannot be written directly. |
 | `CasConflict` | `key: str`, `expected: int`, `actual: int` | A compare-and-set precondition was not satisfied. |
+| `TransactionConflict` | `key: str`, `expected: int`, `actual: int` | A commit found that another writer changed a node the transaction read or wrote. |
+| `TransactionClosed` | — | The transaction is finished: it was already committed or rolled back. |
 | `MaskedReadOnly` | — | A write statement reached a scoped or masked query path, which is read-only. |
 | `RoleWriteDenied` | `reason: str` | A role-bound write was denied. |
 | `MushroomBusy` | `holder: int \| None` | Another process holds the store's write lock. |
+| `Unwritable` | `path: str`, `detail: str` | The store's data directory is not writable by this process. |
 | `NamespaceImmutable` | `key: str`, `from_: str`, `to: str` | A namespace is set at insert and fixed for the node's lifetime. |
 | `CrossNamespace` | `src: str`, `src_ns: str`, `dst: str`, `dst_ns: str` | A hand-written edge would cross a namespace boundary. |
 | `CommitTimeNotMonotonic` | `supplied_ms: int`, `newest_ms: int` | An asserted commit time would move the store's recorded history backwards. |
 | `NoRecordedTime` | — | A date was given to a history call on a store that records no commit times. |
 | `TimeBeforeFloor` | `floor_ms: int`, `floor_commit: int` | The date predates the oldest commit time the store still records. |
+| `ConstraintViolation` | `constraint: str`, `field: str` | A write would give two live nodes the same value under a unique constraint. |
+| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]`, `total: int` | A unique constraint cannot be declared: live nodes already share a value. |
+| `ValueTooLarge` | `field: str`, `size: int`, `limit: int` | A value is larger than the store accepts; `size` and `limit` are bytes. |

@@ -5,20 +5,63 @@ use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
     GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, MaskedNodeResult, NamespaceStats,
-    NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope,
-    Value, NS_MAX_LEN, NS_PROP,
+    NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ReaderSnapshot, ResultSet,
+    RuleDef, Scope, SharedDb, Transaction as CoreTransaction, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyImportError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMemoryView, PySequence,
+    PyString, PyTuple,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod memory_accessor;
+use memory_accessor::MemoryAccessor;
 
 type Db = CoreDb<RealFs>;
 
-struct Inner(Mutex<Option<Db>>);
+/// The store behind a handle: the plain read-write handle it was opened as, or
+/// — once a transaction has begun — the same loaded store wrapped in the
+/// engine's [`SharedDb`], which is what an interactive transaction runs on.
+///
+/// The wrap happens once, on the first `begin_transaction`, and moves the
+/// store rather than reopening it, so the cross-process write lock the open
+/// took is never released. It is never undone.
+enum Store {
+    Plain(Box<Db>),
+    Shared(SharedDb),
+}
+
+struct Inner(Mutex<Option<Store>>, OpenTransactions);
+
+/// How many transactions are open on a store. `close()` refuses while any is:
+/// a transaction owns a clone of the store, so closing under it would leave the
+/// write lock held by a handle the caller believes is closed.
+#[derive(Default)]
+struct OpenTransactions(AtomicUsize);
+
+/// One open transaction's claim on the count; releasing it is dropping it, so
+/// a transaction that is garbage-collected unfinished still lets `close()`
+/// through.
+struct OpenClaim(Arc<Inner>);
+
+impl Drop for OpenClaim {
+    fn drop(&mut self) {
+        (self.0).1 .0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What `upsert_node` did, decided under the store lock and reported after it.
+enum Upsert {
+    Inserted,
+    Updated,
+    WrongLabel(String),
+}
 
 #[pyclass(name = "GraphDb")]
 struct GraphDb {
@@ -56,7 +99,10 @@ impl GraphDb {
         };
         let db = CoreDb::open_with_options(&path, opts).map_err(graph_err)?;
         Ok(GraphDb {
-            inner: Arc::new(Inner(Mutex::new(Some(db)))),
+            inner: Arc::new(Inner(
+                Mutex::new(Some(Store::Plain(Box::new(db)))),
+                OpenTransactions::default(),
+            )),
             scope: None,
         })
     }
@@ -194,6 +240,17 @@ impl GraphDb {
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
+    /// Declare a unique constraint.
+    ///
+    /// Test-only: built with the `test-hooks` feature and never in a wheel.
+    /// Python has no constraint API of its own yet, so this is how a test
+    /// reaches the errors a declaration raises. Like any declaration, it moves
+    /// the store to the V11 snapshot format.
+    #[cfg(feature = "test-hooks")]
+    fn _declare_constraint_for_test(&self, name: &str, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| db.create_constraint(name, label, field))
+    }
+
     /// Insert `key` if absent, otherwise update it in place.
     ///
     /// Returns `"inserted"` or `"updated"`.  On update, only the fields
@@ -219,27 +276,38 @@ impl GraphDb {
         // The guard has to come first, exactly as `create_rule`'s does.
         self.refuse_if_scoped()?;
         let mapped = dict_to_props(&props)?;
-        let existing = self.with_ref(|db| Ok(db.node_info(key)))?;
-        let Some(info) = existing else {
-            self.with_mut(|db| db.insert_node(label, key, mapped))?;
-            return Ok("inserted".to_string());
-        };
-        if info.label != label {
-            return Err(PyValueError::new_err(format!(
-                "upsert_node: node '{key}' already exists with label '{}', not '{label}'; \
-                 delete and re-insert to change a node's label",
-                info.label
-            )));
-        }
-        let mut to_set: Vec<(String, Value)> = Vec::new();
-        for (field, value) in mapped {
-            if info.props.get(&field) == Some(&value) {
-                continue; // unchanged: no WAL record, no rule re-fire
+        // The existence read and the write share one lock acquisition. They
+        // used to take two, which was safe only while every write held the GIL;
+        // with the GIL released around writes, two upserts of one key could
+        // both read "absent" and the second insert would raise `DuplicateKey`.
+        // A label mismatch is returned as a value, not an error, so it can be
+        // raised as `ValueError` after the lock is released.
+        let outcome = self.with_mut(|db| {
+            let Some(info) = db.node_info(key) else {
+                db.insert_node(label, key, mapped)?;
+                return Ok(Upsert::Inserted);
+            };
+            if info.label != label {
+                return Ok(Upsert::WrongLabel(info.label));
             }
-            to_set.push((field, value));
+            let mut to_set: Vec<(String, Value)> = Vec::new();
+            for (field, value) in mapped {
+                if info.props.get(&field) == Some(&value) {
+                    continue; // unchanged: no WAL record, no rule re-fire
+                }
+                to_set.push((field, value));
+            }
+            db.set_props(key, to_set)?;
+            Ok(Upsert::Updated)
+        })?;
+        match outcome {
+            Upsert::Inserted => Ok("inserted".to_string()),
+            Upsert::Updated => Ok("updated".to_string()),
+            Upsert::WrongLabel(stored) => Err(PyValueError::new_err(format!(
+                "upsert_node: node '{key}' already exists with label '{stored}', not '{label}'; \
+                 delete and re-insert to change a node's label"
+            ))),
         }
-        self.with_mut(|db| db.set_props(key, to_set))?;
-        Ok("updated".to_string())
     }
 
     /// Insert a user-owned edge.  Returns `True` if it was newly written,
@@ -463,7 +531,8 @@ impl GraphDb {
     /// - a `dict` mapping name→value (ergonomic form)
     /// - a list of `(name, value)` tuples (back-compat with `query_with_params`)
     ///
-    /// Values must be `int`, `float`, `str`, `bool`, `list`, or `dict`.
+    /// Values must be `int`, `float`, `str`, `bool`, `None`, `list`, or `dict`;
+    /// `None` binds as a null, so `$p IS NULL` is true for it.
     /// Parameters are bound, never interpolated, so string values are safe
     /// against injection.
     ///
@@ -551,7 +620,7 @@ impl GraphDb {
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         let rs = self.with_scope(|db, mask| match mask {
@@ -603,8 +672,9 @@ impl GraphDb {
     /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE /
     /// MATCH…DETACH DELETE / MERGE).
     ///
-    /// Returns a one-row result dict with keys `created`, `properties_set`,
-    /// and `deleted`, unless the statement has its own `RETURN` projection.
+    /// Returns a one-row result dict with keys `created` (nodes),
+    /// `properties_set`, `deleted` and `relationships_created`, unless the
+    /// statement has its own `RETURN` projection.
     ///
     /// `params` takes the same shapes as `query`: `None`, a `dict`, or a list
     /// of `(name, value)` tuples.
@@ -1121,6 +1191,108 @@ impl GraphDb {
                 Ok(d.unbind())
             })
             .collect()
+    }
+
+    /// The whole graph as two `pyarrow.Table`s, `{"nodes": ..., "edges": ...}`.
+    ///
+    /// `nodes` has columns `key`, `label`, `properties` (string, a JSON object
+    /// with sorted keys, each value written as the HTTP API writes it: a
+    /// non-finite float is `null`, a date, time, duration or binary value is a
+    /// tagged object such as `{"$date": "2024-01-15"}`),
+    /// sorted by key. `edges` has `source`, `type`, `target`, `derived`
+    /// (bool), `rule` (string, null for a manual edge), `weight` (float,
+    /// null unless the creating rule declares a numeric `weight_prop`) and
+    /// `properties` (string, the same sorted JSON form as node properties;
+    /// `{}` when absent), sorted by `(type, source, target)`. An empty store
+    /// gives empty tables with the same columns.
+    ///
+    /// It materialises every node and edge in memory at once. `pyarrow` is an
+    /// optional dependency, imported here: without it this raises
+    /// `ImportError` naming `pip install pyarrow`. Refused on a scoped handle.
+    ///
+    /// ```python
+    /// tables = db.to_arrow_tables()
+    /// df = tables["nodes"].to_pandas()
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn to_arrow_tables(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("to_arrow_tables")?;
+        let pa = PyModule::import(py, "pyarrow").map_err(|_| {
+            PyImportError::new_err(
+                "to_arrow_tables() needs pyarrow, which is not installed: pip install pyarrow",
+            )
+        })?;
+        let (nodes, edges) = self.with_ref(|db| {
+            Ok((
+                db.all_nodes_for_export(),
+                db.all_edges_with_props_for_export(),
+            ))
+        })?;
+        let node_rows = PyList::empty(py);
+        for node in &nodes {
+            let props: serde_json::Map<String, serde_json::Value> = node
+                .props
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
+            let row = PyDict::new(py);
+            row.set_item("key", &node.key)?;
+            row.set_item("label", &node.label)?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
+            node_rows.append(row)?;
+        }
+        let edge_rows = PyList::empty(py);
+        for (edge, properties) in &edges {
+            let props: serde_json::Map<String, serde_json::Value> = properties
+                .iter()
+                .map(|(field, value)| (field.clone(), value_to_http_json(value)))
+                .collect();
+            let row = PyDict::new(py);
+            row.set_item("source", &edge.src)?;
+            row.set_item("type", &edge.edge_type)?;
+            row.set_item("target", &edge.dst)?;
+            row.set_item("derived", edge.derived)?;
+            row.set_item("rule", edge.rule.as_deref())?;
+            row.set_item("weight", edge.weight)?;
+            row.set_item("properties", serde_json::Value::Object(props).to_string())?;
+            edge_rows.append(row)?;
+        }
+
+        let string = pa.call_method0("string")?;
+        let node_schema = arrow_schema(
+            &pa,
+            &[
+                ("key", &string),
+                ("label", &string),
+                ("properties", &string),
+            ],
+        )?;
+        let edge_schema = arrow_schema(
+            &pa,
+            &[
+                ("source", &string),
+                ("type", &string),
+                ("target", &string),
+                ("derived", &pa.call_method0("bool_")?),
+                ("rule", &string),
+                ("weight", &pa.call_method0("float64")?),
+                ("properties", &string),
+            ],
+        )?;
+        let table = pa.getattr("Table")?;
+        let out = PyDict::new(py);
+        for (name, rows, schema) in [
+            ("nodes", node_rows, node_schema),
+            ("edges", edge_rows, edge_schema),
+        ] {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", schema)?;
+            out.set_item(
+                name,
+                table.call_method("from_pylist", (rows,), Some(&kwargs))?,
+            )?;
+        }
+        Ok(out.unbind())
     }
 
     /// Enable an equality index on `(label, field)` so `MATCH (n:label {field: v})`
@@ -2040,52 +2212,32 @@ impl GraphDb {
         report_to_py(py, serde_json::to_value(&found))
     }
 
-    /// Write a note the store can later `recall`, and whatever it names.
+    /// The agent-memory methods: `remember`, `recall`, `upsert_entity`,
+    /// `forget`, `schema_report` and `identity_clusters`.
     ///
-    /// `about` is the keys the note is about. A key that does not exist is
-    /// created as a provisional `Entity` rather than refusing the call, and
-    /// listed under `provisional` in the report.
-    ///
-    /// `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
-    /// dicts — entities you recognised in the text, created or updated in the
-    /// same commit. `facts` is a list of `{"subject", "predicate", "object"}`
-    /// dicts — relationships among them, written as edges. Either may be a
-    /// tuple or any other sequence, as `about` may.
-    ///
-    /// `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
-    /// Unix seconds and defaults to now; it is part of the note's key, so the
-    /// same text at the same `ts` is the same note. `source` defaults to
-    /// `"agent"`.
-    ///
-    /// Returns the report as a dict: `note` (the note's key — **not** `key`,
-    /// which is what the MCP tool's JSON reply calls it), `created`,
-    /// `matched`, `derived`, `provisional`, `provisional_capped` (keys past
-    /// the per-call cap of 20, **not** created), `fulltext_declared`,
-    /// `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-    /// the identity links this call made, and the ones it retracted). A
-    /// `score` is the raw float (`0.6666666666666666`); the MCP tool prints
-    /// the same score to two decimals.
-    ///
-    /// Raises `IngestError` when the text is empty or over 4,000 characters,
-    /// the `kind` is unknown, an entity's `props` carry `aliases` or
-    /// `alias_keys`, a name is empty, only whitespace or only invisible
-    /// characters — a key in
-    /// `about`, an entity's `key` or `label`, or a fact's `subject`,
-    /// `predicate` or `object`; nothing is written. Its `.detail` is the
-    /// bare sentence; the message carries an `ingest error: ` prefix in
-    /// front of it.
-    ///
-    /// A store this binding creates has no memory schema. `remember`
-    /// declares full-text on `Note.text` and on each new entity label's
-    /// `name` itself, so `recall` works after the first call.
+    /// A plain handle is a general-purpose graph store and imposes none of
+    /// these behaviours on ordinary nodes. This namespace is the memory API
+    /// only. It shares this handle's store and scope: on a `scoped()` handle
+    /// it is scoped the same way. Each method takes the arguments and returns
+    /// what its docstring says; the old top-level names are deprecated
+    /// aliases of these.
     ///
     /// ```python
-    /// r = db.remember("Matthew is driving 0.7", about=["matthew"],
-    ///                 entities=[{"key": "v0.7", "label": "Release"}],
-    ///                 facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
-    /// r["note"]         # "note:…"
-    /// r["provisional"]  # ["matthew"]
+    /// db.memory.remember("Matthew is driving 0.10", about=["matthew"])
+    /// db.memory.recall("who is driving the release")["hits"]
     /// ```
+    #[getter]
+    fn memory(&self) -> MemoryAccessor {
+        MemoryAccessor {
+            db: GraphDb {
+                inner: Arc::clone(&self.inner),
+                scope: self.scope.clone(),
+            },
+        }
+    }
+
+    /// Deprecated: use `db.memory.remember`, which takes the same arguments
+    /// and returns the same report.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(
         signature = (text, about = None, kind = None, ts = None, source = None, entities = None, facts = None),
@@ -2102,101 +2254,21 @@ impl GraphDb {
         entities: Option<Bound<'_, PyAny>>,
         facts: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        use core_api::memory::remember::{
-            dedup_keep_order, remember, unix_now_secs, RememberInput, DEFAULT_NOTE_KIND,
-        };
-        // First, so a scoped handle is refused before any argument is read.
-        self.refuse_if_scoped()?;
-        let mut about = about.unwrap_or_default();
-        dedup_keep_order(&mut about);
-        let entities = match entities {
-            Some(list) => entities_from_py(&list)?,
-            None => Vec::new(),
-        };
-        let facts = match facts {
-            Some(list) => facts_from_py(&list)?,
-            None => Vec::new(),
-        };
-        let input = RememberInput {
-            text,
-            about: &about,
-            kind: kind.unwrap_or(DEFAULT_NOTE_KIND),
-            ts: ts.unwrap_or_else(unix_now_secs),
-            source,
-            entities: &entities,
-            facts: &facts,
-        };
-        let report = self.with_mut(|db| remember(db, &input))?;
-        report_to_py(py, serde_json::to_value(&report))
+        warn_moved_to_memory(py, "remember")?;
+        self.memory()
+            .remember(py, text, about, kind, ts, source, entities, facts)
     }
 
-    /// What the store holds about a topic, as rows.
-    ///
-    /// Returns `{"indexed": bool, "terms": int, "hits": [...]}`. Each hit is
-    /// `{"key", "label", "summary", "covered", "score"}`, best first:
-    /// `covered` is how many of the topic's `terms` the node's own text
-    /// holds, and it leads the ranking — the fused `score` is nearly flat.
-    /// A hit covers at least half the terms. At most six hits. `terms == 0`
-    /// with hits present means the topic was all stopwords: its words were
-    /// searched together and every hit's `covered` is `0`. `summary` is
-    /// the first 120 characters of the node's `text`, `summary` or `name`,
-    /// or `None` when it has none of them.
-    ///
-    /// `indexed` is `False` when the store declares no full-text index at
-    /// all, so no topic can match — a different answer from an empty `hits`.
-    /// `remember` declares `Note.text` on its first call.
-    ///
-    /// This is the MCP `recall` tool's ranking, as data; the tool renders the
-    /// same rows as a digest, and this method does not offer the digest.
-    ///
-    /// **The rows are raw stored content.** `key`, `label` and `summary` are
-    /// unsanitized: only the digest renderer replaces control characters,
-    /// line separators and bidi or zero-width characters with spaces. If you
-    /// render a row into an assistant's context, that sanitisation is yours
-    /// to do — a stored line break can otherwise forge a line of your
-    /// prompt. This binding exposes no helper for it.
-    ///
-    /// Refused on a `scoped()` handle with `ValueError`.
+    /// Deprecated: use `db.memory.recall`, which takes the same arguments and
+    /// returns the same rows.
     #[pyo3(text_signature = "($self, topic)")]
     fn recall(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyAny>> {
-        self.refuse_read_if_scoped("recall")?;
-        let rows = self.with_ref(|db| Ok(core_api::memory::recall::recall_rows(db, topic)))?;
-        report_to_py(py, serde_json::to_value(&rows))
+        warn_moved_to_memory(py, "recall")?;
+        self.memory().recall(py, topic)
     }
 
-    /// Create or update one entity by key, the way the memory tools do.
-    ///
-    /// Unlike `upsert_node`, this maintains the entity's two identity lists:
-    /// `aliases`, which the store derives from the current key and `name` and
-    /// recomputes on every call — never accumulated, never yours to set — and
-    /// `alias_keys`, the `aliases` you pass, kept as written and accumulating.
-    /// It also sets `id` to the key and clears a `provisional` mark
-    /// `remember` left.
-    ///
-    /// `label` is required to create and optional to update. **An update
-    /// never changes a label**: one that differs from the stored label
-    /// raises `IngestError` and nothing in `props` is written.
-    ///
-    /// `namespace` is the namespace a created node lands in. On an existing
-    /// node its own namespace is a no-op and another raises
-    /// `NamespaceImmutable`. A `props["ns"]` that disagrees with `namespace`
-    /// is a `ValueError`.
-    ///
-    /// Returns `{"key", "label", "created", "updated_fields",
-    /// "same_as_lost"}`. `same_as_lost` lists the identity links this update
-    /// retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-    /// full-name link below the floor. A `score` is the raw float
-    /// (`0.6666666666666666`); the MCP tool prints it to two decimals.
-    ///
-    /// `aliases` or `alias_keys` inside `props` raise `IngestError`: the
-    /// store maintains both. So does a `key` that is empty or only
-    /// whitespace, and a create under such a `label`. An `IngestError`'s
-    /// `.detail` is the bare sentence; its message carries an
-    /// `ingest error: ` prefix.
-    ///
-    /// ```python
-    /// db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
-    /// ```
+    /// Deprecated: use `db.memory.upsert_entity`, which takes the same
+    /// arguments and returns the same report.
     #[pyo3(
         signature = (key, props, label = None, aliases = None, namespace = None),
         text_signature = "($self, key, props, label=None, aliases=None, namespace=None)"
@@ -2210,103 +2282,21 @@ impl GraphDb {
         aliases: Option<Vec<String>>,
         namespace: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
-        // First: the engine call reads the stored label before it writes, and
-        // on a scoped handle that read must never happen (defect #8).
-        self.refuse_if_scoped()?;
-        let mut row: BTreeMap<String, Value> = dict_to_props(&props)?.into_iter().collect();
-        if let Some(ns) = check_namespace(namespace)? {
-            match row.get(NS_PROP).cloned() {
-                Some(Value::Str(s)) if s == ns => {}
-                Some(existing) => {
-                    return Err(PyValueError::new_err(format!(
-                        "upsert_entity: props ns is {existing:?} but namespace={ns:?}; a node is \
-                         created in one namespace, so pass one or the other"
-                    )))
-                }
-                None => {
-                    row.insert(NS_PROP.to_string(), Value::Str(ns.to_string()));
-                }
-            }
-        }
-        let aliases = aliases.unwrap_or_default();
-        let outcome = self.with_mut(|db| {
-            core_api::memory::remember::upsert_entity(db, key, label, row, &aliases)
-        })?;
-        let d = PyDict::new(py);
-        d.set_item("key", key)?;
-        d.set_item("label", &outcome.label)?;
-        d.set_item("created", outcome.created)?;
-        d.set_item("updated_fields", outcome.updated_fields)?;
-        let lost = PyList::empty(py);
-        for pair in &outcome.same_as_lost {
-            let pd = PyDict::new(py);
-            pd.set_item("a", &pair.a)?;
-            pd.set_item("b", &pair.b)?;
-            pd.set_item("score", pair.score)?;
-            lost.append(pd)?;
-        }
-        d.set_item("same_as_lost", lost)?;
-        Ok(d.unbind())
+        warn_moved_to_memory(py, "upsert_entity")?;
+        self.memory()
+            .upsert_entity(py, key, props, label, aliases, namespace)
     }
 
-    /// What the store holds and how it is wired.
-    ///
-    /// Returns a dict: `brief` (`nodes` and `edges` counts, `labels` each
-    /// with its fields, `edge_types` each with its endpoints, `commits`,
-    /// `roles`, `recipes`, `partial`), `rules` (each with its predicate in
-    /// one clause and its namespace), `fulltext` and `indexes` (`[label,
-    /// field]` lists), `provisional` (how many nodes `remember` named and
-    /// nothing has described) and `provisional_sample` (the first ten keys).
-    ///
-    /// `budget_ms` bounds the counting; a spent budget sets
-    /// `brief["partial"]` and the counts are then lower bounds. **`0` is not
-    /// "no limit" here**, as it is for the graph algorithms: it is a budget
-    /// already spent, and returns a partial report. For an unhurried report
-    /// pass a large value, such as `60_000`.
-    ///
-    /// The MCP `schema` tool renders this same report. The names under
-    /// `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
-    /// content, unsanitized, as `recall`'s rows are.
-    ///
-    /// Refused on a `scoped()` handle with `ValueError`.
-    #[allow(deprecated)]
+    /// Deprecated: use `db.memory.schema_report`, which takes the same
+    /// arguments and returns the same report.
     #[pyo3(signature = (budget_ms = 1000), text_signature = "($self, budget_ms=1000)")]
     fn schema_report(&self, py: Python<'_>, budget_ms: u64) -> PyResult<Py<PyAny>> {
-        self.refuse_read_if_scoped("schema_report")?;
-        let opts = core_api::memory::brief::BriefOptions {
-            budget: std::time::Duration::from_millis(budget_ms),
-        };
-        let report = py.allow_threads(|| {
-            self.with_ref(|db| Ok(core_api::memory::schema::schema_report(db, &opts)))
-        })?;
-        report_to_py(py, serde_json::to_value(&report))
+        warn_moved_to_memory(py, "schema_report")?;
+        self.memory().schema_report(py, budget_ms)
     }
 
-    /// Forget a node, one property, or one fact — exactly one of the three.
-    ///
-    /// - `forget(key=k)` tombstones the node and every edge on it.
-    /// - `forget(key=k, prop=p)` removes one property.
-    /// - `forget(fact={"subject", "predicate", "object"})` retracts one
-    ///   hand-written edge.
-    ///
-    /// Returns the report as a dict: `mode` (`"node"`, `"prop"` or
-    /// `"fact"`), `target`, `changed` (`False` when there was nothing to
-    /// forget), `manual_edges`, `derived_edges`, `notes` and `notes_total`
-    /// (notes that still say it — **listed, never deleted**), `history_floor`,
-    /// `prop` in prop mode, `aliases_rewritten` (a forgotten `name` took its
-    /// words out of `aliases` in the same commit) and `alias_keys_remain`
-    /// (forgotten `aliases` left declared aliases behind in `alias_keys`).
-    ///
-    /// **This is a tombstone, not a redaction.** `node_history`,
-    /// `edge_history`, `edges_at` and `was_linked` still read what was
-    /// forgotten, from `history_floor` on, until the log is pruned.
-    ///
-    /// Raises `ValueError` for any other combination of arguments,
-    /// `KeyNotFound` for an unknown key or fact endpoint, and `RuleOwned` for
-    /// a fact a rule derived. That refusal's message and its `.detail` are
-    /// the same whole sentence — which rule owns the edge and the fields it
-    /// reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
-    /// is written in any of the three.
+    /// Deprecated: use `db.memory.forget`, which takes the same arguments and
+    /// returns the same report.
     #[pyo3(
         signature = (key = None, prop = None, fact = None),
         text_signature = "($self, key=None, prop=None, fact=None)"
@@ -2318,71 +2308,19 @@ impl GraphDb {
         prop: Option<String>,
         fact: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        use core_api::memory::forget::{forget, ForgetTarget, FORGET_SHAPE};
-        self.refuse_if_scoped()?;
-        let fact = match fact {
-            Some(d) => Some((
-                required_str(&d, "subject", "fact")?,
-                required_str(&d, "predicate", "fact")?,
-                required_str(&d, "object", "fact")?,
-            )),
-            None => None,
-        };
-        let Some(target) = ForgetTarget::from_parts(key, prop, fact) else {
-            return Err(PyValueError::new_err(FORGET_SHAPE));
-        };
-        let is_fact = matches!(target, ForgetTarget::Fact { .. });
-        // The engine's result comes out of `with_mut` unmapped, so the store
-        // is released before any error is turned into an exception.
-        let report = match self.with_mut(|db| Ok(forget(db, &target)))? {
-            Ok(report) => report,
-            // Only a fact's refusal is the enriched sentence, and it is the
-            // whole message: the variant's `edge is rule-owned: ` prefix was
-            // written for a one-word detail. The MCP tool answers the same.
-            Err(GraphError::RuleOwned { detail }) if is_fact => {
-                return Err(err_with(py, RuleOwned::new_err(detail.clone()), |v| {
-                    v.setattr("detail", detail.as_str())
-                }))
-            }
-            Err(e) => return Err(graph_err(e)),
-        };
-        report_to_py(py, serde_json::to_value(&report))
+        warn_moved_to_memory(py, "forget")?;
+        self.memory().forget(py, key, prop, fact)
     }
 
-    /// Which keys are one entity: `SAME_AS` links resolved into identities.
-    ///
-    /// Returns `{"clusters": [...], "linked": int, "claims": int, "floor":
-    /// float}`. Each cluster is `{"canonical", "members", "weakest"}`: every
-    /// pair of `members` is linked at `floor` or above, `canonical` is the
-    /// oldest member and `members[0]`, and `weakest` is the lowest pairwise
-    /// score inside it. `claims` counts unordered pairs — both directions of
-    /// a link are one claim. `weakest` is the raw float
-    /// (`0.6666666666666666`); the MCP tool prints it to two decimals.
-    ///
-    /// Empty on a store with no `SAME_AS` edges. The identity preset that
-    /// derives them is applied with `mushroomdb schema apply <db>
-    /// --memory-identity`, on the command line, with this handle closed; a
-    /// `SAME_AS` rule made with `create_rule` is the other way.
-    ///
-    /// Raises `ValueError` for a `floor` that is not a finite number.
-    ///
-    /// Refused on a `scoped()` handle with `ValueError`.
-    #[allow(deprecated)]
+    /// Deprecated: use `db.memory.identity_clusters`, which takes the same
+    /// arguments and returns the same report.
     #[pyo3(
         signature = (floor = core_api::memory::identity::SAME_AS_FLOOR),
         text_signature = "($self, floor=0.6)"
     )]
     fn identity_clusters(&self, py: Python<'_>, floor: f64) -> PyResult<Py<PyAny>> {
-        self.refuse_read_if_scoped("identity_clusters")?;
-        if !floor.is_finite() {
-            return Err(PyValueError::new_err(format!(
-                "identity_clusters: floor must be a finite number, got {floor}"
-            )));
-        }
-        let report = py.allow_threads(|| {
-            self.with_ref(|db| Ok(core_api::memory::identity::identity_clusters(db, floor)))
-        })?;
-        report_to_py(py, serde_json::to_value(&report))
+        warn_moved_to_memory(py, "identity_clusters")?;
+        self.memory().identity_clusters(py, floor)
     }
 
     /// Return database statistics: node/edge counts, `namespaces` (every
@@ -2590,6 +2528,68 @@ impl GraphDb {
         Ok(d.unbind())
     }
 
+    /// Begin an interactive transaction and return it.
+    ///
+    /// Statements run with `tx.execute(cypher, params=None)` read the store as
+    /// it was at this call, plus the transaction's own earlier writes, and
+    /// nothing reaches the store — or any other handle — until `tx.commit()`
+    /// writes it as one commit and returns that commit's number.
+    /// `tx.rollback()`, or dropping the transaction, discards it. Prefer
+    /// `with db.transaction() as tx:`, which finishes it for you.
+    ///
+    /// A commit raises `TransactionConflict` when another writer changed a
+    /// node this transaction read or wrote since it began; nothing was
+    /// written, and the whole transaction is safe to run again.
+    ///
+    /// Refused with `ReadOnly` on a `read_only=True` handle. A transaction on a
+    /// `scoped()` handle is read-only: its reads go through the scope, its
+    /// writes raise `ReadOnly`, and its commit writes nothing. `close()` raises
+    /// while a transaction is open.
+    ///
+    /// ```python
+    /// tx = db.begin_transaction()
+    /// tx.execute("CREATE (n:Person {id: $id})", {"id": "alice"})
+    /// tx.commit()
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn begin_transaction(&self, py: Python<'_>) -> PyResult<Transaction> {
+        self.begin(py)
+    }
+
+    /// A context manager that runs a block as one transaction: it commits when
+    /// the block ends cleanly and rolls back — re-raising — when it raises.
+    ///
+    /// The transaction begins on entering the block, and `as tx` is the same
+    /// object `begin_transaction()` returns. Calling `tx.commit()` or
+    /// `tx.rollback()` inside the block is allowed and ends the transaction
+    /// early; leaving the block then does nothing more.
+    ///
+    /// ```python
+    /// with db.transaction() as tx:
+    ///     tx.execute("CREATE (n:Person {id: 'alice'})")
+    ///     tx.execute("MATCH (n:Person {id: 'alice'}) SET n.age = 30")
+    /// ```
+    #[pyo3(text_signature = "($self)")]
+    fn transaction(&self) -> PyResult<TransactionContext> {
+        // Refused here rather than on entering, so a handle that can never
+        // begin fails at the line that names the `with`.
+        {
+            let guard = lock(&self.inner.0)?;
+            match guard.as_ref() {
+                None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                Some(Store::Plain(db)) if db.is_read_only() => return Err(read_only_begin()),
+                Some(_) => {}
+            }
+        }
+        Ok(TransactionContext {
+            handle: GraphDb {
+                inner: Arc::clone(&self.inner),
+                scope: self.scope.clone(),
+            },
+            entered: Mutex::new(None),
+        })
+    }
+
     /// Close the handle and release the store.  Further calls raise
     /// `RuntimeError`.  `GraphDb` is also a context manager, so
     /// `with GraphDb.open(path) as db:` closes on exit.
@@ -2599,6 +2599,15 @@ impl GraphDb {
     #[pyo3(text_signature = "($self)")]
     fn close(&self) -> PyResult<()> {
         let mut guard = lock(&self.inner.0)?;
+        // Counted under the same mutex `begin_transaction` claims under, so a
+        // begin cannot slip in between the check and the release.
+        let open = self.inner.1 .0.load(Ordering::SeqCst);
+        if open > 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "cannot close: {open} open transaction(s) on this store; commit or roll them \
+                 back first"
+            )));
+        }
         *guard = None;
         Ok(())
     }
@@ -2627,7 +2636,8 @@ impl GraphDb {
     /// refusal, and it uses [`GraphDb::with_mut_unscoped`] directly.
     fn with_mut<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&mut Db) -> core_api::Result<T> + Send,
     {
         self.refuse_if_scoped()?;
         self.with_mut_unscoped(f)
@@ -2635,19 +2645,102 @@ impl GraphDb {
 
     fn with_mut_unscoped<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&mut Db) -> core_api::Result<T> + Send,
     {
-        let mut guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_mut()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            f(db)
-        };
-        // Release the store before `graph_err`, which takes the GIL. See
+        // The GIL is released for the whole lock-and-write, so another Python
+        // thread runs during the WAL fsync. `f` holds no Python objects (it is
+        // `Send`), and the store guard is dropped before `graph_err` retakes the
+        // GIL, so the order is always GIL -> store, never store -> GIL. See
         // [`GraphDb::with_scope`] for the inversion that rule prevents.
-        drop(guard);
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let mut guard = lock(&self.inner.0)?;
+                let out = match guard.as_mut() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = f(db);
+                        drop(guard);
+                        out
+                    }
+                    // The handle's own lock is released before the engine's:
+                    // a write waits on the store, not on this mutex.
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let mut write = shared.write();
+                        f(&mut write)
+                    }
+                };
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
+    }
+
+    /// Begin a transaction on this handle's store.
+    ///
+    /// An unscoped handle's first transaction moves the loaded store into the
+    /// engine's shared handle (see [`Store`]); a scoped handle's transaction is
+    /// a read-only view of the store as it is now, resolved through the scope
+    /// once, here.
+    fn begin(&self, py: Python<'_>) -> PyResult<Transaction> {
+        let inner = &self.inner;
+        let scope = &self.scope;
+        // The GIL is released across the store mutex, as everywhere else.
+        let claim = || {
+            inner.1 .0.fetch_add(1, Ordering::SeqCst);
+            OpenClaim(Arc::clone(inner))
+        };
+        let begun = py.detach(|| -> PyResult<core_api::Result<(TxBody, OpenClaim)>> {
+            let mut guard = lock(&inner.0)?;
+            if guard.is_none() {
+                return Err(PyRuntimeError::new_err("GraphDb is closed"));
+            }
+            if matches!(guard.as_ref(), Some(Store::Plain(db)) if db.is_read_only()) {
+                return Err(read_only_begin());
+            }
+            // The claim is taken under the mutex `close()` checks under, and
+            // released by dropping it if the begin below fails.
+            let shared = match guard.as_ref() {
+                Some(Store::Shared(shared)) => (shared.clone(), claim()),
+                Some(Store::Plain(db)) if scope.is_some() => {
+                    // A scoped view reads the plain store in place; no wrap.
+                    let scope = scope.as_ref().expect("checked in the guard");
+                    return Ok(scoped_body(db, scope).map(|body| (body, claim())));
+                }
+                Some(Store::Plain(_)) => {
+                    let Some(Store::Plain(db)) = guard.take() else {
+                        unreachable!("matched Plain under the same guard");
+                    };
+                    // `from_locked` fails only for a read-only handle, refused
+                    // above, so the store is never lost here.
+                    let shared = match SharedDb::from_locked(*db) {
+                        Ok(shared) => shared,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    *guard = Some(Store::Shared(shared.clone()));
+                    (shared, claim())
+                }
+                None => unreachable!("checked open above"),
+            };
+            // From here the handle's own mutex is let go, so a begin that
+            // waits on the store (a writer's fsync) holds no other call up.
+            drop(guard);
+            let (shared, claim) = shared;
+            let body = match scope {
+                Some(scope) => scoped_body(&shared.read(), scope),
+                None => Ok(TxBody::Full(Box::new(shared.begin_transaction()))),
+            };
+            Ok(body.map(|body| (body, claim)))
+        })?;
+        let (body, claim) = begun.map_err(graph_err)?;
+        Ok(Transaction {
+            state: Mutex::new(Some(TxState {
+                body,
+                _claim: claim,
+            })),
+        })
     }
 
     /// Refuse the call when this handle came from `scoped()`.
@@ -2688,18 +2781,31 @@ impl GraphDb {
 
     fn with_ref<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&Db) -> core_api::Result<T> + Send,
     {
-        let guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            f(db)
-        };
-        // Release the store before `graph_err`, which takes the GIL. See
-        // [`GraphDb::with_scope`] for the inversion that rule prevents.
-        drop(guard);
+        // Released like `with_mut_unscoped`, so a read waiting for the store
+        // while a writer fsyncs does not hold the GIL against everyone else.
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let guard = lock(&self.inner.0)?;
+                let out = match guard.as_ref() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = f(db);
+                        drop(guard);
+                        out
+                    }
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let read = shared.read();
+                        f(&read)
+                    }
+                };
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
     }
 
@@ -2750,19 +2856,36 @@ impl GraphDb {
 
     fn with_scope<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T> + Send,
     {
-        let guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            match &self.scope {
-                Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
-                None => f(db, None),
-            }
+        // GIL released across the lock and the read, like `with_ref`; the
+        // guard is dropped before `graph_err` retakes it.
+        let scope = &self.scope;
+        let run = |db: &Db| match scope {
+            Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
+            None => f(db, None),
         };
-        drop(guard);
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let guard = lock(&self.inner.0)?;
+                let out = match guard.as_ref() {
+                    None => return Err(PyRuntimeError::new_err("GraphDb is closed")),
+                    Some(Store::Plain(db)) => {
+                        let out = run(db);
+                        drop(guard);
+                        out
+                    }
+                    Some(Store::Shared(shared)) => {
+                        let shared = shared.clone();
+                        drop(guard);
+                        let read = shared.read();
+                        run(&read)
+                    }
+                };
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
     }
 
@@ -2784,6 +2907,232 @@ impl GraphDb {
         let call = Scope::new(role.map(str::to_owned), namespace.map(str::to_owned), None)
             .map_err(graph_err)?;
         Ok(Some(handle.intersect(&call)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive transactions (0.10 TX-2b)
+// ---------------------------------------------------------------------------
+
+/// What a transaction runs on.
+enum TxBody {
+    /// The engine's transaction: writes buffer and commit as one WAL frame.
+    Full(Box<CoreTransaction>),
+    /// A scoped handle's read-only view of the store as it was at `begin`,
+    /// with the scope resolved to a mask once — the engine has no
+    /// scope-aware write path, and the HTTP and Bolt surfaces refuse here too.
+    Scoped {
+        snapshot: ReaderSnapshot,
+        mask: NodeMask,
+        /// The clock at BEGIN: what `.transaction()` reads in each statement.
+        clock_micros: i64,
+    },
+}
+
+fn scoped_body(db: &Db, scope: &Scope) -> core_api::Result<TxBody> {
+    let mask = scope.resolve(db)?;
+    Ok(TxBody::Scoped {
+        snapshot: db.reader(),
+        mask,
+        clock_micros: core_api::clock_micros(),
+    })
+}
+
+fn read_only_begin() -> PyErr {
+    ReadOnly::new_err(
+        "this handle is read-only and cannot begin a transaction; open the store without \
+         read_only=True",
+    )
+}
+
+fn transaction_finished() -> PyErr {
+    TransactionClosed::new_err(
+        "this transaction is finished: it was committed or rolled back; begin a new one",
+    )
+}
+
+/// A commit's engine error as its Python class: the conflict a retry fixes is
+/// `TransactionConflict`, everything else is what `graph_err` makes of it.
+fn commit_err(e: GraphError) -> PyErr {
+    match &e {
+        GraphError::CasConflict {
+            key,
+            expected,
+            actual,
+        } => Python::attach(|py| {
+            err_with(
+                py,
+                TransactionConflict::new_err(format!(
+                    "transaction conflict: {e}; nothing was written, retry the transaction"
+                )),
+                |v| {
+                    v.setattr("key", key.as_str())?;
+                    v.setattr("expected", *expected)?;
+                    v.setattr("actual", *actual)
+                },
+            )
+        }),
+        _ => graph_err(e),
+    }
+}
+
+struct TxState {
+    body: TxBody,
+    /// Released after `body`, which owns a clone of the store.
+    _claim: OpenClaim,
+}
+
+/// An open interactive transaction, from `db.begin_transaction()` or
+/// `with db.transaction() as tx:`.
+///
+/// One transaction used from two threads is serialised — the calls run one at
+/// a time, never together. Dropping it unfinished is a rollback.
+#[pyclass(name = "Transaction")]
+struct Transaction {
+    /// `None` once committed or rolled back.
+    state: Mutex<Option<TxState>>,
+}
+
+#[pymethods]
+impl Transaction {
+    /// Run one Cypher statement inside the transaction and return its rows, in
+    /// the shape `db.query` and `db.query_write` return.
+    ///
+    /// Reads see the store as it was when the transaction began plus this
+    /// transaction's own writes. Writes are buffered until `commit()`. A
+    /// statement that fails changes nothing and leaves the transaction usable.
+    /// Schema changes (`CREATE INDEX` and the like) are refused inside a
+    /// transaction.
+    ///
+    /// Raises `TransactionClosed` once the transaction is finished.
+    #[pyo3(
+        signature = (cypher, params = None),
+        text_signature = "($self, cypher, params=None)"
+    )]
+    fn execute(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let map = params_to_map(params)?;
+        // Released before waiting on the transaction's mutex, so a second
+        // thread queued behind a running statement does not hold the GIL
+        // against the thread whose statement it is waiting for.
+        let out = py.detach(|| -> PyResult<core_api::Result<ResultSet>> {
+            let mut guard = lock(&self.state)?;
+            let state = guard.as_mut().ok_or_else(transaction_finished)?;
+            match &mut state.body {
+                TxBody::Full(tx) => Ok(tx.execute(cypher, &map)),
+                TxBody::Scoped {
+                    snapshot,
+                    mask,
+                    clock_micros,
+                } => {
+                    match snapshot.query_masked_in_transaction(cypher, &map, mask, *clock_micros) {
+                        Err(GraphError::MaskedReadOnly) => Err(ReadOnly::new_err(
+                            "this transaction is on a scoped handle, and a scoped handle \
+                                 never writes; begin it on the handle scoped() was called on",
+                        )),
+                        other => Ok(other),
+                    }
+                }
+            }
+        })?;
+        let rs = out.map_err(graph_err)?;
+        result_set_to_rows(py, &rs)
+    }
+
+    /// Write the transaction's changes as one commit and return that commit's
+    /// number. A transaction that wrote nothing writes nothing and returns the
+    /// number of the commit it began on.
+    ///
+    /// The transaction is finished afterwards, whether or not this raised.
+    /// `TransactionConflict` means another writer changed a node it read or
+    /// wrote; nothing was written and running it again is safe.
+    #[pyo3(text_signature = "($self)")]
+    fn commit(&self, py: Python<'_>) -> PyResult<u64> {
+        let out = py.detach(|| -> PyResult<core_api::Result<u64>> {
+            let state = lock(&self.state)?.take().ok_or_else(transaction_finished)?;
+            Ok(match state.body {
+                TxBody::Full(tx) => (*tx).commit(),
+                TxBody::Scoped { snapshot, .. } => Ok(snapshot.version),
+            })
+        })?;
+        out.map_err(commit_err)
+    }
+
+    /// Discard the transaction's changes. Nothing reaches the store.
+    ///
+    /// Raises `TransactionClosed` if it is already finished.
+    #[pyo3(text_signature = "($self)")]
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| -> PyResult<()> {
+            let state = lock(&self.state)?.take().ok_or_else(transaction_finished)?;
+            drop(state);
+            Ok(())
+        })
+    }
+}
+
+impl Transaction {
+    fn is_finished(&self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| Ok(lock(&self.state)?.is_none()))
+    }
+}
+
+/// What `db.transaction()` returns: begins on `__enter__`, commits or rolls
+/// back on `__exit__`.
+#[pyclass(name = "TransactionContext")]
+struct TransactionContext {
+    handle: GraphDb,
+    entered: Mutex<Option<Py<Transaction>>>,
+}
+
+#[pymethods]
+impl TransactionContext {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<Py<Transaction>> {
+        let already_entered = || {
+            PyRuntimeError::new_err(
+                "this transaction block was already entered; call db.transaction() again",
+            )
+        };
+        if lock(&self.entered)?.is_some() {
+            return Err(already_entered());
+        }
+        // Begun before the slot is locked for good: `begin` releases the GIL,
+        // and a thread blocked on the slot with the GIL held would starve it.
+        let tx = Py::new(py, self.handle.begin(py)?)?;
+        let mut slot = lock(&self.entered)?;
+        if slot.is_some() {
+            return Err(already_entered());
+        }
+        *slot = Some(tx.clone_ref(py));
+        Ok(tx)
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Bound<'_, PyAny>,
+        _val: Bound<'_, PyAny>,
+        _tb: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let Some(tx) = lock(&self.entered)?.take() else {
+            return Ok(false);
+        };
+        let tx = tx.bind(py).borrow();
+        // The block may have finished it already.
+        if tx.is_finished(py)? {
+            return Ok(false);
+        }
+        if exc_type.is_none() {
+            tx.commit(py)?;
+        } else {
+            tx.rollback(py)?;
+        }
+        // Never swallows: the block's own exception, if any, propagates.
+        Ok(false)
     }
 }
 
@@ -2963,6 +3312,14 @@ fn graph_err(e: GraphError) -> PyErr {
             GraphError::Busy { holder } => err_with(py, MushroomBusy::new_err(msg), |v| {
                 v.setattr("holder", *holder)
             }),
+            // A deployment fault (the data directory's ownership or mount), not
+            // contention: retrying cannot help, so it must not be `MushroomBusy`.
+            GraphError::Unwritable { path, detail, .. } => {
+                err_with(py, Unwritable::new_err(msg), |v| {
+                    v.setattr("path", path.as_str())?;
+                    v.setattr("detail", detail.as_str())
+                })
+            }
             GraphError::NamespaceImmutable { key, from, to } => {
                 err_with(py, NamespaceImmutable::new_err(msg), |v| {
                     v.setattr("key", key.as_str())?;
@@ -2997,6 +3354,29 @@ fn graph_err(e: GraphError) -> PyErr {
                 v.setattr("floor_ms", *floor_ms)?;
                 v.setattr("floor_commit", *floor_commit)
             }),
+            GraphError::ConstraintViolation { constraint, field } => {
+                err_with(py, ConstraintViolation::new_err(msg), |v| {
+                    v.setattr("constraint", constraint.as_str())?;
+                    v.setattr("field", field.as_str())
+                })
+            }
+            GraphError::ConstraintCreationConflict { violations, total } => {
+                err_with(py, ConstraintCreationConflict::new_err(msg), |v| {
+                    let pairs = violations
+                        .iter()
+                        .map(|(key, value)| Ok((key.as_str(), value_to_py(py, value)?)))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    v.setattr("violations", pairs)?;
+                    v.setattr("total", *total)
+                })
+            }
+            GraphError::ValueTooLarge { field, size, limit } => {
+                err_with(py, ValueTooLarge::new_err(msg), |v| {
+                    v.setattr("field", field.as_str())?;
+                    v.setattr("size", *size)?;
+                    v.setattr("limit", *limit)
+                })
+            }
         }
     })
 }
@@ -3074,6 +3454,33 @@ fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {
     Ok(pred)
 }
 
+/// A query parameter. `None` binds as [`Value::Null`], at the top level and
+/// inside a list or dict, as a JSON null does over HTTP (QL-17i). Stored
+/// values keep going through [`py_to_value`], which has no null.
+fn py_to_param(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(py_to_param(&item)?);
+        }
+        return Ok(Value::List(out));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                PyTypeError::new_err("dict keys must be str to convert to Value::Map")
+            })?;
+            map.insert(key, py_to_param(&v)?);
+        }
+        return Ok(Value::Map(map));
+    }
+    py_to_value(obj)
+}
+
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyBool>() {
         return Ok(Value::Bool(obj.extract()?));
@@ -3089,6 +3496,38 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
     if obj.is_instance_of::<PyString>() {
         return Ok(Value::Str(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyBytes>() || obj.is_instance_of::<PyByteArray>() {
+        return Ok(Value::Binary(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyMemoryView>() {
+        return Ok(Value::Binary(obj.call_method0("tobytes")?.extract()?));
+    }
+    if let Ok(duration) = obj.extract::<Duration>() {
+        return Ok(Value::Duration {
+            months: duration.months,
+            days: duration.days,
+            nanos: duration.nanos,
+        });
+    }
+    let datetime = PyModule::import(obj.py(), "datetime")?;
+    // `datetime.datetime` is a `datetime.date`, so it is asked first.
+    if obj.is_instance(&datetime.getattr("datetime")?)? {
+        return datetime_from_py(obj);
+    }
+    if obj.is_instance(&datetime.getattr("date")?)? {
+        let days = days_from_civil(
+            obj.getattr("year")?.extract()?,
+            obj.getattr("month")?.extract()?,
+            obj.getattr("day")?.extract()?,
+        );
+        return Ok(Value::Date(days as i32));
+    }
+    if obj.is_instance(&datetime.getattr("timedelta")?)? {
+        return Err(PyTypeError::new_err(
+            "a datetime.timedelta cannot be stored: a Duration keeps months, days and nanoseconds \
+             apart, which a timedelta cannot express. Use mushroomdb.Duration(months=, days=, nanos=)",
+        ));
     }
     if let Ok(list) = obj.downcast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
@@ -3108,7 +3547,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Map(map));
     }
     Err(PyTypeError::new_err(format!(
-        "cannot convert {} to Value (need str, int, float, bool, list, or dict)",
+        "cannot convert {} to Value (need str, int, float, bool, bytes, date, datetime, Duration, list, or dict)",
         obj.get_type().name()?
     )))
 }
@@ -3133,7 +3572,210 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             }
             Ok(dict.into_any())
         }
+        Value::Binary(bytes) => Ok(pyo3::types::PyBytes::new(py, bytes).into_any()),
+        Value::Date(days) => {
+            let (year, month, day) = civil_from_days(i64::from(*days));
+            let year = python_year(year, "Date")?;
+            PyModule::import(py, "datetime")?
+                .getattr("date")?
+                .call1((year, month, day))
+        }
+        Value::LocalDateTime(micros) => datetime_to_py(py, *micros, None),
+        Value::DateTime {
+            micros_utc,
+            offset_seconds,
+        } => {
+            if offset_seconds.unsigned_abs() > MAX_OFFSET_SECONDS {
+                return Err(PyValueError::new_err(format!(
+                    "DateTime offset {offset_seconds}s is outside +-18:00"
+                )));
+            }
+            let local = micros_utc
+                .checked_add(i64::from(*offset_seconds) * MICROS_PER_SECOND)
+                .ok_or_else(|| {
+                    PyValueError::new_err("DateTime is outside Python's datetime range")
+                })?;
+            datetime_to_py(py, local, Some(*offset_seconds))
+        }
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        } => Ok(Bound::new(
+            py,
+            Duration {
+                months: *months,
+                days: *days,
+                nanos: *nanos,
+            },
+        )?
+        .into_any()),
+        // A null list element or map value.
+        Value::Null => Ok(py.None().into_bound(py)),
     }
+}
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
+/// The widest UTC offset a `DateTime` carries: 18:00.
+const MAX_OFFSET_SECONDS: u32 = 18 * 3600;
+
+/// A span of time as the engine keeps it: calendar months, days and
+/// nanoseconds, independent of each other. A month is not 30 days and a day is
+/// not 24 hours, which is why this is not `datetime.timedelta`.
+#[pyclass(name = "Duration", frozen, eq, hash, module = "mushroomdb")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Duration {
+    #[pyo3(get)]
+    months: i32,
+    #[pyo3(get)]
+    days: i32,
+    #[pyo3(get)]
+    nanos: i64,
+}
+
+#[pymethods]
+impl Duration {
+    #[new]
+    #[pyo3(signature = (months = 0, days = 0, nanos = 0))]
+    fn new(months: i32, days: i32, nanos: i64) -> Self {
+        Duration {
+            months,
+            days,
+            nanos,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Duration(months={}, days={}, nanos={})",
+            self.months, self.days, self.nanos
+        )
+    }
+}
+
+/// Proleptic Gregorian `(year, month, day)` of a day count since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u8;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u8;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Day count since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_index = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let day_of_year = (153 * month_index + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// `year` as a Python year, or a `ValueError` naming the type that has none.
+fn python_year(year: i64, type_name: &str) -> PyResult<i32> {
+    if (1..=9999).contains(&year) {
+        Ok(year as i32)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{type_name} has year {year}, outside Python's datetime range (years 1 to 9999)"
+        )))
+    }
+}
+
+/// A `datetime.datetime` for `local_micros` since 1970-01-01T00:00:00 of
+/// wall-clock time, with a fixed UTC offset when `offset_seconds` is given.
+fn datetime_to_py<'py>(
+    py: Python<'py>,
+    local_micros: i64,
+    offset_seconds: Option<i32>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let type_name = if offset_seconds.is_some() {
+        "DateTime"
+    } else {
+        "LocalDateTime"
+    };
+    let (year, month, day) = civil_from_days(local_micros.div_euclid(MICROS_PER_DAY));
+    let year = python_year(year, type_name)?;
+    let micros_of_day = local_micros.rem_euclid(MICROS_PER_DAY);
+    let seconds_of_day = micros_of_day / MICROS_PER_SECOND;
+    let micro = micros_of_day % MICROS_PER_SECOND;
+    let (hour, minute, second) = (
+        seconds_of_day / 3600,
+        seconds_of_day % 3600 / 60,
+        seconds_of_day % 60,
+    );
+    let datetime = PyModule::import(py, "datetime")?;
+    let tzinfo = match offset_seconds {
+        None => py.None().into_bound(py),
+        Some(seconds) => {
+            let delta = datetime
+                .getattr("timedelta")?
+                .call1((0, i64::from(seconds)))?;
+            datetime.getattr("timezone")?.call1((delta,))?
+        }
+    };
+    datetime
+        .getattr("datetime")?
+        .call1((year, month, day, hour, minute, second, micro, tzinfo))
+}
+
+/// The `Value` for a `datetime.datetime`: `LocalDateTime` when it is naive,
+/// `DateTime` with its offset when it is aware. Refuses a value the engine
+/// cannot hold exactly instead of rounding it.
+fn datetime_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let field = |name: &str| obj.getattr(name)?.extract::<i64>();
+    // A `pandas.Timestamp` is a `datetime` that also carries nanoseconds the
+    // `datetime` fields leave out. The engine holds microseconds, so a nonzero
+    // remainder is refused rather than rounded away.
+    if let Ok(nanos) = obj.getattr("nanosecond") {
+        if nanos.extract::<i64>().unwrap_or(0) != 0 {
+            return Err(PyValueError::new_err(
+                "datetime has a nonzero nanosecond part, which a DateTime or LocalDateTime \
+                 cannot hold exactly: it holds microseconds",
+            ));
+        }
+    }
+    let days = days_from_civil(field("year")?, field("month")? as u8, field("day")? as u8);
+    let local_micros = days
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|us| us.checked_add(field("hour").ok()? * 3600 * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("minute").ok()? * 60 * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("second").ok()? * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("microsecond").ok()?))
+        .ok_or_else(|| PyValueError::new_err("datetime is outside the engine's range"))?;
+    let offset = obj.call_method0("utcoffset")?;
+    if offset.is_none() {
+        return Ok(Value::LocalDateTime(local_micros));
+    }
+    let seconds = offset.getattr("days")?.extract::<i64>()? * 86_400
+        + offset.getattr("seconds")?.extract::<i64>()?;
+    if offset.getattr("microseconds")?.extract::<i64>()? != 0 {
+        return Err(PyValueError::new_err(
+            "datetime has a UTC offset with a fractional second, which a DateTime cannot hold exactly",
+        ));
+    }
+    if seconds.unsigned_abs() > u64::from(MAX_OFFSET_SECONDS) {
+        return Err(PyValueError::new_err(format!(
+            "datetime has UTC offset {seconds}s, outside the +-18:00 a DateTime holds"
+        )));
+    }
+    Ok(Value::DateTime {
+        micros_utc: local_micros - seconds * MICROS_PER_SECOND,
+        offset_seconds: seconds as i32,
+    })
 }
 
 /// A `serde_json::Value` as the object Python's `json.loads` would build:
@@ -3197,7 +3839,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
             let name: String = k.extract().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err("params dict keys must be str")
             })?;
-            map.insert(name, py_to_value(&v)?);
+            map.insert(name, py_to_param(&v)?);
         }
         return Ok(map);
     }
@@ -3216,7 +3858,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         return Ok(map);
@@ -3451,6 +4093,44 @@ fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>
     Ok(rows)
 }
 
+/// A value as the HTTP API writes it (`crates/server/src/json.rs`), so the two
+/// surfaces agree: scalars untagged, a non-finite float as `null`, and a
+/// temporal, duration or binary value as the tagged object `tagged_json`
+/// writes (`{"$date": "2024-01-15"}`). Never produces invalid JSON, and never
+/// goes through a Python `datetime`, so no engine value can abort an export.
+fn value_to_http_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as Js;
+    match v {
+        Value::Int(i) => Js::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Js::Null, Js::Number),
+        Value::Str(s) => Js::String(s.clone()),
+        Value::Bool(b) => Js::Bool(*b),
+        Value::List(xs) => Js::Array(xs.iter().map(value_to_http_json).collect()),
+        Value::Map(m) => Js::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), value_to_http_json(v)))
+                .collect(),
+        ),
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => core_api::tagged_json(v).ok().flatten().unwrap_or(Js::Null),
+        Value::Null => Js::Null,
+    }
+}
+
+fn arrow_schema<'py>(
+    pa: &Bound<'py, PyModule>,
+    fields: &[(&str, &Bound<'py, PyAny>)],
+) -> PyResult<Bound<'py, PyAny>> {
+    let list = PyList::empty(pa.py());
+    for (name, data_type) in fields {
+        list.append(pa.call_method1("field", (*name, *data_type))?)?;
+    }
+    pa.call_method1("schema", (list,))
+}
+
 fn node_info_to_py(py: Python<'_>, info: &NodeInfo) -> PyResult<Py<PyDict>> {
     let props = PyDict::new(py);
     for (k, v) in &info.props {
@@ -3519,6 +4199,24 @@ fn summary_to_py(py: Python<'_>, s: &PredicateSummary) -> PyResult<Py<PyDict>> {
     Ok(d.unbind())
 }
 
+/// Warn that a top-level memory method moved to `db.memory`.
+///
+/// Called from a method Python called directly, so the innermost Python frame
+/// is the caller's: `stacklevel=1` makes the warning name the caller's file
+/// and line, not this binding.
+fn warn_moved_to_memory(py: Python<'_>, name: &str) -> PyResult<()> {
+    let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
+    py.import("warnings")?.call_method1(
+        "warn",
+        (
+            format!("GraphDb.{name}() is deprecated; use db.memory.{name}() instead"),
+            category,
+            1i32,
+        ),
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Error classes — one per `GraphError` variant (v0.6.10 §5.7)
 // ---------------------------------------------------------------------------
@@ -3577,16 +4275,58 @@ engine_errors! {
     MaskedReadOnly, "masked_read_only", "A write statement reached a scoped or masked query path, which is read-only.";
     RoleWriteDenied, "role_write_denied", "A role-bound write was denied. Carries `.reason`, which is also the message.";
     MushroomBusy, "busy", "Another process holds the store's write lock.\n\nNothing was written, so retrying later is always safe. Raised only by write calls: opening read-only and reading never take the lock. Carries `.holder`, the holding process id when the platform makes it cheaply knowable and `None` otherwise — a diagnostic hint, never something to branch on.";
+    Unwritable, "unwritable", "The store's data directory is not writable by this process.\n\nThe filesystem refused permission (`EACCES`, `EPERM` or a read-only mount) on the directory or a file the store must create in it. This is a deployment fault, not contention: it is not `MushroomBusy`, and retrying cannot help until the directory's ownership or mount changes. The message names the path, the effective uid, the directory's owner and mode, and what to change. Carries `.path`, the file or directory refused, and `.detail`, which is also the message.";
     NamespaceImmutable, "namespace_immutable", "A namespace is set at insert and fixed for the node's lifetime. Carries `.key`, `.from_` (spelled with a trailing underscore: `from` is a Python keyword) and `.to`.";
     CrossNamespace, "cross_namespace", "A hand-written edge would cross a namespace boundary. Carries `.src`, `.src_ns`, `.dst`, `.dst_ns`.";
     CommitTimeNotMonotonic, "commit_time_not_monotonic", "An asserted commit time would move the store's recorded history backwards. Carries `.supplied_ms` and `.newest_ms`. Raised by `record_commits_at` only — the live clock is never held to this, so an NTP step backwards still commits. Backfill in chronological order.";
     NoRecordedTime, "no_recorded_time", "A date was given to a history call on a store that records no commit times.\n\nWritten by a release before 0.6.11, or its `commit_times.bin` sidecar was removed. The store is intact and every commit-indexed read still works; only date resolution is unavailable. Pass a commit index instead. Deliberately distinct from `Corrupt`: an absent map is not a damaged one.";
     TimeBeforeFloor, "time_before_floor", "The date predates the oldest commit time the store still records. Carries `.floor_ms` and `.floor_commit`, the oldest entry the map can answer from. Retrying with an earlier instant fails the same way.";
+    ConstraintViolation, "constraint_violation", "A write would give two live nodes the same value under a unique constraint. Carries `.constraint` and `.field`. Nothing was written.";
+    ConstraintCreationConflict, "constraint_creation_conflict", "A unique constraint cannot be declared because live nodes already share a value. Carries `.violations`, the first 100 `(node_key, value)` pairs in node-id order, and `.total`, how many nodes conflict.";
+    ValueTooLarge, "value_too_large", "A value is larger than the store accepts. Carries `.field`, `.size` and `.limit`, in bytes. Nothing was written.";
 }
+
+// Raised by the transaction surface, not by an engine variant: neither maps to
+// a `GraphError`, so they sit outside `engine_errors!`.
+
+pyo3::create_exception!(
+    mushroomdb,
+    TransactionClosed,
+    MushroomError,
+    "The transaction is finished: it was already committed or rolled back."
+);
+
+pyo3::create_exception!(
+    mushroomdb,
+    TransactionConflict,
+    CasConflict,
+    "A commit found that another writer changed a node this transaction read or wrote.\n\n\
+     Nothing was written, so running the transaction again from the start is always safe. \
+     A `CasConflict`, and carries its `.key`, `.expected` and `.actual`."
+);
 
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
+    m.add_class::<MemoryAccessor>()?;
+    m.add_class::<Duration>()?;
+    m.add_class::<Transaction>()?;
+    m.add_class::<TransactionContext>()?;
     register_errors(m)?;
+    for (name, code, ty) in [
+        (
+            "TransactionClosed",
+            "transaction_closed",
+            m.py().get_type::<TransactionClosed>(),
+        ),
+        (
+            "TransactionConflict",
+            "transaction_conflict",
+            m.py().get_type::<TransactionConflict>(),
+        ),
+    ] {
+        ty.setattr("code", code)?;
+        m.add(name, ty)?;
+    }
     Ok(())
 }

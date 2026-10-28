@@ -15,27 +15,44 @@ use crate::json::{
     params_from_json, parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace,
     stamp_namespace_row,
 };
-use crate::{AppState, AuthIdentity};
+use crate::{AppState, AuthIdentity, ReadOnlyKey};
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mushroomdb::{
-    is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
-    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig,
-    PropPredicate, ResultSet, SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
+    BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
+    PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SchemaError, SchemaErrorKind,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::{Display, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use tower_http::services::ServeDir;
 
-/// Build the HTTP router over `db`. Read endpoints take the read lock;
-/// `/ingest` takes the write lock. Guards are dropped before any `.await`.
+// The `/tx/*` routes and the open-transaction store. Declared here, not in
+// `lib.rs`, so the module reaches this file's private helpers (`graph_err`,
+// `forbidden`, ...) instead of widening each of them to `pub(crate)`.
+#[path = "tx.rs"]
+mod tx;
+pub(crate) use tx::TxStore;
+pub use tx::{TxLimits, TX_MAX_ENV, TX_MAX_LIFETIME_ENV, TX_TIMEOUT_ENV};
+
+/// Build the HTTP router over `db`. The graph read endpoints (`/query`,
+/// `/node/{key}`, its `/edges` and `/neighborhood`), `/health`, `/metrics` and
+/// `/algo/*` run on a lock-free [`ReaderSnapshot`], whose capture never waits
+/// behind a writer (see [`SharedDb::reader`]). `/stats`, `/explain`,
+/// `/suggest`, `/find_similar` and the history routes read the rule engine or
+/// the WAL and take the read lock; `/ingest` takes the write lock. Guards are
+/// dropped before any `.await`.
 /// `GET /watch` upgrades to a WebSocket fed by the post-commit sink.
 ///
 /// **Call at most once per [`SharedDb`].** A second call replaces the sink
@@ -52,7 +69,14 @@ use tower_http::services::ServeDir;
 /// (`query_write`, `/ingest`, `create_rule`) run in
 /// `tokio::task::spawn_blocking` and drop the write guard before `.await`.
 /// Reads stay on the worker (neighborhood is µs). `suggest` and `algo`
-/// already use the blocking pool.
+/// already use the blocking pool. A live (non-`as_of`) graph read holds no
+/// guard while it executes, so a long read never holds the writer up, and an
+/// indexed equality lookup is served from the snapshot's own index.
+///
+/// Every `router_*` entry point reads `MUSHROOMDB_CORS_ORIGINS` (except
+/// [`router_with_cors`], which takes the layer explicitly). Fail-fast on an
+/// invalid value holds only for the CLI; a library caller gets CORS off and an
+/// error log. Validate with [`crate::cors_layer_from_env`] first to fail early.
 pub fn router(db: SharedDb) -> Router {
     router_with_auth(db, None)
 }
@@ -70,6 +94,96 @@ pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
         UiFallback::None,
         default_advertise_addr(),
         false,
+    )
+}
+
+/// [`router_with_auth`] whose `GET /ready` follows `ready`: 503 while it is
+/// false, 200 once it is true. Every other router is ready as soon as it is built.
+pub fn router_with_ready_flag(
+    db: SharedDb,
+    token: Option<String>,
+    ready: Arc<AtomicBool>,
+) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        ready,
+        None,
+    )
+}
+
+/// [`router_with_role_tokens`] plus the `keys.json` set (see [`AccessKeys`]).
+///
+/// An `admin` key is full access, a `write` key may mutate but is refused
+/// `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`, and a `read` key
+/// is the role it names. The env token and `role_tokens` keep working beside
+/// them. `keys` is shared, so a reload of it (see [`crate::watch_sighup`])
+/// reaches every router built from it.
+pub fn router_with_access_keys(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    keys: AccessKeys,
+) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        Some(keys),
+    )
+}
+
+/// [`router_with_auth`] with an explicit CORS layer (see [`crate::parse_cors_origins`]).
+/// `None` adds no CORS headers. The other routers read `MUSHROOMDB_CORS_ORIGINS`
+/// instead; this one ignores the environment.
+pub fn router_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Router {
+    build_app_with_cors(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        cors,
+        None,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`router_with_access_keys`] with the open-transaction limits given instead
+/// of read from `MUSHROOMDB_TX_MAX` and `MUSHROOMDB_TX_TIMEOUT_SECS`. For an
+/// embedder that serves several routers, and for tests that need a short idle
+/// timeout.
+pub fn router_with_tx_limits(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    keys: Option<AccessKeys>,
+    limits: TxLimits,
+) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        keys,
+        TxStore::new(limits),
     )
 }
 
@@ -215,6 +329,9 @@ pub async fn serve(
         token,
         HashMap::new(),
         None,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -230,7 +347,19 @@ pub async fn serve_with_role_tokens(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None, token, role_tokens, None).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::None,
+        token,
+        role_tokens,
+        None,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
+    )
+    .await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -257,6 +386,9 @@ pub async fn serve_with_ui(
         token,
         HashMap::new(),
         None,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -278,6 +410,9 @@ pub async fn serve_with_ui_and_role_tokens(
         token,
         role_tokens,
         None,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -302,6 +437,9 @@ pub async fn serve_with_embedded_ui(
         token,
         role_tokens,
         None,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -334,6 +472,9 @@ pub async fn serve_with_shutdown(
         token,
         HashMap::new(),
         Some(shutdown),
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
     )
     .await
 }
@@ -347,6 +488,33 @@ pub async fn serve_with_role_tokens_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
+    )
+    .await
+}
+
+/// [`serve_with_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -355,6 +523,9 @@ pub async fn serve_with_role_tokens_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
+        keys,
+        tx_limits,
     )
     .await
 }
@@ -369,6 +540,35 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        ui_dir,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
+    )
+    .await
+}
+
+/// [`serve_with_ui_and_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -377,6 +577,9 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
+        keys,
+        tx_limits,
     )
     .await
 }
@@ -391,6 +594,34 @@ pub async fn serve_with_embedded_ui_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_embedded_ui_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
+    )
+    .await
+}
+
+/// [`serve_with_embedded_ui_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "embed-ui")]
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -399,6 +630,9 @@ pub async fn serve_with_embedded_ui_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
+        keys,
+        tx_limits,
     )
     .await
 }
@@ -410,6 +644,7 @@ enum UiFallback {
     Embedded,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     db: SharedDb,
     addr: SocketAddr,
@@ -418,6 +653,9 @@ async fn serve_inner(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -425,7 +663,18 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, role_tokens, ui, local, false);
+    let txs = TxStore::new(tx_limits);
+    let app = build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        local,
+        false,
+        ready_flag,
+        keys,
+        txs.clone(),
+    );
     match shutdown {
         None => axum::serve(listener, app).await,
         // Stop accepting, then let every request already in flight finish.
@@ -435,6 +684,9 @@ async fn serve_inner(
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.await;
+                    // The start of the drain: open transactions roll back and
+                    // a new `begin` is refused.
+                    txs.close();
                 })
                 .await
         }
@@ -458,9 +710,7 @@ pub async fn serve_tls(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let config = crate::tls::http_rustls_config(&cert_path, &key_path)?;
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
@@ -481,6 +731,7 @@ pub async fn serve_tls(
 /// listener is closed regardless; an unbounded grace period would let one
 /// stuck request hold a restart open forever.
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_tls_with_shutdown(
     db: SharedDb,
     addr: SocketAddr,
@@ -491,21 +742,63 @@ pub async fn serve_tls_with_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    serve_tls_with_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        cert_path,
+        key_path,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+        None,
+        TxLimits::from_env(),
+    )
+    .await
+}
+
+/// [`serve_tls_with_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls_with_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    tx_limits: TxLimits,
+) -> std::io::Result<()> {
+    let config = crate::tls::http_rustls_config(&cert_path, &key_path)?;
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     if ready.send(local).is_err() {
         eprintln!("serve_tls: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, role_tokens, UiFallback::None, local, true);
+    let txs = TxStore::new(tx_limits);
+    let app = build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        local,
+        true,
+        ready_flag,
+        keys,
+        txs.clone(),
+    );
     let handle = axum_server::Handle::new();
     tokio::spawn({
         let handle = handle.clone();
         async move {
             let _ = shutdown.await;
+            txs.close();
             handle.graceful_shutdown(Some(TLS_GRACE));
         }
     });
@@ -532,6 +825,91 @@ fn build_app(
     addr: SocketAddr,
     tls_active: bool,
 ) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        Arc::new(AtomicBool::new(true)),
+        None,
+    )
+}
+
+/// Reads `MUSHROOMDB_CORS_ORIGINS`. An invalid value does not fail here: the CLI
+/// validates before opening the store; other callers get CORS off plus an error log.
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_ready(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+) -> Router {
+    build_app_with_ready_and_txs(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        ready,
+        keys,
+        TxStore::new(TxLimits::from_env()),
+    )
+}
+
+/// [`build_app_with_ready`] over a transaction store the caller holds, so the
+/// serve loop can close it when the shutdown signal arrives.
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_ready_and_txs(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    keys: Option<AccessKeys>,
+    txs: TxStore,
+) -> Router {
+    // The CLI validates the variable before it opens the store; an invalid value
+    // reaching here (library use) fails closed: no CORS, and an error logged.
+    let cors = crate::cors::cors_layer_from_env().unwrap_or_else(|e| {
+        tracing::error!("{e}; CORS disabled");
+        None
+    });
+    build_app_with_cors(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        ready,
+        cors,
+        keys,
+        txs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    cors: Option<tower_http::cors::CorsLayer>,
+    keys: Option<AccessKeys>,
+    txs: TxStore,
+) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
         "router() must be called at most once per SharedDb; a second call \
@@ -553,10 +931,27 @@ fn build_app(
         addr,
         tls_active,
         started_at: std::time::Instant::now(),
+        started_unix_s: unix_seconds_now(),
+        ready,
+        access_keys: keys,
+        txs,
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready_handler))
         .route("/query", post(query))
+        .route("/schema/indexes", get(schema_indexes_list))
+        .route("/schema/indexes", post(schema_index_create))
+        .route(
+            "/schema/indexes/{name}",
+            axum::routing::delete(schema_index_drop),
+        )
+        .route("/schema/constraints", get(schema_constraints_list))
+        .route("/schema/constraints", post(schema_constraint_create))
+        .route(
+            "/schema/constraints/{name}",
+            axum::routing::delete(schema_constraint_drop),
+        )
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/ingest", post(ingest))
@@ -594,6 +989,7 @@ fn build_app(
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
         .route("/backup", post(backup))
+        .merge(tx::routes())
         .with_state(state.clone());
 
     // The two WebSocket routes are built separately and merged unlayered: a
@@ -645,14 +1041,23 @@ fn build_app(
         #[cfg(feature = "embed-ui")]
         UiFallback::Embedded => app.fallback(embedded_fallback),
     };
-    app.layer(middleware::from_fn_with_state(state, auth_middleware))
+    let app = app
+        .layer(middleware::from_fn_with_state(state, auth_middleware))
         // Outside auth, so a 401 is logged too — an unauthenticated flood is
         // exactly the thing an operator needs to see.
         .layer(middleware::from_fn(log_middleware))
         // Cap request bodies (default axum limit is only 2 MiB; we allow larger
         // ingest batches but reject multi-GB bodies that would OOM the collector
         // before any handler runs).
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
+    // Outermost: a preflight is answered here, before auth (it carries no
+    // credentials), and a 401 still gets CORS headers so a page can read it.
+    match cors {
+        Some(cors) => app
+            .layer(cors)
+            .layer(middleware::from_fn(crate::cors::strip_unless_allowed)),
+        None => app,
+    }
 }
 
 /// Maximum accepted HTTP request body size (64 MiB). Large enough for batched
@@ -755,6 +1160,18 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// plausible operator workload and well below what would exhaust the process.
 const MAX_CONCURRENT_REQUESTS: usize = 256;
 
+/// Readiness for a container platform. Needs no token and says nothing about
+/// the graph.
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    if state.ready.load(Ordering::Acquire) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        let mut response = json_ok(json!({ "ok": false, "reason": "not ready" }));
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        response
+    }
+}
+
 async fn health(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -766,11 +1183,7 @@ async fn health(
     if !matches!(identity, AuthIdentity::Full) {
         return json_ok(json!({ "ok": true }));
     }
-    let (nodes, edges) = {
-        let g = state.db.read();
-        let s = g.stats();
-        (s.nodes_live, s.edges)
-    };
+    let (nodes, _, edges) = state.db.reader().counts();
     json_ok(json!({
         "ok": true,
         "nodes": nodes,
@@ -786,9 +1199,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
 {
+    blocking_write_with(f, graph_err).await
+}
+
+/// [`blocking_write`] with the engine error answered by `on_err`.
+async fn blocking_write_with<T, F>(
+    f: F,
+    on_err: fn(GraphError) -> Response,
+) -> std::result::Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(graph_err(e)),
+        Ok(Err(e)) => Err(on_err(e)),
         Err(_) => Err(err_response("write task panicked")),
     }
 }
@@ -797,7 +1222,11 @@ const TOKEN_COOKIE: &str = "mushroomdb_token";
 
 async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     // No auth configured at all: every request is Full, no restriction.
-    if state.token.is_none() && state.role_tokens.is_empty() {
+    let keys_enforce = state
+        .access_keys
+        .as_ref()
+        .is_some_and(AccessKeys::enforcing);
+    if state.token.is_none() && state.role_tokens.is_empty() && !keys_enforce {
         req.extensions_mut().insert(AuthIdentity::Full);
         return next.run(req).await;
     }
@@ -814,13 +1243,21 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
     // token was refused the same counters by `/metrics` and `/stats` on the
     // stated grounds that counters leak graph size. Two endpoints, one
     // disclosure, opposite policies.
+    if req.method() == Method::GET && req.uri().path() == "/ready" {
+        req.extensions_mut().insert(AuthIdentity::Anonymous);
+        return next.run(req).await;
+    }
     if req.method() == Method::GET && req.uri().path() == "/health" {
         let full = state
             .token
             .clone()
             .filter(|s| !s.is_empty())
             .zip(presented.as_deref())
-            .is_some_and(|(tok, p)| constant_time_eq(p.as_bytes(), tok.as_bytes()));
+            .is_some_and(|(tok, p)| constant_time_eq(p.as_bytes(), tok.as_bytes()))
+            || presented
+                .as_deref()
+                .zip(state.access_keys.as_ref())
+                .is_some_and(|(p, keys)| keys.resolve(p) == Some(KeyTier::Admin));
         req.extensions_mut().insert(if full {
             AuthIdentity::Full
         } else {
@@ -847,7 +1284,7 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
 
     // Check role-bound tokens.
     if let Some(tok) = presented.as_deref() {
-        if let Some(role_name) = state.role_tokens.get(tok) {
+        if let Some(role_name) = role_for_token(&state.role_tokens, tok) {
             // Early-deny paths whose handlers use WebSocket upgrade: the WS
             // extraction consumes the request before the handler body runs, so
             // the handler-level identity check is unreachable in those cases.
@@ -863,9 +1300,83 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
         }
     }
 
+    // Check the keys.json set. `resolve` compares every key in constant time.
+    if let Some(tier) = presented
+        .as_deref()
+        .zip(state.access_keys.as_ref())
+        .and_then(|(tok, keys)| keys.resolve(tok))
+    {
+        let path = req.uri().path();
+        let ws_path = path == "/subscribe" || path == "/watch";
+        match tier {
+            KeyTier::Admin => {
+                let set_cookie = presented_bearer_or_query(&req);
+                req.extensions_mut().insert(AuthIdentity::Full);
+                let mut res = next.run(req).await;
+                if let Some(token) = set_cookie.filter(|_| is_html_response(&res)) {
+                    attach_token_cookie(&mut res, &token, state.tls_active);
+                }
+                return res;
+            }
+            KeyTier::Write => {
+                // The WS extractor runs before the handler body, so these
+                // are refused here as well as in the handlers.
+                if ws_path {
+                    return forbidden(WRITE_TIER_REFUSAL);
+                }
+                req.extensions_mut().insert(AuthIdentity::Write);
+                return next.run(req).await;
+            }
+            KeyTier::Read(role_name) => {
+                if ws_path {
+                    return forbidden("role-bound token: this endpoint is not permitted");
+                }
+                // A role may carry a write scope; a read key never writes.
+                if !read_key_may(req.method(), path) {
+                    return forbidden(READ_TIER_REFUSAL);
+                }
+                req.extensions_mut().insert(AuthIdentity::Role(role_name));
+                req.extensions_mut().insert(ReadOnlyKey);
+                return next.run(req).await;
+            }
+        }
+    }
+
     // Nothing matched → 401.
     unauthorized()
 }
+
+/// The role bound to `presented`, comparing it with every role token in
+/// constant time (a hash-map lookup would stop at the first difference).
+fn role_for_token<'a>(
+    role_tokens: &'a HashMap<String, String>,
+    presented: &str,
+) -> Option<&'a String> {
+    let mut found = None;
+    for (token, role) in role_tokens {
+        if constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+            found = Some(role);
+        }
+    }
+    found
+}
+
+/// Whether a read-tier key may make this request at all. An allowlist, so a
+/// route added later is refused to read keys until someone decides otherwise:
+/// reads (`GET`), the two `POST` routes that carry a read (`/query`, whose
+/// handler refuses a write statement, and `/find_similar`), and the `/tx/*`
+/// routes: a read key may hold a transaction, whose handler refuses a write.
+fn read_key_may(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::GET | Method::HEAD => true,
+        Method::POST => path == "/query" || path == "/find_similar" || path.starts_with("/tx/"),
+        Method::DELETE => path.starts_with("/tx/"),
+        _ => false,
+    }
+}
+
+/// The 403 detail a read-tier key gets on a write.
+pub(crate) const READ_TIER_REFUSAL: &str = "read-tier key: writes are not permitted";
 
 fn request_token(req: &Request) -> Option<String> {
     presented_bearer_or_query(req).or_else(|| presented_cookie(req))
@@ -992,6 +1503,14 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// The 403 detail a write-tier key gets on an operator route.
+pub(crate) const WRITE_TIER_REFUSAL: &str = "write-tier token: route not allowed";
+
+/// 403 for a write-tier key on a route that is for operators.
+pub(crate) fn refuse_write_tier(identity: &AuthIdentity) -> Option<Response> {
+    matches!(identity, AuthIdentity::Write).then(|| forbidden(WRITE_TIER_REFUSAL))
+}
+
 /// 403 response for role-bound token operations that are denied in v1.
 fn forbidden(detail: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": detail}))).into_response()
@@ -1011,6 +1530,18 @@ fn role_mask_err(e: GraphError) -> Response {
             Json(json!({"error": format!("roles misconfigured: {detail}")})),
         )
             .into_response(),
+        GraphError::KeyNotFound { key } if key.starts_with("role:") => unauthorized(),
+        other => graph_err(other),
+    }
+}
+
+/// Convert a role-scoped write's error into an HTTP response: a role the
+/// store no longer defines is 401, as it is for a read (`role_mask_err`) and
+/// over Bolt; anything else is [`graph_err`]. Unlike `role_mask_err`, a
+/// `Corrupt` keeps `graph_err`'s text, since on the write path it need not be
+/// about roles.
+fn role_write_err(e: GraphError) -> Response {
+    match e {
         GraphError::KeyNotFound { key } if key.starts_with("role:") => unauthorized(),
         other => graph_err(other),
     }
@@ -1060,6 +1591,32 @@ fn graph_err(e: GraphError) -> Response {
         }
         // Transient: another process holds the cross-process write lock.
         busy @ GraphError::Busy { .. } => busy_response(busy.to_string()),
+        // The data directory is not writable by the server's user. That is the
+        // operator's to fix and no request can change it, so it is a 500, not
+        // the 400 the catch-all would give. The full message (paths, uids) goes
+        // to the log; the client gets a fixed one.
+        GraphError::Unwritable { path, detail, .. } => {
+            tracing::error!(path = %path, "{detail}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": GraphError::UNWRITABLE_CLIENT_MESSAGE })),
+            )
+                .into_response()
+        }
+        // A unique-constraint clash is a conflict with stored state, like a
+        // duplicate key. The text names the constraint and field only.
+        clash @ GraphError::ConstraintViolation { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": clash.to_string(), "code": "constraint" })),
+        )
+            .into_response(),
+        // A value over the store's size limit: the request is too large for
+        // what it stores, not malformed.
+        big @ GraphError::ValueTooLarge { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "error": big.to_string() })),
+        )
+            .into_response(),
         other => err_response(other.to_string()),
     }
 }
@@ -1139,6 +1696,7 @@ fn format_query_result(rs: ResultSet, format: &str) -> Response {
 async fn query(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
+    read_only_key: Option<Extension<ReadOnlyKey>>,
     Query(qs): Query<BTreeMap<String, String>>,
     Json(body): Json<Js>,
 ) -> Response {
@@ -1207,6 +1765,9 @@ async fn query(
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
+        if is_write && read_only_key.is_some() {
+            return forbidden(READ_TIER_REFUSAL);
+        }
         if as_of.is_some() && is_write {
             return err_response("as_of (time-travel) queries are read-only");
         }
@@ -1230,9 +1791,10 @@ async fn query(
             let cypher_c = cypher.clone();
             let params_c = params.clone();
             let db = state.db.clone();
-            return match blocking_write(move || {
-                db.write().query_write_authz(&role, &cypher_c, &params_c)
-            })
+            return match blocking_write_with(
+                move || db.write().query_write_authz(&role, &cypher_c, &params_c),
+                role_write_err,
+            )
             .await
             {
                 Ok(rs) => format_query_result(rs, format),
@@ -1293,8 +1855,8 @@ async fn query(
     // Full token: existing paths below.
 
     // When a client-supplied mask is present, route to query_masked (read-only).
-    // Hold a single read guard for both from_keys and query_masked so the mask
-    // and the query execute on the same database snapshot.
+    // The mask and query_masked resolve against one snapshot so the mask and
+    // the query see the same graph.
     //
     // `stub_hidden: true` opts into MaskMode::Stub for the mask; Cypher query
     // behaviour is identical in both modes (hidden nodes are excluded from
@@ -1329,38 +1891,42 @@ async fn query(
             .get("stub_hidden")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let db = state.db.read();
-        let mask = {
-            let m = match (&mask_keys, namespace.as_deref()) {
-                (Some(keys), Some(ns)) => {
-                    NodeMask::from_keys(&*db, keys.iter().map(String::as_str))
-                        .intersect(&db.mask_for_namespace(ns))
-                }
-                (Some(keys), None) => NodeMask::from_keys(&*db, keys.iter().map(String::as_str)),
-                (None, Some(ns)) => db.mask_for_namespace(ns),
-                (None, None) => unreachable!("one of the two is Some in this branch"),
-            };
+        let with_mode = |m: NodeMask| {
             if stub_hidden {
                 m.with_mode(MaskMode::Stub)
             } else {
                 m
             }
         };
-        return match db.query_masked(&cypher, &params, &mask) {
-            Ok(rs) => format_query_result(rs, format),
-            Err(GraphError::MaskedReadOnly) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "masked queries are read-only"})),
-            )
-                .into_response(),
-            Err(e) => graph_err(e),
+        // The mask and the query resolve against one lock-free snapshot, so
+        // they see the same graph without holding the read lock for the query.
+        let snap = state.db.reader();
+        let key_mask = mask_keys
+            .as_ref()
+            .map(|keys| snapshot_mask_from_keys(&snap, keys.iter().map(String::as_str)));
+        let mask = match (key_mask, namespace.as_deref()) {
+            (Some(keys), Some(ns)) => match snap.mask_for_namespace(ns) {
+                Ok(ns_mask) => keys.intersect(&ns_mask),
+                Err(e) => return graph_err(e),
+            },
+            (Some(keys), None) => keys,
+            (None, Some(ns)) => match snap.mask_for_namespace(ns) {
+                Ok(ns_mask) => ns_mask,
+                Err(e) => return graph_err(e),
+            },
+            (None, None) => unreachable!("one of the two is Some in this branch"),
         };
+        return masked_query_response(
+            snap.query_masked(&cypher, &params, &with_mode(mask)),
+            format,
+        );
     }
 
     // Detect write statements to dispatch to the correct lock.
     // Write statements (CREATE / MATCH…SET / MATCH…DELETE / MERGE) need the
     // write lock so mutations flow through WAL + rule engine with fsync before
-    // the response is sent.  Read queries (MATCH … RETURN …) use the read lock.
+    // the response is sent.  Read queries (MATCH … RETURN …) use the
+    // lock-free reader (see `read_query`).
     let is_write = match is_write_query(&cypher) {
         Ok(b) => b,
         Err(e) => return err_response(e),
@@ -1382,13 +1948,331 @@ async fn query(
             Err(e) => return graph_err(e),
         }
     } else {
-        match state.db.read().query(&cypher, &params) {
+        match read_query(&state.db, &cypher, &params) {
             Ok(rs) => rs,
             Err(e) => return graph_err(e),
         }
     };
 
     format_query_result(rs, format)
+}
+
+// ── /schema/indexes and /schema/constraints (TY-11) ─────────────────────────
+//
+// Each route runs what the matching Cypher DDL statement runs
+// (`GraphDb::schema_*`, `SHOW …`), so HTTP, Cypher and the CLI cannot
+// disagree: a row has the fields and values `SHOW` gives it, a role-bound
+// caller sees what its `SHOW` shows, and a write is refused to the callers a
+// DDL write is refused to.
+
+/// The rows of `SHOW INDEXES` / `SHOW CONSTRAINTS` as objects, narrowed to
+/// what `identity` can see exactly as the same statement through `/query` is.
+fn schema_listing_response(state: &AppState, identity: &AuthIdentity, statement: &str) -> Response {
+    let params = BTreeMap::new();
+    let rs = match identity {
+        AuthIdentity::Role(role_name) => {
+            let snap = state.db.reader();
+            let role_mask = match snap.mask_for_role(role_name) {
+                Ok(m) => m,
+                Err(e) => return role_mask_err(e),
+            };
+            snap.query_masked(statement, &params, &role_mask)
+        }
+        AuthIdentity::Full | AuthIdentity::Write => state.db.reader().query(statement, &params),
+        AuthIdentity::Anonymous => return forbidden("this endpoint requires a token"),
+    };
+    let rs = match rs {
+        Ok(rs) => rs,
+        Err(e) => return graph_err(e),
+    };
+    let columns: Vec<&String> = rs.columns().iter().collect();
+    let rows: Vec<Js> = (0..rs.len())
+        .map(|i| {
+            let obj: serde_json::Map<String, Js> = columns
+                .iter()
+                .zip(rs.row(i))
+                .map(|(col, cell)| {
+                    let v = cell.as_ref().map_or(Js::Null, crate::json::value_to_json);
+                    ((*col).clone(), v)
+                })
+                .collect();
+            Js::Object(obj)
+        })
+        .collect();
+    json_ok(Js::Array(rows))
+}
+
+async fn schema_indexes_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW INDEXES")
+}
+
+async fn schema_constraints_list(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    schema_listing_response(&state, &identity, "SHOW CONSTRAINTS")
+}
+
+/// 403 for a role-bound token on a schema write, as a DDL statement gives it.
+const SCHEMA_ROLE_REFUSAL: &str =
+    "role-bound token: schema statements (CREATE/DROP INDEX, CREATE/DROP \
+     CONSTRAINT) are not permitted";
+
+/// The refusal a schema write gets for `identity`, if any. A read-tier key never
+/// reaches here (the auth middleware refuses it first), but carries a role.
+fn refuse_schema_write(identity: &AuthIdentity) -> Option<Response> {
+    match identity {
+        AuthIdentity::Role(_) => Some(forbidden(SCHEMA_ROLE_REFUSAL)),
+        AuthIdentity::Anonymous => Some(forbidden("this endpoint requires a token")),
+        AuthIdentity::Full | AuthIdentity::Write => None,
+    }
+}
+
+/// A schema write's error as HTTP, by the kind the engine decided from the
+/// state it found: a name nothing answers to is 404, a collision with what
+/// exists (a taken name or pair, an index a constraint backs, existing
+/// duplicates, a view-owned property) is 409, and a malformed request is 400.
+fn schema_err(e: SchemaError) -> Response {
+    let status = match e.kind {
+        SchemaErrorKind::NotFound => StatusCode::NOT_FOUND,
+        SchemaErrorKind::Conflict => StatusCode::CONFLICT,
+        SchemaErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        SchemaErrorKind::Other => return graph_err(e.error),
+    };
+    let detail = match e.error {
+        GraphError::QueryError { detail } | GraphError::RuleInvalid { detail } => detail,
+        other => other.to_string(),
+    };
+    (status, Json(json!({ "error": detail }))).into_response()
+}
+
+/// The refusal for a schema body that is not an object, or carries a field
+/// outside `allowed`, naming it.
+fn schema_body_check(body: &Js, allowed: &[&str]) -> std::result::Result<(), String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "the body must be a JSON object".to_string())?;
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(unknown) => Err(format!(
+            "unknown field '{unknown}'; this route takes: {}",
+            allowed.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A required, non-empty string field of a schema request body.
+fn schema_text<'a>(body: &'a Js, field: &str) -> std::result::Result<&'a str, String> {
+    match body.get(field).and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(format!(
+            "{field} is required and must be a non-empty string"
+        )),
+    }
+}
+
+/// An optional `name`: absent or null is `None`; otherwise it must be an
+/// identifier, so every surface (HTTP path, Cypher `DROP INDEX name`) can
+/// address it.
+fn schema_name(body: &Js) -> std::result::Result<Option<&str>, String> {
+    match body.get("name") {
+        None | Some(Js::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some(s) if is_schema_identifier(s) => Ok(Some(s)),
+            _ => Err(
+                "name must be a string of letters, digits and underscores, not starting with a digit"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn is_schema_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+async fn schema_index_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "kind"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    let name = match schema_name(&body) {
+        Ok(n) => n.map(str::to_string),
+        Err(e) => return err_response(e),
+    };
+    let kind =
+        match body.get("kind") {
+            None | Some(Js::Null) => "range",
+            Some(v) => match v.as_str() {
+                Some(k @ ("range" | "equality")) => k,
+                _ => return err_response(
+                    "kind must be \"range\" or \"equality\"; full-text indexes are not created \
+                     over this route",
+                ),
+            },
+        };
+    let kind = kind.to_string();
+    let db = state.db.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        let mut g = db.write();
+        match kind.as_str() {
+            "equality" => g.schema_create_equality_index(name.as_deref(), &label, &property),
+            _ => g.schema_create_range_index(name.as_deref(), &label, &property),
+        }
+        .map(|listed| (listed, kind, label, property))
+    })
+    .await;
+    match created {
+        Ok(Ok((listed, kind, label, property))) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": listed, "type": kind, "label": label,
+                "property": property, "state": "online"
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_index_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_index(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_create(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    if let Err(e) = schema_body_check(&body, &["name", "label", "property", "type"]) {
+        return err_response(e);
+    }
+    let (label, property) = match (schema_text(&body, "label"), schema_text(&body, "property")) {
+        (Ok(l), Ok(p)) => (l.to_string(), p.to_string()),
+        (Err(e), _) | (_, Err(e)) => return err_response(e),
+    };
+    // A constraint needs a name (Cypher DDL requires one), so there is none to invent.
+    let name = match schema_name(&body) {
+        Ok(Some(n)) => n.to_string(),
+        Ok(None) => return err_response("name is required for a constraint"),
+        Err(e) => return err_response(e),
+    };
+    match body.get("type") {
+        None | Some(Js::Null) => {}
+        Some(v) if v.as_str() == Some("unique") => {}
+        Some(_) => return err_response("type must be \"unique\", the only constraint type"),
+    }
+    let db = state.db.clone();
+    let reply = json!({
+        "name": name, "type": "unique", "label": label, "property": property
+    });
+    match tokio::task::spawn_blocking(move || {
+        db.write()
+            .schema_create_constraint(&name, &label, &property)
+    })
+    .await
+    {
+        Ok(Ok(())) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+async fn schema_constraint_drop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(refusal) = refuse_schema_write(&identity) {
+        return refusal;
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.write().schema_drop_constraint(&name)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => schema_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+/// An unmasked, live (non-`as_of`) read query, on the lock-free reader. An
+/// equality lookup on a declared index is served from the snapshot's own
+/// index, so this holds for indexed stores too.
+fn read_query(
+    db: &SharedDb,
+    cypher: &str,
+    params: &BTreeMap<String, Value>,
+) -> mushroomdb::Result<ResultSet> {
+    db.reader().query(cypher, params)
+}
+
+/// The response for a full-token masked `/query`, from either path.
+fn masked_query_response(out: mushroomdb::Result<ResultSet>, format: &str) -> Response {
+    match out {
+        Ok(rs) => format_query_result(rs, format),
+        Err(GraphError::MaskedReadOnly) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "masked queries are read-only"})),
+        )
+            .into_response(),
+        Err(e) => graph_err(e),
+    }
+}
+
+/// [`NodeMask::from_keys`] against a snapshot: keys it does not hold are
+/// ignored, and the mode is `Omit`.
+fn snapshot_mask_from_keys<'a>(
+    snap: &ReaderSnapshot,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> NodeMask {
+    NodeMask::from_ids(keys.into_iter().filter_map(|k| snap.resolve_key(k)))
+}
+
+/// The client mask a full-token `/node/*` route reads from `mask=` and
+/// `stub_hidden=`, resolved against `snap`.
+fn snapshot_client_mask(snap: &ReaderSnapshot, mask_param: &str, stub_hidden: bool) -> NodeMask {
+    let keys = mask_param
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let m = snapshot_mask_from_keys(snap, keys);
+    if stub_hidden {
+        m.with_mode(MaskMode::Stub)
+    } else {
+        m
+    }
 }
 
 /// `GET /stats` — store-wide counts, including the `namespaces` roster.
@@ -1408,6 +2292,9 @@ async fn stats(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /stats requires a full-access token");
     }
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
+    }
     let snap = {
         let g = state.db.read();
         g.stats()
@@ -1418,22 +2305,322 @@ async fn stats(
     }
 }
 
+/// The continuous-backup counters `GET /metrics` reports as
+/// `mushroomdb_backup_*`. The serve loop registers them with
+/// [`register_backup_metrics`] when backup is configured; without that, no
+/// backup series is emitted at all (absent, not zero, so an alert on
+/// `mushroomdb_backup_lag_seconds` cannot be satisfied by a store that was
+/// never backed up).
+#[derive(Debug, Clone)]
+pub struct BackupMetrics {
+    /// Failed backup steps since start.
+    pub error_count: Arc<AtomicU64>,
+    /// Unix seconds of the last moment everything durable was shipped; 0
+    /// before the first.
+    pub last_success_ts: Arc<AtomicU64>,
+    /// Seconds the oldest durable, unshipped WAL byte has waited.
+    pub lag_s: Arc<AtomicU64>,
+    /// Whether the worker reports itself healthy.
+    pub healthy: Arc<AtomicBool>,
+    /// Whether the worker holds the bucket lease right now.
+    pub lease_held: Arc<AtomicBool>,
+}
+
+/// The Bolt listener's counters `GET /metrics` reports as
+/// `mushroomdb_bolt_connections_*`; absent when Bolt is off.
+#[derive(Debug, Clone)]
+pub struct BoltMetrics {
+    /// Connections being served now.
+    pub open: Arc<AtomicU64>,
+    /// Connections admitted since the listener started.
+    pub accepted: Arc<AtomicU64>,
+}
+
+static BOLT_METRICS: std::sync::Mutex<Option<BoltMetrics>> = std::sync::Mutex::new(None);
+
+/// Report `metrics` on `GET /metrics` from now on. Like
+/// [`register_backup_metrics`] this is per process: one process serves one
+/// store's metrics.
+pub fn register_bolt_metrics(metrics: BoltMetrics) {
+    *BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+}
+
+fn registered_bolt_metrics() -> Option<BoltSample> {
+    let guard = BOLT_METRICS.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().map(|m| BoltSample {
+        open: m.open.load(Ordering::Acquire),
+        accepted_total: m.accepted.load(Ordering::Acquire),
+    })
+}
+
+/// One reading of the Bolt counters.
+struct BoltSample {
+    open: u64,
+    accepted_total: u64,
+}
+
+static BACKUP_METRICS: std::sync::Mutex<Option<BackupMetrics>> = std::sync::Mutex::new(None);
+
+/// Report `metrics` on `GET /metrics` from now on. Replaces an earlier call.
+///
+/// The registration is process-wide: one process serves one store's metrics,
+/// as `mushroomdb serve` does. Serving several stores from one process would
+/// need these threaded through `AppState` instead.
+pub fn register_backup_metrics(metrics: BackupMetrics) {
+    *BACKUP_METRICS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+}
+
+fn registered_backup_metrics() -> Option<BackupSample> {
+    let guard = BACKUP_METRICS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().map(|m| BackupSample {
+        upload_errors_total: m.error_count.load(Ordering::Acquire),
+        last_success_ts: m.last_success_ts.load(Ordering::Acquire),
+        lag_s: m.lag_s.load(Ordering::Acquire),
+        healthy: m.healthy.load(Ordering::Acquire),
+        lease_held: m.lease_held.load(Ordering::Acquire),
+    })
+}
+
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One reading of the backup counters.
+struct BackupSample {
+    upload_errors_total: u64,
+    last_success_ts: u64,
+    lag_s: u64,
+    healthy: bool,
+    lease_held: bool,
+}
+
+/// Everything the text exposition reports, read once.
+struct PrometheusSample {
+    nodes_live: u64,
+    nodes_tombstoned: u64,
+    edges_live: u64,
+    commits_total: u64,
+    wal_size_bytes: Option<u64>,
+    rss_bytes: Option<u64>,
+    process_start_time_seconds: u64,
+    slow_queries_total: u64,
+    transactions_open: u64,
+    bolt: Option<BoltSample>,
+    backup: Option<BackupSample>,
+}
+
+/// Whether `Accept` asks for the Prometheus text format rather than JSON.
+///
+/// JSON is the default: a caller with no `Accept`, `*/*`, a browser's
+/// `text/html,...` or a client that lists `application/json` among others
+/// (`application/json, text/plain, */*`) gets JSON. Only a caller that names
+/// `text/plain` or `application/openmetrics-text` and not JSON gets text, which
+/// is what a Prometheus scraper sends. Quality values are not weighed.
+fn wants_prometheus_text(headers: &HeaderMap) -> bool {
+    let mut text = false;
+    for value in headers.get_all(header::ACCEPT) {
+        let Ok(value) = value.to_str() else { continue };
+        for range in value.split(',') {
+            let media = range
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            match media.as_str() {
+                "application/json" => return false,
+                "text/plain" | "application/openmetrics-text" => text = true,
+                _ => {}
+            }
+        }
+    }
+    text
+}
+
+/// One metric family in the text exposition format, version 0.0.4.
+fn write_family(out: &mut String, name: &str, kind: &str, help: &str, value: impl Display) {
+    let _ = write!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+    );
+}
+
+/// The Prometheus text exposition (version 0.0.4), written by hand: no
+/// labels, so no cardinality to manage, and a gauge whose source is
+/// unavailable on this platform (`rss_bytes`) is left out rather than
+/// reported as 0.
+fn format_prometheus(s: &PrometheusSample) -> String {
+    let mut out = String::with_capacity(2048);
+    write_family(
+        &mut out,
+        "mushroomdb_nodes_live",
+        "gauge",
+        "Live (non-tombstoned) nodes.",
+        s.nodes_live,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_nodes_tombstoned",
+        "gauge",
+        "Soft-deleted nodes not yet compacted away.",
+        s.nodes_tombstoned,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_edges_live",
+        "gauge",
+        "Edges in the store.",
+        s.edges_live,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_commits_total",
+        "counter",
+        "Commits since the store was created (the commit sequence number).",
+        s.commits_total,
+    );
+    if let Some(bytes) = s.wal_size_bytes {
+        write_family(
+            &mut out,
+            "mushroomdb_wal_size_bytes",
+            "gauge",
+            "On-disk size of the write-ahead log in bytes.",
+            bytes,
+        );
+    }
+    if let Some(bytes) = s.rss_bytes {
+        write_family(
+            &mut out,
+            "mushroomdb_rss_bytes",
+            "gauge",
+            "Resident set size of the server process in bytes.",
+            bytes,
+        );
+    }
+    write_family(
+        &mut out,
+        "mushroomdb_process_start_time_seconds",
+        "gauge",
+        "Start time of the server as seconds since the Unix epoch.",
+        s.process_start_time_seconds,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_slow_queries_total",
+        "counter",
+        "Read queries that met the slow-query threshold since start.",
+        s.slow_queries_total,
+    );
+    write_family(
+        &mut out,
+        "mushroomdb_http_transactions_open",
+        "gauge",
+        "Open interactive HTTP transactions.",
+        s.transactions_open,
+    );
+    if let Some(b) = &s.bolt {
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_open",
+            "gauge",
+            "Bolt connections being served now.",
+            b.open,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_bolt_connections_accepted_total",
+            "counter",
+            "Bolt connections admitted since the listener started.",
+            b.accepted_total,
+        );
+    }
+    if let Some(b) = &s.backup {
+        write_family(
+            &mut out,
+            "mushroomdb_backup_upload_errors_total",
+            "counter",
+            "Failed continuous-backup steps since start.",
+            b.upload_errors_total,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_last_success_timestamp_seconds",
+            "gauge",
+            "Unix time of the last moment all durable data was shipped; 0 before the first.",
+            b.last_success_ts,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_lag_seconds",
+            "gauge",
+            "Seconds the oldest durable, unshipped WAL byte has waited; 0 when all is shipped.",
+            b.lag_s,
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_healthy",
+            "gauge",
+            "1 while the backup worker reports itself healthy, else 0.",
+            u8::from(b.healthy),
+        );
+        write_family(
+            &mut out,
+            "mushroomdb_backup_lease_held",
+            "gauge",
+            "1 while this instance holds the backup bucket lease, else 0.",
+            u8::from(b.lease_held),
+        );
+    }
+    out
+}
+
 async fn metrics(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
+    headers: HeaderMap,
 ) -> Response {
     // Mirror /stats auth: deny role tokens — counters leak graph size.
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /metrics requires a full-access token");
     }
-    let (s, commit_seq, wal_size_bytes, slow_snap) = {
-        let g = state.db.read();
-        let s = g.stats();
-        let commit_seq = g.commit_seq();
-        let wal_size_bytes = g.wal_size_bytes().ok();
-        let slow_snap = g.slow_query_snapshot();
-        (s, commit_seq, wal_size_bytes, slow_snap)
-    };
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
+    }
+    let snap = state.db.reader();
+    let (nodes_live, nodes_tombstoned, edges) = snap.counts();
+    let commit_seq = snap.commit_seq();
+    let wal_size_bytes = snap.wal_size_bytes().ok();
+    let slow_snap = snap.slow_query_snapshot();
+    if wants_prometheus_text(&headers) {
+        let text = format_prometheus(&PrometheusSample {
+            nodes_live: nodes_live as u64,
+            nodes_tombstoned: nodes_tombstoned as u64,
+            edges_live: edges,
+            commits_total: commit_seq,
+            wal_size_bytes,
+            rss_bytes: rss_bytes(),
+            process_start_time_seconds: state.started_unix_s,
+            slow_queries_total: slow_snap.count,
+            transactions_open: state.txs.open_count() as u64,
+            bolt: registered_bolt_metrics(),
+            backup: registered_backup_metrics(),
+        });
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE),
+                (header::VARY, "Accept"),
+            ],
+            text,
+        )
+            .into_response();
+    }
     let uptime_s = state.started_at.elapsed().as_secs();
     let slow_entries: Vec<Js> = slow_snap
         .last
@@ -1446,10 +2633,10 @@ async fn metrics(
             })
         })
         .collect();
-    json_ok(json!({
-        "nodes_live": s.nodes_live,
-        "nodes_tombstoned": s.nodes_tombstoned,
-        "edges": s.edges,
+    let mut response = json_ok(json!({
+        "nodes_live": nodes_live,
+        "nodes_tombstoned": nodes_tombstoned,
+        "edges": edges,
         "commit_seq": commit_seq,
         "wal_size_bytes": wal_size_bytes,
         "rss_bytes": rss_bytes(),
@@ -1459,8 +2646,15 @@ async fn metrics(
             "count": slow_snap.count,
             "last": slow_entries,
         },
-    }))
+    }));
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    response
 }
+
+/// `Content-Type` of the Prometheus text exposition.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Resident set size of the current process in bytes.
 ///
@@ -1751,20 +2945,12 @@ async fn node_info(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.node_info_masked(&key, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.node_info_masked(&key, &mask) {
             Some(mushroomdb::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
             Some(mushroomdb::MaskedNodeResult::Restricted) => {
                 json_ok(crate::json::stub_node_json(&key))
@@ -1773,11 +2959,11 @@ async fn node_info(
         };
     }
 
-    let info = {
-        let g = state.db.read();
-        g.node_info(&key)
-    };
-    match info {
+    let snap = state.db.reader();
+    if let Err(e) = snap.ensure_readable() {
+        return graph_err(e);
+    }
+    match snap.node_info(&key) {
         Some(info) => json_ok(node_info_json(&info)),
         None => key_not_found(key),
     }
@@ -1815,31 +3001,19 @@ async fn node_edges(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.node_edges_masked(&key, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.node_edges_masked(&key, &mask) {
             Ok(edges) => json_ok(crate::json::masked_edges_json(&edges)),
             Err(GraphError::KeyNotFound { key }) => key_not_found(key),
             Err(e) => graph_err(e),
         };
     }
 
-    let out = {
-        let g = state.db.read();
-        g.node_edges(&key)
-    };
-    match out {
+    match state.db.reader().node_edges(&key) {
         Ok(edges) => json_ok(node_edges_json(&edges)),
         Err(GraphError::KeyNotFound { key }) => key_not_found(key),
         Err(e) => graph_err(e),
@@ -1900,37 +3074,25 @@ async fn neighborhood(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
             Some(rs) => json_ok(result_set_json(&rs)),
             None => key_not_found(key),
         };
     }
 
     // Unmasked full-token path (no mask param).
-    let rs = {
-        let g = state.db.read();
-        match g.node_ref(&key) {
-            Some(n) => Ok(n.neighborhood(depth, etype_refs.as_deref(), dir)),
-            None => Err(GraphError::KeyNotFound { key: key.clone() }),
-        }
-    };
-    match rs {
-        Ok(rs) => json_ok(result_set_json(&rs)),
-        Err(GraphError::KeyNotFound { key }) => key_not_found(key),
-        Err(e) => graph_err(e),
+    let snap = state.db.reader();
+    if let Err(e) = snap.ensure_readable() {
+        return graph_err(e);
+    }
+    match snap.neighborhood(&key, depth, etype_refs.as_deref(), dir) {
+        Some(rs) => json_ok(result_set_json(&rs)),
+        None => key_not_found(key),
     }
 }
 
@@ -1987,7 +3149,7 @@ async fn find_similar(
     let exact = exact || where_pred.is_some();
     let role_name = match identity {
         AuthIdentity::Role(r) => Some(r),
-        AuthIdentity::Full => None,
+        AuthIdentity::Full | AuthIdentity::Write => None,
         // Unreachable on this route — `Anonymous` is only ever inserted for
         // `GET /health` — but treated as the narrowest identity rather than
         // the widest, so a future open endpoint cannot inherit full access by
@@ -2031,14 +3193,18 @@ async fn find_similar(
     }
 }
 
+fn refuse_nonobject_algorithm_config(body: &serde_json::Value) -> Option<Response> {
+    (!body.is_object()).then(|| err_response("algorithm configuration must be a JSON object"))
+}
+
 /// `POST /algo/pagerank` — run PageRank over the unified topology.
 ///
 /// # Locking and blocking strategy
 ///
 /// PageRank is CPU-intensive and synchronous. This handler offloads the work
-/// to `tokio::task::spawn_blocking` (blocking thread-pool). The read guard is
-/// acquired and held inside the blocking task — reads don't block other reads.
-/// The `budget_ms` field in [`PageRankConfig`] caps lock-hold time.
+/// to `tokio::task::spawn_blocking` (blocking thread-pool), over a lock-free
+/// [`ReaderSnapshot`], so it holds no guard and never holds a writer up. The
+/// `budget_ms` field in [`PageRankConfig`] caps its running time.
 async fn algo_pagerank(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2048,6 +3214,9 @@ async fn algo_pagerank(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
     }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
+    }
     let config: PageRankConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid pagerank config: {e}")),
@@ -2056,16 +3225,17 @@ async fn algo_pagerank(
         return err_response(format!("invalid pagerank config: {e}"));
     }
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().pagerank(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().pagerank(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("pagerank task panicked"),
     }
 }
 
 /// `POST /algo/wcc` — weakly-connected components over the unified topology.
 ///
-/// Mirrors the `suggest` locking and blocking pattern exactly: spawn_blocking,
-/// read guard inside, `budget_ms` in config caps lock-hold time.
+/// Mirrors `algo_pagerank`: spawn_blocking over a lock-free snapshot,
+/// `budget_ms` in config caps running time.
 async fn algo_wcc(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2074,20 +3244,24 @@ async fn algo_wcc(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
     }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
+    }
     let config: WccConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid wcc config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().connected_components(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().connected_components(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("wcc task panicked"),
     }
 }
 
 /// `POST /algo/degree` — degree centrality over the unified topology.
 ///
-/// Mirrors the `suggest` locking and blocking pattern exactly.
+/// Mirrors `algo_pagerank`.
 async fn algo_degree(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2096,13 +3270,17 @@ async fn algo_degree(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /algo/* requires a full-access token");
     }
+    if let Some(response) = refuse_nonobject_algorithm_config(&body) {
+        return response;
+    }
     let config: DegreeConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid degree config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().degree_centrality(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().degree_centrality(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("degree task panicked"),
     }
 }
@@ -2126,7 +3304,7 @@ fn props_from_json_obj(v: &serde_json::Value) -> Result<Vec<(String, Value)>, St
     };
     let mut out = Vec::with_capacity(obj.len());
     for (k, val) in obj {
-        if let Some(v) = json_to_value(val.clone()) {
+        if let Some(v) = json_to_value(val.clone()).map_err(|e| format!("props {k:?}: {e}"))? {
             out.push((k.clone(), v));
         }
     }
@@ -2414,9 +3592,11 @@ async fn set_node_prop(
     Path((key, field)): Path<(String, String)>,
     Json(body): Json<Js>,
 ) -> Response {
-    let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
-        Some(v) => v,
-        None => {
+    let parsed = body.get("value").map(|v| json_to_value(v.clone()));
+    let value = match parsed {
+        Some(Err(e)) => return err_response(format!("value: {e}")),
+        Some(Ok(Some(v))) => v,
+        Some(Ok(None)) | None => {
             return err_response(
                 "request body must be a JSON object with a \"value\" field, \
                  e.g. {\"value\": \"SanFrancisco\"} or {\"value\": [\"a\", \"b\"]}",
@@ -2820,6 +4000,9 @@ async fn backup(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /backup requires a full-access token");
     }
+    if let Some(refusal) = refuse_write_tier(&identity) {
+        return refusal;
+    }
     let root = backup_root();
     let dest = match body.get("dest").and_then(Js::as_str) {
         Some(s) => match confine_backup_dest(s, &root) {
@@ -2874,9 +4057,122 @@ impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
 
 #[cfg(test)]
 mod tests {
+    fn prom_sample(
+        backup: Option<BackupSample>,
+        bolt: Option<BoltSample>,
+        rss: Option<u64>,
+    ) -> PrometheusSample {
+        PrometheusSample {
+            nodes_live: 3,
+            nodes_tombstoned: 1,
+            edges_live: 2,
+            commits_total: 9,
+            wal_size_bytes: Some(4096),
+            rss_bytes: rss,
+            process_start_time_seconds: 1_700_000_000,
+            slow_queries_total: 4,
+            transactions_open: 2,
+            bolt,
+            backup,
+        }
+    }
+
+    #[test]
+    fn prometheus_text_has_help_and_type_for_every_sample() {
+        let text = format_prometheus(&prom_sample(None, None, Some(1024)));
+        let samples: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(samples.contains(&"mushroomdb_nodes_live 3"));
+        assert!(samples.contains(&"mushroomdb_commits_total 9"));
+        assert!(samples.contains(&"mushroomdb_http_transactions_open 2"));
+        for line in &samples {
+            let name = line.split(' ').next().unwrap();
+            assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name} TYPE");
+        }
+        assert!(!text.contains("backup"));
+        assert!(!text.contains("bolt"), "no Bolt series with Bolt off");
+    }
+
+    #[test]
+    fn prometheus_text_reports_bolt_connections_when_bolt_is_on() {
+        let text = format_prometheus(&prom_sample(
+            None,
+            Some(BoltSample {
+                open: 3,
+                accepted_total: 41,
+            }),
+            None,
+        ));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_open gauge\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_open 3\n"));
+        assert!(text.contains("# TYPE mushroomdb_bolt_connections_accepted_total counter\n"));
+        assert!(text.contains("\nmushroomdb_bolt_connections_accepted_total 41\n"));
+    }
+
+    #[test]
+    fn prometheus_text_omits_an_unavailable_gauge_and_adds_backup_series() {
+        let text = format_prometheus(&prom_sample(
+            Some(BackupSample {
+                upload_errors_total: 5,
+                last_success_ts: 1_700_000_123,
+                lag_s: 7,
+                healthy: false,
+                lease_held: true,
+            }),
+            None,
+            None,
+        ));
+        assert!(!text.contains("mushroomdb_rss_bytes"));
+        assert!(text.contains("# TYPE mushroomdb_backup_upload_errors_total counter\n"));
+        assert!(text.contains("\nmushroomdb_backup_upload_errors_total 5\n"));
+        assert!(text.contains("\nmushroomdb_backup_last_success_timestamp_seconds 1700000123\n"));
+        assert!(text.contains("\nmushroomdb_backup_lag_seconds 7\n"));
+        assert!(text.contains("\nmushroomdb_backup_healthy 0\n"));
+        assert!(text.contains("# TYPE mushroomdb_backup_lease_held gauge\n"));
+        assert!(text.contains("\nmushroomdb_backup_lease_held 1\n"));
+    }
+
+    #[test]
+    fn accept_negotiation_defaults_to_json() {
+        let accept = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, HeaderValue::from_str(v).unwrap());
+            wants_prometheus_text(&h)
+        };
+        assert!(!wants_prometheus_text(&HeaderMap::new()));
+        assert!(!accept("*/*"));
+        assert!(!accept("application/json, text/plain, */*"));
+        assert!(!accept("text/html,application/xhtml+xml"));
+        assert!(accept("text/plain"));
+        assert!(accept("TEXT/PLAIN;version=0.0.4;q=0.5"));
+        assert!(accept(
+            "application/openmetrics-text;version=1.0.0,*/*;q=0.1"
+        ));
+    }
+
     use super::*;
     use crate::json::result_set_json;
     use mushroomdb::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};
+
+    #[tokio::test]
+    async fn an_unwritable_directory_is_a_500_with_a_short_client_message() {
+        let resp = graph_err(GraphError::Unwritable {
+            path: "/secret/dir/LOCK".into(),
+            detail: "uid 65532 owner 0 /secret/dir".into(),
+            read_only_filesystem: false,
+        });
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(GraphError::UNWRITABLE_CLIENT_MESSAGE),
+            "{text}"
+        );
+        assert!(
+            !text.contains("secret") && !text.contains("65532"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn nan_float_cell_serializes_as_null() {
@@ -2991,5 +4287,860 @@ mod tests {
             confine_backup_dest("/srv/backups/x", root).unwrap(),
             PathBuf::from("/srv/backups/x")
         );
+    }
+}
+
+#[cfg(test)]
+mod read_parity_tests {
+    //! TX-5 differential: every HTTP read route that moved from the read lock to
+    //! the lock-free reader answers byte-for-byte what the read-lock path answered.
+    //!
+    //! The `legacy_*` functions are the pre-TX-5 handler bodies, kept here as the
+    //! oracle: each runs under `db.read()` against the `GraphDb` handle, exactly as
+    //! the route did before it moved. Every case sends the same request through the
+    //! live router and compares status, content type and body bytes.
+    //!
+    //! The matrix runs over the house-rule axes: one batch vs separate commits, a
+    //! never-closed handle with a delta tail, a snapshotted store with an overlay
+    //! on top, and a reopened store (WAL replay).
+
+    use super::*;
+    use crate::json::{masked_edges_json, node_edges_json, node_info_json, result_set_json};
+    use axum::body::{to_bytes, Body};
+    use mushroomdb::{Predicate, RoleDef, RuleDef};
+    use tower::ServiceExt;
+
+    // ── The oracle: the read-lock bodies as they were before TX-5 ────────────────
+
+    fn legacy_client_mask(
+        db: &mushroomdb::GraphDb<mushroomdb::RealFs>,
+        mask_param: &str,
+        stub: bool,
+    ) -> NodeMask {
+        let keys = mask_param
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let m = NodeMask::from_keys(db, keys);
+        if stub {
+            m.with_mode(MaskMode::Stub)
+        } else {
+            m
+        }
+    }
+
+    fn legacy_node_info(db: &SharedDb, key: &str, mask: &str, stub: bool) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.node_info_masked(key, &mask) {
+                Some(mushroomdb::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
+                Some(mushroomdb::MaskedNodeResult::Restricted) => {
+                    json_ok(crate::json::stub_node_json(key))
+                }
+                None => key_not_found(key.to_string()),
+            };
+        }
+        match g.node_info(key) {
+            Some(info) => json_ok(node_info_json(&info)),
+            None => key_not_found(key.to_string()),
+        }
+    }
+
+    fn legacy_node_edges(db: &SharedDb, key: &str, mask: &str, stub: bool) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.node_edges_masked(key, &mask) {
+                Ok(edges) => json_ok(masked_edges_json(&edges)),
+                Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+                Err(e) => graph_err(e),
+            };
+        }
+        match g.node_edges(key) {
+            Ok(edges) => json_ok(node_edges_json(&edges)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_neighborhood(
+        db: &SharedDb,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &str,
+        stub: bool,
+    ) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.neighborhood_masked(key, depth, edge_types, dir, &mask) {
+                Some(rs) => json_ok(result_set_json(&rs)),
+                None => key_not_found(key.to_string()),
+            };
+        }
+        match g.node_ref(key) {
+            Some(n) => json_ok(result_set_json(&n.neighborhood(depth, edge_types, dir))),
+            None => key_not_found(key.to_string()),
+        }
+    }
+
+    /// The full-token, live `/query` read paths (unmasked, and client mask and/or
+    /// namespace), after the request has been parsed.
+    fn legacy_query(
+        db: &SharedDb,
+        cypher: &str,
+        mask_keys: Option<&[String]>,
+        namespace: Option<&str>,
+        stub: bool,
+        format: &str,
+    ) -> Response {
+        let params = BTreeMap::new();
+        if mask_keys.is_some() || namespace.is_some() {
+            let db = db.read();
+            let m = match (mask_keys, namespace) {
+                (Some(keys), Some(ns)) => {
+                    NodeMask::from_keys(&*db, keys.iter().map(String::as_str))
+                        .intersect(&db.mask_for_namespace(ns))
+                }
+                (Some(keys), None) => NodeMask::from_keys(&*db, keys.iter().map(String::as_str)),
+                (None, Some(ns)) => db.mask_for_namespace(ns),
+                (None, None) => unreachable!(),
+            };
+            let mask = if stub { m.with_mode(MaskMode::Stub) } else { m };
+            return match db.query_masked(cypher, &params, &mask) {
+                Ok(rs) => format_query_result(rs, format),
+                Err(GraphError::MaskedReadOnly) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "masked queries are read-only"})),
+                )
+                    .into_response(),
+                Err(e) => graph_err(e),
+            };
+        }
+        // The route classifies the statement before it picks a lock; a statement
+        // that does not lex is refused there, on either path.
+        match is_write_query(cypher) {
+            Ok(false) => {}
+            Ok(true) => unreachable!("writes are not read routes"),
+            Err(e) => return err_response(e),
+        }
+        match db.read().query(cypher, &params) {
+            Ok(rs) => format_query_result(rs, format),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    /// The role-token read of `/query`, resolved the read-lock way: the role's mask
+    /// from the live handle, intersected as the route intersects it, and the query
+    /// run by `GraphDb::query_masked`. The route itself has been on the reader since
+    /// 0.6; this pins that its answer, `UNION` included, is the write handle's.
+    fn legacy_role_query(
+        db: &SharedDb,
+        role: &str,
+        cypher: &str,
+        mask_keys: Option<&[String]>,
+        namespace: Option<&str>,
+    ) -> Response {
+        // The role branch's own checks, which run before any lock on either path.
+        match is_write_query(cypher) {
+            Ok(false) => {}
+            Ok(true) => unreachable!("writes are not read routes"),
+            Err(e) => return err_response(e),
+        }
+        let g = db.read();
+        let role_mask = match g.mask_for_role(role) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        let mask = match mask_keys {
+            Some(keys) => {
+                role_mask.intersect(&NodeMask::from_keys(&*g, keys.iter().map(String::as_str)))
+            }
+            None => role_mask,
+        };
+        let mask = match namespace {
+            Some(ns) => mask.intersect(&g.mask_for_namespace(ns)),
+            None => mask,
+        };
+        match g.query_masked(cypher, &BTreeMap::new(), &mask) {
+            Ok(rs) => format_query_result(rs, "json"),
+            Err(GraphError::MaskedReadOnly) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "masked queries are read-only"})),
+            )
+                .into_response(),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    // ── Plumbing ──────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, PartialEq)]
+    struct Answer {
+        status: StatusCode,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn answer(res: Response) -> Answer {
+        let status = res.status();
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        Answer {
+            status,
+            content_type,
+            body,
+        }
+    }
+
+    async fn routed(app: &Router, req: axum::http::Request<Body>) -> Answer {
+        answer(app.clone().oneshot(req).await.unwrap()).await
+    }
+
+    fn get(uri: &str, token: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder().method("GET").uri(uri);
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    fn post(uri: &str, body: Js, token: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d =
+            std::env::temp_dir().join(format!("tx5-parity-{name}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    const FULL: &str = "admin";
+    const ROLE: &str = "role-tok";
+
+    /// How a fixture reaches its final state.
+    #[derive(Clone, Copy, Debug)]
+    enum Build {
+        /// Every write its own commit, on a handle that never closed: a long
+        /// delta tail over the open-time fold.
+        SeparateCommits,
+        /// The same graph written as one batch.
+        OneBatch,
+        /// Snapshotted part-way, then more writes: an mmap base with an overlay
+        /// and a tail on top.
+        Snapshotted,
+        /// Written, closed, and reopened: the state comes from WAL replay.
+        Reopened,
+        /// Equality indexes declared and folded, then the second half on top:
+        /// indexed lookups answered from the fold's index plus the tail.
+        Indexed,
+    }
+
+    fn rule() -> RuleDef {
+        RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        }
+    }
+
+    /// A weighted rule: its `score` is written on each edge by the rule engine,
+    /// with no WAL record, and refreshed in place when an endpoint changes.
+    fn weighted_rule() -> RuleDef {
+        RuleDef {
+            name: "skill_fit".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::Overlap {
+                field: "skills".into(),
+                min: 0.3,
+            },
+            edge_type: "FITS".into(),
+            weight_prop: Some("score".into()),
+            ..rule()
+        }
+    }
+
+    fn skills(list: &[&str]) -> Value {
+        Value::List(list.iter().map(|s| Value::Str(s.to_string())).collect())
+    }
+
+    fn person(key: &str, org: &str, ns: &str) -> BatchOp {
+        let mine: &[&str] = match key.len() % 3 {
+            0 => &["rust", "sql"],
+            1 => &["rust", "go", "sql"],
+            _ => &["go"],
+        };
+        BatchOp::InsertNode {
+            label: "Person".into(),
+            key: key.into(),
+            props: vec![
+                ("name".into(), Value::Str(key.to_uppercase())),
+                ("org_id".into(), Value::Str(org.into())),
+                ("age".into(), Value::Int(key.len() as i64 * 7)),
+                ("ns".into(), Value::Str(ns.into())),
+                ("skills".into(), skills(mine)),
+            ],
+        }
+    }
+
+    fn edge(t: &str, s: &str, d: &str) -> BatchOp {
+        BatchOp::InsertEdge {
+            edge_type: t.into(),
+            src_key: s.into(),
+            dst_key: d.into(),
+        }
+    }
+
+    /// The graph every fixture holds: two orgs, people in two namespaces, a
+    /// rule-derived `WORKS_AT` per person, asserted `KNOWS` edges (each inside one
+    /// namespace, as the store requires) including a self-loop and a 2-cycle, a
+    /// property removed, and a node deleted.
+    fn first_half() -> Vec<BatchOp> {
+        vec![
+            BatchOp::InsertNode {
+                label: "Org".into(),
+                key: "o1".into(),
+                props: vec![
+                    ("name".into(), Value::Str("Acme".into())),
+                    ("ns".into(), Value::Str("tenant-a".into())),
+                    ("skills".into(), skills(&["rust", "sql", "go"])),
+                ],
+            },
+            BatchOp::InsertNode {
+                label: "Org".into(),
+                key: "o2".into(),
+                props: vec![
+                    ("ns".into(), Value::Str("tenant-b".into())),
+                    ("skills".into(), skills(&["go", "sql"])),
+                ],
+            },
+            person("alice", "o1", "tenant-a"),
+            person("bob", "o1", "tenant-a"),
+            person("carol", "o2", "tenant-b"),
+        ]
+    }
+
+    fn second_half() -> Vec<BatchOp> {
+        vec![
+            person("dave", "o2", "tenant-b"),
+            person("erin", "o1", "tenant-a"),
+            edge("KNOWS", "alice", "bob"),
+            edge("KNOWS", "erin", "bob"),
+            edge("KNOWS", "bob", "alice"),
+            edge("KNOWS", "carol", "dave"),
+            edge("KNOWS", "dave", "dave"),
+            edge("LIKES", "erin", "alice"),
+            edge("LIKES", "alice", "o1"),
+            edge("LIKES", "dave", "o2"),
+            BatchOp::SetProp {
+                key: "bob".into(),
+                field: "age".into(),
+                value: Value::Int(41),
+            },
+            // Moves bob's `FITS` score in place: no edge is derived or retracted.
+            BatchOp::SetProp {
+                key: "bob".into(),
+                field: "skills".into(),
+                value: skills(&["rust", "sql", "go"]),
+            },
+            BatchOp::RemoveProp {
+                key: "carol".into(),
+                field: "age".into(),
+            },
+            person("zed", "o1", "tenant-a"),
+            edge("KNOWS", "zed", "alice"),
+            BatchOp::DeleteNode { key: "zed".into() },
+            // Moves an indexed value: the fold's index still says CAROL.
+            BatchOp::SetProp {
+                key: "carol".into(),
+                field: "name".into(),
+                value: Value::Str("CAROLINE".into()),
+            },
+        ]
+    }
+
+    fn write_ops(db: &SharedDb, ops: Vec<BatchOp>, one_batch: bool) {
+        if one_batch {
+            db.submit_batch(ops).unwrap();
+        } else {
+            for op in ops {
+                db.submit_batch(vec![op]).unwrap();
+            }
+        }
+    }
+
+    fn roles() -> mushroomdb::schema::Schema {
+        mushroomdb::schema::Schema {
+            roles: vec![RoleDef {
+                name: "analyst".into(),
+                labels: vec!["Person".into()],
+                keys: vec!["o1".into()],
+                visible_where: None,
+                namespaces: None,
+                write: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn fixture(name: &str, build: Build) -> (Router, SharedDb) {
+        let dir = tmp(name);
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().apply_schema(&roles()).unwrap();
+        db.write().create_rule(rule()).unwrap();
+        db.write().create_rule(weighted_rule()).unwrap();
+        match build {
+            Build::SeparateCommits => {
+                write_ops(&db, first_half(), false);
+                write_ops(&db, second_half(), false);
+            }
+            Build::OneBatch => {
+                let mut ops = first_half();
+                ops.extend(second_half());
+                write_ops(&db, ops, true);
+            }
+            Build::Snapshotted => {
+                write_ops(&db, first_half(), false);
+                db.write().snapshot().unwrap();
+                write_ops(&db, second_half(), false);
+            }
+            Build::Reopened => {
+                write_ops(&db, first_half(), false);
+                write_ops(&db, second_half(), false);
+            }
+            Build::Indexed => {
+                db.write().enable_index("Person", "name").unwrap();
+                db.write().enable_index("Org", "name").unwrap();
+                write_ops(&db, first_half(), false);
+                // Enough commits to fold, so the indexes and the first half are
+                // in the fold and the second half is the tail.
+                for i in 0..mushroomdb::FOLD_EVERY_K {
+                    db.submit_batch(vec![BatchOp::InsertNode {
+                        label: "Pad".into(),
+                        key: format!("pad{i}"),
+                        props: vec![],
+                    }])
+                    .unwrap();
+                }
+                write_ops(&db, second_half(), false);
+                assert!(db.reader().queries_use_index(), "{name}: index unused");
+            }
+        }
+        let db = match build {
+            Build::Reopened => {
+                drop(db);
+                SharedDb::open(&dir).unwrap()
+            }
+            _ => db,
+        };
+        let app = router_with_role_tokens(
+            db.clone(),
+            Some(FULL.into()),
+            HashMap::from([(ROLE.to_string(), "analyst".to_string())]),
+        );
+        (app, db)
+    }
+
+    const KEYS: &[&str] = &["alice", "bob", "carol", "dave", "o1", "o2", "zed", "nobody"];
+    const MASKS: &[(&str, bool)] = &[
+        ("", false),
+        ("alice,carol,o1", false),
+        ("alice,carol,o1", true),
+        ("dave", true),
+        ("nobody", false),
+    ];
+
+    async fn node_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        for key in KEYS {
+            for (mask, stub) in MASKS {
+                let qs = if mask.is_empty() {
+                    String::new()
+                } else {
+                    format!("?mask={mask}&stub_hidden={stub}")
+                };
+                let got = routed(app, get(&format!("/node/{key}{qs}"), Some(FULL))).await;
+                let want = answer(legacy_node_info(db, key, mask, *stub)).await;
+                assert_eq!(got, want, "{label}: GET /node/{key}{qs}");
+
+                let got = routed(app, get(&format!("/node/{key}/edges{qs}"), Some(FULL))).await;
+                let want = answer(legacy_node_edges(db, key, mask, *stub)).await;
+                assert_eq!(got, want, "{label}: GET /node/{key}/edges{qs}");
+                cases += 2;
+
+                for (depth, dir, dir_name, types) in [
+                    (1, Dir::Both, "both", None),
+                    (2, Dir::Out, "out", None),
+                    (3, Dir::In, "in", Some("KNOWS")),
+                    (2, Dir::Both, "both", Some("WORKS_AT,LIKES")),
+                ] {
+                    let mut uri = format!("/node/{key}/neighborhood?depth={depth}&dir={dir_name}");
+                    if let Some(t) = types {
+                        uri.push_str(&format!("&edge_types={t}"));
+                    }
+                    if !mask.is_empty() {
+                        uri.push_str(&format!("&mask={mask}&stub_hidden={stub}"));
+                    }
+                    let names: Option<Vec<&str>> = types.map(|t| t.split(',').collect());
+                    let got = routed(app, get(&uri, Some(FULL))).await;
+                    let want = answer(legacy_neighborhood(
+                        db,
+                        key,
+                        depth,
+                        names.as_deref(),
+                        dir,
+                        mask,
+                        *stub,
+                    ))
+                    .await;
+                    assert_eq!(got, want, "{label}: GET {uri}");
+                    cases += 1;
+                }
+            }
+        }
+        cases
+    }
+
+    const CYPHERS: &[&str] = &[
+        "MATCH (n:Person {name: 'BOB'}) RETURN n.key, n.age",
+        "MATCH (n:Person) WHERE n.name = 'CAROLINE' RETURN n.key",
+        "MATCH (n:Person {name: 'CAROL'}) RETURN n.key",
+        "MATCH (n:Person {name: 'ZED'}) RETURN n.key",
+        "MATCH (n:Person {name: 'ERIN'}) RETURN n.key",
+        "MATCH (o:Org {name: 'Acme'})<-[:WORKS_AT]-(p) RETURN p.key",
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+        "MATCH (n:Person)-[:KNOWS]->(m) RETURN n.name, m.name ORDER BY n.name, m.name",
+        "MATCH (n:Person)-[:WORKS_AT]->(o:Org) RETURN n.name, o.name",
+        "MATCH (n:Person)-[r:FITS]->(o:Org) RETURN n.name, o.name, r.score ORDER BY n.name, o.name",
+        "MATCH (n:Person) WHERE n.age > 30 RETURN n.name, n.age",
+        "MATCH (n:Person) RETURN count(n) AS c",
+        "MATCH (n:Person) RETURN n.ns AS ns UNION MATCH (o:Org) RETURN o.ns AS ns",
+        "MATCH (n:Person) RETURN n.org_id AS x UNION ALL MATCH (n:Person) RETURN n.org_id AS x",
+        "MATCH (n:Person) RETURN n.name UNION MATCH (o:Org) RETURN o.key",
+        "MATCH (n:Person RETURN n",
+        "MATCH (n:Person) RETURN",
+        "MATCH (n:Person) RETURN n.name UNION",
+        "MATCH (n) RETURN nosuchfn(n.name)",
+        "MATCH (n:Person) RETURN m.name",
+        "MATCH (n) RETURN \u{1}",
+        "MATCH (n:Person {key: 'zed'}) RETURN n",
+        "CREATE (x:Person {key: 'mallory'})",
+    ];
+
+    async fn query_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let masks: [Option<Vec<String>>; 3] = [
+            None,
+            Some(vec!["alice".into(), "carol".into(), "o2".into()]),
+            Some(vec!["nobody".into()]),
+        ];
+        for cypher in CYPHERS {
+            for mask in &masks {
+                for namespace in [None, Some("tenant-a"), Some("no-such-ns")] {
+                    for stub in [false, true] {
+                        // A write without a mask or namespace is not a read route.
+                        if cypher.starts_with("CREATE") && mask.is_none() && namespace.is_none() {
+                            continue;
+                        }
+                        if stub && mask.is_none() && namespace.is_none() {
+                            continue;
+                        }
+                        for format in ["json", ""] {
+                            let mut body = json!({ "cypher": cypher });
+                            if let Some(m) = mask {
+                                body["mask"] = json!(m);
+                            }
+                            if let Some(ns) = namespace {
+                                body["namespace"] = json!(ns);
+                            }
+                            if stub {
+                                body["stub_hidden"] = json!(true);
+                            }
+                            let uri = if format.is_empty() {
+                                "/query".to_string()
+                            } else {
+                                format!("/query?format={format}")
+                            };
+                            let got = routed(app, post(&uri, body.clone(), Some(FULL))).await;
+                            let want = answer(legacy_query(
+                                db,
+                                cypher,
+                                mask.as_deref(),
+                                namespace,
+                                stub,
+                                format,
+                            ))
+                            .await;
+                            assert_eq!(got, want, "{label}: POST {uri} {body}");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    async fn role_queries_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let masks: [Option<Vec<String>>; 2] = [None, Some(vec!["alice".into(), "o1".into()])];
+        for cypher in CYPHERS.iter().filter(|c| !c.starts_with("CREATE")) {
+            for mask in &masks {
+                for namespace in [None, Some("tenant-a")] {
+                    let mut body = json!({ "cypher": cypher });
+                    if let Some(m) = mask {
+                        body["mask"] = json!(m);
+                    }
+                    if let Some(ns) = namespace {
+                        body["namespace"] = json!(ns);
+                    }
+                    let got =
+                        routed(app, post("/query?format=json", body.clone(), Some(ROLE))).await;
+                    let want = answer(legacy_role_query(
+                        db,
+                        "analyst",
+                        cypher,
+                        mask.as_deref(),
+                        namespace,
+                    ))
+                    .await;
+                    assert_eq!(got, want, "{label}: role POST /query {body}");
+                    cases += 1;
+                }
+            }
+        }
+        cases
+    }
+
+    async fn all_routes_match(build: Build, name: &str) {
+        let (app, db) = fixture(name, build);
+        // The fixture must exercise what it claims to: a tail the reader applies.
+        if !matches!(build, Build::Reopened) {
+            assert!(
+                !db.read().reader().deltas.is_empty(),
+                "{name}: no delta tail"
+            );
+        }
+        let label = format!("{build:?}");
+        let n = node_routes_match(&app, &db, &label).await
+            + query_routes_match(&app, &db, &label).await
+            + role_queries_match(&app, &db, &label).await
+            + counter_and_algo_routes_match(&app, &db, &label).await;
+        assert!(n > 500, "{label}: only {n} cases ran");
+    }
+
+    // ── /health, /metrics and /algo/* (moved in fix round 1) ──────────────────
+
+    fn legacy_health(db: &SharedDb) -> Response {
+        let (nodes, edges) = {
+            let g = db.read();
+            let s = g.stats();
+            (s.nodes_live, s.edges)
+        };
+        json_ok(json!({
+            "ok": true,
+            "nodes": nodes,
+            "edges": edges,
+            "addr": default_advertise_addr().to_string(),
+        }))
+    }
+
+    /// `/metrics` before TX-5, minus `rss_bytes` and `uptime_s`, which move
+    /// between any two calls.
+    fn legacy_metrics(db: &SharedDb) -> Js {
+        let g = db.read();
+        let s = g.stats();
+        let slow = g.slow_query_snapshot();
+        json!({
+            "nodes_live": s.nodes_live,
+            "nodes_tombstoned": s.nodes_tombstoned,
+            "edges": s.edges,
+            "commit_seq": g.commit_seq(),
+            "wal_size_bytes": g.wal_size_bytes().ok(),
+            "slow_queries": {
+                "threshold_ms": slow.threshold_ms,
+                "count": slow.count,
+                "last": slow.last.iter().map(|e| json!({
+                    "ms": e.ms, "query": e.query, "at_commit": e.at_commit,
+                })).collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    fn legacy_algo(db: &SharedDb, route: &str, body: &Js) -> Response {
+        let g = db.read();
+        let v = match route {
+            "pagerank" => {
+                serde_json::to_value(g.pagerank(&serde_json::from_value(body.clone()).unwrap()))
+            }
+            "wcc" => serde_json::to_value(
+                g.connected_components(&serde_json::from_value(body.clone()).unwrap()),
+            ),
+            _ => serde_json::to_value(
+                g.degree_centrality(&serde_json::from_value(body.clone()).unwrap()),
+            ),
+        };
+        json_ok(v.unwrap_or_else(|_| json!({})))
+    }
+
+    async fn counter_and_algo_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let got = routed(app, get("/health", Some(FULL))).await;
+        assert_eq!(got, answer(legacy_health(db)).await, "{label}: /health");
+        let got = routed(app, get("/health", None)).await;
+        assert_eq!(got.body, br#"{"ok":true}"#, "{label}: anonymous /health");
+
+        let got = routed(app, get("/metrics", Some(FULL))).await;
+        assert_eq!(got.status, StatusCode::OK);
+        let mut v: Js = serde_json::from_slice(&got.body).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        assert!(obj.remove("rss_bytes").is_some() && obj.remove("uptime_s").is_some());
+        assert_eq!(v, legacy_metrics(db), "{label}: /metrics");
+        cases += 3;
+
+        for route in ["pagerank", "wcc", "degree"] {
+            for body in [
+                json!({}),
+                json!({"edge_type": "KNOWS"}),
+                json!({"edge_type": "FITS"}),
+            ] {
+                let got = routed(
+                    app,
+                    post(&format!("/algo/{route}"), body.clone(), Some(FULL)),
+                )
+                .await;
+                let want = answer(legacy_algo(db, route, &body)).await;
+                assert_eq!(got, want, "{label}: /algo/{route} {body}");
+                cases += 1;
+            }
+        }
+        cases
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_separate_commits() {
+        all_routes_match(Build::SeparateCommits, "separate").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_one_batch() {
+        all_routes_match(Build::OneBatch, "batch").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_snapshotted() {
+        all_routes_match(Build::Snapshotted, "snapshotted").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_reopened() {
+        all_routes_match(Build::Reopened, "reopened").await;
+    }
+
+    /// The cases are only a differential if the two sides can disagree: `UNION` on
+    /// the role path, which the reader refused before TX-5, now answers rows.
+    #[tokio::test]
+    async fn union_answers_on_the_reader_for_both_identities() {
+        let (app, _db) = fixture("union", Build::SeparateCommits);
+        let cypher = "MATCH (n:Person) RETURN n.ns AS ns UNION MATCH (o:Org) RETURN o.ns AS ns";
+        for token in [FULL, ROLE] {
+            let got = routed(
+                &app,
+                post(
+                    "/query?format=json",
+                    json!({ "cypher": cypher }),
+                    Some(token),
+                ),
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK, "{token}: {:?}", got.body);
+            let v: Js = serde_json::from_slice(&got.body).unwrap();
+            assert!(
+                !v["rows"].as_array().unwrap().is_empty(),
+                "{token}: UNION returned no rows: {v}"
+            );
+        }
+    }
+
+    /// A store whose indexes are in the fold, with a tail that moves, deletes
+    /// and adds indexed values: the reader serves the lookups from the fold's
+    /// index layered with the tail and answers what the read lock answered.
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_indexed() {
+        all_routes_match(Build::Indexed, "indexed").await;
+    }
+
+    /// An unmasked reader query still lands in the `/metrics` slow-query ring.
+    #[tokio::test]
+    async fn a_slow_reader_query_is_still_recorded() {
+        let (app, db) = fixture("slow", Build::SeparateCommits);
+        let bulk = (0..5_000)
+            .map(|i| BatchOp::InsertNode {
+                label: "Bulk".into(),
+                key: format!("bulk{i}"),
+                props: vec![("n".into(), Value::Int(i))],
+            })
+            .collect();
+        db.submit_batch(bulk).unwrap();
+        let before = db.read().slow_query_snapshot().count;
+        // Threshold 1 ms: a filtered scan of 5 000 nodes reaches it, and the count
+        // is what is asserted, not the duration.
+        db.write().set_slow_query_threshold_ms(1);
+        let cypher = "MATCH (n:Bulk) WHERE n.n >= 0 RETURN count(n) AS c";
+        let mut recorded = false;
+        for _ in 0..20 {
+            let got = routed(
+                &app,
+                post(
+                    "/query?format=json",
+                    json!({ "cypher": cypher }),
+                    Some(FULL),
+                ),
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK);
+            if db.read().slow_query_snapshot().count > before {
+                recorded = true;
+                break;
+            }
+        }
+        assert!(recorded, "a slow reader query never reached the ring");
+        let last = db.read().slow_query_snapshot().last;
+        assert_eq!(last.last().map(|e| e.query.as_str()), Some(cypher));
     }
 }

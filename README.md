@@ -8,7 +8,9 @@
 [![PyPI](https://img.shields.io/pypi/v/mushroomdb?logo=python&logoColor=white&label=PyPI)](https://pypi.org/project/mushroomdb/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**The graph that stays true — and knows who's allowed to see it.**
+**An embedded graph database — Cypher queries, self-maintaining rule-derived edges, time travel, and a memory layer for AI agents.**
+
+Embedded in your process, or run as a server.
 
 mushroomdb is an embedded graph database for agents and apps that reason over entities. You
 declare a relationship as a rule, once. Every write after that derives the matching edges, scores
@@ -95,8 +97,8 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 
 - Not a hosted service. There is no account and no endpoint.
 - Not a vector database. Vector rules and an HNSW index are built in; you bring the embeddings.
-- Not a transactional relational database. One writer at a time, no interactive transactions, and
-  the working graph lives in memory.
+- Not a transactional relational database. One writer at a time, transactions are snapshot-isolated
+  rather than serializable, and the working graph lives in memory.
 
 [Known limits](https://matthewsherlin.github.io/mushroomdb/docs/limits.html) says what has been measured and how far.
 

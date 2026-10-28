@@ -1,11 +1,17 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
-    OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
-    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, DdlStatement, EdgeDelete, Expr,
+    HopRange, LimitSkip, ListPredKind, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt,
+    MatchSetMapStmt, MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause,
+    OrderItem, OrderTarget, Pattern, ProcCallStmt, Query, RelDir, RelPat, RetItem, RetVal,
+    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement, LABEL_TEST_FN, ONE_ROW_VAR,
 };
+use unwind_write::{Scope, VarKind};
+/// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
+/// is the merge (`+=`) form, and the map's entries.
+type SetMapClause = (String, bool, Vec<(String, Operand)>, Option<String>);
+
 use super::Tok;
 use crate::filter::CmpOp;
 use core_storage::{Value, NS_PROP};
@@ -13,12 +19,24 @@ use core_storage::{Value, NS_PROP};
 /// Max parenthesized-expression nesting. Deeper input is `Err`, not a stack overflow.
 const MAX_PAREN_DEPTH: usize = 64;
 
+/// Max nesting of expressions of any kind (parentheses, function arguments,
+/// list and map elements, CASE branches), counted together. Deeper input is
+/// `Err`, not a stack overflow. Measured at 63 levels: about 1.1 MiB of stack in
+/// a debug build (16-18 KiB a level) and 0.3 MiB in a release build, so the
+/// limit fits a 2 MiB thread.
+const MAX_EXPR_DEPTH: usize = MAX_PAREN_DEPTH;
+
 /// Parse a tokenized Cypher subset query. Every failure is `Err(String)`; this
 /// function never panics on a well-formed `&[Tok]` (including empty / garbage).
+/// A query that parses is then checked ([`check`](super::check)): an invalid
+/// one is refused before it is planned.
 pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+        plain_shape_miss: false,
     };
     let q = p.query()?;
     if p.pos < p.toks.len() {
@@ -26,6 +44,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         // error here. Use `parse_read` to accept a `UNION` chain.
         return Err(p.unsupported_or_unexpected("unexpected tokens after query"));
     }
+    super::check::check_query(&q)?;
     Ok(q)
 }
 
@@ -39,11 +58,20 @@ pub struct UnionQuery {
     pub all_flags: Vec<bool>,
 }
 
-/// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
+/// True if `tok` is the identifier `word`, compared case-insensitively.
+pub(crate) fn kw(tok: Option<&Tok>, word: &str) -> bool {
+    matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(word))
+}
+
+/// Parse a read query, accepting a `UNION` / `UNION ALL` chain, and check it
+/// ([`check`](super::check)).
 pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+        plain_shape_miss: false,
     };
     let mut parts = vec![p.query()?];
     let mut all_flags = Vec::new();
@@ -59,28 +87,265 @@ pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     if p.pos < p.toks.len() {
         return Err(p.err("unexpected tokens after UNION query"));
     }
-    Ok(UnionQuery { parts, all_flags })
+    let union = UnionQuery { parts, all_flags };
+    super::check::check_union(&union)?;
+    Ok(union)
 }
 
 /// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
-/// Returns `Err` for read queries or malformed write statements.
+/// Returns `Err` for read queries or malformed write statements, and for a
+/// statement the compile-time check ([`check`](super::check)) refuses.
 pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+        plain_shape_miss: false,
     };
-    p.write_statement()
+    let stmt = p.write_statement()?;
+    super::check::check_write(&stmt)?;
+    Ok(stmt)
+}
+
+/// Parse a procedure call statement, `CALL ns.name(args) [YIELD …] [WHERE …]
+/// [RETURN …]` (QL-12). Callers tell a call apart with [`is_call_tokens`]
+/// first. `CALL { … }` is refused as a subquery, and a call followed by any
+/// other clause as a call inside a larger query.
+pub fn parse_call(tokens: &[Tok]) -> Result<ProcCallStmt, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+        plain_shape_miss: false,
+    };
+    p.call_statement()
+}
+
+/// Whether the tokens begin a `CALL` statement. No read or write statement
+/// can begin with the word, so a malformed call is reported as one.
+pub fn is_call_tokens(tokens: &[Tok]) -> bool {
+    kw(tokens.first(), "call")
+}
+
+/// The error for an openCypher form this release recognises and does not run.
+pub(crate) fn refusal(feature: &str) -> String {
+    format!("not supported in mushroomdb 0.10: {feature}")
+}
+
+/// Parse a schema statement (`CREATE INDEX`, `DROP INDEX`, `SHOW INDEXES`,
+/// `CREATE CONSTRAINT`, `DROP CONSTRAINT`, `SHOW CONSTRAINTS`). The statement
+/// must be the whole input. Callers tell DDL apart with [`is_ddl_tokens`]
+/// first, so a malformed DDL statement gets this parser's error rather than a
+/// read or write parser's.
+pub fn parse_ddl(tokens: &[Tok]) -> Result<DdlStatement, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        literal_depth: 0,
+        expr_depth: 0,
+        plain_shape_miss: false,
+    };
+    p.ddl_statement()
+}
+
+/// Whether the tokens begin a schema statement: `CREATE INDEX`,
+/// `CREATE CONSTRAINT`, or anything starting with `DROP` or `SHOW` — no read
+/// or write statement can begin with either word, so a malformed one is
+/// reported as malformed DDL.
+pub fn is_ddl_tokens(tokens: &[Tok]) -> bool {
+    match tokens.first() {
+        Some(Tok::Create) => kw(tokens.get(1), "index") || kw(tokens.get(1), "constraint"),
+        first => kw(first, "drop") || kw(first, "show"),
+    }
 }
 
 /// Return true if the token stream starts with a write keyword, or is a MATCH
 /// statement followed by SET or DELETE.  Used for fast server-side dispatch
 /// without a full parse.
+///
+/// Schema statements that change the schema (`CREATE INDEX|CONSTRAINT`,
+/// `DROP …`) are writes; `SHOW …` is a read.
 pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
-        Some(Tok::Match) => tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)),
+        first if kw(first, "drop") => true,
+        // `MATCH … SET|DELETE|REMOVE|CREATE|MERGE …`.
+        Some(Tok::Match) => {
+            tokens
+                .iter()
+                .any(|t| matches!(t, Tok::Set | Tok::Delete | Tok::Create | Tok::Merge))
+                || has_remove_clause(tokens)
+        }
+        // `UNWIND … CREATE|MERGE|SET|DELETE|REMOVE …`: a write when any write
+        // clause follows; `UNWIND … RETURN` stays a read. The same holds after
+        // a leading `OPTIONAL MATCH` (QL-ON).
+        Some(Tok::Unwind) | Some(Tok::Optional) => {
+            tokens.iter().any(|t| {
+                matches!(
+                    t,
+                    Tok::Create | Tok::Merge | Tok::Set | Tok::Delete | Tok::Detach
+                )
+            }) || has_remove_clause(tokens)
+        }
         _ => false,
     }
+}
+
+/// Whether a statement that begins with `CREATE` or `MERGE` needs the per-row
+/// form (QL-PM): a `$parameter` inside a node pattern (`{id: $id}`, `(n:P
+/// $props)`), or a map `SET` (`ON CREATE SET n += $props`, `SET n = {…}`).
+/// The per-row form evaluates its values against the statement's parameters,
+/// and runs once, over one row, when no clause before it produces more. A
+/// statement with neither keeps the plain form, which folds its literals
+/// while parsing.
+fn needs_per_row_form(tokens: &[Tok]) -> bool {
+    let mut depth = 0usize;
+    // Before the first `ON CREATE` / `ON MATCH`: the node patterns.
+    let mut in_patterns = true;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth = depth.saturating_sub(1),
+            Tok::Return if depth == 0 => return false,
+            Tok::Ident(_) if depth == 0 && kw(Some(tok), "on") => in_patterns = false,
+            Tok::Param(_) if depth > 0 && in_patterns => return true,
+            // `SET n = …` / `SET n += …`, or the same item after a comma.
+            Tok::Set | Tok::Comma
+                if depth == 0
+                    && matches!(tokens.get(i + 1), Some(Tok::Ident(_)))
+                    && matches!(
+                        (tokens.get(i + 2), tokens.get(i + 3)),
+                        (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+                    ) =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the plain `CREATE` form expresses `stmt`: every node has a label
+/// and a string `id`, its key. Any other `CREATE` is the per-row form, which
+/// gives a node with no string `id` a generated key (QL-NM).
+fn plain_create_fits(stmt: &WriteStatement) -> bool {
+    let WriteStatement::Create(create) = stmt else {
+        return false;
+    };
+    create.nodes.iter().all(|node| {
+        !node.label.is_empty()
+            && node
+                .props
+                .iter()
+                .any(|(k, v)| k == "id" && matches!(v, Value::Str(_)))
+    })
+}
+
+/// Whether the plain `MERGE` form expresses `stmt`: a key MERGE, every node a
+/// label and a string `id` alone. Any other pattern matches by label and
+/// properties, which the per-row form does (QL-NM).
+fn plain_merge_fits(stmt: &WriteStatement) -> bool {
+    let WriteStatement::Merge(merge) = stmt else {
+        return false;
+    };
+    let end_fits = merge
+        .edge
+        .as_ref()
+        .is_none_or(|e| matches!(e.end_key_value, Value::Str(_)));
+    matches!(merge.key_value, Value::Str(_)) && end_fits
+}
+
+/// True if the statement writes a relationship's properties, or names a
+/// relationship a `CREATE` makes (QL-RP): a property map or `$parameter`
+/// inside a `-[ … ]-` bracket, a `CREATE … -[r…]-` variable, or a `SET` /
+/// `REMOVE` item whose target is a relationship variable. Such a statement is
+/// parsed as the per-row form, the one executor that writes relationship
+/// properties.
+fn writes_relationship_properties(tokens: &[Tok]) -> bool {
+    let mut rel_vars: Vec<&str> = Vec::new();
+    let mut in_create = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Tok::Create => in_create = true,
+            Tok::Match | Tok::Merge | Tok::With | Tok::Unwind | Tok::Return | Tok::Set => {
+                in_create = false
+            }
+            Tok::LBracket if i > 0 && tokens[i - 1] == Tok::Dash => {
+                if let Some(Tok::Ident(name)) = tokens.get(i + 1) {
+                    if in_create {
+                        return true;
+                    }
+                    rel_vars.push(name);
+                }
+                let mut j = i + 1;
+                while j < tokens.len() && tokens[j] != Tok::RBracket {
+                    if matches!(tokens[j], Tok::LBrace | Tok::Param(_)) {
+                        return true;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if rel_vars.is_empty() {
+        return false;
+    }
+    // A SET / REMOVE item's target: the name right after `SET`, `REMOVE` or a
+    // comma of that clause, outside any bracket.
+    let mut depth = 0usize;
+    let mut in_items = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+            Tok::RParen | Tok::RBracket | Tok::RBrace => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            Tok::Set => in_items = true,
+            _ if kw(Some(tok), "remove") => in_items = true,
+            Tok::Comma if in_items => {}
+            Tok::Ident(name) if in_items => {
+                let target = i > 0
+                    && (matches!(tokens[i - 1], Tok::Set | Tok::Comma)
+                        || kw(tokens.get(i - 1), "remove"));
+                if target && rel_vars.contains(&name.as_str()) {
+                    return true;
+                }
+            }
+            Tok::Create
+            | Tok::Merge
+            | Tok::Match
+            | Tok::With
+            | Tok::Unwind
+            | Tok::Return
+            | Tok::Delete
+            | Tok::Detach => in_items = false,
+            _ if kw(Some(tok), "on") => in_items = false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if the tokens hold a `REMOVE var.field` or `REMOVE var:Label` clause.
+/// `REMOVE` is an ordinary identifier, so it counts only in clause position:
+/// followed by `name` and then `.` or `:`, and not itself a property or label
+/// name (`n.remove`, `(x:Remove)`).
+fn has_remove_clause(tokens: &[Tok]) -> bool {
+    tokens.iter().enumerate().any(|(i, tok)| {
+        kw(Some(tok), "remove")
+            && !matches!(
+                i.checked_sub(1).and_then(|j| tokens.get(j)),
+                Some(Tok::Dot | Tok::Colon)
+            )
+            && matches!(tokens.get(i + 1), Some(Tok::Ident(_)))
+            && matches!(tokens.get(i + 2), Some(Tok::Dot | Tok::Colon))
+    })
 }
 
 /// `true` or `false` in any case, as the literal it spells; `None` for any
@@ -96,9 +361,82 @@ fn bool_literal(name: &str) -> Option<bool> {
     }
 }
 
+/// `null` in any case. Like `true` and `false` it is recognised here, not by
+/// the lexer, so `n.null` and a backtick-quoted `` `null` `` key stay names.
+fn is_null_literal(name: &str) -> bool {
+    name.eq_ignore_ascii_case("null")
+}
+
+/// A predicate in a value position.
+fn pred(expr: Expr) -> Operand {
+    Operand::Pred(Box::new(expr))
+}
+
+/// The quantifier a function name spells, in any case.
+fn list_pred_kind(name: &str) -> Option<ListPredKind> {
+    [
+        ("all", ListPredKind::All),
+        ("any", ListPredKind::Any),
+        ("none", ListPredKind::None),
+        ("single", ListPredKind::Single),
+    ]
+    .into_iter()
+    .find(|(n, _)| name.eq_ignore_ascii_case(n))
+    .map(|(_, kind)| kind)
+}
+
+/// The predicate an expression stands for in a WHERE: a predicate is itself;
+/// any other value is read for its truthiness.
+fn into_predicate(op: Operand) -> Expr {
+    match op {
+        Operand::Pred(expr) => *expr,
+        other => Expr::Truthy(other),
+    }
+}
+
+/// Reads a `{key: value, …}` map whose values are of type `V`.
+type PropsParser<'a, V> = fn(&mut Parser<'a>) -> Result<Vec<(String, V)>, String>;
+
+/// A parsed MERGE node pattern.
+struct MergeNode<V = Value> {
+    var: Option<String>,
+    /// Empty for a pattern with no label (QL-NM).
+    label: String,
+    /// `Some` for a key pattern: a label and `id` alone (or a lone `ns`),
+    /// whose value is the key when it is a string.
+    key: Option<(String, V)>,
+    /// Every property of the pattern but `ns`; for a key pattern, the key.
+    props: Vec<(String, V)>,
+    ns: Option<V>,
+}
+
+/// A key MERGE node of the plain form: a label and `id` (or a lone `ns`),
+/// the key.
+struct KeyMergeNode {
+    var: Option<String>,
+    label: String,
+    key_field: String,
+    key_value: Value,
+    ns: Option<Value>,
+}
+
+mod call;
+mod ddl;
+mod unwind_write;
+
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
+    /// How many list/map literals enclose the position being parsed.
+    literal_depth: usize,
+    /// How many expressions (parentheses, arguments, elements, branches)
+    /// enclose the position being parsed.
+    expr_depth: usize,
+    /// Set when the plain `CREATE` / `MERGE` parser stops only because the
+    /// statement is not its shape (several patterns or clauses, a node with
+    /// no label, a MERGE pattern that is not a key): the per-row form parses
+    /// such a statement (QL-NM). Read by [`Parser::plain_or_per_row`].
+    plain_shape_miss: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -116,6 +454,9 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: &str) -> String {
+        if let Some(refused) = self.unsupported_form() {
+            return refused;
+        }
         match self.peek() {
             Some(tok) => format!("parse error at token {}: {msg} (found {tok:?})", self.pos),
             None => format!(
@@ -144,12 +485,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `true` and `false` are literals, so neither can name a variable or an
-    /// alias: an expression that mentions the name would read the literal.
+    /// The label after a `:`. An empty backtick-quoted name is refused: the
+    /// empty label is how a node with no label is stored (QL-NM), so no
+    /// pattern may name it.
+    fn label_name(&mut self) -> Result<String, String> {
+        let label = self.ident("expected label identifier after ':'")?;
+        if label.is_empty() {
+            self.pos -= 1;
+            return Err(self.err("a label name cannot be empty"));
+        }
+        Ok(label)
+    }
+
+    /// `true`, `false` and `null` are literals, so none can name a variable or
+    /// an alias: an expression that mentions the name would read the literal.
     fn not_reserved(&self, name: &str) -> Result<(), String> {
         if bool_literal(name).is_some() {
             return Err(self.err(&format!(
                 "`{name}` is a boolean literal and cannot name a variable or an alias"
+            )));
+        }
+        if is_null_literal(name) {
+            return Err(self.err(&format!(
+                "`{name}` is the null literal and cannot name a variable or an alias"
             )));
         }
         Ok(())
@@ -168,49 +526,72 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::Match) {
             matches.extend(self.match_clause()?);
         }
-        if matches.is_empty() {
-            return Err(self.err("expected MATCH"));
+        // A leading OPTIONAL MATCH reads as `UNWIND [1] AS <ONE_ROW_VAR>
+        // OPTIONAL MATCH …`: it runs against one row, so it gives one row of
+        // nulls when nothing matches.
+        let leading_optional = matches.is_empty() && self.peek() == Some(&Tok::Optional);
+        // A query may also open with UNWIND, WITH or RETURN; it then reads
+        // nothing from the graph and runs against one empty row.
+        if matches.is_empty()
+            && !leading_optional
+            && !matches!(
+                self.peek(),
+                Some(Tok::Unwind) | Some(Tok::With) | Some(Tok::Return)
+            )
+        {
+            return Err(self.err("expected MATCH, OPTIONAL MATCH, UNWIND, WITH or RETURN"));
         }
-        // Optional WHERE clause that follows the required MATCH(es) — may come
-        // before or after OPTIONAL MATCH.  In standard Cypher, WHERE applies to
-        // the preceding MATCH, so `MATCH (a) WHERE … OPTIONAL MATCH … RETURN`
-        // is legal.  Parse it here, then parse OPTIONAL MATCHes, then check
-        // again in case WHERE follows the OPTIONAL MATCHes instead.
-        let where_expr_pre = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
-        } else {
-            None
-        };
-        // Optional MATCH clauses (zero or more, after required MATCHes + WHERE).
-        let mut optional_clauses = Vec::new();
-        while self.peek() == Some(&Tok::Optional) {
-            optional_clauses.push(self.optional_match_clause()?);
-        }
-        // WHERE may also appear *after* OPTIONAL MATCHes (if not already seen).
-        let where_expr = if where_expr_pre.is_some() {
-            where_expr_pre
-        } else if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
-        } else {
-            None
-        };
-        // Optional top-level UNWIND clauses (after WHERE, before WITH).
+        let mut scope = Scope::default();
         let mut unwinds = Vec::new();
+        let mut optional_clauses = Vec::new();
+        let mut where_expr = None;
+        if leading_optional {
+            scope.bind_hidden(ONE_ROW_VAR, VarKind::Scalar);
+            unwinds.push(unwind_write::one_row_unwind());
+        } else {
+            // Optional WHERE clause that follows the required MATCH(es) — may
+            // come before or after OPTIONAL MATCH.  In standard Cypher, WHERE
+            // applies to the preceding MATCH, so `MATCH (a) WHERE … OPTIONAL
+            // MATCH … RETURN` is legal.  Parse it here, then parse OPTIONAL
+            // MATCHes, then check again in case WHERE follows the OPTIONAL
+            // MATCHes instead.
+            if self.eat(&Tok::Where) {
+                where_expr = Some(self.where_expr()?);
+            }
+            // Optional MATCH clauses (zero or more, after required MATCHes + WHERE).
+            while self.peek() == Some(&Tok::Optional) {
+                optional_clauses.push(self.optional_match_clause()?);
+            }
+            // WHERE may also appear *after* OPTIONAL MATCHes (if not already seen).
+            if where_expr.is_none() && self.eat(&Tok::Where) {
+                where_expr = Some(self.where_expr()?);
+            }
+        }
+        // Optional top-level UNWIND clauses (after WHERE, before WITH).
         while self.peek() == Some(&Tok::Unwind) {
             unwinds.push(self.unwind_clause()?);
         }
         // Optional WHERE that follows UNWIND (references UNWIND aliases).
         let post_unwind_where = if !unwinds.is_empty() && self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
-        // WITH pipeline stages (zero or more).
+        // WITH pipeline stages (zero or more). After an UNWIND the stages may
+        // also be plain MATCH / OPTIONAL MATCH / UNWIND clauses.
         let mut stages = Vec::new();
-        while self.peek() == Some(&Tok::With) {
-            stages.push(self.with_stage()?);
+        scope.bind_clauses(&matches, &optional_clauses, &unwinds);
+        if unwinds.is_empty() {
+            while self.peek() == Some(&Tok::With) {
+                let stage = self.with_stage(&scope)?;
+                scope.after_with(&stage.items);
+                scope.bind_clauses(&stage.matches, &stage.optional_clauses, &stage.unwinds);
+                stages.push(stage);
+            }
+        } else {
+            self.stages_after_unwind(&mut scope, &mut stages)?;
         }
-        let (distinct, returns) = self.return_clause()?;
+        let (distinct, returns) = self.return_clause(&scope)?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
         let order_by = if self.peek() == Some(&Tok::Order) {
             self.order_clause(&aliases)?
@@ -246,7 +627,16 @@ impl<'a> Parser<'a> {
 
     /// True if the next token is the `UNION` keyword (an ordinary identifier).
     fn peek_is_union(&self) -> bool {
-        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("union"))
+        self.peek_kw("union")
+    }
+
+    /// True if the next token is the word `word`, in any case. Words such as
+    /// `UNION`, `REMOVE`, `FOREACH`, `EXISTS`, `CALL` and `EXPLAIN` are lexed as
+    /// plain identifiers; a parser position where a clause or statement can
+    /// start (or `EXISTS {` in an expression) asks `peek_kw` and treats the word
+    /// as a keyword only there. Everywhere else it stays a name.
+    fn peek_kw(&self, word: &str) -> bool {
+        kw(self.peek(), word)
     }
 
     /// Named errors for still-unsupported Cypher forms (`UNION`, `CASE`).
@@ -259,6 +649,99 @@ impl<'a> Parser<'a> {
                 "CASE is not supported".to_string()
             }
             _ => self.err(msg),
+        }
+    }
+
+    /// The refusal for an openCypher form this release does not run, when the
+    /// parse failed at its first token. [`err`](Self::err) asks this first, so
+    /// a form that no parser branch accepts is named instead of reported as
+    /// an unexpected token. It looks only at a failure point: wherever one of
+    /// these words parses (as a name), no error is raised and this never runs.
+    fn unsupported_form(&self) -> Option<String> {
+        let at = |i: usize| self.toks.get(i);
+        let prev = self.pos.checked_sub(1).and_then(at);
+        let next = at(self.pos + 1);
+        let feature = match self.peek()? {
+            Tok::Ident(word) => match word.to_ascii_lowercase().as_str() {
+                "call" if matches!(next, Some(Tok::LBrace | Tok::LParen)) => "CALL subquery",
+                "call" if matches!(next, Some(Tok::Ident(_))) && self.pos == 0 => {
+                    "CALL here (a procedure call runs only as a read query of its own)"
+                }
+                "call" if matches!(next, Some(Tok::Ident(_))) => "CALL inside a larger query",
+                "foreach" if next == Some(&Tok::LParen) => "FOREACH",
+                "load" if kw(next, "csv") => "LOAD CSV",
+                "use" if self.pos == 0 && matches!(next, Some(Tok::Ident(_))) => {
+                    "USE (database selection)"
+                }
+                "allshortestpaths" if next == Some(&Tok::LParen) => "allShortestPaths",
+                _ => return None,
+            },
+            Tok::LBrace if kw(prev, "exists") => "EXISTS { } subquery",
+            Tok::LBrace if kw(prev, "count") => "COUNT { } subquery",
+            Tok::LBrace if kw(prev, "collect") => "COLLECT { } subquery",
+            Tok::LBrace if next == Some(&Tok::Dot) => "map projection (n {.key, …})",
+            Tok::Colon | Tok::Pipe
+                if matches!(prev, Some(Tok::Ident(_)))
+                    && self.pos.checked_sub(2).and_then(at) == Some(&Tok::Colon) =>
+            {
+                "more than one label (n:A:B, n:A|B); a node has one label"
+            }
+            _ => return None,
+        };
+        Some(refusal(feature))
+    }
+
+    /// Whether the tokens at the cursor open a relationship pattern used as an
+    /// expression: a node pattern `(` [var] [`:Label`…] [`{…}`] `)` followed by
+    /// the start of a relationship (`--`, `-[`, `<-`). No arithmetic or
+    /// comparison reads that way: unary minus applies only to a number, so
+    /// `(x) - -(…)` and `(x) < -(…)` are parse errors already.
+    fn pattern_ahead(&self) -> bool {
+        let at = |i: usize| self.toks.get(i);
+        let mut i = self.pos;
+        if at(i) != Some(&Tok::LParen) {
+            return false;
+        }
+        i += 1;
+        if matches!(at(i), Some(Tok::Ident(_))) {
+            i += 1;
+        }
+        while at(i) == Some(&Tok::Colon) && matches!(at(i + 1), Some(Tok::Ident(_))) {
+            i += 2;
+        }
+        if at(i) == Some(&Tok::LBrace) {
+            let mut depth = 0usize;
+            loop {
+                match at(i) {
+                    Some(Tok::LBrace) => depth += 1,
+                    Some(Tok::RBrace) => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    None => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        if at(i) != Some(&Tok::RParen) {
+            return false;
+        }
+        match (at(i + 1), at(i + 2), at(i + 3)) {
+            (Some(Tok::Dash), Some(Tok::Dash), Some(Tok::LParen | Tok::Gt)) => true,
+            (Some(Tok::Dash), Some(Tok::LBracket), after) => matches!(
+                (after, at(i + 4)),
+                (Some(Tok::Colon | Tok::RBracket | Tok::Star), _)
+                    | (
+                        Some(Tok::Ident(_)),
+                        Some(Tok::Colon | Tok::RBracket | Tok::Star | Tok::LBrace)
+                    )
+            ),
+            (Some(Tok::Lt), Some(Tok::Dash), Some(Tok::LBracket | Tok::Dash)) => true,
+            _ => false,
         }
     }
 
@@ -281,10 +764,10 @@ impl<'a> Parser<'a> {
     fn optional_match_clause(&mut self) -> Result<OptionalClause, String> {
         self.expect(&Tok::Optional, "expected OPTIONAL")?;
         self.expect(&Tok::Match, "expected MATCH after OPTIONAL")?;
-        let patterns = vec![self.pattern()?];
+        let patterns = vec![self.match_pattern()?];
         // Optional WHERE inside the optional scope.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -296,15 +779,13 @@ impl<'a> Parser<'a> {
 
     /// Parse one `WITH <items> [WHERE] [ORDER BY] [SKIP] [LIMIT] [MATCH]* [UNWIND]* [WHERE]`
     /// stage and return a `WithStage`.
-    fn with_stage(&mut self) -> Result<WithStage, String> {
+    /// `scope` is what is in scope before the WITH (for `WITH *`).
+    fn with_stage(&mut self, scope: &Scope) -> Result<WithStage, String> {
         self.expect(&Tok::With, "expected WITH")?;
-        let mut items = vec![self.ret_item()?];
-        while self.eat(&Tok::Comma) {
-            items.push(self.ret_item()?);
-        }
+        let items = self.projection_items(scope)?;
         // Optional WHERE / HAVING immediately after WITH items.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
@@ -325,6 +806,34 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let (matches, optional_clauses, stage_unwinds, post_where) = self.with_stage_tail()?;
+        Ok(WithStage {
+            items,
+            where_expr,
+            order_by,
+            skip,
+            limit,
+            matches,
+            optional_clauses,
+            unwinds: stage_unwinds,
+            post_where,
+        })
+    }
+
+    /// The clauses that may follow a WITH (or an UNWIND): `MATCH`es, then
+    /// `OPTIONAL MATCH`es, then `UNWIND`s, then one `WHERE` over all of them.
+    #[allow(clippy::type_complexity)]
+    fn with_stage_tail(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<Pattern>,
+            Vec<OptionalClause>,
+            Vec<UnwindClause>,
+            Option<Expr>,
+        ),
+        String,
+    > {
         // Optional MATCH clauses that follow this WITH.
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -345,21 +854,11 @@ impl<'a> Parser<'a> {
             && (!matches.is_empty() || !optional_clauses.is_empty() || !stage_unwinds.is_empty())
         {
             self.pos += 1; // consume WHERE
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
-        Ok(WithStage {
-            items,
-            where_expr,
-            order_by,
-            skip,
-            limit,
-            matches,
-            optional_clauses,
-            unwinds: stage_unwinds,
-            post_where,
-        })
+        Ok((matches, optional_clauses, stage_unwinds, post_where))
     }
 
     /// Parse `UNWIND <expr> AS <alias>`.
@@ -371,37 +870,22 @@ impl<'a> Parser<'a> {
         Ok(UnwindClause { list, alias })
     }
 
-    /// Parse the list expression in an UNWIND clause:
-    /// - `[v1, v2, …]` — literal list.
-    /// - `var.field`   — property reference.
-    /// - `var`         — bare variable (alias from a prior WITH).
+    /// Parse the list expression in an UNWIND clause: any expression that
+    /// evaluates to a list, such as `[e1, e2, …]`, `range(1, 5)`, `$items`,
+    /// `a + b`, `var.field` or a bare `var`. The plain forms keep their
+    /// dedicated variants; everything else becomes `UnwindExpr::Expr`.
     fn unwind_expr(&mut self) -> Result<UnwindExpr, String> {
-        match self.peek() {
-            Some(Tok::LBracket) => {
-                self.pos += 1; // consume '['
-                let mut vals = Vec::new();
-                if !self.eat(&Tok::RBracket) {
-                    loop {
-                        vals.push(self.literal_value("UNWIND list element")?);
-                        if self.eat(&Tok::Comma) {
-                            continue;
-                        }
-                        self.expect(&Tok::RBracket, "expected ']' to close UNWIND list")?;
-                        break;
-                    }
-                }
-                Ok(UnwindExpr::Lit(vals))
+        if let Some(Tok::Ident(n)) = self.peek() {
+            if is_null_literal(n) {
+                self.pos += 1;
+                return Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)));
             }
-            Some(Tok::Ident(_)) => {
-                let name = self.ident("expected variable or property in UNWIND")?;
-                if self.eat(&Tok::Dot) {
-                    let field = self.ident("expected field name after '.' in UNWIND")?;
-                    Ok(UnwindExpr::Prop { var: name, field })
-                } else {
-                    Ok(UnwindExpr::Var(name))
-                }
-            }
-            _ => Err(self.err("expected list literal, property, or variable in UNWIND")),
+        }
+        match self.value_expr()? {
+            Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
+            Operand::Prop { var, field } => Ok(UnwindExpr::Prop { var, field }),
+            Operand::Var(name) => Ok(UnwindExpr::Var(name)),
+            other => Ok(UnwindExpr::Expr(other)),
         }
     }
 
@@ -411,26 +895,45 @@ impl<'a> Parser<'a> {
     /// write an intersection — `MATCH (t)-[:A]->(c), (t)-[:B]->(c)` binds the
     /// *same* `t` and `c` across both patterns — and every multihop question
     /// an assistant asks is that shape. The returned patterns are appended to
-    /// the same `Vec<Pattern>` a run of separate MATCH clauses produces, so
-    /// the two spellings plan and execute identically.
+    /// the same `Vec<Pattern>` a run of separate MATCH clauses produces; the
+    /// second and later parts carry `continues_match`, because the parts of
+    /// one clause share relationship uniqueness and separate clauses do not.
     fn match_clause(&mut self) -> Result<Vec<Pattern>, String> {
         self.expect(&Tok::Match, "expected MATCH")?;
         let mut out = vec![self.match_pattern()?];
         while self.eat(&Tok::Comma) {
-            out.push(self.match_pattern()?);
+            let mut part = self.match_pattern()?;
+            part.continues_match = true;
+            out.push(part);
         }
         Ok(out)
     }
 
     /// One pattern inside a MATCH clause: `shortestPath(…)` or a plain chain.
     fn match_pattern(&mut self) -> Result<Pattern, String> {
+        let path_var = self.path_binding()?;
         // Detect `shortestPath(...)`.
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s.eq_ignore_ascii_case("shortestpath") {
-                return self.shortest_path_clause();
+        let mut pat = match self.peek() {
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("shortestpath") => {
+                self.shortest_path_clause()?
             }
+            _ => self.pattern()?,
+        };
+        pat.path_var = path_var;
+        Ok(pat)
+    }
+
+    /// The `p =` that names a path: an identifier followed by `=`. Anything
+    /// else leaves the position alone.
+    fn path_binding(&mut self) -> Result<Option<String>, String> {
+        let is_binding = matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.pos + 1) == Some(&Tok::Eq);
+        if !is_binding {
+            return Ok(None);
         }
-        self.pattern()
+        let name = self.binding("expected a path name before '='")?;
+        self.pos += 1; // consume '='
+        Ok(Some(name))
     }
 
     fn shortest_path_clause(&mut self) -> Result<Pattern, String> {
@@ -449,6 +952,8 @@ impl<'a> Parser<'a> {
             start,
             chain: vec![(rel, dest)],
             shortest: true,
+            path_var: None,
+            continues_match: false,
         })
     }
 
@@ -464,6 +969,8 @@ impl<'a> Parser<'a> {
             start,
             chain,
             shortest: false,
+            path_var: None,
+            continues_match: false,
         })
     }
 
@@ -479,7 +986,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         let label = if self.eat(&Tok::Colon) {
-            Some(self.ident("expected label identifier after ':'")?)
+            Some(self.label_name()?)
         } else {
             None
         };
@@ -664,101 +1171,137 @@ impl<'a> Parser<'a> {
         Ok(HopRange { min, max })
     }
 
-    fn expr(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let mut left = self.term(paren_depth)?;
+    // ── Expression grammar (QL-BX) ─────────────────────────────────────────────
+    //
+    // One grammar serves every expression position. From loosest to tightest:
+    //   or_expr   = xor_expr (OR xor_expr)*
+    //   xor_expr  = and_expr (XOR and_expr)*
+    //   and_expr  = not_expr (AND not_expr)*
+    //   not_expr  = NOT* cmp_expr
+    //   cmp_expr  = pred_expr [cmp_op pred_expr]
+    //   pred_expr = arith_expr (IS [NOT] NULL | IN in_list
+    //                          | STARTS WITH arith | ENDS WITH arith | CONTAINS arith)*
+    //   arith_expr … arith_atom, where arith_atom includes `( or_expr )`.
+    //
+    // A predicate is an `Expr`; in a value position it is carried as
+    // `Operand::Pred`. A WHERE takes the same tree back out (`into_predicate`),
+    // so its `Expr` is exactly what the WHERE-only grammar built before.
+
+    /// A WHERE (or CASE WHEN, or comprehension WHERE) predicate.
+    fn where_expr(&mut self) -> Result<Expr, String> {
+        Ok(into_predicate(self.value_expr()?))
+    }
+
+    /// A full expression, in any value position.
+    fn value_expr(&mut self) -> Result<Operand, String> {
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            return Err(self.err("expression nesting too deep"));
+        }
+        self.expr_depth += 1;
+        let out = self.or_expr();
+        self.expr_depth -= 1;
+        out
+    }
+
+    fn or_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.xor_expr()?;
         while self.eat(&Tok::Or) {
-            let right = self.term(paren_depth)?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+            let right = self.xor_expr()?;
+            left = pred(Expr::Or(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
         }
         Ok(left)
     }
 
-    fn term(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let mut left = self.factor(paren_depth)?;
+    /// `XOR` is an ordinary identifier to the lexer; after an operand it can
+    /// only be the operator.
+    fn xor_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.and_expr()?;
+        while self.eat_ident_kw("xor") {
+            let right = self.and_expr()?;
+            left = pred(Expr::Xor(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
+        }
+        Ok(left)
+    }
+
+    fn and_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.not_expr()?;
         while self.eat(&Tok::And) {
-            let right = self.factor(paren_depth)?;
-            left = Expr::And(Box::new(left), Box::new(right));
+            let right = self.not_expr()?;
+            left = pred(Expr::And(
+                Box::new(into_predicate(left)),
+                Box::new(into_predicate(right)),
+            ));
         }
         Ok(left)
     }
 
-    fn factor(&mut self, paren_depth: usize) -> Result<Expr, String> {
-        let negated = self.eat(&Tok::Not);
-        let inner = if self.eat(&Tok::LParen) {
-            if paren_depth >= MAX_PAREN_DEPTH {
+    /// `NOT` binds looser than a comparison: `NOT a = b` is `NOT (a = b)`.
+    fn not_expr(&mut self) -> Result<Operand, String> {
+        let mut nots = 0usize;
+        while self.eat(&Tok::Not) {
+            nots += 1;
+            if nots > MAX_PAREN_DEPTH {
                 return Err(self.err("expression nesting too deep"));
             }
-            let e = self.expr(paren_depth + 1)?;
-            self.expect(
-                &Tok::RParen,
-                "expected ')' to close parenthesized expression",
-            )?;
-            e
-        } else {
-            self.cmp()?
-        };
-        if negated {
-            Ok(Expr::Not(Box::new(inner)))
-        } else {
-            Ok(inner)
         }
+        let mut inner = self.cmp_expr()?;
+        for _ in 0..nots {
+            inner = pred(Expr::Not(Box::new(into_predicate(inner))));
+        }
+        Ok(inner)
     }
 
-    fn cmp(&mut self) -> Result<Expr, String> {
-        let lhs = self.arith_expr()?;
-        // Check for IS NULL / IS NOT NULL postfix.
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s.eq_ignore_ascii_case("is") {
-                self.pos += 1; // consume "IS"
-                               // Optional NOT.
+    fn cmp_expr(&mut self) -> Result<Operand, String> {
+        let lhs = self.pred_expr()?;
+        let Some(op) = self.peek_cmp_op() else {
+            return Ok(lhs);
+        };
+        self.pos += 1;
+        let rhs = self.pred_expr()?;
+        Ok(pred(Expr::Cmp { lhs, op, rhs }))
+    }
+
+    /// The postfix predicates: `IS [NOT] NULL`, `IN`, and the infix string
+    /// predicates, which bind tighter than a comparison.
+    fn pred_expr(&mut self) -> Result<Operand, String> {
+        let mut lhs = self.arith_expr()?;
+        loop {
+            if self.eat_ident_kw("is") {
                 let negated = self.eat(&Tok::Not);
-                // Expect NULL identifier.
-                match self.peek() {
-                    Some(Tok::Ident(n)) if n.eq_ignore_ascii_case("null") => {
-                        self.pos += 1; // consume "NULL"
-                        return Ok(if negated {
-                            Expr::IsNotNull(lhs)
-                        } else {
-                            Expr::IsNull(lhs)
-                        });
-                    }
-                    _ => {
-                        return Err(self.err(if negated {
-                            "expected NULL after IS NOT"
-                        } else {
-                            "expected NULL after IS"
-                        }));
-                    }
+                if !self.eat_ident_kw("null") {
+                    return Err(self.err(if negated {
+                        "expected NULL after IS NOT"
+                    } else {
+                        "expected NULL after IS"
+                    }));
                 }
-            }
-        }
-        // `IN [a, b, $p]` or `IN $list`.
-        if self.eat_ident_kw("in") {
-            let list = self.in_list()?;
-            return Ok(Expr::In { expr: lhs, list });
-        }
-        // Infix string predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`.
-        // These desugar to the scalar functions of the same name that the
-        // executor already implements, so null- and non-string handling is
-        // shared with the `startsWith(a, b)` call spelling. Only the infix
-        // form is what an assistant writes, and it used to be a parse error.
-        if let Some(name) = self.eat_infix_string_op()? {
-            let rhs = self.arith_expr()?;
-            return Ok(Expr::Truthy(Operand::FuncCall {
-                name: name.to_string(),
-                args: vec![lhs, rhs],
-            }));
-        }
-        // If no comparison operator follows, treat the operand as a standalone
-        // boolean predicate (Expr::Truthy).  This enables:
-        //   WHERE textMatches(n.bio, 'query')
-        // without requiring an explicit `= true` or similar.
-        match self.cmp_op() {
-            Ok(op) => {
+                lhs = pred(if negated {
+                    Expr::IsNotNull(lhs)
+                } else {
+                    Expr::IsNull(lhs)
+                });
+            } else if self.eat_ident_kw("in") {
+                // `IN [a, b, $p]` or `IN $list`.
+                let list = self.in_list()?;
+                lhs = pred(Expr::In { expr: lhs, list });
+            } else if let Some(name) = self.eat_infix_string_op()? {
+                // `STARTS WITH`, `ENDS WITH`, `CONTAINS` desugar to the
+                // scalar functions of the same name, so null and non-string
+                // handling is shared with the `startsWith(a, b)` spelling.
                 let rhs = self.arith_expr()?;
-                Ok(Expr::Cmp { lhs, op, rhs })
+                lhs = Operand::FuncCall {
+                    name: name.to_string(),
+                    args: vec![lhs, rhs],
+                };
+            } else {
+                return Ok(lhs);
             }
-            Err(_) => Ok(Expr::Truthy(lhs)),
         }
     }
 
@@ -795,34 +1338,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the list operand of `IN`: `[a, b, $p]` or a single operand (`$cities`).
-    fn in_list(&mut self) -> Result<Vec<Operand>, String> {
-        if self.eat(&Tok::LBracket) {
-            let mut items = Vec::new();
-            if !self.eat(&Tok::RBracket) {
-                loop {
-                    items.push(self.arith_expr()?);
-                    if self.eat(&Tok::Comma) {
-                        continue;
-                    }
-                    self.expect(&Tok::RBracket, "expected ']' to close IN list")?;
-                    break;
-                }
-            }
-            Ok(items)
-        } else {
-            Ok(vec![self.arith_expr()?])
-        }
+    /// The right-hand side of `IN`: one additive expression, as in openCypher,
+    /// so `IN [a, b]`, `IN $list` and `IN [1] + [2]` all name one list.
+    fn in_list(&mut self) -> Result<Operand, String> {
+        self.arith_expr()
     }
 
-    // ── Arithmetic expression parsing (precedence: * / > + -) ──────────────
+    // ── Arithmetic expression parsing (precedence: ^ > * / % > + -) ──────────────
     //
     // Grammar:
     //   arith_expr  = arith_add
     //   arith_add   = arith_mul ((+ | -) arith_mul)*
-    //   arith_mul   = arith_unary ((* | /) arith_unary)*
+    //   arith_mul   = arith_pow ((* | / | %) arith_pow)*
+    //   arith_pow   = arith_unary (^ arith_unary)*
     //   arith_unary = - arith_atom | arith_atom
-    //   arith_atom  = literal | param | ident | ident.field | ident(args…) | (arith_add)
+    //   arith_atom  = literal | param | ident | ident.field | ident(args…) | ( value_expr )
 
     /// Parse a full arithmetic expression (additive level).
     fn arith_expr(&mut self) -> Result<Operand, String> {
@@ -851,18 +1381,36 @@ impl<'a> Parser<'a> {
 
     /// Parse a multiplicative-level arithmetic expression.
     fn arith_mul(&mut self) -> Result<Operand, String> {
-        let mut left = self.arith_unary()?;
+        let mut left = self.arith_pow()?;
         loop {
             let op = if self.eat(&Tok::Star) {
                 ArithOp::Mul
             } else if self.eat(&Tok::Slash) {
                 ArithOp::Div
+            } else if self.eat(&Tok::Percent) {
+                ArithOp::Mod
             } else {
                 break;
             };
-            let right = self.arith_unary()?;
+            let right = self.arith_pow()?;
             left = Operand::BinArith {
                 op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parse an exponentiation-level expression: `^` binds tighter than `*`,
+    /// is left-associative (`2^3^2` is `(2^3)^2`), and takes unary-minus
+    /// operands (`-2^2` is `(-2)^2`).
+    fn arith_pow(&mut self) -> Result<Operand, String> {
+        let mut left = self.arith_unary()?;
+        while self.eat(&Tok::Caret) {
+            let right = self.arith_unary()?;
+            left = Operand::BinArith {
+                op: ArithOp::Pow,
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -873,7 +1421,10 @@ impl<'a> Parser<'a> {
     /// Parse a unary-level arithmetic expression (handles unary `-`).
     fn arith_unary(&mut self) -> Result<Operand, String> {
         if self.eat(&Tok::Dash) {
-            // Unary minus: fold into the next atom.
+            // Unary minus: fold into the next atom. Only a number takes one,
+            // which `pattern_ahead` relies on: it reads `(v)--(…)` and
+            // `(v)<--…` as relationship patterns. A change that lets unary
+            // minus take any expression must revisit that lookahead.
             return match self.peek() {
                 Some(Tok::Int(n)) => {
                     let n = *n;
@@ -896,15 +1447,218 @@ impl<'a> Parser<'a> {
 
     /// Parse an atomic operand (leaf of the arithmetic expression tree).
     fn arith_atom(&mut self) -> Result<Operand, String> {
-        // Parenthesized arithmetic expression.
+        // `(n)-[:K]->()` as a value or a predicate.
+        if self.pattern_ahead() {
+            return Err(refusal(
+                "pattern predicate (a relationship pattern used as an expression)",
+            ));
+        }
+        // A parenthesized expression: arithmetic or a predicate.
         if self.eat(&Tok::LParen) {
-            let inner = self.arith_expr()?;
-            self.expect(&Tok::RParen, "expected ')' to close arithmetic expression")?;
+            // `value_expr` bounds the nesting.
+            let inner = self.value_expr()?;
+            self.expect(
+                &Tok::RParen,
+                "expected ')' to close parenthesized expression",
+            )?;
             return Ok(inner);
         }
-        // Delegate to the existing atom parser (no unary minus here — handled above).
-        let atom = self.operand_atom()?;
+        let atom = match self.peek() {
+            Some(Tok::LBracket) => self.list_literal()?,
+            Some(Tok::LBrace) => self.map_literal()?,
+            // The existing atom parser (no unary minus here — handled above).
+            _ => self.operand_atom()?,
+        };
         self.subscripts(atom)
+    }
+
+    /// Enter one level of literal nesting, or fail before the stack does.
+    fn enter_literal(&mut self) -> Result<(), String> {
+        if self.literal_depth >= MAX_PAREN_DEPTH {
+            return Err(self.err("list or map literal nesting too deep"));
+        }
+        self.literal_depth += 1;
+        Ok(())
+    }
+
+    /// `[]` or `[e1, e2, …]`; each element is any expression. A list whose
+    /// elements are all constants folds to one `Lit(Value::List)`. A trailing
+    /// comma is refused.
+    fn list_literal(&mut self) -> Result<Operand, String> {
+        self.expect(&Tok::LBracket, "expected '['")?;
+        if self.pattern_ahead() {
+            return Err(refusal("pattern comprehension [(n)-->(m) | …]"));
+        }
+        self.enter_literal()?;
+        if let (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) =
+            (self.peek(), self.toks.get(self.pos + 1))
+        {
+            if kw.eq_ignore_ascii_case("in") {
+                return self.list_comprehension();
+            }
+        }
+        let mut items = Vec::new();
+        if !self.eat(&Tok::RBracket) {
+            loop {
+                items.push(self.value_expr()?);
+                if self.eat(&Tok::Comma) {
+                    if self.peek() == Some(&Tok::RBracket) {
+                        return Err(self.err("trailing comma in a list literal is not allowed"));
+                    }
+                    continue;
+                }
+                self.expect(&Tok::RBracket, "expected ',' or ']' in a list literal")?;
+                break;
+            }
+        }
+        self.literal_depth -= 1;
+        if items.iter().all(|o| matches!(o, Operand::Lit(_))) {
+            let values = items
+                .into_iter()
+                .filter_map(|o| match o {
+                    Operand::Lit(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Operand::Lit(Value::List(values)));
+        }
+        Ok(Operand::ListLit(items))
+    }
+
+    /// The rest of `[x IN list [WHERE pred] [| expr]]`, after the `[` and the
+    /// literal-depth entry. A comprehension nests like a list literal, so it
+    /// shares `literal_depth` and its limit.
+    fn list_comprehension(&mut self) -> Result<Operand, String> {
+        let var = self.ident("expected a comprehension variable")?;
+        self.eat_ident_kw("in");
+        let list = self.value_expr()?;
+        let filter = if self.eat(&Tok::Where) {
+            Some(Box::new(self.where_expr()?))
+        } else {
+            None
+        };
+        let map = if self.eat(&Tok::Pipe) {
+            self.value_expr()?
+        } else {
+            Operand::Var(var.clone())
+        };
+        self.expect(&Tok::RBracket, "expected ']' to close a list comprehension")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListComprehension {
+            var,
+            list: Box::new(list),
+            filter,
+            map: Box::new(map),
+        })
+    }
+
+    /// Whether the tokens after `name` `(` read `ident IN`: the head of a
+    /// list predicate. Anything else is an ordinary function call, so a
+    /// user function named `any` keeps working.
+    fn list_predicate_ahead(&self) -> bool {
+        matches!(
+            (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)),
+            (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) if kw.eq_ignore_ascii_case("in")
+        )
+    }
+
+    /// The rest of `all|any|none|single(x IN list WHERE pred)`, after the
+    /// name. It nests like a list literal, so it shares `literal_depth` and
+    /// its limit.
+    fn list_predicate(&mut self, kind: ListPredKind) -> Result<Operand, String> {
+        const SHAPE: &str = "a list predicate takes (x IN list WHERE predicate)";
+        self.expect(&Tok::LParen, "expected '(' after the list predicate name")?;
+        self.enter_literal()?;
+        let var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        let list = self.value_expr()?;
+        if !self.eat(&Tok::Where) {
+            return Err(self.err(SHAPE));
+        }
+        let pred = self.where_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close a list predicate")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListPredicate {
+            kind,
+            var,
+            list: Box::new(list),
+            pred: Box::new(pred),
+        })
+    }
+
+    /// The rest of `reduce(acc = init, x IN list | body)`, after the name.
+    /// It nests like a list literal, so it shares `literal_depth` and its
+    /// limit.
+    fn reduce_call(&mut self) -> Result<Operand, String> {
+        const SHAPE: &str = "reduce() takes (acc = init, x IN list | expression)";
+        self.expect(&Tok::LParen, "expected '(' after reduce")?;
+        self.enter_literal()?;
+        let acc_var = self.ident(SHAPE)?;
+        self.expect(&Tok::Eq, SHAPE)?;
+        let init = self.value_expr()?;
+        self.expect(&Tok::Comma, SHAPE)?;
+        let iter_var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        if acc_var == iter_var {
+            return Err(self.err("reduce() accumulator and element variables must differ"));
+        }
+        let list = self.value_expr()?;
+        self.expect(&Tok::Pipe, SHAPE)?;
+        let body = self.value_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close reduce()")?;
+        self.literal_depth -= 1;
+        Ok(Operand::Reduce {
+            acc_var,
+            init: Box::new(init),
+            iter_var,
+            list: Box::new(list),
+            body: Box::new(body),
+        })
+    }
+
+    /// `{}` or `{k1: e1, k2: e2}`; keys are identifiers (backtick-quoted
+    /// allowed), values are any expression. A duplicate key is refused (some
+    /// engines keep the last one; silently dropping a value hides a typo). An
+    /// all-constant map folds to one `Lit(Value::Map)`.
+    fn map_literal(&mut self) -> Result<Operand, String> {
+        self.expect(&Tok::LBrace, "expected '{'")?;
+        self.enter_literal()?;
+        let mut entries: Vec<(String, Operand)> = Vec::new();
+        if !self.eat(&Tok::RBrace) {
+            loop {
+                let key = self.ident("expected a map key")?;
+                if entries.iter().any(|(k, _)| *k == key) {
+                    return Err(self.err(&format!("duplicate map key `{key}` in a map literal")));
+                }
+                self.expect(&Tok::Colon, "expected ':' after a map key")?;
+                let value = self.value_expr()?;
+                entries.push((key, value));
+                if self.eat(&Tok::Comma) {
+                    if self.peek() == Some(&Tok::RBrace) {
+                        return Err(self.err("trailing comma in a map literal is not allowed"));
+                    }
+                    continue;
+                }
+                self.expect(&Tok::RBrace, "expected ',' or '}' in a map literal")?;
+                break;
+            }
+        }
+        self.literal_depth -= 1;
+        if entries.iter().all(|(_, o)| matches!(o, Operand::Lit(_))) {
+            let map = entries
+                .into_iter()
+                .filter_map(|(k, o)| match o {
+                    Operand::Lit(v) => Some((k, v)),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Operand::Lit(Value::Map(map)));
+        }
+        Ok(Operand::MapLit(entries))
     }
 
     /// Apply any postfix `[index]` subscripts to an already-parsed operand.
@@ -915,7 +1669,7 @@ impl<'a> Parser<'a> {
     /// non-null for the list shapes the graph stores.
     fn subscripts(&mut self, mut base: Operand) -> Result<Operand, String> {
         while self.eat(&Tok::LBracket) {
-            let index = self.arith_expr()?;
+            let index = self.value_expr()?;
             self.expect(&Tok::RBracket, "expected ']' to close a list subscript")?;
             base = Operand::Index {
                 base: Box::new(base),
@@ -925,18 +1679,17 @@ impl<'a> Parser<'a> {
         Ok(base)
     }
 
-    fn cmp_op(&mut self) -> Result<CmpOp, String> {
-        let op = match self.peek() {
-            Some(Tok::Eq) => CmpOp::Eq,
-            Some(Tok::Ne) => CmpOp::Ne,
-            Some(Tok::Lt) => CmpOp::Lt,
-            Some(Tok::Le) => CmpOp::Le,
-            Some(Tok::Gt) => CmpOp::Gt,
-            Some(Tok::Ge) => CmpOp::Ge,
-            _ => return Err(self.err("expected comparison operator")),
-        };
-        self.pos += 1;
-        Ok(op)
+    /// The comparison operator at the cursor, if one is there.
+    fn peek_cmp_op(&self) -> Option<CmpOp> {
+        Some(match self.peek()? {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Ne => CmpOp::Ne,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            _ => return None,
+        })
     }
 
     /// Parse a single atomic operand (no arithmetic wrapping — use `arith_expr`
@@ -962,7 +1715,19 @@ impl<'a> Parser<'a> {
             Some(Tok::Param(s)) => {
                 let s = s.clone();
                 self.pos += 1;
-                Ok(Operand::Param(s))
+                // `$p.field` (chained: `$p.a.b`): the map entry, as `$p['field']`.
+                let mut operand = Operand::Param(s);
+                while self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+                {
+                    self.pos += 1;
+                    let field = self.ident("expected a key after '.'")?;
+                    operand = Operand::Index {
+                        base: Box::new(operand),
+                        index: Box::new(Operand::Lit(Value::Str(field))),
+                    };
+                }
+                Ok(operand)
             }
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected identifier")?;
@@ -977,24 +1742,41 @@ impl<'a> Parser<'a> {
                             .to_string(),
                     );
                 }
+                if name.eq_ignore_ascii_case("reduce") && self.peek() == Some(&Tok::LParen) {
+                    return self.reduce_call();
+                }
+                if let Some(kind) = list_pred_kind(&name) {
+                    if self.peek() == Some(&Tok::LParen) && self.list_predicate_ahead() {
+                        return self.list_predicate(kind);
+                    }
+                }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
-                    // Function arguments may be arbitrary arithmetic expressions.
-                    self.pos += 1; // consume '('
-                    let mut args = Vec::new();
-                    if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.arith_expr()?);
-                        while self.eat(&Tok::Comma) {
-                            args.push(self.arith_expr()?);
-                        }
-                    }
-                    self.expect(&Tok::RParen, "expected ')' to close function call")?;
+                    let args = self.function_args()?;
                     Ok(Operand::FuncCall { name, args })
                 } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
+                    // `ns.name(…)` is a namespaced function call
+                    // (`date.truncate(…)`); no property access is followed
+                    // by `(`.
+                    if self.peek() == Some(&Tok::LParen) {
+                        let args = self.function_args()?;
+                        return Ok(Operand::FuncCall {
+                            name: format!("{name}.{field}"),
+                            args,
+                        });
+                    }
                     Ok(Operand::Prop { var: name, field })
                 } else if let Some(b) = bool_literal(&name) {
                     Ok(Operand::Lit(Value::Bool(b)))
+                } else if is_null_literal(&name) {
+                    // Evaluates to query null; inside a list or map it is kept
+                    // as a `Value::Null` element.
+                    Ok(Operand::Lit(Value::Null))
+                } else if self.peek() == Some(&Tok::Colon)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+                {
+                    self.label_predicate(name)
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
                     Ok(Operand::Var(name))
@@ -1002,6 +1784,38 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// `(arg, …)` of a function call, from its `(`. Arguments may be
+    /// arbitrary arithmetic expressions.
+    fn function_args(&mut self) -> Result<Vec<Operand>, String> {
+        self.expect(&Tok::LParen, "expected '(' to open function call")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            args.push(self.value_expr()?);
+            while self.eat(&Tok::Comma) {
+                args.push(self.value_expr()?);
+            }
+        }
+        self.expect(&Tok::RParen, "expected ')' to close function call")?;
+        Ok(args)
+    }
+
+    /// `var:Label` after the variable: a label predicate, parsed to the
+    /// [`LABEL_TEST_FN`] call. A node has one label in 0.10, so `var:A:B` and
+    /// `var:A|B` are refused by name.
+    fn label_predicate(&mut self, var: String) -> Result<Operand, String> {
+        self.expect(&Tok::Colon, "expected ':' before a label")?;
+        let label = self.ident("expected a label after ':'")?;
+        if matches!(self.peek(), Some(Tok::Colon | Tok::Pipe)) {
+            return Err(refusal(
+                "more than one label (n:A:B, n:A|B); a node has one label",
+            ));
+        }
+        Ok(Operand::FuncCall {
+            name: LABEL_TEST_FN.to_string(),
+            args: vec![Operand::Var(var), Operand::Lit(Value::Str(label))],
+        })
     }
 
     /// Parse a generic `CASE WHEN <cond> THEN <value> … [ELSE <value>] END`.
@@ -1012,12 +1826,12 @@ impl<'a> Parser<'a> {
         let mut branches = Vec::new();
         while is_kw(self.peek(), "when") {
             self.pos += 1; // consume WHEN
-            let cond = self.expr(0)?;
+            let cond = self.where_expr()?;
             if !is_kw(self.peek(), "then") {
                 return Err(self.err("expected THEN in a CASE branch"));
             }
             self.pos += 1; // consume THEN
-            let value = self.arith_expr()?;
+            let value = self.value_expr()?;
             branches.push((cond, value));
         }
         if branches.is_empty() {
@@ -1025,7 +1839,7 @@ impl<'a> Parser<'a> {
         }
         let default = if is_kw(self.peek(), "else") {
             self.pos += 1; // consume ELSE
-            Some(Box::new(self.arith_expr()?))
+            Some(Box::new(self.value_expr()?))
         } else {
             None
         };
@@ -1036,32 +1850,29 @@ impl<'a> Parser<'a> {
         Ok(Operand::Case { branches, default })
     }
 
-    /// Parse a full arithmetic expression (additive + multiplicative + unary +
-    /// atom).  This is the primary operand entry point for WHERE, RETURN, SET,
-    /// and function arguments.  Use `operand_atom` for contexts that truly
-    /// require a single atom (e.g., MATCH property map values where arithmetic
-    /// would be syntactically ambiguous with the `}` delimiter).
+    /// A MATCH pattern property value: a full expression, like every other
+    /// value position.
     fn operand(&mut self) -> Result<Operand, String> {
-        // In contexts where `operand` is called for MATCH props, the parser
-        // never sees arithmetic operators (`+`/`/`) because they can't appear
-        // inside `{key: val}` maps.  Delegating to `arith_expr` is safe here.
-        self.arith_expr()
+        self.value_expr()
     }
 
-    fn return_clause(&mut self) -> Result<(bool, Vec<RetItem>), String> {
+    /// `RETURN [DISTINCT] items`; `scope` is what is in scope (for `RETURN *`).
+    fn return_clause(&mut self, scope: &Scope) -> Result<(bool, Vec<RetItem>), String> {
         if !self.eat(&Tok::Return) {
             return Err(self.unsupported_or_unexpected("expected RETURN"));
         }
         let distinct = self.eat_ident_kw("distinct");
-        let mut items = vec![self.ret_item()?];
-        while self.eat(&Tok::Comma) {
-            items.push(self.ret_item()?);
-        }
-        Ok((distinct, items))
+        Ok((distinct, self.projection_items(scope)?))
     }
 
-    fn return_items(&mut self) -> Result<Vec<RetItem>, String> {
-        let mut items = vec![self.ret_item()?];
+    /// The items of a RETURN or WITH: `item [, item …]`, or `* [, item …]`,
+    /// where `*` stands for every name in `scope` (see [`Scope::star_items`]).
+    fn projection_items(&mut self, scope: &Scope) -> Result<Vec<RetItem>, String> {
+        let mut items = if self.eat(&Tok::Star) {
+            scope.star_items()?
+        } else {
+            vec![self.ret_item()?]
+        };
         while self.eat(&Tok::Comma) {
             items.push(self.ret_item()?);
         }
@@ -1080,9 +1891,18 @@ impl<'a> Parser<'a> {
                 "min" => Some(AggFunc::Min),
                 "max" => Some(AggFunc::Max),
                 "collect" => Some(AggFunc::Collect),
+                "stdev" => Some(AggFunc::StDev),
+                "stdevp" => Some(AggFunc::StDevP),
+                // `p` is filled in after the first argument is parsed.
+                "percentilecont" => Some(AggFunc::PercentileCont {
+                    p: Operand::Lit(Value::Null),
+                }),
+                "percentiledisc" => Some(AggFunc::PercentileDisc {
+                    p: Operand::Lit(Value::Null),
+                }),
                 _ => None,
             };
-            if let Some(func) = func {
+            if let Some(mut func) = func {
                 self.pos += 1; // consume the function name
                 self.expect(&Tok::LParen, "expected '(' after aggregate function name")?;
                 // `count(DISTINCT t)` — DISTINCT is an ordinary identifier to
@@ -1113,6 +1933,14 @@ impl<'a> Parser<'a> {
                 } else {
                     arg
                 };
+                if let AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } = &mut func {
+                    if !self.eat(&Tok::Comma) {
+                        return Err(
+                            self.err("expected ',' and a percentile `p` after the argument")
+                        );
+                    }
+                    *p = self.value_expr()?;
+                }
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
                     Some(self.binding("expected alias identifier after AS")?)
@@ -1134,11 +1962,14 @@ impl<'a> Parser<'a> {
         //   f(...)     → RetVal::FuncCall
         //   n.age + 1  → RetVal::ScalarExpr(BinArith)
         //   42         → RetVal::ScalarExpr(Lit)
-        let op = self.arith_expr()?;
+        let op = self.value_expr()?;
         let value = match op {
             Operand::Var(name) => RetVal::Var(name),
             Operand::Prop { var, field } => RetVal::Prop { var, field },
-            Operand::FuncCall { name, args } => RetVal::FuncCall { name, args },
+            // A label test names its column like any other predicate.
+            Operand::FuncCall { name, args } if name != LABEL_TEST_FN => {
+                RetVal::FuncCall { name, args }
+            }
             other => RetVal::ScalarExpr(other),
         };
         let alias = if self.eat(&Tok::As) {
@@ -1160,14 +1991,11 @@ impl<'a> Parser<'a> {
     }
 
     fn order_item(&mut self, aliases: &[&str]) -> Result<OrderItem, String> {
-        let name = self.ident("expected ORDER BY target")?;
-        let target = if self.eat(&Tok::Dot) {
-            let field = self.ident("expected field name after '.'")?;
-            OrderTarget::Prop { var: name, field }
-        } else if aliases.contains(&name.as_str()) {
-            OrderTarget::Alias(name)
-        } else {
-            OrderTarget::Var(name)
+        let target = match self.value_expr()? {
+            Operand::Prop { var, field } => OrderTarget::Prop { var, field },
+            Operand::Var(name) if aliases.contains(&name.as_str()) => OrderTarget::Alias(name),
+            Operand::Var(name) => OrderTarget::Var(name),
+            other => OrderTarget::Expr(other),
         };
         let descending = if self.eat(&Tok::Desc) {
             true
@@ -1202,12 +2030,52 @@ impl<'a> Parser<'a> {
 
     fn write_statement(&mut self) -> Result<WriteStatement, String> {
         match self.peek() {
-            Some(Tok::Create) => self.create_stmt(),
-            Some(Tok::Merge) => self.merge_stmt(),
+            Some(Tok::Create) | Some(Tok::Merge)
+                if needs_per_row_form(&self.toks[self.pos..])
+                    || writes_relationship_properties(&self.toks[self.pos..]) =>
+            {
+                self.unwind_write_stmt()
+            }
+            Some(Tok::Create) => {
+                let start = self.pos;
+                self.plain_or_per_row(start, Self::create_stmt, plain_create_fits)
+            }
+            Some(Tok::Merge) => {
+                let start = self.pos;
+                self.plain_or_per_row(start, Self::merge_stmt, plain_merge_fits)
+            }
             Some(Tok::Match) => self.match_write_stmt(),
-            _ => Err(self
-                .err("expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)")),
+            Some(Tok::Unwind) | Some(Tok::Optional) => self.unwind_write_stmt(),
+            _ => Err(self.err(
+                "expected CREATE, MERGE, MATCH … SET/DELETE, or UNWIND … CREATE/MERGE/SET \
+                 (write statement required)",
+            )),
         }
+    }
+
+    /// Parse a statement that opens with `CREATE` or `MERGE` in its plain form
+    /// when that form expresses it (`fits`), and as the per-row form otherwise
+    /// (QL-NM): several patterns or clauses, a node with no label or no string
+    /// `id`, a MERGE pattern that is not a key. A plain-form error stands
+    /// unless the plain parser marked it a shape miss
+    /// ([`plain_shape_miss`](Parser::plain_shape_miss)); then the per-row form
+    /// parses the statement.
+    fn plain_or_per_row(
+        &mut self,
+        start: usize,
+        plain: fn(&mut Self) -> Result<WriteStatement, String>,
+        fits: fn(&WriteStatement) -> bool,
+    ) -> Result<WriteStatement, String> {
+        self.plain_shape_miss = false;
+        match plain(self) {
+            Ok(stmt) if fits(&stmt) => return Ok(stmt),
+            Ok(_) => {}
+            Err(e) if !self.plain_shape_miss => return Err(e),
+            Err(_) => {}
+        }
+        self.plain_shape_miss = false;
+        self.pos = start;
+        self.unwind_write_stmt()
     }
 
     // ── CREATE ────────────────────────────────────────────────────────────────
@@ -1217,9 +2085,18 @@ impl<'a> Parser<'a> {
         let mut stmt = self.create_pattern()?;
         // Optional RETURN clause: `CREATE (n:L {…}) RETURN n` or `RETURN n.id AS id`.
         if self.eat(&Tok::Return) {
-            stmt.returns = Some(self.return_items()?);
+            let mut scope = Scope::default();
+            for (i, node) in stmt.nodes.iter().enumerate() {
+                match &node.var {
+                    // `create_node` names an anonymous node `_cn<index>`.
+                    Some(v) if *v != format!("_cn{i}") => scope.bind(v, VarKind::Node),
+                    _ => {}
+                }
+            }
+            stmt.returns = Some(self.projection_items(&scope)?);
         }
         if self.pos < self.toks.len() {
+            self.plain_shape_miss = true;
             return Err(self.err("unexpected tokens after CREATE"));
         }
         Ok(WriteStatement::Create(stmt))
@@ -1256,6 +2133,9 @@ impl<'a> Parser<'a> {
                 src_var,
                 etype,
                 dst_var,
+                rel_var: None,
+                props: Vec::new(),
+                props_map: None,
             });
             nodes.push(next);
         }
@@ -1278,9 +2158,10 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if !self.eat(&Tok::Colon) {
+            self.plain_shape_miss = true;
             return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
         }
-        let label = self.ident("expected label identifier after ':'")?;
+        let label = self.label_name()?;
         let props = if self.peek() == Some(&Tok::LBrace) {
             self.literal_props()?
         } else {
@@ -1291,7 +2172,11 @@ impl<'a> Parser<'a> {
         Ok(CreateNode { var, label, props })
     }
 
-    /// Parse `{key: literal, …}` where all values must be literals (no params, no props).
+    /// Parse the `{key: value, …}` of a plain CREATE or MERGE. A value is a
+    /// literal, or any expression that reads no variable, property or
+    /// `$parameter` (`1 > 0`, `'a' + 'b'`), which is evaluated here so the
+    /// write (and a MERGE's match) sees the value. A statement whose map reads
+    /// a `$parameter` is the per-row form instead (see [`needs_per_row_form`]).
     fn literal_props(&mut self) -> Result<Vec<(String, Value)>, String> {
         self.expect(&Tok::LBrace, "expected '{'")?;
         let mut out = Vec::new();
@@ -1301,7 +2186,7 @@ impl<'a> Parser<'a> {
         loop {
             let key = self.ident("expected property key")?;
             self.expect(&Tok::Colon, "expected ':' after property key")?;
-            let val = self.literal_value("property value")?;
+            let val = self.property_value(&key)?;
             out.push((key, val));
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1312,8 +2197,54 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// Parse a literal value (int, float, string, boolean or list). Parameters and property
-    /// references are not accepted in write statements (v1 limitation).
+    /// One value of [`literal_props`](Self::literal_props). A plain literal
+    /// keeps its own parse (and its named errors: a `null` value, a `$param`,
+    /// a variable); anything else is a constant expression.
+    fn property_value(&mut self, key: &str) -> Result<Value, String> {
+        const WHAT: &str = "property value";
+        let start = self.pos;
+        let literal = self.literal_value(WHAT);
+        if let Ok(value) = &literal {
+            if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RBrace)) {
+                return Ok(value.clone());
+            }
+        }
+        let literal_err = literal.err();
+        self.pos = start;
+        let operand = match self.value_expr() {
+            Ok(Operand::Lit(Value::Null)) => {
+                self.pos = start;
+                return Err(self.err(&format!(
+                    "property `{key}` is null (a CREATE or MERGE property value cannot be null)"
+                )));
+            }
+            Err(_) => {
+                self.pos = start;
+                return Err(literal_err.unwrap_or_else(|| self.err("expected a property value")));
+            }
+            Ok(operand) => operand,
+        };
+        match super::exec::fold_constant(&operand) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(self.err(&format!(
+                "property `{key}` evaluated to null (a CREATE or MERGE property value cannot be null)"
+            ))),
+            // Unreachable from `write_statement`, which gives a statement
+            // whose map reads a parameter the per-row form.
+            Err(super::exec::FoldError::Param) => Err(self.err(&format!(
+                "property `{key}` reads a $parameter, which this form of the statement cannot evaluate"
+            ))),
+            Err(super::exec::FoldError::Variable) => Err(self.err(&format!(
+                "property `{key}` reads a variable, and no clause before this CREATE or MERGE binds one"
+            ))),
+            Err(super::exec::FoldError::Eval(e)) => Err(format!("property `{key}`: {e}")),
+        }
+    }
+
+    /// Parse a literal value (int, float, string, boolean or list). Anything
+    /// else (a parameter, a variable, an expression) is an error, which
+    /// [`property_value`](Self::property_value) answers by parsing an
+    /// expression instead.
     fn literal_value(&mut self, what: &str) -> Result<Value, String> {
         if self.eat(&Tok::Dash) {
             return match self.peek() {
@@ -1354,7 +2285,14 @@ impl<'a> Parser<'a> {
                 let mut items = Vec::new();
                 if !self.eat(&Tok::RBracket) {
                     loop {
-                        items.push(self.literal_value(what)?);
+                        // A null element parses so the write path can refuse
+                        // it by name; a top-level `null` keeps the error below.
+                        if matches!(self.peek(), Some(Tok::Ident(n)) if is_null_literal(n)) {
+                            self.pos += 1;
+                            items.push(Value::Null);
+                        } else {
+                            items.push(self.literal_value(what)?);
+                        }
                         if self.eat(&Tok::Comma) {
                             continue;
                         }
@@ -1369,12 +2307,12 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Value::Bool(b))
             }
-            Some(Tok::Param(_)) => Err(self.err(&format!(
-                "parameter references are not supported in {what} (v1 limitation: use literals only)"
-            ))),
-            Some(Tok::Ident(_)) => Err(self.err(&format!(
-                "expression RHS not supported in {what} (v1 limitation: use literals only)"
-            ))),
+            Some(Tok::Param(_)) => {
+                Err(self.err(&format!("expected a literal {what}, not a $parameter")))
+            }
+            Some(Tok::Ident(_)) => {
+                Err(self.err(&format!("expected a literal {what}, not a variable")))
+            }
             _ => Err(self.err(&format!("expected literal value for {what}"))),
         }
     }
@@ -1408,9 +2346,19 @@ impl<'a> Parser<'a> {
 
     // ── MERGE ─────────────────────────────────────────────────────────────────
 
-    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
-        self.expect(&Tok::Merge, "expected MERGE")?;
-        self.expect(&Tok::LParen, "expected '(' after MERGE")?;
+    /// One MERGE node pattern `(var:Label {key: 'x' [, ns: 'y']})`.
+    fn merge_node(&mut self, open_msg: &str) -> Result<MergeNode, String> {
+        self.merge_node_with(open_msg, Self::literal_props)
+    }
+
+    /// [`merge_node`](Self::merge_node) with the property values read by
+    /// `props`: literals for a plain MERGE, expressions for a per-row one.
+    fn merge_node_with<V: Clone>(
+        &mut self,
+        open_msg: &str,
+        props: PropsParser<'a, V>,
+    ) -> Result<MergeNode<V>, String> {
+        self.expect(&Tok::LParen, open_msg)?;
         // Optional var: `MERGE (n:Label {…})` — capture n for RETURN projection.
         let var = match self.peek() {
             Some(Tok::Ident(_)) => {
@@ -1424,16 +2372,24 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        if !self.eat(&Tok::Colon) {
-            return Err(self.err("MERGE requires a label (e.g., MERGE (n:Label {key: 'x'}))"));
-        }
-        let label = self.ident("expected label identifier after ':'")?;
-        if self.peek() != Some(&Tok::LBrace) {
-            return Err(self.err(
-                "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
+        // No label and no property map are both allowed (QL-NM): such a
+        // pattern matches by what it does name.
+        let label = if self.eat(&Tok::Colon) {
+            self.label_name()?
+        } else {
+            String::new()
+        };
+        if matches!(self.peek(), Some(Tok::Param(_))) {
+            return Err(refusal(
+                "a $parameter map in a MERGE pattern; name the key and set the rest, \
+                 e.g. MERGE (n:Label {id: $p.id}) ON CREATE SET n += $p",
             ));
         }
-        let props = self.literal_props()?;
+        let props = if self.peek() == Some(&Tok::LBrace) {
+            props(self)?
+        } else {
+            Vec::new()
+        };
         let mut ns = None;
         let mut rest = Vec::new();
         for (k, v) in props {
@@ -1448,44 +2404,155 @@ impl<'a> Parser<'a> {
                 rest.push((k, v));
             }
         }
-        if rest.len() != 1 {
+        self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+        // Only `id` is a key lookup (QL-NM, owner decision 2026-10-26): any
+        // other property, alone or not, matches by label and property.
+        let key = if label.is_empty() {
+            None
+        } else if rest.len() == 1 && rest[0].0 == "id" {
+            Some(rest[0].clone())
+        } else if rest.is_empty() {
             // A lone `ns` is the identifying key, not a namespace stamp.
-            if rest.is_empty() {
-                if let Some(v) = ns.take() {
-                    rest.push((NS_PROP.to_string(), v));
-                }
-            }
-            if rest.len() != 1 {
-                return Err(format!(
-                    "MERGE supports exactly one key property (got {}); use CREATE for multi-prop nodes",
-                    rest.len() + usize::from(ns.is_some()),
-                ));
+            ns.take().map(|v| {
+                rest.push((NS_PROP.to_string(), v.clone()));
+                (NS_PROP.to_string(), v)
+            })
+        } else {
+            None
+        };
+        Ok(MergeNode {
+            var,
+            label,
+            key,
+            props: rest,
+            ns,
+        })
+    }
+
+    /// A plain MERGE node: a key pattern, or a shape miss (the per-row form
+    /// matches any other pattern by its label and properties).
+    fn plain_merge_key(&mut self, node: MergeNode) -> Result<KeyMergeNode, String> {
+        match node.key {
+            Some((key_field, key_value)) => Ok(KeyMergeNode {
+                var: node.var,
+                label: node.label,
+                key_field,
+                key_value,
+                ns: node.ns,
+            }),
+            None => {
+                self.plain_shape_miss = true;
+                Err(
+                    "MERGE pattern is not a key pattern; it matches by label and properties"
+                        .to_string(),
+                )
             }
         }
-        self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+    }
+
+    /// The `-[:T]->` / `<-[:T]-` of a MERGE pattern: one typed, directed,
+    /// single-hop relationship.
+    fn merge_rel(&mut self) -> Result<(Option<String>, String, RelDir), String> {
+        let rel = self.rel()?;
+        self.merge_rel_checked(rel)
+    }
+
+    /// MERGE's checks on its relationship: single-hop, directed, one type.
+    fn merge_rel_checked(&self, rel: RelPat) -> Result<(Option<String>, String, RelDir), String> {
+        if rel.hops.is_some() {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with a variable-length relationship"
+                    .to_string(),
+            );
+        }
+        if rel.dir == RelDir::Undirected {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with an undirected relationship; \
+                 give it a direction (-[:T]-> or <-[:T]-)"
+                    .to_string(),
+            );
+        }
+        match rel.etypes.as_slice() {
+            [one] => Ok((rel.var, one.clone(), rel.dir)),
+            [] => Err("MERGE requires a relationship type (e.g., -[:KNOWS]->)".to_string()),
+            _ => Err(
+                "not supported in mushroomdb 0.10: MERGE with alternative relationship types"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
+        self.expect(&Tok::Merge, "expected MERGE")?;
+        let start = self.merge_node("expected '(' after MERGE")?;
+        let start = self.plain_merge_key(start)?;
+        let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+            let (rel_var, etype, dir) = self.merge_rel()?;
+            let end = self.merge_node("expected '(' to start the MERGE end node")?;
+            let end = self.plain_merge_key(end)?;
+            if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+                return Err(
+                    "not supported in mushroomdb 0.10: MERGE with more than one relationship"
+                        .to_string(),
+                );
+            }
+            Some(MergeEdgePat {
+                etype,
+                dir,
+                end_label: end.label,
+                end_key_field: end.key_field,
+                end_key_value: end.key_value,
+                end_ns: end.ns,
+                end_var: end.var,
+                rel_var,
+            })
+        } else {
+            None
+        };
+        let KeyMergeNode {
+            var,
+            label,
+            key_field,
+            key_value,
+            ns,
+        } = start;
         let mut on_create = Vec::new();
         let mut on_match = Vec::new();
         while self.eat_ident_kw("on") {
             if self.eat(&Tok::Create) {
                 self.expect(&Tok::Set, "expected SET after ON CREATE")?;
-                on_create.extend(self.set_clauses()?);
+                on_create.extend(self.merge_set_clauses()?);
             } else if self.eat(&Tok::Match) {
                 self.expect(&Tok::Set, "expected SET after ON MATCH")?;
-                on_match.extend(self.set_clauses()?);
+                on_match.extend(self.merge_set_clauses()?);
             } else {
                 return Err(self.err("expected CREATE or MATCH after ON"));
             }
         }
         // Optional RETURN clause.
         let returns = if self.eat(&Tok::Return) {
-            Some(self.return_items()?)
+            let mut scope = Scope::default();
+            let names = [
+                (var.as_ref(), VarKind::Node),
+                (
+                    edge.as_ref().and_then(|e| e.end_var.as_ref()),
+                    VarKind::Node,
+                ),
+                (edge.as_ref().and_then(|e| e.rel_var.as_ref()), VarKind::Rel),
+            ];
+            for (name, kind) in names {
+                if let Some(name) = name {
+                    scope.bind(name, kind);
+                }
+            }
+            Some(self.projection_items(&scope)?)
         } else {
             None
         };
         if self.pos < self.toks.len() {
+            self.plain_shape_miss = true;
             return Err(self.unsupported_or_unexpected("unexpected tokens after MERGE"));
         }
-        let (key_field, key_value) = rest.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
             label,
             key_field,
@@ -1495,12 +2562,27 @@ impl<'a> Parser<'a> {
             on_create,
             on_match,
             returns,
+            edge,
         }))
     }
 
     // ── MATCH … SET / MATCH … DELETE ─────────────────────────────────────────
 
     fn match_write_stmt(&mut self) -> Result<WriteStatement, String> {
+        // `MATCH … CREATE …` / `MATCH … MERGE …` run per matched row, as the
+        // `UNWIND [1] AS _ MATCH …` form does.
+        // So do the statements that write a relationship's properties
+        // (`MATCH ()-[r]->() SET r.w = 1`): the per-row executor writes them.
+        // So does a statement with an `OPTIONAL MATCH` (QL-ON): its write skips
+        // the rows where the optional node is null, and only the per-row
+        // executor sees one row at a time.
+        if self.toks[self.pos..]
+            .iter()
+            .any(|t| matches!(t, Tok::Create | Tok::Merge | Tok::Optional))
+            || writes_relationship_properties(&self.toks[self.pos..])
+        {
+            return self.unwind_write_stmt();
+        }
         // Parse MATCH clauses (same as read query).
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -1511,17 +2593,38 @@ impl<'a> Parser<'a> {
         }
         // Optional WHERE.
         let where_expr = if self.eat(&Tok::Where) {
-            Some(self.expr(0)?)
+            Some(self.where_expr()?)
         } else {
             None
         };
         // Dispatch on SET, DETACH DELETE, or DELETE.
         match self.peek() {
+            Some(Tok::Set) if self.set_map_form_ahead() => {
+                self.pos += 1; // consume SET
+                let (var, merge, map, param) = self.set_map_clause(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after SET"));
+                }
+                Ok(WriteStatement::MatchSetMap(MatchSetMapStmt {
+                    matches,
+                    where_expr,
+                    merge,
+                    var,
+                    map,
+                    param,
+                    returns,
+                }))
+            }
             Some(Tok::Set) => {
                 self.pos += 1; // consume SET
                 let sets = self.set_clauses()?;
                 let returns = if self.eat(&Tok::Return) {
-                    Some(self.return_items()?)
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
                 } else {
                     None
                 };
@@ -1578,11 +2681,152 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            _ if self.peek_kw("remove") => {
+                self.pos += 1; // consume REMOVE
+                let removals = self.remove_items(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.projection_items(&Scope::of_patterns(&matches))?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after REMOVE"));
+                }
+                Ok(WriteStatement::MatchRemove(MatchRemoveStmt {
+                    matches,
+                    where_expr,
+                    removals,
+                    returns,
+                }))
+            }
             _ => Err(self.err(
-                "expected SET or DELETE after MATCH [WHERE]; \
+                "expected SET, REMOVE or DELETE after MATCH [WHERE]; \
                  combined MATCH…RETURN is a read query, not a write statement",
             )),
         }
+    }
+
+    /// True when the SET at the cursor is a map form: `SET var = …` or
+    /// `SET var += …` (a name straight after SET, then `=` or `+ =`, no `.`).
+    fn set_map_form_ahead(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+            && matches!(
+                (self.toks.get(self.pos + 2), self.toks.get(self.pos + 3)),
+                (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+            )
+    }
+
+    /// `var = {…}` or `var += {…}` after SET: the variable, whether it is the
+    /// merge form, and the map's entries. The variable must be
+    /// a node bound by `matches`; the right side must be a map literal or a
+    /// `$parameter` (another variable is refused by name); a second SET item
+    /// after the map is refused, since the forms do not mix in one clause.
+    fn set_map_clause(&mut self, matches: &[Pattern]) -> Result<SetMapClause, String> {
+        let var = self.ident("expected variable after SET")?;
+        let merge = self.eat(&Tok::Plus);
+        self.expect(&Tok::Eq, "expected '=' in SET clause")?;
+        let param = match self.peek() {
+            Some(Tok::Param(name)) => Some(name.clone()),
+            Some(Tok::LBrace) => None,
+            _ => {
+                return Err(format!(
+                    "not supported in mushroomdb 0.10: SET {var} {}= with a right side that is \
+                     neither a map literal ({{key: value, …}}) nor a $parameter",
+                    if merge { "+" } else { "" }
+                ));
+            }
+        };
+        let is_rel = matches
+            .iter()
+            .flat_map(|p| p.chain.iter())
+            .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+        let is_node = matches.iter().any(|p| {
+            p.start.var.as_deref() == Some(var.as_str())
+                || p.chain
+                    .iter()
+                    .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+        });
+        if is_rel {
+            return Err(format!(
+                "SET {var} = map: '{var}' is a relationship; the map forms work on nodes"
+            ));
+        }
+        if !is_node {
+            return Err(format!(
+                "SET {var} = map: '{var}' is not a node variable bound by MATCH"
+            ));
+        }
+        if param.is_some() {
+            self.pos += 1;
+        }
+        let map = match if param.is_some() {
+            Operand::MapLit(vec![])
+        } else {
+            self.map_literal()?
+        } {
+            Operand::Lit(Value::Map(entries)) => entries
+                .into_iter()
+                .map(|(k, v)| (k, Operand::Lit(v)))
+                .collect(),
+            Operand::MapLit(entries) => entries,
+            _ => return Err(self.err("expected a map literal after SET")),
+        };
+        if self.peek() == Some(&Tok::Comma) {
+            return Err(
+                "not supported in mushroomdb 0.10: a SET map form followed by another SET item; \
+                 use one SET clause per statement"
+                    .to_string(),
+            );
+        }
+        Ok((var, merge, map, param))
+    }
+
+    /// `var.field [, var.field …]` after REMOVE. Each `var` must be a node bound
+    /// by `matches`. A label removal (`n:Label`) is refused by name: a node has
+    /// one label in 0.10.
+    fn remove_items(&mut self, matches: &[Pattern]) -> Result<Vec<(String, String)>, String> {
+        let mut items = Vec::new();
+        loop {
+            let var = self.ident("expected variable after REMOVE")?;
+            if self.peek() == Some(&Tok::Colon) {
+                return Err(
+                    "not supported in mushroomdb 0.10: REMOVE n:Label (label removal)".to_string(),
+                );
+            }
+            self.expect(&Tok::Dot, "expected '.' after variable in REMOVE")?;
+            let field = self.ident("expected property name after '.' in REMOVE")?;
+            let is_rel = matches
+                .iter()
+                .flat_map(|p| p.chain.iter())
+                .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+            if is_rel {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is a relationship; REMOVE works on node properties"
+                ));
+            }
+            let is_node = matches.iter().any(|p| {
+                p.start.var.as_deref() == Some(var.as_str())
+                    || p.chain
+                        .iter()
+                        .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+            });
+            if !is_node {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is not a node variable bound by MATCH"
+                ));
+            }
+            items.push((var, field));
+            if !self.eat(&Tok::Comma) {
+                return Ok(items);
+            }
+        }
+    }
+
+    /// `set_clauses` for a plain `MERGE … ON CREATE/ON MATCH SET`. A map form
+    /// (`n = {…}`, `n += $p`) never reaches here: `write_statement` gives such
+    /// a statement the per-row form ([`needs_per_row_form`]).
+    fn merge_set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
+        self.set_clauses()
     }
 
     fn set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
@@ -1594,12 +2838,21 @@ impl<'a> Parser<'a> {
     }
 
     fn set_clause(&mut self) -> Result<SetClause, String> {
+        self.set_clause_with(false)
+    }
+
+    /// One `var.field = expr`. `row` is the per-row form (after UNWIND), where a
+    /// bare property or variable is a value like any other.
+    fn set_clause_with(&mut self, row: bool) -> Result<SetClause, String> {
         let var = self.ident("expected variable in SET clause")?;
+        if self.peek() == Some(&Tok::Colon) {
+            return Err(refusal("SET n:Label (label assignment)"));
+        }
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-        // Accept Lit, Param, BinArith (arithmetic expression), and FuncCall on
-        // the RHS. Bare Prop/Var (e.g. `SET n.x = m.y`) remain a named error
+        // Accept Lit, Param, BinArith (arithmetic expression), FuncCall and a
+        // predicate (`n.score > 10`) on the RHS. Bare Prop/Var (e.g. `SET n.x = m.y`) remain a named error
         // because that form requires join semantics not supported in v1; use
         // an arithmetic expression like `m.y + 0` if needed.
         let value = match self.peek() {
@@ -1609,16 +2862,27 @@ impl<'a> Parser<'a> {
                 | Tok::Str(_)
                 | Tok::Param(_)
                 | Tok::Dash
-                | Tok::Ident(_),
+                | Tok::Ident(_)
+                | Tok::LBracket
+                | Tok::LBrace
+                | Tok::LParen
+                | Tok::Not,
             ) => {
-                let op = self.arith_expr()?;
+                let op = self.value_expr()?;
                 match &op {
-                    Operand::Lit(_)
+                    Operand::Pred(_)
+                    | Operand::Lit(_)
                     | Operand::Param(_)
                     | Operand::BinArith { .. }
                     | Operand::FuncCall { .. }
                     | Operand::Index { .. }
+                    | Operand::ListLit(_)
+                    | Operand::MapLit(_)
+                    | Operand::ListComprehension { .. }
+                    | Operand::Reduce { .. }
+                    | Operand::ListPredicate { .. }
                     | Operand::Case { .. } => op,
+                    Operand::Prop { .. } | Operand::Var(_) if row => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
                             "SET RHS: bare property/variable reference is not supported; \
@@ -1627,9 +2891,6 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            // List-literal RHS: `SET n.tags = ['a', 'b']`. Lists are pure
-            // literals (no arithmetic), so parse directly into `Operand::Lit`.
-            Some(Tok::LBracket) => Operand::Lit(self.literal_value("SET value")?),
             _ => {
                 return Err(
                     self.err("expected literal, $parameter, or arithmetic expression as SET value")
@@ -1790,6 +3051,73 @@ mod tests {
         parse(&lex(src)?)
     }
 
+    /// Parse `RETURN <expr> AS v` and give back the scalar expression.
+    fn return_expr(expr: &str) -> Operand {
+        use crate::cypher::ast::RetVal;
+        let q = parse_src(&format!("MATCH (n) RETURN {expr} AS v")).unwrap();
+        match q.returns.into_iter().next().unwrap().value {
+            RetVal::ScalarExpr(op) => op,
+            other => panic!("expected a scalar expression, got {other:?}"),
+        }
+    }
+
+    fn bin(op: crate::cypher::ast::ArithOp, l: Operand, r: Operand) -> Operand {
+        Operand::BinArith {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn int(n: i64) -> Operand {
+        Operand::Lit(Value::Int(n))
+    }
+
+    #[test]
+    fn modulo_shares_a_level_with_mul_and_div_left_associative() {
+        use crate::cypher::ast::ArithOp::{Div, Mod, Mul};
+        assert_eq!(return_expr("7 % 3"), bin(Mod, int(7), int(3)));
+        assert_eq!(
+            return_expr("10 % 4 * 2"),
+            bin(Mul, bin(Mod, int(10), int(4)), int(2))
+        );
+        assert_eq!(
+            return_expr("10 * 4 % 3 / 2"),
+            bin(Div, bin(Mod, bin(Mul, int(10), int(4)), int(3)), int(2))
+        );
+    }
+
+    #[test]
+    fn caret_binds_tighter_than_mul_and_is_left_associative() {
+        use crate::cypher::ast::ArithOp::{Add, Mul, Pow};
+        assert_eq!(return_expr("2 ^ 8"), bin(Pow, int(2), int(8)));
+        assert_eq!(
+            return_expr("2 ^ 3 ^ 2"),
+            bin(Pow, bin(Pow, int(2), int(3)), int(2))
+        );
+        assert_eq!(
+            return_expr("2 * 3 ^ 2"),
+            bin(Mul, int(2), bin(Pow, int(3), int(2)))
+        );
+        assert_eq!(
+            return_expr("1 + 2 ^ 3"),
+            bin(Add, int(1), bin(Pow, int(2), int(3)))
+        );
+        // unary minus binds tighter than ^: -2^2 is (-2)^2
+        assert_eq!(return_expr("-2 ^ 2"), bin(Pow, int(-2), int(2)));
+    }
+
+    #[test]
+    fn words_that_became_keywords_still_parse_as_names() {
+        for src in [
+            "MATCH (call:Remove) WHERE call.exists = 1 RETURN call.explain AS foreach",
+            "MATCH (n:Exists {call: 1, Remove: 2})-[r:FOREACH]->(m) RETURN n.Call, r, m",
+            "MATCH (n) WITH n AS explain RETURN explain.remove",
+        ] {
+            parse_src(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
+    }
+
     fn prop(var: &str, field: &str) -> Operand {
         Operand::Prop {
             var: var.into(),
@@ -1858,6 +3186,8 @@ SKIP 1 LIMIT 5";
                     ),
                 ],
                 shortest: false,
+                path_var: None,
+                continues_match: false,
             }],
             optional_clauses: vec![],
             unwinds: vec![],
@@ -2058,6 +3388,8 @@ LIMIT 10";
                     ),
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 },
                 Pattern {
                     start: node(Some("c"), Some("Company"), vec![]),
@@ -2071,6 +3403,8 @@ LIMIT 10";
                         node(Some("t"), None, vec![]),
                     )],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 },
                 Pattern {
                     start: node(Some("c"), None, vec![]),
@@ -2084,6 +3418,8 @@ LIMIT 10";
                         node(Some("t"), None, vec![]),
                     )],
                     shortest: false,
+                    path_var: None,
+                    continues_match: false,
                 },
             ],
             optional_clauses: vec![],
@@ -2374,16 +3710,22 @@ LIMIT 10";
                         field: "city".into()
                     }
                 );
-                assert_eq!(list.len(), 2);
-                assert_eq!(list[0], Operand::Lit(Value::Str("Austin".into())));
-                assert_eq!(list[1], Operand::Param("c".into()));
+                // One list-valued right-hand side (QL-BX): a written list
+                // with a non-constant element stays a list literal.
+                assert_eq!(
+                    list,
+                    Operand::ListLit(vec![
+                        Operand::Lit(Value::Str("Austin".into())),
+                        Operand::Param("c".into()),
+                    ])
+                );
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
         let q2 = parse_src("MATCH (n) WHERE n.city IN $cities RETURN n").unwrap();
         match q2.where_expr {
             Some(Expr::In { list, .. }) => {
-                assert_eq!(list, vec![Operand::Param("cities".into())]);
+                assert_eq!(list, Operand::Param("cities".into()));
             }
             other => panic!("expected Expr::In, got {other:?}"),
         }
@@ -2399,7 +3741,7 @@ LIMIT 10";
     #[test]
     fn union_query_parses_into_parts() {
         use super::parse_read;
-        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m").unwrap())
+        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m AS n").unwrap())
             .expect("UNION parses");
         assert_eq!(u.parts.len(), 2);
         assert_eq!(u.all_flags, vec![true]);
@@ -2491,12 +3833,20 @@ LIMIT 10";
             other => panic!("expected Merge, got {other:?}"),
         }
 
+        // A second property makes the pattern one that matches by label and
+        // properties (QL-NM): the per-row form, which carries every property.
         let toks = crate::cypher::lex("MERGE (n:Doc {id: 'x', name: 'Alice'})").unwrap();
-        let err = parse_write(&toks).expect_err("a non-ns extra property is still refused");
-        assert!(
-            err.contains("one key property") || err.contains("exactly one"),
-            "error must mention the single-key constraint, got: {err}"
-        );
+        match parse_write(&toks).expect("a pattern of several properties parses") {
+            WriteStatement::UnwindWrite(u) => match u.writes.as_slice() {
+                [crate::cypher::ast::RowWrite::Merge(m)] => {
+                    assert!(!m.start.key_pattern);
+                    let names: Vec<&str> = m.start.props.iter().map(|(k, _)| k.as_str()).collect();
+                    assert_eq!(names, ["id", "name"]);
+                }
+                other => panic!("expected one MERGE, got {other:?}"),
+            },
+            other => panic!("expected the per-row form, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2868,5 +4218,84 @@ LIMIT 10";
                 Value::Str("y".into())
             ]))
         );
+    }
+
+    // ── QL-16: list and map literals ─────────────────────────────────────────
+
+    fn parse_err_of(src: &str) -> String {
+        match parse_src(src) {
+            Ok(q) => panic!("`{src}` must not parse, got {q:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn ql16_all_literal_lists_and_maps_fold_to_values() {
+        assert_eq!(
+            return_expr("[1, 'a', [2]]"),
+            Operand::Lit(Value::List(vec![
+                Value::Int(1),
+                Value::Str("a".into()),
+                Value::List(vec![Value::Int(2)]),
+            ]))
+        );
+        assert_eq!(return_expr("[]"), Operand::Lit(Value::List(vec![])));
+        assert_eq!(
+            return_expr("{a: 1, `b c`: 2}"),
+            Operand::Lit(Value::Map(
+                [
+                    ("a".to_string(), Value::Int(1)),
+                    ("b c".to_string(), Value::Int(2))
+                ]
+                .into_iter()
+                .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn ql16_non_literal_elements_stay_expressions() {
+        assert_eq!(
+            return_expr("[n.x, 1]"),
+            Operand::ListLit(vec![prop("n", "x"), int(1)])
+        );
+        assert_eq!(
+            return_expr("{k: n.x}"),
+            Operand::MapLit(vec![("k".to_string(), prop("n", "x"))])
+        );
+    }
+
+    #[test]
+    fn ql16_literal_errors_are_clear() {
+        assert!(parse_err_of("MATCH (n) RETURN [1, 2,] AS x").contains("trailing comma"));
+        assert!(parse_err_of("MATCH (n) RETURN {a: 1,} AS x").contains("trailing comma"));
+        assert!(
+            parse_err_of("MATCH (n) RETURN {a: 1, a: 2} AS x").contains("duplicate map key `a`")
+        );
+        assert!(parse_err_of("MATCH (n) RETURN [1, 2 AS x").contains("']'"));
+        assert!(parse_err_of("MATCH (n) RETURN {a: 1 AS x").contains("'}'"));
+        assert!(parse_err_of("MATCH (n) RETURN {a 1} AS x").contains("':'"));
+        assert!(parse_err_of("MATCH (n) RETURN [").contains("expected"));
+        assert!(parse_err_of("MATCH (n) RETURN {").contains("expected"));
+    }
+
+    #[test]
+    fn ql16_pattern_maps_and_relationship_brackets_parse_as_before() {
+        let q = parse_src("MATCH (a:L {k: 1})-[r:T]->(b) RETURN a").unwrap();
+        let pat = &q.matches[0];
+        assert_eq!(pat.start.props, vec![("k".to_string(), int(1))]);
+        assert_eq!(pat.chain[0].0.etypes, vec!["T".to_string()]);
+        // A list-valued property in a pattern now parses as an operand.
+        assert!(parse_src("MATCH (a:L {k: [1, 2]}) RETURN a").is_ok());
+    }
+
+    #[test]
+    fn ql16_deeply_nested_literals_are_an_error_not_a_stack_overflow() {
+        let src = format!(
+            "MATCH (n) RETURN {}1{} AS x",
+            "[".repeat(5000),
+            "]".repeat(5000)
+        );
+        assert!(parse_err_of(&src).contains("too deep"));
     }
 }

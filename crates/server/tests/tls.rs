@@ -11,7 +11,9 @@ fn tmp_tls(name: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn tls_serves_https_and_rejects_plain_http() {
-    // Both ring and aws-lc-rs may be compiled in; pick ring explicitly.
+    // A convenience for this binary only: the server needs no installed
+    // provider (`tls_no_provider.rs` pins that); installing one here keeps
+    // these tests independent of which provider the helper falls back to.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -56,4 +58,60 @@ async fn tls_serves_https_and_rejects_plain_http() {
     );
 
     handle.abort();
+}
+
+/// The shared TLS helper (contract C4): one config for HTTP and Bolt, with no
+/// ALPN of its own, and errors that name the file at fault.
+#[test]
+fn load_server_config_reads_the_pair_and_names_a_bad_file() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let config = server::load_server_config(&cert_path, &key_path).unwrap();
+    assert!(
+        config.alpn_protocols.is_empty(),
+        "the shared config is protocol-neutral"
+    );
+
+    let missing = dir.path().join("missing.pem");
+    let err = server::load_server_config(&missing, &key_path).unwrap_err();
+    assert!(
+        err.contains("--tls-cert") && err.contains("missing.pem"),
+        "{err}"
+    );
+
+    let garbage = dir.path().join("garbage.pem");
+    std::fs::write(&garbage, "not pem at all").unwrap();
+    let err = server::load_server_config(&cert_path, &garbage).unwrap_err();
+    assert!(
+        err.contains("--tls-key") && err.contains("garbage.pem"),
+        "{err}"
+    );
+    let err = server::load_server_config(&garbage, &key_path).unwrap_err();
+    assert!(err.contains("--tls-cert"), "{err}");
+
+    // A key file with two keys is refused, as axum-server's parser did.
+    let two_keys = dir.path().join("two-keys.pem");
+    std::fs::write(
+        &two_keys,
+        format!(
+            "{}{}",
+            cert.key_pair.serialize_pem(),
+            cert.key_pair.serialize_pem()
+        ),
+    )
+    .unwrap();
+    let err = server::load_server_config(&cert_path, &two_keys).unwrap_err();
+    assert!(err.contains("more than one"), "{err}");
+
+    // A key that belongs to another certificate is refused.
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let other_key = dir.path().join("other-key.pem");
+    std::fs::write(&other_key, other.key_pair.serialize_pem()).unwrap();
+    assert!(server::load_server_config(&cert_path, &other_key).is_err());
 }

@@ -1,0 +1,59 @@
+# mushroomdb on Render (Blueprint).
+#
+# SINGLE WRITER - replicas must be 1. Keep the instance count at 1: a Render
+# persistent disk attaches to one instance, and a second writer on the same
+# store contends for the write lock. Do not enable autoscaling.
+#
+# Secret values are entered in the Render dashboard (sync: false); none live in
+# this file.
+#
+# VOLUME OWNERSHIP: the image runs as uid 65532, not root, and has no shell, so
+# it cannot chown its own disk. A Render disk mounts root-owned, and Render has
+# no setting for the owner. If serve exits at start with `the data directory is
+# not writable ... uid 65532`, deploy a thin wrapper image instead of the stock
+# one: it starts as root, chowns /data, then drops to uid 65532 before it execs
+# the server. The Dockerfile is in docs/site/deployment.md, "Volume ownership on
+# managed platforms" (push the wrapper to a registry, or use runtime: docker).
+# Status: confirmed at the release gate by a real Render
+# deploy; it has not been run yet.
+#
+# NO BOLT: a Render web service exposes only HTTP, so Bolt (7687) is not
+# reachable from outside and this template does not start it. A Render private
+# service can take other ports, reachable only from your other Render services
+# (UNVERIFIED here; docs/site/deployment.md, "Exposing the Bolt port").
+services:
+  - type: web
+    name: mushroomdb
+    runtime: image
+    image:
+      url: ghcr.io/matthewsherlin/mushroomdb:latest
+    numInstances: 1
+    # Explicit command: no --demo-if-empty, so a production disk is never seeded.
+    dockerCommand: serve /data --addr 0.0.0.0:8080 --snapshot-every 300 --shutdown-timeout-secs 25
+    disk:
+      name: mushroomdb-data
+      mountPath: /data
+      sizeGB: 10
+    # Render probes the port named by PORT; the server binds 8080 (--addr above).
+    healthCheckPath: /ready
+    # Render sends SIGKILL 30 s after SIGTERM, and that delay cannot be changed
+    # for a service with a persistent disk (maxShutdownDelaySeconds is refused
+    # with one). So serve is told to finish its whole shutdown (drain, snapshot,
+    # backup flush, lease release) within 25 s; see docs/site/deployment.md,
+    # "Stopping cleanly".
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: MUSHROOMDB_TOKEN
+        sync: false
+      - key: MUSHROOMDB_LOG_FORMAT
+        value: json
+      # Continuous backup (docs/site/deployment.md); the AWS_* credentials are
+      # entered in the dashboard (sync: false), never here:
+      # - key: MUSHROOMDB_BACKUP_S3_URL
+      #   value: s3://<bucket>/<prefix>
+      # Restore on boot: an empty disk restores the newest backup there before serving.
+      # - key: MUSHROOMDB_RESTORE_FROM_S3
+      #   value: s3://<bucket>/<prefix>
+      # Backup stays off until MUSHROOMDB_BACKUP_S3_URL is set; the other backup
+      # settings and their defaults: docs/site/deployment.md and docs/site/self-host.md.

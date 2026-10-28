@@ -1,11 +1,11 @@
 [package]
 name = "mushroomdb-cli"
-version = "0.9.4"
+version = "0.10.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-keywords.workspace = true
+keywords = ["graph-database", "cypher", "mcp", "agent-memory", "cli"]
 categories.workspace = true
 description = "CLI binary for mushroomdb: start, shell, and server commands"
 readme = "README.md"
@@ -24,25 +24,44 @@ doc = false
 [features]
 default = []
 embed-ui = ["server/embed-ui"]
-tls = ["server/tls"]
+tls = ["server/tls", "bolt/tls"]
+# Test-only hooks in the binary (a slow shutdown snapshot). Enabled for this
+# package's own tests through the self dev-dependency below; never default.
+test-hooks = []
 
 [dependencies]
 # The subscriber lives in the binary. `env-filter` gives MUSHROOMDB_LOG, and
-# `fmt` is the human-readable writer; JSON output is deliberately not wired
-# until someone needs to ship these somewhere that wants it.
+# `fmt` is the human-readable writer; `json` is `MUSHROOMDB_LOG_FORMAT=json`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
     "fmt",
     "env-filter",
     "ansi",
+    "json",
 ] }
-mushroomdb = { path = "../core-api", version = "0.9.4" }
-code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.9.4" }
-server = { package = "mushroomdb-server", path = "../server", version = "0.9.4" }
+mushroomdb = { path = "../core-api", version = "0.10.0" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.10.0" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.10.0" }
+# `serve --bolt-port`: the Bolt listener beside the HTTP server.
+bolt = { package = "mushroomdb-bolt", path = "../bolt", version = "0.10.0" }
+backup = { package = "mushroomdb-backup", path = "../backup", version = "0.10.0" }
 serde = { workspace = true }
-serde_json = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 parquet = { version = "59", default-features = false, features = ["arrow"] }
 arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
+# `mushroomdb import`: RFC 4180 parsing of the bulk-import CSV files.
+csv = "1"
+# `keys add`: the token comes from the operating system's random source on every
+# platform. Already in the lock (rand and others use it).
+getrandom = "0.3"
+
+[dev-dependencies]
+# Self dev-dependency: turns on `test-hooks` for this package's tests only.
+mushroomdb-cli = { path = ".", features = ["test-hooks"] }
+# `tests/serve_bolt.rs` under `tls`: a self-signed certificate and a TLS client
+# for HTTPS and Bolt. Both already in the tree.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

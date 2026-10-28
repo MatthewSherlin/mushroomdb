@@ -416,10 +416,11 @@ _REFUSED_READS = {
     "search": lambda h: h.search("bio", "alpha"),
     "fulltext_pairs": lambda h: h.fulltext_pairs(),
     "rules": lambda h: h.rules(),
+    "to_arrow_tables": lambda h: h.to_arrow_tables(),
     "suggest_rules": lambda h: h.suggest_rules(),
-    "recall": lambda h: h.recall("alpha"),
-    "schema_report": lambda h: h.schema_report(),
-    "identity_clusters": lambda h: h.identity_clusters(),
+    "recall": lambda h: h.memory.recall("alpha"),
+    "schema_report": lambda h: h.memory.schema_report(),
+    "identity_clusters": lambda h: h.memory.identity_clusters(),
 }
 
 # The ones whose unscoped answer names every node in the fixture — a row per
@@ -563,6 +564,33 @@ def test_context_manager_on_a_scoped_handle(tmp_path):
         db.node_info("vis_a")
 
 
+def test_a_scoped_handles_transactions_read_through_the_scope_and_never_write(store):
+    """`begin_transaction` / `transaction` on a scoped handle: the scope applies to
+    every statement, and a write is refused the same way for a hidden key and an
+    absent one — the transaction is not an existence oracle either."""
+    from mushroomdb import ReadOnly
+
+    _, s = store
+    reads = [
+        "MATCH (n:Person) RETURN n.team AS team, key(n) AS k",
+        "MATCH (a)-[r:LINKS]->(b) RETURN key(a) AS a, key(b) AS b",
+        "MATCH (a)-[r]->(b) RETURN key(a) AS a, type(r) AS t, key(b) AS b",
+        "MATCH (n:Person) WHERE n.bio CONTAINS 'alpha' RETURN n.bio AS bio",
+    ]
+    with s.transaction() as tx:
+        for cypher in reads:
+            rows = tx.execute(cypher)
+            _assert_clean(f"tx.execute({cypher!r})", rows)
+            assert rows == s.query(cypher), cypher
+        refusals = []
+        for key in (HIDDEN[0], ABSENT):
+            with pytest.raises(ReadOnly) as caught:
+                tx.execute("MATCH (n:Person {id: $k}) SET n.team = 'x'", {"k": key})
+            refusals.append((type(caught.value), caught.value.code, str(caught.value)))
+        assert refusals[0] == refusals[1]
+    assert s.begin_transaction().commit() >= 0
+
+
 def test_open_carries_no_scope_and_reads_no_other_store(tmp_path):
     """`open` is a staticmethod: `s.open(p)` is `GraphDb.open(p)`, unscoped.
 
@@ -658,16 +686,16 @@ _WRITES_BY_KEY = {
     # A *mismatching* label on purpose, as the `upsert_node` row has: the
     # relabel refusal reads the stored label, and on a scoped handle that read
     # must never be reached.
-    ("upsert_entity", "key"): lambda s, k: s.upsert_entity(k, {"t": 1}, label="__probe_label__"),
-    ("remember", "about"): lambda s, k: s.remember("probe", about=[k], ts=1),
-    ("remember", "entity"): lambda s, k: s.remember(
+    ("upsert_entity", "key"): lambda s, k: s.memory.upsert_entity(k, {"t": 1}, label="__probe_label__"),
+    ("remember", "about"): lambda s, k: s.memory.remember("probe", about=[k], ts=1),
+    ("remember", "entity"): lambda s, k: s.memory.remember(
         "probe", ts=1, entities=[{"key": k, "label": "__probe_label__", "props": {"t": 1}}]
     ),
-    ("forget", "key"): lambda s, k: s.forget(key=k),
-    ("forget", "subject"): lambda s, k: s.forget(
+    ("forget", "key"): lambda s, k: s.memory.forget(key=k),
+    ("forget", "subject"): lambda s, k: s.memory.forget(
         fact={"subject": k, "predicate": "LINKS", "object": "vis_b"}
     ),
-    ("forget", "object"): lambda s, k: s.forget(
+    ("forget", "object"): lambda s, k: s.memory.forget(
         fact={"subject": "vis_a", "predicate": "LINKS", "object": k}
     ),
 }
@@ -784,6 +812,7 @@ COVERED = {
     "search": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "fulltext_pairs": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "to_arrow_tables": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "suggest_rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "recall": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "schema_report": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
@@ -797,6 +826,8 @@ COVERED = {
     "refresh": "test_refresh_is_permitted_and_names_nothing",
     "scoped": "test_scoped_narrows_and_never_widens",
     "close": "test_close_is_permitted_on_a_scoped_handle",
+    "begin_transaction": "test_a_scoped_handles_transactions_read_through_the_scope_and_never_write",
+    "transaction": "test_a_scoped_handles_transactions_read_through_the_scope_and_never_write",
     "open": "test_open_carries_no_scope_and_reads_no_other_store",
     "restore": "test_restore_is_a_staticmethod_about_other_directories",
     # writes — refused, and the refusal discloses nothing

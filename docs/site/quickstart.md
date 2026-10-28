@@ -1,5 +1,7 @@
 # Quickstart
 
+Looking to use mushroomdb as a graph database? See [Get started](get-started.md) for language-specific 60-second quickstarts. This page covers the agent-memory MCP quickstart.
+
 Two commands put a populated store behind an assistant. Four calls are what the
 store is for. Graphing a repository is at the bottom of this page.
 

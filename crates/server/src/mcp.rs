@@ -689,12 +689,13 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             continue;
         }
         match json_to_value(json_val.clone()) {
-            Some(v) => {
+            Ok(Some(v)) => {
                 row.insert(field.clone(), v);
             }
-            None => {
+            Ok(None) => {
                 return CallOutcome::ToolErr(format!("prop {field} is not a supported value type"))
             }
+            Err(e) => return CallOutcome::ToolErr(format!("prop {field}: {e}")),
         }
     }
     if let Some(ns) = namespace.as_deref() {
@@ -740,6 +741,14 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             crate::mcp_tasks::SAME_AS_LOST_REMEDY
         ));
     }
+    // Absent unless the read-back failed, so an ordinary reply is unchanged.
+    if let Some(unread) = &outcome.same_as_unread {
+        reply["same_as_unread"] = json!(unread);
+        reply["same_as_unread_note"] = json!(format!(
+            "this write committed, but its SAME_AS links could not be read afterwards, \
+             so same_as_lost is not known: {unread}"
+        ));
+    }
     CallOutcome::ToolOk(reply)
 }
 
@@ -774,8 +783,11 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
 
     // When a `vector` array is provided, use the HNSW / brute-force vector
     // similarity path instead of looking up pre-derived edges.
-    if let Some(vec_js) = args.get("vector").and_then(Js::as_array) {
-        let q: Vec<f64> = vec_js.iter().filter_map(|v| v.as_f64()).collect();
+    let vector = match vector_arg(args) {
+        Ok(v) => v,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if let Some(q) = vector {
         if q.is_empty() {
             return CallOutcome::ToolErr("vector must be a non-empty array of numbers".into());
         }
@@ -955,6 +967,45 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+/// The `vector` argument: `None` when absent or null, the numbers when it is
+/// an array of numbers, an error otherwise. An element that is not a number is
+/// never dropped (`[1, "x", 0]` is not `[1, 0]`), and a `vector` that is not an
+/// array is never taken for absent.
+fn vector_arg(args: &Js) -> Result<Option<Vec<f64>>, String> {
+    match args.get("vector") {
+        None | Some(Js::Null) => Ok(None),
+        Some(Js::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .ok_or_else(|| "vector elements must all be numbers".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err("vector must be an array of numbers".to_string()),
+    }
+}
+
+/// A non-negative integer argument. Absent or null takes `default`; present
+/// and not that integer is an error naming the argument, never the default.
+fn count_arg(args: &Js, name: &str, default: usize) -> Result<usize, String> {
+    match args.get(name) {
+        None | Some(Js::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("{name} must be a non-negative integer")),
+    }
+}
+
+/// A number argument, under the same rule as [`count_arg`].
+fn number_arg(args: &Js, name: &str, default: f64) -> Result<f64, String> {
+    match args.get(name) {
+        None | Some(Js::Null) => Ok(default),
+        Some(v) => v.as_f64().ok_or_else(|| format!("{name} must be a number")),
+    }
+}
+
 /// Exact cosine top-k among a caller key set. Self excluded. Never HNSW.
 fn tool_pairwise_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(keys_js) = args.get("keys").and_then(Js::as_array) else {
@@ -970,12 +1021,14 @@ fn tool_pairwise_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(field) = args.get("field").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing required field: field".into());
     };
-    let k = args
-        .get("k")
-        .and_then(Js::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(10);
-    let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.0);
+    let k = match count_arg(args, "k", 10) {
+        Ok(k) => k,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let min = match number_arg(args, "min", 0.0) {
+        Ok(min) => min,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     let out = {
         let g = db.read();
@@ -1019,17 +1072,15 @@ fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
         .and_then(Js::as_str)
         .unwrap_or("embedding");
     let label = args.get("label").and_then(Js::as_str);
-    let k = args
-        .get("k")
-        .and_then(Js::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(10);
+    let k = match count_arg(args, "k", 10) {
+        Ok(k) => k,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
 
-    let query_vec: Vec<f64> = args
-        .get("vector")
-        .and_then(Js::as_array)
-        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
-        .unwrap_or_default();
+    let query_vec: Vec<f64> = match vector_arg(args) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
 
     let hits = {
         let g = db.read();
@@ -1162,6 +1213,11 @@ fn parse_where_arg(args: &Js) -> std::result::Result<Option<PropPredicate>, Stri
 pub(crate) fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
+        // The detail names paths and uids; it goes to the server's log only.
+        GraphError::Unwritable { path, detail, .. } => {
+            tracing::error!(path = %path, "{detail}");
+            GraphError::UNWRITABLE_CLIENT_MESSAGE.to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -1287,7 +1343,7 @@ fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range or the list is null, and an error when the property is not a list or map or the index is not an integer.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1362,6 +1418,19 @@ fn graph_tools() -> Vec<Js> {
                         "approximate": {
                             "type": "boolean",
                             "description": "Find candidates through the HNSW index instead of comparing every pair (default: false). Only for a VectorSimilar predicate; the edges are approximate, not exact."
+                        },
+                        "via_label": {
+                            "type": "string",
+                            "description": "Optional intermediate hop: the label of the via node. Give it together with via_edge. The predicate is then evaluated between the via node and the destination, and the derived edge still runs source to destination."
+                        },
+                        "via_edge": {
+                            "type": "string",
+                            "description": "Optional intermediate hop: the edge type followed from the source to reach a via node. Give it together with via_label."
+                        },
+                        "via_dir": {
+                            "type": "string",
+                            "enum": ["Out", "In"],
+                            "description": "Direction to follow via_edge from the source (default: Out, source to via)."
                         },
                         "namespace": {
                             "type": "string",
@@ -1635,6 +1704,17 @@ fn write_json(writer: &mut impl Write, value: &Js) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unwritable_directory_reaches_a_client_without_paths_or_uids() {
+        let msg = graph_err_msg(GraphError::Unwritable {
+            path: "/secret/dir/LOCK".into(),
+            detail: "uid 65532 owner 0 /secret/dir".into(),
+            read_only_filesystem: false,
+        });
+        assert_eq!(msg, GraphError::UNWRITABLE_CLIENT_MESSAGE);
+        assert!(!msg.contains("secret") && !msg.contains("65532"));
+    }
     use mushroomdb::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2314,6 +2394,28 @@ mod tests {
     }
 
     #[test]
+    fn upsert_entity_refuses_a_bad_tagged_value_naming_the_prop() {
+        let db = demo_db();
+        let before = db.read().node_count();
+        for (payload, reason) in [
+            (json!({"$date": "2023-02-29"}), "is not an ISO 8601 date"),
+            (json!({"$binary": 7}), "payload must be a string"),
+        ] {
+            let resp = tool_call(
+                &db,
+                1,
+                "upsert_entity",
+                json!({"key": "carol", "label": "Person", "props": {"born": payload}}),
+            );
+            assert!(is_error(&resp));
+            let err = tool_err_text(&resp);
+            assert!(err.contains("prop born: $"), "{err}");
+            assert!(err.contains(reason), "{err}");
+        }
+        assert_eq!(db.read().node_count(), before);
+    }
+
+    #[test]
     fn test_upsert_entity_updates_existing_node() {
         let db = demo_db();
         let resp = tool_call(
@@ -2586,6 +2688,93 @@ mod tests {
             is_error(&resp),
             "non-string mask element must produce a tool error"
         );
+    }
+
+    /// Ledger row 88: a `vector` with an element that is not a number was
+    /// searched with the element dropped (`[1, "x", 0]` as `[1, 0]`); the same
+    /// for `hybrid_search`'s `vector`, and `pairwise_similar` / `hybrid_search`
+    /// replaced a wrongly typed `k` (and `min`) by a default.
+    #[test]
+    fn find_similar_drops_non_numeric_vector_elements_is_error() {
+        let db = demo_db();
+        for (tool, args, want) in [
+            (
+                "find_similar",
+                json!({ "vector": [1, "x", 0], "field": "emb" }),
+                "vector elements must all be numbers",
+            ),
+            (
+                "hybrid_search",
+                json!({
+                    "query_text": "alice", "text_field": "name",
+                    "vector": [1.0, null], "vector_field": "emb"
+                }),
+                "vector elements must all be numbers",
+            ),
+            (
+                "find_similar",
+                json!({ "vector": "1,0", "field": "emb" }),
+                "vector must be an array of numbers",
+            ),
+            (
+                "hybrid_search",
+                json!({ "query_text": "alice", "text_field": "name", "vector": 5 }),
+                "vector must be an array of numbers",
+            ),
+            (
+                "hybrid_search",
+                json!({ "query_text": "alice", "text_field": "name", "k": "3" }),
+                "k must be a non-negative integer",
+            ),
+            (
+                "pairwise_similar",
+                json!({ "keys": ["alice", "bob"], "field": "emb", "k": "3" }),
+                "k must be a non-negative integer",
+            ),
+            (
+                "pairwise_similar",
+                json!({ "keys": ["alice", "bob"], "field": "emb", "min": "0.5" }),
+                "min must be a number",
+            ),
+        ] {
+            let resp = tool_call(&db, 1, tool, args.clone());
+            assert!(
+                is_error(&resp),
+                "{tool} {args} must be a tool error, got {resp}"
+            );
+            assert_eq!(tool_err_text(&resp), want, "for {tool} {args}");
+        }
+        // Absent or null keeps the default.
+        let resp = tool_call(
+            &db,
+            2,
+            "pairwise_similar",
+            json!({ "keys": ["alice", "bob"], "field": "emb", "k": null }),
+        );
+        assert!(!is_error(&resp), "null takes the default: {resp}");
+        assert_eq!(tool_text(&resp)["k"], json!(10));
+    }
+
+    /// Ledger row 88: `create_rule` accepts `via_label`, `via_edge` and
+    /// `via_dir`, so its advertised schema names them.
+    #[test]
+    fn create_rule_schema_advertises_the_via_fields() {
+        let db = demo_db();
+        let resp = roundtrip_with(
+            &db,
+            true,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        let rule = tools
+            .iter()
+            .find(|t| t["name"] == "create_rule")
+            .expect("create_rule");
+        let props = &rule["inputSchema"]["properties"];
+        for field in ["via_label", "via_edge", "via_dir"] {
+            assert!(props.get(field).is_some(), "{field} missing: {props}");
+        }
+        assert_eq!(props["via_dir"]["enum"], json!(["Out", "In"]));
     }
 
     /// A `min`, `k` or `limit` that is present and not the number it should be

@@ -6,9 +6,11 @@
 pub mod doctor;
 pub mod export;
 pub(crate) mod hook;
+pub mod import;
 pub mod ingest_git;
 pub mod install;
 pub mod recall;
+pub mod serve_bolt;
 pub mod structure;
 
 use export::ExportFormat;
@@ -19,13 +21,14 @@ pub use mushroomdb::restore::RestoreOutcome;
 use mushroomdb::schema::Schema;
 use mushroomdb::{
     default_max_edges, is_write_query, valid_namespace, AlgoDir, BackupReport, DegreeConfig,
-    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs,
-    ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    Explanation, GraphDb, IngestOptions, LouvainConfig, OpenOptions, PageRankConfig, Predicate,
+    RealFs, ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
     WriteGuard, NS_MAX_LEN,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -244,11 +247,10 @@ pub enum Command {
     /// A hook body 0.6 installed and 0.7 retired: `touch`, `intercept`,
     /// `impact-hook` and `enrich` in the assistant's settings, `sync` in the
     /// git hooks. A machine that upgraded without re-running `install` still
-    /// calls them, so each is accepted with any arguments, opens nothing, and
-    /// prints one stderr line saying how to remove it. Never in [`usage`].
-    RetiredHook {
-        sub: &'static str,
-    },
+    /// calls them, so each is accepted with any arguments, opens nothing,
+    /// prints nothing and exits 0. `mushroomdb doctor` lists any that remain
+    /// and `install` removes them. Never in [`usage`].
+    RetiredHook,
     Serve {
         db_dir: PathBuf,
         addr: SocketAddr,
@@ -263,6 +265,10 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// `--shutdown-timeout-secs`: the whole graceful shutdown (drain,
+        /// snapshot, backup flush, lease release) must finish within this.
+        /// Default [`DEFAULT_SHUTDOWN_TIMEOUT_SECS`].
+        shutdown_timeout: Duration,
         /// Seed an empty `db_dir` from the newest backup under this directory
         /// before opening it. See [`restore_if_empty`]. `None` = off (default).
         restore_from: Option<PathBuf>,
@@ -270,6 +276,13 @@ pub enum Command {
         tls_cert: Option<PathBuf>,
         /// Path to PEM private key for native TLS (`--tls-key`). Requires `--tls-cert`.
         tls_key: Option<PathBuf>,
+        /// The `--bolt-*` flags; resolved against the environment by
+        /// [`serve_bolt::resolve_bolt_settings`].
+        bolt: serve_bolt::BoltFlags,
+        /// `--tx-max`, `--tx-timeout-secs`, `--tx-max-lifetime-secs`: the HTTP
+        /// transaction limits; resolved against the environment by
+        /// [`resolve_tx_limits`].
+        tx: TxFlags,
     },
     Mcp {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
@@ -302,6 +315,10 @@ pub enum Command {
         at: Option<String>,
         /// Optional Cypher read query to execute against the as-of view.
         query: Option<String>,
+        /// Read the Cypher statement from this file instead of `--query`.
+        file: Option<PathBuf>,
+        /// Read the Cypher statement from standard input instead of `--query`.
+        stdin: bool,
         /// Read only this namespace, as it was at that commit.
         namespace: Option<String>,
     },
@@ -331,6 +348,10 @@ pub enum Command {
         db_dir: PathBuf,
         /// Positional after dir (remaining args joined), or `--query`.
         cypher: String,
+        /// Read the statement from this file (`--file`), instead of `cypher`.
+        file: Option<PathBuf>,
+        /// Read the statement from standard input (`--stdin`), instead of `cypher`.
+        stdin: bool,
         /// Answer as one of the store's roles: only the nodes it may see.
         role: Option<String>,
         /// Answer from one namespace only. Intersects `role` — never widens it.
@@ -360,10 +381,25 @@ pub enum Command {
         memory_defaults: bool,
         memory_identity: bool,
     },
+    /// List the declared indexes (`schema indexes <db-dir>`) or unique
+    /// constraints (`schema constraints <db-dir>`) as a table.
+    SchemaList {
+        db_dir: PathBuf,
+        what: SchemaListing,
+    },
     /// Migrate an old-format snapshot to the current version and keep `.bak`.
     Migrate {
         db_dir: PathBuf,
     },
+    /// Issue an access key: print a new random token once, store only its hash.
+    KeysAdd {
+        db_dir: PathBuf,
+        name: String,
+        tier: String,
+        role: Option<String>,
+    },
+    /// Print the `keys.json` hash of the token read from standard input.
+    KeysHash,
     /// Validate CRC32 integrity of every section in the V8 snapshot.
     Verify {
         db_dir: PathBuf,
@@ -373,11 +409,28 @@ pub enum Command {
         db_dir: PathBuf,
         dest: PathBuf,
     },
+    /// Restore a store from a continuous backup in S3-compatible storage
+    /// (`restore --from s3://bucket/prefix`). See [`run_restore_s3`].
+    RestoreS3 {
+        /// `s3://bucket/prefix`, `r2://…` or `minio://…`.
+        from: String,
+        /// `--at`: a commit number or an RFC 3339 timestamp; `None` restores
+        /// the newest restore point.
+        at: Option<String>,
+        /// `--into`; `None` is [`DEFAULT_RESTORE_INTO`].
+        into: Option<PathBuf>,
+    },
     /// Export all nodes, edges, and rules to a destination directory.
     Export {
         db_dir: PathBuf,
         dest: PathBuf,
         format: ExportFormat,
+    },
+    /// Bulk-load CSV and JSONL files.
+    Import {
+        db_dir: PathBuf,
+        inputs: import::ImportInputs,
+        opts: import::ImportOptions,
     },
     /// Build (or incrementally sync) a graph of a git repository.
     IngestGit {
@@ -461,6 +514,112 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
+  mushroomdb query <db-dir> [--query \"MATCH ...\"|--file <path>|--stdin] [--role <name>] [--namespace <ns>] <cypher…>
+                     --file reads the statement from a file and --stdin from standard input,
+                     so a quote or a backslash needs no shell escaping; a trailing newline
+                     and one trailing `;` are dropped, and the statement comes from only one of the three places
+                     --role answers as one of the store's roles and --namespace from one
+                     namespace; together they intersect, so neither ever widens the other
+                     and either one makes the query a read
+  mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"|--file <path>|--stdin] [--namespace <ns>]
+                     --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
+                     and resolves to the last commit at or before it; exactly one of
+                     --commit and --at
+  mushroomdb stats <db-dir>
+  mushroomdb why <db-dir> <a> <b>
+                                   every rule edge between two keys with the evidence that
+                                   derived it, or a note that there is none
+  mushroomdb suggest <db-dir>
+  mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo wcc <db-dir> [--top N]
+  mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
+  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
+  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
+                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
+                     so node_history, edge_history, was_linked and asof keep reaching it;
+                     --truncate discards it instead, --keep-wal leaves wal.bin whole
+  mushroomdb keys add <db-dir> <name> --tier admin|write|read [--role <name>]
+                     issues an access key: prints a new random token once and stores only its
+                     blake3 hash in <db-dir>/keys.json (created private, mode 0600); --tier read
+                     needs --role, and reads that role's view without ever writing
+  mushroomdb keys hash
+                     reads a token (at least 32 bytes) from stdin and prints the hash keys.json holds
+  mushroomdb build-index <db-dir> [--rule <name>]
+                     drives a rule's vector index to completion a slice at a time, for an
+                     operator who wants the build finished before traffic arrives; a rule
+                     created over a large corpus derives no edges until its index is whole
+  mushroomdb migrate <db-dir>
+  mushroomdb schema indexes <db-dir>
+  mushroomdb schema constraints <db-dir>
+  mushroomdb schema apply <db-dir> <schema.json>
+  mushroomdb schema apply <db-dir> --memory-defaults
+                                   applies the built-in memory schema to an existing store;
+                                   full-text on a populated store builds the index at each open until the next snapshot carries it
+  mushroomdb schema apply <db-dir> --memory-identity
+                                   adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
+                                   says what it will backfill, then backfills
+  mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
+                                      WARNING: unsafe against a concurrently running serve process;
+                                      use POST /backup on the HTTP server for live-serve backups
+  mushroomdb restore --from s3://bucket/prefix [--at <commit | timestamp>] [--into <dir>]
+                     restores a continuous backup (MUSHROOMDB_BACKUP_S3_URL) into <dir>, default ./restored,
+                     which must be new or empty; every object is checked against its manifest first
+                     --at N restores the store as it was right after commit N (as asof --commit counts);
+                     --at 2026-10-01T12:00:00Z the last commit at or before that instant, from the
+                     backup's commit times; an instant past the newest recorded time is refused
+                     when later commits have none
+                     the restored store starts a new backup lineage: back it up to a new prefix
+                     r2:// and minio:// need AWS_ENDPOINT_URL; credentials come from the AWS_* variables
+  mushroomdb export <db-dir> <dest> --format jsonl|csv|cypher|parquet|graphml [--single-file]   export all data
+                                      --single-file (jsonl only) writes one graph.jsonl of typed node, edge and rule lines
+                                      csv writes nodes.csv and relationships.csv (plus rules.jsonl when the store has rules);
+                                      cypher writes graph.cypher, one statement per line; both load back with `mushroomdb import` / `mushroomdb query`
+                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
+                                      existing directory, otherwise <dest> is the file path itself
+                                      (nodes + edges only; rules have no GraphML analogue)
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--shutdown-timeout-secs <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+                   [--bolt-port <port>] [--bolt-tls | --bolt-plaintext] [--bolt-advertised-host <host>] [--bolt-advertised-port <port>]
+                   [--bolt-database <name>] [--bolt-max-connections <n>] [--bolt-tx-timeout-secs <secs>] [--bookmark-timeout-secs <secs>]
+                   [--tx-max <n>] [--tx-timeout-secs <secs>] [--tx-max-lifetime-secs <secs>]
+                     --restore-from seeds an empty <db-dir> from the newest backup under <dir>
+                     (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
+                     MUSHROOMDB_RESTORE_FROM_S3=s3://bucket/prefix restores the newest backup there into an
+                     empty <db-dir> before the port is bound, as a new lineage that keeps backing up beside
+                     it; a prefix with no backup starts an empty store, any other failure exits 1
+                     --tls-cert and --tls-key go together and need a build with the `tls` feature
+                     --bolt-port (or MUSHROOMDB_BOLT_PORT) also serves Bolt on --addr's IP; off when unset
+                     Bolt is TLS when --tls-cert is given, unless --bolt-plaintext (MUSHROOMDB_BOLT_TLS=on|off)
+                     --bolt-advertised-host/-port (MUSHROOMDB_BOLT_ADVERTISED_HOST/_PORT) are the address ROUTE
+                     hands drivers; a wildcard --addr needs the host. --bolt-max-connections (default 256,
+                     MUSHROOMDB_BOLT_MAX_CONNECTIONS); --bolt-database names the store (default mushroomdb);
+                     --bolt-tx-timeout-secs (default 30) ends an idle transaction; --bookmark-timeout-secs
+                     (default 5) bounds a bookmark wait
+                     --tx-max (default 100) open HTTP transactions at once; --tx-timeout-secs (default 30)
+                     ends an idle one and --tx-max-lifetime-secs (default 300) any one; each flag wins over
+                     MUSHROOMDB_TX_MAX, MUSHROOMDB_TX_TIMEOUT_SECS and MUSHROOMDB_TX_MAX_LIFETIME_SECS
+  mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                    [--nodes-jsonl <file|->] [--edges-jsonl <file|->] [--rules-jsonl <file|->] [--jsonl <file|->]
+                    [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
+                                   bulk-load CSV or JSONL files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   the JSONL files are the ones `export --format jsonl` writes; --jsonl reads the one file
+                                   `export --format jsonl --single-file` writes (typed node, edge and rule lines, nodes before the edges that use them);
+                                   `-` reads one of them from standard input
+                                   nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
+                                   other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
+                                   one label per node: Person;Employee is refused; relationship properties are not supported
+                                   rules the store already has fire per batch; import first, then declare rules, to backfill once
+                                   an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
+                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
+                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
+                                   --recurse-submodules also walks each initialised submodule
+                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
+                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
+                                   --no-docs skips Markdown bodies, headings and mentions
+                                   --ensure-gitignore adds the database directory to the repo's .gitignore
+                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
+  mushroomdb demo <db-dir>
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-prewarm] [--delivery cli|mcp|both]
                      [--always-load|--no-always-load]
@@ -480,72 +639,17 @@ Usage:
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, and a real stdio
                      handshake with the configured MCP command; exits 1 on any `fail`
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
-                     --restore-from seeds an empty <db-dir> from the newest backup under <dir>
-                     (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
-                     --tls-cert and --tls-key go together and need a build with the `tls` feature
   mushroomdb mcp <db-dir>|--auto [--all-tools]
                      --all-tools lists every served tool; the default lists the association tools on every store,
                      a store `ingest-git` built included (the rest stay callable, just unlisted)
-  mushroomdb stats <db-dir>
-  mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb brief <db-dir>|--auto    hook body: the store's schema in one block — labels,
                                       edge types, history depth, roles and one worked call per
                                       question kind; byte-stable, so a session host caches it once
-  mushroomdb why <db-dir> <a> <b>
-                                   every rule edge between two keys with the evidence that
-                                   derived it, or a note that there is none
-  mushroomdb suggest <db-dir>
-  mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"] [--namespace <ns>]
-                     --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
-                     and resolves to the last commit at or before it; exactly one of
-                     --commit and --at
-  mushroomdb query <db-dir> [--query \"MATCH ...\"] [--role <name>] [--namespace <ns>] <cypher…>
-                     --role answers as one of the store's roles and --namespace from one
-                     namespace; together they intersect, so neither ever widens the other
-                     and either one makes the query a read
-  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
-                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
-                     so node_history, edge_history, was_linked and asof keep reaching it;
-                     --truncate discards it instead, --keep-wal leaves wal.bin whole
-  mushroomdb build-index <db-dir> [--rule <name>]
-                     drives a rule's vector index to completion a slice at a time, for an
-                     operator who wants the build finished before traffic arrives; a rule
-                     created over a large corpus derives no edges until its index is whole
-  mushroomdb migrate <db-dir>
-  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
-  mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
-                                      WARNING: unsafe against a concurrently running serve process;
-                                      use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
-                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
-                                      existing directory, otherwise <dest> is the file path itself
-                                      (nodes + edges only; rules have no GraphML analogue)
-  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
-                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
-                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
-                                   --recurse-submodules also walks each initialised submodule
-                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
-                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
-                                   --no-docs skips Markdown bodies, headings and mentions
-                                   --ensure-gitignore adds the database directory to the repo's .gitignore
-                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
-  mushroomdb schema apply <db-dir> <schema.json>
-  mushroomdb schema apply <db-dir> --memory-defaults
-                                   applies the built-in memory schema to an existing store;
-                                   full-text on a populated store builds the index at each open until the next snapshot carries it
-  mushroomdb schema apply <db-dir> --memory-identity
-                                   adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
-                                   says what it will backfill, then backfills
-  mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
-  mushroomdb algo wcc <db-dir> [--top N]
-  mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
-  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
   mushroomdb --version
   mushroomdb --help
 
-Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token, MUSHROOMDB_TOKEN, or an `admin` key in `<db-dir>/keys.json` (read and write keys alone do not count).
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
@@ -861,8 +965,11 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
+        "keys" => parse_keys(&args[1..]),
         "backup" => parse_backup(&args[1..]),
+        "restore" => parse_restore(&args[1..]),
         "export" => parse_export(&args[1..]),
+        "import" => parse_import(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "brief" => parse_dir_or_auto("brief", &args[1..])
@@ -880,11 +987,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
         // Arguments are not parsed: whatever a 0.6 install wrote after the
         // subcommand, the answer is the same.
-        "touch" => Ok(Command::RetiredHook { sub: "touch" }),
-        "intercept" => Ok(Command::RetiredHook { sub: "intercept" }),
-        "impact-hook" => Ok(Command::RetiredHook { sub: "impact-hook" }),
-        "enrich" => Ok(Command::RetiredHook { sub: "enrich" }),
-        "sync" => Ok(Command::RetiredHook { sub: "sync" }),
+        "touch" | "intercept" | "impact-hook" | "enrich" | "sync" => Ok(Command::RetiredHook),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -903,9 +1006,12 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut bolt = serve_bolt::BoltFlags::default();
+    let mut tx = TxFlags::default();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -970,6 +1076,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--shutdown-timeout-secs" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --shutdown-timeout-secs".to_string())?;
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--shutdown-timeout-secs=") {
+            shutdown_timeout = parse_shutdown_timeout(val)?;
+            i += 1;
         } else if a == "--restore-from" {
             let val = args
                 .get(i + 1)
@@ -1000,6 +1116,10 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--tls-key=") {
             tls_key = Some(PathBuf::from(val));
             i += 1;
+        } else if let Some(used) = parse_bolt_flag(args, i, &mut bolt)? {
+            i += used;
+        } else if let Some(used) = parse_tx_flag(args, i, &mut tx)? {
+            i += used;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1026,10 +1146,141 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        shutdown_timeout,
         restore_from,
         tls_cert,
         tls_key,
+        bolt,
+        tx,
     })
+}
+
+/// The HTTP transaction limits as given on `serve`'s command line; `None` is
+/// "not given", which leaves the environment variable (or the default) in
+/// force. Non-zero integers, not `Duration`s, keep [`Command::Serve`] small.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxFlags {
+    /// `--tx-max <n>` (`MUSHROOMDB_TX_MAX`).
+    pub max_open: Option<NonZeroU64>,
+    /// `--tx-timeout-secs <secs>` (`MUSHROOMDB_TX_TIMEOUT_SECS`).
+    pub idle_timeout_secs: Option<NonZeroU64>,
+    /// `--tx-max-lifetime-secs <secs>` (`MUSHROOMDB_TX_MAX_LIFETIME_SECS`).
+    pub max_lifetime_secs: Option<NonZeroU64>,
+}
+
+/// The HTTP transaction limits `serve` runs with: each flag given wins over
+/// its environment variable, read through `env`; a limit given by neither
+/// keeps its default.
+pub fn resolve_tx_limits(
+    flags: &TxFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> server::TxLimits {
+    let mut limits = server::TxLimits::from_lookup(|name| match name {
+        // A flag given: its variable is not read, so an invalid value there
+        // does not warn about a limit that does not apply.
+        server::TX_MAX_ENV if flags.max_open.is_some() => None,
+        server::TX_TIMEOUT_ENV if flags.idle_timeout_secs.is_some() => None,
+        server::TX_MAX_LIFETIME_ENV if flags.max_lifetime_secs.is_some() => None,
+        _ => env(name),
+    });
+    if let Some(n) = flags.max_open {
+        limits.max_open = usize::try_from(n.get()).unwrap_or(usize::MAX);
+    }
+    if let Some(secs) = flags.idle_timeout_secs {
+        limits.idle_timeout = Duration::from_secs(secs.get());
+    }
+    if let Some(secs) = flags.max_lifetime_secs {
+        limits.max_lifetime = Duration::from_secs(secs.get());
+    }
+    limits
+}
+
+/// Reads one `--tx-*` flag at `args[i]` into `tx`, as `--flag value` or
+/// `--flag=value`. Returns how many arguments it used, or `None` when
+/// `args[i]` is not one of them. Every value must be a positive integer.
+fn parse_tx_flag(args: &[&str], i: usize, tx: &mut TxFlags) -> Result<Option<usize>, String> {
+    const VALUED: [&str; 3] = ["--tx-max", "--tx-timeout-secs", "--tx-max-lifetime-secs"];
+    let arg = args[i];
+    let (flag, value, used) = match arg.split_once('=') {
+        Some((flag, value)) if VALUED.contains(&flag) => (flag, value, 1),
+        _ if VALUED.contains(&arg) => {
+            let value = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| format!("missing value for {arg}"))?;
+            (arg, value, 2)
+        }
+        _ => return Ok(None),
+    };
+    let n = value
+        .parse::<NonZeroU64>()
+        .map_err(|_| format!("{flag} must be a positive integer, got: {value}"))?;
+    match flag {
+        "--tx-max" => tx.max_open = Some(n),
+        "--tx-timeout-secs" => tx.idle_timeout_secs = Some(n),
+        _ => tx.max_lifetime_secs = Some(n),
+    }
+    Ok(Some(used))
+}
+
+/// Reads one `--bolt-*` flag (or `--bookmark-timeout-secs`) at `args[i]` into
+/// `bolt`, as `--flag value` or `--flag=value`. Returns how many arguments it
+/// used, or `None` when `args[i]` is not one of them.
+fn parse_bolt_flag(
+    args: &[&str],
+    i: usize,
+    bolt: &mut serve_bolt::BoltFlags,
+) -> Result<Option<usize>, String> {
+    let arg = args[i];
+    match arg {
+        "--bolt-tls" | "--bolt-plaintext" => {
+            let tls = arg == "--bolt-tls";
+            if bolt.tls == Some(!tls) {
+                return Err("cannot combine --bolt-tls and --bolt-plaintext".into());
+            }
+            bolt.tls = Some(tls);
+            return Ok(Some(1));
+        }
+        _ => {}
+    }
+    const VALUED: [&str; 7] = [
+        "--bolt-port",
+        "--bolt-advertised-host",
+        "--bolt-advertised-port",
+        "--bolt-database",
+        "--bolt-max-connections",
+        "--bolt-tx-timeout-secs",
+        "--bookmark-timeout-secs",
+    ];
+    let (flag, value, used) = match arg.split_once('=') {
+        Some((flag, value)) if VALUED.contains(&flag) => (flag, value, 1),
+        _ if VALUED.contains(&arg) => {
+            let value = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| format!("missing value for {arg}"))?;
+            (arg, value, 2)
+        }
+        _ => return Ok(None),
+    };
+    let invalid = || format!("invalid {flag}: {value}");
+    let port = || value.parse::<u16>().map_err(|_| invalid());
+    let seconds = || match value.parse::<u64>() {
+        Ok(0) | Err(_) => Err(format!("{flag} must be a positive number of seconds")),
+        Ok(secs) => Ok(Duration::from_secs(secs)),
+    };
+    match flag {
+        "--bolt-port" => bolt.port = Some(port()?),
+        "--bolt-advertised-host" => bolt.advertised_host = Some(value.to_string()),
+        "--bolt-advertised-port" => bolt.advertised_port = Some(port()?),
+        "--bolt-database" => bolt.database = Some(value.to_string()),
+        "--bolt-max-connections" => {
+            bolt.max_connections = Some(value.parse().map_err(|_| invalid())?)
+        }
+        "--bolt-tx-timeout-secs" => bolt.tx_timeout = Some(seconds()?),
+        _ => bolt.bookmark_timeout = Some(seconds()?),
+    }
+    Ok(Some(used))
 }
 
 fn parse_role_token(val: &str) -> Result<(String, String), String> {
@@ -1043,6 +1294,75 @@ fn parse_role_token(val: &str) -> Result<(String, String), String> {
         return Err("--role-token: ROLE must not be empty".to_string());
     }
     Ok((tok.to_string(), role.to_string()))
+}
+
+/// Default for `serve --shutdown-timeout-secs`: drain up to 25 s, snapshot in
+/// what is left of the budget (8 s with the default backup bounds), then flush
+/// the backup and release the lease within 22 s.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 55;
+/// The drain phase's share at the default timeout, and its cap at any timeout.
+pub const SHUTDOWN_DRAIN_SECS: u64 = 25;
+/// The snapshot phase's nominal share, used to scale the phases down when the
+/// timeout is shorter than drain + snapshot + backup.
+const SHUTDOWN_SNAPSHOT_NOMINAL: Duration = Duration::from_secs(8);
+/// A backup flush keeps at least this much of any timeout, so the lease
+/// release is still attempted under a tight one.
+const SHUTDOWN_BACKUP_FLOOR: Duration = Duration::from_secs(2);
+
+/// How a shutdown's time is divided: the three phases, in order, and the
+/// most each may take. They sum to at most the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// Longest the drain of in-flight requests may take.
+    pub drain: Duration,
+    /// Snapshot's share; unused drain time also goes to it at run time.
+    pub snapshot: Duration,
+    /// Backup flush and lease release. Zero without backup.
+    pub backup: Duration,
+}
+
+/// Divide `total` between the phases. `backup_bound` is the backup's own
+/// shutdown bound (`BackupConfig::shutdown_budget`), zero without backup.
+///
+/// With room (`total` at least drain cap + 8 s + `backup_bound`) the drain gets
+/// its cap, the backup its bound, and the snapshot the rest. With less, all
+/// three scale down in proportion, except that the backup keeps a floor
+/// ([`SHUTDOWN_BACKUP_FLOOR`], never more than its bound) and the drain gives
+/// way first: it is the phase a stuck client can stretch.
+pub fn shutdown_plan(total: Duration, backup_bound: Duration) -> ShutdownPlan {
+    let cap = Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    let nominal = cap + SHUTDOWN_SNAPSHOT_NOMINAL + backup_bound;
+    if total >= nominal {
+        return ShutdownPlan {
+            drain: cap,
+            snapshot: total - cap - backup_bound,
+            backup: backup_bound,
+        };
+    }
+    let scaled = |d: Duration| d.mul_f64(total.as_secs_f64() / nominal.as_secs_f64());
+    let backup = if backup_bound.is_zero() {
+        Duration::ZERO
+    } else {
+        scaled(backup_bound)
+            .max(SHUTDOWN_BACKUP_FLOOR.min(backup_bound))
+            .min(total)
+    };
+    let drain = scaled(cap).min(total - backup);
+    ShutdownPlan {
+        drain,
+        snapshot: total - backup - drain,
+        backup,
+    }
+}
+
+fn parse_shutdown_timeout(val: &str) -> Result<Duration, String> {
+    let secs: u64 = val
+        .parse()
+        .map_err(|_| format!("invalid --shutdown-timeout-secs: {val}"))?;
+    if secs == 0 {
+        return Err("--shutdown-timeout-secs must be a positive number of seconds".into());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
@@ -1075,11 +1395,26 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
     let mut commit: Option<u64> = None;
     let mut at: Option<String> = None;
     let mut query: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut stdin = false;
     let mut namespace: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--at" {
+        if a == "--file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --file".to_string())?;
+            file = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--file=") {
+            file = Some(PathBuf::from(val));
+            i += 1;
+        } else if a == "--stdin" {
+            stdin = true;
+            i += 1;
+        } else if a == "--at" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -1149,11 +1484,14 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
         }
         _ => {}
     }
+    check_statement_sources("asof", query.is_some(), file.is_some(), stdin)?;
     Ok(Command::AsOf {
         db_dir,
         commit,
         at,
         query,
+        file,
+        stdin,
         namespace,
     })
 }
@@ -1221,16 +1559,88 @@ fn check_namespace(namespace: Option<&str>) -> Result<Option<&str>, CliError> {
     }
 }
 
+/// A statement comes from one place: the command line, `--file` or `--stdin`.
+/// Two sources is a refusal, never a precedence rule.
+fn check_statement_sources(
+    command: &str,
+    inline: bool,
+    file: bool,
+    stdin: bool,
+) -> Result<(), String> {
+    if [inline, file, stdin].iter().filter(|given| **given).count() > 1 {
+        return Err(format!(
+            "{command}: give the Cypher statement one way — on the command line, \
+             with --file <path>, or with --stdin — not several"
+        ));
+    }
+    Ok(())
+}
+
+/// The statement a `query` or `asof` was given: `inline` as it came, or the
+/// text of `--file` or of standard input. A file or pipe ends in a newline the
+/// editor or `echo` put there, which is not part of the statement, so trailing
+/// whitespace is dropped.
+pub fn resolve_statement(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    stdin: bool,
+    input: &mut dyn std::io::Read,
+) -> Result<Option<String>, CliError> {
+    let text = match (file, stdin) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .map_err(|e| CliError(format!("cannot read --file {}: {e}", path.display())))?,
+        (None, true) => {
+            let mut text = String::new();
+            input
+                .read_to_string(&mut text)
+                .map_err(|e| CliError(format!("cannot read the statement from stdin: {e}")))?;
+            text
+        }
+        (None, false) => match inline {
+            Some(statement) => return Ok(Some(tidy_statement(statement).to_string())),
+            None => return Ok(None),
+        },
+    };
+    let statement = tidy_statement(&text);
+    if statement.trim().is_empty() {
+        return Err(CliError("the Cypher statement is empty".to_string()));
+    }
+    Ok(Some(statement.to_string()))
+}
+
+/// One leading byte-order mark, trailing whitespace and one trailing `;` are
+/// not part of the statement: an editor, a pipe and a pasted line put them
+/// there, and the lexer has no use for any of them.
+fn tidy_statement(text: &str) -> &str {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).trim_end();
+    text.strip_suffix(';').unwrap_or(text).trim_end()
+}
+
 fn parse_query(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut query_flag: Option<String> = None;
     let mut role: Option<String> = None;
     let mut namespace: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut stdin = false;
     let mut cypher_parts: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--query" {
+        if a == "--file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --file".to_string())?;
+            file = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--file=") {
+            file = Some(PathBuf::from(val));
+            i += 1;
+        } else if a == "--stdin" {
+            stdin = true;
+            i += 1;
+        } else if a == "--query" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -1271,7 +1681,15 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "query requires <db-dir>".to_string())?;
-    let cypher = if let Some(q) = query_flag {
+    check_statement_sources(
+        "query",
+        query_flag.is_some() || !cypher_parts.is_empty(),
+        file.is_some(),
+        stdin,
+    )?;
+    let cypher = if file.is_some() || stdin {
+        String::new()
+    } else if let Some(q) = query_flag {
         if !cypher_parts.is_empty() {
             return Err(
                 "query: pass Cypher as remaining arguments or --query, not both".to_string(),
@@ -1287,6 +1705,8 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Query {
         db_dir,
         cypher,
+        file,
+        stdin,
         role,
         namespace,
     })
@@ -1423,10 +1843,13 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         },
     )?;
     db.snapshot()?;
+    // The version the snapshot was written at: a WAL-only store whose WAL
+    // holds a 0.10 record is written at V11, not at the default.
+    let to_ver = mushroomdb::snapshot_version_at(db_dir)?.unwrap_or(current);
 
     let msg = match from_ver {
-        Some(ver) => format!("migrated V{ver} -> V{current}\n"),
-        None => format!("migrated WAL-only -> V{current}\n"),
+        Some(ver) => format!("migrated V{ver} -> V{to_ver}\n"),
+        None => format!("migrated WAL-only -> V{to_ver}\n"),
     };
     Ok(msg)
 }
@@ -1630,13 +2053,92 @@ pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<St
 
 fn parse_schema(args: &[&str]) -> Result<Command, String> {
     if args.is_empty() {
-        return Err("schema requires a subcommand: apply".to_string());
+        return Err("schema requires a subcommand: apply | indexes | constraints".to_string());
     }
     match args[0] {
         "apply" => parse_schema_apply(&args[1..]),
+        "indexes" => {
+            parse_one_dir("schema indexes", &args[1..]).map(|db_dir| Command::SchemaList {
+                db_dir,
+                what: SchemaListing::Indexes,
+            })
+        }
+        "constraints" => {
+            parse_one_dir("schema constraints", &args[1..]).map(|db_dir| Command::SchemaList {
+                db_dir,
+                what: SchemaListing::Constraints,
+            })
+        }
         other => Err(format!(
-            "unknown schema subcommand: {other}; expected apply"
+            "unknown schema subcommand: {other}; expected apply | indexes | constraints"
         )),
+    }
+}
+
+/// What `mushroomdb schema indexes|constraints` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaListing {
+    Indexes,
+    Constraints,
+}
+
+/// `mushroomdb schema indexes|constraints`: the rows `SHOW INDEXES` /
+/// `SHOW CONSTRAINTS` give, as a table. The store opens read-only, so this
+/// writes nothing and never waits on a writer, a server included.
+pub fn run_schema_list(db_dir: &Path, what: SchemaListing) -> Result<String, CliError> {
+    let db = GraphDb::open_with_options(
+        db_dir,
+        OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )?;
+    let statement = match what {
+        SchemaListing::Indexes => "SHOW INDEXES",
+        SchemaListing::Constraints => "SHOW CONSTRAINTS",
+    };
+    let rs = db.query(statement, &BTreeMap::new())?;
+    let columns = rs.columns();
+    let rows: Vec<Vec<String>> = (0..rs.len())
+        .map(|i| {
+            columns
+                .iter()
+                .map(|c| fmt_cell_plain(rs.get(i, c)))
+                .collect()
+        })
+        .collect();
+    let widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(n, c)| {
+            rows.iter()
+                .map(|r| r[n].chars().count())
+                .chain([c.chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: &[String]| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
+        format!("{}\n", padded.join(" | ").trim_end())
+    };
+    let mut out = line(columns);
+    for row in &rows {
+        out.push_str(&line(row));
+    }
+    Ok(out)
+}
+
+/// A cell as text, without the quoting [`fmt_cell`] puts around a string.
+fn fmt_cell_plain(cell: Option<&Value>) -> String {
+    match cell {
+        Some(Value::Str(s)) => s.clone(),
+        other => fmt_cell(other),
     }
 }
 
@@ -1868,25 +2370,146 @@ fn parse_backup(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Backup { db_dir, dest })
 }
 
+/// `restore --from <url> [--at <commit | timestamp>] [--into <dir>]`.
+fn parse_restore(args: &[&str]) -> Result<Command, String> {
+    let (mut from, mut at, mut into) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = flag_value(args, &mut i, "--from")? {
+            from = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--at")? {
+            // Checked here so a typo fails before anything is downloaded.
+            backup::RestoreTarget::parse(v)?;
+            at = Some(v.to_string());
+        } else if let Some(v) = flag_value(args, &mut i, "--into")? {
+            into = Some(PathBuf::from(v));
+        } else if args[i].starts_with('-') {
+            return Err(format!("unexpected flag: {}", args[i]));
+        } else {
+            return Err(format!(
+                "unexpected argument: {} (restore takes --from, --at and --into)",
+                args[i]
+            ));
+        }
+    }
+    let from = from
+        .filter(|f| !f.trim().is_empty())
+        .ok_or_else(|| "restore requires --from s3://bucket/prefix".to_string())?;
+    Ok(Command::RestoreS3 { from, at, into })
+}
+
+/// Take the value of `--flag value` or `--flag=value` at `args[*i]`.
+fn flag_value<'a>(args: &[&'a str], i: &mut usize, flag: &str) -> Result<Option<&'a str>, String> {
+    let a = args[*i];
+    if a == flag {
+        let val = args
+            .get(*i + 1)
+            .copied()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        *i += 2;
+        Ok(Some(val))
+    } else if let Some(val) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+        *i += 1;
+        Ok(Some(val))
+    } else {
+        Ok(None)
+    }
+}
+
+/// A one-character option value; `tab` and `\t` name the tab.
+fn single_char(flag: &str, val: &str) -> Result<char, String> {
+    let val = if val == "tab" || val == "\\t" {
+        "\t"
+    } else {
+        val
+    };
+    let mut chars = val.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(format!("{flag} takes one character, got '{val}'")),
+    }
+}
+
+fn parse_import(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = PathBuf::from("mushroomdb-data");
+    let mut inputs = import::ImportInputs::default();
+    let mut opts = import::ImportOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--ignore-errors" {
+            opts.ignore_errors = true;
+            i += 1;
+        } else if let Some(v) = flag_value(args, &mut i, "--nodes")? {
+            inputs.nodes_csv = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--relationships")? {
+            inputs.rels_csv = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--nodes-jsonl")? {
+            inputs.nodes_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--edges-jsonl")? {
+            inputs.edges_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--jsonl")? {
+            inputs.stream_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--rules-jsonl")? {
+            inputs.rules_jsonl = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--db")? {
+            db_dir = PathBuf::from(v);
+        } else if let Some(v) = flag_value(args, &mut i, "--delimiter")? {
+            let c = single_char("--delimiter", v)?;
+            opts.delimiter = u8::try_from(u32::from(c))
+                .ok()
+                .filter(u8::is_ascii)
+                .ok_or_else(|| format!("--delimiter must be an ASCII character, got '{v}'"))?;
+        } else if let Some(v) = flag_value(args, &mut i, "--array-delimiter")? {
+            opts.array_delimiter = single_char("--array-delimiter", v)?;
+        } else if let Some(v) = flag_value(args, &mut i, "--batch-size")? {
+            opts.batch_size = v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("--batch-size must be a positive integer, got '{v}'"))?;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    if inputs == import::ImportInputs::default() {
+        return Err(
+            "import needs --nodes, --relationships, --nodes-jsonl, --edges-jsonl, --rules-jsonl or --jsonl"
+                .to_string(),
+        );
+    }
+    Ok(Command::Import {
+        db_dir,
+        inputs,
+        opts,
+    })
+}
+
 fn parse_export(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut dest = None;
     let mut format = ExportFormat::Jsonl;
+    let mut single_file = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--format" {
+        if a == "--single-file" {
+            single_file = true;
+            i += 1;
+        } else if a == "--format" {
             let val = args
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --format".to_string())?;
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--format=") {
             format = ExportFormat::parse(val).ok_or_else(|| {
-                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+                format!("unknown format '{val}'; expected jsonl, csv, cypher, parquet, or graphml")
             })?;
             i += 1;
         } else if a.starts_with('-') {
@@ -1903,6 +2526,12 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
     }
     let db_dir = db_dir.ok_or_else(|| "export requires <db-dir>".to_string())?;
     let dest = dest.ok_or_else(|| "export requires <dest>".to_string())?;
+    if single_file {
+        if format != ExportFormat::Jsonl {
+            return Err("--single-file goes with --format jsonl".to_string());
+        }
+        format = ExportFormat::JsonlSingle;
+    }
     Ok(Command::Export {
         db_dir,
         dest,
@@ -1914,6 +2543,73 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
 pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> {
     let db = GraphDb::open(db_dir)?;
     Ok(db.backup_to(dest)?)
+}
+
+/// Where `restore` writes when `--into` is not given.
+pub const DEFAULT_RESTORE_INTO: &str = "restored";
+
+/// `mushroomdb restore --from s3://…`: download, verify and install a restore
+/// point into `into` (default [`DEFAULT_RESTORE_INTO`]) with
+/// [`backup::restore_from_s3`], and say what was restored.
+pub fn run_restore_s3(
+    from: &str,
+    at: Option<&str>,
+    into: Option<&Path>,
+) -> Result<String, CliError> {
+    let target = at
+        .map(backup::RestoreTarget::parse)
+        .transpose()
+        .map_err(CliError)?;
+    let into = into.map_or_else(|| PathBuf::from(DEFAULT_RESTORE_INTO), Path::to_path_buf);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let out = rt
+        .block_on(backup::restore_from_s3(from, target, &into))
+        .map_err(|e| CliError(format!("restore from {from} failed: {e}")))?;
+    Ok(format_restore_s3(from, target, &out))
+}
+
+/// Format a [`backup::RestoreS3Outcome`] for display.
+pub fn format_restore_s3(
+    from: &str,
+    at: Option<backup::RestoreTarget>,
+    out: &backup::RestoreS3Outcome,
+) -> String {
+    let mut s = String::new();
+    let point = at.map_or_else(|| "the newest restore point".to_string(), |t| t.to_string());
+    writeln!(s, "restored {from} at {point} into {}", out.into.display()).unwrap();
+    writeln!(s, "  manifest: {}", out.manifest).unwrap();
+    writeln!(s, "  commits: {}", out.commits).unwrap();
+    writeln!(s, "  files: {}", out.files.join(", ")).unwrap();
+    writeln!(s, "  segments: {}", out.segments).unwrap();
+    writeln!(s, "  bytes: {}", out.bytes).unwrap();
+    for path in &out.swept {
+        writeln!(
+            s,
+            "  removed a killed restore's leftover: {}",
+            path.display()
+        )
+        .unwrap();
+    }
+    if let Some(note) = &out.install_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    if let Some(note) = &out.tail_note {
+        writeln!(s, "  warning: {note}").unwrap();
+    }
+    writeln!(
+        s,
+        "  lineage: {} (new; restored from {})",
+        out.lineage, out.source_lineage
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "back this store up to a new prefix: the one it came from belongs to the source"
+    )
+    .unwrap();
+    s
 }
 
 /// [`mushroomdb::restore::restore_if_empty`], in the CLI's error type.
@@ -1940,48 +2636,141 @@ pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
     out
 }
 
+/// Bulk-load CSV and JSONL files into `db_dir`; `mushroomdb import`.
+pub fn run_import(
+    db_dir: &Path,
+    inputs: &import::ImportInputs,
+    opts: &import::ImportOptions,
+) -> Result<import::ImportReport, CliError> {
+    import::run_import_inputs(db_dir, inputs, opts, &mut |_| {})
+}
+
+/// The warning line for NaN and infinite floats, which JSON and CSV cannot
+/// carry; empty when there are none.
+fn non_finite_note(stats: &export::ExportStats) -> String {
+    match stats.non_finite_floats {
+        0 => String::new(),
+        n => format!(
+            "warning: {n} NaN or infinite float values cannot be written in this format and were left out\n"
+        ),
+    }
+}
+
+fn export_summary(
+    dest: &Path,
+    format: &ExportFormat,
+    stats: &export::ExportStats,
+    rule_count: usize,
+    extra: &str,
+) -> String {
+    let manual = stats.edges - stats.derived_edges;
+    let mut out = format!(
+        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+        dest.display(),
+        format.name(),
+        stats.nodes,
+        manual,
+        rule_count
+    );
+    if stats.derived_edges > 0 {
+        let _ = writeln!(
+            out,
+            "{} derived edges are not written; they belong to their rules",
+            stats.derived_edges
+        );
+    }
+    out.push_str(extra);
+    out
+}
+
 /// Export all data from `db_dir` to `dest` in `format`.
+///
+/// JSONL, CSV and Cypher stream: the store is read node by node and the files
+/// are written as it goes. Parquet and GraphML build their whole file in
+/// memory, so they read the store whole.
 pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
-    let nodes = db.all_nodes_for_export();
-    let edges = db.all_edges_for_export();
     let mut rules = db.rules();
     rules.sort_by(|a, b| a.name.cmp(&b.name));
-    let node_count = nodes.len();
-    let edge_count = edges.len();
     let rule_count = rules.len();
     match format {
         ExportFormat::Jsonl => {
-            export::write_jsonl(&nodes, &edges, &rules, dest)?;
+            let stats = export::write_jsonl(&db, &rules, dest)?;
+            // JSONL has always counted every edge, derived included.
             Ok(format!(
-                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n{}",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
-                rule_count
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
             ))
         }
+        ExportFormat::JsonlSingle => {
+            let stats = export::write_jsonl_single(&db, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}, single file): {} nodes, {} edges, {} rules\n{}",
+                dest.display(),
+                format.name(),
+                stats.nodes,
+                stats.edges,
+                rule_count,
+                non_finite_note(&stats)
+            ))
+        }
+        ExportFormat::Csv => {
+            let stats = export::write_csv(&db, &rules, dest)?;
+            let note = non_finite_note(&stats);
+            Ok(export_summary(dest, format, &stats, rule_count, &note))
+        }
+        ExportFormat::Cypher => {
+            let (stats, loss) = export::write_cypher(&db, dest)?;
+            let mut extra = String::new();
+            if rule_count > 0 {
+                extra.push_str(&format!(
+                    "{rule_count} rules are not written: Cypher has no statement for one\n"
+                ));
+            }
+            if loss.ids_added > 0 {
+                extra.push_str(&format!(
+                    "warning: {} nodes had no id property and gain one, equal to their key, when the file is run\n",
+                    loss.ids_added
+                ));
+            }
+            if loss.typed_properties + loss.unwritable_numbers + loss.differing_ids > 0 {
+                extra.push_str(&format!(
+                    "warning: not written to the Cypher file: {} properties of the date, time, duration or binary types, \
+                     {} NaN, infinite or -2^63 numbers or names with a line break, {} nodes whose id property is not their key\n",
+                    loss.typed_properties, loss.unwritable_numbers, loss.differing_ids
+                ));
+            }
+            Ok(export_summary(dest, format, &stats, 0, &extra))
+        }
         ExportFormat::Parquet => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             export::write_parquet(&nodes, &edges, &rules, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
                 dest.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
                 rule_count
             ))
         }
         // GraphML has no rule analogue: only nodes and edges are written.
         ExportFormat::Graphml => {
+            let nodes = db.all_nodes_for_export();
+            let edges = db.all_edges_for_export();
             let file_path = export::write_graphml(&nodes, &edges, dest)?;
             Ok(format!(
                 "exported to {} (format={}): {} nodes, {} edges\n",
                 file_path.display(),
                 format.name(),
-                node_count,
-                edge_count,
+                nodes.len(),
+                edges.len(),
             ))
         }
     }
@@ -2505,6 +3294,61 @@ fn parse_positional(
     Ok((db_dir, rest))
 }
 
+fn parse_keys(args: &[&str]) -> Result<Command, String> {
+    match args.first().copied() {
+        Some("hash") if args.len() == 1 => Ok(Command::KeysHash),
+        Some("hash") => Err("keys hash takes no arguments; it reads the token from stdin".into()),
+        Some("add") => {
+            let mut positional: Vec<&str> = Vec::new();
+            let mut tier: Option<String> = None;
+            let mut role: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i] {
+                    "--tier" | "--role" => {
+                        let flag = args[i];
+                        i += 1;
+                        let value = args
+                            .get(i)
+                            .ok_or_else(|| format!("{flag} requires a value"))?;
+                        let slot = if flag == "--tier" {
+                            &mut tier
+                        } else {
+                            &mut role
+                        };
+                        if slot.replace((*value).to_string()).is_some() {
+                            return Err(format!("{flag} given twice"));
+                        }
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unexpected flag: {flag}"))
+                    }
+                    other => positional.push(other),
+                }
+                i += 1;
+            }
+            let [db_dir, name] = positional.as_slice() else {
+                return Err("keys add requires <db-dir> <name>".into());
+            };
+            let tier = tier.ok_or("keys add requires --tier admin|write|read")?;
+            match (tier.as_str(), role.is_some()) {
+                ("admin" | "write", false) => {}
+                ("admin" | "write", true) => return Err("--role goes only with --tier read".into()),
+                ("read", true) => {}
+                ("read", false) => return Err("--tier read requires --role <name>".into()),
+                _ => return Err("--tier must be admin, write or read".into()),
+            }
+            Ok(Command::KeysAdd {
+                db_dir: PathBuf::from(*db_dir),
+                name: (*name).to_string(),
+                tier,
+                role,
+            })
+        }
+        _ => Err("keys requires a subcommand: add or hash".into()),
+    }
+}
+
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
     let mut db_dir = None;
     for a in args {
@@ -2980,6 +3824,13 @@ fn fmt_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => mushroomdb::v11_display_text(v).unwrap_or_default(),
+        // A null list element or map value.
+        Value::Null => "null".to_string(),
     }
 }
 
@@ -3106,9 +3957,12 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
@@ -3120,6 +3974,8 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -3135,9 +3991,12 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3152,6 +4011,8 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -3167,9 +4028,12 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        shutdown_timeout: _,
                         restore_from,
                         tls_cert,
                         tls_key,
+                        bolt,
+                        tx,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -3184,6 +4048,8 @@ mod tests {
                         assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
+                        assert_eq!(bolt, super::serve_bolt::BoltFlags::default());
+                        assert_eq!(tx, super::TxFlags::default());
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -3535,11 +4401,7 @@ mod tests {
                 vec![sub, "--auto"],
                 vec![sub, "/tmp/db", "--whatever", "x"],
             ] {
-                assert_eq!(
-                    parse_args(&args),
-                    Ok(Command::RetiredHook { sub }),
-                    "{args:?}"
-                );
+                assert_eq!(parse_args(&args), Ok(Command::RetiredHook), "{args:?}");
             }
             assert!(
                 !usage().contains(&format!("mushroomdb {sub}")),
@@ -3559,6 +4421,192 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_shutdown_plan_uses_the_nominal_split_with_room_and_scales_without() {
+        let s = Duration::from_secs;
+        // Default timeout, default backup bound: 25 + 8 + 22.
+        let p = shutdown_plan(s(55), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(8), s(22)));
+        // More room goes to the snapshot.
+        let p = shutdown_plan(s(100), s(22));
+        assert_eq!((p.drain, p.snapshot, p.backup), (s(25), s(53), s(22)));
+        // Less room: every phase shrinks, and the sum never exceeds the timeout.
+        for total in [1, 2, 5, 10, 25, 40, 54] {
+            for bound in [0, 1, 3, 22, 60] {
+                let p = shutdown_plan(s(total), s(bound));
+                assert!(
+                    p.drain + p.snapshot + p.backup <= s(total),
+                    "{total}/{bound}: {p:?}"
+                );
+                assert!(p.drain <= s(SHUTDOWN_DRAIN_SECS));
+                if bound == 0 {
+                    assert_eq!(p.backup, Duration::ZERO);
+                } else {
+                    assert!(p.backup <= s(bound).min(s(total)));
+                    assert!(p.backup >= s(2).min(s(bound)).min(s(total)), "{p:?}");
+                }
+            }
+        }
+        // 25 s with backup: the backup keeps a real share.
+        let p = shutdown_plan(s(25), s(22));
+        assert!(p.backup >= s(9) && p.drain >= s(10), "{p:?}");
+    }
+
+    #[test]
+    fn serve_parses_the_bolt_flags_in_both_spellings() {
+        let bolt = |args: &[&str]| match parse_args(args).unwrap() {
+            Command::Serve { bolt, .. } => bolt,
+            other => panic!("{other:?}"),
+        };
+        let flags = bolt(&[
+            "serve",
+            "/tmp/db",
+            "--bolt-port",
+            "7687",
+            "--bolt-tls",
+            "--bolt-advertised-host=db.example.test",
+            "--bolt-advertised-port",
+            "17687",
+            "--bolt-database=orders",
+            "--bolt-max-connections",
+            "8",
+            "--bolt-tx-timeout-secs=12",
+            "--bookmark-timeout-secs",
+            "3",
+        ]);
+        assert_eq!(
+            flags,
+            serve_bolt::BoltFlags {
+                port: Some(7687),
+                tls: Some(true),
+                advertised_host: Some("db.example.test".into()),
+                advertised_port: Some(17687),
+                database: Some("orders".into()),
+                max_connections: Some(8),
+                tx_timeout: Some(Duration::from_secs(12)),
+                bookmark_timeout: Some(Duration::from_secs(3)),
+            }
+        );
+        assert_eq!(
+            bolt(&["serve", "/tmp/db", "--bolt-port=0", "--bolt-plaintext"]).tls,
+            Some(false)
+        );
+        for bad in [
+            &["serve", "/tmp/db", "--bolt-port", "70000"][..],
+            &["serve", "/tmp/db", "--bolt-port"],
+            &["serve", "/tmp/db", "--bolt-tls", "--bolt-plaintext"],
+            &["serve", "/tmp/db", "--bolt-tx-timeout-secs", "0"],
+            &["serve", "/tmp/db", "--bookmark-timeout-secs=x"],
+            &["serve", "/tmp/db", "--bolt-max-connections", "-1"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn serve_parses_the_tx_flags_in_both_spellings_and_refuses_zero() {
+        let tx = |args: &[&str]| match parse_args(args).unwrap() {
+            Command::Serve { tx, .. } => tx,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(tx(&["serve", "/tmp/db"]), TxFlags::default());
+        assert_eq!(
+            tx(&[
+                "serve",
+                "/tmp/db",
+                "--tx-max",
+                "7",
+                "--tx-timeout-secs=4",
+                "--tx-max-lifetime-secs",
+                "60",
+            ]),
+            TxFlags {
+                max_open: NonZeroU64::new(7),
+                idle_timeout_secs: NonZeroU64::new(4),
+                max_lifetime_secs: NonZeroU64::new(60),
+            }
+        );
+        for bad in [
+            &["serve", "/tmp/db", "--tx-max", "0"][..],
+            &["serve", "/tmp/db", "--tx-max"],
+            &["serve", "/tmp/db", "--tx-timeout-secs=0"],
+            &["serve", "/tmp/db", "--tx-max-lifetime-secs", "-5"],
+            &["serve", "/tmp/db", "--tx-timeout-secs", "soon"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_tx_flag_wins_over_its_variable_and_an_unset_flag_leaves_the_variable() {
+        let env = |name: &str| match name {
+            server::TX_MAX_ENV => Some("5".to_string()),
+            server::TX_TIMEOUT_ENV => Some("9".to_string()),
+            server::TX_MAX_LIFETIME_ENV => Some("99".to_string()),
+            _ => None,
+        };
+        let s = Duration::from_secs;
+        let from_env = resolve_tx_limits(&TxFlags::default(), &env);
+        assert_eq!(
+            (
+                from_env.max_open,
+                from_env.idle_timeout,
+                from_env.max_lifetime
+            ),
+            (5, s(9), s(99))
+        );
+        let flags = TxFlags {
+            max_open: NonZeroU64::new(2),
+            idle_timeout_secs: None,
+            max_lifetime_secs: NonZeroU64::new(40),
+        };
+        let mixed = resolve_tx_limits(&flags, &env);
+        assert_eq!(
+            (mixed.max_open, mixed.idle_timeout, mixed.max_lifetime),
+            (2, s(9), s(40))
+        );
+        // Neither: the defaults.
+        assert_eq!(
+            resolve_tx_limits(&TxFlags::default(), &|_| None),
+            server::TxLimits::default()
+        );
+        // A flag given: an invalid variable beside it is not read.
+        let invalid = |name: &str| (name == server::TX_MAX_ENV).then(|| "lots".to_string());
+        let given = TxFlags {
+            max_open: NonZeroU64::new(3),
+            ..TxFlags::default()
+        };
+        assert_eq!(resolve_tx_limits(&given, &invalid).max_open, 3);
+    }
+
+    #[test]
+    fn serve_shutdown_timeout_parses_seconds_and_defaults_to_55() {
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(55)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", "90"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(90)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs=7"]).unwrap() {
+            Command::Serve {
+                shutdown_timeout, ..
+            } => assert_eq!(shutdown_timeout, Duration::from_secs(7)),
+            other => panic!("{other:?}"),
+        }
+        for bad in ["0", "nope"] {
+            let err =
+                parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs", bad]).unwrap_err();
+            assert!(err.contains("shutdown-timeout-secs"), "{err}");
+        }
+        assert!(parse_args(&["serve", "/tmp/db", "--shutdown-timeout-secs"]).is_err());
     }
 
     #[test]
@@ -3729,6 +4777,41 @@ mod tests {
             "synced sha",
         ] {
             assert!(!text.contains(stale), "usage still says {stale:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keys_subcommands() {
+        match parse_args(&["keys", "add", "/d", "app", "--tier", "write"]).unwrap() {
+            Command::KeysAdd {
+                name, tier, role, ..
+            } => assert_eq!((name.as_str(), tier.as_str(), role), ("app", "write", None)),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["keys", "add", "/d", "t", "--role", "r", "--tier", "read"]).unwrap() {
+            Command::KeysAdd { tier, role, .. } => {
+                assert_eq!((tier.as_str(), role.as_deref()), ("read", Some("r")))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&["keys", "hash"]),
+            Ok(Command::KeysHash)
+        ));
+        for bad in [
+            vec!["keys"],
+            vec!["keys", "hash", "x"],
+            vec!["keys", "add", "/d", "app"],
+            vec!["keys", "add", "/d", "--tier", "write"],
+            vec!["keys", "add", "/d", "app", "--tier", "read"],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--role", "r"],
+            vec!["keys", "add", "/d", "app", "--tier", "root"],
+            vec![
+                "keys", "add", "/d", "app", "--tier", "write", "--tier", "read",
+            ],
+            vec!["keys", "add", "/d", "app", "--tier", "write", "--bogus"],
+        ] {
+            assert!(parse_args(&bad).is_err(), "{bad:?}");
         }
     }
 
@@ -4373,6 +5456,72 @@ mod tests {
             }
             other => panic!("backup parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_restore_takes_from_at_and_into() {
+        assert_eq!(
+            parse_args(&["restore", "--from", "s3://b/p"]),
+            Ok(Command::RestoreS3 {
+                from: "s3://b/p".into(),
+                at: None,
+                into: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&[
+                "restore",
+                "--from=minio://b/p",
+                "--at",
+                "75",
+                "--into",
+                "/tmp/r",
+            ]),
+            Ok(Command::RestoreS3 {
+                from: "minio://b/p".into(),
+                at: Some("75".into()),
+                into: Some(PathBuf::from("/tmp/r")),
+            })
+        );
+        match parse_args(&["restore", "--from", "s3://b", "--at=2026-10-01T12:00:00Z"]) {
+            Ok(Command::RestoreS3 { at, .. }) => {
+                assert_eq!(at.as_deref(), Some("2026-10-01T12:00:00Z"))
+            }
+            other => panic!("restore parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_refuses_what_it_cannot_use() {
+        for (args, needle) in [
+            (vec!["restore"], "--from"),
+            (vec!["restore", "--into", "x"], "--from"),
+            (
+                vec!["restore", "--from", "s3://b", "--at", "yesterday"],
+                "RFC 3339",
+            ),
+            (vec!["restore", "--from", "s3://b", "--at"], "missing value"),
+            (
+                vec!["restore", "--from", "s3://b", "extra"],
+                "unexpected argument",
+            ),
+            (
+                vec!["restore", "--from", "s3://b", "--force"],
+                "unexpected flag",
+            ),
+        ] {
+            let e = parse_args(&args).unwrap_err();
+            assert!(e.contains(needle), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn restore_with_a_bad_url_fails_before_touching_anything() {
+        let parent = tmp("restore-bad-url");
+        let into = parent.join("restored");
+        let e = run_restore_s3("gs://b/p", None, Some(&into)).unwrap_err();
+        assert!(e.0.contains("--from"), "{e}");
+        assert!(!into.exists());
     }
 
     #[test]
@@ -5653,6 +6802,121 @@ mod tests {
         assert!(parse_args(&["query", "/tmp/db", "--namespace"]).is_err());
         assert!(parse_args(&["query", "/tmp/db", "--role"]).is_err());
         assert!(usage().contains("--namespace <ns>"));
+    }
+
+    /// `query` and `asof` take the statement from `--file` or `--stdin`, and
+    /// refuse a second source rather than pick one.
+    #[test]
+    fn parse_query_and_asof_take_a_file_or_stdin() {
+        let Ok(Command::Query {
+            cypher,
+            file,
+            stdin,
+            ..
+        }) = parse_args(&["query", "/tmp/db", "--file", "/tmp/q.cyp"])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(cypher, "");
+        assert_eq!(file, Some(PathBuf::from("/tmp/q.cyp")));
+        assert!(!stdin);
+
+        let Ok(Command::Query { file, stdin, .. }) = parse_args(&["query", "/tmp/db", "--stdin"])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(file, None);
+        assert!(stdin);
+
+        let Ok(Command::AsOf {
+            commit,
+            query,
+            file,
+            stdin,
+            ..
+        }) = parse_args(&["asof", "/tmp/db", "--commit", "1", "--file=/tmp/q.cyp"])
+        else {
+            panic!("expected AsOf");
+        };
+        assert_eq!(commit, Some(1));
+        assert_eq!(query, None);
+        assert_eq!(file, Some(PathBuf::from("/tmp/q.cyp")));
+        assert!(!stdin);
+
+        let Ok(Command::AsOf { stdin, .. }) =
+            parse_args(&["asof", "/tmp/db", "--commit", "1", "--stdin"])
+        else {
+            panic!("expected AsOf");
+        };
+        assert!(stdin);
+
+        for args in [
+            &["query", "/tmp/db", "--stdin", "--file", "/tmp/q"][..],
+            &["query", "/tmp/db", "--stdin", "MATCH (n) RETURN n"],
+            &[
+                "query",
+                "/tmp/db",
+                "--file",
+                "/tmp/q",
+                "--query",
+                "MATCH (n) RETURN n",
+            ],
+            &[
+                "asof",
+                "/tmp/db",
+                "--commit",
+                "1",
+                "--stdin",
+                "--query",
+                "MATCH (n) RETURN n",
+            ],
+            &[
+                "asof", "/tmp/db", "--commit", "1", "--stdin", "--file", "/tmp/q",
+            ],
+            &["query", "/tmp/db", "--file"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?} should be refused");
+        }
+        assert!(usage().contains("--file <path>|--stdin"));
+    }
+
+    /// The trailing newline a file or pipe ends in is not part of the
+    /// statement; an empty one is refused.
+    #[test]
+    fn resolve_statement_drops_the_trailing_newline() {
+        let mut piped: &[u8] = b"MATCH (n) RETURN count(n)\n\n";
+        let got = resolve_statement(None, None, true, &mut piped).expect("stdin");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN count(n)"));
+
+        let mut unused: &[u8] = b"";
+        let inline = resolve_statement(Some("MATCH (n) RETURN n"), None, false, &mut unused)
+            .expect("inline");
+        assert_eq!(inline.as_deref(), Some("MATCH (n) RETURN n"));
+        assert_eq!(
+            resolve_statement(None, None, false, &mut unused).unwrap(),
+            None
+        );
+
+        // A byte-order mark and one trailing semicolon are not the statement,
+        // whichever way it arrives.
+        let mut bom: &[u8] = b"\xEF\xBB\xBFMATCH (n) RETURN n;  \n";
+        let got = resolve_statement(None, None, true, &mut bom).expect("bom");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("MATCH (n) RETURN n ; "), None, false, &mut unused)
+            .expect("inline semicolon");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("RETURN ';;'"), None, false, &mut unused).unwrap();
+        assert_eq!(got.as_deref(), Some("RETURN ';;'"));
+
+        let mut blank: &[u8] = b" \n";
+        assert!(resolve_statement(None, None, true, &mut blank).is_err());
+        assert!(resolve_statement(
+            None,
+            Some(Path::new("/nonexistent/q.cyp")),
+            false,
+            &mut unused
+        )
+        .is_err());
     }
 
     /// `query --role` answers as that role, `--namespace` narrows, and the two

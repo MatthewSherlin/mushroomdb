@@ -25,6 +25,8 @@
 //! 10. wal_consumed_tracks_bytes_exactly
 //! 11. refresh_on_unchanged_store_is_zero_cost
 //! 12. read_sees_a_peer_commit_that_lands_microseconds_later
+//! 13. a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock
+//! 14. a_peers_constraint_over_older_duplicates_is_absorbed_not_checked
 
 use core_storage::fs::{FileId, Fs, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -697,4 +699,195 @@ fn a_peers_commit_times_survive_this_handles_first_write() {
 
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── TX-5 round 2. A lock-free capture sees a peer's commit while another ──────
+// ── in-process reader holds the read lock ─────────────────────────────────────
+
+/// `SharedDb::reader()` serves the published snapshot when it cannot take the
+/// read lock. A stale handle must not take that shortcut merely because some
+/// other reader (a long `/suggest`, an `as_of` query) holds a read guard: the
+/// peer's commit would be missing until this process next wrote. The capture
+/// applies the peer's tail instead, waiting for the guards already held.
+#[test]
+fn a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock() {
+    use std::sync::atomic::AtomicBool;
+
+    let d = tmp("peer-under-read-guard");
+    let db = SharedDb::open(&d).unwrap();
+    db.write().insert_node("Person", "local", vec![]).unwrap();
+    assert!(db.reader().node_info("local").is_some());
+
+    // A long read in this process.
+    let held = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let holder = {
+        let (db, held, released) = (db.clone(), Arc::clone(&held), Arc::clone(&released));
+        std::thread::spawn(move || {
+            let guard = db.read();
+            held.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1500));
+            released.store(true, Ordering::SeqCst);
+            drop(guard);
+        })
+    };
+    while !held.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A peer commits, and returns, while that guard is held.
+    let (code, _) = run_worker(&d, &["write", "peer", "3"]);
+    assert_eq!(code, 0, "peer writer must succeed");
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the peer finished after the read guard was released; the test proves nothing"
+    );
+
+    let snap = db.reader();
+    for k in ["peer-0", "peer-1", "peer-2", "local"] {
+        assert!(
+            snap.node_info(k).is_some(),
+            "{k} is missing from a capture taken after the peer's commit returned"
+        );
+    }
+    holder.join().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── 14. A peer's constraint is absorbed, not re-checked ───────────────────────
+
+#[test]
+fn a_peers_constraint_over_older_duplicates_is_absorbed_not_checked() {
+    let d = tmp("peer-constraint");
+    let shared = SharedDb::open(&d).unwrap();
+    let mut db = shared.write();
+    let email = |s: &str| vec![("email".to_string(), Value::Str(s.into()))];
+    db.insert_node("User", "alice", email("a@x")).unwrap();
+
+    // A peer's tail: a duplicate written before any constraint existed, the
+    // constraint declared over it, and a write made under that constraint.
+    let mut fs = RealFs::new(&d).unwrap();
+    for rec in [
+        WalRecord::InsertNode {
+            label: "User".into(),
+            key: "bob".into(),
+            props: email("a@x"),
+        },
+        WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        },
+        WalRecord::InsertNode {
+            label: "User".into(),
+            key: "carol".into(),
+            props: email("c@x"),
+        },
+    ] {
+        fs.append(FileId::Wal, &encode_record(&rec)).unwrap();
+    }
+    assert_eq!(db.refresh().expect("a peer's tail is never re-checked"), 3);
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+    assert_eq!(
+        db.get_prop("carol", "email"),
+        Some(Value::Str("c@x".into()))
+    );
+    // The absorbed declaration binds this handle's own writes.
+    assert!(matches!(
+        db.insert_node("User", "dave", email("c@x")),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
+    db.insert_node("User", "dave", email("d@x")).unwrap();
+    drop(db);
+
+    // A peer that folds all of it into a snapshot: this handle reloads from
+    // disk, and the duplicate and the declaration both survive.
+    let (code, _) = run_worker(&d, &["snapshot"]);
+    assert_eq!(code, 0, "the peer's snapshot of such a store must succeed");
+    let mut db = shared.write();
+    db.refresh().expect("reload over a peer's snapshot");
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(
+        db.get_prop("alice", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+    assert!(db.node_info("dave").is_some());
+    drop(db);
+    // A reader's capture of the same state sees both duplicates.
+    let read = shared.read();
+    assert_eq!(
+        read.get_prop("alice", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    assert_eq!(
+        read.get_prop("bob", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    drop(read);
+    drop(shared);
+    let reopened = GraphDb::open(&d).expect("the store opens");
+    assert_eq!(reopened.constraints().len(), 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── V11 across processes (0.10 TY-12) ─────────────────────────────────────────
+
+/// A store this process moved to V11 — a Date, a unique constraint and a
+/// range index — is read in full by a peer process opening it fresh.
+#[test]
+fn a_peer_reads_a_store_another_handle_moved_to_v11() {
+    let d = tmp("v11-peer-reads");
+    let shared = SharedDb::open(&d).unwrap();
+    {
+        let mut w = shared.write();
+        w.insert_node("Event", "peer", vec![("on".into(), Value::Date(19_737))])
+            .unwrap();
+        w.create_constraint("uniq_on", "Event", "on").unwrap();
+        w.enable_range_index("by_on", "Event", "on").unwrap();
+        assert!(w.is_v11());
+    }
+    let (code, out) = run_worker(&d, &["v11-read"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "v11=true constraints=1 ranges=1 on=Date(19737)");
+    // And again after a truncating snapshot, where only the snapshot (and
+    // its section 18) says it.
+    shared.write().snapshot().unwrap();
+    let (code, out) = run_worker(&d, &["v11-read"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "v11=true constraints=1 ranges=1 on=Date(19737)");
+}
+
+/// A peer process moves the store to V11 while this process holds it open:
+/// this handle picks up the V11 snapshot, the value and both declarations
+/// on refresh, and the constraint binds its own writes.
+#[test]
+fn a_handle_follows_a_peer_that_moved_the_store_to_v11() {
+    let d = tmp("v11-peer-writes");
+    let shared = SharedDb::open(&d).unwrap();
+    shared
+        .write()
+        .insert_node("Event", "mine", vec![("n".into(), Value::Int(1))])
+        .unwrap();
+    assert!(!shared.read().is_v11());
+    let (code, out) = run_worker(&d, &["v11-write"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(mushroomdb::snapshot_version_at(&d).unwrap(), Some(11));
+    let mut db = shared.write();
+    db.refresh().expect("reload over the peer's V11 snapshot");
+    assert!(db.is_v11());
+    assert_eq!(db.get_prop("peer", "on"), Some(Value::Date(19_737)));
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(db.range_indexes().len(), 1);
+    assert!(matches!(
+        db.insert_node("Event", "dup", vec![("on".into(), Value::Date(19_737))]),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
+    db.insert_node("Event", "other", vec![("on".into(), Value::Date(1))])
+        .unwrap();
+    db.snapshot().unwrap();
+    drop(db);
+    assert_eq!(mushroomdb::snapshot_version_at(&d).unwrap(), Some(11));
 }

@@ -4,7 +4,14 @@
  * Entry point re-exports everything callers need.
  */
 
-export { MushroomClient, MushroomError } from "./client.js";
+export {
+  ConstraintViolationError,
+  MushroomClient,
+  MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
+  TxHandle,
+} from "./client.js";
 export type {
   AlgoDir,
   AlgoReport,
@@ -19,10 +26,13 @@ export type {
   EdgeInfo,
   Explanation,
   FindSimilarOptions,
+  ConstraintInfo,
+  CreateIndexOptions,
   FindSimilarResult,
   HealthReport,
   HistoryChange,
   HistoryEntry,
+  IndexInfo,
   IngestEdge,
   IngestOptions,
   IngestReport,
@@ -47,13 +57,28 @@ export type {
   SlowQueryEntry,
   Stats,
   SuggestReport,
+  TxBeginResponse,
+  TxCommitResponse,
   WasLinkedResult,
   WccConfig,
   WccReport,
 } from "./client.js";
 export type {
+  BinaryValue,
+  DateTimeValue,
+  DateValue,
   DbEvent,
+  DurationValue,
+  LocalDateTimeValue,
   SubscribeMessage,
+} from "./types.js";
+export {
+  asBinary,
+  asDate,
+  asDateTime,
+  asDuration,
+  asLocalDateTime,
+  binaryBytes,
 } from "./types.js";
 export type {
   SubscribeHandle,

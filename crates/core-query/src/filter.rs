@@ -1,4 +1,4 @@
-use crate::value_ops::values_equal;
+use crate::value_ops::equality;
 use core_storage::Value;
 use std::cmp::Ordering;
 
@@ -33,13 +33,21 @@ fn is_orderable_pair(lhs: &Value, rhs: &Value) -> bool {
         ) | (Value::Str(_), Value::Str(_))
             // Row 160: openCypher orders false before true.
             | (Value::Bool(_), Value::Bool(_))
+            | (Value::Date(_), Value::Date(_))
+            | (Value::LocalDateTime(_), Value::LocalDateTime(_))
+            | (Value::DateTime { .. }, Value::DateTime { .. })
+            | (Value::Binary(_), Value::Binary(_))
     )
 }
 
+/// A comparison that is true. openCypher's null result (a `Value::Null`
+/// operand, or a list or map whose equality is unknown because of a null
+/// element) is `false`, as a WHERE reads it: the row is dropped for every
+/// operator, `<>` included.
 pub fn eval_cmp(op: &CmpOp, lhs: &Value, rhs: &Value) -> bool {
     match op {
-        CmpOp::Eq => values_equal(lhs, rhs),
-        CmpOp::Ne => !values_equal(lhs, rhs),
+        CmpOp::Eq => equality(lhs, rhs) == Some(true),
+        CmpOp::Ne => equality(lhs, rhs) == Some(false),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
             if !is_orderable_pair(lhs, rhs) {
                 return false;
@@ -52,6 +60,29 @@ pub fn eval_cmp(op: &CmpOp, lhs: &Value, rhs: &Value) -> bool {
                 CmpOp::Ge => c != Ordering::Less,
                 _ => unreachable!(),
             }
+        }
+    }
+}
+
+/// A comparison, three-valued: `None` is null. Equality is
+/// [`equality`]; an ordering of a pair that does not order (`1 < 'a'`) is
+/// null. [`eval_cmp`] is this with null read as false.
+pub fn eval_cmp3(op: &CmpOp, lhs: &Value, rhs: &Value) -> Option<bool> {
+    match op {
+        CmpOp::Eq => equality(lhs, rhs),
+        CmpOp::Ne => equality(lhs, rhs).map(|eq| !eq),
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+            if !is_orderable_pair(lhs, rhs) {
+                return None;
+            }
+            let c = crate::value_ops::cmp_values(lhs, rhs);
+            Some(match op {
+                CmpOp::Lt => c == Ordering::Less,
+                CmpOp::Le => c != Ordering::Greater,
+                CmpOp::Gt => c == Ordering::Greater,
+                CmpOp::Ge => c != Ordering::Less,
+                _ => unreachable!(),
+            })
         }
     }
 }
@@ -172,12 +203,6 @@ mod tests {
             &Value::Bool(true)
         ));
         assert!(!eval_cmp(
-            &CmpOp::Gt,
-            &Value::Bool(false),
-            &Value::Bool(true)
-        ));
-        assert!(!eval_cmp(&CmpOp::Lt, &Value::Bool(false), &Value::Int(1)));
-        assert!(!eval_cmp(
             &CmpOp::Lt,
             &Value::List(vec![]),
             &Value::List(vec![Value::Int(1)])
@@ -262,5 +287,46 @@ mod tests {
         };
         assert!(eval_filter(&ne_age, &get_ada));
         assert!(!eval_filter(&ne_same, &get_ada));
+    }
+
+    #[test]
+    fn new_types_compare_within_their_own_type() {
+        let lt = CmpOp::Lt;
+        assert!(eval_cmp(&lt, &Value::Date(1), &Value::Date(2)));
+        assert!(eval_cmp(
+            &lt,
+            &Value::LocalDateTime(1),
+            &Value::LocalDateTime(2)
+        ));
+        let early = Value::DateTime {
+            micros_utc: 1,
+            offset_seconds: 3_600,
+        };
+        let late = Value::DateTime {
+            micros_utc: 2,
+            offset_seconds: 0,
+        };
+        assert!(eval_cmp(&lt, &early, &late));
+        assert!(eval_cmp(
+            &lt,
+            &Value::Binary(vec![0]),
+            &Value::Binary(vec![1])
+        ));
+        // Across types, and on durations (not totally ordered), `<` is false.
+        assert!(!eval_cmp(&lt, &Value::Date(1), &Value::LocalDateTime(2)));
+        assert!(!eval_cmp(&lt, &Value::Date(1), &Value::Int(2)));
+        let d = |months| Value::Duration {
+            months,
+            days: 0,
+            nanos: 0,
+        };
+        assert!(!eval_cmp(&lt, &d(1), &d(2)));
+        assert!(eval_cmp(&CmpOp::Eq, &d(1), &d(1)));
+        // `=` on DateTime is the UTC instant.
+        let same_instant = Value::DateTime {
+            micros_utc: 2,
+            offset_seconds: -3_600,
+        };
+        assert!(eval_cmp(&CmpOp::Eq, &late, &same_instant));
     }
 }

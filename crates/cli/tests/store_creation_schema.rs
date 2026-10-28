@@ -433,6 +433,8 @@ const OPENS: [&str; 3] = ["GraphDb::open", "SharedDb::open", "CoreDb::open"];
 /// either a general-purpose command whose documented behaviour is to operate on
 /// whatever store it is pointed at, or an internal implementation that the CLI
 /// and bindings share. A name here that no longer exists fails the census.
+/// An entry `<file>::<fn>` (a workspace-relative path) allows only that file's
+/// function of that name; a bare name allows the function in every file.
 const ALLOWLIST: &[(&str, &str)] = &[
     (
         "run_query",
@@ -462,6 +464,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "copies an existing store; the backup must match the source",
     ),
     ("run_export", "reads an existing store out to a file"),
+    (
+        "run_import_inputs",
+        "general-purpose bulk loader of the user's own labels and properties; \
+         declaring the memory schema would add full-text indexes the data did \
+         not ask for and slow the load — schema is opt-in via `schema apply`",
+    ),
     ("run_algo", "runs a graph algorithm over an existing store"),
     (
         "read_stats",
@@ -488,7 +496,23 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "test-only SharedDb constructor for injecting a WAL sync function; \
          applies no schema because callers configure the store separately",
     ),
+    (
+        "crates/tck-runner/src/runner.rs::new",
+        "tck-runner's TempGraph::new: a conformance-test fixture, not a \
+         user-facing store creation path; every TCK scenario assumes an empty \
+         store with no schema, so declaring the memory schema would change \
+         what the scenarios measure",
+    ),
 ];
+
+/// Whether ALLOWLIST `entry` covers `function` in the file `rel`: a
+/// `<file>::<fn>` entry only in that file, a bare name in any.
+fn allows(entry: &str, rel: &str, function: &str) -> bool {
+    match entry.rsplit_once("::") {
+        Some((file, name)) => file == rel && name == function,
+        None => entry == function,
+    }
+}
 
 /// Store-opening calls classified, one per line: `file:line fn class`.
 struct Site {
@@ -656,7 +680,7 @@ fn census() -> (Vec<Site>, Vec<String>) {
                     "read-only"
                 } else if applies {
                     "applies a schema"
-                } else if ALLOWLIST.iter().any(|(f, _)| *f == function) {
+                } else if ALLOWLIST.iter().any(|(f, _)| allows(f, &rel, &function)) {
                     "allowlisted"
                 } else {
                     "OFFENDER"
@@ -709,8 +733,8 @@ fn every_store_creating_call_site_applies_a_schema() {
          function to ALLOWLIST with its reason."
     );
     // Guards that the scan sees what it guards: a census that found nothing
-    // would pass vacuously.
-    for expected in ["run_mcp", "run_serve", "run_demo", "run_ingest_git"] {
+    // would pass vacuously. (serve opens its store in `open_for_serve`.)
+    for expected in ["run_mcp", "open_for_serve", "run_demo", "run_ingest_git"] {
         assert!(
             sites
                 .iter()
@@ -726,13 +750,28 @@ fn every_store_creating_call_site_applies_a_schema() {
     );
     for (name, reason) in ALLOWLIST {
         assert!(!reason.is_empty(), "{name} has no reason");
+        let bare = name.rsplit("::").next().unwrap_or(name);
         assert!(
-            functions.iter().any(|f| f == name),
+            functions.iter().any(|f| f == bare),
             "ALLOWLIST names {name}, which no longer exists"
         );
         assert!(
-            sites.iter().any(|s| s.function == *name),
+            sites.iter().any(|s| {
+                let file = s.at.rsplit_once(':').map_or(s.at.as_str(), |(f, _)| f);
+                allows(name, file, &s.function)
+            }),
             "ALLOWLIST names {name}, which no longer opens a store"
         );
     }
+}
+
+/// A path-qualified entry allows its own file's function only: allowlisting
+/// the TCK runner's `new` must not exempt every store-opening `new`.
+#[test]
+fn a_path_qualified_allowlist_entry_covers_only_its_file() {
+    let entry = "crates/tck-runner/src/runner.rs::new";
+    assert!(allows(entry, "crates/tck-runner/src/runner.rs", "new"));
+    assert!(!allows(entry, "crates/cli/src/main.rs", "new"));
+    assert!(!allows(entry, "crates/tck-runner/src/runner.rs", "open"));
+    assert!(allows("run_query", "crates/cli/src/query.rs", "run_query"));
 }

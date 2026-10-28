@@ -1,7 +1,7 @@
 {
   "name": "mushroomdb",
-  "version": "0.9.4",
-  "description": "Embedded graph database for agents: declare a relationship as a rule, and the edges maintain themselves. This package launches the native binary.",
+  "version": "0.10.0",
+  "description": "Embedded graph database with Cypher queries, rule-derived edges, time travel, and agent-memory tools. This package launches the native binary.",
   "mcpName": "io.github.MatthewSherlin/mushroomdb",
   "homepage": "https://matthewsherlin.github.io/mushroomdb/",
   "license": "(MIT OR Apache-2.0)",
@@ -18,6 +18,15 @@
   "scripts": {
     "postinstall": "node install.js"
   },
+  "keywords": [
+    "graph",
+    "embedded",
+    "database",
+    "cypher",
+    "graph-database",
+    "mcp",
+    "agent-memory"
+  ],
   "files": [
     "install.js",
     "bin/mushroomdb.js"

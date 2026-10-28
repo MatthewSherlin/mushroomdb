@@ -13,8 +13,8 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
-listener is accepting. Non-loopback `--addr` requires `--token` or
-`MUSHROOMDB_TOKEN` (see `SECURITY.md`).
+listener is accepting. Non-loopback `--addr` requires `--token`,
+`MUSHROOMDB_TOKEN` or an `admin` key in `keys.json` (see `SECURITY.md`).
 
 ## Authentication
 
@@ -25,6 +25,10 @@ header, as a `?token=` query parameter, or in the `mushroomdb_token` cookie. The
 that cookie itself when it answers an explorer page to a request that carried the full-access
 token, so a browser opened with `?token=` stays signed in. The header is read first, then the
 query, then the cookie. Grants access to all endpoints.
+
+**Cross-origin pages:** set `MUSHROOMDB_CORS_ORIGINS` to let a browser page on another origin call the API
+(`*`, or a comma-separated list of origins). Unset, no CORS headers are sent. It does not protect
+`/watch`; see [Browser access (CORS)](deployment.md#browser-access-cors).
 
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
 read the same three ways, though the server never sets the cookie for one. A role token
@@ -58,6 +62,7 @@ Role-token behavior per endpoint:
 | Endpoint | Role-token response |
 |---|---|
 | `GET /health` | 200 `{"ok":true}` — reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
+| `GET /ready` | 200 `{"ok":true}` — reachable without a credential, like `/health` |
 | `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
 | `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
 | `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
@@ -75,6 +80,8 @@ Role-token behavior per endpoint:
 | `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
+| `GET /schema/indexes`, `GET /schema/constraints` | 200 — only the rows whose label the role can see a node of, as `SHOW` lists them |
+| `POST`/`DELETE /schema/indexes`, `/schema/constraints` | 403 (schema changes are not permitted to a role token) |
 | `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
@@ -98,6 +105,80 @@ predicate, v4 when any role is bound to one or more namespaces). A version this
 binary does not recognise poisons the roles state rather than loading it —
 denying beats over-granting.
 
+## Access keys and the write tier
+
+`MUSHROOMDB_TOKEN` is one all-powerful token, and a role token can write wherever its role's write
+scope reaches. To hand an application a token that can write but cannot read operator data, or a
+token that can only read, issue access keys. They live in `keys.json` in the store directory, beside
+`roles.json`, and the file holds **hashes, never tokens**.
+
+```text
+mushroomdb keys add <db-dir> app --tier write
+mushroomdb keys add <db-dir> tenant --tier read --role tenant_a
+```
+
+Each command generates a random 32-byte token, prints it once on standard output, and appends only
+its blake3 hash to `keys.json`, creating the file with mode 0600. The token cannot be shown again.
+A running server loads it on SIGHUP (`kill -HUP <pid>`), including the first key added to a server that started without a `keys.json`; once that key is loaded the server requires a key. Windows has no SIGHUP: restart the server there.
+
+```json
+{
+  "keys": [
+    { "name": "ops",    "hash": "<64 hex characters>", "tier": "admin" },
+    { "name": "app",    "hash": "<64 hex characters>", "tier": "write" },
+    { "name": "tenant", "hash": "<64 hex characters>", "tier": "read", "role": "tenant_a" }
+  ]
+}
+```
+
+To bring a token you already have, hash it: `printf %s "$TOKEN" | mushroomdb keys hash` prints the
+`hash` to put in the file. A token must be at least 32 bytes; a shorter one is refused by `keys hash`
+and never matches. A file with a plaintext `"token"` field is refused, and the message says how to
+convert it.
+
+| Tier | What it is |
+|---|---|
+| `admin` | Full access, the same as `MUSHROOMDB_TOKEN`. |
+| `write` | May read and mutate everything the full token can: `/query` (including writes), `/ingest`, `/rules`, `/nodes`, `/edges`, `/node/{key}` and its props, `/schema/*`, `/algo/*`. Refused with 403 on `/backup`, `/stats`, `/metrics`, `/watch` and `/subscribe`. `/health` tells it only that the server is alive. |
+| `read` | The `role` it names, masked exactly as a role token reads, and **never a write**, even when the role has a write scope. Every route but a read is refused with 403 `read-tier key: writes are not permitted`: it may `GET` (apart from `/stats`, `/metrics`, `/watch` and `/subscribe`, which stay refused), `POST /query` with a statement that only reads, and `POST /find_similar`. A `read` key must name a role. |
+
+Keys are read the same three ways as the other tokens (header, `?token=`, cookie). They add to
+`MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS` rather than replacing them. Each token belongs in
+one place: `serve` refuses to start when a token given by `--token`, `MUSHROOMDB_TOKEN` or a role
+token is also a key. A server with no env token and no role tokens but at least one key requires
+a key. An `admin` key also satisfies the rule that a non-loopback `--addr` needs a token; a
+`read` or `write` key alone does not, and `serve` refuses to start. With no `keys.json` nothing changes.
+
+The file is strict. An unknown tier, a `read` key with no `role`, a `role` on another tier, a
+malformed or repeated hash, a repeated name, a plaintext `token`, or an unknown field refuses the
+whole file; `serve` then exits with status 1 before it opens the store. On Unix the file must be owned by the user running the server and closed to group and others: a file
+with any group or world bit set is refused with a message naming the path and its mode (`chmod 600`
+fixes it), and a file owned by another account is refused naming both uids. The check is made on the
+opened file, so the file checked is the file read. **Windows performs no such check**: there the
+file is as private as its directory's access list makes it, so lock that down yourself. Error messages
+never contain a token.
+
+**Reloading.** Send the server SIGHUP (`kill -HUP <pid>`) to re-read `keys.json` without a restart.
+The new set replaces the old one in a single step, so a request sees one set or the other, never a
+mix. If the new file does not parse or is not private, the old keys stay in force and the error is
+logged. Removing every key locks the server rather than opening it: once a key has been loaded,
+authentication stays required. A server started with no `keys.json` handles SIGHUP too: with no file it is a logged no-op, and a file created later is picked up. On a platform without SIGHUP (Windows), restart to reload.
+
+**What a reload does not reach.** HTTP resolves the key on every request, so a revoked key is
+refused on its next request. A WebSocket (`/watch`, `/subscribe`) opened with an admin key, and a
+Bolt connection, keep the access they were granted until they close: a Bolt connection
+authenticates once, at `HELLO`, and a stream does not look again. Close them yourself, or restart,
+when you revoke an admin key.
+
+**Bolt.** The same keys work as the Bolt `HELLO` credentials (`basic` or `bearer`), with the same
+tiers: an `admin` or `write` key reads and writes, including inside an explicit transaction, and a
+`read` key reads under its role, in auto-commit and in an explicit transaction, and is refused every
+statement that writes with `Neo.ClientError.Security.Forbidden`. See [Scoped access](bolt.md#scoped-access).
+
+`keys.json` is not part of `POST /backup` or `mushroomdb backup`, so a restore from one of those does not bring
+keys back: reissue or copy the file deliberately. The continuous S3 backup does carry it (hashes only), and
+`restore --from` and restore on boot bring it back.
+
 ## Write scopes for role-bound tokens
 
 v0.3 lifts the write ban for roles that explicitly declare write scopes in
@@ -112,10 +193,14 @@ pub struct WriteScope {
     pub delete_labels: Vec<String>,      // DELETE / DETACH DELETE visible nodes
     pub create_edge_types: Vec<String>,  // INSERT EDGE between two visible endpoints
     pub delete_edge_types: Vec<String>,  // DELETE user-owned edges (not derived)
+    pub update_edge_types: Vec<String>,  // SET / REMOVE relationship properties (0.10)
 }
 ```
 
-All fields default to empty (read-only). Each label field must be a subset of the
+All fields default to empty (read-only). `update_edge_types` lets a role write
+the properties of an existing relationship of those types (Cypher `SET r.p`,
+`SET r += …`, `REMOVE r.p`) between two visible nodes; creating a relationship
+with its property map needs only `create_edge_types`. Each label field must be a subset of the
 role's read `labels` — `apply_schema` rejects disjoint write and read scopes with
 an error naming the role and offending label.
 
@@ -237,15 +322,16 @@ An error the server's own handlers raise is one JSON object, `{"error": "<what w
 | 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
 | 403 | A role-bound token asked for something outside its role. The message says what |
 | 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
-| 409 | `POST /nodes/{key}/rename` onto a key that is taken |
-| 413 | A request body over 64 MiB |
+| 409 | `POST /nodes/{key}/rename` onto a key that is taken, or a write that would give a second node a value a unique constraint covers; on `/tx/*`, a commit conflict or a transaction that is busy |
+| 410 | On `/tx/*`, a transaction rolled back after sitting idle past its timeout |
+| 413 | A request body over 64 MiB, or a `Binary` value over 1 MiB |
 | 415 | A route that takes a JSON body was sent without `Content-Type: application/json` |
 | 500 | The store is corrupt, or `roles.json` is misconfigured |
-| 503 | Another process holds the write lock (`Retry-After: 1`), or the server is at its concurrency limit |
+| 503 | Another process holds the write lock (`Retry-After: 1`), the server is at its concurrency limit, or, on `POST /tx/begin`, it is at its open-transaction limit or shutting down (`Retry-After: 1`) |
 
 What is refused before a handler runs is not that object. A body that is not valid JSON is
-400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, 413
-and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
+400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, the
+64 MiB body-limit 413, and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
 server is serving the explorer, which answers instead; a route asked with the wrong method is
 405 with an empty body. A failed `POST /backup` answers 500 with its report.
 
@@ -259,8 +345,9 @@ may not see and a key that does not exist are told apart for no one.
 | Method | Path | What it does |
 |---|---|---|
 | `GET` | [`/health`](#get-health) | Liveness; with the full-access token, node and edge counts |
+| `GET` | [`/ready`](#get-ready) | Readiness for a container platform; 503 until the store is open |
 | `GET` | [`/stats`](#get-stats) | Node, edge and rule counts |
-| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON |
+| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON or in the Prometheus text format |
 | `POST` | [`/backup`](#post-backup) | A verified copy of the store, taken while it serves |
 | `POST` | [`/query`](#post-query) | Run a Cypher read or write |
 | `POST` | [`/ingest`](#post-ingest) | Insert many nodes of one label |
@@ -274,6 +361,12 @@ may not see and a key that does not exist are told apart for no one.
 | `GET` | [`/node/{key}/history`](#get-nodekeyhistory) | Every change to a node |
 | `GET` | [`/history/edge`](#get-historyedge) | When edges between two nodes came and went |
 | `GET` | [`/history/was_linked`](#get-historywas_linked) | Whether two nodes were linked on a date or at a commit |
+| `POST` | [`/tx/begin`](#post-txbegin) | Open an interactive transaction |
+| `POST` | [`/tx/{id}/run`](#post-txidrun) | Run one Cypher statement inside it |
+| `POST` | [`/tx/{id}/commit`](#post-txidcommit) | Commit it as one write |
+| `POST` | [`/tx/{id}/rollback`](#post-txidrollback) | Discard it |
+| `DELETE` | [`/tx/{id}`](#delete-txid) | Discard it (same as rollback) |
+| `GET` | [`/tx/{id}`](#get-txid) | Its expiry and how many statements ran |
 | `POST` | [`/nodes`](#post-nodes) | Create a node |
 | `DELETE` | [`/node/{key}`](#delete-nodekey) | Delete a node |
 | `PUT` | [`/node/{key}/prop/{field}`](#put-nodekeypropfield) | Set a property |
@@ -307,6 +400,18 @@ it is serving:
 
 A role-bound token, a wrong token and no token all get `{"ok": true}` and nothing more: the
 counts say how big the graph is, and `/stats` refuses a role the same counts.
+
+### `GET /ready`
+
+Readiness. It needs no token and never answers 401, so a container platform can gate traffic
+on it. The server opens the store before it binds, so a running server answers 200:
+
+```json
+{"ok": true}
+```
+
+Until the server is ready to serve, the answer is 503 and the body is `{"ok": false, "reason": "not ready"}`.
+Use `/health` to ask whether the process is alive and `/ready` to ask whether to send it requests.
 
 ### `GET /stats`
 
@@ -349,7 +454,8 @@ The field is absent for every rule that is not building. See
 ### `GET /metrics`
 
 Returns runtime counters and the slow-query log. Requires a full-access token
-(role-bound tokens receive 403, same as `/stats`).
+(role-bound tokens receive 403, same as `/stats`; the same holds for the text
+format below).
 
 ```json
 {
@@ -395,6 +501,66 @@ appended to the in-memory ring buffer (capped at 16 entries).
 includes shared library mappings and may not match tools like `top` exactly. It
 never causes a panic or blocking I/O.
 
+#### Prometheus text format
+
+Send `Accept: text/plain` (or `application/openmetrics-text`, which is what a
+Prometheus scraper sends first) and `GET /metrics` answers in the Prometheus
+text exposition format, `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+JSON stays the default: no `Accept`, `*/*`, a browser's `text/html,...`, or any
+`Accept` that lists `application/json` returns the JSON above, unchanged.
+
+```text
+# HELP mushroomdb_nodes_live Live (non-tombstoned) nodes.
+# TYPE mushroomdb_nodes_live gauge
+mushroomdb_nodes_live 60
+```
+
+Every metric has `HELP` and `TYPE`, and none has labels, so the series count is
+fixed.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `mushroomdb_nodes_live` | gauge | Live nodes |
+| `mushroomdb_nodes_tombstoned` | gauge | Soft-deleted nodes |
+| `mushroomdb_edges_live` | gauge | Edges (the JSON `edges`) |
+| `mushroomdb_commits_total` | counter | Commit sequence number (the JSON `commit_seq`) |
+| `mushroomdb_wal_size_bytes` | gauge | WAL size on disk; absent when it cannot be read |
+| `mushroomdb_rss_bytes` | gauge | Resident set size; absent on unsupported platforms |
+| `mushroomdb_process_start_time_seconds` | gauge | Server start, Unix seconds (uptime is `time() - this`) |
+| `mushroomdb_slow_queries_total` | counter | Reads that met the slow-query threshold since start |
+| `mushroomdb_http_transactions_open` | gauge | Open `/tx` transactions |
+| `mushroomdb_bolt_connections_open` | gauge | Bolt connections being served now |
+| `mushroomdb_bolt_connections_accepted_total` | counter | Bolt connections admitted since the listener started |
+| `mushroomdb_backup_upload_errors_total` | counter | Failed backup steps since start |
+| `mushroomdb_backup_last_success_timestamp_seconds` | gauge | Unix time all durable data was last shipped; 0 before the first |
+| `mushroomdb_backup_lag_seconds` | gauge | Seconds the oldest unshipped durable WAL byte has waited; 0 when all is shipped |
+| `mushroomdb_backup_healthy` | gauge | 1 while the backup worker reports healthy, else 0 |
+| `mushroomdb_backup_lease_held` | gauge | 1 while this instance holds the bucket lease, 0 while another does or the lease was lost |
+
+The five `mushroomdb_backup_*` series exist only on a server running continuous
+backup (`MUSHROOMDB_BACKUP_S3_URL`); without it they are absent, not zero. The
+two `mushroomdb_bolt_*` series exist only when the Bolt listener is on
+(`--bolt-port`). One process reports one store's metrics. The response carries
+`Vary: Accept`, and `Accept` quality values are not weighed.
+
+A scrape config, with the token as a bearer credential (a full-access token or an
+`admin`-tier key; role tokens and `write`/`read` keys get 403):
+
+```yaml
+scrape_configs:
+  - job_name: mushroomdb
+    metrics_path: /metrics
+    scheme: https   # when the server terminates TLS (--tls-cert/--tls-key) or a proxy does
+    authorization:
+      credentials: "<full-access token>"
+    static_configs:
+      - targets: ["mushroomdb:8080"]
+```
+
+Useful alerts: `mushroomdb_backup_lag_seconds > 300`,
+`mushroomdb_backup_healthy == 0`, and
+`time() - mushroomdb_backup_last_success_timestamp_seconds > 900`.
+
 ### `POST /backup`
 
 Take a consistent backup of the database. Full-token only; role tokens return 403.
@@ -414,7 +580,7 @@ The server holds the read lock for the **full duration** of the operation: file 
 plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
-The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+The server copies: `snapshot.bin`, `snapshot.bin.bak` when there is one, `wal.bin`, all `wal.<N>.archive` files,
 `wal.floor`, `wal.genesis`, `roles.json`, `commit_times.bin` and, when there is one, `snapshot.intent`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
@@ -453,6 +619,12 @@ Request body:
   "stub_hidden": false
 }
 ```
+
+`params` (optional): an object of query parameters. A JSON `null` binds as a null, at
+the top level and inside a list or an object, so `WHERE $p IS NULL` is true for
+`{"p": null}`. (Before 0.10 a null parameter was left out and the query failed with
+`missing parameter`.) Writes keep their own rules: `SET n.p = $p` with a null `$p` is
+a 400, and a list holding a null cannot be stored. A null inside a map parameter reaches `SET n += $m` (which removes that key) and `SET n = $m` (which replaces the properties with the non-null entries); before 0.10 the null was dropped and the key stayed.
 
 `stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
 request resolved to appear as `{"key": "…", "restricted": true}` rather than being
@@ -521,6 +693,18 @@ send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
+Arrow column types for the date, time and binary value types. A column
+becomes one of these only when every non-null value in it has that type; a
+column that mixes types is Utf8 text.
+
+| Value type | Arrow type | Loss |
+|---|---|---|
+| `Date` | `Date32` | none |
+| `LocalDateTime` | `Timestamp(microsecond)`, no zone | none |
+| `DateTime` | `Timestamp(microsecond, "+00:00")` | Arrow holds one zone per column, so each value is its UTC instant and its own offset is dropped |
+| `Duration` | `Duration(microsecond)` | nanoseconds below one microsecond are truncated; a column with any non-zero month is Utf8 ISO 8601 text instead, because a month has no fixed length |
+| `Binary` | `LargeBinary` | none |
+
 Add `?format=json` for a JSON response:
 
 ```json
@@ -540,10 +724,13 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 **Write statements** sent to `/query` (server routes to write-lock automatically):
 - `CREATE (n:Label {id: 'key', ...})` — insert node(s) and optional edges
 - `MATCH … SET n.field = value` — update properties
+- `MATCH … REMOVE n.field` — remove properties (a missing property is a no-op)
+- `MATCH … SET n += {k: v, …}` / `SET n = {k: v, …}` — merge a map into the node's properties (a null value removes that one), or replace them all
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
-- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`)
+- `UNWIND $rows AS r CREATE (:Label {id: r.id, …})` — and `… MERGE …`, `… MATCH … SET …`: the writes run per row and commit as one batch; each write is scope-checked as the single statement is, so one row outside scope refuses the whole statement
+- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`). `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` finds or creates both nodes and the edge (never a duplicate); the role needs scope on both labels and the edge type
 
 **Aggregate functions** in `RETURN`:
 
@@ -935,6 +1122,116 @@ first WAL frame after the snapshot. Use
 `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
 snapshots, or `archive_wal: true` to keep it in archives.
 
+## Transactions
+
+An interactive transaction groups several Cypher statements into one atomic write. `POST /tx/begin`
+freezes the store as it is; each statement runs against that frozen state plus the transaction's own
+uncommitted writes; `POST /tx/{id}/commit` writes them all as one commit, or fails and writes nothing.
+Isolation is snapshot isolation: a commit fails with a conflict when a node the transaction read or
+wrote has changed since `begin`.
+
+The state is in the server's memory. A transaction is not durable until it commits, and a restart
+rolls back every open one.
+
+- **Ownership.** A transaction belongs to the credential that began it: the full token, one
+  `keys.json` key, or one role token (a server with no authentication has one shared owner, so every
+  caller reaches every transaction). Anyone else asking for its id gets `404`, the same answer as
+  for an id that never existed.
+- **Idle timeout.** A transaction not touched for `MUSHROOMDB_TX_TIMEOUT_SECS` seconds (default 30)
+  is rolled back. Every `run` restarts the clock; `GET /tx/{id}` does not. The owner of an expired id
+  hears `410` (`transaction expired: idle too long, rolled back`) for a while afterwards, then `404`.
+- **Lifetime.** A transaction is rolled back `MUSHROOMDB_TX_MAX_LIFETIME_SECS` seconds after `begin`
+  (default 300) however often it is used, even while a statement is running on it. Its owner then hears
+  `410` with `transaction expired: open longer than its maximum lifetime, rolled back`. `expires_at` is the
+  nearer of the idle deadline and this one. A transaction holds its snapshot and every write it has
+  buffered in memory (up to a request body, 64 MiB, per statement), so keep them short; the open limit
+  and the lifetime bound the total, not the size of one.
+- **Limit.** At most `MUSHROOMDB_TX_MAX` transactions are open at once (default 100). `POST /tx/begin`
+  beyond that is `503` with `Retry-After: 1` and `too many open transactions (limit N); retry`. The three variables are read when the server starts; a value
+  that is not a positive integer is ignored with a warning. `mushroomdb serve` takes the same limits as flags,
+  `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs`; a flag wins over its variable, and must be a
+  positive integer.
+- **One request at a time.** A second request on a transaction while another is still running on it
+  is `409` with `{"error": "transaction busy", "code": "busy"}`. A commit conflict is `409` with
+  `"code": "conflict"`. A commit that a unique constraint refuses is `409` with `"code": "constraint"` (on any write route, not only `/tx/*`). A request the client abandons (it hung up, or the 120 s deadline hit) does not
+  strand the transaction: the statement finishes and the transaction is usable again. Statements never interleave. Retry once the first
+  returns.
+- **Shutdown.** When the server is told to stop, it rolls back every open transaction at the start of
+  the drain and answers `POST /tx/begin` with `503`. A statement already running finishes, and then
+  its transaction is rolled back too.
+- **Read-tier keys and role tokens.** A `read`-tier key or a role token may begin a transaction.
+  Its reads go through the role's mask, on the snapshot the transaction began on. It cannot write: a
+  write statement is `403`, with the same message `/query` gives (`read-tier key: writes are not
+  permitted` for a key), and the transaction stays open. This holds for a role token whose role
+  carries a write scope too, although `POST /query` would let it write: a transaction has no
+  role-aware commit yet (ledger row 140, planned for 0.11). Its commit writes nothing and returns the
+  commit number it read. `write`-tier and `admin` keys and the full token run the transaction engine
+  itself.
+- **Schema statements.** `CREATE` and `DROP` of an index or constraint are refused inside a
+  transaction, with a `400` that says so. `SHOW` is allowed.
+
+The routes take no request body except `run`. The status codes: `404` unknown or not yours, `410`
+expired, `409` commit conflict or busy, `503` limit or shutdown. A `409` with `"code": "conflict"` from a
+commit is transient: nothing was written, and the whole transaction can be retried from `begin`. One with
+`"code": "constraint"` is not: the same writes will be refused again until the clashing value changes.
+
+### `POST /tx/begin`
+
+No body. Opens a transaction.
+
+```json
+{ "tx_id": "9f3c1c7e0b2a4d5e8a61f0c4d2b7a913", "expires_at": "2026-10-22T12:00:30.000Z" }
+```
+
+`tx_id` is 32 hex characters, unguessable. `expires_at` is the idle deadline, UTC, ISO 8601; it moves
+forward with each `run`.
+
+### `POST /tx/{id}/run`
+
+```json
+{ "cypher": "CREATE (n:Person {id: $id})", "params": { "id": "p1" } }
+```
+
+`params` is optional and as in [`POST /query`](#post-query). The answer is the shape
+`POST /query?format=json` gives: `{"columns": [...], "rows": [[...]]}`. A statement that fails (`400`,
+or `403` for a write on a scoped transaction) changes nothing, restarts no clock, and leaves the
+transaction open.
+
+### `POST /tx/{id}/commit`
+
+No body. Writes everything the transaction buffered as one commit and ends the transaction.
+
+```json
+{ "bookmark": 42, "bookmark_text": "mushroomdb:commit:42" }
+```
+
+`bookmark` is the commit number of that write (for a transaction that wrote nothing, the commit it
+read). `bookmark_text` is the same number in the text form a Bolt `COMMIT` returns; pass it in a later
+Bolt `BEGIN` or `RUN` to read at least that commit. Bolt refuses the bare integer, and no HTTP route
+takes a bookmark. A node the transaction read or wrote that changed after `begin` makes
+the commit `409` and writes nothing; the transaction is over either way.
+
+### `POST /tx/{id}/rollback`
+
+No body. Discards the transaction. Answers `200` with `{"rolled_back": true}`; an expired one is `410`,
+an unknown one `404`.
+
+### `DELETE /tx/{id}`
+
+The same as `POST /tx/{id}/rollback`.
+
+### `GET /tx/{id}`
+
+```json
+{ "tx_id": "9f3c1c7e0b2a4d5e8a61f0c4d2b7a913", "expires_at": "2026-10-22T12:00:30.000Z", "op_count": 2 }
+```
+
+`op_count` is the number of statements that ran successfully. Reading it does not restart the idle
+clock. While a statement or a commit is running on the transaction the answer is `409` with
+`{"error": "transaction busy", "code": "busy"}`, as for any other request on it; ask again once that
+request has returned. A commit that is still running after its own request gave up (the 120 s
+deadline) answers this way until it ends, and `404` after.
+
 ## Writing nodes and edges
 
 ### `POST /nodes`
@@ -1084,10 +1381,14 @@ type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
 
 ### `POST /algo/pagerank`
 
-PageRank over hand-written and derived edges together. The body is a JSON object and may be
-`{}`: every field has a default. It may not be empty. A field the config does not have is 400
-on all three `/algo` routes, so `max_iter` for `max_iters` is refused and not run with the
-default.
+PageRank over hand-written and derived edges together. The body must be a JSON object;
+`{}` uses every field's default. With `Content-Type: application/json`, an absent body,
+an array, a scalar or `null` is 400 on all three `/algo` routes. The request parser
+returns 415 for a missing or non-JSON content type. Arrays are refused even when their
+positions could match the fields.
+A field the config does not have is also 400, so `max_iter` for `max_iters` is refused
+and not run with the default. A well-formed non-object body returns
+`{"error":"algorithm configuration must be a JSON object"}`.
 
 | Field | Default | What it is |
 |---|---|---|
@@ -1117,6 +1418,8 @@ A value the config does not accept is 400, and the message names what it would h
 ```
 
 A role-bound token gets 403 on every `/algo` route, because the scan covers the whole graph.
+For well-formed JSON, that refusal precedes config validation. Malformed JSON is refused
+by the request parser before the handler.
 More in [Algorithms](algorithms.md).
 
 ### `POST /algo/wcc`
@@ -1144,6 +1447,58 @@ only leave edges out; the score is a count.
 
 Highest first.
 
+## Schema indexes and constraints
+
+`/schema/indexes` and `/schema/constraints` list, create and drop the same things the Cypher statements `SHOW INDEXES`, `CREATE INDEX`, `DROP INDEX`, `SHOW CONSTRAINTS`, `CREATE CONSTRAINT` and `DROP CONSTRAINT` do, through the same code: a row has the fields and values `SHOW` gives it, and a request fails as the statement does. See [Cypher query language](query.md) for the statements.
+
+A `GET` needs read access, and a role-bound token or a `read` key sees only the rows `SHOW` shows it (those whose label it can see a node of). A `POST` or `DELETE` is a write: a full token, an `admin` key or a `write` key may; a role-bound token or a `read` key gets 403.
+
+Errors: a body that is not an object, a field the route does not take (the error names it), a field of the wrong type, a missing or empty field, an unknown `kind` or `type`, a `name` that is not letters, digits and underscores, or a range-index name beginning `eq_` or `ft_` (reserved for the names `SHOW INDEXES` lists equality and full-text indexes under) is `400`. A name that already exists, a pair that already has a range index, an index a unique constraint is checked against, and a constraint over properties that already hold duplicates are `409`. A name nothing answers to on `DELETE` is `404`. Each carries `{"error": "..."}`.
+
+### `GET /schema/indexes`
+
+Every index, range, equality and full-text, sorted by name.
+
+```json
+[{"name": "idx_Person_age", "type": "range", "label": "Person", "property": "age", "state": "online"}]
+```
+
+### `POST /schema/indexes`
+
+Declare an index.
+
+```json
+{"name": "by_age", "label": "Person", "property": "age", "kind": "range"}
+```
+
+`label` and `property` are required. `kind` is `"range"` (the default) or `"equality"`; full-text indexes are declared in a schema file, not here. `name` is optional for a range index and is `idx_<label>_<property>` without it. An equality index has no name of its own and is listed as `eq_<label>_<property>`: omit `name` or give exactly that. Answers `201` with the row `GET` lists.
+
+### `DELETE /schema/indexes/{name}`
+
+Drop the index listed under `name`, of any kind. `204` with no body. An equality index that a unique constraint is checked against is `409` naming the constraint: drop the constraint first.
+
+### `GET /schema/constraints`
+
+Every unique constraint, sorted by name.
+
+```json
+[{"name": "uc_email", "type": "unique", "label": "User", "property": "email"}]
+```
+
+### `POST /schema/constraints`
+
+Declare a unique constraint.
+
+```json
+{"name": "uc_email", "label": "User", "property": "email", "type": "unique"}
+```
+
+`name`, `label` and `property` are required; `type` is `"unique"`, the only one, and may be left out. Answers `201` with the row `GET` lists. Its equality index is created with it.
+
+### `DELETE /schema/constraints/{name}`
+
+Withdraw the constraint. `204` with no body. Its equality index stays.
+
 ## Live streams
 
 ### `GET /watch`
@@ -1163,9 +1518,11 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `dst`), `node_deleted` (`key`), `rule_created`, `rule_deleted` and `rule_rebuilt` (`name`),
 `batch_applied` (`ops`) and `ingested` (`label`, `inserted`). The lag notice here is
 `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
+A write to a relationship's own properties (`SET r.p`, a `CREATE` relationship map) has no frame
+yet, here or on `/subscribe` (ledger row 155, planned for 0.11).
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
-the WebSocket URL when the client cannot set headers. A role-bound token gets 403.
+the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
 
 ### `GET /subscribe`
 

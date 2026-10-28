@@ -3,7 +3,8 @@
 //! Wire layout (all integers LE):
 //! ```text
 //! [0..4]   MAGIC "GDB1"
-//! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
+//! [4..6]   VERSION = 8, 9, 10 or 11 (u16 LE) — same container; V9 adds section 12,
+//!          V11 adds section 18 and the typed-value columns
 //! [6..8]   section_count (u16 LE) — 14 since 0.7.2; one more with a WAL mark, one more with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
@@ -25,6 +26,8 @@
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained as undecoded bytes at open)
 //!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
+//!  13–17 = optional sections (FULLTEXT, WAL_MARK, EDGES_SWEPT, PROV_RECONCILED, DERIVED_BITS)
+//!  18 = DECLARATIONS (magic + bincode SnapshotDeclarations; V11 only)
 
 pub mod encode;
 pub mod layout;
@@ -120,6 +123,129 @@ pub const SWEPT_MAGIC: &[u8; 4] = b"MSWP";
 pub const SECTION_PROV_RECONCILED: u8 = 16;
 /// The whole payload of [`SECTION_PROV_RECONCILED`].
 pub const RECONCILED_MAGIC: &[u8; 4] = b"MREC";
+/// Which of the snapshot's edges a rule derived: [`DERIVED_BITS_MAGIC`], then
+/// one bit per `u32` of the TOPOLOGY section (bit `i` is byte `i / 8`, bit
+/// `i % 8`, of the bytes after the magic). Bit `i` is set when the four bytes
+/// at offset `4 * i` of the TOPOLOGY section are a neighbour entry — in an
+/// out-row or an in-row — of an edge some rule owns. Written by a snapshot
+/// whose state has at least one such edge, and left out otherwise. A reader
+/// that does not know the id ignores it; a snapshot without it is read by
+/// building the answer from PROVENANCE instead.
+pub const SECTION_DERIVED_BITS: u8 = 17;
+/// The first four bytes of [`SECTION_DERIVED_BITS`].
+pub const DERIVED_BITS_MAGIC: &[u8; 4] = b"MDRV";
+/// The store's declarations, carried by the snapshot itself:
+/// [`DECLARATIONS_MAGIC`], a `u16` LE section version, then the fields of
+/// [`SnapshotDeclarations`] one after another in bincode. Written by every V11
+/// snapshot and by no other, so a store that never opted in to V11 writes the
+/// bytes 0.9.x writes. The open applies it at the point of the WAL the
+/// snapshot was taken at, so a snapshot whose WAL was archived away before its
+/// baseline was written still carries the store's constraints, indexes and
+/// multiplicity opt-in. Small, and CRC-checked on every read; a damaged one
+/// refuses the open rather than drop a constraint.
+///
+/// **Adding a field:** append it to the end of [`SnapshotDeclarations`], give
+/// it a `Default` that means "not declared", write it last in
+/// [`SnapshotDeclarations::encode`] and read it last in
+/// [`SnapshotDeclarations::decode`], and bump [`DECLARATIONS_VERSION`]. A
+/// reader decodes the fields it knows in order: a field the payload ends
+/// before (an older writer) reads as its default, and bytes after the last
+/// field it knows (a newer writer) are ignored. A change that is not an append
+/// needs a new section id.
+pub const SECTION_DECLARATIONS: u8 = 18;
+/// The first four bytes of [`SECTION_DECLARATIONS`].
+pub const DECLARATIONS_MAGIC: &[u8; 4] = b"MDCL";
+/// The version of the [`SECTION_DECLARATIONS`] payload this build writes.
+///
+/// 1 carried `multiplicity` and `constraints`; 2 appended `indexes` and
+/// `range_indexes`.
+pub const DECLARATIONS_VERSION: u16 = 2;
+
+mod erased {
+    /// One field of the declarations section, written in bincode.
+    pub trait Field {
+        fn write(&self, out: &mut Vec<u8>) -> bincode::Result<()>;
+    }
+    impl<T: serde::Serialize> Field for T {
+        fn write(&self, out: &mut Vec<u8>) -> bincode::Result<()> {
+            bincode::serialize_into(out, self)
+        }
+    }
+}
+
+/// The payload of [`SECTION_DECLARATIONS`], after its magic and version.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotDeclarations {
+    /// The store records insert-count multiplicity. V11 carries this fact
+    /// here because V11 is above V10, so the V10 stamp can no longer say it.
+    pub multiplicity: bool,
+    /// The declared unique constraints, in declaration order.
+    pub constraints: Vec<crate::types::UniqueConstraint>,
+    /// The declared equality indexes as `(label, field)` (version 2).
+    pub indexes: Vec<(String, String)>,
+    /// The declared range indexes as `(name, label, field)` (version 2).
+    pub range_indexes: Vec<(String, String, String)>,
+}
+
+impl SnapshotDeclarations {
+    /// The section payload: the magic, the version, then each field.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = DECLARATIONS_MAGIC.to_vec();
+        out.extend_from_slice(&DECLARATIONS_VERSION.to_le_bytes());
+        let fields: [&dyn erased::Field; 4] = [
+            &self.multiplicity,
+            &self.constraints,
+            &self.indexes,
+            &self.range_indexes,
+        ];
+        for f in fields {
+            f.write(&mut out).map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: declarations serialize: {e}"),
+            })?;
+        }
+        Ok(out)
+    }
+
+    /// Read a section payload of any version: see [`SECTION_DECLARATIONS`]
+    /// for the rule. Returns the payload's version beside the declarations.
+    ///
+    /// # Errors
+    /// [`GraphError::Corrupt`] for a payload without the magic or a version,
+    /// with version 0, or whose fields do not decode.
+    pub fn decode(bytes: &[u8]) -> Result<(u16, Self)> {
+        let corrupt = |why: String| GraphError::Corrupt {
+            detail: format!("v8: declarations section: {why}"),
+        };
+        let rest = bytes
+            .strip_prefix(DECLARATIONS_MAGIC.as_slice())
+            .ok_or_else(|| corrupt("bad magic".into()))?;
+        if rest.len() < 2 {
+            return Err(corrupt("no version".into()));
+        }
+        let version = u16::from_le_bytes([rest[0], rest[1]]);
+        if version == 0 {
+            return Err(corrupt("version 0".into()));
+        }
+        let mut body = &rest[2..];
+        /// The next field, or its default when the payload has ended before it.
+        fn field<T: serde::de::DeserializeOwned + Default>(body: &mut &[u8]) -> Result<T> {
+            if body.is_empty() {
+                return Ok(T::default());
+            }
+            bincode::deserialize_from(body).map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: declarations section: {e}"),
+            })
+        }
+        let decls = Self {
+            multiplicity: field(&mut body)?,
+            constraints: field(&mut body)?,
+            indexes: field(&mut body)?,
+            range_indexes: field(&mut body)?,
+        };
+        // Anything left is fields a newer writer appended: ignored by rule.
+        Ok((version, decls))
+    }
+}
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -290,6 +416,8 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_WAL_MARK
             | SECTION_EDGES_SWEPT
             | SECTION_PROV_RECONCILED
+            | SECTION_DERIVED_BITS
+            | SECTION_DECLARATIONS
     )
 }
 
@@ -297,6 +425,13 @@ fn is_large_section(id: u8) -> bool {
 const STATE_UNCHECKED: u8 = 0;
 const STATE_OK: u8 = 1;
 const STATE_BAD: u8 = 2;
+
+/// Byte ranges of the derived-bits section's bits and of the topology section.
+#[derive(Clone, Copy)]
+struct DerivedBitsAt {
+    bits: (usize, usize),
+    topology_start: usize,
+}
 
 #[derive(Clone, Copy)]
 struct SectionEntry {
@@ -320,6 +455,8 @@ pub struct MappedBase {
     check_state: [AtomicU8; V8_MAGIC_SECTION_COUNT],
     /// One decode per `Mixed` column, for the life of this mapping.
     mixed: crate::v8::seam::MixedCache,
+    /// Where section 17's bits and the topology section start, found once.
+    derived_bits: std::sync::OnceLock<Option<DerivedBitsAt>>,
 }
 
 impl MappedBase {
@@ -342,6 +479,7 @@ impl MappedBase {
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
             mixed: Default::default(),
+            derived_bits: Default::default(),
         })
     }
 
@@ -357,6 +495,7 @@ impl MappedBase {
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
             mixed: Default::default(),
+            derived_bits: Default::default(),
         })
     }
 
@@ -448,6 +587,8 @@ impl MappedBase {
             SECTION_WAL_MARK => "wal_mark",
             SECTION_EDGES_SWEPT => "edges_swept",
             SECTION_PROV_RECONCILED => "prov_reconciled",
+            SECTION_DERIVED_BITS => "derived_bits",
+            SECTION_DECLARATIONS => "declarations",
             _ => "unknown",
         };
         self.dir
@@ -493,6 +634,61 @@ impl MappedBase {
                 }
             })
             .collect()
+    }
+
+    /// Section 17 as a reader of [`seam::DerivedBits`](crate::v8::seam::DerivedBits),
+    /// or `None` when the snapshot has none (it predates the section, or no
+    /// edge in it is derived) or the section is malformed. Found once; each
+    /// later call is a copy of two numbers.
+    pub fn derived_bits(&self) -> Option<crate::v8::seam::DerivedBits<'_>> {
+        let at = self
+            .derived_bits
+            .get_or_init(|| {
+                let section = |id| self.dir.iter().find(|e| e.id == id);
+                let bits = section(SECTION_DERIVED_BITS)?;
+                let topology = section(SECTION_TOPOLOGY)?;
+                let start = bits.offset as usize;
+                let end = start.checked_add(bits.len as usize)?;
+                let payload = self.backing.get(start..end)?;
+                self.backing.get(
+                    topology.offset as usize..(topology.offset as usize + topology.len as usize),
+                )?;
+                // What the writer wrote for this topology: the magic and one
+                // bit per `u32` of it, rounded up to a byte.
+                let expected = DERIVED_BITS_MAGIC.len() + topology.len as usize / 32 + 1;
+                let problem = if !payload.starts_with(DERIVED_BITS_MAGIC) {
+                    Some("bad magic".to_string())
+                } else if payload.len() != expected {
+                    Some(format!(
+                        "length {} where the topology needs {expected}",
+                        payload.len()
+                    ))
+                } else if crc32fast::hash(payload) != bits.crc32 {
+                    Some("CRC mismatch".to_string())
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    // Wrong bits would give wrong answers, never an error:
+                    // set the section aside and read PROVENANCE instead.
+                    eprintln!(
+                        "mushroomdb: snapshot section 17 (derived_bits) is unusable \
+                         ({problem}); reading derived edges from provenance instead. \
+                         `mushroomdb verify` reports the section"
+                    );
+                    return None;
+                }
+                Some(DerivedBitsAt {
+                    bits: (start + DERIVED_BITS_MAGIC.len(), end),
+                    topology_start: topology.offset as usize,
+                })
+            })
+            .as_ref()?;
+        let base_address = self.backing.as_ptr() as usize;
+        Some(crate::v8::seam::DerivedBits {
+            bits: self.backing.get(at.bits.0..at.bits.1)?,
+            topology_start: base_address + at.topology_start,
+        })
     }
 
     /// Return the raw bytes for `section_id`, validating its CRC32 lazily.
@@ -861,6 +1057,29 @@ impl MappedBase {
                 .is_ok_and(|bytes| bytes == RECONCILED_MAGIC)
     }
 
+    /// The V11 declarations this snapshot carries (section 18), or `None`
+    /// for a snapshot without the section — every one before V11.
+    ///
+    /// The section is checked against its directory CRC on every call: it is
+    /// a few bytes, read once per open, and a constraint silently dropped
+    /// from a damaged one would let duplicates in.
+    ///
+    /// # Errors
+    /// [`GraphError::Corrupt`] for a section that fails its CRC or does not
+    /// decode.
+    pub fn declarations(&self) -> Result<Option<SnapshotDeclarations>> {
+        let Some(entry) = self.dir.iter().find(|e| e.id == SECTION_DECLARATIONS) else {
+            return Ok(None);
+        };
+        let bytes = self.section_bytes(SECTION_DECLARATIONS)?;
+        if crc32fast::hash(bytes) != entry.crc32 {
+            return Err(GraphError::Corrupt {
+                detail: "v8: declarations section: CRC mismatch".into(),
+            });
+        }
+        SnapshotDeclarations::decode(bytes).map(|(_, decls)| Some(decls))
+    }
+
     /// The WAL mark this snapshot carries (section 14), if it carries one
     /// that reads back. `None` for a snapshot with no such section and for
     /// one whose mark is damaged: either way the open replays the whole WAL,
@@ -1007,6 +1226,75 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_declarations() -> SnapshotDeclarations {
+        SnapshotDeclarations {
+            multiplicity: true,
+            constraints: vec![crate::types::UniqueConstraint {
+                name: "c".into(),
+                label: "L".into(),
+                field: "f".into(),
+            }],
+            indexes: vec![("L".into(), "f".into())],
+            range_indexes: vec![("r".into(), "L".into(), "g".into())],
+        }
+    }
+
+    #[test]
+    fn declarations_round_trip_at_the_current_version() {
+        let d = sample_declarations();
+        let bytes = d.encode().unwrap();
+        assert_eq!(&bytes[..4], DECLARATIONS_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            DECLARATIONS_VERSION
+        );
+        assert_eq!(
+            SnapshotDeclarations::decode(&bytes).unwrap(),
+            (DECLARATIONS_VERSION, d)
+        );
+    }
+
+    /// An older writer's payload ends before the fields it did not know; a
+    /// reader gives each of them its default ("not declared").
+    #[test]
+    fn an_older_declarations_version_reads_missing_fields_as_default() {
+        let d = sample_declarations();
+        let mut v1 = DECLARATIONS_MAGIC.to_vec();
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        bincode::serialize_into(&mut v1, &d.multiplicity).unwrap();
+        bincode::serialize_into(&mut v1, &d.constraints).unwrap();
+        let (version, back) = SnapshotDeclarations::decode(&v1).unwrap();
+        assert_eq!(version, 1);
+        assert!(back.multiplicity);
+        assert_eq!(back.constraints, d.constraints);
+        assert!(back.indexes.is_empty() && back.range_indexes.is_empty());
+    }
+
+    /// A newer writer appends fields after the last one this reader knows;
+    /// the reader decodes its own and ignores the rest.
+    #[test]
+    fn a_newer_declarations_version_ignores_appended_fields() {
+        let d = sample_declarations();
+        let mut v3 = d.encode().unwrap();
+        v3[4..6].copy_from_slice(&(DECLARATIONS_VERSION + 1).to_le_bytes());
+        bincode::serialize_into(&mut v3, &vec!["a field from the future".to_string()]).unwrap();
+        bincode::serialize_into(&mut v3, &42u64).unwrap();
+        let (version, back) = SnapshotDeclarations::decode(&v3).unwrap();
+        assert_eq!(version, DECLARATIONS_VERSION + 1);
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn a_declarations_payload_without_magic_or_version_is_refused() {
+        assert!(SnapshotDeclarations::decode(b"MDCX\x02\x00").is_err());
+        assert!(SnapshotDeclarations::decode(b"MDCL").is_err());
+        assert!(SnapshotDeclarations::decode(b"MDCL\x00\x00").is_err());
+        // A truncated field is corrupt, not a default.
+        let mut cut = sample_declarations().encode().unwrap();
+        cut.truncate(cut.len() - 1);
+        assert!(SnapshotDeclarations::decode(&cut).is_err());
+    }
     use crate::columns::ColumnStore;
     use crate::idmap::IdMap;
     use crate::interner::Interner;
@@ -1031,6 +1319,8 @@ mod tests {
             fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
             prov_reconciled: false,
+            v11: false,
+            declarations: Default::default(),
         }
     }
 

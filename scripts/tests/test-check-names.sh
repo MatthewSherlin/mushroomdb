@@ -59,6 +59,12 @@ expect "a name spelled with diacritics fails" 1 "$d"
 d="$TMP/lock"; mkdir -p "$d"; echo 'name = "examplegraph"' > "$d/Cargo.lock"
 expect "a lockfile is exempt: nobody here chose its package names" 0 "$d"
 
+d="$TMP/tck"; mkdir -p "$d/vendor/opencypher-tck/tck"; echo '# Copyright ExampleGraph' > "$d/vendor/opencypher-tck/tck/A.feature"
+expect "the vendored openCypher TCK is exempt: third-party test data, not our prose" 0 "$d"
+
+d="$TMP/vendor-other"; mkdir -p "$d/vendor/other"; echo '# Copyright ExampleGraph' > "$d/vendor/other/A.feature"
+expect "a name elsewhere under vendor/ still fails" 1 "$d"
+
 if printf 'abc\tx\n' | python3 "$GATE" --list "$TMP/short.sha256" --add >/dev/null 2>&1; then
   echo "FAIL: --add accepted a three-character name"; fails=1
 else

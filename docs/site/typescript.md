@@ -69,7 +69,67 @@ Each method calls one route. The route's page has the request and the response i
 | `client.setNodeProp(` | Set or overwrite one property on a node | [`PUT /node/{key}/prop/{field}`](http.md#put-nodekeypropfield) |
 | `client.removeNodeProp(` | Delete one property from a node | [`DELETE /node/{key}/prop/{field}`](http.md#delete-nodekeypropfield) |
 | `client.backup(` | Copy the store to a directory and verify it | [`POST /backup`](http.md#post-backup) |
+| `client.indexes(` | Every index, as `SHOW INDEXES` lists it | [`GET /schema/indexes`](http.md#get-schemaindexes) |
+| `client.createIndex(` | Declare a range index on a label's property | [`POST /schema/indexes`](http.md#post-schemaindexes) |
+| `client.dropIndex(` | Drop an index by name | [`DELETE /schema/indexes/{name}`](http.md#delete-schemaindexesname) |
+| `client.constraints(` | Every unique constraint, as `SHOW CONSTRAINTS` lists it | [`GET /schema/constraints`](http.md#get-schemaconstraints) |
+| `client.createConstraint(` | Declare a unique constraint | [`POST /schema/constraints`](http.md#post-schemaconstraints) |
+| `client.dropConstraint(` | Withdraw a unique constraint by name | [`DELETE /schema/constraints/{name}`](http.md#delete-schemaconstraintsname) |
+| `client.beginTransaction(` | Open a transaction and return its handle | [`POST /tx/begin`](http.md#post-txbegin) |
+| `client.transaction(` | Run a callback in a transaction; commit when it resolves, roll back when it throws | [`POST /tx/begin`](http.md#post-txbegin), [`POST /tx/{tx_id}/commit`](http.md#post-txidcommit), [`POST /tx/{tx_id}/rollback`](http.md#post-txidrollback) |
 | `client.watch(` | Stream the raw mutation log over WebSocket | [`GET /watch`](http.md#get-watch) |
+
+## Algorithm configs
+
+`client.algo` returns the report for the selected algorithm. Configs are optional;
+`client.algo('wcc')` and `client.algo('wcc', undefined)` use the server defaults.
+All three configs support `edge_type`, `budget_ms`, `weight_prop` and `min_weight`.
+PageRank uses edge weights; components and degree use the weight fields only to
+filter edges, and degree still counts edges.
+
+The compiler checks a config variable's declared keys. A `PageRankConfig` variable
+cannot be passed to `wcc` or `degree`, and a `DegreeConfig` cannot be passed to `wcc`,
+even if its current value sets only shared fields. Declare a narrower shared type
+when the same config is intended for several algorithms:
+
+```ts
+const shared: { edge_type?: string | null; budget_ms?: number } = {
+  edge_type: 'KNOWS', budget_ms: 1000,
+};
+await client.algo('wcc', shared);
+await client.algo('degree', shared);
+```
+
+This is a compile-time check; `any`, casts and annotations that erase extra keys can
+bypass it. The server separately refuses unknown fields and requires an object body.
+
+## Transactions
+
+```ts
+import { TransactionConflictError } from 'mushroomdb-client';
+
+// The callback form commits when the callback resolves and rolls back,
+// rethrowing, when it throws.
+const seenCount = await client.transaction(async (tx) => {
+  await tx.execute('CREATE (:Person {id: $id})', { id: 'p1' });
+  const seen = await tx.execute('MATCH (p:Person {id: $id}) RETURN p.id AS id', { id: 'p1' });
+  return seen.rows.length; // sees its own write
+});
+
+// The explicit form.
+const tx = await client.beginTransaction();
+try {
+  await tx.execute('CREATE (:Person {id: $id})', { id: 'p2' });
+  const commitNumber = await tx.commit();
+} catch (err) {
+  if (err instanceof TransactionConflictError) {
+    // a node it read or wrote changed after begin: retry the whole unit of work
+  }
+  await tx.rollback();
+}
+```
+
+`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`, which a retry of the whole transaction can fix; a commit a unique constraint refuses throws `ConstraintViolationError` (the server's 409 with `code: "constraint"`, also thrown by an auto-commit write such as `client.query`), which a retry cannot fix, and the transaction is over; a request that raced another on the same transaction (the server answers 409 with `code: "busy"`) throws a plain `MushroomError` with `code === "busy"` and leaves the handle open, so it can be retried; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. All three extend `MushroomError`. The client does not retry. If a rollback fails after the callback threw, the callback's error is still the one rethrown, with the rollback failure on its `rollbackError` property. After any other failed commit the client asks the server (`GET /tx/{tx_id}`) whether it still holds the transaction: the handle stays usable only if it does (a commit that reached the engine always ends it). If `commit()` fails at the network level, or the server is still running the commit, its outcome is unknown and the handle refuses further use; a failed `rollback()` can be retried.
 
 ## What it does not wrap
 
@@ -87,6 +147,32 @@ a Cypher `CREATE`, `SET` or `DELETE`.
 | `as_of` | `number` | Time-travel: run the query on the graph as it was at this WAL commit index (0 to `commit_seq − 1`, read-only). A commit index from a `nodeHistory`/`edgeHistory` entry is the usual source. |
 | `mask` | `string[]` | Node-key allow-list: the query sees only nodes whose key is in this set. Makes the query read-only. |
 | `namespace` | `string` | Restrict results to this namespace, intersecting with `mask` and any role. Makes the query read-only. |
+
+## Dates, durations and binary
+
+Five value types travel as one-key JSON objects, and a `CellValue` can be any of them:
+
+| Type | Form | Example |
+|---|---|---|
+| Date | `{ $date }` | `{ $date: '2024-01-15' }` |
+| Local date-time | `{ $ldt }` | `{ $ldt: '2024-01-15T12:34:56.789012' }` |
+| Date-time | `{ $dt }` | `{ $dt: '2024-01-15T12:34:56.789012+05:30' }` |
+| Duration | `{ $dur }` | `{ $dur: 'P1Y2M3DT4H5M6.789S' }` |
+| Binary | `{ $binary }` | `{ $binary: '3q2+7w==' }` (base64, at most 1 MiB) |
+
+The text is ISO 8601, and a date-time keeps the UTC offset it was written with (within ±18:00).
+`asDate`, `asLocalDateTime`, `asDateTime`, `asDuration` and `asBinary` narrow a cell to its text, or
+return `undefined` for any other cell; `binaryBytes` decodes a binary cell to a `Uint8Array`.
+
+```ts
+import { asDate } from 'mushroomdb-client';
+
+const { rows } = await client.query('MATCH (e:Event) RETURN e.on AS on');
+const day = asDate(rows[0][0]); // '2024-01-15', or undefined if the cell is not a date
+```
+
+These types are not yet storable: a write that carries one is refused, naming the type, until the
+format that holds them lands.
 
 ## Errors
 

@@ -18,7 +18,73 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
                     .zip(y.iter())
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && values_equal(v1, v2))
         }
+        (Value::Date(x), Value::Date(y)) => x == y,
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x == y,
+        // The same instant is the same DateTime whatever offset it was written
+        // with: the offset is display-only.
+        (Value::DateTime { micros_utc: x, .. }, Value::DateTime { micros_utc: y, .. }) => x == y,
+        // Component-wise: one month is not 30 days.
+        (
+            Value::Duration {
+                months: m1,
+                days: d1,
+                nanos: n1,
+            },
+            Value::Duration {
+                months: m2,
+                days: d2,
+                nanos: n2,
+            },
+        ) => (m1, d1, n1) == (m2, d2, n2),
+        (Value::Binary(x), Value::Binary(y)) => x == y,
         _ => false,
+    }
+}
+
+/// openCypher equality, three-valued: `None` is null (unknown).
+///
+/// A null on either side is null. Two lists (or maps) with a definite
+/// mismatch — a different length, different keys, or an element pair that is
+/// unequal — are `false` even when other elements are null; with no mismatch
+/// but a null pair the answer is null: `[1, null] = [1, null]` is null,
+/// `[1, null] = [2, null]` is false. Everything else is [`values_equal`].
+///
+/// A comparison reads null as "drop the row", so this is what keeps a null
+/// list element and a missing property (`[n.missing] <> [5]` and
+/// `n.missing <> 5`) agreeing.
+pub fn equality(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::List(x), Value::List(y)) => {
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            all_equal(x.iter().zip(y.iter()))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            if x.len() != y.len() || x.keys().zip(y.keys()).any(|(k1, k2)| k1 != k2) {
+                return Some(false);
+            }
+            all_equal(x.values().zip(y.values()))
+        }
+        _ => Some(values_equal(a, b)),
+    }
+}
+
+/// Fold element equalities: any `false` wins, then any null, else `true`.
+fn all_equal<'a>(pairs: impl Iterator<Item = (&'a Value, &'a Value)>) -> Option<bool> {
+    let mut unknown = false;
+    for (l, r) in pairs {
+        match equality(l, r) {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(true)
     }
 }
 
@@ -28,8 +94,17 @@ fn class_rank(v: &Value) -> u8 {
         Value::Str(_) => 1,
         Value::Bool(_) => 2,
         Value::List(_) => 3,
+        // Each temporal type is its own class: a Date never compares with a
+        // DateTime by implicit coercion.
+        Value::Date(_) => 4,
+        Value::LocalDateTime(_) => 5,
+        Value::DateTime { .. } => 6,
+        Value::Duration { .. } => 7,
+        Value::Binary(_) => 8,
         // Map sorts after all other types.
-        Value::Map(_) => 4,
+        Value::Map(_) => 9,
+        // A null element sorts after everything, as a null row value does.
+        Value::Null => 10,
     }
 }
 
@@ -76,35 +151,79 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             }
             x.len().cmp(&y.len())
         }
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x.cmp(y),
+        // By instant; the offset only breaks ties so a sort is stable.
+        (
+            Value::DateTime {
+                micros_utc: x,
+                offset_seconds: ox,
+            },
+            Value::DateTime {
+                micros_utc: y,
+                offset_seconds: oy,
+            },
+        ) => (x, ox).cmp(&(y, oy)),
+        // Durations are not totally ordered, so `<` refuses them
+        // (`filter::is_orderable_pair`); this component-wise order exists only
+        // so ORDER BY over a duration column is deterministic.
+        (
+            Value::Duration {
+                months: m1,
+                days: d1,
+                nanos: n1,
+            },
+            Value::Duration {
+                months: m2,
+                days: d2,
+                nanos: n2,
+            },
+        ) => (m1, d1, n1).cmp(&(m2, d2, n2)),
+        (Value::Binary(x), Value::Binary(y)) => x.cmp(y),
+        (Value::Null, Value::Null) => Ordering::Equal,
         _ => unreachable!("same class rank implies matching variants"),
     }
 }
 
+/// Ordering for ORDER BY: null (a missing property or `Value::Null`) is the
+/// largest value, as openCypher has it, so ascending puts nulls last and
+/// descending puts them first. This is ordering only; equality is
+/// `values_equal` and is unchanged.
 pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ordering {
-    match (a, b) {
+    let a = a.filter(|v| !matches!(v, Value::Null));
+    let b = b.filter(|v| !matches!(v, Value::Null));
+    let ascending = match (a, b) {
         (None, None) => Ordering::Equal,
-        // None sorts LAST regardless of ascending/descending.
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some(x), Some(y)) => {
-            let c = cmp_values(x, y);
-            if descending {
-                c.reverse()
-            } else {
-                c
-            }
-        }
+        (Some(x), Some(y)) => cmp_values(x, y),
+    };
+    if descending {
+        ascending.reverse()
+    } else {
+        ascending
     }
 }
 
-/// One element of a list value, openCypher subscript semantics.
+/// One element of a list value, or one entry of a map value, openCypher
+/// subscript semantics.
 ///
-/// A negative index counts from the end. A non-list base, a non-integer
-/// index, or an out-of-range index all give null — a subscript reads like a
-/// property that is not there, never an error.
+/// A list takes an integer index; a negative one counts from the end. A map
+/// takes a string key (`$p['id']`, and `$p.id`, which parses to it). Any other
+/// base, an index of the wrong type, an out-of-range index or an absent key
+/// all give null. Queries use [`index_value`], which makes a base or an
+/// index of the wrong type an error (QL-VE); this lenient form remains for a
+/// subscript of a node, relationship or path variable, which reads nothing.
 pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
-    let (Some(Value::List(items)), Some(idx)) = (base, index) else {
+    let (Some(base), Some(idx)) = (base, index) else {
         return None;
+    };
+    let (items, idx) = match (base, idx) {
+        (Value::Map(mut entries), Value::Str(key)) => {
+            return entries.remove(&key).and_then(element)
+        }
+        (Value::List(items), idx) => (items, idx),
+        _ => return None,
     };
     let i = match idx {
         Value::Int(n) => n,
@@ -116,7 +235,127 @@ pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
     if pos < 0 || pos >= len {
         return None;
     }
-    items.into_iter().nth(pos as usize)
+    items.into_iter().nth(pos as usize).and_then(element)
+}
+
+/// A subscript `base[index]` with openCypher's type errors (QL-VE): the
+/// base must be a list or a map, a list takes an integer index (an integral
+/// float is read as one) and a map a string key. A null base or index is
+/// null; an out-of-range index or an absent key is null, as in
+/// [`index_list`].
+pub fn index_value(base: Option<Value>, index: Option<Value>) -> Result<Option<Value>, String> {
+    let (Some(b), Some(i)) = (&base, &index) else {
+        return Ok(None);
+    };
+    match (b, i) {
+        (_, Value::Null) | (Value::Null, _) => return Ok(None),
+        (Value::List(_), Value::Int(_)) => {}
+        (Value::List(_), Value::Float(f)) if f.fract() == 0.0 && f.is_finite() => {}
+        (Value::List(_), other) => {
+            return Err(format!(
+                "list index must be an integer, got {}",
+                type_name_of(other)
+            ))
+        }
+        (Value::Map(_), Value::Str(_)) => {}
+        (Value::Map(_), other) => {
+            return Err(format!(
+                "map key must be a string, got {}",
+                type_name_of(other)
+            ))
+        }
+        (other, _) => {
+            return Err(format!(
+                "{} cannot be indexed; only a list or a map can",
+                type_name_of(other)
+            ))
+        }
+    }
+    Ok(index_list(base, index))
+}
+
+/// The name of a value's type, for messages: `an integer`, `a list`, …
+pub fn type_name_of(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_) => "an integer",
+        Value::Float(_) => "a float",
+        Value::Str(_) => "a string",
+        Value::Bool(_) => "a boolean",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Null => "null",
+        _ => "a temporal or binary value",
+    }
+}
+
+/// A list element or map value read out as a query value: a
+/// [`Value::Null`] element is query null (`None`). Every place that takes an
+/// element out of a list goes through this, so `Some(Value::Null)` never
+/// reaches a row, a comparison or `IS NULL`.
+#[inline]
+pub fn element(v: Value) -> Option<Value> {
+    match v {
+        Value::Null => None,
+        other => Some(other),
+    }
+}
+
+/// A query value stored as a list element or map value: query null becomes
+/// [`Value::Null`].
+#[inline]
+pub fn into_element(v: Option<Value>) -> Value {
+    // A `match`, not `unwrap_or`: no default value is built and dropped for
+    // the common non-null element.
+    match v {
+        Some(v) => v,
+        None => Value::Null,
+    }
+}
+
+/// A number in the text form `toString()` gives it.
+fn number_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Int(n) => Some(n.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+/// `left + right` for the operand pairs that are not both numbers: string
+/// joins, list joins, and list-with-element (openCypher). Returns `None`
+/// when the pair is none of those, so the caller raises its type error.
+///
+/// Both arithmetic evaluators (the read executor's and the write-statement
+/// RETURN's) call this, so `+` means the same in every position. Null is
+/// handled by the callers before this is reached.
+pub fn plus_non_numeric(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Str(l), Value::Str(r)) => Some(Value::Str(format!("{l}{r}"))),
+        // A number joins a string as its `toString()` text.
+        (Value::Str(l), n @ (Value::Int(_) | Value::Float(_))) => {
+            Some(Value::Str(format!("{l}{}", number_text(n)?)))
+        }
+        (n @ (Value::Int(_) | Value::Float(_)), Value::Str(r)) => {
+            Some(Value::Str(format!("{}{r}", number_text(n)?)))
+        }
+        (Value::List(l), Value::List(r)) => {
+            let mut joined = l.clone();
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        (Value::List(l), element) => {
+            let mut joined = l.clone();
+            joined.push(element.clone());
+            Some(Value::List(joined))
+        }
+        (element, Value::List(r)) => {
+            let mut joined = Vec::with_capacity(r.len() + 1);
+            joined.push(element.clone());
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -218,18 +457,142 @@ mod tests {
     }
 
     #[test]
-    fn cmp_optional_none_last_both_directions() {
+    fn equality_is_three_valued_over_null_elements() {
+        use super::equality;
+        let l = |items: Vec<Value>| Value::List(items);
+        let (one, two) = (Value::Int(1), Value::Int(2));
+        assert_eq!(equality(&Value::Null, &Value::Null), None);
+        assert_eq!(equality(&one, &Value::Null), None);
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), Value::Null]),
+                &l(vec![one.clone(), Value::Null])
+            ),
+            None
+        );
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), Value::Null]),
+                &l(vec![two.clone(), Value::Null])
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            equality(&l(vec![one.clone(), Value::Null]), &l(vec![one.clone()])),
+            Some(false)
+        );
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), two.clone()]),
+                &l(vec![one.clone(), two.clone()])
+            ),
+            Some(true)
+        );
+        let m = |v: Value| Value::Map([("a".to_string(), v)].into_iter().collect());
+        assert_eq!(equality(&m(Value::Null), &m(Value::Null)), None);
+        assert_eq!(equality(&m(Value::Null), &m(one.clone())), None);
+        let other_key = Value::Map([("b".to_string(), Value::Null)].into_iter().collect());
+        assert_eq!(equality(&m(Value::Null), &other_key), Some(false));
+        assert_eq!(
+            equality(&l(vec![l(vec![Value::Null])]), &l(vec![l(vec![one])])),
+            None
+        );
+    }
+
+    #[test]
+    fn cmp_optional_null_is_the_largest_value() {
         let a = Value::Int(1);
         let b = Value::Int(2);
         assert_eq!(cmp_optional(None, Some(&a), false), Greater);
         assert_eq!(cmp_optional(Some(&a), None, false), Less);
-        assert_eq!(cmp_optional(None, Some(&a), true), Greater);
-        assert_eq!(cmp_optional(Some(&a), None, true), Less);
+        assert_eq!(cmp_optional(None, Some(&a), true), Less);
+        assert_eq!(cmp_optional(Some(&a), None, true), Greater);
+        assert_eq!(cmp_optional(Some(&Value::Null), None, false), Equal);
+        assert_eq!(cmp_optional(Some(&Value::Null), Some(&a), true), Less);
         assert_eq!(cmp_optional(None, None, false), Equal);
         assert_eq!(cmp_optional(None, None, true), Equal);
         assert_eq!(cmp_optional(Some(&a), Some(&b), false), Less);
         assert_eq!(cmp_optional(Some(&a), Some(&b), true), Greater);
         assert_eq!(cmp_optional(Some(&a), Some(&a), false), Equal);
         assert_eq!(cmp_optional(Some(&a), Some(&a), true), Equal);
+    }
+
+    fn dt(micros_utc: i64, offset_seconds: i32) -> Value {
+        Value::DateTime {
+            micros_utc,
+            offset_seconds,
+        }
+    }
+
+    fn dur(months: i32, days: i32, nanos: i64) -> Value {
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        }
+    }
+
+    #[test]
+    fn new_types_equality() {
+        assert!(values_equal(&Value::Date(5), &Value::Date(5)));
+        assert!(!values_equal(&Value::Date(5), &Value::Date(6)));
+        assert!(values_equal(
+            &Value::LocalDateTime(7),
+            &Value::LocalDateTime(7)
+        ));
+        // DateTime: the same instant at two offsets is equal.
+        assert!(values_equal(&dt(1_000, 0), &dt(1_000, -18_000)));
+        assert!(!values_equal(&dt(1_000, 0), &dt(1_001, 0)));
+        // Duration: component-wise, a month is not 30 days.
+        assert!(values_equal(&dur(1, 2, 3), &dur(1, 2, 3)));
+        assert!(!values_equal(&dur(1, 0, 0), &dur(0, 30, 0)));
+        assert!(values_equal(
+            &Value::Binary(vec![1, 2]),
+            &Value::Binary(vec![1, 2])
+        ));
+        // No implicit coercion between types.
+        assert!(!values_equal(&Value::Date(0), &Value::LocalDateTime(0)));
+        assert!(!values_equal(&Value::Date(0), &Value::Int(0)));
+        assert!(!values_equal(&dt(0, 0), &Value::LocalDateTime(0)));
+        assert!(!values_equal(
+            &Value::Binary(b"a".to_vec()),
+            &Value::Str("a".into())
+        ));
+    }
+
+    #[test]
+    fn new_types_ordering_never_panics_and_is_total() {
+        let all = [
+            Value::Int(0),
+            Value::Str("a".into()),
+            Value::Bool(true),
+            Value::List(vec![]),
+            Value::Date(1),
+            Value::LocalDateTime(1),
+            dt(1, 0),
+            dur(0, 0, 1),
+            Value::Binary(vec![1]),
+            Value::Map(Default::default()),
+        ];
+        // Every pair compares without panicking; distinct types are ordered
+        // by class, and the order is antisymmetric.
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(cmp_values(a, b), i.cmp(&j), "{a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(cmp_values(&Value::Date(-1), &Value::Date(0)), Less);
+        assert_eq!(
+            cmp_values(&Value::LocalDateTime(9), &Value::LocalDateTime(2)),
+            Greater
+        );
+        // DateTime orders by instant; the offset only breaks ties.
+        assert_eq!(cmp_values(&dt(1, 3_600), &dt(2, 0)), Less);
+        assert_eq!(cmp_values(&dt(1, 0), &dt(1, 3_600)), Less);
+        assert_eq!(
+            cmp_values(&Value::Binary(vec![0, 9]), &Value::Binary(vec![1])),
+            Less
+        );
+        assert_eq!(cmp_values(&dur(1, 0, 0), &dur(0, 99, 0)), Greater);
     }
 }

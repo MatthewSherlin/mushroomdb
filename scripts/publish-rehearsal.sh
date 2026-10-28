@@ -45,9 +45,10 @@ fi
 
 # The order publish.yml uses (.github/workflows/publish.yml, the crates.io job).
 CRATES=(mushroomdb-storage mushroomdb-rules mushroomdb-query mushroomdb
-        mushroomdb-arrow mushroomdb-server mushroomdb-extract mushroomdb-cli)
+        mushroomdb-arrow mushroomdb-server mushroomdb-bolt mushroomdb-extract
+        mushroomdb-backup mushroomdb-cli)
 
-step "crates: package all eight together, siblings resolved from the workspace"
+step "crates: package all ten together, siblings resolved from the workspace"
 args=(publish --dry-run --workspace --exclude core-bench --exclude sim-harness --allow-dirty)
 [[ $QUICK -eq 1 ]] && args+=(--no-verify)
 if ! cargo "${args[@]}"; then

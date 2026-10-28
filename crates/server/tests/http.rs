@@ -73,6 +73,190 @@ fn parse_json(bytes: &[u8]) -> Json {
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
 }
 
+async fn algcf_arrays_need_objects(algorithm: &str, arrays: Vec<Json>) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("algcf-{algorithm}-{nonce}");
+    let dir = std::env::temp_dir().join(format!("graphdb-http-{name}-{}", std::process::id()));
+    let (app, db) = open(&name);
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    let before = {
+        let read = db.read();
+        (
+            read.commit_seq(),
+            read.all_nodes_for_export(),
+            read.all_edges_with_props_for_export(),
+        )
+    };
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    for value in arrays {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req("POST", &format!("/algo/{algorithm}"), value),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(parse_json(&body)["error"]
+            .as_str()
+            .unwrap()
+            .contains("object"));
+        let read = db.read();
+        assert_eq!(
+            (
+                read.commit_seq(),
+                read.all_nodes_for_export(),
+                read.all_edges_with_props_for_export()
+            ),
+            before
+        );
+        assert_eq!(std::fs::read(dir.join("wal.bin")).unwrap(), wal);
+    }
+}
+
+#[tokio::test]
+async fn algcf_pagerank_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "pagerank",
+        vec![
+            json!([]),
+            json!([0.85]),
+            json!([0.85, 50, 0.000001, null, "out", 5000, null, null]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_wcc_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "wcc",
+        vec![json!([]), json!([null]), json!([null, 5000, null, null])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_degree_arrays_are_not_configs() {
+    algcf_arrays_need_objects(
+        "degree",
+        vec![
+            json!([]),
+            json!([null]),
+            json!([null, "both", 5000, null, null]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn algcf_scalars_are_not_configs_and_malformed_json_stays_an_extractor_error() {
+    for algorithm in ["pagerank", "wcc", "degree"] {
+        algcf_arrays_need_objects(
+            algorithm,
+            vec![Json::Null, json!(17), json!(true), json!("text")],
+        )
+        .await;
+        let (app, _) = open(&format!("algcf-malformed-{algorithm}"));
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/algo/{algorithm}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, body, _) = send(app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn algcf_named_defaults_and_weight_filters_keep_algorithm_results() {
+    let (app, db) = open("algcf-named-weighted");
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    db.submit_batch(vec![mushroomdb::BatchOp::SetEdgeProp {
+        edge_type: "KNOWS".into(),
+        src_key: "a".into(),
+        dst_key: "b".into(),
+        field: "score".into(),
+        value: Value::Float(0.1),
+    }])
+    .unwrap();
+    let configs = [
+        (
+            "pagerank",
+            serde_json::to_value(mushroomdb::algo::PageRankConfig::default()).unwrap(),
+        ),
+        (
+            "wcc",
+            serde_json::to_value(mushroomdb::algo::WccConfig::default()).unwrap(),
+        ),
+        (
+            "degree",
+            serde_json::to_value(mushroomdb::algo::DegreeConfig::default()).unwrap(),
+        ),
+    ];
+    for (algorithm, named) in configs {
+        let route = format!("/algo/{algorithm}");
+        let (status, defaults, _) = send(app.clone(), json_req("POST", &route, json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, explicit, _) = send(app.clone(), json_req("POST", &route, named)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parse_json(&defaults), parse_json(&explicit));
+        let (status, filtered, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                &route,
+                json!({"weight_prop":"score","min_weight":0.5,"budget_ms":0}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&filtered)
+        );
+        let filtered = parse_json(&filtered);
+        match algorithm {
+            "pagerank" => {
+                assert!(filtered["scores"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| (row[1].as_f64().unwrap() - 0.5).abs() < 1e-12));
+            }
+            "wcc" => assert_eq!(filtered["components"], json!([["a", "a"], ["b", "b"]])),
+            _ => assert_eq!(filtered["scores"], json!([["a", 0], ["b", 0]])),
+        }
+    }
+    let (status, out, _) = send(
+        app.clone(),
+        json_req("POST", "/algo/degree", json!({"direction":"out"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&out)["scores"], json!([["a", 1], ["b", 0]]));
+    let (status, incoming, _) = send(
+        app,
+        json_req("POST", "/algo/degree", json!({"direction":"in"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&incoming)["scores"], json!([["b", 1], ["a", 0]]));
+}
+
 /// Binding: `/health` answers without a credential, and tells an
 /// uncredentialed caller nothing but that the server is alive.
 ///
@@ -477,6 +661,27 @@ async fn query_format_json_matches_columns_and_rows() {
     assert_eq!(v["rows"], json!([["p1"]]));
 }
 
+/// QL-NM: a node with no label and no `id` is created over HTTP like any
+/// other statement; its key is generated and its labels are empty.
+#[tokio::test]
+async fn query_creates_a_node_with_no_label_and_no_id() {
+    let (app, db) = open("query-no-label");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "CREATE (n {name: 'a'}), (:A) \
+                   RETURN labels(n) AS l, key(n) STARTS WITH '_:' AS generated"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["rows"], json!([[[], true]]));
+    assert_eq!(db.read().node_count(), 2);
+}
+
 /// Binding: COUNT(*) via ?format=json → {"columns":["COUNT(*)"],"rows":[[n]]}.
 #[tokio::test]
 async fn query_count_star_format_json_wire_shape() {
@@ -507,6 +712,46 @@ async fn query_count_star_format_json_wire_shape() {
         v["rows"],
         json!([[3]]),
         "three Person nodes must be counted"
+    );
+}
+
+/// QL-11: `EXPLAIN` over `/query` is the one-row `plan` column, for a read and
+/// for a write statement, and runs none of it.
+#[tokio::test]
+async fn query_explain_returns_the_plan_and_writes_nothing() {
+    let (app, db) = open("query-explain");
+    seed_person(&db, "p1");
+
+    for cypher in [
+        "EXPLAIN MATCH (t:Person) RETURN t.id",
+        "EXPLAIN CREATE (n:Person {id: 'p9'})",
+    ] {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req("POST", "/query?format=json", json!({ "cypher": cypher })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cypher}");
+        let v = parse_json(&body);
+        assert_eq!(v["columns"], json!(["plan"]), "{cypher}");
+        let plan = v["rows"][0][0].as_str().expect("plan string");
+        let ops: serde_json::Value = serde_json::from_str(plan).expect("plan is JSON");
+        assert!(ops.as_array().is_some_and(|a| !a.is_empty()), "{cypher}");
+    }
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "MATCH (t:Person) RETURN count(t)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parse_json(&body)["rows"],
+        json!([[1]]),
+        "nothing was created"
     );
 }
 
@@ -1473,7 +1718,7 @@ fn wire_types_serialize() {
     }
     assert_eq!(
         json_to_value(json!("p1")),
-        Some(Value::Str("p1".into())),
+        Ok(Some(Value::Str("p1".into()))),
         "params reuse json_to_value"
     );
 }
@@ -1502,13 +1747,19 @@ async fn cypher_write_over_http_is_durable() {
     let v = parse_json(&body);
     assert_eq!(
         v["columns"],
-        json!(["created", "properties_set", "deleted"])
+        json!([
+            "created",
+            "properties_set",
+            "deleted",
+            "relationships_created"
+        ])
     );
     let rows = v["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], json!(1), "created=1");
     assert_eq!(rows[0][1], json!(0), "properties_set=0");
     assert_eq!(rows[0][2], json!(0), "deleted=0");
+    assert_eq!(rows[0][3], json!(0), "relationships_created=0");
 
     // Read back via the same SharedDb handle to confirm node is live.
     assert!(
@@ -2054,17 +2305,18 @@ async fn role_token_algo_is_403() {
         Some("admin"),
         &[("role-tok", "analyst")],
     );
-    let req = authed_json_req("POST", "/algo/pagerank", "role-tok", json!({}));
-    let (status, _, _) = send(app.clone(), req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/pagerank must be 403");
-
-    let req = authed_json_req("POST", "/algo/wcc", "role-tok", json!({}));
-    let (status, _, _) = send(app.clone(), req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/wcc must be 403");
-
-    let req = authed_json_req("POST", "/algo/degree", "role-tok", json!({}));
-    let (status, _, _) = send(app, req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/degree must be 403");
+    for route in ["/algo/pagerank", "/algo/wcc", "/algo/degree"] {
+        for body in [json!({}), json!([]), Json::Null, json!(17)] {
+            let req = authed_json_req("POST", route, "role-tok", body);
+            let (status, body, _) = send(app.clone(), req).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{route}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
 }
 
 // ── 12. /explain via role token → 403 ────────────────────────────────────────
@@ -2423,14 +2675,29 @@ async fn a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404() {
         );
     }
 
-    // A full token reads the same damaged store through the unscoped path —
-    // pinned here so the role branches' answer can be read against it.
-    let (status, _, _) = send(app, authed_get("/node/pub1/edges", "admin")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the full-token path does not read the delta tail"
-    );
+    // A full token reads the same lock-free snapshot since TX-5, so it meets the
+    // same damage and answers it the same way — never a 404, never a 200 built
+    // from state the snapshot cannot reach. Pinned here so the role branches'
+    // answer can be read against it.
+    for uri in [
+        "/node/pub1",
+        "/node/pub1/edges",
+        "/node/pub1/neighborhood",
+        "/node/pub1?mask=pub1",
+        "/node/pub1/edges?mask=pub1",
+        "/node/pub1/neighborhood?mask=pub1",
+    ] {
+        let (status, body, _) = send(app.clone(), authed_get(uri, "admin")).await;
+        let err = parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {err}");
+        assert!(
+            err.contains("mvcc delta intern mismatch"),
+            "{uri} must name the corruption: {err}"
+        );
+    }
 }
 
 // ── Fix round-1: C1 — /edges filters hidden neighbor endpoints ────────────────
@@ -3792,6 +4059,7 @@ fn agent_write_scope() -> WriteScope {
         delete_labels: vec!["AgentNote".into()],
         create_edge_types: vec!["RECALLS".into()],
         delete_edge_types: vec!["RECALLS".into()],
+        update_edge_types: vec![],
     }
 }
 
@@ -3954,6 +4222,7 @@ async fn scoped_delete_node_scope_denied() {
                 delete_labels: vec![], // no delete scope
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4266,6 +4535,7 @@ async fn scoped_set_prop_scope_denied() {
                 delete_labels: vec![],
                 create_edge_types: vec![],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4361,6 +4631,7 @@ async fn scoped_remove_prop_scope_denied() {
                 delete_labels: vec!["AgentNote".into()],
                 create_edge_types: vec!["RECALLS".into()],
                 delete_edge_types: vec!["RECALLS".into()],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -4739,6 +5010,7 @@ async fn scoped_ingest_no_create_labels_403() {
                 delete_labels: vec![],
                 create_edge_types: vec!["RECALLS".into()],
                 delete_edge_types: vec![],
+                update_edge_types: vec![],
             }),
         )],
         Some("admin"),
@@ -5219,6 +5491,201 @@ async fn metrics_role_token_is_forbidden() {
         StatusCode::FORBIDDEN,
         "role token must be 403 on /metrics"
     );
+}
+
+fn get_accepting(uri: &str, accept: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(axum::http::header::ACCEPT, accept)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A strict reader of the Prometheus text exposition format: every sample
+/// line is `name value`, the name is legal, a HELP and a TYPE line for it came
+/// first, counters end in `_total`, and the value is a number. Returns
+/// name -> (type, value).
+fn parse_exposition(text: &str) -> std::collections::BTreeMap<String, (String, f64)> {
+    let mut helps = std::collections::BTreeSet::new();
+    let mut types = std::collections::BTreeMap::new();
+    let mut samples = std::collections::BTreeMap::new();
+    assert!(text.ends_with('\n'), "exposition must end with a newline");
+    for line in text.lines() {
+        assert!(!line.is_empty(), "no blank lines");
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, help) = rest.split_once(' ').expect("HELP has text");
+            assert!(!help.trim().is_empty(), "{name}: empty HELP");
+            assert!(helps.insert(name.to_string()), "{name}: duplicate HELP");
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let (name, ty) = rest.split_once(' ').expect("TYPE has a type");
+            assert!(helps.contains(name), "{name}: TYPE before HELP");
+            assert!(matches!(ty, "counter" | "gauge"), "{name}: type {ty}");
+            if ty == "counter" {
+                assert!(name.ends_with("_total"), "{name}: counter without _total");
+            }
+            assert!(types.insert(name.to_string(), ty.to_string()).is_none());
+        } else {
+            assert!(!line.starts_with('#'), "unknown comment: {line}");
+            let (name, value) = line.split_once(' ').expect("sample is `name value`");
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    && !name.starts_with(|c: char| c.is_ascii_digit()),
+                "illegal metric name {name}"
+            );
+            let ty = types
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: sample before TYPE"));
+            let v: f64 = value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}: value {value}"));
+            assert!(
+                samples.insert(name.to_string(), (ty.clone(), v)).is_none(),
+                "{name}: duplicate sample"
+            );
+        }
+    }
+    for name in types.keys() {
+        assert!(samples.contains_key(name), "{name}: TYPE without a sample");
+    }
+    samples
+}
+
+/// `Accept: text/plain` gets the Prometheus text format.
+#[tokio::test]
+async fn metrics_prometheus_text_format() {
+    let (app, db) = open("metrics-prom");
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("KNOWS", "alice", "bob").unwrap();
+
+    let (status, body, ctype) = send(app, get_accepting("/metrics", "text/plain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ctype = ctype.expect("content-type");
+    assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains("# TYPE mushroomdb_nodes_live gauge\n"),
+        "{text}"
+    );
+    assert!(text.contains("mushroomdb_commits_total"), "{text}");
+
+    let m = parse_exposition(&text);
+    assert_eq!(m["mushroomdb_nodes_live"], ("gauge".into(), 2.0));
+    assert_eq!(m["mushroomdb_nodes_tombstoned"].1, 0.0);
+    assert_eq!(m["mushroomdb_edges_live"].1, 1.0);
+    assert_eq!(m["mushroomdb_commits_total"].0, "counter");
+    assert!(m["mushroomdb_commits_total"].1 >= 2.0);
+    assert!(m["mushroomdb_wal_size_bytes"].1 > 0.0);
+    assert_eq!(m["mushroomdb_slow_queries_total"].0, "counter");
+    assert_eq!(m["mushroomdb_http_transactions_open"].1, 0.0);
+    let started = m["mushroomdb_process_start_time_seconds"].1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!(
+        started > 1.6e9 && started <= now + 1.0,
+        "start time {started}"
+    );
+    assert!(!m.contains_key("mushroomdb_uptime_seconds"));
+    // No backup configured: no backup series at all.
+    assert!(m.keys().all(|k| !k.contains("backup")), "{m:?}");
+}
+
+/// `mushroomdb_edges_live` counts live edges only: a deleted edge, and the
+/// edges a deleted node took with it, leave the gauge.
+#[tokio::test]
+async fn metrics_edges_live_drops_deleted_edges() {
+    let (app, db) = open("metrics-edges-live");
+    for key in ["a", "b", "c", "d"] {
+        seed_person(&db, key);
+    }
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    db.write().insert_edge("KNOWS", "b", "c").unwrap();
+    db.write().insert_edge("KNOWS", "c", "d").unwrap();
+    db.write().insert_edge("KNOWS", "d", "a").unwrap();
+    assert!(db.write().delete_edge("KNOWS", "a", "b").unwrap());
+    // `c` takes b→c and c→d with it; only d→a is left.
+    db.write().delete_node("c").unwrap();
+
+    let (status, body, _) = send(app, get_accepting("/metrics", "text/plain")).await;
+    assert_eq!(status, StatusCode::OK);
+    let m = parse_exposition(&String::from_utf8(body).unwrap());
+    assert_eq!(m["mushroomdb_edges_live"].1, 1.0);
+    assert_eq!(m["mushroomdb_nodes_live"].1, 3.0);
+    assert_eq!(m["mushroomdb_nodes_tombstoned"].1, 1.0);
+}
+
+/// Prometheus's own Accept header, and OpenMetrics alone, get the text format.
+#[tokio::test]
+async fn metrics_prometheus_scraper_accept_headers() {
+    let (app, _db) = open("metrics-prom-scraper");
+    for accept in [
+        "application/openmetrics-text;version=1.0.0,application/openmetrics-text;version=0.0.1;q=0.75,text/plain;version=0.0.4;q=0.5,*/*;q=0.1",
+        "application/openmetrics-text",
+        "text/plain;version=0.0.4",
+    ] {
+        let (status, body, ctype) =
+            send(app.clone(), get_accepting("/metrics", accept)).await;
+        assert_eq!(status, StatusCode::OK, "{accept}");
+        assert!(ctype.unwrap().starts_with("text/plain"), "{accept}");
+        assert!(String::from_utf8(body).unwrap().contains("# TYPE "), "{accept}");
+    }
+}
+
+/// JSON stays the default and is unchanged, whatever else the caller accepts.
+#[tokio::test]
+async fn metrics_json_is_default_and_unchanged() {
+    let (app, _db) = open("metrics-prom-json");
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("*/*"),
+        Some("text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"),
+        Some("application/json, text/plain, */*"),
+    ] {
+        let req = match accept {
+            Some(a) => get_accepting("/metrics", a),
+            None => get("/metrics"),
+        };
+        let (status, body, ctype) = send(app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{accept:?}");
+        assert!(ctype.unwrap().starts_with("application/json"), "{accept:?}");
+        let v = parse_json(&body);
+        assert!(v["nodes_live"].is_number(), "{accept:?}");
+        assert!(v["uptime_s"].is_number(), "{accept:?}");
+    }
+}
+
+/// The text format is refused to a role token exactly as the JSON is.
+#[tokio::test]
+async fn metrics_prometheus_role_token_is_forbidden() {
+    let db = SharedDb::open(&tmp("metrics-prom-role-403")).unwrap();
+    let app = router_with_role_tokens(
+        db,
+        Some("adm".into()),
+        std::collections::HashMap::from([("viewer".to_string(), "reader".to_string())]),
+    );
+    let mk = |tok: &str| {
+        Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .header(axum::http::header::ACCEPT, "text/plain")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _, _) = send(app.clone(), mk("viewer")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body, _) = send(app, mk("adm")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("mushroomdb_nodes_live"));
 }
 
 /// A store held by another process's write lock is 503 + `Retry-After`, not 400.
@@ -6578,4 +7045,1514 @@ async fn a_pagerank_damping_outside_zero_to_one_is_refused() {
             String::from_utf8_lossy(&out)
         );
     }
+}
+
+/// HO-02. A container platform asks `/ready` before it routes traffic. With the
+/// flag false the answer is 503, with it true 200, and neither call carries a
+/// token even though the server requires one.
+#[tokio::test]
+async fn ready_returns_503_before_open_and_200_after() {
+    let db = SharedDb::open(&tmp("ready-flag")).unwrap();
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = server::router_with_ready_flag(db, Some("t".into()), ready.clone());
+
+    let (status, body, _) = send(app.clone(), get("/ready")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        parse_json(&body),
+        json!({"ok": false, "reason": "not ready"})
+    );
+
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body, _) = send(app, get("/ready")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+}
+
+/// Every entry point but `run_serve` opens the store before it serves, so a
+/// server built without a flag is ready the moment it binds.
+#[tokio::test]
+async fn ready_is_200_on_a_router_built_without_a_flag() {
+    let db = SharedDb::open(&tmp("ready-default")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(app, get("/ready")).await;
+    assert_eq!(status, StatusCode::OK, "no token is needed");
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+}
+
+// ---------------------------------------------------------------------------
+// Format-V11 values (0.10 TY-1, TY-12): every HTTP write path stores a tagged
+// value, the store moves to the V11 snapshot format before the value reaches
+// the WAL, and a read returns the value in the wire form it was written in —
+// live and after a reopen.
+// ---------------------------------------------------------------------------
+
+fn wal_bytes(dir: &std::path::Path) -> Vec<u8> {
+    std::fs::read(dir.join("wal.bin")).unwrap_or_default()
+}
+
+/// One wire form of each 0.10 value type.
+fn v11_wire_forms() -> Vec<Json> {
+    vec![
+        json!({"$date": "2024-01-15"}),
+        json!({"$ldt": "2024-01-15T12:34:56.789012"}),
+        json!({"$dt": "2024-01-15T12:34:56.789012+05:30"}),
+        json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
+        json!({"$binary": "3q2+7w=="}),
+    ]
+}
+
+/// `key.born` read back over `/query`, as JSON.
+async fn read_born(app: &Router, key: &str) -> Json {
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:Person) WHERE n.id = $k RETURN n.born AS born",
+        json!({"k": key}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v["rows"][0][0].clone()
+}
+
+/// Write `form` through `uri` onto `key`, then read it back live and after a
+/// reopen.
+async fn assert_v11_write_round_trips(name: &str, uri: &str, body: Json, key: &str, form: &Json) {
+    let dir = tmp(name);
+    let db = SharedDb::open(&dir).unwrap();
+    seed_person(&db, "alice");
+    let app = router(db.clone());
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(app.clone(), json_req("POST", uri, body)).await;
+    assert!(
+        status.is_success(),
+        "{uri}: {status} {}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
+        Some(11),
+        "{uri}: the write moves the store to V11"
+    );
+    assert!(
+        wal_bytes(&dir).starts_with(&before),
+        "{uri}: the WAL is kept"
+    );
+    assert_eq!(&read_born(&app, key).await, form, "{uri}: live");
+    drop(app);
+    drop(db);
+    let reopened = router(SharedDb::open(&dir).unwrap());
+    assert_eq!(&read_born(&reopened, key).await, form, "{uri}: reopened");
+}
+
+#[tokio::test]
+async fn ingest_with_a_tagged_value_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-ingest-{i}"),
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [{"id": "bob", "born": form}],
+                "options": {"auto_fk": "off"}
+            }),
+            "bob",
+            form,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn create_node_with_a_tagged_value_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-create-node-{i}"),
+            "/nodes",
+            json!({"label": "Person", "key": "bob", "props": {"born": form}}),
+            "bob",
+            form,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn cypher_set_with_a_tagged_param_round_trips() {
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        assert_v11_write_round_trips(
+            &format!("v11-cypher-set-{i}"),
+            "/query",
+            json!({
+                "cypher": "MATCH (n:Person) WHERE n.id = 'alice' SET n.born = $d",
+                "params": {"d": form}
+            }),
+            "alice",
+            form,
+        )
+        .await;
+    }
+}
+
+/// Arrow: stored typed values come back over the default `/query` format, one
+/// row per type, as the text the bridge renders them in — live and after a
+/// reopen of the V11 store.
+#[tokio::test]
+async fn stored_v11_values_round_trip_through_arrow() {
+    let dir = tmp("v11-arrow");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db.clone());
+    for (i, form) in v11_wire_forms().iter().enumerate() {
+        let (status, resp, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/nodes",
+                json!({"label": "Typed", "key": format!("t{i}"), "props": {"i": i, "v": form}}),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{}", String::from_utf8_lossy(&resp));
+    }
+    assert_eq!(mushroomdb::snapshot_version_at(&dir).unwrap(), Some(11));
+    let expected = [
+        "2024-01-15",
+        "2024-01-15T12:34:56.789012",
+        "2024-01-15T12:34:56.789012+05:30",
+        "P1Y2M3DT4H5M6.789S",
+        "3q2+7w==",
+    ];
+    async fn arrow_column(app: &Router) -> Vec<String> {
+        let (status, body, ctype) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query",
+                json!({"cypher": "MATCH (n:Typed) RETURN n.v AS v ORDER BY n.i"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ctype.as_deref(),
+            Some("application/vnd.apache.arrow.stream")
+        );
+        let mut reader = StreamReader::try_new(Cursor::new(body), None).unwrap();
+        let batch = reader.next().expect("one batch").unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("a mixed column of V11 values is Utf8");
+        (0..col.len()).map(|i| col.value(i).to_string()).collect()
+    }
+    assert_eq!(arrow_column(&app).await, expected, "live");
+    drop(app);
+    drop(db);
+    let reopened = router(SharedDb::open(&dir).unwrap());
+    assert_eq!(arrow_column(&reopened).await, expected, "reopened");
+}
+
+// ---------------------------------------------------------------------------
+// Unique constraints (0.10 TY-5): every HTTP write path is refused with 409 and
+// appends nothing when it would duplicate a constrained value.
+// ---------------------------------------------------------------------------
+
+const CONSTRAINT_VIOLATION: &str = "constraint violation: property 'email' is declared unique \
+                                    by constraint 'uniq_email'; a node with that value already \
+                                    exists";
+
+async fn assert_constraint_refused(name: &str, method: &str, uri: &str, body: Json) {
+    let dir = tmp(name);
+    let db = SharedDb::open(&dir).unwrap();
+    {
+        let mut w = db.write();
+        w.create_constraint("uniq_email", "User", "email").unwrap();
+        w.insert_node(
+            "User",
+            "alice",
+            vec![
+                ("id".into(), Value::Str("alice".into())),
+                ("email".into(), Value::Str("a@x".into())),
+            ],
+        )
+        .unwrap();
+    }
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(router(db.clone()), json_req(method, uri, body)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{uri}: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        CONSTRAINT_VIOLATION
+    );
+    assert_eq!(parse_json(&resp)["code"], "constraint");
+    assert_eq!(
+        wal_bytes(&dir),
+        before,
+        "{uri}: a refused write appended to the WAL"
+    );
+    assert_eq!(db.read().node_count(), 1);
+}
+
+#[tokio::test]
+async fn http_writes_refuse_a_unique_constraint_duplicate() {
+    assert_constraint_refused(
+        "uc-create-node",
+        "POST",
+        "/nodes",
+        json!({"label": "User", "key": "bob", "props": {"email": "a@x"}}),
+    )
+    .await;
+    assert_constraint_refused(
+        "uc-ingest",
+        "POST",
+        "/ingest",
+        json!({
+            "label": "User",
+            "rows": [{"id": "bob", "email": "a@x"}],
+            "options": {"auto_fk": "off"}
+        }),
+    )
+    .await;
+    assert_constraint_refused(
+        "uc-cypher-create",
+        "POST",
+        "/query",
+        json!({"cypher": "CREATE (n:User {id: 'bob', email: 'a@x'})"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn http_put_prop_refuses_a_unique_constraint_duplicate() {
+    // PUT tries to give carol the value alice already holds.
+    let dir = tmp("uc-put-prop");
+    let db = SharedDb::open(&dir).unwrap();
+    {
+        let mut w = db.write();
+        w.create_constraint("uniq_email", "User", "email").unwrap();
+        w.insert_node(
+            "User",
+            "alice",
+            vec![("email".into(), Value::Str("a@x".into()))],
+        )
+        .unwrap();
+        w.insert_node(
+            "User",
+            "carol",
+            vec![("email".into(), Value::Str("c@x".into()))],
+        )
+        .unwrap();
+    }
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(
+        router(db.clone()),
+        json_req("PUT", "/node/carol/prop/email", json!({"value": "a@x"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        CONSTRAINT_VIOLATION
+    );
+    assert_eq!(wal_bytes(&dir), before, "a refused PUT appended to the WAL");
+    assert_eq!(
+        db.read().node_info("carol").unwrap().props.get("email"),
+        Some(&Value::Str("c@x".into()))
+    );
+}
+
+#[tokio::test]
+async fn http_binary_over_the_limit_is_413() {
+    let dir = tmp("value-too-large");
+    let db = SharedDb::open(&dir).unwrap();
+    let before = wal_bytes(&dir);
+    let big = mushroomdb::tagged_json(&Value::Binary(vec![0u8; mushroomdb::BINARY_MAX_BYTES + 1]))
+        .unwrap()
+        .unwrap();
+    let (status, resp, _) = send(
+        router(db.clone()),
+        json_req(
+            "POST",
+            "/nodes",
+            json!({"label": "Blob", "key": "b", "props": {"data": big}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        format!(
+            "value too large: property 'data' is {} bytes; the limit is {} bytes",
+            mushroomdb::BINARY_MAX_BYTES + 1,
+            mushroomdb::BINARY_MAX_BYTES
+        )
+    );
+    assert_eq!(wal_bytes(&dir), before);
+    assert_eq!(db.read().node_count(), 0);
+}
+
+/// The read path is open: a tagged parameter comes back in its tagged form.
+#[tokio::test]
+async fn query_returns_tagged_params_in_their_wire_form() {
+    let (app, db) = open("v11-query-roundtrip");
+    seed_person(&db, "alice");
+    let wire = json!([
+        {"$date": "2024-01-15"},
+        {"$ldt": "2024-01-15T12:34:56.789012"},
+        {"$dt": "2024-01-15T12:34:56.789012+05:30"},
+        {"$dur": "P1Y2M3DT4H5M6.789S"},
+        {"$binary": "3q2+7w=="},
+    ]);
+    for form in wire.as_array().unwrap() {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query?format=json",
+                json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": form}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&parse_json(&body)["rows"][0][0], form);
+    }
+    // A bare ISO string stays a string.
+    let (_, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": "2024-01-15"}}),
+        ),
+    )
+    .await;
+    assert_eq!(parse_json(&body)["rows"][0][0], json!("2024-01-15"));
+}
+
+/// A known tag with a bad or non-string payload is a 400 naming the field and
+/// the reason, on every JSON entry path — never a stored map.
+#[tokio::test]
+async fn bad_tagged_payloads_are_errors_naming_the_field() {
+    let dir = tmp("v11-bad-tags");
+    let db = SharedDb::open(&dir).unwrap();
+    seed_person(&db, "alice");
+    let before = wal_bytes(&dir);
+    let app = router(db.clone());
+    for (payload, reason) in [
+        (json!({"$date": "2024-1-5"}), "is not an ISO 8601 date"),
+        (json!({"$dt": "2024-01-15T12:00:00+19:00"}), "within ±18:00"),
+        (json!({"$binary": "Zm9vYg"}), "padded standard base64"),
+        (json!({"$dur": 5}), "payload must be a string"),
+    ] {
+        // Query params.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query?format=json",
+                json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": payload.clone()}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = parse_json(&body)["error"].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"param "d": $"#) && err.contains(reason),
+            "{err}"
+        );
+        // Node props.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/nodes",
+                json!({"label": "Person", "key": "bob", "props": {"born": payload.clone()}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = parse_json(&body)["error"].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"props "born": $"#) && err.contains(reason),
+            "{err}"
+        );
+        // Ingest: the row is refused with an error naming the field.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/ingest",
+                json!({"label": "Person", "rows": [{"id": "bob", "born": payload.clone()}],
+                       "options": {"auto_fk": "off"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let report = parse_json(&body);
+        assert_eq!(report["inserted"], json!(0));
+        let err = report["row_errors"][0][1].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"field "born": $"#) && err.contains(reason),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        wal_bytes(&dir),
+        before,
+        "a refused write appended to the WAL"
+    );
+    assert_eq!(db.read().node_count(), 1);
+}
+
+// ---- CORS (HO-03) ----
+
+fn cors_app(spec: Option<&str>, token: Option<&str>, name: &str) -> Router {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    let layer = spec.and_then(|s| server::parse_cors_origins(s).unwrap());
+    server::router_with_cors(db, token.map(String::from), layer)
+}
+
+fn preflight(origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("OPTIONS")
+        .uri("/query")
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cors_wildcard_adds_header() {
+    let app = cors_app(Some("*"), None, "cors-wild");
+    let res = app.oneshot(preflight("https://app.example")).await.unwrap();
+    assert!(res.status().is_success());
+    let h = res.headers();
+    assert_eq!(h["access-control-allow-origin"], "*");
+    assert!(h.get("access-control-allow-credentials").is_none());
+}
+
+#[tokio::test]
+async fn cors_unset_no_header() {
+    let app = cors_app(None, None, "cors-unset");
+    let mut req = get("/health");
+    req.headers_mut()
+        .insert("origin", "https://app.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert!(res
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("access-control-")));
+}
+
+#[tokio::test]
+async fn cors_unset_responses_match_plain_router() {
+    let plain = open("cors-plain").0;
+    let unset = cors_app(None, None, "cors-plain2");
+    let mut seen = Vec::new();
+    for app in [plain, unset] {
+        let mut req = get("/health");
+        req.headers_mut()
+            .insert("origin", "https://app.example".parse().unwrap());
+        let res = app.oneshot(req).await.unwrap();
+        let mut names: Vec<String> = res.headers().keys().map(|k| k.to_string()).collect();
+        names.sort();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        seen.push((names, body.len()));
+    }
+    assert_eq!(seen[0], seen[1]);
+}
+
+#[tokio::test]
+async fn cors_explicit_origin_allows_credentials_and_only_listed_origins() {
+    let app = cors_app(
+        Some("https://app.example, http://localhost:3000"),
+        Some("secret"),
+        "cors-list",
+    );
+    let res = app
+        .clone()
+        .oneshot(preflight("https://app.example"))
+        .await
+        .unwrap();
+    let h = res.headers();
+    assert_eq!(h["access-control-allow-origin"], "https://app.example");
+    assert_eq!(h["access-control-allow-credentials"], "true");
+    let vary = res.headers().get_all("vary");
+    assert!(vary
+        .iter()
+        .any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("origin")));
+    let res = app
+        .oneshot(preflight("https://evil.example"))
+        .await
+        .unwrap();
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+    ] {
+        assert!(
+            res.headers().get(name).is_none(),
+            "{name} on disallowed origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_401_to_disallowed_origin_has_no_cors_headers() {
+    let app = cors_app(Some("https://app.example"), Some("secret"), "cors-401");
+    let mut req = json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"}));
+    req.headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(res
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("access-control-")));
+}
+
+#[tokio::test]
+async fn cors_preflight_needs_no_token_but_actual_request_does() {
+    let app = cors_app(Some("https://app.example"), Some("secret"), "cors-auth");
+    let res = app
+        .clone()
+        .oneshot(preflight("https://app.example"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    // The real request without a token is still refused, and says so to the page.
+    let mut req = json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"}));
+    req.headers_mut()
+        .insert("origin", "https://app.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()["access-control-allow-origin"],
+        "https://app.example"
+    );
+}
+
+/// QL-17: a null list element is JSON `null` inside the array, and a query
+/// may begin with RETURN.
+#[tokio::test]
+async fn query_json_renders_a_null_list_element_as_null() {
+    let (app, _db) = open("query-null-element");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "RETURN [1, null] AS l, {a: null} AS m, null AS v"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["l", "m", "v"]));
+    assert_eq!(v["rows"], json!([[[1, null], {"a": null}, null]]));
+}
+
+// ── QL-BX: a predicate is a value in a projection ──────────────────────────
+
+#[tokio::test]
+async fn query_json_returns_a_predicate_as_a_boolean_or_null() {
+    let (app, _db) = open("query-predicate-value");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "RETURN $p IS NULL AS a, $p > 1 AS b, NOT (null = 1) AS c, [x IN [1, 2] | x > 1] AS d",
+                "params": {"p": 5}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["a", "b", "c", "d"]));
+    assert_eq!(v["rows"], json!([[false, true, null, [false, true]]]));
+}
+
+// ── The `id` property mirrors the key (ledger row 128) ──────────────────────
+
+#[tokio::test]
+async fn http_prop_routes_refuse_an_id_that_is_not_the_key() {
+    let (app, db) = open("key-property");
+    db.submit_batch(vec![mushroomdb::BatchOp::InsertNode {
+        label: "P".into(),
+        key: "x".into(),
+        props: vec![("id".into(), Value::Str("x".into()))],
+    }])
+    .unwrap();
+    let id_of = |db: &SharedDb| db.reader().node_info("x").unwrap().props.get("id").cloned();
+
+    let (status, body, _) = send(
+        app.clone(),
+        json_req("PUT", "/node/x/prop/id", json!({"value": "mallory"})),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("key property `id`") && text.contains("rename_node"),
+        "{text}"
+    );
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/node/x/prop/id")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app.clone(), req).await;
+    assert!(status.is_client_error(), "{status}");
+    assert!(String::from_utf8_lossy(&body).contains("key property `id`"));
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+
+    // Restating the key is accepted.
+    let (status, _, _) = send(
+        app,
+        json_req("PUT", "/node/x/prop/id", json!({"value": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+}
+
+/// POST `/query` with `params` and return the status and the JSON body.
+async fn query_with_params(app: axum::Router, cypher: &str, params: Json) -> (StatusCode, Json) {
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": cypher, "params": params}),
+        ),
+    )
+    .await;
+    (status, parse_json(&body))
+}
+
+/// QL-17i: a JSON `null` parameter binds as `null`, as it does over Bolt, so
+/// `$p IS NULL` is true instead of "missing parameter".
+#[tokio::test]
+async fn http_null_param_binds_as_null() {
+    let (app, _db) = open("http-null-param");
+    let (status, _) = query_with_params(app.clone(), "CREATE (n:NP {id: 'a'})", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = query_with_params(
+        app,
+        "MATCH (n:NP) WHERE $p IS NULL RETURN n.id AS x",
+        json!({"p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([["a"]]));
+}
+
+/// QL-17i: a null inside a list or a map parameter stays a null element.
+#[tokio::test]
+async fn http_null_param_inside_list_and_map() {
+    let (app, _db) = open("http-null-param-nested");
+    let (status, v) = query_with_params(
+        app.clone(),
+        "RETURN size($ids) AS n, $ids[0] AS first, $ids[1] AS second",
+        json!({"ids": [1, null]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[2, 1, null]]));
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "RETURN $m AS m, keys($m) AS ks",
+        json!({"m": {"a": null, "b": 2}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[{"a": null, "b": 2}, ["a", "b"]]]));
+
+    let (status, v) =
+        query_with_params(app, "RETURN $p AS p", json!({"p": [null, {"k": null}]})).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[[null, {"k": null}]]]));
+}
+
+/// QL-17i: a typed parameter object keeps its meaning next to the null change.
+#[tokio::test]
+async fn http_typed_param_object_still_decodes() {
+    let (app, _db) = open("http-null-param-typed");
+    let (status, v) = query_with_params(
+        app,
+        "RETURN $d AS d, $p AS p",
+        json!({"d": {"$date": "2024-01-15"}, "p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[{"$date": "2024-01-15"}, null]]));
+}
+
+/// QL-17i: a write with a null parameter is the engine's call, not the route's:
+/// `SET n.p = $p` with a null `$p` is refused by name, as it is embedded, and
+/// leaves the stored property alone.
+#[tokio::test]
+async fn http_write_with_null_param_follows_the_engine() {
+    let (app, _db) = open("http-null-param-write");
+    let (status, _) =
+        query_with_params(app.clone(), "CREATE (n:NP {id: 'a', p: 1})", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n.p = $p",
+        json!({"p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], json!("SET value for n.p evaluated to null"));
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[1]]));
+
+    // A null inside a stored list is still refused at the engine's choke point.
+    let (status, v) = query_with_params(
+        app,
+        "MATCH (n:NP {id: 'a'}) SET n.l = $l",
+        json!({"l": [1, null]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("a property value cannot contain null")),
+        "{v}"
+    );
+}
+
+/// QL-17i: a null inside a map parameter now reaches the engine, so the map
+/// forms of SET follow openCypher: `+=` removes the key, `=` replaces every
+/// user property with the map's non-null entries. Before, HTTP dropped the
+/// null and the key stayed.
+#[tokio::test]
+async fn http_null_map_param_in_set_removes_the_key() {
+    let (app, _db) = open("http-null-param-set-map");
+    let (status, _) = query_with_params(
+        app.clone(),
+        "CREATE (n:NP {id: 'a', p: 1, y: 2})",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n += $m",
+        json!({"m": {"y": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.y AS y",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[1, null]]), "+= with a null removes y");
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n = $m",
+        json!({"m": {"z": null, "w": 1}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app,
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.w AS w",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[null, 1]]), "= replaces the properties");
+}
+
+// ---------------------------------------------------------------------------
+// HO-04: access keys (`keys.json`) and the write tier.
+// ---------------------------------------------------------------------------
+
+const ADM_KEY: &str = "adm-key-0123456789abcdef0123456789abcdef";
+const WR_KEY: &str = "wr-key-0123456789abcdef0123456789abcdef";
+const RD_KEY: &str = "rd-key-0123456789abcdef0123456789abcdef";
+const LATE_KEY: &str = "late-key-0123456789abcdef0123456789abcdef";
+
+/// A key file's text: one entry per `(token, tier, role)`, holding hashes only.
+fn keys_text(entries: &[(&str, &str, Option<&str>)]) -> String {
+    let keys: Vec<Json> = entries
+        .iter()
+        .enumerate()
+        .map(|(n, (token, tier, role))| {
+            let mut entry = json!({
+                "name": format!("key{n}"),
+                "hash": mushroomdb::hash_token(token).unwrap(),
+                "tier": tier,
+            });
+            if let Some(role) = role {
+                entry["role"] = json!(role);
+            }
+            entry
+        })
+        .collect();
+    json!({ "keys": keys }).to_string()
+}
+
+fn keys_json() -> String {
+    keys_text(&[
+        (ADM_KEY, "admin", None),
+        (WR_KEY, "write", None),
+        (RD_KEY, "read", Some("viewer")),
+    ])
+}
+
+/// Writes `text` to `path` keeping the file private, as the CLI does.
+fn write_private(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// A store with a `viewer` role, a node, and a router that accepts `keys`
+/// beside the env token `env-tok`.
+fn open_keyed(name: &str, keys: &mushroomdb::AccessKeys) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "viewer".into(),
+                labels: vec!["Person".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_person(&db, "seed");
+    let app = server::router_with_access_keys(
+        db.clone(),
+        Some("env-tok".into()),
+        std::collections::HashMap::new(),
+        keys.clone(),
+    );
+    (app, db)
+}
+
+fn keys_in(name: &str, text: &str) -> (mushroomdb::AccessKeys, PathBuf) {
+    let dir = tmp(&format!("keys-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keys.json");
+    write_private(&path, text);
+    (mushroomdb::AccessKeys::load(&path).unwrap(), path)
+}
+
+async fn status_of(app: &Router, req: Request<Body>) -> StatusCode {
+    send(app.clone(), req).await.0
+}
+
+/// A write-tier token mutates through every mutation route.
+#[tokio::test]
+async fn write_tier_can_mutate() {
+    let (keys, _) = keys_in("mutate", &keys_json());
+    let (app, db) = open_keyed("keys-mutate", &keys);
+
+    let node = json!({"label": "Person", "key": "w1", "props": {"id": "w1"}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/nodes", WR_KEY, node)).await,
+        StatusCode::OK
+    );
+    let edge = json!({"type": "KNOWS", "src": "w1", "dst": "seed"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/edges", WR_KEY, edge)).await,
+        StatusCode::OK
+    );
+    let create = json!({"cypher": "CREATE (n:Person {id: 'w2'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", WR_KEY, create)).await,
+        StatusCode::OK
+    );
+    let ingest = json!({"label": "Person", "rows": [{"id": "w3"}], "options": {}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/ingest", WR_KEY, ingest)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/node/w1", WR_KEY)).await,
+        StatusCode::OK,
+        "a write key reads what it wrote"
+    );
+    assert_eq!(
+        status_of(
+            &app,
+            authed_json_req("DELETE", "/node/w1", WR_KEY, json!({}))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (nodes, _, _) = db.reader().counts();
+    assert!(nodes >= 3, "the writes landed: {nodes}");
+}
+
+/// A write-tier token is refused the operator surfaces; an admin key is not.
+#[tokio::test]
+async fn write_tier_denied_metrics() {
+    let (keys, _) = keys_in("denied", &keys_json());
+    let (app, _db) = open_keyed("keys-denied", &keys);
+
+    for path in ["/metrics", "/stats"] {
+        assert_eq!(
+            status_of(&app, authed_get(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert_eq!(
+            status_of(&app, authed_get(path, ADM_KEY)).await,
+            StatusCode::OK,
+            "an admin key reads {path}"
+        );
+    }
+    let dest = tmp("keys-denied-backup");
+    let backup = json!({"dest": dest.to_str().unwrap()});
+    assert_eq!(
+        status_of(
+            &app,
+            authed_json_req("POST", "/backup", WR_KEY, backup.clone())
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!dest.exists(), "the refused backup wrote nothing");
+    for path in ["/watch", "/subscribe"] {
+        assert_eq!(
+            status_of(&app, authed_ws_upgrade(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path} with an upgrade"
+        );
+        assert_eq!(
+            status_of(&app, authed_get(path, WR_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{path} without one"
+        );
+    }
+}
+
+/// A write-tier token is told liveness and nothing about the graph, as every
+/// token short of full access is.
+#[tokio::test]
+async fn write_tier_health_discloses_no_counts() {
+    let (keys, _) = keys_in("health", &keys_json());
+    let (app, _db) = open_keyed("keys-health", &keys);
+    let (_, body, _) = send(app.clone(), authed_get("/health", WR_KEY)).await;
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+    let (_, body, _) = send(app, authed_get("/health", ADM_KEY)).await;
+    assert!(parse_json(&body)["nodes"].is_number());
+}
+
+/// A read key is the role it names: it reads masked and writes nothing.
+#[tokio::test]
+async fn read_tier_key_reads_and_cannot_mutate() {
+    let (keys, _) = keys_in("read", &keys_json());
+    let (app, db) = open_keyed("keys-read", &keys);
+    let q = json!({"cypher": "MATCH (n:Person) RETURN n.id"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, q)).await,
+        StatusCode::OK
+    );
+    let node = json!({"label": "Person", "key": "r1", "props": {}});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/nodes", RD_KEY, node)).await,
+        StatusCode::FORBIDDEN
+    );
+    let create = json!({"cypher": "CREATE (n:Person {id: 'r2'})"});
+    assert_ne!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, create)).await,
+        StatusCode::OK
+    );
+    assert_eq!(db.reader().counts().0, 1, "nothing was written");
+    assert_eq!(
+        status_of(&app, authed_get("/metrics", RD_KEY)).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// The env token, role tokens and keys all work together; anything else is 401.
+/// `/stats` tells them apart: full access answers, the narrower tiers get 403.
+#[tokio::test]
+async fn keys_merge_with_the_env_tokens_and_unknown_tokens_are_401() {
+    let (keys, _) = keys_in("merge", &keys_json());
+    let db = SharedDb::open(&tmp("keys-merge")).unwrap();
+    let mut roles = std::collections::HashMap::new();
+    roles.insert("legacy-role-tok".to_string(), "viewer".to_string());
+    let app = server::router_with_access_keys(db, Some("env-tok".into()), roles, keys);
+    for (token, want) in [
+        ("env-tok", StatusCode::OK),
+        (ADM_KEY, StatusCode::OK),
+        (WR_KEY, StatusCode::FORBIDDEN),
+        ("nope", StatusCode::UNAUTHORIZED),
+        ("wr-ke", StatusCode::UNAUTHORIZED),
+        (&WR_KEY[..WR_KEY.len() - 1], StatusCode::UNAUTHORIZED),
+        (&format!("{WR_KEY}-"), StatusCode::UNAUTHORIZED),
+    ] {
+        assert_eq!(
+            status_of(&app, authed_get("/stats", token)).await,
+            want,
+            "{token}"
+        );
+    }
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", "legacy-role-tok")).await,
+        StatusCode::FORBIDDEN,
+        "a role token still resolves, and is still refused /stats"
+    );
+}
+
+/// Keys alone (no env token, no role tokens) still close the server.
+#[tokio::test]
+async fn a_server_with_only_keys_requires_one_and_removing_them_all_keeps_it_closed() {
+    let (keys, path) = keys_in("only", &keys_json());
+    let db = SharedDb::open(&tmp("keys-only")).unwrap();
+    let app =
+        server::router_with_access_keys(db, None, std::collections::HashMap::new(), keys.clone());
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::OK
+    );
+    write_private(&path, r#"{"keys":[]}"#);
+    keys.reload().unwrap();
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked key is refused"
+    );
+    assert_eq!(
+        status_of(&app, get("/stats")).await,
+        StatusCode::UNAUTHORIZED,
+        "emptying the file must not open the server"
+    );
+}
+
+/// With no env token, no role tokens and no key file, the server is open as before.
+#[tokio::test]
+async fn no_keys_file_leaves_the_server_as_open_as_it_was() {
+    let dir = tmp("keys-absent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = mushroomdb::AccessKeys::load(dir.join("keys.json")).unwrap();
+    let db = SharedDb::open(&tmp("keys-absent-db")).unwrap();
+    let app = server::router_with_access_keys(db, None, std::collections::HashMap::new(), keys);
+    assert_eq!(status_of(&app, get("/stats")).await, StatusCode::OK);
+}
+
+/// SIGHUP re-reads `keys.json`: a new key works and a removed one stops,
+/// without a restart. A bad file on SIGHUP changes nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn keys_json_reload_on_sighup() {
+    let (keys, path) = keys_in("sighup", &keys_json());
+    let (app, _db) = open_keyed("keys-sighup", &keys);
+    // Registers the handler before this returns, so the signal below cannot
+    // arrive first and take the process down.
+    server::watch_sighup(&keys);
+
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let hangup = || unsafe {
+        libc::kill(libc::getpid(), libc::SIGHUP);
+    };
+
+    write_private(
+        &path,
+        &keys_text(&[(LATE_KEY, "admin", None), (WR_KEY, "write", None)]),
+    );
+    hangup();
+    // `/health` shows counts only to a full key.
+    let full = |app: Router| async move {
+        for _ in 0..200 {
+            let (_, body, _) = send(app.clone(), authed_get("/health", LATE_KEY)).await;
+            if parse_json(&body)["nodes"].is_number() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    };
+    assert!(full(app.clone()).await, "the new key works after SIGHUP");
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", ADM_KEY)).await,
+        StatusCode::UNAUTHORIZED,
+        "a key dropped from the file stops working"
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/stats", "env-tok")).await,
+        StatusCode::OK,
+        "the env token is not a file key"
+    );
+
+    // A file that does not parse changes nothing.
+    write_private(&path, "{ not json");
+    hangup();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        status_of(&app, authed_get("/stats", LATE_KEY)).await,
+        StatusCode::OK,
+        "a bad file leaves the old keys in force"
+    );
+}
+
+/// A store whose `viewer` role *can* write (labels Person, edges KNOWS), and a
+/// router with that role bound twice: as a legacy role token and as a `read` key.
+fn open_writable_role(name: &str, keys: &mushroomdb::AccessKeys) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "viewer".into(),
+                labels: vec!["Person".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: Some(WriteScope {
+                    create_labels: vec!["Person".into()],
+                    update_labels: vec!["Person".into()],
+                    delete_labels: vec!["Person".into()],
+                    create_edge_types: vec!["KNOWS".into()],
+                    delete_edge_types: vec!["KNOWS".into()],
+                    update_edge_types: vec![],
+                }),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_person(&db, "seed");
+    seed_person(&db, "other");
+    let mut role_tokens = std::collections::HashMap::new();
+    role_tokens.insert(
+        "legacy-role-token-0123456789abcdef".to_string(),
+        "viewer".to_string(),
+    );
+    let app = server::router_with_access_keys(db.clone(), None, role_tokens, keys.clone());
+    (app, db)
+}
+
+const READ_TIER_REFUSAL: &str = "read-tier key: writes are not permitted";
+
+/// Every `.route("<path>"` the router registers, read from the source, so a
+/// route added later cannot escape the sweep below.
+fn registered_route_paths() -> std::collections::BTreeSet<String> {
+    let source = include_str!("../src/http.rs");
+    let mut paths = std::collections::BTreeSet::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        let trimmed = rest.trim_start();
+        if let Some(quoted) = trimmed.strip_prefix('"') {
+            if let Some(end) = quoted.find('"') {
+                paths.insert(quoted[..end].to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// A `read` key whose role has a write scope still never writes, on any route.
+/// The control first shows the premise: the same role as a plain role token can.
+#[tokio::test]
+async fn read_tier_key_is_refused_on_every_write_route_even_when_its_role_can_write() {
+    let (keys, _) = keys_in("sweep", &keys_json());
+    let (app, db) = open_writable_role("keys-sweep", &keys);
+    let legacy = "legacy-role-token-0123456789abcdef";
+
+    // Control: the role itself may create a Person.
+    let control = json!({"cypher": "CREATE (n:Person {id: 'control'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", legacy, control)).await,
+        StatusCode::OK,
+        "the role must be able to write for this test to mean anything"
+    );
+    let nodes_before = db.reader().counts();
+    let edges_before = db.reader().counts().2;
+
+    // (method, concrete path, body, the exact error the refusal carries)
+    let write_refusal = READ_TIER_REFUSAL;
+    let role_stats = "role-bound token: /stats requires a full-access token";
+    let role_metrics = "role-bound token: /metrics requires a full-access token";
+    let role_ws = "role-bound token: this endpoint is not permitted";
+    let cases: Vec<(&str, &str, Json, &str)> = vec![
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "CREATE (n:Person {id: 'x1'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MATCH (n:Person {id: 'seed'}) SET n.age = 1"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MATCH (n:Person {id: 'seed'}) DETACH DELETE n"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "CREATE (a:Person {id: 'x6'})-[:KNOWS]->(b:Person {id: 'x7'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/query",
+            json!({"cypher": "MERGE (n:Person {id: 'x2'})"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/ingest",
+            json!({"label": "Person", "rows": [{"id": "x3"}], "options": {}}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/rules",
+            json!({"name": "r", "kind": "x"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/nodes",
+            json!({"label": "Person", "key": "x4", "props": {}}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/nodes/seed/rename",
+            json!({"new_key": "x5"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/edges",
+            json!({"type": "KNOWS", "src": "seed", "dst": "other"}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/edges/upsert",
+            json!({"type": "KNOWS", "src": "seed", "dst": "other"}),
+            write_refusal,
+        ),
+        ("DELETE", "/node/seed", json!({}), write_refusal),
+        (
+            "PUT",
+            "/node/seed/prop/age",
+            json!({"value": 1}),
+            write_refusal,
+        ),
+        ("DELETE", "/node/seed/prop/id", json!({}), write_refusal),
+        (
+            "DELETE",
+            "/edges/KNOWS/seed/other",
+            json!({}),
+            write_refusal,
+        ),
+        (
+            "POST",
+            "/schema/indexes",
+            json!({"label": "Person", "property": "age", "kind": "range"}),
+            write_refusal,
+        ),
+        ("DELETE", "/schema/indexes/i", json!({}), write_refusal),
+        (
+            "POST",
+            "/schema/constraints",
+            json!({"name": "c", "label": "Person", "property": "id", "type": "unique"}),
+            write_refusal,
+        ),
+        ("DELETE", "/schema/constraints/c", json!({}), write_refusal),
+        ("POST", "/algo/pagerank", json!({}), write_refusal),
+        ("POST", "/algo/wcc", json!({}), write_refusal),
+        ("POST", "/algo/degree", json!({}), write_refusal),
+        (
+            "POST",
+            "/backup",
+            json!({"dest": tmp("keys-sweep-backup").to_str().unwrap()}),
+            write_refusal,
+        ),
+        ("GET", "/stats", json!(null), role_stats),
+        ("GET", "/metrics", json!(null), role_metrics),
+    ];
+    for (method, path, body, want) in &cases {
+        let req = if body.is_null() {
+            authed_get(path, RD_KEY)
+        } else {
+            authed_json_req(method, path, RD_KEY, body.clone())
+        };
+        let (status, bytes, _) = send(app.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} {body} -> {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(parse_json(&bytes)["error"], json!(want), "{method} {path}");
+    }
+    for path in ["/watch", "/subscribe"] {
+        for req in [authed_ws_upgrade(path, RD_KEY), authed_get(path, RD_KEY)] {
+            let (status, bytes, _) = send(app.clone(), req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(parse_json(&bytes)["error"], json!(role_ws), "{path}");
+        }
+    }
+
+    // Nothing was written, and the dest of the refused backup does not exist.
+    assert_eq!(db.reader().counts(), nodes_before);
+    assert_eq!(db.reader().counts().2, edges_before);
+    assert!(!tmp("keys-sweep-backup").exists());
+
+    // The read key still reads.
+    let read = json!({"cypher": "MATCH (n:Person) RETURN n.id"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", RD_KEY, read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, authed_get("/node/seed", RD_KEY)).await,
+        StatusCode::OK
+    );
+
+    // Guard: every route the router registers is covered by this test.
+    let covered: std::collections::BTreeSet<String> = [
+        "/health",
+        "/ready",
+        "/query",
+        "/stats",
+        "/metrics",
+        "/ingest",
+        "/rules",
+        "/suggest",
+        "/explain",
+        "/find_similar",
+        "/node/{key}",
+        "/node/{key}/edges",
+        "/node/{key}/neighborhood",
+        "/node/{key}/history",
+        "/history/edge",
+        "/history/was_linked",
+        "/node/{key}/prop/{field}",
+        "/nodes",
+        "/nodes/{key}/rename",
+        "/edges",
+        "/edges/upsert",
+        "/edges/{etype}/{src}/{dst}",
+        "/algo/pagerank",
+        "/algo/wcc",
+        "/algo/degree",
+        "/schema/indexes",
+        "/schema/indexes/{name}",
+        "/schema/constraints",
+        "/schema/constraints/{name}",
+        "/backup",
+        "/watch",
+        "/subscribe",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        registered_route_paths(),
+        covered,
+        "a route was added or removed: decide what a read key may do on it and extend the sweep"
+    );
+}
+
+/// The read-only GETs a read key may make are not caught by the write refusal.
+#[tokio::test]
+async fn read_tier_key_may_use_the_read_routes() {
+    let (keys, _) = keys_in("reads", &keys_json());
+    let (app, _db) = open_writable_role("keys-reads", &keys);
+    for path in [
+        "/health",
+        "/node/seed",
+        "/node/seed/edges",
+        "/node/seed/neighborhood",
+        "/node/seed/history",
+    ] {
+        let status = status_of(&app, authed_get(path, RD_KEY)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+    let similar = json!({"key": "seed", "k": 1});
+    let status = status_of(
+        &app,
+        authed_json_req("POST", "/find_similar", RD_KEY, similar),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "/find_similar is a read");
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The write tier is not narrowed by this: its role-less writes still work.
+#[tokio::test]
+async fn write_tier_keeps_writing_beside_a_read_key() {
+    let (keys, _) = keys_in("beside", &keys_json());
+    let (app, _db) = open_writable_role("keys-beside", &keys);
+    let create = json!({"cypher": "CREATE (n:Person {id: 'w9'})"});
+    assert_eq!(
+        status_of(&app, authed_json_req("POST", "/query", WR_KEY, create)).await,
+        StatusCode::OK
+    );
 }

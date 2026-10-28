@@ -28,6 +28,11 @@
 //!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
 //!  13 = FULLTEXT (the full-text index's own blob; only when a pair is declared)
+//!  14–17 = WAL_MARK, EDGES_SWEPT, PROV_RECONCILED, DERIVED_BITS (optional)
+//!  18 = DECLARATIONS (versioned: multiplicity, constraints, indexes; V11 only, see `V8Meta::v11`)
+//!
+//! A V11 snapshot also writes columns of the five 0.10 value types (pack tags
+//! 5–9) into section 1 in the `Mixed` shape; any other version refuses them.
 
 use crate::columns::ColumnStore;
 use crate::edge_props::EdgeProps;
@@ -112,6 +117,18 @@ pub struct V8Meta {
     /// next open repairs at its first write.
     #[serde(skip)]
     pub prov_reconciled: bool,
+    /// The snapshot is V11. Only then may the columns hold the five 0.10 value
+    /// types (pack tags 5–9) — any other version refuses them — and only then
+    /// is section 18 written, from `constraints` and `multiplicity`. False
+    /// writes exactly what 0.9.x writes.
+    #[serde(skip)]
+    pub v11: bool,
+    /// The store's declarations, written to section 18 of a V11 snapshot. Not
+    /// in the bincode META section: a field there would add bytes to every
+    /// snapshot, V9 included, and V9 stays byte-identical to 0.9.x. Ignored
+    /// unless `v11`.
+    #[serde(skip)]
+    pub declarations: crate::v8::SnapshotDeclarations,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +187,8 @@ pub fn encode_v8<W: Write>(
     // Sections 1 and 12 are produced together: the columns hold string ids, the
     // one shared table holds the vocabulary they index.
     let (cols_data, strings_data) = match base_cols {
-        Some(archived) => columns_merge_to_data(archived, base_strings, cols)?,
-        None => columnstore_to_data(cols)?,
+        Some(archived) => columns_merge_to_data(archived, base_strings, cols, meta.v11)?,
+        None => columnstore_to_data(cols, meta.v11)?,
     };
     let cols_bytes = rkyv_encode(&cols_data)?;
     let strings_bytes = rkyv_encode(&strings_data)?;
@@ -262,17 +279,28 @@ pub fn encode_v8<W: Write>(
     // does not keep its WAL writes only the swept marker, and the reconciled
     // one when its state has had the repair, beside what it always wrote.
     // None goes at the end: the last section stays a small, eagerly-CRC'd one.
+    let derived_bits_bytes = derived_bits_section(&topo_bytes, &meta.provenance);
     let swept: &[u8] = crate::v8::SWEPT_MAGIC;
     let reconciled: &[u8] = if meta.prov_reconciled {
         crate::v8::RECONCILED_MAGIC
     } else {
         &[]
     };
+    let declarations = if meta.v11 {
+        meta.declarations.encode()?
+    } else {
+        Vec::new()
+    };
     for (id, bytes) in [
         (SECTION_FULLTEXT, meta.fulltext_blob.as_slice()),
         (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
         (crate::v8::SECTION_EDGES_SWEPT, swept),
         (crate::v8::SECTION_PROV_RECONCILED, reconciled),
+        (
+            crate::v8::SECTION_DERIVED_BITS,
+            derived_bits_bytes.as_slice(),
+        ),
+        (crate::v8::SECTION_DECLARATIONS, declarations.as_slice()),
     ] {
         if bytes.is_empty() {
             continue;
@@ -613,12 +641,13 @@ fn columns_merge_to_data(
     base: &crate::v8::layout::ArchivedColumns,
     base_strings: Option<&crate::v8::layout::ArchivedStringTable>,
     overlay: &ColumnStore,
+    v11: bool,
 ) -> Result<(ColumnsData, StringTableData)> {
     // 1. Materialise base.  `base_strings` is `None` for a pre-V9 base, whose
     //    columns still carry their own tables — that is the migration path.
     let mut merged = archived_to_columnstore(base, base_strings);
     // 2. Apply tombstones (base-only props deleted since last snapshot).
-    for (node, fields) in &overlay.prop_tombstones {
+    for (node, fields) in overlay.prop_tombstones.iter() {
         for field in fields {
             merged.remove(*node, field);
         }
@@ -630,17 +659,20 @@ fn columns_merge_to_data(
         }
     }
     // 4. Encode.
-    columnstore_to_data(&merged)
+    columnstore_to_data(&merged, v11)
 }
 
 /// Pack a `ColumnStore` into the archived column layout plus the one string
 /// table every `Str` column in it indexes.  The two are always written as a
 /// pair (columns section 1, strings section 12) and are only meaningful
 /// together: the columns carry ids, the table carries the vocabulary.
-fn columnstore_to_data(store: &ColumnStore) -> Result<(ColumnsData, StringTableData)> {
+///
+/// `v11` is whether the snapshot is V11, the only version that may hold a
+/// column of the five 0.10 value types; see [`decode_all_columns`].
+fn columnstore_to_data(store: &ColumnStore, v11: bool) -> Result<(ColumnsData, StringTableData)> {
     let mut buf = Vec::new();
-    store.pack(&mut buf);
-    let (mut data, strings) = decode_all_columns(&buf)?;
+    store.pack(&mut buf)?;
+    let (mut data, strings) = decode_all_columns(&buf, v11)?;
     // Post-process: promote Mixed columns that are pure all-float lists of equal
     // dimension to ColumnData::Vector for zero-copy raw-f64 access (B2).
     for field in data.fields.iter_mut() {
@@ -648,7 +680,23 @@ fn columnstore_to_data(store: &ColumnStore) -> Result<(ColumnsData, StringTableD
             let map: HashMap<u32, Value> =
                 bincode::deserialize(blob.as_slice()).unwrap_or_default();
             if let Some(vec_col) = try_promote_to_vector(&map) {
+                // Every value is a list of floats: nothing V11 in it, and the
+                // walk that proved it was the promotion's own.
                 field.col = vec_col;
+            } else {
+                // A mixed column (an `Int` beside a `Date`, a list of dates) is
+                // the one other way a 0.10 value type reaches this section.
+                if !v11 {
+                    if let Some(type_name) = map.values().find_map(crate::types::v11_only_type) {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "v8: column '{}' holds {type_name} values, which only a V11 \
+                                 snapshot can store",
+                                field.name
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -717,7 +765,14 @@ fn try_promote_to_vector(map: &HashMap<u32, Value>) -> Option<ColumnData> {
 /// string table.  The pack format has always written the intern table exactly
 /// once; up to V8 every `Str` column got a `clone()` of it, which is the whole
 /// bloat this returns separately instead.
-fn decode_all_columns(buf: &[u8]) -> Result<(ColumnsData, StringTableData)> {
+///
+/// Pack tags 5–9 — columns of `Date`, `LocalDateTime`, `DateTime`, `Duration`
+/// and `Binary` values — are written as [`ColumnData::Mixed`], the bincode
+/// node-to-value map every reader since V8 already decodes, so the archived
+/// layout of the section does not move. They are refused unless `v11`: a
+/// pre-V11 snapshot holding one would be stamped for a 0.9.x reader that
+/// cannot decode its values.
+fn decode_all_columns(buf: &[u8], v11: bool) -> Result<(ColumnsData, StringTableData)> {
     use crate::pack::{read_exact, read_f64s, read_i64s, read_str, read_u32, read_u32s};
     let mut pos = 0usize;
 
@@ -804,6 +859,28 @@ fn decode_all_columns(buf: &[u8]) -> Result<(ColumnsData, StringTableData)> {
                     .to_vec();
                 ColumnData::Mixed(blob)
             }
+            5..=9 if !v11 => {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "v8: column '{fname}' holds {} values, which only a V11 snapshot can \
+                         store",
+                        typed_tag_name(tag)
+                    ),
+                });
+            }
+            5..=9 => {
+                // Back over the tag: the column reader starts at it.
+                pos -= 1;
+                let map = crate::columns::unpack_typed_column_map(buf, &mut pos).map_err(|e| {
+                    GraphError::Corrupt {
+                        detail: format!("v8: column '{fname}' pack decode: {e}"),
+                    }
+                })?;
+                let blob = bincode::serialize(&map).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' encode: {e}"),
+                })?;
+                ColumnData::Mixed(blob)
+            }
             other => {
                 return Err(GraphError::Corrupt {
                     detail: format!(
@@ -825,6 +902,17 @@ fn decode_all_columns(buf: &[u8]) -> Result<(ColumnsData, StringTableData)> {
     ))
 }
 
+/// The value type a typed-column pack tag (5–9) holds.
+fn typed_tag_name(tag: u8) -> &'static str {
+    match tag {
+        5 => "Date",
+        6 => "LocalDateTime",
+        7 => "DateTime",
+        8 => "Duration",
+        _ => "Binary",
+    }
+}
+
 fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {
     use crate::pack::{read_exact, read_u32};
     let n = read_u32(buf, pos).ok()? as usize;
@@ -838,10 +926,9 @@ fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {
 }
 
 fn idmap_to_data(ids: &IdMap) -> IdMapData {
-    let to_key: Vec<String> = ids.all_keys().to_vec();
+    let to_key: Vec<String> = ids.all_keys().cloned().collect();
     let tombstones: Vec<u32> = ids
         .all_keys()
-        .iter()
         .enumerate()
         .filter_map(|(i, _)| {
             let id = i as u32;
@@ -1063,8 +1150,8 @@ fn edge_props_to_data(ep: &EdgeProps) -> EdgePropsData {
 ///    is hidden for it.
 /// 2. A key with an overlay entry and no tombstone emits the base fields with
 ///    the overlay's laid over them, field by field. Emitting the overlay entry
-///    alone dropped every base field it did not name, which a live read still
-///    showed.
+///    alone dropped every base field it did not name — a relationship property
+///    written after a snapshot lost the pair's insert `count` at the next one.
 /// 3. Every other base entry is copied as it is.
 ///
 /// Entries in the result are sorted by (etype, src, dst) ascending.
@@ -1143,6 +1230,39 @@ fn hnsw_to_data(hnsw: &BTreeMap<String, (Vec<u8>, Vec<u8>)>) -> HnswSectionData 
         .collect();
     rules.sort_by(|a, b| a.name.cmp(&b.name));
     HnswSectionData { rules }
+}
+
+/// Section 17's payload for the topology bytes `topo_bytes` and the edges
+/// `provenance` says a rule owns: the magic and one bit per `u32` of the
+/// topology section. Empty — the section is left out — when no such edge is in
+/// the topology.
+fn derived_bits_section(
+    topo_bytes: &[u8],
+    provenance: &BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+) -> Vec<u8> {
+    if provenance.values().all(BTreeSet::is_empty) {
+        return Vec::new();
+    }
+    // SAFETY: `topo_bytes` is what `rkyv_encode` just produced from a `CsrData`,
+    // in an allocation of its own.
+    let csr = unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedCsr>(topo_bytes) };
+    let slots = crate::v8::seam::derived_slots(
+        csr,
+        topo_bytes.as_ptr() as usize,
+        provenance.values().flatten().copied(),
+    );
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let mut out =
+        Vec::with_capacity(crate::v8::DERIVED_BITS_MAGIC.len() + topo_bytes.len() / 32 + 1);
+    out.extend_from_slice(crate::v8::DERIVED_BITS_MAGIC);
+    out.resize(out.len() + topo_bytes.len() / 32 + 1, 0);
+    let bits = crate::v8::DERIVED_BITS_MAGIC.len();
+    for slot in slots {
+        out[bits + slot / 8] |= 1 << (slot % 8);
+    }
+    out
 }
 
 /// Build `ProvenanceSectionData` from owned provenance map.
@@ -1251,6 +1371,36 @@ pub fn decode_provenance_bytes(
     }
 }
 
+/// Every triple of a PROVENANCE section, across rules, as one flat list: the
+/// reader's input for telling which edges are derived, without the per-rule
+/// maps (and their `String` keys, and their ordered sets) that
+/// [`decode_provenance_bytes`] builds.
+///
+/// `None` for bytes that do not validate, which a reader treats as an absent
+/// section, as [`decode_provenance_bytes`] does. A triple two rules own appears
+/// twice.
+pub fn provenance_triples(bytes: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let archived = rkyv::access::<
+        crate::v8::layout::ArchivedProvenanceSectionData,
+        rkyv::rancor::Error,
+    >(bytes)
+    .ok()?;
+    let total = archived.entries.iter().map(|e| e.triples.len()).sum();
+    let mut triples = Vec::with_capacity(total);
+    for entry in archived.entries.iter() {
+        triples.extend(
+            entry
+                .triples
+                .iter()
+                .map(|t| (u32::from(t.etype), u32::from(t.src), u32::from(t.dst))),
+        );
+    }
+    Some(triples)
+}
+
 /// Return type for `archived_rules_meta_to_owned`.
 pub type RulesMetaOwned = (Vec<Vec<u8>>, BTreeMap<String, bool>, BTreeMap<String, u64>);
 
@@ -1334,69 +1484,165 @@ pub fn archived_hnsw_to_owned(
 }
 
 #[cfg(test)]
-mod edge_props_merge_tests {
-    use super::{edge_props_merge_to_data, edge_props_to_data};
-    use crate::edge_props::EdgeProps;
+mod null_backstop_tests {
+    use super::columnstore_to_data;
     use crate::types::Value;
-    use std::collections::BTreeMap;
+    use crate::ColumnStore;
 
-    type Entry = ((u32, u32, u32), BTreeMap<String, Value>);
-
-    fn props_of(data: &crate::v8::layout::EdgePropsData) -> Vec<Entry> {
-        data.entries
-            .iter()
-            .map(|e| {
-                (
-                    (e.etype, e.src, e.dst),
-                    bincode::deserialize(&e.props_blob).unwrap(),
-                )
-            })
-            .collect()
-    }
-
-    fn map(pairs: &[(&str, f64)]) -> BTreeMap<String, Value> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), Value::Float(*v)))
-            .collect()
-    }
-
-    /// The merge a snapshot writes reads each key as `EdgePropsView` does:
-    /// a tombstoned key is the overlay entry alone (row 154), an overlay entry
-    /// without one lays its fields over the base's, and an untouched base
-    /// entry is copied.
     #[test]
-    fn the_merge_reads_each_key_as_the_view_does() {
-        let mut base = EdgeProps::new();
-        base.set(0, 1, 2, "wa", Value::Float(1.0)); // retracted, then claimed
-        base.set(0, 3, 4, "a", Value::Float(1.0)); // partly rewritten
-        base.set(0, 3, 4, "b", Value::Float(1.0));
-        base.set(0, 5, 6, "a", Value::Float(1.0)); // untouched
-        base.set(0, 7, 8, "a", Value::Float(1.0)); // deleted
-        let bytes =
-            rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&edge_props_to_data(&base)).unwrap();
-        let archived =
-            rkyv::access::<crate::v8::layout::ArchivedEdgeProps, rkyv::rancor::Error>(&bytes)
+    fn the_v8_column_encoder_refuses_a_null_value() {
+        let mut store = ColumnStore::default();
+        store.set(0, "ok", Value::Int(1));
+        store.set(0, "tags", Value::List(vec![Value::Null]));
+        for v11 in [false, true] {
+            let err =
+                columnstore_to_data(&store, v11).expect_err("a null never reaches a snapshot");
+            assert!(err.to_string().contains("null"), "{err}");
+        }
+        // The same store without the null encodes.
+        let mut clean = ColumnStore::default();
+        clean.set(0, "tags", Value::List(vec![Value::Int(1)]));
+        assert!(columnstore_to_data(&clean, false).is_ok());
+    }
+}
+
+/// The five 0.10 value types reach the COLUMNS section only in a V11 snapshot
+/// (TY-2 carry, TY-12 checklist (a)).
+#[cfg(test)]
+mod typed_column_tests {
+    use super::{columnstore_to_data, encode_v8, V8Meta};
+    use crate::types::Value;
+    use crate::v8::layout::ColumnData;
+    use crate::v8::MappedBase;
+    use crate::{ColumnStore, IdMap, Interner, Topology};
+    use std::collections::HashMap;
+
+    fn typed_values() -> Vec<Value> {
+        vec![
+            Value::Date(19_737),
+            Value::LocalDateTime(1_705_322_096_789_012),
+            Value::DateTime {
+                micros_utc: 1_705_302_296_789_012,
+                offset_seconds: -18_000,
+            },
+            Value::Duration {
+                months: 14,
+                days: 3,
+                nanos: 1,
+            },
+            Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        ]
+    }
+
+    /// One store per type, each a homogeneous column (pack tags 5–9) over
+    /// two nodes with a gap, so the presence bitmap matters.
+    fn store_of(v: &Value) -> ColumnStore {
+        let mut store = ColumnStore::default();
+        store.set(0, "f", v.clone());
+        store.set(2, "f", v.clone());
+        store
+    }
+
+    #[test]
+    fn a_pre_v11_snapshot_refuses_a_typed_column() {
+        for v in typed_values() {
+            let err = match columnstore_to_data(&store_of(&v), false) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{v:?}: a pre-V11 snapshot took a typed column"),
+            };
+            assert!(err.contains("only a V11 snapshot can store"), "{err}");
+            assert!(err.contains("column 'f'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_v11_snapshot_writes_a_typed_column_as_a_mixed_map() {
+        for v in typed_values() {
+            let (data, _) = columnstore_to_data(&store_of(&v), true).unwrap();
+            assert_eq!(data.fields.len(), 1);
+            let ColumnData::Mixed(blob) = &data.fields[0].col else {
+                panic!("{v:?}: expected the Mixed shape");
+            };
+            let map: HashMap<u32, Value> = bincode::deserialize(blob).unwrap();
+            assert_eq!(map, HashMap::from([(0, v.clone()), (2, v.clone())]));
+        }
+    }
+
+    /// A new-type value inside a mixed column (beside an `Int`, or inside a
+    /// list) is as V11-only as a typed column.
+    #[test]
+    fn a_pre_v11_snapshot_refuses_a_typed_value_in_a_mixed_column() {
+        for v in typed_values() {
+            let mut store = ColumnStore::default();
+            store.set(0, "f", Value::Int(1));
+            store.set(1, "f", v.clone());
+            assert!(columnstore_to_data(&store, false).is_err(), "{v:?}");
+            assert!(columnstore_to_data(&store, true).is_ok(), "{v:?}");
+            let mut listed = ColumnStore::default();
+            listed.set(0, "f", Value::List(vec![v.clone()]));
+            assert!(columnstore_to_data(&listed, false).is_err(), "{v:?}");
+        }
+    }
+
+    /// Through the whole encoder: V11 reads back every value; pre-V11 is an
+    /// error rather than a file.
+    #[test]
+    fn encode_v8_round_trips_typed_columns_only_for_v11() {
+        for v in typed_values() {
+            let store = store_of(&v);
+            let mut ids = IdMap::new();
+            for k in ["a", "b", "c"] {
+                ids.get_or_insert(k);
+            }
+            let meta = V8Meta {
+                labels: vec![0; 3],
+                ..V8Meta::default()
+            };
+            let mut out = Vec::new();
+            let pre = encode_v8(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &Topology::new(),
+                &store,
+                &ids,
+                &Interner::new(),
+                &meta,
+                &mut out,
+            );
+            assert!(pre.is_err(), "{v:?}: pre-V11 encode must fail");
+            let meta = V8Meta { v11: true, ..meta };
+            let mut out = Vec::new();
+            encode_v8(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &Topology::new(),
+                &store,
+                &ids,
+                &Interner::new(),
+                &meta,
+                &mut out,
+            )
+            .unwrap();
+            crate::snapshot::stamp_container_version(&mut out, crate::snapshot::VERSION_11)
                 .unwrap();
-
-        let mut overlay = EdgeProps::new();
-        overlay.remove_edge(0, 1, 2);
-        overlay.set(0, 1, 2, "wb", Value::Float(1.0));
-        overlay.set(0, 3, 4, "b", Value::Float(2.0));
-        overlay.remove_edge(0, 7, 8);
-
-        let view = crate::v8::seam::EdgePropsView::with_base(&overlay, archived);
-        assert_eq!(view.get(0, 1, 2, "wa"), None);
-        assert_eq!(view.get(0, 1, 2, "wb"), Some(Value::Float(1.0)));
-        assert_eq!(view.get(0, 3, 4, "a"), Some(Value::Float(1.0)));
-
-        assert_eq!(
-            props_of(&edge_props_merge_to_data(archived, &overlay)),
-            vec![
-                ((0, 1, 2), map(&[("wb", 1.0)])),
-                ((0, 3, 4), map(&[("a", 1.0), ("b", 2.0)])),
-                ((0, 5, 6), map(&[("a", 1.0)])),
-            ]
-        );
+            let base = MappedBase::from_bytes(out).unwrap();
+            let state = crate::snapshot::decode_v8_from_mapped(&base)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.props.get(0, "f"), Some(&v));
+            assert_eq!(state.props.get(1, "f"), None);
+            assert_eq!(state.props.get(2, "f"), Some(&v));
+            assert_eq!(
+                base.declarations().unwrap(),
+                Some(crate::v8::SnapshotDeclarations::default()),
+                "a V11 snapshot always carries section 18"
+            );
+        }
     }
 }

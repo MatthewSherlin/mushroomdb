@@ -58,6 +58,10 @@ pub enum Tok {
     Plus,
     /// `/` — division operator.
     Slash,
+    /// `%` — modulo operator.
+    Percent,
+    /// `^` — exponentiation operator.
+    Caret,
 }
 
 pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
@@ -76,11 +80,18 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             '|' => toks.push(Tok::Pipe),
             ',' => toks.push(Tok::Comma),
             '.' => toks.push(Tok::Dot),
+            '=' if matches!(chars.peek(), Some((_, '~'))) => {
+                return Err(
+                    "not supported in mushroomdb 0.10: regular-expression match (=~)".to_string(),
+                )
+            }
             '=' => toks.push(Tok::Eq),
             '*' => toks.push(Tok::Star),
             '-' => toks.push(Tok::Dash),
             '+' => toks.push(Tok::Plus),
             '/' => toks.push(Tok::Slash),
+            '%' => toks.push(Tok::Percent),
+            '^' => toks.push(Tok::Caret),
             '<' => match chars.peek() {
                 Some((_, '=')) => {
                     chars.next();
@@ -100,7 +111,8 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
                     toks.push(Tok::Gt);
                 }
             }
-            '\'' => toks.push(lex_string(i, &mut chars)?),
+            '\'' | '"' => toks.push(lex_string(i, ch, &mut chars)?),
+            '`' => toks.push(lex_quoted_ident(i, &mut chars)?),
             '$' => toks.push(lex_param(input, i, &mut chars)?),
             '0'..='9' => toks.push(lex_number(input, i, ch, &mut chars)?),
             'A'..='Z' | 'a'..='z' | '_' => toks.push(lex_word(input, i, ch, &mut chars)),
@@ -110,17 +122,58 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
     Ok(toks)
 }
 
-fn lex_string(
+/// Lex a backtick-quoted identifier (`` `c d` ``). It lexes as an ordinary
+/// `Ident` whose text is whatever sits between the backticks; a doubled
+/// backtick is one literal backtick. An empty name or an unterminated quote
+/// is an error.
+fn lex_quoted_ident(
     start: usize,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
 ) -> Result<Tok, String> {
     let mut out = String::new();
     loop {
         match chars.next() {
+            None => {
+                return Err(format!(
+                    "unterminated quoted identifier at position {start}"
+                ))
+            }
+            Some((_, '`')) => {
+                if matches!(chars.peek(), Some((_, '`'))) {
+                    chars.next();
+                    out.push('`');
+                } else if out.is_empty() {
+                    return Err(format!("empty quoted identifier at position {start}"));
+                } else {
+                    return Ok(Tok::Ident(out));
+                }
+            }
+            Some((_, ch)) => out.push(ch),
+        }
+    }
+}
+
+/// Lex a string literal opened by `quote` (`'` or `"`). Escapes, in either quote
+/// style: `\\`, `\'`, `\"`, `\n`, `\t`, `\r`, `\b`, `\f` and `\uXXXX`; any other
+/// escape is an error.
+fn lex_string(
+    start: usize,
+    quote: char,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Result<Tok, String> {
+    let mut out = String::new();
+    loop {
+        match chars.next() {
             None => return Err(format!("unterminated string at position {start}")),
-            Some((_, '\'')) => return Ok(Tok::Str(out)),
+            Some((_, ch)) if ch == quote => return Ok(Tok::Str(out)),
             Some((_, '\\')) => match chars.next() {
-                Some((_, '\'')) => out.push('\''),
+                Some((_, ch @ ('\'' | '"' | '\\'))) => out.push(ch),
+                Some((_, 'n')) => out.push('\n'),
+                Some((_, 't')) => out.push('\t'),
+                Some((_, 'r')) => out.push('\r'),
+                Some((_, 'b')) => out.push('\u{8}'),
+                Some((_, 'f')) => out.push('\u{c}'),
+                Some((pos, 'u')) => out.push(lex_unicode_escape(pos, chars)?),
                 Some((pos, ch)) => {
                     return Err(format!("invalid escape '\\{ch}' at position {pos}"));
                 }
@@ -129,6 +182,36 @@ fn lex_string(
             Some((_, ch)) => out.push(ch),
         }
     }
+}
+
+/// Four hex digits after `\u`. A high surrogate must be followed by a `\uXXXX`
+/// low surrogate; the pair is one character.
+fn lex_unicode_escape(
+    pos: usize,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Result<char, String> {
+    let bad = || format!("invalid unicode escape at position {pos}");
+    let hex4 = |chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>| {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let (_, c) = chars.next().ok_or_else(bad)?;
+            v = v * 16 + c.to_digit(16).ok_or_else(bad)?;
+        }
+        Ok::<u32, String>(v)
+    };
+    let first = hex4(chars)?;
+    if (0xD800..0xDC00).contains(&first) {
+        if !matches!(chars.next(), Some((_, '\\'))) || !matches!(chars.next(), Some((_, 'u'))) {
+            return Err(bad());
+        }
+        let second = hex4(chars)?;
+        if !(0xDC00..0xE000).contains(&second) {
+            return Err(bad());
+        }
+        let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+        return char::from_u32(code).ok_or_else(bad);
+    }
+    char::from_u32(first).ok_or_else(bad)
 }
 
 fn lex_param(
@@ -468,7 +551,7 @@ mod tests {
 
     #[test]
     fn garbage_bytes_are_err_not_panic() {
-        let cases = ["@", "#", "MATCH @ n", "\"double\"", "\u{0}", "1.2.3@"];
+        let cases = ["@", "#", "MATCH @ n", "\"unterminated", "\u{0}", "1.2.3@"];
         for src in cases {
             let result = std::panic::catch_unwind(|| lex(src));
             assert!(result.is_ok(), "lex({src:?}) panicked");
@@ -480,5 +563,85 @@ mod tests {
                 "error must include position info, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn percent_and_caret_lex_as_tokens() {
+        assert_eq!(lex("%").unwrap(), vec![Tok::Percent]);
+        assert_eq!(lex("^").unwrap(), vec![Tok::Caret]);
+        assert_eq!(
+            lex("3 % 2").unwrap(),
+            vec![Tok::Int(3), Tok::Percent, Tok::Int(2)]
+        );
+        assert_eq!(
+            lex("2 ^ 8").unwrap(),
+            vec![Tok::Int(2), Tok::Caret, Tok::Int(8)]
+        );
+    }
+
+    #[test]
+    fn double_quoted_strings_match_single_quoted() {
+        assert_eq!(lex("\"hello\"").unwrap(), vec![Tok::Str("hello".into())]);
+        assert_eq!(lex("\"it's\"").unwrap(), vec![Tok::Str("it's".into())]);
+        assert_eq!(
+            lex(r#""say \"hi\"""#).unwrap(),
+            vec![Tok::Str("say \"hi\"".into())]
+        );
+        assert_eq!(lex(r#""it\'s""#).unwrap(), vec![Tok::Str("it's".into())]);
+        assert_eq!(
+            lex(r#"'say \"hi\"'"#).unwrap(),
+            vec![Tok::Str("say \"hi\"".into())]
+        );
+        let err = lex("\"abc").expect_err("unterminated double-quoted string");
+        assert!(err.contains("position"), "got: {err}");
+        let err = lex(r#""a\d""#).expect_err("unknown escape");
+        assert!(err.contains("position"), "got: {err}");
+    }
+
+    #[test]
+    fn backslash_escape_yields_one_backslash() {
+        assert_eq!(lex(r"'C:\\dir'").unwrap(), vec![Tok::Str(r"C:\dir".into())]);
+        assert_eq!(
+            lex(r#""C:\\dir""#).unwrap(),
+            vec![Tok::Str(r"C:\dir".into())]
+        );
+    }
+
+    #[test]
+    fn the_five_contextual_words_lex_as_identifiers() {
+        for w in ["REMOVE", "foreach", "Exists", "CALL", "explain"] {
+            assert_eq!(lex(w).unwrap(), vec![Tok::Ident(w.into())]);
+        }
+    }
+
+    #[test]
+    fn control_and_unicode_escapes() {
+        assert_eq!(
+            lex(r"'a\nb\tc\rd\be\ff'").unwrap(),
+            vec![Tok::Str("a\nb\tc\rd\u{8}e\u{c}f".into())]
+        );
+        assert_eq!(
+            lex(r#""a\nbAé""#).unwrap(),
+            vec![Tok::Str("a\nbA\u{e9}".into())]
+        );
+        assert_eq!(lex(r"'😀'").unwrap(), vec![Tok::Str("\u{1F600}".into())]);
+        for bad in [
+            r"'\u12'",
+            r"'\uZZZZ'",
+            r"'\ud83d'",
+            r"'\ud83dx'",
+            r"'\ude00'",
+        ] {
+            let err = lex(bad).expect_err(bad);
+            assert!(err.contains("position"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn backtick_quoted_identifiers_lex_as_idents() {
+        assert_eq!(lex("`c d`").unwrap(), vec![Tok::Ident("c d".into())]);
+        assert_eq!(lex("`a``b`").unwrap(), vec![Tok::Ident("a`b".into())]);
+        assert!(lex("`abc").unwrap_err().contains("unterminated"));
+        assert!(lex("``").unwrap_err().contains("empty"));
     }
 }

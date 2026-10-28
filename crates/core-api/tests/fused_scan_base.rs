@@ -1,15 +1,15 @@
 //! A filtered scan with LIMIT sees the nodes a snapshot base holds (ledger
-//! row 139; backported to 0.9.3).
+//! row 139, QL-FS).
 //!
 //! `MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k` (no ORDER BY) runs
 //! the pull path's fused scan-and-filter: it resolves the property column once
 //! and compares inline. Any label scan whose filter is that one comparison is
 //! fused, so `MATCH (m:M), (n:L) WHERE n.f = …` and `MATCH (m:M) MATCH (n:L)
-//! WHERE n.f = …` are too; on a single-node MATCH `=` is lifted into a lookup
-//! before the fusion can see it. That column handle read the overlay but never the
-//! archived base a snapshot leaves behind, so every node whose value
-//! the snapshot held was dropped — silently. Two nodes, `snapshot()`, a third:
-//! `WHERE n.val <> 3 … LIMIT 5` answered only the third.
+//! WHERE n.f = …` are too, and SKIP does not stop it. That column handle read
+//! the layer and the overlay but never the archived base a snapshot leaves
+//! behind, so every node whose value the snapshot held was dropped —
+//! silently. Two nodes, `snapshot()`, a third: `WHERE n.val <> 3 … LIMIT 5`
+//! answered only the third.
 //!
 //! Each test compares the fused shape with the same filter written so the
 //! fusion does not fire (`… AND n.key IS NOT NULL`, always true; a compound
@@ -26,7 +26,7 @@ fn tmp(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let d = std::env::temp_dir().join(format!("row139-{tag}-{}-{nanos}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("qlfs-{tag}-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -37,10 +37,9 @@ fn p() -> BTreeMap<String, Value> {
 
 const OPS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
 
-/// One literal per scalar value type the fixtures store, and a second
-/// integer. (0.9's WHERE has no list, map or `null` literal; list- and
-/// map-valued properties are still stored, and compared against these.)
-const LITERALS: [&str; 5] = ["3", "2.5", "'m'", "true", "0"];
+/// One literal per value type the fixtures store, a second integer, and
+/// `null`.
+const LITERALS: [&str; 8] = ["3", "2.5", "'m'", "true", "0", "[1, 2]", "{a: 1}", "null"];
 
 /// The fused shape and its unfused twin, for one comparison, single-node.
 fn pair(op: &str, lit: &str) -> (String, String) {
@@ -55,7 +54,7 @@ fn pair(op: &str, lit: &str) -> (String, String) {
 /// Every fused form and its unfused twin, for one comparison: the
 /// single-node MATCH, the same with SKIP, and the filtered node as the second
 /// scan of a MATCH — comma-joined and as a second MATCH — where `=` is fused
-/// too (nothing lifts an equality off a later scan).
+/// too (0.9.x lifted an equality into a lookup on the first scan only).
 fn forms(op: &str, lit: &str) -> [(String, String); 4] {
     let cmp = format!("n.val {op} {lit}");
     let twin = format!("{cmp} AND n.key IS NOT NULL");
@@ -83,8 +82,8 @@ fn keys(rs: &mushroomdb::ResultSet) -> Vec<String> {
 }
 
 /// Every operator against every literal, in every form: the fused answer
-/// equals the unfused one. Returns how many comparisons kept at least one row, so a
-/// caller can tell the fixture was not vacuous.
+/// equals the unfused one. Returns how many comparisons kept at least one
+/// row, so a caller can tell the fixture was not vacuous.
 fn assert_fused_matches(
     run: &dyn Fn(&str) -> mushroomdb::Result<mushroomdb::ResultSet>,
     when: &str,
@@ -184,8 +183,8 @@ fn the_reported_shape_sees_the_snapshot_base() {
 }
 
 /// `=` off the first scanned node is fused, so it missed the base too (seen
-/// on the released 0.9.2 binary); on a single-node MATCH it is a lookup and
-/// was right.
+/// on the released 0.9.2 binary), and so did a fused scan under SKIP; the
+/// single-node `=` is the control.
 #[test]
 fn an_equality_on_a_later_scan_sees_the_snapshot_base() {
     let dir = tmp("eq-later");
@@ -324,9 +323,8 @@ fn open_at_over_the_base() {
 
 /// A reader is a fold plus, until `FOLD_EVERY_K` commits accumulate, an
 /// unfolded delta tail laid over it. Both shapes, with the base under them.
-/// (0.9 has no transactions; the 0.10 copy of this test also reads one.)
 #[test]
-fn shared_readers_folded_and_unfolded() {
+fn shared_readers_folded_and_unfolded_and_a_transaction() {
     for typed in [Some(0), Some(2), None] {
         let dir = tmp("shared");
         let shared = SharedDb::open(&dir).unwrap();
@@ -356,6 +354,27 @@ fn shared_readers_folded_and_unfolded() {
             &format!("folded reader {typed:?}"),
         );
 
+        // A transaction reads its own writes over the base.
+        let mut tx = shared.begin_transaction();
+        tx.execute("MATCH (n:L {id: 'f'}) REMOVE n.val", &p())
+            .unwrap();
+        tx.execute("MATCH (n:L {id: 'e'}) SET n.val = 3", &p())
+            .unwrap();
+        tx.execute("CREATE (n:L {id: 'tx', val: 1})", &p()).unwrap();
+        let mut run = |q: &str| tx.execute(q, &p());
+        let mut nonempty = 0;
+        for op in OPS {
+            for lit in LITERALS {
+                for (fused, unfused) in forms(op, lit) {
+                    let want = keys(&run(&unfused).unwrap());
+                    let got = keys(&run(&fused).unwrap());
+                    assert_eq!(got, want, "transaction {typed:?}: {fused}");
+                    nonempty += usize::from(!want.is_empty());
+                }
+            }
+        }
+        assert!(nonempty > 0);
+        drop(tx);
         drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }

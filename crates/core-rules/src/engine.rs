@@ -76,7 +76,7 @@ fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
         })
         .collect()
 }
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
@@ -127,20 +127,74 @@ pub(crate) fn record_desired_len(n: usize) {
     }
 }
 
+/// A structure the engine may write, borrowed so that it is copied only
+/// when it is written.
+///
+/// The store shares its interner, topology and edge properties with the
+/// reader's fold through `Arc`s. Handing the engine `&mut` to them meant
+/// `Arc::make_mut` up front, so every commit that ran the engine copied all
+/// three whole the first time after a fold, though most commits derive
+/// nothing (ledger row 126). Reads go through `Deref`, which never copies;
+/// the first `&mut` use (`DerefMut`) copies the shared value then, once.
+pub struct CowMut<'a, T: Clone> {
+    slot: CowSlot<'a, T>,
+}
+
+enum CowSlot<'a, T> {
+    Shared(&'a mut std::sync::Arc<T>),
+    Owned(&'a mut T),
+}
+
+impl<'a, T: Clone> From<&'a mut std::sync::Arc<T>> for CowMut<'a, T> {
+    fn from(arc: &'a mut std::sync::Arc<T>) -> Self {
+        Self {
+            slot: CowSlot::Shared(arc),
+        }
+    }
+}
+
+impl<'a, T: Clone> From<&'a mut T> for CowMut<'a, T> {
+    fn from(value: &'a mut T) -> Self {
+        Self {
+            slot: CowSlot::Owned(value),
+        }
+    }
+}
+
+impl<T: Clone> std::ops::Deref for CowMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match &self.slot {
+            CowSlot::Shared(arc) => arc,
+            CowSlot::Owned(value) => value,
+        }
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for CowMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        match &mut self.slot {
+            CowSlot::Shared(arc) => std::sync::Arc::make_mut(arc),
+            CowSlot::Owned(value) => value,
+        }
+    }
+}
+
 /// Borrowed mutable view of graph state the engine writes derived edges into.
 pub struct GraphMut<'a> {
     pub ids: &'a IdMap,
-    pub syms: &'a mut Interner,
+    pub syms: CowMut<'a, Interner>,
     pub labels: &'a [u32],
     pub props: ColumnsView<'a>,
     /// Edges written since the snapshot. Reads must go through
     /// [`GraphMut::neighbors`], not this field: on a store opened from a
     /// snapshot the overlay is empty and every edge lives in `base_topo`.
-    pub topo: &'a mut Topology,
+    pub topo: CowMut<'a, Topology>,
     /// The snapshot's archived CSR, when one is open. `None` for a store with
     /// no snapshot, where `topo` already holds everything.
     pub base_topo: Option<&'a core_storage::v8::layout::ArchivedCsr>,
-    pub edge_props: &'a mut EdgeProps,
+    pub edge_props: CowMut<'a, EdgeProps>,
 }
 
 impl GraphMut<'_> {
@@ -206,8 +260,8 @@ impl GraphMut<'_> {
         v: u32,
     ) -> std::borrow::Cow<'_, [u32]> {
         match self.base_topo {
-            None => TopologyView::owned(self.topo).neighbors(etype, dir, v),
-            Some(base) => TopologyView::with_base(self.topo, base).neighbors(etype, dir, v),
+            None => TopologyView::owned(&self.topo).neighbors(etype, dir, v),
+            Some(base) => TopologyView::with_base(&self.topo, base).neighbors(etype, dir, v),
         }
     }
 }
@@ -296,12 +350,46 @@ struct LazyProvenance {
     intern_rule: Vec<String>,
 }
 
+/// The triples some rule owns, and a journal of how that set has moved.
+///
+/// The journal holds each triple's *final* state since it was last taken
+/// (`true` = owned, `false` = retracted), so it is bounded by the distinct
+/// triples that changed, not by how many times they changed. A reader's view
+/// of which edges are derived is kept current from it.
+#[derive(Debug, Default)]
+struct OwnedTriples {
+    set: BTreeSet<Triple>,
+    journal: HashMap<Triple, bool>,
+}
+
+impl OwnedTriples {
+    fn insert(&mut self, triple: Triple) -> bool {
+        self.journal.insert(triple, true);
+        self.set.insert(triple)
+    }
+
+    fn remove(&mut self, triple: &Triple) -> bool {
+        self.journal.insert(*triple, false);
+        self.set.remove(triple)
+    }
+
+    fn contains(&self, triple: &Triple) -> bool {
+        self.set.contains(triple)
+    }
+
+    /// Load triples that are already part of the state the journal is kept
+    /// relative to (a snapshot's provenance): not a change.
+    fn load(&mut self, triples: impl IntoIterator<Item = Triple>) {
+        self.set.extend(triples);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
     indexes: BTreeMap<String, RuleIndex>,
     provenance: BTreeMap<String, BTreeSet<Triple>>,
-    owned: BTreeSet<Triple>,
+    owned: OwnedTriples,
     /// Derived reverse index: node → provenance triples that touch it.
     /// Never serialized; rebuilt from `provenance` on persist-restore.
     by_node: BTreeMap<u32, BTreeSet<Touch>>,
@@ -1117,7 +1205,7 @@ fn apply_per_src_top_k(
         if !desired_from_src.contains_key(&(s, d)) {
             g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            prov.remove(&def.name, (t, s, d), g.ids, &g.syms);
             let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
             prov.retracted.push((by, (t, s, d)));
         }
@@ -1130,7 +1218,7 @@ fn apply_per_src_top_k(
         if !already {
             let newly = g.add_edge(et, *s, *d);
             if newly {
-                prov.insert(&def.name, triple, g.ids, g.syms);
+                prov.insert(&def.name, triple, g.ids, &g.syms);
             }
         }
         let is_owned = already || prov.contains(&triple);
@@ -1233,7 +1321,7 @@ fn resolve_by_node(
 /// through [`ProvSets::insert`] / [`ProvSets::remove`].
 struct ProvSets<'a> {
     set: &'a mut BTreeSet<Triple>,
-    owned: &'a mut BTreeSet<Triple>,
+    owned: &'a mut OwnedTriples,
     by_node: &'a mut BTreeMap<u32, BTreeSet<Touch>>,
     rule_intern: &'a mut BTreeMap<String, u32>,
     intern_rule: &'a mut Vec<String>,
@@ -1395,7 +1483,7 @@ fn apply_desired_scoped(
         if !desired.contains_key(&(s, d)) {
             g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            prov.remove(&def.name, (t, s, d), g.ids, &g.syms);
             let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
             prov.retracted.push((by, (t, s, d)));
         }
@@ -1411,7 +1499,7 @@ fn apply_desired_scoped(
             }
             let newly = g.add_edge(et, s, d);
             if newly {
-                prov.insert(&def.name, triple, g.ids, g.syms);
+                prov.insert(&def.name, triple, g.ids, &g.syms);
             }
         }
         // Only set weight_prop on edges this rule owns (newly added now, or
@@ -1677,7 +1765,7 @@ fn apply_streaming_create(
                 }
                 let newly = g.add_edge(et, s, d);
                 if newly {
-                    prov.insert(&def.name, triple, g.ids, g.syms);
+                    prov.insert(&def.name, triple, g.ids, &g.syms);
                 }
             }
             let is_owned_here = already || prov.contains(&triple);
@@ -1839,7 +1927,7 @@ fn apply_via_rebuild(
             if !desired.contains_key(&(s, d)) {
                 g.remove_edge(t, s, d);
                 g.edge_props.remove_edge(t, s, d);
-                prov.remove(&def.name, triple, g.ids, g.syms);
+                prov.remove(&def.name, triple, g.ids, &g.syms);
                 // Signal the second-pass reclaim so another rule over the same
                 // edge type can take the edge (ledger row 84).
                 let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
@@ -1850,7 +1938,7 @@ fn apply_via_rebuild(
             let triple = (et, s, d);
             let already = prov.contains(&triple);
             if !already && g.add_edge(et, s, d) {
-                prov.insert(&def.name, triple, g.ids, g.syms);
+                prov.insert(&def.name, triple, g.ids, &g.syms);
             }
             // Only weight edges this rule owns; a pre-existing user edge is not
             // ours to annotate.
@@ -1907,7 +1995,7 @@ fn apply_streaming_rebuild(
         if !pair_still_desired(def, s, d, g) {
             g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            prov.remove(&def.name, (t, s, d), g.ids, &g.syms);
             // Signal the second-pass reclaim so another rule over the same
             // edge type can take the edge (ledger row 84).
             let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
@@ -1933,7 +2021,7 @@ fn apply_streaming_rebuild(
             if !already {
                 let newly = g.add_edge(et, s, d);
                 if newly {
-                    prov.insert(&def.name, triple, g.ids, g.syms);
+                    prov.insert(&def.name, triple, g.ids, &g.syms);
                 }
             }
             let is_owned_here = already || prov.contains(&triple);
@@ -2247,6 +2335,21 @@ impl RuleEngine {
         }
     }
 
+    /// The triples whose ownership changed since the last call, each with its
+    /// final state (`true` = some rule owns it, `false` = none does). Relative to
+    /// the provenance the engine was built from.
+    pub fn take_derived_changes(&mut self) -> HashMap<(u32, u32, u32), bool> {
+        std::mem::take(&mut self.owned.journal)
+    }
+
+    /// Every triple any rule owns, from the live provenance.
+    ///
+    /// Empty while provenance bytes are still retained: the caller reads those
+    /// from the snapshot they came from (see [`Self::provenance_is_retained`]).
+    pub fn derived_triples(&self) -> BTreeSet<(u32, u32, u32)> {
+        self.provenance.values().flatten().copied().collect()
+    }
+
     /// O(degree) reverse-index lookup: every provenance triple that touches `node`.
     ///
     /// Dispatches to the lazy-decoded or live index depending on whether
@@ -2364,9 +2467,9 @@ impl RuleEngine {
         // does for the bytes path (ledger row 107).  An as-of handle decoded into
         // its overlay arrives here, not through the bytes path.
         dedup_provenance(&mut prov);
-        let mut owned = BTreeSet::new();
+        let mut owned = OwnedTriples::default();
         for set in prov.values() {
-            owned.extend(set.iter().copied());
+            owned.load(set.iter().copied());
         }
         let indexes = rules
             .iter()
@@ -3178,7 +3281,7 @@ impl RuleEngine {
         dedup_provenance(&mut prov);
 
         for set in prov.values() {
-            self.owned.extend(set.iter().copied());
+            self.owned.load(set.iter().copied());
         }
         let (by_node, rule_intern, intern_rule) = rebuild_by_node(&prov);
         self.provenance = prov;
@@ -3823,7 +3926,7 @@ impl RuleEngine {
             .take()
             .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-        self.reindex_all_load_state(g.ids, g.syms, g.labels, g.props, ivf, hnsw);
+        self.reindex_all_load_state(g.ids, &g.syms, g.labels, g.props, ivf, hnsw);
     }
 
     /// Register a rule and backfill existing nodes.
@@ -3888,9 +3991,9 @@ impl RuleEngine {
             if deferred {
                 // The non-vector legs are O(n) and cheap, and the rule would be
                 // internally inconsistent without them; only the graph waits.
-                index_node_for_rule_deferring_hnsw(id, label_sym, &def, idx, g.syms, g.props);
+                index_node_for_rule_deferring_hnsw(id, label_sym, &def, idx, &g.syms, g.props);
             } else {
-                index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+                index_node_for_rule(id, label_sym, &def, idx, &g.syms, g.props);
             }
         }
 
@@ -3960,7 +4063,7 @@ impl RuleEngine {
                             }
                             let newly = g.add_edge(et, s, d);
                             if newly {
-                                prov.insert(&name, triple, g.ids, g.syms);
+                                prov.insert(&name, triple, g.ids, &g.syms);
                             }
                         }
                         let is_owned_here = already || prov.contains(&triple);
@@ -4028,7 +4131,7 @@ impl RuleEngine {
             let (t, s, d) = triple;
             g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            sets.remove(name, triple, g.ids, g.syms);
+            sets.remove(name, triple, g.ids, &g.syms);
         }
         // Surviving rules that share the same edge_type may derive edges that
         // were previously blocked (add_edge returned false because the deleted
@@ -4981,7 +5084,7 @@ impl RuleEngine {
                     emit: self.emit_deltas,
                     retracted: &mut self.retracted,
                 }
-                .remove(&rule_name, triple, g.ids, g.syms);
+                .remove(&rule_name, triple, g.ids, &g.syms);
             }
         }
 
@@ -5157,7 +5260,7 @@ impl RuleEngine {
                 _ => continue,
             };
             let idx = self.indexes.get_mut(name).unwrap();
-            index_node_for_rule_skipping(id, label_sym, &def, idx, g.syms, g.props, &skip);
+            index_node_for_rule_skipping(id, label_sym, &def, idx, &g.syms, g.props, &skip);
         }
 
         // Fit IVF clusters for approximate rules after reindex (drift reset).
@@ -5262,12 +5365,12 @@ mod tests {
         fn g(&mut self) -> GraphMut<'_> {
             GraphMut {
                 ids: &self.ids,
-                syms: &mut self.syms,
+                syms: (&mut self.syms).into(),
                 labels: &self.labels,
                 props: ColumnsView::owned(&self.props),
-                topo: &mut self.topo,
+                topo: (&mut self.topo).into(),
                 base_topo: None,
-                edge_props: &mut self.eprops,
+                edge_props: (&mut self.eprops).into(),
             }
         }
     }
@@ -6653,7 +6756,7 @@ mod tests {
             let mut g = fx.g();
             eng.create_rule(numeric_rule(), &mut g).unwrap();
             // |12−10| = 2 ≤ 2 → score 0.0 both ways
-            assert!(pair_edges(g.topo, et, a, b));
+            assert!(pair_edges(&g.topo, et, a, b));
         }
 
         // 12.0 (bucket 6) → 16.1 (bucket 8): two buckets away, so the old
@@ -6663,7 +6766,7 @@ mod tests {
         {
             let mut g = fx.g();
             eng.on_node_changed(b, Some(("year", old)), &mut g);
-            assert!(!pair_edges(g.topo, et, a, b));
+            assert!(!pair_edges(&g.topo, et, a, b));
             assert_eq!(g.topo.edge_count(), 0);
         }
         let def = numeric_rule();
@@ -6682,7 +6785,7 @@ mod tests {
         fx.props.set(b, "year", Value::Float(11.9));
         let mut g = fx.g();
         eng.on_node_changed(b, Some(("year", old)), &mut g);
-        assert!(pair_edges(g.topo, et, a, b));
+        assert!(pair_edges(&g.topo, et, a, b));
     }
 
     fn loc_val(lat: f64, lon: f64) -> Value {
@@ -7118,12 +7221,12 @@ mod tests {
                 }
                 let g = GraphMut {
                     ids: &fx.ids,
-                    syms: &mut fx.syms,
+                    syms: (&mut fx.syms).into(),
                     labels: &fx.labels,
                     props: ColumnsView::owned(&fx.props),
-                    topo: &mut fx.topo,
+                    topo: (&mut fx.topo).into(),
                     base_topo: None,
-                    edge_props: &mut fx.eprops,
+                    edge_props: (&mut fx.eprops).into(),
                 };
                 let per_src = compute_desired(rule, &idx, id, true, &g);
                 // Independent brute-force sort: score DESC, dst-key ASC, take k.

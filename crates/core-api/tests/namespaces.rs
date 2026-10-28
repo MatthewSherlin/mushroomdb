@@ -290,6 +290,7 @@ fn write_role(name: &str, labels: &[&str], namespaces: Option<&[&str]>) -> RoleD
             delete_labels: labels_v.clone(),
             create_edge_types: vec![],
             delete_edge_types: vec![],
+            update_edge_types: vec![],
         }),
         ..role(name, labels, namespaces)
     }
@@ -870,15 +871,14 @@ fn removing_the_ns_property_is_refused() {
         other => panic!("expected NamespaceImmutable, got {other:?}"),
     }
 
-    // (c) There is no Cypher path to a property removal at all — the dialect has
-    // no REMOVE — so the statement is a query error, not a second way round the
-    // refusal. Pinned so that adding REMOVE has to decide about `ns` on purpose.
+    // (c) Cypher `REMOVE` (QL-05) submits the same `RemoveProp`, so it meets the
+    // same refusal: the statement fails with NamespaceImmutable and applies nothing.
     let err = db
         .query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params())
-        .expect_err("the dialect has no REMOVE");
+        .expect_err("REMOVE n.ns must be refused");
     assert!(
-        matches!(err, GraphError::QueryError { .. }),
-        "expected a query error, got {err:?}"
+        matches!(err, GraphError::NamespaceImmutable { .. }),
+        "expected NamespaceImmutable, got {err:?}"
     );
 
     // The node is untouched, and stays untouched across a reopen — this is the

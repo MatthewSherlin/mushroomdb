@@ -15,7 +15,7 @@ const page = readFileSync(join(here, "../../../docs/site/typescript.md"), "utf8"
 
 // `private` is a compile-time word in TypeScript: these are on the
 // prototype at run time, but are not part of what a caller uses.
-const PRIVATE = ["url", "wsUrl", "authHeaders", "fetchJson", "checkPathSeg"];
+const PRIVATE = ["url", "wsUrl", "authHeaders", "fetchJson", "checkPathSeg", "txJson"];
 
 const methods = Object.getOwnPropertyNames(MushroomClient.prototype)
   .filter((name) => name !== "constructor" && !PRIVATE.includes(name))

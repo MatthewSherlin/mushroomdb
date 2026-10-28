@@ -25,16 +25,19 @@ document is the binding contract for how the snapshot and WAL formats evolve.
 | V8 | mmap-able zero-copy rkyv sections; every string column carries a full copy of the string table |
 | V9 (default) | V8's container with one shared string table (section 12); every string column's own table is empty |
 | V10 | V9's container, byte for byte. Written only by a store that has called `enable_multiplicity()`; it declares that the store's WAL may carry discriminant 23 |
+| V11 (0.10+) | V9's container plus section 18, with the five 0.10 value types allowed in section 1. Written only by a store that has stored a `Date`, `LocalDateTime`, `DateTime`, `Duration` or `Binary` value, or declared a unique constraint or a range index; it declares that the store's WAL may carry those values and discriminants 24–27. Sticky: see *V11 is opt-in and sticky* below |
 
-The current encoder writes **V9** for every store, and **V10** only for a store
-that has opted in to insert-count multiplicity. The decoder supports V5 through
-V10. V5–V8 stores are **automatically migrated** to V9 on `GraphDb::open` (see
-Automatic migration below); a V10 store is already current and is never
-rewritten down.
+The current encoder writes **V9** for every store, **V10** only for a store
+that has opted in to insert-count multiplicity, and **V11** only for a store
+that has opted in to a 0.10 feature (a V11 store that also counts multiplicity
+stays V11). The decoder supports V5 through V11. V5–V8 stores are
+**automatically migrated** to V9 on `GraphDb::open` (see Automatic migration
+below); a V10 or V11 store is already current and is never rewritten down.
 
-V8, V9 and V10 are the *same container* — same magic, header page, directory
-entries and per-section CRC — and all three decode through `MappedBase`. The
-version still moves each time, because each step is not backward-safe:
+V8, V9, V10 and V11 are the *same container* — same magic, header page,
+directory entries and per-section CRC — and all four decode through
+`MappedBase`. The version still moves each time, because each step is not
+backward-safe:
 
 - A V8 reader opening a V9 snapshot would find every string column's own table
   empty and silently drop every string property. It refuses with
@@ -42,17 +45,29 @@ version still moves each time, because each step is not backward-safe:
 - A pre-v0.6.10 reader opening a V10 store would meet WAL discriminant 23 and
   truncate the WAL at it (see *Discriminant 23 is opt-in* below). It refuses
   with `snapshot: unsupported version 10` instead, and never opens the WAL.
+- A 0.9.x reader opening a V11 store would meet a WAL frame it cannot decode —
+  a 0.10 value (bincode tags 6–10) or a constraint or range-index declaration
+  (discriminants 24–27) — and truncate the WAL at it. It refuses with
+  `snapshot: unsupported version 11` instead, and never opens the WAL.
 
-V10 adds no section, no field and no byte of data. Which version a snapshot is
-written at is decided in one place, `snapshot::version_for(multiplicity)`.
+V10 adds no section, no field and no byte of data. V11 adds section 18 and
+lets section 1 hold the 0.10 value types (see the section table). Which version
+a snapshot is written at is decided in one place,
+`snapshot::version_for(StoreFeatures)`.
 
-#### V9 / V10 wire description
+A snapshot version this binary does not know is refused with `snapshot:
+unsupported version N`; for a version above 11, 0.10 adds `— this store was
+written by a newer mushroomdb than this binary. To read it, upgrade your
+binary. Downgrade is not supported: see docs/format-stability.md.`
+
+#### V9 / V10 / V11 wire description
 
 ```text
 [0..4]         magic "GDB1"
-[4..6]         VERSION = 9, or 10 on a multiplicity-enabled store (u16 LE);
-               V8 wrote 8 into the same container
-[6..8]         section_count (u16 LE) — 14 since 0.7.2; one more for a snapshot that kept its WAL, one more when the store declares a full-text pair, and one more (0.9.2+) when its state has had the lost-provenance repair; 13 before
+[4..6]         VERSION = 9, 10 on a multiplicity-enabled store, or 11 on a
+               store that has opted in to a 0.10 feature (u16 LE); V8 wrote 8
+               into the same container
+[6..8]         section_count (u16 LE) — 14 since 0.7.2; one more for a snapshot that kept its WAL, one more when the store declares a full-text pair, one more (0.9.2+) when its state has had the lost-provenance repair, one more (0.10+) when the state has a rule-derived edge, and one more (V11 only) for the declarations; 13 before
 [8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
 [8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
 [..4096]       zero-pad to complete the 4 KB header page
@@ -64,7 +79,7 @@ Section ids (fixed):
 | ID | Name | Encoding |
 |----|------|----------|
 | 0  | TOPOLOGY   | rkyv `CsrData` (zero-copy archived CSR) |
-| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store) |
+| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store). In V11 a column of `Date`, `LocalDateTime`, `DateTime`, `Duration` or `Binary` values — or a mixed column holding one — is written in the existing `Mixed` shape, a bincode `HashMap<u32, Value>` whose values use bincode tags 6–10; the archived layout does not change. Any other version refuses to write one |
 | 2  | IDS        | rkyv `IdMapData` (zero-copy archived id map) |
 | 3  | SYMS       | rkyv `InternerData` (zero-copy archived symbol interner) |
 | 4  | META       | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
@@ -80,6 +95,8 @@ Section ids (fixed):
 | 14 | WAL_MARK   | 20 bytes: magic `MWAL`, the length of WAL the snapshot holds (u64 LE), a CRC32 of all of it, a CRC32 of the 16 bytes before. Optional: written only by a snapshot that keeps its WAL (0.7.2+). With it, an open counts the frames the snapshot holds and applies only the declarations among them. A snapshot without it, and a reader that does not know the id, replay the whole WAL over the snapshot. A mark that does not read back is ignored the same way at open, though `verify` reports its section as failed |
 | 15 | EDGES_SWEPT | 4 bytes, `MSWP`. Written by every snapshot from 0.7.2 on. It says the writer removes a deleted node's edges from the snapshot it was working over, so the topology holds no edge to or from a retired id. An open of a snapshot without it — one 0.7.1 or earlier wrote — looks for such edges and drops them (ledger row 95) |
 | 16 | PROV_RECONCILED | 4 bytes, `MREC`. Optional (0.9.2+). It says the state the snapshot holds has had the lost-provenance repair of ledger rows 111 and 113: no rule counts an edge the graph does not hold, and no top-k source is short of an edge 0.8.0 took from it. Written only by a writer that ran the repair, opened a snapshot that says so, or opened none. An open of a snapshot with it skips the repair, which on such a state changes nothing; an open of one without it — or a reader that does not know the id — runs the repair at the first write (ledger row 116) |
+| 17 | DERIVED_BITS | Magic `MDRV`, then one bit per `u32` of the TOPOLOGY section (bit `i` is bit `i % 8` of byte `i / 8` after the magic). Bit `i` is set when the four bytes at offset `4 * i` of the TOPOLOGY section are a neighbour entry — in an out-row or in an in-row — of an edge some rule owns. Optional (0.10+): written by a snapshot whose state has at least one such edge, left out otherwise. With it, a reader answers whether a base edge is rule-derived from the bit at that edge's own entry, with no search and nothing built at open or first read. A snapshot without it — one an earlier version wrote, or one with no derived edge — is read by building the answer from PROVENANCE at the first read that needs it. A reader that does not know the id ignores it; a 0.9.x writer snapshotting such a store leaves it out, so it never goes stale beside the topology it indexes. Unlike the other large sections it is validated eagerly, once per base on first use: the magic, the length (the magic plus one bit per `u32` of the topology section) and the CRC32 against its directory entry. On any mismatch the reader warns once and answers from PROVENANCE instead, so it never returns a wrong answer from damaged bits, and `verify` reports the mismatch |
+| 18 | DECLARATIONS | Magic `MDCL`, a `u16` LE section version (2 in 0.10), then the fields of `SnapshotDeclarations` one after another in bincode: `multiplicity: bool`, `constraints: Vec<UniqueConstraint { name, label, field }>` (version 1), then `indexes: Vec<(label, field)>` and `range_indexes: Vec<(name, label, field)>` (version 2). V11 only: every V11 snapshot writes it and no other version does, so a store that never opted in writes what 0.9.x writes. The open applies these declarations at the point of the WAL the snapshot was taken at — after the frames a keep-WAL snapshot holds, before the first one it does not — and takes `multiplicity` as the V10 stamp's fact (a V11 store cannot say it with its version). So a snapshot whose WAL was archived away before its baseline WAL was written still carries the store's constraints, indexes and opt-in. **Adding a field:** append it, with a default that means "not declared", and bump the version; a reader decodes the fields it knows in order, reads a field the payload ends before as its default (an older writer), and ignores bytes after the last field it knows (a newer writer). Any other change needs a new section id. Small: its CRC32 is checked on every read, and a section that fails it, has no magic or version, or whose fields do not decode, refuses the open rather than drop a constraint. A reader that does not know the id is a reader that refuses V11 already |
 
 Resolution rule for string columns, in one sentence: **if the shared table is
 present it is the table; otherwise the column's own `strings` is.** That is what
@@ -95,7 +112,7 @@ Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC
 on first access.
 
 Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
-IVF_STATE=10, STRINGS=12, FULLTEXT=13, WAL_MARK=14, EDGES_SWEPT=15, PROV_RECONCILED=16) **skip** the per-touch CRC on the normal query path. A full-section
+IVF_STATE=10, STRINGS=12, FULLTEXT=13, WAL_MARK=14, EDGES_SWEPT=15, PROV_RECONCILED=16) **skip** the per-touch CRC on the normal query path (DERIVED_BITS=17 is also large but is the exception: it is validated eagerly, once per base, as its row in the table above says; DECLARATIONS=18 is small and checks its own CRC on every read). A full-section
 hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
 at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
 root-pointer lookup, no pointer-walk). This is sound for encoder-produced
@@ -121,7 +138,7 @@ the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
 
-WAL record discriminants 0–23 are append-only: once assigned, a discriminant
+WAL record discriminants 0–27 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
 
@@ -188,6 +205,61 @@ One case does leave the store opted out: a failure with no archive present and
 no record written. A stray V10 snapshot remains, and that store's next snapshot
 rewrites it at V9.
 
+#### V11 is opt-in and sticky
+
+The 0.10 value types (`Date`, `LocalDateTime`, `DateTime`, `Duration`,
+`Binary`: bincode tags 6–10) and the 0.10 declarations (`CreateConstraint` 24,
+`DropConstraint` 25, `EnableRangeIndex` 26, `DisableRangeIndex` 27) are V11-only
+records: 0.9.x cannot decode a frame that carries one. There is no call to opt
+in. A store opts in by using a feature, at its **first V11-only record of any
+kind** — on every write path (`insert_node`, `set_prop`, `set_props`, batches,
+ingest, Cypher, HTTP, Python, `create_constraint`, `enable_range_index`):
+
+- That write first takes a **V11 snapshot that keeps the WAL**, then appends its
+  record, exactly as `enable_multiplicity()` does for V10. The store is never in
+  a state where the record is on disk without the V11 stamp. On a large store the
+  first such write costs one full snapshot write. A read that only takes a typed
+  parameter changes nothing.
+- A write refused before its record is built — an over-size `Binary`, a
+  `DateTime` offset beyond ±18:00, a constraint whose data conflicts — does not
+  upgrade. A write refused after the upgrade (a unique-constraint violation)
+  leaves the store V11 with nothing V11 written: the safe direction.
+- If the V11 snapshot fails, the write fails and nothing is appended. The handle
+  stays non-V11 unless the V11 snapshot did reach disk, in which case it stays
+  V11 (and so does every later snapshot it takes); that costs an older reader a
+  refusal and nothing else.
+- The WAL is fsynced before the upgrade's snapshot is written, so the snapshot
+  holds no frame that is not durable. A group commit (`SharedDb::submit_batch`,
+  `GraphDb::commit_group`) whose submissions carry the store's first 0.10 value
+  upgrades **before the group's first append**, so the snapshot never holds a
+  submission of that group: if the group fsync then fails, every submission of
+  the group is gone, as the group-commit contract says.
+- **V11 is sticky.** Every later snapshot is V11, whatever the store's data
+  holds: dropping the last constraint or range index, or overwriting the last
+  typed value, does not move it back, because its WAL and archives still hold
+  V11 records. An open treats a store as V11 when its snapshot is V11 or when its
+  WAL replay (at open, on refresh, or in `open_at`) meets a V11-only record.
+  `GraphDb::is_v11()` reports it.
+- A 0.9.x binary opening a V11 store stops at `snapshot: unsupported version 11`
+  and **leaves the WAL byte-identical**.
+- **0.9.x `open_at` / `mushroomdb asof`.** A 0.9.x `open_at` reaches a commit
+  inside a WAL archive by replaying the archives from empty state, on the
+  strength of the `wal.genesis` marker alone and without reading `snapshot.bin`;
+  its WAL decoder silently drops every frame from the first one it cannot read.
+  Beside archives that hold V11 records that would answer with the wrong
+  history. So a V11 store keeps its genesis marker as **`wal.genesis.v11`**,
+  renamed from `wal.genesis` before any snapshot a V11 store takes (and so before
+  any archive can hold a V11 record). 0.9.x does not read that name: it refuses
+  every archive-resident commit with `commit N is out of range`, and every other
+  commit goes through the snapshot, which it refuses with `snapshot: unsupported
+  version 11`. 0.10 reads either name. Backups and restores copy both.
+
+A store that never writes a V11-only record keeps writing V9 (or V10), byte for
+byte what 0.9.x writes, and stays readable by 0.9.x indefinitely. There is no
+call that moves a V11 store back, and no downgrade path for one.
+
+`Value::Null` is never stored, in V11 as before: a write carrying one is refused.
+
 Which `Intern` records a `Batch` frame carries, and where they sit inside it,
 is **not** part of the format contract — only that replaying a frame's records
 in order reproduces the write-time symbol assignment. Since v0.5.0 a `Batch`
@@ -205,6 +277,7 @@ files alongside `snapshot.bin` and `wal.bin`:
 | `wal.<N>.archive` | each `archive_wal` snapshot | renamed WAL file; N = cumulative end-frame index |
 | `wal.floor` | first retention prune | 8-byte LE u64 horizon floor |
 | `wal.genesis` | first archive, also the store's first-ever snapshot | empty marker: archive chain covers genesis |
+| `wal.genesis.v11` | the same, on a V11 store (0.10+); `wal.genesis` is renamed to it | the same marker under a name 0.9.x does not read (see *V11 is opt-in and sticky*) |
 
 The genesis marker is written only when the first archive snapshot is also the
 store's very first snapshot (no `snapshot.bin` existed before it).  This rule
@@ -256,9 +329,9 @@ re-snapshot before upgrading.
    log-and-continue is never used.
 4. The next clean open at the current VERSION deletes the `.bak`.
 
-A V10 (multiplicity-enabled) snapshot is **not** migrated: it is at or above the
-version this binary writes, so it is treated as current and left alone. Steps 1
-and 2 would only rewrite it as another V10 snapshot.
+A V10 (multiplicity-enabled) or V11 snapshot is **not** migrated: it is at or
+above the version this binary writes, so it is treated as current and left alone.
+Steps 1 and 2 would only rewrite it as another V10 or V11 snapshot.
 
 > **Production note — ANN index re-fit cost.** Stores with approximate
 > (`approximate: true`) rules must re-fit k-means ANN indexes during migration

@@ -1,0 +1,396 @@
+//! `durable_wal_position` reports only fsynced WAL bytes, ending on a frame
+//! boundary, and starts a new generation whenever `wal.bin` is replaced.
+//!
+//! The backup worker ships exactly what this position says, so every way a
+//! byte reaches the WAL — a direct write, a group commit, a relaxed write, a
+//! failed group fsync, a snapshot, a reopen — is pinned here.
+
+use core_storage::wal::decode_all;
+use mushroomdb::{
+    disk_snapshot_ident, BatchOp, FsyncPolicy, SharedDb, SnapshotOptions, SnapshotStop, WalPosition,
+};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+fn tmp(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "graphdb-durable-{}-{}-{}",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+fn wal_len(dir: &Path) -> u64 {
+    std::fs::metadata(dir.join("wal.bin"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// The position ends on a frame boundary of the file on disk.
+fn assert_on_frame_boundary(dir: &Path, pos: WalPosition) {
+    let bytes = std::fs::read(dir.join("wal.bin")).unwrap_or_default();
+    assert!(pos.len as usize <= bytes.len(), "{pos:?} past the file");
+    let (_, valid) = decode_all(&bytes[..pos.len as usize]);
+    assert_eq!(valid as u64, pos.len, "{pos:?} is not on a frame boundary");
+}
+
+fn insert(key: &str) -> Vec<BatchOp> {
+    vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: key.into(),
+        props: vec![],
+    }]
+}
+
+#[test]
+fn a_strict_direct_write_is_durable_up_to_its_last_frame() {
+    let dir = tmp("strict");
+    let db = SharedDb::open(&dir).unwrap();
+    let before = db.durable_wal_position();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let pos = db.durable_wal_position();
+    assert_eq!(pos.generation, before.generation);
+    assert!(pos.len > before.len);
+    assert_eq!(pos.len, wal_len(&dir));
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
+    assert!(!pos.snapshot_in_progress);
+    assert_on_frame_boundary(&dir, pos);
+}
+
+#[test]
+fn a_group_commit_is_durable_once_its_fsync_returns() {
+    let dir = tmp("group");
+    let db = SharedDb::open(&dir).unwrap();
+    db.submit_batch(insert("a")).unwrap();
+    db.submit_batch(insert("b")).unwrap();
+    let pos = db.durable_wal_position();
+    assert_eq!(pos.len, wal_len(&dir));
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
+    assert_on_frame_boundary(&dir, pos);
+}
+
+#[test]
+fn a_relaxed_write_is_not_durable_until_something_fsyncs_it() {
+    let dir = tmp("relaxed");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let synced = db.durable_wal_position();
+    db.write().set_fsync_policy(FsyncPolicy::Relaxed);
+    db.write().insert_node("A", "b", vec![]).unwrap();
+    db.submit_batch(insert("c")).unwrap();
+    assert!(
+        wal_len(&dir) > synced.len,
+        "the relaxed writes reached the file"
+    );
+    assert_eq!(
+        db.durable_wal_position(),
+        synced,
+        "bytes no fsync covered must not count as durable"
+    );
+    // The next fsync covers everything before it.
+    db.write().set_fsync_policy(FsyncPolicy::Strict);
+    db.write().insert_node("A", "d", vec![]).unwrap();
+    assert_eq!(db.durable_wal_position().len, wal_len(&dir));
+}
+
+#[test]
+fn a_failed_group_fsync_leaves_the_position_where_it_was() {
+    let dir = tmp("failed-fsync");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail2 = Arc::clone(&fail);
+    let db = SharedDb::open_with_test_sync(&dir, move |path| {
+        if fail2.load(Ordering::Acquire) {
+            Err(std::io::Error::other("injected fsync failure"))
+        } else {
+            core_storage::sync_wal_at(path)
+        }
+    })
+    .unwrap();
+    db.submit_batch(insert("ok")).unwrap();
+    let synced = db.durable_wal_position();
+    assert_eq!(synced.len, wal_len(&dir));
+    fail.store(true, Ordering::Release);
+    assert!(db.submit_batch(insert("lost")).is_err());
+    assert_eq!(db.durable_wal_position(), synced);
+}
+
+#[test]
+fn a_truncating_snapshot_starts_a_new_generation_at_its_baseline() {
+    let dir = tmp("truncate");
+    let db = SharedDb::open(&dir).unwrap();
+    for k in ["a", "b", "c"] {
+        db.write().insert_node("A", k, vec![]).unwrap();
+    }
+    let before = db.durable_wal_position();
+    db.write().snapshot().unwrap();
+    let pos = db.durable_wal_position();
+    assert_eq!(pos.generation, before.generation + 1);
+    assert_eq!(pos.len, wal_len(&dir), "the baseline is written durably");
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
+    assert!(!pos.snapshot_in_progress);
+    assert_on_frame_boundary(&dir, pos);
+}
+
+#[test]
+fn an_archiving_snapshot_starts_a_new_generation() {
+    let dir = tmp("archive");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let before = db.durable_wal_position();
+    db.write()
+        .snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: true,
+        })
+        .unwrap();
+    let pos = db.durable_wal_position();
+    assert!(pos.generation > before.generation);
+    assert_eq!(pos.len, wal_len(&dir));
+    // Frames keep counting across the archive: the archived ones are still
+    // addressable history.
+    assert!(pos.frames >= before.frames);
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
+}
+
+#[test]
+fn a_snapshot_that_keeps_the_wal_keeps_the_generation() {
+    let dir = tmp("keep");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let before = db.durable_wal_position();
+    db.write()
+        .snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            archive_wal: false,
+        })
+        .unwrap();
+    let pos = db.durable_wal_position();
+    assert_eq!(pos.generation, before.generation);
+    assert_eq!(pos.len, before.len);
+    assert!(!pos.snapshot_in_progress);
+}
+
+#[test]
+fn a_snapshot_that_fails_clears_its_in_progress_mark() {
+    let dir = tmp("stopped");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let before = db.durable_wal_position();
+    {
+        let mut w = db.write();
+        w.stop_next_snapshot(SnapshotStop::BeforeWalReplacement);
+        assert!(w.snapshot().is_err());
+    }
+    let pos = db.durable_wal_position();
+    assert!(!pos.snapshot_in_progress, "the mark must drop on error");
+    assert_eq!(
+        pos.generation, before.generation,
+        "the WAL was not replaced"
+    );
+}
+
+#[test]
+fn a_reopen_starts_at_the_end_of_what_it_replayed() {
+    let dir = tmp("reopen");
+    {
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().set_fsync_policy(FsyncPolicy::Relaxed);
+        db.write().insert_node("A", "a", vec![]).unwrap();
+        db.write().insert_node("A", "b", vec![]).unwrap();
+        assert_eq!(db.durable_wal_position().len, 0);
+    }
+    let db = SharedDb::open(&dir).unwrap();
+    let pos = db.durable_wal_position();
+    assert_eq!(pos.generation, 0);
+    assert_eq!(
+        pos.len,
+        wal_len(&dir),
+        "the first read fsyncs what the open replayed"
+    );
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
+    assert_on_frame_boundary(&dir, pos);
+}
+
+#[test]
+fn reading_the_position_never_waits_for_the_write_lock() {
+    let dir = tmp("nolock");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let guard = db.write();
+    // Held write guard: a lock-taking read here would deadlock the test.
+    let pos = db.durable_wal_position();
+    assert!(pos.len > 0);
+    drop(guard);
+}
+
+#[test]
+fn a_snapshot_names_the_snapshot_on_disk() {
+    let dir = tmp("snapident");
+    let db = SharedDb::open(&dir).unwrap();
+    assert_eq!(db.durable_wal_position().snapshot, None);
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    db.write().snapshot().unwrap();
+    let ident = disk_snapshot_ident(&dir).unwrap();
+    assert!(ident.is_some());
+    assert_eq!(db.durable_wal_position().snapshot, ident);
+}
+
+/// Another handle on the same store (a separate open description of the lock
+/// file, exactly as another process has) snapshots. Until this handle catches
+/// up, its position names the old snapshot — which is how a reader can tell
+/// its offsets describe a file that is gone. After the refresh it is in a new
+/// generation, and once vouched for, durable to the end of the peer's WAL.
+#[test]
+fn a_peer_snapshot_shows_until_the_handle_catches_up() {
+    let dir = tmp("peer");
+    let server = SharedDb::open(&dir).unwrap();
+    server.write().insert_node("A", "a", vec![]).unwrap();
+    let before = server.durable_wal_position();
+    {
+        let peer = SharedDb::open(&dir).unwrap();
+        peer.write().insert_node("A", "b", vec![]).unwrap();
+        peer.write().snapshot().unwrap();
+        peer.write().insert_node("A", "c", vec![]).unwrap();
+    }
+    let disk = disk_snapshot_ident(&dir).unwrap();
+    assert_ne!(
+        server.durable_wal_position().snapshot,
+        disk,
+        "behind the disk"
+    );
+    server.refresh_if_stale_now();
+    let pos = server.durable_wal_position();
+    assert_eq!(pos.snapshot, disk);
+    assert!(pos.generation > before.generation);
+    assert_eq!(
+        pos.len,
+        wal_len(&dir),
+        "the peer's WAL is fsynced and vouched for"
+    );
+    assert_eq!(pos.frames, Some(server.read().wal_total_commits().unwrap()));
+    assert_on_frame_boundary(&dir, pos);
+}
+
+/// A handle that reloaded while another process was between writing its
+/// snapshot and replacing the WAL holds the new snapshot's identity and an
+/// offset into the old WAL file. When the WAL file under the name changes —
+/// here replaced by a longer copy, so a length check alone would read a tail
+/// at the old offset — the refresh must reload, and the position must name
+/// the file on disk.
+#[cfg(unix)]
+#[test]
+fn a_replaced_wal_file_reloads_even_when_it_is_longer() {
+    let dir = tmp("walident");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    {
+        let peer = SharedDb::open(&dir).unwrap();
+        for k in ["b", "c", "d"] {
+            peer.write().insert_node("A", k, vec![]).unwrap();
+        }
+    }
+    let copy = dir.join("wal.copy");
+    std::fs::copy(dir.join("wal.bin"), &copy).unwrap();
+    std::fs::rename(&copy, dir.join("wal.bin")).unwrap();
+    let before = a.durable_wal_position();
+    assert_ne!(before.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+    a.refresh_if_stale_now();
+    let pos = a.durable_wal_position();
+    assert!(pos.generation > before.generation, "the handle reloaded");
+    assert_eq!(pos.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+    assert_eq!(a.read().node_count(), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_first_append_learns_which_wal_file_it_created() {
+    let dir = tmp("walcreate");
+    let db = SharedDb::open(&dir).unwrap();
+    assert_eq!(db.durable_wal_position().wal, None);
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let pos = db.durable_wal_position();
+    assert!(pos.wal.is_some());
+    assert_eq!(pos.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+}
+
+/// Replace this store's `wal.bin` with the WAL of another store that holds
+/// `keys` under the label `B`, and return the replacement's length. The other
+/// label interns differently, so frames this store's handle encodes against
+/// its own interner do not decode on top of the replacement.
+#[cfg(unix)]
+fn replace_wal_with_another_stores(dir: &Path, name: &str, keys: &[&str]) -> u64 {
+    let other = tmp(name);
+    {
+        let db = SharedDb::open(&other).unwrap();
+        for k in keys {
+            db.write().insert_node("B", k, vec![]).unwrap();
+        }
+    }
+    let copy = dir.join("wal.copy");
+    std::fs::copy(other.join("wal.bin"), &copy).unwrap();
+    std::fs::rename(&copy, dir.join("wal.bin")).unwrap();
+    let _ = std::fs::remove_dir_all(&other);
+    wal_len(dir)
+}
+
+/// A write scope appends at this handle's cursor, so it must not append to a
+/// WAL file that is not the one the cursor describes. When a peer replaced
+/// the WAL with a file of exactly the cursor's length, no length check can
+/// tell; only the file's identity can. Frames appended on top of the wrong
+/// file are encoded against the wrong state, and the store no longer opens.
+#[cfg(unix)]
+#[test]
+fn a_write_after_an_equal_length_wal_replacement_leaves_an_openable_store() {
+    let dir = tmp("waleqwrite");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    let cursor = wal_len(&dir);
+    let replaced = replace_wal_with_another_stores(&dir, "waleqother", &["b"]);
+    assert_eq!(replaced, cursor, "the replacement is the cursor's length");
+    assert_ne!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap()
+    );
+    a.write().insert_node("A", "c", vec![]).unwrap();
+    assert_eq!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap(),
+        "the handle reloaded before writing"
+    );
+    assert_eq!(a.read().node_count(), 2);
+    drop(a);
+    let reopened = SharedDb::open(&dir).expect("the store still opens");
+    assert_eq!(reopened.read().node_count(), 2);
+}
+
+/// The same, with a replacement longer than the cursor.
+#[cfg(unix)]
+#[test]
+fn a_write_after_a_longer_wal_replacement_leaves_an_openable_store() {
+    let dir = tmp("wallongwrite");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    let cursor = wal_len(&dir);
+    let replaced = replace_wal_with_another_stores(&dir, "wallongother", &["b", "d"]);
+    assert!(
+        replaced > cursor,
+        "the replacement is longer than the cursor"
+    );
+    a.write().insert_node("A", "c", vec![]).unwrap();
+    assert_eq!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap(),
+        "the handle reloaded before writing"
+    );
+    assert_eq!(a.read().node_count(), 3);
+    drop(a);
+    let reopened = SharedDb::open(&dir).expect("the store still opens");
+    assert_eq!(reopened.read().node_count(), 3);
+}

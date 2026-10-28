@@ -416,6 +416,13 @@ const FULLTEXT_BLOB_VERSION: u32 = 1;
 /// larger than its encoding, so the count alone is not a size to allocate.
 const BLOB_PREALLOC: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`FulltextIndex::remove_node_field`] walked a field's
+    /// whole vocabulary on this thread.
+    static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Incremental inverted index for full-text BM25 search.
 ///
 /// Enabled per `(label, field)` pair via [`FulltextIndex::enable`].
@@ -725,8 +732,61 @@ impl FulltextIndex {
         }
     }
 
+    /// Remove `node_id`'s tokens in `field`, given `indexed`: the value they
+    /// were indexed from, which is the stored value before the write that
+    /// replaces or removes it. This costs the words of that value, where
+    /// [`FulltextIndex::remove_node_field`] walks the field's whole
+    /// vocabulary — a cost that grows with the store, paid on every commit
+    /// that rewrites an indexed property.
+    ///
+    /// The result is the same as `remove_node_field`'s whatever `indexed`
+    /// is. A document's postings hold exactly its document length in
+    /// positions, so when the positions removed through `indexed`'s words
+    /// are not that length, `indexed` was not what is indexed, and the rest
+    /// of the document is found by the walk.
+    pub fn remove_node_value(&mut self, node_id: u32, field: &str, indexed: Option<&Value>) {
+        let expected = self
+            .doc_len
+            .get(field)
+            .and_then(|lens| lens.get(&node_id))
+            .copied()
+            .unwrap_or(0) as usize;
+        let mut removed = 0usize;
+        if let (Some(value), Some(col)) = (indexed, self.postings.get_mut(field)) {
+            let words: BTreeSet<String> = value_tokens_stemmed_with_positions(value)
+                .into_iter()
+                .map(|(word, _)| word)
+                .collect();
+            for word in &words {
+                if let Some(docs) = col.get_mut(word) {
+                    if let Some(positions) = docs.remove(&node_id) {
+                        removed += positions.len();
+                    }
+                    if docs.is_empty() {
+                        col.remove(word);
+                    }
+                }
+            }
+            if col.is_empty() {
+                self.postings.remove(field);
+            }
+        }
+        if removed != expected {
+            self.remove_node_field(node_id, field);
+            return;
+        }
+        if let Some(lens) = self.doc_len.get_mut(field) {
+            lens.remove(&node_id);
+            if lens.is_empty() {
+                self.doc_len.remove(field);
+            }
+        }
+    }
+
     /// Remove all tokens for `node_id` in `field`'s posting list.
     pub fn remove_node_field(&mut self, node_id: u32, field: &str) {
+        #[cfg(test)]
+        SCANS.with(|s| s.set(s.get() + 1));
         if let Some(col) = self.postings.get_mut(field) {
             col.retain(|_, node_map| {
                 node_map.remove(&node_id);
@@ -1089,6 +1149,10 @@ mod tests {
         tokenize(s)
     }
 
+    fn scans() -> u64 {
+        SCANS.with(|s| s.get())
+    }
+
     #[test]
     fn tokenizer_basic() {
         assert_eq!(toks("Hello, World!"), vec!["hello", "world"]);
@@ -1399,6 +1463,119 @@ mod tests {
         idx.add_tokens(0, "f", &Value::Str("hello world".into()));
         idx.remove_node_field(0, "f");
         assert!(idx.search("f", "hello", 0).is_empty());
+    }
+
+    /// A store-sized vocabulary: `n` documents, each with a word of its own
+    /// and two words every document shares.
+    fn wide_index(n: u32) -> FulltextIndex {
+        let mut idx = FulltextIndex::new();
+        idx.enable("A", "f");
+        for id in 0..n {
+            idx.add_tokens(id, "f", &Value::Str(format!("person {id} person")));
+        }
+        idx
+    }
+
+    #[test]
+    fn removing_a_document_by_its_value_walks_only_its_words() {
+        let mut idx = wide_index(2_000);
+        let before = scans();
+        idx.remove_node_value(7, "f", Some(&Value::Str("person 7 person".into())));
+        assert_eq!(scans(), before, "the vocabulary was walked");
+        assert!(!idx.has_doc(7, "f"));
+        assert!(idx.search("f", "7", 0).is_empty());
+        assert_eq!(idx.search("f", "person", 0).len(), 1_999);
+    }
+
+    #[test]
+    fn removing_by_a_value_that_is_not_the_indexed_one_still_removes_everything() {
+        let mut idx = wide_index(50);
+        let mut want = idx.clone();
+        want.remove_node_field(7, "f");
+        // A stale value (one word in common), a disjoint one, and none at all.
+        for stale in [
+            Some(Value::Str("person 8".into())),
+            Some(Value::Int(1)),
+            None,
+        ] {
+            let mut got = idx.clone();
+            let before = scans();
+            got.remove_node_value(7, "f", stale.as_ref());
+            assert_eq!(got, want, "stale value {stale:?}");
+            assert_eq!(scans(), before + 1, "a mismatch falls back to the walk");
+        }
+        // A value with no words, and a node that was never indexed.
+        idx.add_tokens(60, "f", &Value::Int(3));
+        let mut want = idx.clone();
+        want.remove_node_field(60, "f");
+        want.remove_node_field(61, "f");
+        idx.remove_node_value(60, "f", Some(&Value::Int(3)));
+        idx.remove_node_value(61, "f", Some(&Value::Str("person".into())));
+        assert_eq!(idx, want);
+    }
+
+    /// The differential: random documents written, rewritten and removed
+    /// through `remove_node_value` + `add_tokens` equal an index rebuilt from
+    /// the final values, and answer every query the same.
+    #[test]
+    fn rewriting_by_value_equals_a_rebuild_over_random_writes() {
+        let words = ["graph", "graphs", "run", "running", "rust", "db", "x", ""];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let mut idx = FulltextIndex::new();
+        idx.enable("A", "f");
+        let mut values: BTreeMap<u32, Value> = BTreeMap::new();
+        let before = scans();
+        for _ in 0..3_000 {
+            let id = next(40) as u32;
+            let value = match next(6) {
+                0 => None,
+                1 => Some(Value::Int(next(9) as i64)),
+                2 => Some(Value::List(
+                    (0..next(3))
+                        .map(|_| Value::Str(words[next(8) as usize].into()))
+                        .collect(),
+                )),
+                _ => Some(Value::Str(
+                    (0..next(5))
+                        .map(|_| words[next(8) as usize])
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )),
+            };
+            idx.remove_node_value(id, "f", values.get(&id));
+            match value {
+                Some(v) => {
+                    idx.add_tokens(id, "f", &v);
+                    values.insert(id, v);
+                }
+                None => {
+                    values.remove(&id);
+                }
+            }
+        }
+        assert_eq!(scans(), before, "every removal knew its value");
+        let mut rebuilt = FulltextIndex::new();
+        rebuilt.enable("A", "f");
+        for (&id, v) in &values {
+            rebuilt.add_tokens(id, "f", v);
+        }
+        assert_eq!(idx, rebuilt);
+        for q in [
+            "graph",
+            "run",
+            "gra*",
+            "\"graph run\"",
+            "rust -db",
+            "x OR db",
+        ] {
+            assert_eq!(idx.search("f", q, 0), rebuilt.search("f", q, 0), "{q}");
+        }
     }
 
     #[test]

@@ -15,7 +15,11 @@ import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import WS from "ws";
 import { inject, describe, it, expect, beforeAll } from "vitest";
-import { MushroomClient, MushroomError } from "../src/client.js";
+import {
+  MushroomClient,
+  MushroomError,
+  TransactionConflictError,
+} from "../src/index.js";
 import type { WsConstructor } from "../src/ws.js";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +93,13 @@ describe.skipIf(NO_SERVER)("query", () => {
     expect(result.rows.length).toBe(1);
     expect(result.rows[0]![0]).toBe("person-01");
   });
+
+  it("returns a null list element as null, from a query without MATCH", async () => {
+    const result = await client.query("RETURN [1, null] AS l, null AS v");
+
+    expect(result.columns).toEqual(["l", "v"]);
+    expect(result.rows).toEqual([[[1, null], null]]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -122,6 +133,26 @@ describe.skipIf(NO_SERVER)("write via query", () => {
     expect(result.rows.length).toBe(1);
     expect(result.rows[0]![0]).toBe(crKey);
     expect(result.rows[0]![1]).toBe(42);
+  });
+});
+
+// A format-V11 value written in its tagged JSON form reads back in the same
+// form (TY-12): the first such write moves the store to the V11 format.
+describe.skipIf(NO_SERVER)("tagged V11 values round-trip", () => {
+  it.each([
+    ["Date", { $date: "2024-01-15" }],
+    ["LocalDateTime", { $ldt: "2024-01-15T12:34:56.789012" }],
+    ["DateTime", { $dt: "2024-01-15T12:34:56.789012+05:30" }],
+    ["Duration", { $dur: "P1Y2M3DT4H5M6.789S" }],
+    ["Binary", { $binary: "3q2+7w==" }],
+  ] as const)("a %s prop is stored and read back unchanged", async (name, value) => {
+    const key = `ts-typed-${name}-${Date.now()}`;
+    await client.createNode("TsTyped", key, { v: value });
+    const result = await client.query("MATCH (n:TsTyped) WHERE n.id = $k RETURN n.v AS v", {
+      params: { k: key },
+    });
+    expect(result.columns).toEqual(["v"]);
+    expect(result.rows).toEqual([[value]]);
   });
 });
 
@@ -255,6 +286,21 @@ describe.skipIf(NO_SERVER)("algo", () => {
     expect(Array.isArray(report.scores)).toBe(true);
     expect(report.scores.length).toBeGreaterThan(0);
     expect(typeof report.truncated).toBe("boolean");
+  });
+
+  it("accepts shared weight-filter options for each algorithm", async () => {
+    const options = { weight_prop: "algcf_absent_weight", min_weight: 2, budget_ms: 0 };
+    const rank = await client.algo("pagerank", options);
+    expect(rank.scores.length).toBeGreaterThan(0);
+    for (const [, value] of rank.scores) {
+      expect(value).toBeCloseTo(1 / rank.scores.length, 12);
+    }
+    const components = await client.algo("wcc", options);
+    expect(components.components.length).toBeGreaterThan(0);
+    expect(components.components.every(([key, component]) => key === component)).toBe(true);
+    const degree = await client.algo("degree", options);
+    expect(degree.scores.length).toBeGreaterThan(0);
+    expect(degree.scores.every(([, value]) => value === 0)).toBe(true);
   });
 });
 
@@ -1723,5 +1769,89 @@ describe.skipIf(NO_SERVER)("special character key round trip", () => {
     } finally {
       await client.deleteNode(key);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// schema indexes / constraints — server-based behavior
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("schema indexes and constraints", () => {
+  it("declares, lists and drops a range index and a unique constraint", async () => {
+    const label = `TsSchema${Date.now()}`;
+    const created = await client.createIndex(label, "age");
+    expect(created.name).toBe(`idx_${label}_age`);
+    expect((await client.indexes()).some((i) => i.name === created.name && i.type === "range")).toBe(true);
+    await client.dropIndex(created.name);
+    expect((await client.indexes()).some((i) => i.name === created.name)).toBe(false);
+
+    await client.createConstraint(`uc_${label}`, label, "email");
+    expect((await client.constraints()).some((c) => c.name === `uc_${label}`)).toBe(true);
+    await client.dropConstraint(`uc_${label}`);
+    await client.dropIndex(`eq_${label}_email`);
+  });
+
+  it("dropIndex throws MushroomError (404) for an unknown name", async () => {
+    await expect(client.dropIndex("ts_no_such_index")).rejects.toBeInstanceOf(MushroomError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interactive transactions against the real /tx/* routes (TX-4)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("transactions (server)", () => {
+  const suffix = Date.now();
+
+  it("the callback form commits, sees its own write, and the write is then visible", async () => {
+    const key = `ts-tx-commit-${suffix}`;
+    const seen = await client.transaction(async (tx) => {
+      await tx.execute(`CREATE (n:TsTx {id: '${key}'})`);
+      const inside = await tx.execute("MATCH (n:TsTx {id: $id}) RETURN n.id AS id", { id: key });
+      const outside = await client.query("MATCH (n:TsTx {id: $id}) RETURN n.id AS id", {
+        params: { id: key },
+      });
+      return { inside: inside.rows.length, outside: outside.rows.length };
+    });
+    expect(seen).toEqual({ inside: 1, outside: 0 });
+    const after = await client.query("MATCH (n:TsTx {id: $id}) RETURN n.id AS id", {
+      params: { id: key },
+    });
+    expect(after.rows.length).toBe(1);
+  });
+
+  it("commit resolves to the commit number", async () => {
+    const tx = await client.beginTransaction();
+    await tx.execute(`CREATE (n:TsTx {id: 'ts-tx-bm-${suffix}'})`);
+    const bookmark = await tx.commit();
+    expect(Number.isInteger(bookmark)).toBe(true);
+    expect(bookmark).toBeGreaterThan(0);
+  });
+
+  it("a throw in the callback rolls back", async () => {
+    const key = `ts-tx-rollback-${suffix}`;
+    await expect(
+      client.transaction(async (tx) => {
+        await tx.execute(`CREATE (n:TsTx {id: '${key}'})`);
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    const after = await client.query("MATCH (n:TsTx {id: $id}) RETURN n.id AS id", {
+      params: { id: key },
+    });
+    expect(after.rows.length).toBe(0);
+  });
+
+  it("a concurrent write to a node it touched makes commit a TransactionConflictError", async () => {
+    const key = `ts-tx-conflict-${suffix}`;
+    await client.query(`CREATE (n:TsTx {id: '${key}', v: 0})`);
+    const tx = await client.beginTransaction();
+    await tx.execute("MATCH (n:TsTx {id: $id}) SET n.v = 1", { id: key });
+    await client.query("MATCH (n:TsTx {id: $id}) SET n.v = 2", { params: { id: key } });
+    await expect(tx.commit()).rejects.toBeInstanceOf(TransactionConflictError);
+    const v = await client.query("MATCH (n:TsTx {id: $id}) RETURN n.v AS v", {
+      params: { id: key },
+    });
+    expect(v.rows[0]![0]).toBe(2);
   });
 });

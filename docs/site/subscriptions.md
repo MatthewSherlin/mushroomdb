@@ -24,6 +24,10 @@ let sub = db.subscribe_all_rules()?;
 let sub = db.subscribe_writes()?;
 ```
 
+A relationship's own properties (`SET r.p`, a `CREATE` relationship map) are not announced
+yet: no write event carries them (ledger row 155, planned for 0.11). A query subscription that
+reads `r.p` is re-run on the commit and does see the new value.
+
 Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
 
 ### Reading events
