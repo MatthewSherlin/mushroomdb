@@ -8,14 +8,14 @@
 [![PyPI](https://img.shields.io/pypi/v/mushroomdb?logo=python&logoColor=white&label=PyPI)](https://pypi.org/project/mushroomdb/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**An embedded graph database — Cypher queries, self-maintaining rule-derived edges, time travel, and a memory layer for AI agents.**
+**The graph that stays true — and knows who's allowed to see it.**
 
-Embedded in your process, or run as a server.
+A graph database you embed in your process or run as a server. Cypher, the Bolt protocol,
+transactions, full-text and vector search, and a history you can query as of any commit.
 
-mushroomdb is an embedded graph database for agents and apps that reason over entities. You
-declare a relationship as a rule, once. Every write after that derives the matching edges, scores
-them, and retracts them when they stop being true. It is a directory on disk: no account, no
-server to run, no model call in the write path.
+You declare a relationship as a rule, once. Every write after that derives the matching edges,
+scores them, and retracts them when they stop being true, and each edge can say why it exists.
+Embedded, it is a directory on disk: no account and no server to run.
 
 **[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
 
@@ -27,12 +27,13 @@ server to run, no model call in the write path.
 
 | To… | Run |
 |---|---|
-| Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | Use it from Python | `pip install mushroomdb` |
 | Use it from Rust | `cargo add mushroomdb` |
+| Run it as a server (HTTP, optional Bolt) | `docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb` |
+| Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db` |
 
-There is also a Claude Code plugin, a Docker image and a `cargo install`. The
+There is also a Claude Code plugin and a `cargo install`. The
 [Install page](https://matthewsherlin.github.io/mushroomdb/docs/install.html) has a row for each, and says what each one leaves out.
 
 ## Try it
@@ -95,7 +96,7 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 
 ## What it is not
 
-- Not a hosted service. There is no account and no endpoint.
+- Not a hosted service. You run it: embedded, or from the image and templates in `deploy/`.
 - Not a vector database. Vector rules and an HNSW index are built in; you bring the embeddings.
 - Not a transactional relational database. One writer at a time, transactions are snapshot-isolated
   rather than serializable, and the working graph lives in memory.
