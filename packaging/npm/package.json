@@ -1,6 +1,6 @@
 {
   "name": "mushroomdb",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "description": "Embedded graph database with Cypher queries, rule-derived edges, time travel, and agent-memory tools. This package launches the native binary.",
   "mcpName": "io.github.MatthewSherlin/mushroomdb",
   "homepage": "https://matthewsherlin.github.io/mushroomdb/",
