@@ -28,6 +28,7 @@ fn shared_db_drop_never_hangs() {
         let h = std::thread::spawn(move || {
             let db = SharedDb::open(&path).unwrap();
             drop(db);
+            let _ = std::fs::remove_dir_all(&path);
             done_tx.send(()).unwrap();
         });
         done_rx

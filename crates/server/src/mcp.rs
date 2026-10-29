@@ -1716,23 +1716,30 @@ mod tests {
         assert!(!msg.contains("secret") && !msg.contains("65532"));
     }
     use mushroomdb::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn tmp_dir() -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), n));
-        // These stores are never cleaned up, so a process id the OS hands out
-        // again lands on a previous run's data and every assertion about counts
-        // fails. `tests/mcp.rs::tmp` already clears its path for this reason.
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    /// A unique temporary directory, removed on drop (backed by `tempfile`).
+    fn tmp_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("temp dir")
+    }
+
+    /// A SharedDb together with its temporary directory; the directory is
+    /// removed on drop so every test path — pass or fail — cleans up.
+    struct DemoDb {
+        db: SharedDb,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for DemoDb {
+        type Target = SharedDb;
+        fn deref(&self) -> &SharedDb {
+            &self.db
+        }
     }
 
     /// Open a SharedDb with two Person nodes and one derived SIMILAR edge.
-    fn demo_db() -> SharedDb {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+    fn demo_db() -> DemoDb {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = SharedDb::open(dir.path()).expect("open");
         {
             let mut g = db.write();
             let opts = IngestOptions {
@@ -1786,7 +1793,7 @@ mod tests {
             })
             .expect("rule");
         }
-        db
+        DemoDb { db, _dir: dir }
     }
 
     fn roundtrip(db: &SharedDb, request: &str) -> Js {
@@ -2046,7 +2053,8 @@ mod tests {
     /// confirm the roster exists and invite a guess at its size.
     #[test]
     fn mcp_stats_unscoped_omits_namespace_roster() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             g.insert_node(
@@ -2098,7 +2106,8 @@ mod tests {
     /// do not exist yet.
     #[test]
     fn create_rule_reports_a_build_it_could_not_finish() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             for i in 0..300usize {
@@ -2185,7 +2194,8 @@ mod tests {
 
     #[test]
     fn test_query_create_is_a_write() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         let resp = tool_call(
             &db,
             1,
@@ -2318,7 +2328,8 @@ mod tests {
 
     #[test]
     fn test_create_rule_backfills() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             let opts = IngestOptions {
@@ -2519,7 +2530,8 @@ mod tests {
     /// the query is 0.0 (orthogonal) must not appear in the results.
     #[test]
     fn test_find_similar_vector_default_min_is_0_8() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             // close: [1,0] → cosine 1.0 with query [1,0] (above 0.8)
@@ -2616,7 +2628,8 @@ mod tests {
     /// `find_similar` with `mask` must exclude hidden node keys from results.
     #[test]
     fn test_find_similar_vector_mask_excludes_hidden() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             // visible: [1,0] — should appear in results.
@@ -2672,7 +2685,8 @@ mod tests {
     /// `find_similar` with `mask` — bad mask value returns a tool error.
     #[test]
     fn test_find_similar_vector_mask_bad_type_is_error() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         let resp = tool_call(
             &db,
             1,
@@ -2829,7 +2843,8 @@ mod tests {
     /// Vector-mode `where` eq filters to matching nodes. Default `min` stays 0.8.
     #[test]
     fn test_find_similar_vector_where_eq() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             g.insert_node(
@@ -2883,7 +2898,8 @@ mod tests {
 
     #[test]
     fn test_find_similar_vector_where_invalid_is_error() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         let resp = tool_call(
             &db,
             1,
@@ -2926,7 +2942,8 @@ mod tests {
     /// Edge-traversal mode with `mask` must exclude hidden neighbors.
     #[test]
     fn test_find_similar_edge_mask_excludes_hidden_neighbor() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             g.insert_node("P", "alice", vec![]).unwrap();
@@ -2964,7 +2981,8 @@ mod tests {
     /// its existence — response must be a tool error identical to a nonexistent key.
     #[test]
     fn test_find_similar_edge_mask_hidden_key_is_not_found() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             g.insert_node("P", "alice", vec![]).unwrap();
@@ -3082,7 +3100,8 @@ mod tests {
     /// and the response must include the echo fields.
     #[test]
     fn test_was_linked_at_valid_commit() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             let opts = IngestOptions {
@@ -3124,7 +3143,8 @@ mod tests {
     /// a protocol error), and the error message must mention the commit range.
     #[test]
     fn test_was_linked_out_of_horizon_returns_tool_error() {
-        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let _dir = tmp_dir();
+        let db = SharedDb::open(_dir.path()).expect("open");
         {
             let mut g = db.write();
             g.insert_node("N", "a", vec![]).expect("node a");

@@ -11,7 +11,44 @@ use std::path::PathBuf;
 
 type Rows = Vec<Vec<Option<Value>>>;
 
-fn tmp(name: &str) -> PathBuf {
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A SharedDb together with its temporary directory; the directory is removed
+/// when this value is dropped.
+struct TmpSharedDb {
+    db: SharedDb,
+    _dir: TmpDir,
+}
+
+impl std::ops::Deref for TmpSharedDb {
+    type Target = SharedDb;
+    fn deref(&self) -> &SharedDb {
+        &self.db
+    }
+}
+
+fn tmp(name: &str) -> TmpDir {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -21,7 +58,7 @@ fn tmp(name: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    TmpDir(d)
 }
 
 fn s(v: &str) -> Value {
@@ -72,12 +109,13 @@ const PEOPLE: [&str; 4] = [
     "CREATE (:Person {id: 'd', v: 4})",
 ];
 
-fn people(name: &str) -> SharedDb {
-    let db = SharedDb::open(&tmp(name)).unwrap();
+fn people(name: &str) -> TmpSharedDb {
+    let _dir = tmp(name);
+    let db = SharedDb::open(&_dir).unwrap();
     for q in PEOPLE {
         db.write().query_write(q, &none()).unwrap();
     }
-    db
+    TmpSharedDb { db, _dir }
 }
 
 const CONNECT: &str = "MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)";
@@ -131,7 +169,8 @@ fn rollback_of_match_driven_writes_leaves_no_trace() {
 /// reads both the transaction's earlier writes and its own earlier rows.
 #[test]
 fn per_row_writes_read_the_transactions_own_writes() {
-    let db = SharedDb::open(&tmp("ryw")).unwrap();
+    let _g = tmp("ryw");
+    let db = SharedDb::open(&_g).unwrap();
     let mut tx = db.begin_transaction();
     let rs = tx
         .execute(
@@ -325,8 +364,10 @@ fn an_id_rewrite_is_refused_at_the_statement() {
 /// `deleted` of `MATCH (n:X) DETACH DELETE n`, auto-commit and inside a
 /// transaction, over the same graph.
 fn detach_delete_counts(name: &str, setup: &[&str]) -> (i64, i64) {
-    let auto = SharedDb::open(&tmp(&format!("{name}-auto"))).unwrap();
-    let txd = SharedDb::open(&tmp(&format!("{name}-tx"))).unwrap();
+    let _g_auto = tmp(&format!("{name}-auto"));
+    let auto = SharedDb::open(&_g_auto).unwrap();
+    let _g_txd = tmp(&format!("{name}-tx"));
+    let txd = SharedDb::open(&_g_txd).unwrap();
     for q in setup {
         auto.write().query_write(q, &none()).unwrap();
         txd.write().query_write(q, &none()).unwrap();
@@ -378,8 +419,10 @@ fn unwind_detach_delete_counts_relationships_as_match_detach_delete_does() {
                        CREATE (a)-[:L]->(b) DETACH DELETE a";
     // p and its 4 stored edges, and the edge the statement created.
     for (q, want) in [(unwound, 6), (created_too, 1 + 4 + 1)] {
-        let auto = SharedDb::open(&tmp("uw-detach-auto")).unwrap();
-        let txd = SharedDb::open(&tmp("uw-detach-tx")).unwrap();
+        let _g_auto = tmp("uw-detach-auto");
+        let auto = SharedDb::open(&_g_auto).unwrap();
+        let _g_txd = tmp("uw-detach-tx");
+        let txd = SharedDb::open(&_g_txd).unwrap();
         for stmt in setup {
             auto.write().query_write(stmt, &none()).unwrap();
             txd.write().query_write(stmt, &none()).unwrap();
@@ -408,7 +451,8 @@ fn row_147_a_self_loop_is_deleted_once() {
         (3, 3),
         "node + 2 edges"
     );
-    let db = SharedDb::open(&tmp("row147-api")).unwrap();
+    let _g = tmp("row147-api");
+    let db = SharedDb::open(&_g).unwrap();
     for q in setup {
         db.write().query_write(q, &none()).unwrap();
     }
@@ -722,8 +766,10 @@ fn the_same_writes_auto_commit_and_in_one_transaction_agree_randomized() {
     let mut total = 0;
     for seed in 1..=50u64 {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x1000_0001));
-        let auto = SharedDb::open(&tmp(&format!("diff-auto-{seed}"))).unwrap();
-        let txd = SharedDb::open(&tmp(&format!("diff-tx-{seed}"))).unwrap();
+        let _g_auto = tmp(&format!("diff-auto-{seed}"));
+        let auto = SharedDb::open(&_g_auto).unwrap();
+        let _g_txd = tmp(&format!("diff-tx-{seed}"));
+        let txd = SharedDb::open(&_g_txd).unwrap();
         for q in random_seed_graph(&mut rng) {
             auto.write().query_write(&q, &none()).unwrap();
             txd.write().query_write(&q, &none()).unwrap();
