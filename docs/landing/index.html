@@ -201,14 +201,15 @@
     <h1>mushroomdb</h1>
     <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
     <p class="lede">
-      mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust
-      graph database in which a relationship is a schema declaration: write a rule once, and every
-      write derives, maintains and <strong>retracts</strong> the matching edges, each one carrying
-      the rule, the score and the values that produced it.
+      mushroomdb is a Rust graph database you embed in your process or run as a server, with
+      Cypher, the Bolt protocol, transactions and a queryable history. A relationship is a schema
+      declaration: write a rule once, and every write derives, maintains and
+      <strong>retracts</strong> the matching edges, each one carrying the rule, the score and the
+      values that produced it.
     </p>
     <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
-    <div class="install"><pre><code id="install-cmd">npx mushroomdb install --db ./memory</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
-    <p class="install-note">Writes the <code>/mushroom</code> skill, an MCP server listing the twenty-three-tool association surface, and the session hooks, for Claude Code or Cursor.</p>
+    <div class="install"><pre><code id="install-cmd">pip install mushroomdb</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
+    <p class="install-note">Also <code>cargo add mushroomdb</code>, <code>npm install mushroomdb-client</code>, the Docker image, and <code>npx mushroomdb install --db ./memory</code> to give Claude Code or Cursor a memory.</p>
     <p class="cta"><a class="primary" href="docs/quickstart.html">Quickstart</a><a href="docs/">Read the docs</a></p>
     <svg class="mycelium" viewBox="0 0 860 176" aria-hidden="true" focusable="false">
       <line class="ground" x1="0" y1="100" x2="860" y2="100" />
@@ -280,9 +281,9 @@
       <div class="card">
         <h3>What it isn't</h3>
         <ul>
-          <li>Not a hosted memory service — no account, no endpoint, nothing to sign up for.</li>
+          <li>Not a hosted service — you run it, embedded or from the image and the templates in <code>deploy/</code>.</li>
           <li>Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.</li>
-          <li>Not a transactional relational database. Single writer, no interactive transactions, memory-first storage.</li>
+          <li>Not a transactional relational database. Single writer, snapshot-isolated transactions, memory-first storage.</li>
         </ul>
       </div>
     </div>

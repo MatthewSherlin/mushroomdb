@@ -1,7 +1,7 @@
 # mushroomdb
 
-mushroomdb is an embedded graph database for any app that needs a graph — and a memory layer for AI
-agents. A relationship is a schema declaration: write a rule once, and every write
+mushroomdb is a graph database for any app that needs a graph, embedded in your process or run
+as a server. A relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
 the values that produced it.
 
