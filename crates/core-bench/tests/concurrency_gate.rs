@@ -223,11 +223,11 @@ fn concurrency_gate() {
     if let Some((alone_x, under_x)) = vs_v092 {
         assert!(
             alone_x <= ALONE_MAX_VS_V092,
-            "a plain commit with no readers costs {alone_x:.2}x v0.9.2's on this machine; bound {ALONE_MAX_VS_V092}x (the 1.05x bar plus noise)"
+            "a plain commit with no readers costs {alone_x:.2}x v0.9.2's on this machine; bound {ALONE_MAX_VS_V092}x (the Linux cost 0.10.0 shipped with, ledger row 167)"
         );
         assert!(
             under_x <= UNDER_MAX_VS_V092,
-            "a plain commit under readers costs {under_x:.2}x v0.9.2's on this machine, with the cost of sharing the cores taken out; the owner accepted up to 1.21x, bound {UNDER_MAX_VS_V092}x"
+            "a plain commit under readers costs {under_x:.2}x v0.9.2's on this machine, with the cost of sharing the cores taken out; bound {UNDER_MAX_VS_V092}x (the Linux cost 0.10.0 shipped with, ledger row 167)"
         );
     }
 }

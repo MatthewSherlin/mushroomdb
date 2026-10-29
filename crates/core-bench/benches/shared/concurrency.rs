@@ -68,13 +68,24 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// not the store, and both builds' running medians are taken relative to
 /// their own busy block before they are compared.
 /// Where there are cores to spare, as on the machine the decision was
-/// measured on, the busy block costs what the paused one does and the
-/// bounds read as before. No bound changed.
-pub const ALONE_MAX_VS_V092: f64 = 1.15;
-/// See [`ALONE_MAX_VS_V092`]: the owner accepted up to 1.21×; 1.25× is that
-/// with a 0.04 noise margin. This tree measured 1.01–1.09× v0.9.2 here
-/// (TX-7 fix round 1).
-pub const UNDER_MAX_VS_V092: f64 = 1.25;
+/// measured on, the busy block costs what the paused one does.
+///
+/// The owner's decision of 2026-10-28 (ledger row 167). The 2026-10-21
+/// numbers were measured on macOS, where the cost is smallest. On Linux the
+/// same 0.10.0 source costs 1.18–1.34× v0.9.2 with no readers (CI Intel
+/// Xeon runners and a Linux container on the M4) and 1.44–1.58× under
+/// readers with the cores' share taken out (the container). The owner
+/// re-accepted those, the costs 0.10.0 shipped with, so the gate catches
+/// anything worse; 0.10.1 is to cut the per-commit publish cost and bring
+/// these bounds back toward 1.15× and 1.25×.
+///
+/// Paused: the worst measured, 1.34×, plus a 0.06 noise margin. Before
+/// 2026-10-28 this was 1.15× (the 1.05× bar plus 0.10).
+pub const ALONE_MAX_VS_V092: f64 = 1.40;
+/// Under readers: the worst measured on Linux, 1.58×, plus a 0.07 noise
+/// margin. Before 2026-10-28 this was 1.25×: the 1.21× the owner accepted on
+/// macOS plus 0.04.
+pub const UNDER_MAX_VS_V092: f64 = 1.65;
 /// Interleaved v0.9.2 / this-build pairs behind the v0.9.2 bounds. The
 /// alone bound is the 1.05× bar plus a 0.10 noise margin: on the machine
 /// this was tuned on, the median of a 10 × 200-commit run moved ±8 % between
@@ -83,9 +94,11 @@ pub const UNDER_MAX_VS_V092: f64 = 1.25;
 pub const V092_ROUNDS: usize = 5;
 /// Under readers, the commit's median may cost up to this multiple of the
 /// same build's median beside as many busy threads (with them paused, before
-/// 2026-10-28): about 1.4× when the decision was
-/// measured, 0.98–1.21× on this tree; the pre-fix state was 2.6–2.8×.
-pub const WRITER_UNDER_READERS_MAX: f64 = 1.5;
+/// 2026-10-28): about 1.4× when the decision was measured, 0.98–1.29× on
+/// macOS and 1.43× in a Linux container on 2026-10-28; the pre-fix state was
+/// 2.6–2.8×. 1.65×, with the under-readers bound above, since 2026-10-28
+/// (was 1.5×).
+pub const WRITER_UNDER_READERS_MAX: f64 = 1.65;
 /// When v0.9.2 is measured on the same machine, the under-readers ratio may
 /// also reach this multiple of v0.9.2's own: on a runner with fewer cores
 /// than readers plus the writer, the readers take the writer's CPU whatever
