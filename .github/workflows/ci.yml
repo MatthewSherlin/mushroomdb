@@ -945,9 +945,14 @@ jobs:
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
           git fetch --no-tags --depth=1 origin "$BASE"
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
-          (cd "$RUNNER_TEMP/base" && bash benchmarks/ci/run.sh --output "$GITHUB_WORKSPACE/base.json")
-          echo "[bench] this change against $BASE, both measured on this runner:"
-          python3 benchmarks/ci/compare.py results.json base.json --threshold 0.15
+          (cd "$RUNNER_TEMP/base" && cargo build --release -p mushroomdb --example ci_bench)
+          # Both binaries built, then run turn about: measured one after the
+          # other, a test-only change read 74 % slower ingest than its base.
+          python3 benchmarks/ci/paired.py \
+            target/release/examples/ci_bench "$RUNNER_TEMP/base/target/release/examples/ci_bench" \
+            5 head.json base.json
+          echo "[bench] this change against $BASE, alternating on this runner:"
+          python3 benchmarks/ci/compare.py head.json base.json --threshold 0.15
 
   # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
   # on an empty store — a memory store, so the association tools —
