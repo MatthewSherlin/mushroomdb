@@ -1,1 +1,0 @@
-- **`what_if_set_prop` nets on the edge.** An edge that changes owner is not reported as both lost and gained (ledger row 85).

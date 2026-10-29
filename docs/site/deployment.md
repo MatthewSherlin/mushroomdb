@@ -364,7 +364,7 @@ point names.
   copy a new prefix.
 
 This was row 138 of the
-[defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/roadmap/v0.6.10-defects.md),
+[defect ledger](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/internal/defect-ledger.md),
 closed once both restore paths, `restore --from` and restore on boot, gave the
 store they restore a new lineage. The hand-made copy above is what remains.
 

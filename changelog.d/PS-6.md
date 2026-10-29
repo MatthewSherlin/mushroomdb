@@ -1,2 +1,0 @@
-### Added
-- **Cypher function conformance table.** `docs/site/conformance-functions.md` lists every Cypher function the openCypher TCK calls, and every function the engine lists that no scenario calls, with whether it is supported and how many scenarios pass. `tck-runner --function-table <path>` writes it, `bash scripts/gen-conformance-table.sh` regenerates it, and CI fails when it is stale. (PS-6).

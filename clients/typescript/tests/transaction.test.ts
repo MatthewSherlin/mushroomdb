@@ -1,5 +1,5 @@
-// Transaction API against a mock HTTP server that speaks the /tx/* contract of
-// docs/roadmap/v0.10/W3-transactions-bolt.md section 3.1.
+// Transaction API against a mock HTTP server that speaks the server's /tx/*
+// routes: begin, run statements, then commit or roll back by transaction id.
 
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";

@@ -1,2 +1,0 @@
-### Fixed
-- **A filtered scan with LIMIT missed every node a snapshot held.** `MATCH (n:L) WHERE n.val <> 3 RETURN n LIMIT 5` (one comparison of a property with a literal, a LIMIT, no ORDER BY) returned only the nodes whose value was written since the last snapshot, with no error, on every handle that reads a snapshot. It now returns what the same filter returns without LIMIT. Present since 0.2.0 (ledger row 139).
