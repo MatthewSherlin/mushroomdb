@@ -161,9 +161,8 @@ fi
 #    hand-maintained docs. `check-claims.sh` already fails the build when one
 #    of these lags — it was added because 0.6.9 shipped telling readers to
 #    install 0.6.8 — so the bump has to move them or every release trips its
-#    own gate. CHANGELOG and docs/roadmap are exempt for the same reason
-#    check-claims exempts them: they are history, and history keeps its pins.
-#    docs/roadmap/ no longer exists.
+#    own gate. CHANGELOG is exempt for the same reason check-claims exempts
+#    it: it is history, and history keeps its pins.
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   while IFS= read -r -d '' f; do
     case "$f" in

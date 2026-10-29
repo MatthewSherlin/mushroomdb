@@ -1,5 +1,5 @@
-// Transaction API against a mock HTTP server that speaks the /tx/* Bolt contract:
-// BEGIN → RUN → PULL → COMMIT/ROLLBACK over HTTP, each with a transaction id.
+// Transaction API against a mock HTTP server that speaks the server's /tx/*
+// routes: begin, run statements, then commit or roll back by transaction id.
 
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
