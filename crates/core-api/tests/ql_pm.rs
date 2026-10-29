@@ -10,7 +10,44 @@ use std::path::PathBuf;
 
 type Rows = Vec<Vec<Option<Value>>>;
 
-fn tmp(name: &str) -> PathBuf {
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A SharedDb together with its temporary directory; the directory is removed
+/// when this value is dropped.
+struct TmpSharedDb {
+    db: SharedDb,
+    _dir: TmpDir,
+}
+
+impl std::ops::Deref for TmpSharedDb {
+    type Target = SharedDb;
+    fn deref(&self) -> &SharedDb {
+        &self.db
+    }
+}
+
+fn tmp(name: &str) -> TmpDir {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -20,7 +57,7 @@ fn tmp(name: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    TmpDir(d)
 }
 
 fn s(v: &str) -> Value {
@@ -83,8 +120,10 @@ fn state(db: &SharedDb) -> (Rows, Rows) {
     )
 }
 
-fn open(name: &str) -> SharedDb {
-    SharedDb::open(&tmp(name)).unwrap()
+fn open(name: &str) -> TmpSharedDb {
+    let _dir = tmp(name);
+    let db = SharedDb::open(&_dir).unwrap();
+    TmpSharedDb { db, _dir }
 }
 
 fn write(db: &SharedDb, q: &str, p: &BTreeMap<String, Value>) -> mushroomdb::ResultSet {

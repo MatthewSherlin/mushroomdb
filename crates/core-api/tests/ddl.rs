@@ -15,10 +15,53 @@ use std::path::PathBuf;
 
 type GraphDb = mushroomdb::GraphDb<RealFs>;
 
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A GraphDb together with its temporary directory; the directory is removed
+/// when this value is dropped.
+struct TmpDb {
+    db: GraphDb,
+    _dir: TmpDir,
+}
+
+impl std::ops::Deref for TmpDb {
+    type Target = GraphDb;
+    fn deref(&self) -> &GraphDb {
+        &self.db
+    }
+}
+
+impl std::ops::DerefMut for TmpDb {
+    fn deref_mut(&mut self) -> &mut GraphDb {
+        &mut self.db
+    }
+}
+
 /// A fresh directory per call. The clock alone is not enough: on macOS it
 /// ticks in microseconds, so two tests running in parallel could get the same
 /// name and share a store; the counter keeps every name in the process unique.
-fn tmp(name: &str) -> PathBuf {
+fn tmp(name: &str) -> TmpDir {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -30,11 +73,13 @@ fn tmp(name: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    TmpDir(d)
 }
 
-fn open_temp() -> GraphDb {
-    GraphDb::open(&tmp("db")).unwrap()
+fn open_temp() -> TmpDb {
+    let _dir = tmp("db");
+    let db = GraphDb::open(&_dir).unwrap();
+    TmpDb { db, _dir }
 }
 
 fn p() -> BTreeMap<String, Value> {
@@ -462,7 +507,7 @@ fn ddl_is_refused_on_an_as_of_handle_and_by_query_at() {
     assert!(before.is_empty());
 }
 
-fn role_store() -> GraphDb {
+fn role_store() -> TmpDb {
     let mut db = open_temp();
     db.apply_schema(&Schema {
         fulltext: vec![],
@@ -689,7 +734,7 @@ fn drop_index_refuses_a_listed_name_two_indexes_share() {
 /// Role `writer` sees label `P` only. `P` and `Q` each have a node, a range
 /// index, an equality index and a constraint; `P` lives in namespace `a`,
 /// `Q` in `b`.
-fn two_label_store() -> GraphDb {
+fn two_label_store() -> TmpDb {
     let mut db = role_store();
     db.insert_node("Q", "q1", vec![("ns".into(), Value::Str("b".into()))])
         .unwrap();

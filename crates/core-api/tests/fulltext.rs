@@ -9,22 +9,67 @@ use std::collections::BTreeMap;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn open() -> GraphDb<core_storage::fs::RealFs> {
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(std::path::PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A GraphDb together with its temporary directory; the directory is removed
+/// when this value is dropped.
+struct TempDb {
+    db: GraphDb<core_storage::fs::RealFs>,
+    _dir: TmpDir,
+}
+
+impl std::ops::Deref for TempDb {
+    type Target = GraphDb<core_storage::fs::RealFs>;
+    fn deref(&self) -> &GraphDb<core_storage::fs::RealFs> {
+        &self.db
+    }
+}
+
+impl std::ops::DerefMut for TempDb {
+    fn deref_mut(&mut self) -> &mut GraphDb<core_storage::fs::RealFs> {
+        &mut self.db
+    }
+}
+
+fn open() -> TempDb {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("graphdb-ft-{}-{}", n, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
-    GraphDb::open(&d).unwrap()
+    let _dir = TmpDir(d);
+    let db = GraphDb::open(&_dir).unwrap();
+    TempDb { db, _dir }
 }
 
-fn tmp_dir() -> std::path::PathBuf {
+fn tmp_dir() -> TmpDir {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(10000);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("graphdb-ft-dir-{}-{}", n, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    TmpDir(d)
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,9 +1766,7 @@ fn answers(db: &GraphDb<core_storage::fs::RealFs>, queries: &[&str]) -> Vec<Vec<
 }
 
 /// A store built from nothing but the final documents: no rewrite, no removal.
-fn fresh_store(
-    nodes: &BTreeMap<String, (&'static str, Option<Value>)>,
-) -> GraphDb<core_storage::fs::RealFs> {
+fn fresh_store(nodes: &BTreeMap<String, (&'static str, Option<Value>)>) -> TempDb {
     let mut db = open();
     db.set_fsync_policy(mushroomdb::FsyncPolicy::Relaxed);
     db.enable_fulltext("A", "name").unwrap();

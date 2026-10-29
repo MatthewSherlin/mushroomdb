@@ -29,7 +29,36 @@ fn as_the_quoting_rule_says(text: &str) -> String {
     out
 }
 
-fn tmp(name: &str) -> PathBuf {
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TmpDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+fn tmp(name: &str) -> TmpDir {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -40,7 +69,7 @@ fn tmp(name: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&d).unwrap();
-    d
+    TmpDir(d)
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -141,7 +170,7 @@ fn mv(repo: &Path, from: &str, to: &str) {
     git(repo, &["mv", from, to]);
 }
 
-fn seed_repo() -> PathBuf {
+fn seed_repo() -> TmpDir {
     let repo = tmp("repo");
     git(&repo, &["init", "-q", "-b", "main"]);
     commit(
@@ -1111,7 +1140,7 @@ fn co_changed_writes_no_edge_for_a_partner_under_the_similarity_floor() {
 
 /// A parent repository with an initialised submodule checked out at
 /// `vendor/lib`, plus the repository the submodule was cloned from.
-fn seed_repo_with_submodule() -> PathBuf {
+fn seed_repo_with_submodule() -> TmpDir {
     let lib = tmp("lib");
     git(&lib, &["init", "-q", "-b", "main"]);
     commit(&lib, "carol", "lib init", &[("src/lib.rs", "l1")]);
@@ -1792,7 +1821,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
 }
 
 /// A store with one node and no `GitSync` marker: the memory surface.
-fn memory_store(name: &str) -> PathBuf {
+fn memory_store(name: &str) -> TmpDir {
     let db_dir = tmp(name);
     let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
         .arg("query")
@@ -2086,7 +2115,8 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
 
     // No install beside the store means both doors, and the line is the
     // MCP one, unchanged.
-    let bare = tmp("brief-no-install").join("db");
+    let _bare_g = tmp("brief-no-install");
+    let bare = _bare_g.join("db");
     let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
         .arg("query")
         .arg(&bare)

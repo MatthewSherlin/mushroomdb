@@ -17,7 +17,50 @@ use std::path::PathBuf;
 type GraphDb = mushroomdb::GraphDb<RealFs>;
 type Rows = Vec<Vec<Option<Value>>>;
 
-fn tmp(name: &str) -> PathBuf {
+/// A temporary directory removed on drop, so every test path — pass or fail — is
+/// cleaned up when the guard goes out of scope.
+struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TmpDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A GraphDb together with its temporary directory; the directory is removed
+/// when this value is dropped.
+struct TmpDb {
+    db: GraphDb,
+    _dir: TmpDir,
+}
+
+impl std::ops::Deref for TmpDb {
+    type Target = GraphDb;
+    fn deref(&self) -> &GraphDb {
+        &self.db
+    }
+}
+
+impl std::ops::DerefMut for TmpDb {
+    fn deref_mut(&mut self) -> &mut GraphDb {
+        &mut self.db
+    }
+}
+
+fn tmp(name: &str) -> TmpDir {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -27,7 +70,7 @@ fn tmp(name: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    TmpDir(d)
 }
 
 fn s(v: &str) -> Value {
@@ -85,8 +128,9 @@ fn state(db: &GraphDb) -> (Rows, Rows) {
 }
 
 /// People `a`..`d` (`v` 1..4) and a company `c1`.
-fn people(name: &str) -> GraphDb {
-    let mut db = GraphDb::open(&tmp(name)).unwrap();
+fn people(name: &str) -> TmpDb {
+    let _dir = tmp(name);
+    let mut db = GraphDb::open(&_dir).unwrap();
     for q in [
         "CREATE (:Person {id: 'a', v: 1})",
         "CREATE (:Person {id: 'b', v: 2})",
@@ -96,7 +140,7 @@ fn people(name: &str) -> GraphDb {
     ] {
         write(&mut db, q);
     }
-    db
+    TmpDb { db, _dir }
 }
 
 // ── MATCH … CREATE / MATCH … MERGE ─────────────────────────────────────────
@@ -230,7 +274,8 @@ fn match_then_create_and_merge_are_writes_everywhere() {
 
 #[test]
 fn match_then_create_under_a_role_stays_inside_its_scope() {
-    let mut db = GraphDb::open(&tmp("mc-role")).unwrap();
+    let _g = tmp("mc-role");
+    let mut db = GraphDb::open(&_g).unwrap();
     db.apply_schema(&Schema {
         fulltext: vec![],
         indexes: vec![],
@@ -286,7 +331,8 @@ fn match_then_create_under_a_role_stays_inside_its_scope() {
 /// transaction's own earlier write; `tx_mw.rs` covers it in depth.
 #[test]
 fn match_then_create_runs_inside_a_transaction() {
-    let db: SharedDb = SharedDb::open(&tmp("mc-tx")).unwrap();
+    let _g = tmp("mc-tx");
+    let db: SharedDb = SharedDb::open(&_g).unwrap();
     let mut tx = db.begin_transaction();
     tx.execute("CREATE (:P {id: 'x'})", &none()).unwrap();
     let rs = tx
@@ -386,8 +432,10 @@ fn match_then_write_equals_the_unwind_form_randomized() {
     let (mut changed, mut failed) = (0, 0);
     for seed in 1..=60u64 {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x1000_0001));
-        let mut top = GraphDb::open(&tmp(&format!("diff-top-{seed}"))).unwrap();
-        let mut unwound = GraphDb::open(&tmp(&format!("diff-uw-{seed}"))).unwrap();
+        let _g_top = tmp(&format!("diff-top-{seed}"));
+        let mut top = GraphDb::open(&_g_top).unwrap();
+        let _g_uw = tmp(&format!("diff-uw-{seed}"));
+        let mut unwound = GraphDb::open(&_g_uw).unwrap();
         random_graph(&mut rng, &mut [&mut top, &mut unwound]);
         for step in 0..6 {
             let q = random_match_write(&mut rng, step);
@@ -460,7 +508,8 @@ fn row_143_every_create_path_counts_its_relationships() {
 
 #[test]
 fn row_143_a_transaction_counts_its_relationships_too() {
-    let db: SharedDb = SharedDb::open(&tmp("row143-tx")).unwrap();
+    let _g = tmp("row143-tx");
+    let db: SharedDb = SharedDb::open(&_g).unwrap();
     let mut tx = db.begin_transaction();
     let rs = tx
         .execute("CREATE (:N {id: 'a'})-[:K]->(:N {id: 'b'})", &none())
@@ -678,7 +727,8 @@ fn a_label_predicate_filters_and_projects_three_valued() {
 
 #[test]
 fn a_stored_label_property_does_not_fool_the_label_test() {
-    let mut db = GraphDb::open(&tmp("label-prop")).unwrap();
+    let _g = tmp("label-prop");
+    let mut db = GraphDb::open(&_g).unwrap();
     write(&mut db, "CREATE (:Person {id: 'x', label: 'Company'})");
     assert_eq!(
         read(&db, "MATCH (n) WHERE n:Company RETURN n.id"),
@@ -714,7 +764,8 @@ fn more_than_one_label_is_refused_by_name() {
 
 #[test]
 fn a_label_test_is_never_pushed_into_an_index_or_a_fused_scan() {
-    let mut db = GraphDb::open(&tmp("label-index")).unwrap();
+    let _g = tmp("label-index");
+    let mut db = GraphDb::open(&_g).unwrap();
     for i in 0..40 {
         let label = if i % 3 == 0 { "A" } else { "B" };
         db.insert_node(
@@ -765,7 +816,8 @@ fn a_label_test_is_never_pushed_into_an_index_or_a_fused_scan() {
 fn a_label_predicate_equals_labels_randomized() {
     for seed in 1..=40u64 {
         let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ seed.wrapping_mul(0x2545_F491));
-        let mut db = GraphDb::open(&tmp(&format!("label-diff-{seed}"))).unwrap();
+        let _g_db = tmp(&format!("label-diff-{seed}"));
+        let mut db = GraphDb::open(&_g_db).unwrap();
         random_graph(&mut rng, &mut [&mut db]);
         for _ in 0..8 {
             let l = rng.pick(&["A", "B", "C", "D"]);
