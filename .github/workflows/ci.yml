@@ -939,8 +939,10 @@ jobs:
         if: steps.stored.outcome == 'failure'
         run: |
           set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
-          if [ -z "$BASE" ]; then BASE=$(git rev-parse HEAD^1); fi
+          # A pull request's base, or main's previous tip on a push. Not
+          # `HEAD^1`: the checkout is shallow, so the parent is not there, and
+          # the step failed before it measured anything (main, 2026-10-29).
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
           git fetch --no-tags --depth=1 origin "$BASE"
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
           (cd "$RUNNER_TEMP/base" && bash benchmarks/ci/run.sh --output "$GITHUB_WORKSPACE/base.json")
