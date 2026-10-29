@@ -179,7 +179,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
 | 169 | Medium — wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Closed in 0.10.1: the planner's single-aggregate path returned before emitting `Skip` / `Limit`, on the reasoning that the aggregate makes one row; it now emits them and both aggregate executors apply them to that row. Tests: `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`; `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op` in `crates/core-query/src/cypher/exec.rs` | **CLOSED** in 0.10.1 |
 | 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **DEFERRED** to 0.10.1 |
-| 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead | **DEFERRED** to 0.10.1 |
+| 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
 <!-- DEFECT-INDEX:END -->
 
 ## 20. Spec §5.9 asks for a shape the code cannot be put into — CLOSED
@@ -4908,11 +4908,34 @@ query.md says only that null is the largest value. **Owner decision, 2026-10-29:
 openCypher order. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them`
 (ignored until the fix); the H-3 property skips the shape in `hits_row_170`.
 
-## 171. query.md documents `-->`, but the parser refuses it — DEFERRED to 0.10.1
+## 171. query.md documents `-->`, but the parser refuses it — CLOSED in 0.10.1
 
 Present in 0.10.0, verified on `main`; **Low** (doc/engine mismatch; loud, not wrong results).
 Found 2026-10-29 by H-3's generator. query.md (Relationship patterns) says "Omitting the brackets
 entirely (`-->`) is also accepted", but `MATCH (a)-->(b) RETURN key(a)`, `(a)--(b)` and
 `(a)<--(b)` all fail with `parse error at token 5: expected '[' in a relationship pattern (found
-Dash)`. `(a)-[]->(b)` works. Fix the parser or the page; H-3 renders an untyped hop as `-[]->`
-and can switch to `-->` with the fix.
+Dash)`. `(a)-[]->(b)` works.
+
+**Fix:** `rel()` in `crates/core-query/src/cypher/parser.rs` now checks whether the next token
+after the opening `-` (or `<-`) is another `-` rather than `[`. If so it returns an empty `RelPat`
+(no variable, no types, no hop range) for the bare form without calling `rel_body()`. The bare
+forms are exactly equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere relationship patterns are
+accepted: MATCH, OPTIONAL MATCH, MERGE (which then refuses them because they carry no type), and
+shortestPath (which refuses them because they carry no hop range). CREATE uses a separate
+`create_rel()` path that is unchanged.
+
+**Ambiguity audit:** `--` is not a comment character in this dialect (the lexer has no `--`
+comment rule; it emits each `-` as `Tok::Dash`). The existing `arith_unary` gate restricts unary
+minus to number literals, so `a - -1` cannot produce two consecutive `Dash` tokens from an
+expression: the first is consumed as subtraction, the second starts a unary-minus-then-literal
+sequence. `<-` in a less-than expression (`n.x < -1`) is not ambiguous because `<` and `-` reach
+the parser as separate tokens, and `<-` only starts a left relationship inside `rel()`, which is
+never called from an expression parser.
+
+**Tests:** `crates/core-query/src/cypher/tests/ql_ba.rs` — parse acceptance, execution (bare
+equals bracketed on a small graph), ambiguity (arithmetic `a - -1`, `n.x < -1` still parse
+correctly), pattern-predicate refusal still fires for bare forms in WHERE expressions.
+
+**H-3:** `bare_rels: Vec<bool>` added to `Path`; the generator draws a flag per untyped hop and
+`render_path` alternates between `-->` and `-[]->` accordingly. TCK rate rose from 0.7268 to
+0.7419 (bare-arrow scenarios now pass).
