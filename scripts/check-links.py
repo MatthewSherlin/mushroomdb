@@ -44,7 +44,6 @@ SOURCES = [
     "docs/design.md",
     "docs/format-stability.md",
     "docs/concurrency-decision.md",
-    "docs/dogfood-report.md",
     "bindings/python/README.md",
     "clients/typescript/README.md",
     "packaging/plugin/README.md",

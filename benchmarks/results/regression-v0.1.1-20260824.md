@@ -129,7 +129,6 @@ Table date updated from 2026-08-21 to 2026-08-24. Supported row count: 42. Named
 | `dogfood/results/scale-100k.md` | Replaced with v0.1.1 V6 numbers; corrected "V5 snapshot" template text to "V6 snapshot"; added snapshot file size (1.1 GiB) |
 | `benchmarks/results/regression-v0.1.1-20260824.md` | New file — this document |
 | `CHANGELOG.md` | Updated snapshot section: replaced "100k-node numbers will be re-published" promise with measured V6 numbers |
-| `docs/release-notes/v0.1.1.md` | New file — release notes draft |
 | `docs/site/query.md` | Date updated 2026-08-21 → 2026-08-24 |
 | `README.md` | Updated cold-start benchmark table: V5→V6 snapshot open/write/size |
 
