@@ -44,9 +44,9 @@
 //! the documented behaviour is one named function that points at its source:
 //! `sum_of_nothing` (ledger row 166). Every other difference is an engine bug.
 //! Three found when this test was written are ledger rows 168–170, pinned,
-//! shrunk, as the `finding_*` tests at the end. Row 168 is fixed; the others
-//! are ignored until 0.10.1 fixes them, and the property skips their shapes
-//! in `hits_row_169` and `hits_row_170`.
+//! shrunk, as the `finding_*` tests at the end. Rows 168 and 169 are fixed;
+//! row 170's test is ignored until 0.10.1 fixes it, and the property skips
+//! its shape in `hits_row_170`.
 //! Shapes the engine refuses outright (`-->`, row 171; `WITH DISTINCT`;
 //! `RETURN DISTINCT` with an aggregate) are not generated.
 //!
@@ -1404,12 +1404,6 @@ fn compare(q: &Query, want: &Answer, rs: &ResultSet) -> Result<(), String> {
 // them so it keeps checking everything else; each `finding_*` test below pins
 // the defect itself. Delete each function, and its call, with its fix.
 
-/// Ledger row 169: `SKIP` / `LIMIT` are ignored on an aggregate with no
-/// grouping key. Delete with the fix.
-fn hits_row_169(q: &Query) -> bool {
-    q.ret.items.iter().all(|i| i.0.is_agg()) && (q.skip.is_some() || q.limit.is_some())
-}
-
 /// Ledger row 170: values of different types order numbers first in
 /// `ORDER BY`, `min` and `max`. Only a value of `Kind::Any` mixes types.
 /// Delete with the fix.
@@ -1449,7 +1443,7 @@ proptest! {
         let (g, db) = build(&nodes, &edges, &updates, usize::from(snapshot_slot));
         for choices in &queries {
             let q = gen_query(choices);
-            if hits_row_169(&q) || hits_row_170(&q) {
+            if hits_row_170(&q) {
                 continue;
             }
             let text = render_query(&q);
@@ -1669,7 +1663,6 @@ fn rows_of(db: &GraphDb<SimFs>, q: &str) -> (Vec<String>, Vec<Vec<Option<Value>>
 /// one row it makes is returned under `SKIP 1` and `LIMIT 0`. openCypher
 /// applies them to that row like any other, so both return no rows.
 #[test]
-#[ignore = "ledger row 169, fixed in 0.10.1: un-ignore with the fix"]
 fn finding_skip_and_limit_apply_to_an_ungrouped_aggregate() {
     let db = fixed_db(&[("A", vec![])]);
     for q in [

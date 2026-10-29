@@ -154,3 +154,97 @@ fn row_168_what_already_ran_is_unchanged() {
         vec![vec![s("a"), int(2)], vec![s("b"), int(1)]]
     );
 }
+
+#[test]
+fn row_169_skip_and_limit_apply_to_an_ungrouped_aggregate() {
+    let fx = abb();
+    let none: Rows = vec![];
+    assert_eq!(rows(&fx, "MATCH (a) RETURN count(*) AS c SKIP 1"), none);
+    assert_eq!(rows(&fx, "MATCH (a) RETURN count(*) AS c LIMIT 0"), none);
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN count(*) AS c SKIP 0"),
+        vec![vec![int(3)]]
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN count(*) AS c SKIP 0 LIMIT 1"),
+        vec![vec![int(3)]]
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (z:Missing) RETURN count(*) AS c LIMIT 0"),
+        none
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (z:Missing) RETURN count(*) AS c LIMIT 1"),
+        vec![vec![int(0)]]
+    );
+    let p = BTreeMap::from([("k".to_string(), Value::Int(1))]);
+    assert_eq!(
+        rows_with(&fx, "MATCH (a) RETURN count(*) AS c SKIP $k", &p).1,
+        none
+    );
+    assert_eq!(
+        rows_with(&fx, "MATCH (a) RETURN count(*) AS c LIMIT $k", &p).1,
+        vec![vec![int(3)]]
+    );
+}
+
+#[test]
+fn row_169_skip_and_limit_on_an_ungrouped_aggregate_over_a_variable_length_path() {
+    let fx = abb();
+    let q = "MATCH (a)-[:T*1..2]->(b) RETURN count(*) AS c";
+    assert_eq!(rows(&fx, q), vec![vec![int(1)]]);
+    assert_eq!(rows(&fx, &format!("{q} SKIP 1")), Rows::new());
+    assert_eq!(rows(&fx, &format!("{q} LIMIT 0")), Rows::new());
+}
+
+#[test]
+fn row_169_skip_and_limit_on_several_ungrouped_aggregates_and_on_groups() {
+    let fx = abb();
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN count(*) AS c, max(a.s) AS m SKIP 1"),
+        Rows::new()
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN count(*) AS c, max(a.s) AS m LIMIT 1"),
+        vec![vec![int(3), s("b")]]
+    );
+    let grouped = "MATCH (a) RETURN a.s AS w, count(*) AS n ORDER BY w";
+    assert_eq!(
+        rows(&fx, &format!("{grouped} SKIP 1")),
+        vec![vec![s("b"), int(1)]]
+    );
+    assert_eq!(
+        rows(&fx, &format!("{grouped} LIMIT 1")),
+        vec![vec![s("a"), int(2)]]
+    );
+}
+
+#[test]
+fn row_169_skip_and_limit_on_an_ungrouped_aggregate_after_a_with() {
+    let fx = abb();
+    let none = Rows::new();
+    assert_eq!(
+        rows(&fx, "MATCH (a) WITH a RETURN count(*) AS c SKIP 1"),
+        none
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (a) WITH a RETURN count(*) AS c LIMIT 0"),
+        none
+    );
+    assert_eq!(
+        rows(&fx, "MATCH (a) WITH a RETURN count(*) AS c LIMIT 1"),
+        vec![vec![int(3)]]
+    );
+    assert_eq!(
+        rows(&fx, &format!("{GROUPS} RETURN count(*) AS c SKIP 1")),
+        none
+    );
+    assert_eq!(
+        rows(&fx, &format!("{GROUPS} RETURN count(*) AS c LIMIT 0")),
+        none
+    );
+    assert_eq!(
+        rows(&fx, &format!("{GROUPS} RETURN w0, w1 ORDER BY w0 SKIP 1")),
+        vec![vec![s("b"), int(1)]]
+    );
+}

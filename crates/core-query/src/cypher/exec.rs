@@ -1046,10 +1046,7 @@ fn execute_inner(
                     // agg_stream with empty ops hits the terminal branch (accumulate).
                     agg_stream(&ctx, &[], row, &mut acc)?;
                 }
-                let value = acc.finish();
-                let mut rs = ResultSet::new(vec![column.clone()]);
-                rs.push_row(vec![value]);
-                return Ok(rs);
+                return aggregate_result(column, acc.finish(), &plan[op_index + 1..], params);
             }
             // OPTIONAL MATCH: left-outer-join apply.
             //
@@ -4857,11 +4854,33 @@ fn execute_aggregate(
     let initial_row: Row = vec![None; vars.names.len()];
     let mut acc = AggAcc::for_arg(func, arg, params)?;
     agg_stream(&ctx, producers, &initial_row, &mut acc)?;
+    aggregate_result(column, acc.finish(), &plan[agg_pos + 1..], params)
+}
 
-    let value = acc.finish();
-    let mut rs = ResultSet::new(vec![column.clone()]);
-    rs.push_row(vec![value]);
-    Ok(rs)
+/// The one-row result of a single `Aggregate`, with the `SKIP` / `LIMIT` ops
+/// that follow it in the plan applied to that row (ledger row 169).
+fn aggregate_result(
+    column: &str,
+    value: Option<Value>,
+    tail: &[PlanOp],
+    params: &Params,
+) -> Result<ResultSet, String> {
+    let mut rows = vec![vec![value]];
+    for op in tail {
+        match op {
+            PlanOp::Skip(ls) => apply_skip(&mut rows, resolve_ls(ls, params)?),
+            PlanOp::Limit(ls) => apply_limit(&mut rows, resolve_ls(ls, params)?),
+            other => {
+                return Err(format!(
+                    "internal: {other:?} after an Aggregate — structurally malformed"
+                ));
+            }
+        }
+    }
+    Ok(finish(Projected {
+        columns: vec![column.to_string()],
+        rows,
+    }))
 }
 
 /// The value a `DISTINCT` aggregate argument takes on one row.
@@ -8857,10 +8876,12 @@ LIMIT 10";
         assert_eq!(max_rs.row(0), &[Some(i(7))]);
     }
 
-    /// I-1: LIMIT, SKIP, and ORDER BY are silently dropped for aggregate
-    /// queries (always one result row).  Pin both boundary values.
+    /// I-1: an aggregate with no grouping key makes one row. ORDER BY has
+    /// nothing to reorder and is dropped; LIMIT and SKIP apply to that row
+    /// like any other (ledger row 169: they used to be dropped too, and
+    /// `LIMIT 0` / `SKIP 100` still returned the row). Pin both boundaries.
     #[test]
-    fn aggregate_limit_skip_order_by_are_no_ops() {
+    fn aggregate_limit_and_skip_apply_and_order_by_is_a_no_op() {
         let mut fx = Fx::new();
         fx.add("N", "a", vec![]);
         fx.add("N", "b", vec![]);
@@ -8868,34 +8889,21 @@ LIMIT 10";
         let v = fx.view();
         let params = BTreeMap::new();
 
-        // LIMIT 5 — aggregate always returns exactly 1 row regardless.
+        // LIMIT 5 keeps the one row.
         let rs_lim5 =
             run(&v, "MATCH (n:N) RETURN COUNT(*) LIMIT 5", &params).expect("COUNT(*) LIMIT 5");
-        assert_eq!(
-            rs_lim5.len(),
-            1,
-            "aggregate with LIMIT 5 must still return 1 row"
-        );
+        assert_eq!(rs_lim5.len(), 1, "aggregate with LIMIT 5 returns its row");
         assert_eq!(rs_lim5.row(0), &[Some(i(3))]);
 
-        // LIMIT 0 — even LIMIT 0 does not suppress the aggregate row.
+        // LIMIT 0 returns no rows.
         let rs_lim0 =
             run(&v, "MATCH (n:N) RETURN COUNT(*) LIMIT 0", &params).expect("COUNT(*) LIMIT 0");
-        assert_eq!(
-            rs_lim0.len(),
-            1,
-            "aggregate with LIMIT 0 must still return 1 row"
-        );
-        assert_eq!(rs_lim0.row(0), &[Some(i(3))]);
+        assert_eq!(rs_lim0.len(), 0, "aggregate with LIMIT 0 returns no rows");
 
-        // SKIP 100 — does not discard the single result row.
+        // SKIP 100 discards the one row.
         let rs_skip =
             run(&v, "MATCH (n:N) RETURN COUNT(*) SKIP 100", &params).expect("COUNT(*) SKIP 100");
-        assert_eq!(
-            rs_skip.len(),
-            1,
-            "aggregate with large SKIP must still return 1 row"
-        );
+        assert_eq!(rs_skip.len(), 0, "aggregate with SKIP 100 returns no rows");
 
         // ORDER BY is a no-op on a single-row result (but must not panic).
         // Note: the planner drops ORDER BY for aggregates; verify that the plan
