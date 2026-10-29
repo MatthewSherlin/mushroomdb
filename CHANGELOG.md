@@ -2,7 +2,6 @@
 
 ## v0.10.0 — Cypher, Bolt, and a store you host yourself
 
-Per-unit notes that are not repeated here are in `changelog.d/`.
 
 A store that never uses a 0.10 feature opens under 0.9.x, and 0.9.x opens under
 0.10. The first write of a new value type, a unique constraint, a range index or
