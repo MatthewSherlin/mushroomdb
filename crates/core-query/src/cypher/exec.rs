@@ -625,25 +625,26 @@ fn execute_inner(
     // n RETURN c.name, n * 2 AS dbl` came back as columns `c` and `n`
     // carrying the group key and the raw count.
     //
+    // The same holds for every op after the first `GroupAggregate` that is
+    // not ORDER BY / SKIP / LIMIT. A second `GroupAggregate` (an aggregating
+    // RETURN, or a second aggregating WITH, straight after an aggregating
+    // WITH) or a MATCH after the aggregate was dropped the same way: `WITH
+    // a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` returned the WITH's
+    // columns and groups (ledger row 168).
+    //
     // A plain aggregate with no `WITH` (`RETURN c.name, count(*)`) has its
-    // columns in the `GroupAggregate` op itself and no `Project` after it, so
-    // it keeps the streaming path.
+    // columns in the `GroupAggregate` op itself and only ORDER BY / SKIP /
+    // LIMIT after it, so it keeps the streaming path.
     let is_pipeline = plan.iter().any(|op| {
         matches!(
             op,
             PlanOp::With { .. } | PlanOp::Unwind { .. } | PlanOp::LeftOuterApply { .. }
         )
-    }) || {
-        let mut saw_gagg = false;
-        plan.iter().any(|op| {
-            if matches!(op, PlanOp::GroupAggregate { .. }) {
-                saw_gagg = true;
-                false
-            } else {
-                saw_gagg && matches!(op, PlanOp::Filter { .. } | PlanOp::Project { .. })
-            }
-        })
-    };
+    }) || plan
+        .iter()
+        .skip_while(|op| !matches!(op, PlanOp::GroupAggregate { .. }))
+        .skip(1)
+        .any(|op| !is_group_table_op(op));
 
     // GroupAggregate plans: streaming HashMap accumulator (O(groups) memory).
     // Checked before the bounded path and before single-aggregate so they are
@@ -5648,10 +5649,26 @@ fn execute_group_aggregate(
                 let n = resolve_ls(ls, params)?;
                 apply_limit(&mut projected.rows, n);
             }
-            _ => {} // Ignore unexpected ops defensively.
+            // `execute_inner` sends any other tail to the staged path; one
+            // reaching here would be dropped silently (ledger row 168).
+            other => {
+                return Err(format!(
+                    "internal: {other:?} after a streamed GroupAggregate — structurally malformed"
+                ));
+            }
         }
     }
     Ok(finish(projected))
+}
+
+/// Whether `op` is one the streaming group path applies to the finished group
+/// table: ORDER BY, SKIP and LIMIT. Any other op after a `GroupAggregate`
+/// needs the staged path.
+fn is_group_table_op(op: &PlanOp) -> bool {
+    matches!(
+        op,
+        PlanOp::OrderBy { .. } | PlanOp::Skip(_) | PlanOp::Limit(_)
+    )
 }
 
 /// Recursively walk all matching rows through `ops`, computing the group key
@@ -6804,6 +6821,10 @@ mod ql_cx;
 #[cfg(test)]
 #[path = "tests/ql_ag.rs"]
 mod ql_ag;
+
+#[cfg(test)]
+#[path = "tests/h3.rs"]
+mod h3;
 
 #[cfg(test)]
 #[path = "tests/tx_15.rs"]

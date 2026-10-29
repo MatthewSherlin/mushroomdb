@@ -176,7 +176,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 164 | Low — lease lifecycle, introduced in unreleased 0.10 (HO-07), release blocker | Shutdown canceled an initial lease acquisition after its remote PUT but before capability probes returned a handle. The own LEASE remained after clean exit, and no final manifest was published. HO-LC retains the pending attempt, shares its completion and flush under one grace deadline, then performs one bounded ownership-checked release | **CLOSED** in 0.10 (HO-LC) |
 | 166 | Low — semantic deviation, present in released 0.9.x and 0.10.0 | `sum` over no values returns null; openCypher returns 0. `MATCH (n) RETURN sum(n.missing)` and a group whose rows all lack the property both give null. Pinned as intended by `sum_numeric_prop_ignores_null_and_non_numeric` in `crates/core-query/src/cypher/exec.rs`. Found by hardening H-2. Changing it changes a result a caller can see, so it waits for an owner ruling. | **DEFERRED** to 0.11 |
 | 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. | **DEFERRED** to 0.10.1 |
-| 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Pinned by `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs` | **DEFERRED** to 0.10.1 |
+| 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
 | 169 | Medium — wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Pinned by `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs` | **DEFERRED** to 0.10.1 |
 | 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **DEFERRED** to 0.10.1 |
 | 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead | **DEFERRED** to 0.10.1 |
@@ -4824,7 +4824,7 @@ measured 1.34× plus 0.06), under readers 1.25× → 1.65× (worst 1.58× plus 0
 under-readers ratio 1.5× → 1.65×. **DEFERRED to 0.10.1**: cut the per-commit publish cost on
 Linux and bring the bounds back toward 1.15× and 1.25×.
 
-## 168. An aggregating `RETURN` after an aggregating `WITH` is dropped — DEFERRED to 0.10.1
+## 168. An aggregating `RETURN` after an aggregating `WITH` is dropped — CLOSED in 0.10.1
 
 Present in released 0.9.x (seen on v0.9.3) and 0.10.0; **High** (silent wrong results). Found
 2026-10-29 by the 0.10.x hardening test H-3 (`crates/sim-harness/tests/reference_evaluator.rs`),
@@ -4845,6 +4845,20 @@ on the `RETURN`'s alias is refused (`ORDER BY target c0 is not a projected colum
 drop seen from the other side. Pinned by
 `finding_an_aggregating_return_after_an_aggregating_with_runs` (ignored until the fix); the H-3
 property skips the shape in `hits_row_168`, which goes with the fix.
+
+**CLOSED in 0.10.1.** The plan was right: `GroupAggregate` for the `WITH`, then `GroupAggregate`
+for the `RETURN`. `execute_inner` (`crates/core-query/src/cypher/exec.rs`) chose the streaming
+group path for it. That path runs the first `GroupAggregate` and applies only the `ORDER BY`,
+`SKIP` and `LIMIT` ops after it, ignoring anything else, and the routing sent a plan to the staged
+path only when a `Filter` or `Project` followed the aggregate. A `WHERE` after the `WITH` is a
+`Filter` and a non-aggregating `RETURN` is a `Project`, which is why those ran; a second
+`GroupAggregate`, or a `MATCH` after the aggregating `WITH`, was dropped. Any op after the first
+`GroupAggregate` other than `ORDER BY` / `SKIP` / `LIMIT` now takes the staged path, and the
+streaming path refuses any other op it is given instead of ignoring it. Two aggregating `WITH`
+stages followed by an aggregating `RETURN`, and `WITH count(*) AS n MATCH (b) RETURN n, count(*)`,
+had the same drop and are fixed with it. Tests:
+`finding_an_aggregating_return_after_an_aggregating_with_runs` (un-ignored), the H-3 property
+without `hits_row_168`, and the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs`.
 
 ## 169. `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key — DEFERRED to 0.10.1
 

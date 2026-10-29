@@ -44,8 +44,9 @@
 //! the documented behaviour is one named function that points at its source:
 //! `sum_of_nothing` (ledger row 166). Every other difference is an engine bug.
 //! Three found when this test was written are ledger rows 168–170, pinned,
-//! shrunk, as the `finding_*` tests at the end (ignored until 0.10.1 fixes
-//! them); the property skips their shapes in `hits_row_168` … `hits_row_170`.
+//! shrunk, as the `finding_*` tests at the end. Row 168 is fixed; the others
+//! are ignored until 0.10.1 fixes them, and the property skips their shapes
+//! in `hits_row_169` and `hits_row_170`.
 //! Shapes the engine refuses outright (`-->`, row 171; `WITH DISTINCT`;
 //! `RETURN DISTINCT` with an aggregate) are not generated.
 //!
@@ -1403,17 +1404,6 @@ fn compare(q: &Query, want: &Answer, rs: &ResultSet) -> Result<(), String> {
 // them so it keeps checking everything else; each `finding_*` test below pins
 // the defect itself. Delete each function, and its call, with its fix.
 
-/// Ledger row 168: an aggregating `RETURN` straight after an aggregating
-/// `WITH` (no `WHERE` between) is dropped. Delete with the fix.
-fn hits_row_168(q: &Query) -> bool {
-    let ret_aggregates = q.ret.items.iter().any(|i| i.0.is_agg());
-    let with_aggregates_unfiltered = q
-        .with
-        .as_ref()
-        .is_some_and(|(p, w)| w.is_none() && p.items.iter().any(|i| i.0.is_agg()));
-    ret_aggregates && with_aggregates_unfiltered
-}
-
 /// Ledger row 169: `SKIP` / `LIMIT` are ignored on an aggregate with no
 /// grouping key. Delete with the fix.
 fn hits_row_169(q: &Query) -> bool {
@@ -1459,7 +1449,7 @@ proptest! {
         let (g, db) = build(&nodes, &edges, &updates, usize::from(snapshot_slot));
         for choices in &queries {
             let q = gen_query(choices);
-            if hits_row_168(&q) || hits_row_169(&q) || hits_row_170(&q) {
+            if hits_row_169(&q) || hits_row_170(&q) {
                 continue;
             }
             let text = render_query(&q);
@@ -1695,7 +1685,6 @@ fn finding_skip_and_limit_apply_to_an_ungrouped_aggregate() {
 /// and rows. With a `WHERE` in between the `RETURN` runs. openCypher
 /// aggregates the `WITH`'s rows again.
 #[test]
-#[ignore = "ledger row 168, fixed in 0.10.1: un-ignore with the fix"]
 fn finding_an_aggregating_return_after_an_aggregating_with_runs() {
     let s = |x: &str| vec![("s", Value::Str(x.into()))];
     let db = fixed_db(&[("A", s("a")), ("A", s("a")), ("B", s("b"))]);

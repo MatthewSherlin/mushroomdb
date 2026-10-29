@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **An aggregating `RETURN` straight after an aggregating `WITH` aggregates the `WITH`'s rows.** `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` returned the `WITH`'s columns and groups (`w0, w1`) instead of one row `c0`, silently; `RETURN sum(w1)` did the same. A second aggregating `WITH`, or a `MATCH` after the aggregating `WITH`, followed by an aggregating `RETURN` was dropped the same way. Affected: 0.10.0, on every surface that runs Cypher (on v0.9.3 the shape was refused with an error). What is unchanged: a non-aggregating `RETURN` after an aggregating `WITH`, and an aggregating `RETURN` with a `WHERE` between it and the `WITH`, already ran and give the same answers (row 168).
+
 ## v0.10.0 — Cypher, Bolt, and a store you host yourself
 
 
