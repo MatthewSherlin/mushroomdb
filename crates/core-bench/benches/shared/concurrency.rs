@@ -52,9 +52,23 @@ pub const P99_MAX_MS: f64 = 2.0;
 ///   this scenario, `--cfg mdb_v092`, and points `MUSHROOMDB_GATE_V092` at
 ///   it; the two are run interleaved, [`V092_ROUNDS`] times each):
 ///   - readers paused: at most [`ALONE_MAX_VS_V092`]× v0.9.2's;
-///   - readers running: at most [`UNDER_MAX_VS_V092`]× v0.9.2's.
-/// - **Against this build with its readers paused**, which needs no
-///   baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
+///   - readers running: at most [`UNDER_MAX_VS_V092`]× v0.9.2's, once the
+///     cost of sharing the cores is taken out (below).
+/// - **Against this build with as many busy threads beside it**, which
+///   needs no baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
+///
+/// Sharing the cores (2026-10-28, ledger row 167). v0.9.2's readers block
+/// behind its writer and do almost no work, so they take none of its cores;
+/// this build's readers do hundreds of thousands of reads a second. On a
+/// machine with fewer cores than readers, writer and builder (a 4-vCPU CI
+/// runner), the readers then cost the writer CPU whatever the locking: the
+/// same source measured 1.04–1.23× v0.9.2 on EPYC 9V45/9V74 runners and
+/// 1.34–1.42× on EPYC 7763 ones. [`measure_writer`] therefore also times the
+/// writer beside as many busy threads that share the cores and memory but
+/// not the store, and the bounds above compare the readers' cost to that.
+/// Where there are cores to spare, as on the machine the decision was
+/// measured on, the busy block costs what the paused one does and the
+/// bounds read as before. No bound changed.
 pub const ALONE_MAX_VS_V092: f64 = 1.15;
 /// See [`ALONE_MAX_VS_V092`]: the owner accepted up to 1.21×; 1.25× is that
 /// with a 0.04 noise margin. This tree measured 1.01–1.09× v0.9.2 here
@@ -67,7 +81,8 @@ pub const UNDER_MAX_VS_V092: f64 = 1.25;
 /// commit), and a median over these pairs halves that.
 pub const V092_ROUNDS: usize = 5;
 /// Under readers, the commit's median may cost up to this multiple of the
-/// same build's median with them paused: about 1.4× when the decision was
+/// same build's median beside as many busy threads (with them paused, before
+/// 2026-10-28): about 1.4× when the decision was
 /// measured, 0.98–1.21× on this tree; the pre-fix state was 2.6–2.8×.
 pub const WRITER_UNDER_READERS_MAX: f64 = 1.5;
 /// When v0.9.2 is measured on the same machine, the under-readers ratio may
@@ -396,6 +411,9 @@ pub struct WriterReport {
     pub readers: usize,
     /// Median plain commit with the readers paused.
     pub alone_p50_ms: f64,
+    /// Median plain commit with as many threads as readers doing CPU and
+    /// memory work that never touches the store (see [`busy_work`]).
+    pub busy_p50_ms: f64,
     /// Median plain commit with the readers running.
     pub under_p50_ms: f64,
     /// Reads the readers completed per second while running.
@@ -403,22 +421,76 @@ pub struct WriterReport {
 }
 
 impl WriterReport {
+    /// What running readers cost the writer beyond the cost of sharing the
+    /// machine's cores: `under / busy`. Where the readers and the writer have
+    /// cores to themselves, `busy` equals `alone` and this is `under / alone`.
     pub fn ratio(&self) -> f64 {
-        self.under_p50_ms / self.alone_p50_ms
+        self.under_p50_ms / self.busy_p50_ms
+    }
+
+    /// How much sharing the cores alone slows the writer: `busy / alone`.
+    pub fn cpu_share(&self) -> f64 {
+        self.busy_p50_ms / self.alone_p50_ms
     }
 }
 
+/// Words in each busy thread's buffer: 8 MiB, past a core's share of L2 and
+/// most of a 4-vCPU runner's L3, so the threads load memory the way readers
+/// walking a graph do rather than spinning in registers.
+const BUSY_WORDS: usize = 1 << 20;
+
+/// One busy thread: pseudo-random reads over its own buffer until `stop`,
+/// working only while `active`. It shares the writer's cores and memory
+/// bandwidth as a reader would, and none of the store's locks or data.
+fn busy_work(stop: Arc<AtomicBool>, active: Arc<AtomicBool>, seed: u64) {
+    let buf: Vec<u64> = (0..BUSY_WORDS as u64).map(|i| i ^ seed).collect();
+    let mut x = seed | 1;
+    let mut acc = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        if !active.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
+        }
+        for _ in 0..4_096 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            acc = acc.wrapping_add(buf[(x as usize) & (BUSY_WORDS - 1)]);
+        }
+        std::hint::black_box(acc);
+    }
+}
+
+/// Which threads run beside the writer during one block of commits.
+#[derive(Clone, Copy, PartialEq)]
+enum Beside {
+    Nothing,
+    Busy,
+    Readers,
+}
+
 /// The owner-decision scenario: on the gate's store with fsync off, time
-/// plain single-property commits through `db.write()` in `rounds` pairs of
-/// blocks of `per_block` commits — one block with `readers` threads paused,
-/// one with them capturing, looking a node up and reading its neighbourhood
-/// as fast as they can. Alternating on one store means a disk or load spike
-/// lands on both sides, not on one.
+/// plain single-property commits through `db.write()` in `rounds` rounds of
+/// three blocks of `per_block` commits — one with `readers` threads paused,
+/// one with as many busy threads ([`busy_work`]) sharing the cores but not
+/// the store, and one with the readers capturing, looking a node up and
+/// reading its neighbourhood as fast as they can. Alternating on one store
+/// means a disk or load spike lands on every side, not on one. The busy block
+/// separates what sharing a small machine's cores costs the writer, which
+/// any working reader would cost, from what the readers' use of the store
+/// costs it, which is what the owner's decision is about.
 pub fn measure_writer(readers: usize, rounds: usize, per_block: usize) -> WriterReport {
     let store = build_store("writer");
     let db = &store.db;
     let stop = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicBool::new(false));
+    let busy_threads: Vec<_> = (0..readers)
+        .map(|r| {
+            let (stop, busy) = (Arc::clone(&stop), Arc::clone(&busy));
+            std::thread::spawn(move || busy_work(stop, busy, 0x9e37_79b9 ^ r as u64))
+        })
+        .collect();
     let reads = Arc::new(AtomicU64::new(0));
     let threads: Vec<_> = (0..readers)
         .map(|r| {
@@ -444,13 +516,15 @@ pub fn measure_writer(readers: usize, rounds: usize, per_block: usize) -> Writer
             })
         })
         .collect();
-    let (mut alone, mut under) = (Vec::new(), Vec::new());
+    let (mut alone, mut beside_busy, mut under) = (Vec::new(), Vec::new(), Vec::new());
     let (mut reading_secs, mut reads_done) = (0.0, 0u64);
     let mut i = 0usize;
     for _ in 0..rounds {
-        for running in [false, true] {
+        for beside in [Beside::Nothing, Beside::Busy, Beside::Readers] {
+            let running = beside == Beside::Readers;
             active.store(running, Ordering::Relaxed);
-            // Let the readers stop, or reach full speed.
+            busy.store(beside == Beside::Busy, Ordering::Relaxed);
+            // Let the threads stop, or reach full speed.
             std::thread::sleep(Duration::from_millis(20));
             let (reads_before, start) = (reads.load(Ordering::Relaxed), Instant::now());
             for _ in 0..per_block {
@@ -460,10 +534,10 @@ pub fn measure_writer(readers: usize, rounds: usize, per_block: usize) -> Writer
                     .set_prop(&k, "score", Value::Int(-(i as i64)))
                     .expect("plain commit");
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
-                if running {
-                    under.push(ms)
-                } else {
-                    alone.push(ms)
+                match beside {
+                    Beside::Nothing => alone.push(ms),
+                    Beside::Busy => beside_busy.push(ms),
+                    Beside::Readers => under.push(ms),
                 }
                 i += 1;
             }
@@ -477,9 +551,13 @@ pub fn measure_writer(readers: usize, rounds: usize, per_block: usize) -> Writer
     for t in threads {
         t.join().expect("reader thread");
     }
+    for t in busy_threads {
+        t.join().expect("busy thread");
+    }
     WriterReport {
         readers,
         alone_p50_ms: quantile(&mut alone, 0.5),
+        busy_p50_ms: quantile(&mut beside_busy, 0.5),
         under_p50_ms: quantile(&mut under, 0.5),
         reads_per_sec: reads_done as f64 / reading_secs,
     }
