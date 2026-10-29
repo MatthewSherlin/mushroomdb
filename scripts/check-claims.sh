@@ -219,7 +219,7 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
   if [[ ${#_scan[@]} -gt 0 ]]; then
     stale="$( (cd "$ROOT" && grep -nE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
              | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
-             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/|(^|/)scripts/" || true)"
+             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)scripts/" || true)"
   fi
   # A pin the rewriter mangled: `mushroomdb` immediately followed by a version
   # with no `@`. This exists because the bump script once produced exactly that
@@ -231,7 +231,7 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
     # `scripts/` is excluded: the bump script's own comment describes this
     # exact wreckage, and a pin inside a script is not reader-facing copy.
     mangled="$( (cd "$ROOT" && grep -nE "mushroomdb\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
-               | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/|(^|/)scripts/" || true)"
+               | grep -vE "(^|/)CHANGELOG\.md:|(^|/)scripts/" || true)"
   fi
   if [[ -n "$mangled" ]]; then
     echo "check-claims.sh: install pins with the '@' missing — a mangled rewrite:" >&2

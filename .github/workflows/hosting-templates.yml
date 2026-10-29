@@ -192,12 +192,13 @@ jobs:
           MUSHROOMDB_TOKEN: not-a-real-token
         run: docker compose -f deploy/docker-compose/docker-compose.yml config -q
 
-  # The image, with --features tls as the Dockerfile builds it. On pull
-  # requests ci.yml's `docker` job already builds and runs the same Dockerfile,
-  # so this one runs on pushes, where ci.yml runs only for main.
+  # The image, with --features tls as the Dockerfile builds it. ci.yml's
+  # `docker` job already builds the same Dockerfile on push to main and on pull
+  # requests, so this job runs only on release/** pushes (where ci.yml does not
+  # trigger) to keep the image gate in place for release branches.
   docker-build:
     needs: [changes]
-    if: github.event_name != 'pull_request' && needs.changes.outputs.image == 'true'
+    if: startsWith(github.ref, 'refs/heads/release/') && needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

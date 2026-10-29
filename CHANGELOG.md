@@ -2,7 +2,6 @@
 
 ## v0.10.0 — Cypher, Bolt, and a store you host yourself
 
-Per-unit notes that are not repeated here are in `changelog.d/`.
 
 A store that never uses a 0.10 feature opens under 0.9.x, and 0.9.x opens under
 0.10. The first write of a new value type, a unique constraint, a range index or
@@ -792,7 +791,7 @@ Twenty methods, each with a signature and a docstring in
 
 ### Known limits
 
-Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
+Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
 
 - **A nickname stub links only when the alias is declared.** A bare `matt`
   stub holds one alias and cannot reach Jaccard 0.6 against an entity named

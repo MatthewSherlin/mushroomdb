@@ -1,2 +1,0 @@
-### Changed
-- **`mushroomdb-storage`: `ColumnsView::column` returns a `ViewColumn` that reads the snapshot base too, and is no longer deprecated.** 0.9.3 deprecated the overlay-only `column` and added `ColumnsView::view_column` (row 139); 0.10 keeps `view_column` as the same handle under its 0.9.3 name. A caller of 0.9.x's `column` that used the returned `ColumnHandle` type by name needs `ViewColumn`, whose `get` returns `Option<ValueRef>`.
