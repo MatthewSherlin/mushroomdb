@@ -1,6 +1,6 @@
 # Tag-gated. Pushing a v* tag builds a binary for each of six platforms, a GitHub Release,
-# GHCR images, and (when tokens/OIDC exist) npm / PyPI. crates.io is referenced
-# but not published until workspace path deps gain version= keys.
+# and GHCR images, then dispatches publish.yml which publishes crates.io, npm and PyPI
+# via OIDC Trusted Publishing.
 #
 # Third-party actions are pinned to commit SHAs (tag in the trailing comment).
 name: release
