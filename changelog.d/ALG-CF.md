@@ -1,1 +1,0 @@
-- **Algorithm configuration:** Require JSON objects on the three algorithm HTTP routes, preserving named defaults and authorization checks. TypeScript algorithm calls reject configs declaring another algorithm's options and expose the existing `weight_prop` and `min_weight` fields.

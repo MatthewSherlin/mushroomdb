@@ -1515,8 +1515,8 @@ fn call_tool(db: &SharedDb, all_tools: bool, name: &str, arguments: &Js) -> Js {
 ///
 /// Asserted against a real `tools/list` rather than against a constant this
 /// file declares. The 0.6.12 version of exactly this test compared against
-/// its own copy of the tool list and passed with the bug reintroduced
-/// (`docs/roadmap/road-to-0.7-plan.md:186-193`).
+/// its own copy of the tool list and passed with the bug reintroduced —
+/// a test that asserts against its own copy cannot catch the bug it guards.
 #[test]
 fn the_code_graph_tools_are_absent_from_every_listing() {
     const GONE: [&str; 7] = [

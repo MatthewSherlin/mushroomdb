@@ -1,1 +1,0 @@
-- **Delete of an absent edge is no longer rule-owned**, and a via-hop, namespaced or capped rule no longer blocks an edge it would not derive (ledger row 67).

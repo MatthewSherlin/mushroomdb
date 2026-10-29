@@ -1,6 +1,9 @@
 # publish.yml — Registry publishing via OIDC Trusted Publishing
 #
-# Triggered on GitHub Release "published" event (or manually).
+# Triggered by release.yml's trigger-publish job via workflow_dispatch after
+# the GitHub Release is created. (GitHub suppresses events caused by
+# GITHUB_TOKEN, so `release: published` never fires for releases that
+# release.yml creates — dispatch is used instead.) Can also be run manually.
 # Publishes to crates.io, PyPI, and npm in parallel after building.
 # NO secrets required for crates.io or PyPI — both use OIDC.
 # npm requires a granular token (see bootstrap notes below).
@@ -69,8 +72,6 @@
 name: publish
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -147,17 +148,16 @@ jobs:
           done
 
   # ── PyPI ───────────────────────────────────────────────────────────────────
-  # Builds wheels for four targets, then uploads via OIDC trusted publishing.
+  # Builds wheels for three targets, then uploads via OIDC trusted publishing.
   # No PyPI token secret needed — configure a pending publisher on PyPI first.
+  # This job only builds and uploads artifacts; the `environment: pypi` gate
+  # and id-token live only on the upload jobs below so builds do not require
+  # manual approval.
   publish-pypi:
     name: PyPI
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      id-token: write  # Required for OIDC Trusted Publishing
-    environment:
-      name: pypi
-      url: https://pypi.org/p/mushroomdb
 
     strategy:
       matrix:
