@@ -174,6 +174,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 161 | Low — wrong values, introduced in 0.10 (QL-TF), never released | `date.statement()` / `date.transaction()` (and the `localdatetime.` and `datetime.` forms) read the clock on every call instead of holding one instant per statement or transaction, so two calls in one statement can differ and `statement()` can differ from `transaction()`. Two TCK Temporal10 scenarios fail on it, and flip on clock timing. `realtime()` reading the clock on every call is right | **CLOSED** in 0.10 (QL-CL) |
 | 162 | None on 0.10; the symptoms are rows 114, 117 and 124, present in released 0.9.x (run on v0.9.3) | Reported by the v0.9.4 review: `db.reader()` answered rule-derived edges and their weights differently from the live handle (2559 of 5345 checks with null weights, 487 missing derived edges). A seeded differential probe on 0.10 finds no difference; on v0.9.3 it reproduces as rows 114, 117 and 124, which 0.10 closed | **CLOSED** — not a defect on 0.10; present in 0.9.x as rows 114, 117 and 124 |
 | 164 | Low — lease lifecycle, introduced in unreleased 0.10 (HO-07), release blocker | Shutdown canceled an initial lease acquisition after its remote PUT but before capability probes returned a handle. The own LEASE remained after clean exit, and no final manifest was published. HO-LC retains the pending attempt, shares its completion and flush under one grace deadline, then performs one bounded ownership-checked release | **CLOSED** in 0.10 (HO-LC) |
+| 166 | Low — semantic deviation, present in released 0.9.x and 0.10.0 | `sum` over no values returns null; openCypher returns 0. `MATCH (n) RETURN sum(n.missing)` and a group whose rows all lack the property both give null. Pinned as intended by `sum_numeric_prop_ignores_null_and_non_numeric` in `crates/core-query/src/cypher/exec.rs`. Found by hardening H-2. Changing it changes a result a caller can see, so it waits for an owner ruling. | **DEFERRED** to 0.11 |
 | 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. | **DEFERRED** to 0.10.1 |
 <!-- DEFECT-INDEX:END -->
 
@@ -4769,6 +4770,18 @@ records, black-holed cleanup, one shared pending/flush grace, channel closure/si
 failed and unsupported capability checks, suspect-record watch retention, expired fencing and boot
 adoption. The existing CLI shutdown/final-manifest test is unchanged. The unit report records the
 final commit range from base `5c806ab7` and complete local/CI evidence before release.
+
+## 166. `sum` over no values is null, where openCypher gives 0 — DEFERRED to 0.11
+
+Present in released 0.9.x and 0.10.0; **Low**. Found by the 0.10.x hardening test H-2
+(`crates/sim-harness/tests/query_rewrites.rs`) at 1,000 cases: a store whose nodes all lack `i`
+answers `RETURN sum(n.i)` with null. openCypher defines the sum of no values as 0, and `count` already
+gives 0 there. The null is deliberate in this engine: `sum_numeric_prop_ignores_null_and_non_numeric`
+asserts it. The same holds per group: a group whose rows all lack the property sums to null.
+
+Not a silent wrong answer to a query the engine documents, but a result a caller reads, so it
+is not changed without the owner. The H-2 test encodes the current behaviour in one function,
+`sum_of`, which is the only line to flip. Deferred to 0.11.
 
 ## 167. On Linux a plain commit costs 1.2–1.3× v0.9.2, and up to 1.4–1.6× under readers — DEFERRED to 0.10.1
 
