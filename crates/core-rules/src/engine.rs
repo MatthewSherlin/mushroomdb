@@ -5996,7 +5996,7 @@ mod tests {
         }
     }
 
-    /// Defect ledger row 37 (`docs/roadmap/v0.6.10-defects.md`), deferred to
+    /// Defect ledger row 37 (`docs/internal/defect-ledger.md`), deferred to
     /// 0.8. Two rules share `(src_label, dst_label, edge_type)` and both
     /// desire `a→b`. An edge has one owner, the rule that added it; the other
     /// records nothing. When the owner's predicate stops holding it removes

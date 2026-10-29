@@ -1,14 +1,13 @@
-# v0.6.10 — open defects
+# Defect ledger
 
-**Every entry here must be CLOSED before v0.6.10 is tagged.** Task 12 of the
-implementation plan will not pass its gate while any row is OPEN. Owner
-instruction, 2026-09-17: *"ensure everything we find is fixed before 0.6.10 is
-released."*
+Every defect found in mushroomdb, its severity, and the release it was fixed or
+deferred to. The ledger started at v0.6.10 with an adversarial review of
+committed work that was already green — passing tests are not evidence of an
+absent leak.
 
-These were found by an adversarial review of the release's own committed work —
-commits that were already green: tests passing, `clippy -D warnings` clean.
-Passing tests are not evidence of an absent leak, which is the whole reason this
-file exists.
+`scripts/check-defect-ledger.sh` parses the index between the
+`DEFECT-INDEX:BEGIN` / `DEFECT-INDEX:END` markers and gates releases: it exits
+non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 
 <!-- DEFECT-INDEX:BEGIN — the release gate parses ONLY between these markers. Mutation tables elsewhere in this file share the row shape and must never be counted as defects. -->
 | # | Severity | Where | Status |

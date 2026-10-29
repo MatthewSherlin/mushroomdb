@@ -162,7 +162,7 @@ which would make the preset seventeen rules. It was considered and is **held,
 not built**: the engine gives an edge one owner, so a `KeyMatch` rule beside
 the `Entity→Entity` `Overlap` rule on the same label pair and edge type loses
 a still-declared claim when the `Overlap` rule retracts (defect ledger row 37,
-`docs/roadmap/v0.6.10-defects.md`, deferred to 0.8). **The preset measured by
+`docs/internal/defect-ledger.md`, deferred to 0.8). **The preset measured by
 the third run is unchanged at sixteen rules.**
 
 ### What changed in what is measured

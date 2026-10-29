@@ -792,7 +792,7 @@ Twenty methods, each with a signature and a docstring in
 
 ### Known limits
 
-Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
+Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
 
 - **A nickname stub links only when the alias is declared.** A bare `matt`
   stub holds one alias and cannot reach Jaccard 0.6 against an entity named

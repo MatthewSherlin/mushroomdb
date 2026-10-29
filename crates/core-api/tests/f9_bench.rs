@@ -13,7 +13,7 @@
 //!
 //! What it showed, release profile, n=20 000, fanout 4, every pair inserted
 //! twice, snapshotted and reopened so the mmap'd-base branch is the one taken,
-//! 5 reps, median — see `docs/roadmap/v0.6.10-defects.md` #29 for the numbers
+//! 5 reps, median — see `docs/internal/defect-ledger.md` #29 for the numbers
 //! and what changed between them.
 use core_storage::fs::RealFs;
 use mushroomdb::algo::AlgoDir;
