@@ -52,8 +52,8 @@ pub const P99_MAX_MS: f64 = 2.0;
 ///   this scenario, `--cfg mdb_v092`, and points `MUSHROOMDB_GATE_V092` at
 ///   it; the two are run interleaved, [`V092_ROUNDS`] times each):
 ///   - readers paused: at most [`ALONE_MAX_VS_V092`]× v0.9.2's;
-///   - readers running: at most [`UNDER_MAX_VS_V092`]× v0.9.2's, once the
-///     cost of sharing the cores is taken out (below).
+///   - readers running: at most [`UNDER_MAX_VS_V092`]× v0.9.2's, each
+///     measured against its own build's busy block (below).
 /// - **Against this build with as many busy threads beside it**, which
 ///   needs no baseline: at most [`WRITER_UNDER_READERS_MAX`]×.
 ///
@@ -65,7 +65,8 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// same source measured 1.04–1.23× v0.9.2 on EPYC 9V45/9V74 runners and
 /// 1.34–1.42× on EPYC 7763 ones. [`measure_writer`] therefore also times the
 /// writer beside as many busy threads that share the cores and memory but
-/// not the store, and the bounds above compare the readers' cost to that.
+/// not the store, and both builds' running medians are taken relative to
+/// their own busy block before they are compared.
 /// Where there are cores to spare, as on the machine the decision was
 /// measured on, the busy block costs what the paused one does and the
 /// bounds read as before. No bound changed.

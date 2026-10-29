@@ -28,8 +28,8 @@ fn probe_line(w: &WriterReport) -> String {
     )
 }
 
-/// Parse [`probe_line`]'s `alone` and `under`.
-fn parse_probe(out: &str) -> Option<(f64, f64)> {
+/// Parse [`probe_line`]'s `alone`, `busy` and `under`.
+fn parse_probe(out: &str) -> Option<(f64, f64, f64)> {
     let line = out.lines().find(|l| l.starts_with("WRITER_PROBE"))?;
     let field = |name: &str| {
         line.split_whitespace()
@@ -37,7 +37,7 @@ fn parse_probe(out: &str) -> Option<(f64, f64)> {
             .parse::<f64>()
             .ok()
     };
-    Some((field("alone")?, field("under")?))
+    Some((field("alone")?, field("busy")?, field("under")?))
 }
 
 /// One set of writer measurements: [`V092_ROUNDS`] interleaved pairs of the
@@ -49,20 +49,22 @@ struct WriterSet {
     busy: f64,
     under: f64,
     reads: f64,
-    /// This build's paused median over v0.9.2's, and its running median with
-    /// the cost of sharing the cores taken out (`under × alone / busy`) over
-    /// v0.9.2's running median. v0.9.2's readers block behind its writer and
-    /// do almost no work, so they share no cores with it; this build's
-    /// readers do, and on a machine with fewer cores than threads that costs
-    /// the writer whatever the locking. The busy block measures that share.
+    /// This build's paused median over v0.9.2's, and its running median over
+    /// v0.9.2's with each taken relative to its own build's busy block:
+    /// `(under / busy) / (v0.9.2 under / v0.9.2 busy)`. On a machine with
+    /// fewer cores than threads, threads beside the writer cost it CPU
+    /// whatever the locking; each build's busy block measures that on the
+    /// same runner, so the ratio compares what the readers' use of the store
+    /// costs. With cores to spare both busy blocks equal the paused ones and
+    /// this is the plain running ratio.
     vs_v092: Option<(f64, f64)>,
-    /// v0.9.2's own running median over its paused one.
+    /// v0.9.2's own running median over its busy one.
     v092_ratio: Option<f64>,
 }
 
 #[cfg(not(mdb_v092))]
 impl WriterSet {
-    /// The bound on `under / alone`: [`WRITER_UNDER_READERS_MAX`], or
+    /// The bound on `under / busy`: [`WRITER_UNDER_READERS_MAX`], or
     /// [`SELF_RATIO_MAX_VS_V092`] times v0.9.2's own ratio when that is higher.
     fn ratio_bound(&self) -> f64 {
         self.v092_ratio.map_or(WRITER_UNDER_READERS_MAX, |r| {
@@ -82,7 +84,7 @@ impl WriterSet {
 #[cfg(not(mdb_v092))]
 fn measure_writer_set(baseline: Option<&str>) -> WriterSet {
     let mut head: Vec<WriterReport> = Vec::new();
-    let mut base: Vec<(f64, f64)> = Vec::new();
+    let mut base: Vec<(f64, f64, f64)> = Vec::new();
     let rounds = if baseline.is_some() { V092_ROUNDS } else { 1 };
     for _ in 0..rounds {
         if let Some(exe) = baseline {
@@ -107,23 +109,26 @@ fn measure_writer_set(baseline: Option<&str>) -> WriterSet {
         quantile(&mut busy, 0.5),
         quantile(&mut under, 0.5),
     );
-    let under_cores_out = under * alone / busy;
     let reads = head
         .iter()
         .map(|w| w.reads_per_sec)
         .fold(f64::INFINITY, f64::min);
     let vs_v092 = (!base.is_empty()).then(|| {
         let mut b_alone: Vec<f64> = base.iter().map(|b| b.0).collect();
-        let mut b_under: Vec<f64> = base.iter().map(|b| b.1).collect();
-        let (b_alone, b_under) = (quantile(&mut b_alone, 0.5), quantile(&mut b_under, 0.5));
-        println!(
-            "v0.9.2: paused {b_alone:.4} ms, under readers {b_under:.4} ms; this build {:.2}x paused, {:.2}x under readers ({:.2}x before taking out the {:.2}x the busy threads cost)",
-            alone / b_alone,
-            under_cores_out / b_under,
-            under / b_under,
-            busy / alone
+        let mut b_busy: Vec<f64> = base.iter().map(|b| b.1).collect();
+        let mut b_under: Vec<f64> = base.iter().map(|b| b.2).collect();
+        let (b_alone, b_busy, b_under) = (
+            quantile(&mut b_alone, 0.5),
+            quantile(&mut b_busy, 0.5),
+            quantile(&mut b_under, 0.5),
         );
-        (alone / b_alone, under_cores_out / b_under, b_under / b_alone)
+        let under_x = (under / busy) / (b_under / b_busy);
+        println!(
+            "v0.9.2: paused {b_alone:.4} ms, beside busy threads {b_busy:.4} ms, under readers {b_under:.4} ms; this build {:.2}x paused, {under_x:.2}x under readers against each build's busy block ({:.2}x raw)",
+            alone / b_alone,
+            under / b_under
+        );
+        (alone / b_alone, under_x, b_under / b_busy)
     });
     WriterSet {
         alone,
