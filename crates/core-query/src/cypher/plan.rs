@@ -572,8 +572,16 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             .clone()
             .unwrap_or_else(|| agg_column_name(&func, &arg));
         ops.push(PlanOp::Aggregate { func, arg, column });
-        // ORDER BY and LIMIT/SKIP are ignored for single-aggregate queries
-        // (always returns exactly one row).
+        // The aggregate makes exactly one row, so ORDER BY has nothing to
+        // reorder and is not emitted. SKIP and LIMIT still apply to that row:
+        // `RETURN count(*) SKIP 1` and `… LIMIT 0` return no rows (ledger row
+        // 169; they were dropped here and the row always came back).
+        if let Some(ls) = &q.skip {
+            ops.push(PlanOp::Skip(ls.clone()));
+        }
+        if let Some(ls) = &q.limit {
+            ops.push(PlanOp::Limit(ls.clone()));
+        }
         return Ok(ops);
     }
 
