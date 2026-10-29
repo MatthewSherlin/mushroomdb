@@ -76,3 +76,8 @@ cli/tests/export_round_trip.rs::jsonl_import_throughput_above_50k_per_second —
 # range_query.rs — TY-10 range planner; 1M-node correctness (TY-14 times it) and 100k timings
 core-api/tests/range_query.rs::test_range_query_1000_results_latency — release only: inserts 1M nodes and checks a 101k-row range answered from the index (release, --ignored); TY-14 measures its latency
 core-api/tests/range_query.rs::bench_range_and_top_k_at_100k — measurement by hand: prints range and ORDER BY … LIMIT timings at 100k nodes with and without the index (release, --ignored), nothing asserted
+
+# reference_evaluator.rs (H-3) — shrunk regressions for deferred ledger rows; un-ignore with each fix
+sim-harness/tests/reference_evaluator.rs::finding_an_aggregating_return_after_an_aggregating_with_runs — ledger row 168, fixed in 0.10.1: un-ignore with the fix
+sim-harness/tests/reference_evaluator.rs::finding_skip_and_limit_apply_to_an_ungrouped_aggregate — ledger row 169, fixed in 0.10.1: un-ignore with the fix
+sim-harness/tests/reference_evaluator.rs::finding_values_of_different_types_order_as_opencypher_orders_them — ledger row 170, fixed in 0.10.1: un-ignore with the fix

@@ -28,6 +28,11 @@ jobs:
             cases_var: H2_CASES
             cases: "3000"
             what: rewrites of a query do not change its answer
+          - id: H-3
+            test: reference_evaluator
+            cases_var: H3_CASES
+            cases: "20000"
+            what: the engine agrees with a reference evaluator for a core of Cypher
           - id: H-4
             test: time_travel_equals_live
             cases_var: H4_CASES
