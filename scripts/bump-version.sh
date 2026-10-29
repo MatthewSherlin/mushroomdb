@@ -163,10 +163,11 @@ fi
 #    install 0.6.8 — so the bump has to move them or every release trips its
 #    own gate. CHANGELOG and docs/roadmap are exempt for the same reason
 #    check-claims exempts them: they are history, and history keeps its pins.
+#    docs/roadmap/ no longer exists.
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   while IFS= read -r -d '' f; do
     case "$f" in
-      CHANGELOG.md|docs/roadmap/*|scripts/*) continue ;;
+      CHANGELOG.md|scripts/*) continue ;;
     esac
     if grep -qE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "$ROOT/$f" 2>/dev/null; then
       # The `@` must be escaped on BOTH sides: unescaped in the replacement,
