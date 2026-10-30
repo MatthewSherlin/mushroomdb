@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.10.1 — aggregates and mixed-type ordering are right, and commits cost less on Linux
 
 ### Performance
 
-- **Plain commit overhead on Linux reduced.** Since 0.10.0 (TX-5, lock-free reader snapshots), the writer published a reader snapshot on every commit, allocating three separate `Arc` objects per commit (one `EffectiveCell`, one `IndexCell`, one `AtomicBool`) plus a new `Arc<ReadContext>` containing a copy of the slow-query ring and WAL path, which are constant between commits. On Linux, glibc's higher per-call overhead for small concurrent allocations (≈0.3 extra `mprotect` and 0.17 `futex` per commit) caused the per-commit cost to reach 1.18–1.34× v0.9.2 paused and 1.44–1.58× under readers. The fix bundles `EffectiveCell` + `AtomicBool` into one `Arc<CacheCell>`, keeps `IndexCell` as a separate `Arc<IndexCell>` (restoring the O(1) seed-move via `Arc::try_unwrap`), and caches the static read-context in the handle as `Arc<ReadContextStatic>`, saving 3 small heap allocations per commit (5 → 2). After: macOS 1.04× paused / 0.98× under readers; Linux arm64 container (3 CPUs) 1.20–1.21× paused / 1.17–1.20× under readers. Gate bounds tightened: paused 1.40× → 1.35×, under-readers 1.65× → 1.40× (rows 167, 172).
+- **Plain commits cost less on Linux.** Since 0.10.0 the writer publishes a reader snapshot on every commit, and that publish now makes 3 fewer small heap allocations per commit (5 → 2). Against v0.9.2 on a Linux arm64 container (3 CPUs), a commit with no readers went from 1.18–1.34× to 1.20–1.21×, and under readers from 1.44–1.58× to 1.17–1.20×. On macOS it is 1.04× and 0.98×. The concurrency gate's bounds tighten from 1.40× to 1.35× with no readers and from 1.65× to 1.40× under readers. Linux with no readers is still above the 1.15× target; ledger row 172 tracks that for 0.11 (rows 167, 172).
 
 ### Fixed
 
