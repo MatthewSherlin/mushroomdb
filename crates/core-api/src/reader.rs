@@ -502,37 +502,34 @@ pub struct ReaderSnapshot {
     pub version: u64,
     /// Role → mask memo, shared with the `GraphDb` this snapshot came from.
     role_masks: Arc<RoleMaskCache>,
-    /// `deltas` as one [`DeltaLayer`] over `frozen`: the effective state is
-    /// `frozen` read through it.
-    ///
-    /// Built at most once per `ReaderSnapshot`, on the first call to
-    /// [`Self::effective`] when `deltas` is non-empty, at the cost of the
-    /// tail's records — nothing below the layer is copied or re-indexed.
-    /// Stores `Err(String)` if a record will not apply, so the error is
-    /// returned to every later caller without re-attempting. When `deltas` is
-    /// empty it is never populated and reads go to `frozen` directly.
-    cache: Arc<EffectiveCell>,
-    /// What the snapshot knows of the handle beyond its graph state: where
-    /// slow queries go, the counts at capture, the WAL's path. Behind one
-    /// `Arc`, so another handle on the snapshot copies no path.
-    context: Arc<ReadContext>,
-    /// The index this snapshot's queries use: the fold's, layered with the
-    /// tail's touched nodes; `None` inside when no index applies. Built at
-    /// most once, on the first query, and shared like `cache`.
+    /// The delta-tail layer and background-build flag, shared with every
+    /// snapshot of the same version.  Bundled into one `Arc<CacheCell>` so
+    /// only two allocations — this and `index` — are paid per commit on the
+    /// write path (row 167; previously five: three cell Arcs + PathBuf +
+    /// Arc<ReadContext>).
+    cache: Arc<CacheCell>,
+    /// The handle's slow-query ring and WAL path — constant across commits,
+    /// Arc-cloned from the handle rather than allocated fresh each commit
+    /// (row 167).
+    context: Arc<ReadContextStatic>,
+    /// `(nodes_live, nodes_tombstoned, edges)` as `GraphDb::stats` counted
+    /// them at capture — this snapshot's version.  Inlined so changing
+    /// counts per commit does not require a new `Arc<ReadContext>` allocation.
+    counts: (usize, usize, u64),
+    /// The query index, shared with every snapshot of the same version.
+    /// Separate from `cache` so each can be taken by move independently when
+    /// the seeds extend a longer tail.
     index: Arc<IndexCell>,
     /// The layer and index of an earlier snapshot whose tail is a prefix of
-    /// this one's, for `cache` and `index` to extend instead of rebuild.
+    /// this one's, for `cache.layer` and `index` to extend instead of rebuild.
     seeds: Arc<Seeds>,
-    /// Set when the background builder built this version's cells; shared
-    /// like `cache`.
-    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The latest built cells of one fold, which a later version takes and
 /// extends; see [`SharedEffective`]. Only built cells are registered.
 #[derive(Default)]
 pub(crate) struct Seeds {
-    layer: std::sync::Mutex<Option<(Arc<EffectiveCell>, usize)>>,
+    layer: std::sync::Mutex<Option<(Arc<CacheCell>, usize)>>,
     index: std::sync::Mutex<Option<(Arc<IndexCell>, usize)>>,
 }
 
@@ -545,25 +542,52 @@ fn register<T>(slot: &std::sync::Mutex<Option<(Arc<T>, usize)>>, cell: &Arc<T>, 
     }
 }
 
-/// The value a built cell holds — by move when no one else holds the cell,
-/// by clone otherwise — or `None` when it was never built.
-fn take_cell<T: Clone>(cell: Arc<OnceLock<T>>) -> Option<T> {
+thread_local! {
+    /// How many times the seeded layer was taken by move — `Arc::try_unwrap`
+    /// succeeded — on this thread.  A test that drops a snapshot and then
+    /// builds the next one may assert this incremented.
+    static SEED_LAYER_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The layer held by `cache` — by move when no other reference to that
+/// `CacheCell` exists, by clone otherwise — or `None` when it was never
+/// built.  Counts every move in [`SEED_LAYER_MOVES`] so tests can assert the
+/// O(1) path was taken.
+fn take_layer(cache: Arc<CacheCell>) -> Option<std::result::Result<DeltaLayer, String>> {
+    match Arc::try_unwrap(cache) {
+        Ok(c) => {
+            SEED_LAYER_MOVES.with(|n| n.set(n.get() + 1));
+            c.layer.into_inner()
+        }
+        Err(shared) => shared.layer.get().cloned(),
+    }
+}
+
+/// The value a built index cell holds — by move when no other reference
+/// exists, by clone otherwise — or `None` when it was never built.
+fn take_index(cell: Arc<IndexCell>) -> Option<Option<PropertyIndex>> {
     match Arc::try_unwrap(cell) {
         Ok(once) => once.into_inner(),
         Err(shared) => shared.get().cloned(),
     }
 }
 
-/// What a [`ReaderSnapshot`] carries of its handle beyond the graph.
-#[derive(Clone)]
-pub(crate) struct ReadContext {
+/// How many times the seeded layer was taken by move (not cloned) on the
+/// current thread since the process started.  Used by tests to verify the
+/// O(1) seed-extend path fires.
+#[doc(hidden)]
+pub fn seed_layer_moves_this_thread() -> u64 {
+    SEED_LAYER_MOVES.with(|n| n.get())
+}
+
+/// The parts of a [`ReaderSnapshot`]'s context that are constant across
+/// commits: the slow-query ring and the WAL path.  Cached in the
+/// [`crate::db::GraphDb`] handle and Arc-cloned into every snapshot so
+/// those two fields are not allocated fresh on every commit.
+pub(crate) struct ReadContextStatic {
     /// Where [`ReaderSnapshot::query`] reports a slow query: the handle's
     /// threshold and ring, so `/metrics` sees reader queries too.
     pub(crate) slow: SlowQuerySink,
-    /// `(nodes_live, nodes_tombstoned, edges)` as `GraphDb::stats` counted
-    /// them at capture — this snapshot's version — from the handle's own
-    /// exact counters.
-    pub(crate) counts: (usize, usize, u64),
     /// The WAL file, for [`ReaderSnapshot::wal_size_bytes`].
     pub(crate) wal_path: Option<std::path::PathBuf>,
 }
@@ -586,6 +610,20 @@ type EffectiveCell = OnceLock<std::result::Result<DeltaLayer, String>>;
 
 /// A snapshot's query index, built at most once. See [`ReaderSnapshot::query_index`].
 type IndexCell = OnceLock<Option<PropertyIndex>>;
+
+/// The delta-tail layer and the background-build flag for one version,
+/// bundled into one `Arc` allocation.  Pairing them saves one heap alloc
+/// per commit compared with holding `Arc<EffectiveCell>` and
+/// `Arc<AtomicBool>` separately (row 167).
+///
+/// The index lives in its own `Arc<IndexCell>` so the seeds can hold the
+/// layer and the index under separate reference counts, which lets
+/// `Arc::try_unwrap` succeed on either when it is the sole remaining holder
+/// — moving the value out instead of cloning it.
+pub(crate) struct CacheCell {
+    pub(crate) layer: EffectiveCell,
+    pub(crate) background: std::sync::atomic::AtomicBool,
+}
 
 /// The layer and index every snapshot of one fold and delta tail shares.
 ///
@@ -618,10 +656,9 @@ pub(crate) struct SharedEffective {
     base: Option<Arc<MappedBase>>,
     len: usize,
     last: Option<Arc<CommitDelta>>,
-    cell: Arc<EffectiveCell>,
+    cache: Arc<CacheCell>,
     index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
-    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Everything [`ReaderSnapshot::new`] builds a snapshot from.
@@ -632,16 +669,19 @@ pub(crate) struct SnapshotParts {
     pub(crate) tail_derived: Arc<TailDerived>,
     pub(crate) version: u64,
     pub(crate) role_masks: Arc<RoleMaskCache>,
-    pub(crate) context: ReadContext,
+    /// The slow-query ring and WAL path, cached in the handle and Arc-cloned
+    /// here instead of allocated fresh each commit (row 167).
+    pub(crate) context: Arc<ReadContextStatic>,
+    /// `(nodes_live, nodes_tombstoned, edges)` at this commit's version.
+    pub(crate) counts: (usize, usize, u64),
     pub(crate) shared: SharedCell,
 }
 
 /// What [`SharedEffective::cell_for`] hands a new snapshot.
 pub(crate) struct SharedCell {
-    cell: Arc<EffectiveCell>,
+    cache: Arc<CacheCell>,
     index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
-    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn same_arc<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
@@ -674,10 +714,9 @@ impl SharedEffective {
                 && same_arc(entry.last.as_ref(), deltas.last())
             {
                 return SharedCell {
-                    cell: Arc::clone(&entry.cell),
+                    cache: Arc::clone(&entry.cache),
                     index: Arc::clone(&entry.index),
                     seeds: Arc::clone(&entry.seeds),
-                    background: Arc::clone(&entry.background),
                 };
             }
             // One register per fold: every tail of a fold extends every
@@ -686,25 +725,27 @@ impl SharedEffective {
                 seeds = Some(Arc::clone(&entry.seeds));
             }
         }
-        let cell = Arc::new(EffectiveCell::new());
+        // Two Arc allocations per commit: one for the layer+background-flag
+        // bundle (CacheCell) and one for the index (row 167).
+        let cache = Arc::new(CacheCell {
+            layer: OnceLock::new(),
+            background: std::sync::atomic::AtomicBool::new(false),
+        });
         let index = Arc::new(IndexCell::new());
         let seeds = seeds.unwrap_or_default();
-        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
         *slot = Some(SharedEffective {
             frozen: Arc::clone(frozen),
             base: base.clone(),
             len: deltas.len(),
             last: deltas.last().cloned(),
-            cell: Arc::clone(&cell),
+            cache: Arc::clone(&cache),
             index: Arc::clone(&index),
             seeds: Arc::clone(&seeds),
-            background: Arc::clone(&background),
         });
         SharedCell {
-            cell,
+            cache,
             index,
             seeds,
-            background,
         }
     }
 }
@@ -885,6 +926,7 @@ impl ReaderSnapshot {
             version,
             role_masks,
             context,
+            counts,
             shared,
         } = parts;
         Self {
@@ -894,11 +936,11 @@ impl ReaderSnapshot {
             tail_derived,
             version,
             role_masks,
-            cache: shared.cell,
-            context: Arc::new(context),
+            cache: shared.cache,
+            context,
+            counts,
             index: shared.index,
             seeds: shared.seeds,
-            background: shared.background,
         }
     }
 
@@ -914,9 +956,9 @@ impl ReaderSnapshot {
             role_masks: Arc::clone(&self.role_masks),
             cache: Arc::clone(&self.cache),
             context: Arc::clone(&self.context),
+            counts: self.counts,
             index: Arc::clone(&self.index),
             seeds: Arc::clone(&self.seeds),
-            background: Arc::clone(&self.background),
         }
     }
 
@@ -955,7 +997,7 @@ impl ReaderSnapshot {
             return Ok(None);
         }
         let mut built = false;
-        let cached = self.cache.get_or_init(|| {
+        let cached = self.cache.layer.get_or_init(|| {
             built = true;
             count_build(true);
             match self.seeded_layer() {
@@ -1168,17 +1210,17 @@ impl ReaderSnapshot {
     /// The seed's layer extended by the deltas after it, or `None` when there
     /// is no usable seed (the caller then builds the layer from the tail).
     fn seeded_layer(&self) -> Option<Result<DeltaLayer>> {
-        let (cell, len) = self
+        let (cache, len) = self
             .seeds
             .layer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()?;
         if len > self.deltas.len() {
-            register(&self.seeds.layer, &cell, len);
+            register(&self.seeds.layer, &cache, len);
             return None;
         }
-        let mut layer = take_cell(cell)?.ok()?;
+        let mut layer = take_layer(cache)?.ok()?;
         Some(
             layer
                 .extend(&self.frozen, &self.base, &self.deltas[len..])
@@ -1189,17 +1231,17 @@ impl ReaderSnapshot {
     /// The seed's index layer with the nodes the later deltas touched
     /// re-indexed, or `None` when there is no usable seed.
     fn seeded_index(&self, view: &GraphView<'_>) -> Option<Option<PropertyIndex>> {
-        let (cell, len) = self
+        let (index, len) = self
             .seeds
             .index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()?;
         if len > self.deltas.len() {
-            register(&self.seeds.index, &cell, len);
+            register(&self.seeds.index, &index, len);
             return None;
         }
-        let mut layer = take_cell(cell)??;
+        let mut layer = take_index(index)??;
         let mut stale = std::collections::BTreeSet::new();
         let mut unresolved = false;
         for delta in &self.deltas[len..] {
@@ -1227,7 +1269,7 @@ impl ReaderSnapshot {
     /// published it.
     #[doc(hidden)]
     pub fn layer_and_index_built(&self) -> bool {
-        let layer = self.deltas.is_empty() || self.cache.get().is_some();
+        let layer = self.deltas.is_empty() || self.cache.layer.get().is_some();
         let index = self.deltas.is_empty()
             || self.frozen.prop_index.enabled_pairs().next().is_none()
             || self.index.get().is_some();
@@ -1254,7 +1296,8 @@ impl ReaderSnapshot {
 
     /// Mark this version's cells as built by the background builder.
     pub(crate) fn mark_built_in_background(&self) {
-        self.background
+        self.cache
+            .background
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -1262,7 +1305,9 @@ impl ReaderSnapshot {
     /// test checks to know it is reading builder-built cells.
     #[doc(hidden)]
     pub fn built_in_background(&self) -> bool {
-        self.background.load(std::sync::atomic::Ordering::Acquire)
+        self.cache
+            .background
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether this snapshot's queries answer equality lookups from an index
@@ -1326,7 +1371,7 @@ impl ReaderSnapshot {
     /// [`GraphDb::stats`](crate::GraphDb::stats) counts them, at this
     /// snapshot's version.
     pub fn counts(&self) -> (usize, usize, u64) {
-        self.context.counts
+        self.counts
     }
 
     /// The commit sequence this snapshot reads, as

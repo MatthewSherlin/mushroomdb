@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Performance
+
+- **Plain commit overhead on Linux reduced.** Since 0.10.0 (TX-5, lock-free reader snapshots), the writer published a reader snapshot on every commit, allocating three separate `Arc` objects per commit (one `EffectiveCell`, one `IndexCell`, one `AtomicBool`) plus a new `Arc<ReadContext>` containing a copy of the slow-query ring and WAL path, which are constant between commits. On Linux, glibc's higher per-call overhead for small concurrent allocations (≈0.3 extra `mprotect` and 0.17 `futex` per commit) caused the per-commit cost to reach 1.18–1.34× v0.9.2 paused and 1.44–1.58× under readers. The fix bundles `EffectiveCell` + `AtomicBool` into one `Arc<CacheCell>`, keeps `IndexCell` as a separate `Arc<IndexCell>` (restoring the O(1) seed-move via `Arc::try_unwrap`), and caches the static read-context in the handle as `Arc<ReadContextStatic>`, saving 3 small heap allocations per commit (5 → 2). After: macOS 1.04× paused / 0.98× under readers; Linux arm64 container (3 CPUs) 1.20–1.21× paused / 1.17–1.20× under readers. Gate bounds tightened: paused 1.40× → 1.35×, under-readers 1.65× → 1.40× (rows 167, 172).
+
 ### Fixed
 
 - **An aggregating `RETURN` straight after an aggregating `WITH` aggregates the `WITH`'s rows.** `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` returned the `WITH`'s columns and groups (`w0, w1`) instead of one row `c0`, silently; `RETURN sum(w1)` did the same. A second aggregating `WITH`, or a `MATCH` after the aggregating `WITH`, followed by an aggregating `RETURN` was dropped the same way. Affected: 0.10.0, on every surface that runs Cypher (on v0.9.3 the shape was refused with an error). What is unchanged: a non-aggregating `RETURN` after an aggregating `WITH`, and an aggregating `RETURN` with a `WHERE` between it and the `WITH`, already ran and give the same answers (row 168).

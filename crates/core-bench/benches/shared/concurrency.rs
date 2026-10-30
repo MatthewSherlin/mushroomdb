@@ -79,13 +79,22 @@ pub const P99_MAX_MS: f64 = 2.0;
 /// anything worse; 0.10.1 is to cut the per-commit publish cost and bring
 /// these bounds back toward 1.15× and 1.25×.
 ///
-/// Paused: the worst measured, 1.34×, plus a 0.06 noise margin. Before
-/// 2026-10-28 this was 1.15× (the 1.05× bar plus 0.10).
-pub const ALONE_MAX_VS_V092: f64 = 1.40;
-/// Under readers: the worst measured on Linux, 1.58×, plus a 0.07 noise
-/// margin. Before 2026-10-28 this was 1.25×: the 1.21× the owner accepted on
-/// macOS plus 0.04.
-pub const UNDER_MAX_VS_V092: f64 = 1.65;
+/// 0.10.1 fix (row 167): bundling the three per-version cells into one Arc
+/// allocation and caching the static read-context in the handle cuts ~4 small
+/// heap allocations per commit. macOS: 1.03× paused, 1.04× under readers
+/// (was 1.01× / 1.16–1.21×). Linux arm64 container (3 CPUs): 1.27× paused,
+/// 1.28× under readers (was 1.18–1.22× / 1.44–1.58×). The under-readers
+/// improvement is clear; the paused improvement is smaller (dominated by WAL
+/// syscalls, not allocations). Bounds tightened toward the original targets.
+///
+/// Paused: worst measured after fix, 1.27× (arm64 container), plus a 0.08
+/// noise margin for x86 variance and run-to-run jitter. Before 2026-10-28
+/// this was 1.15× (the 1.05× bar plus 0.10).
+pub const ALONE_MAX_VS_V092: f64 = 1.35;
+/// Under readers: worst measured after fix, 1.28× (arm64 container), plus a
+/// 0.12 noise margin for x86 variance. Before 2026-10-28 this was 1.25×:
+/// the 1.21× the owner accepted on macOS plus 0.04.
+pub const UNDER_MAX_VS_V092: f64 = 1.40;
 /// Interleaved v0.9.2 / this-build pairs behind the v0.9.2 bounds. The
 /// alone bound is the 1.05× bar plus a 0.10 noise margin: on the machine
 /// this was tuned on, the median of a 10 × 200-commit run moved ±8 % between
@@ -96,9 +105,10 @@ pub const V092_ROUNDS: usize = 5;
 /// same build's median beside as many busy threads (with them paused, before
 /// 2026-10-28): about 1.4× when the decision was measured, 0.98–1.29× on
 /// macOS and 1.43× in a Linux container on 2026-10-28; the pre-fix state was
-/// 2.6–2.8×. 1.65×, with the under-readers bound above, since 2026-10-28
-/// (was 1.5×).
-pub const WRITER_UNDER_READERS_MAX: f64 = 1.65;
+/// 2.6–2.8×. After the 0.10.1 fix, the arm64 container shows 1.25×; tightened
+/// from 1.65× to 1.40× (measured 1.25× plus 0.15 margin, was 1.65× since 2026-10-28
+/// and 1.5× before that).
+pub const WRITER_UNDER_READERS_MAX: f64 = 1.40;
 /// When v0.9.2 is measured on the same machine, the under-readers ratio may
 /// also reach this multiple of v0.9.2's own: on a runner with fewer cores
 /// than readers plus the writer, the readers take the writer's CPU whatever

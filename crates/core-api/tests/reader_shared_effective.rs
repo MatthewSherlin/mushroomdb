@@ -6,7 +6,10 @@
 //! workload, a fresh snapshot answers exactly what `GraphDb` answers, and every
 //! snapshot taken earlier still answers what it answered when it was taken.
 
-use mushroomdb::{BatchOp, Dir, Predicate, RuleDef, SharedDb, Value, FOLD_EVERY_K};
+use mushroomdb::{
+    seed_layer_moves_this_thread, BatchOp, Dir, FsyncPolicy, GraphDb, Predicate, RealFs, RuleDef,
+    SharedDb, Value, FOLD_EVERY_K,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -376,4 +379,64 @@ fn the_published_snapshot_arrives_with_its_layer_and_index_built() {
     assert_eq!(rs.len(), 1);
     release.store(true, Ordering::SeqCst);
     holder.join().unwrap();
+}
+
+/// Row 167 fix: when the snapshot that built the seeded layer is dropped and
+/// the seeds register becomes the sole holder of the `Arc<CacheCell>`, the
+/// next snapshot's `seeded_layer` takes it by move (`Arc::try_unwrap` → `Ok`)
+/// instead of deep-cloning the `DeltaLayer`.
+///
+/// Uses `GraphDb<RealFs>` directly (no Published/Builder background thread) so
+/// the old snapshot's cache is not kept alive beyond the seeds register by any
+/// background holder, and `Arc::try_unwrap` sees refcount == 1.
+///
+/// We detect the move via the `seed_layer_moves_this_thread()` counter that
+/// `take_layer` increments only on the `Ok` (move) branch.
+#[test]
+fn seed_layer_is_moved_not_cloned_when_snapshot_is_sole_holder() {
+    let dir = tmp("seed-move");
+    let mut db: GraphDb<RealFs> = GraphDb::open(&dir).unwrap();
+    db.set_fsync_policy(FsyncPolicy::Relaxed);
+
+    // Write enough nodes to produce a non-empty delta tail.
+    for i in 0..5 {
+        db.insert_node(
+            "N",
+            &format!("seed-node-{i}"),
+            vec![("v".to_string(), Value::Int(i))],
+        )
+        .unwrap();
+    }
+
+    // snap_a: build the layer so it lands in the seeds register.
+    let snap_a = db.reader();
+    snap_a.ensure_readable().unwrap();
+
+    let moves_before = seed_layer_moves_this_thread();
+
+    // Drop snap_a; the SharedEffective slot still holds one Arc<CacheCell>,
+    // and the seeds register holds another. After the next commit the slot is
+    // replaced, leaving the seeds register as the sole holder (count == 1).
+    // Because we use GraphDb directly (no Published/Builder), no background
+    // thread holds a copy of the old snapshot.
+    drop(snap_a);
+
+    // One more commit on the same fold: extends the tail so snap_b has a
+    // longer tail and must go through seeded_layer.
+    db.insert_node("N", "seed-node-ext", vec![]).unwrap();
+
+    // snap_b's seeded_layer() now takes the Arc<CacheCell> from seeds.
+    // The SharedEffective slot holds a NEW Arc<CacheCell> (for the new version),
+    // so the seeds slot is the only remaining reference to the old one:
+    // Arc::try_unwrap succeeds → move.
+    let snap_b = db.reader();
+    snap_b.ensure_readable().unwrap();
+
+    let moves_after = seed_layer_moves_this_thread();
+    assert_eq!(
+        moves_after,
+        moves_before + 1,
+        "the seeded layer should have been taken by move (Arc::try_unwrap Ok), not cloned",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
