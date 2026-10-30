@@ -1017,11 +1017,21 @@ impl<'a> Parser<'a> {
     }
 
     fn rel(&mut self) -> Result<RelPat, String> {
+        // Left-directed: `<-[…]-` or bare `<--`
         if self.eat(&Tok::Lt) {
             self.expect(
                 &Tok::Dash,
                 "expected '-' after '<' in a left-directed relationship",
             )?;
+            // Bare `<--`: second dash with no bracket follows the first dash.
+            if self.eat(&Tok::Dash) {
+                return Ok(RelPat {
+                    var: None,
+                    etypes: vec![],
+                    dir: RelDir::Left,
+                    hops: None,
+                });
+            }
             let (var, etypes, hops) = self.rel_body()?;
             self.expect(
                 &Tok::Dash,
@@ -1035,6 +1045,20 @@ impl<'a> Parser<'a> {
             });
         }
         self.expect(&Tok::Dash, "expected '-' to start a relationship")?;
+        // Bare `-->` or `--`: second dash with no bracket follows the first dash.
+        if self.eat(&Tok::Dash) {
+            let dir = if self.eat(&Tok::Gt) {
+                RelDir::Right
+            } else {
+                RelDir::Undirected
+            };
+            return Ok(RelPat {
+                var: None,
+                etypes: vec![],
+                dir,
+                hops: None,
+            });
+        }
         let (var, etypes, hops) = self.rel_body()?;
         self.expect(&Tok::Dash, "expected '-' after ']'")?;
         let dir = if self.eat(&Tok::Gt) {

@@ -8,5 +8,5 @@
 #   bash scripts/gen-conformance-table.sh
 # A change that adds or edits a skip rule says, beside the new rates, how
 # many scenarios the rule moved: a skip changes the denominator.
-0.7268
-strict 0.7208
+0.7419
+strict 0.7359

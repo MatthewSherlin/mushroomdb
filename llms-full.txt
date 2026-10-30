@@ -6031,7 +6031,8 @@ LIMIT 10
 ```
 
 The relationship variable (`r`) is optional.  Omitting the brackets entirely
-(`-->`) is also accepted.
+is also accepted: `-->`, `<--`, and `--` are equivalent to `-[]->`, `<-[]-`,
+and `-[]-` respectively.
 
 ### Multiple patterns in one MATCH
 

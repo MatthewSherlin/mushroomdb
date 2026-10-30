@@ -47,8 +47,10 @@
 //! shrunk, as the `finding_*` tests at the end. Rows 168 and 169 are fixed;
 //! row 170's test is ignored until 0.10.1 fixes it, and the property skips
 //! its shape in `hits_row_170`.
-//! Shapes the engine refuses outright (`-->`, row 171; `WITH DISTINCT`;
+//! Shapes the engine refuses outright (`WITH DISTINCT`;
 //! `RETURN DISTINCT` with an aggregate) are not generated.
+//! Untyped hops (`-->`, row 171 fixed) alternate between the bare form and
+//! the bracketed `-[]->` form, so both spellings are exercised.
 //!
 //! Any divergence is an engine bug. Do not weaken these assertions.
 //!
@@ -390,6 +392,11 @@ struct Projection {
 struct Path {
     nodes: Vec<(String, Option<usize>)>,
     rels: Vec<Option<usize>>,
+    /// For each untyped (`None`) rel, whether to render the bare form (`-->`
+    /// / `<--` / `--`) instead of the bracketed form (`-[]->`). Typed rels
+    /// always render with brackets. If shorter than `rels`, remaining entries
+    /// default to `false`.
+    bare_rels: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,9 +466,15 @@ fn render_path(p: &Path) -> String {
     for (i, r) in p.rels.iter().enumerate() {
         match r {
             Some(t) => out.push_str(&format!("-[:{}]->", ETYPES[*t])),
-            // `-->` is refused by the parser, though query.md documents it
-            // (ledger row 171).
-            None => out.push_str("-[]->"),
+            None => {
+                // Bare `-->` (row 171 fix): alternate between bare and bracketed
+                // so H-3 covers both forms.
+                if p.bare_rels.get(i).copied().unwrap_or(false) {
+                    out.push_str("-->");
+                } else {
+                    out.push_str("-[]->");
+                }
+            }
         }
         out.push_str(&node(&p.nodes[i + 1]));
     }
@@ -797,12 +810,14 @@ fn gen_query(choices: &[u8]) -> Query {
     let mut first = Path {
         nodes: Vec::new(),
         rels: Vec::new(),
+        bare_rels: Vec::new(),
     };
     for (h, name) in names.iter().enumerate().take(hops + 1) {
         first.nodes.push((name.to_string(), g.label()));
         scope.push((name.to_string(), Kind::Node));
         if h < hops {
             first.rels.push(g.label());
+            first.bare_rels.push(g.flag());
         }
     }
     let mut paths = vec![first];
@@ -811,15 +826,18 @@ fn gen_query(choices: &[u8]) -> Query {
             paths.push(Path {
                 nodes: vec![("d".into(), g.label())],
                 rels: Vec::new(),
+                bare_rels: Vec::new(),
             });
             scope.push(("d".into(), Kind::Node));
         }
         2 => {
             let from = names[g.pick(hops + 1)].to_string();
             let rel = g.label();
+            let bare = g.flag();
             paths.push(Path {
                 nodes: vec![(from, None), ("e".into(), g.label())],
                 rels: vec![rel],
+                bare_rels: vec![bare],
             });
             scope.push(("e".into(), Kind::Node));
         }
@@ -1610,6 +1628,7 @@ fn the_reference_follows_opencypher_on_known_cases() {
         paths: vec![Path {
             nodes: vec![("a".into(), Some(1))],
             rels: Vec::new(),
+            bare_rels: Vec::new(),
         }],
         filter: None,
         unwind: None,

@@ -15,7 +15,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `collect` | implemented | 11 / 96 | aggregate: takes a variable, not an expression; 2 skipped |
 | `contains` | implemented | — | no TCK scenarios |
 | `cos` | implemented | — | no TCK scenarios |
-| `count` | implemented | 95 / 183 | 3 skipped |
+| `count` | implemented | 97 / 183 | 3 skipped |
 | `date` | implemented | 153 / 177 | 45 skipped |
 | `date.realtime` | implemented | 1 / 1 |  |
 | `date.statement` | implemented | 1 / 1 |  |
@@ -44,10 +44,10 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `id` | implemented | — | no TCK scenarios |
 | `key` | implemented | — | no TCK scenarios |
 | `keys` | implemented | 19 / 28 |  |
-| `labels` | implemented | 5 / 12 | 10 skipped |
+| `labels` | implemented | 6 / 12 | 10 skipped |
 | `last` | implemented | 0 / 1 |  |
 | `left` | implemented | — | no TCK scenarios |
-| `length` | implemented | 2 / 8 |  |
+| `length` | implemented | 4 / 8 |  |
 | `localdatetime` | implemented | 209 / 234 | 96 skipped |
 | `localdatetime.realtime` | implemented | 1 / 1 |  |
 | `localdatetime.statement` | implemented | 1 / 1 |  |
@@ -63,7 +63,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `ltrim` | implemented | — | no TCK scenarios |
 | `max` | implemented | 22 / 29 | aggregate: takes a variable, not an expression |
 | `min` | implemented | 0 / 9 | aggregate: takes a variable, not an expression |
-| `nodes` | implemented | 2 / 12 |  |
+| `nodes` | implemented | 3 / 12 |  |
 | `percentilecont` | implemented | 6 / 6 | aggregate: takes a variable, not an expression |
 | `percentiledisc` | implemented | 6 / 7 | aggregate: takes a variable, not an expression |
 | `pi` | implemented | — | no TCK scenarios |
@@ -99,7 +99,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `tofloatornull` | implemented | — | no TCK scenarios |
 | `tointeger` | implemented | 8 / 18 |  |
 | `tointegerornull` | implemented | — | no TCK scenarios |
-| `tolower` | implemented | 0 / 1 |  |
+| `tolower` | implemented | 1 / 1 |  |
 | `tostring` | implemented | 22 / 29 | 3 skipped |
 | `toupper` | implemented | — | no TCK scenarios |
 | `trim` | implemented | — | no TCK scenarios |
