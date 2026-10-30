@@ -2039,7 +2039,13 @@ fn range_scan_ids(
                 if desc {
                     ids.extend(unindexed_ids(view, index, scan));
                 } else {
-                    ids.extend(index.non_scalar_ids(scan.label, scan.field));
+                    // The set holds every such node; keep only the ones this
+                    // view reads, as `top_k` and `unindexed_ids` do.
+                    ids.extend(
+                        index
+                            .non_scalar_ids(scan.label, scan.field)
+                            .filter(|&id| keeps(id)),
+                    );
                     if ids.len() < keep {
                         // Fewer candidates than needed; null nodes (which sort
                         // last) may fill the gap.  `unindexed_ids` returns
