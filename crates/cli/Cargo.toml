@@ -1,6 +1,6 @@
 [package]
 name = "mushroomdb-cli"
-version = "0.10.0"
+version = "0.10.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -40,12 +40,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "ansi",
     "json",
 ] }
-mushroomdb = { path = "../core-api", version = "0.10.0" }
-code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.10.0" }
-server = { package = "mushroomdb-server", path = "../server", version = "0.10.0" }
+mushroomdb = { path = "../core-api", version = "0.10.1" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.10.1" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.10.1" }
 # `serve --bolt-port`: the Bolt listener beside the HTTP server.
-bolt = { package = "mushroomdb-bolt", path = "../bolt", version = "0.10.0" }
-backup = { package = "mushroomdb-backup", path = "../backup", version = "0.10.0" }
+bolt = { package = "mushroomdb-bolt", path = "../bolt", version = "0.10.1" }
+backup = { package = "mushroomdb-backup", path = "../backup", version = "0.10.1" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }

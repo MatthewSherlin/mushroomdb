@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llama-index-graph-stores-mushroomdb"
-version = "0.10.0"
+version = "0.10.1"
 description = "LlamaIndex PropertyGraphStore backed by the mushroomdb embedded graph database"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.14",
-    "mushroomdb>=0.10.0,<0.11",
+    "mushroomdb>=0.10.1,<0.11",
 ]
 
 [project.optional-dependencies]
