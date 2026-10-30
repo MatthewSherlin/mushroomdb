@@ -89,21 +89,24 @@ fn all_equal<'a>(pairs: impl Iterator<Item = (&'a Value, &'a Value)>) -> Option<
 }
 
 fn class_rank(v: &Value) -> u8 {
+    // openCypher ascending orderability: map < list < temporal types <
+    // string < boolean < number < null.  Binary has no spec position;
+    // it sits between DateTime and string.
     match v {
-        Value::Int(_) | Value::Float(_) => 0,
-        Value::Str(_) => 1,
-        Value::Bool(_) => 2,
-        Value::List(_) => 3,
+        // Map sorts first among all types.
+        Value::Map(_) => 0,
+        Value::List(_) => 1,
         // Each temporal type is its own class: a Date never compares with a
         // DateTime by implicit coercion.
-        Value::Date(_) => 4,
-        Value::LocalDateTime(_) => 5,
-        Value::DateTime { .. } => 6,
-        Value::Duration { .. } => 7,
-        Value::Binary(_) => 8,
-        // Map sorts after all other types.
-        Value::Map(_) => 9,
-        // A null element sorts after everything, as a null row value does.
+        Value::Date(_) => 2,
+        Value::LocalDateTime(_) => 3,
+        Value::DateTime { .. } => 4,
+        Value::Duration { .. } => 5,
+        Value::Binary(_) => 6,
+        Value::Str(_) => 7,
+        Value::Bool(_) => 8,
+        Value::Int(_) | Value::Float(_) => 9,
+        // Null sorts after everything, as openCypher has it.
         Value::Null => 10,
     }
 }
@@ -406,15 +409,26 @@ mod tests {
 
     #[test]
     fn cmp_values_class_ranks() {
-        // numeric < Str < Bool < List
-        assert_eq!(cmp_values(&Value::Int(99), &Value::Str("a".into())), Less);
-        assert_eq!(cmp_values(&Value::Float(1.0), &Value::Bool(false)), Less);
+        // openCypher order: List < Str < Bool < numeric
+        assert_eq!(
+            cmp_values(&Value::List(vec![]), &Value::Str("a".into())),
+            Less
+        );
         assert_eq!(
             cmp_values(&Value::Str("z".into()), &Value::Bool(false)),
             Less
         );
-        assert_eq!(cmp_values(&Value::Bool(true), &Value::List(vec![])), Less);
-        assert_eq!(cmp_values(&Value::List(vec![]), &Value::Int(0)), Greater);
+        assert_eq!(cmp_values(&Value::Bool(false), &Value::Int(0)), Less);
+        assert_eq!(
+            cmp_values(&Value::Int(99), &Value::Str("a".into())),
+            Greater
+        );
+        assert_eq!(cmp_values(&Value::Float(1.0), &Value::Bool(false)), Greater);
+        assert_eq!(
+            cmp_values(&Value::Bool(true), &Value::List(vec![])),
+            Greater
+        );
+        assert_eq!(cmp_values(&Value::List(vec![]), &Value::Int(0)), Less);
 
         // numerics via f64::total_cmp
         assert_eq!(cmp_values(&Value::Int(1), &Value::Float(1.5)), Less);
@@ -446,11 +460,11 @@ mod tests {
             ),
             Less
         );
-        // list elements use class ranks
+        // list elements use class ranks: in openCypher, Str(7) < Int(9).
         assert_eq!(
             cmp_values(
-                &Value::List(vec![Value::Int(1)]),
                 &Value::List(vec![Value::Str("a".into())]),
+                &Value::List(vec![Value::Int(1)]),
             ),
             Less
         );
@@ -562,17 +576,20 @@ mod tests {
 
     #[test]
     fn new_types_ordering_never_panics_and_is_total() {
+        // Array must match openCypher ascending class order so that `i.cmp(&j)`
+        // agrees with `cmp_values(a, b)` for distinct types.
+        // openCypher: map < list < temporal types < (binary) < string < boolean < number.
         let all = [
-            Value::Int(0),
-            Value::Str("a".into()),
-            Value::Bool(true),
+            Value::Map(Default::default()),
             Value::List(vec![]),
             Value::Date(1),
             Value::LocalDateTime(1),
             dt(1, 0),
             dur(0, 0, 1),
             Value::Binary(vec![1]),
-            Value::Map(Default::default()),
+            Value::Str("a".into()),
+            Value::Bool(true),
+            Value::Int(0),
         ];
         // Every pair compares without panicking; distinct types are ordered
         // by class, and the order is antisymmetric.

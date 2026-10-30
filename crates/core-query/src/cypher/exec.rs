@@ -2026,18 +2026,14 @@ fn range_scan_ids(
                 Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
                 None => Box::new(index.lookup_ordered(scan.label, scan.field, lo, hi, desc)),
             };
-            let (mut ids, cut) = top_k(view, scan.field, walk, keep, &keeps);
+            let (mut ids, _) = top_k(view, scan.field, walk, keep, &keeps);
             // With a range, a node with no index entry fails it. Without
             // one, such nodes (no property, or a list, map or `Duration`)
             // sort among the rows: descending, nulls come first; ascending,
-            // after numbers, strings and Bools — so only a cut past those
-            // can need them.
-            let settled_before_unindexed = !desc
-                && matches!(
-                    cut,
-                    Some(Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_))
-                );
-            if !bounded && !settled_before_unindexed {
+            // before all indexed types (openCypher: list/map/Duration sort
+            // before temporal, string, boolean and number), so they must
+            // always be considered when there is no range bound.
+            if !bounded {
                 ids.extend(unindexed_ids(view, index, scan));
             }
             ids.sort_unstable();

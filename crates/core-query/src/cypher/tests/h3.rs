@@ -1,4 +1,4 @@
-//! Hardening H-3 findings in aggregation (defect-ledger rows 168 and 169).
+//! Hardening H-3 findings in aggregation (defect-ledger rows 168–170).
 //!
 //! Row 168: an aggregating `RETURN` straight after an aggregating `WITH` was
 //! dropped. The plan was right (`GroupAggregate`, `GroupAggregate`), but the
@@ -10,6 +10,10 @@
 //! key. The planner's single-aggregate path returned before emitting them, on
 //! the reasoning that the aggregate makes exactly one row; that one row is
 //! still a row `SKIP` and `LIMIT` apply to.
+//!
+//! Row 170: values of different types ordered numbers first in `ORDER BY` and
+//! in `min` / `max`. openCypher's orderability (ascending) is list < string <
+//! boolean < number < null; the engine was putting numbers first.
 
 use super::tests::{run, Fx};
 use core_storage::Value;
@@ -246,5 +250,103 @@ fn row_169_skip_and_limit_on_an_ungrouped_aggregate_after_a_with() {
     assert_eq!(
         rows(&fx, &format!("{GROUPS} RETURN w0, w1 ORDER BY w0 SKIP 1")),
         vec![vec![s("b"), int(1)]]
+    );
+}
+
+// ─── Row 170: cross-type ORDER BY and min/max follow openCypher order ──────────
+//
+// openCypher ascending: list < string < boolean < number < null.
+// The engine used to put numbers first.
+
+/// Three nodes with m = 1 (Int), 'a' (Str), true (Bool).
+fn mixed_types() -> Fx {
+    let mut fx = Fx::new();
+    fx.add("A", "n1", vec![("m", Value::Int(1))]);
+    fx.add("A", "n2", vec![("m", Value::Str("a".into()))]);
+    fx.add("A", "n3", vec![("m", Value::Bool(true))]);
+    fx
+}
+
+fn b(v: bool) -> Option<Value> {
+    Some(Value::Bool(v))
+}
+
+#[test]
+fn row_170_order_by_asc_puts_string_before_bool_before_number() {
+    let fx = mixed_types();
+    // openCypher ascending: 'a' < true < 1
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m"),
+        vec![vec![s("a")], vec![b(true)], vec![int(1)]]
+    );
+}
+
+#[test]
+fn row_170_order_by_desc_puts_number_before_bool_before_string() {
+    let fx = mixed_types();
+    // openCypher descending: 1 > true > 'a'
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m DESC"),
+        vec![vec![int(1)], vec![b(true)], vec![s("a")]]
+    );
+}
+
+#[test]
+fn row_170_null_is_last_asc_and_first_desc() {
+    // Add a node with no `m` property so a.m resolves to null.
+    let mut fx = mixed_types();
+    fx.add("A", "n4", vec![]);
+    // Ascending: null sorts last.
+    let asc = rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m");
+    assert_eq!(asc.last().unwrap(), &vec![None::<Value>]);
+    assert_eq!(&asc[..3], &[vec![s("a")], vec![b(true)], vec![int(1)]]);
+    // Descending: null sorts first.
+    let desc = rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m DESC");
+    assert_eq!(desc.first().unwrap(), &vec![None::<Value>]);
+    assert_eq!(&desc[1..], &[vec![int(1)], vec![b(true)], vec![s("a")]]);
+}
+
+#[test]
+fn row_170_min_is_string_max_is_number_over_mixed_types() {
+    let fx = mixed_types();
+    // openCypher: min picks the smallest (Str), max picks the largest (Int).
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN min(a.m) AS lo, max(a.m) AS hi"),
+        vec![vec![s("a"), int(1)]]
+    );
+}
+
+#[test]
+fn row_170_order_by_limit_bounded_path() {
+    let fx = mixed_types();
+    // Top-k (bounded) path: first 2 ascending.
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m LIMIT 2"),
+        vec![vec![s("a")], vec![b(true)]]
+    );
+    // Top-k descending: first 2.
+    assert_eq!(
+        rows(&fx, "MATCH (a) RETURN a.m AS m ORDER BY m DESC LIMIT 2"),
+        vec![vec![int(1)], vec![b(true)]]
+    );
+}
+
+#[test]
+fn row_170_order_by_in_grouped_with() {
+    let fx = mixed_types();
+    // Grouped path: ORDER BY on a mixed-type column.
+    let (cols, r) = rows_with(
+        &fx,
+        "MATCH (a) WITH a.m AS m, count(*) AS c ORDER BY m RETURN m, c",
+        &BTreeMap::new(),
+    );
+    assert_eq!(cols, vec!["m".to_string(), "c".to_string()]);
+    assert_eq!(
+        r,
+        vec![
+            vec![s("a"), int(1)],
+            vec![b(true), int(1)],
+            vec![int(1), int(1)],
+        ]
     );
 }

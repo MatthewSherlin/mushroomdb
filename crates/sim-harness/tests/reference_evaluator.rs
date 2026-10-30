@@ -44,9 +44,7 @@
 //! the documented behaviour is one named function that points at its source:
 //! `sum_of_nothing` (ledger row 166). Every other difference is an engine bug.
 //! Three found when this test was written are ledger rows 168–170, pinned,
-//! shrunk, as the `finding_*` tests at the end. Rows 168 and 169 are fixed;
-//! row 170's test is ignored until 0.10.1 fixes it, and the property skips
-//! its shape in `hits_row_170`.
+//! shrunk, as the `finding_*` tests at the end. All three are fixed in 0.10.1.
 //! Shapes the engine refuses outright (`WITH DISTINCT`;
 //! `RETURN DISTINCT` with an aggregate) are not generated.
 //! Untyped hops (`-->`, row 171 fixed) alternate between the bare form and
@@ -1418,25 +1416,6 @@ fn compare(q: &Query, want: &Answer, rs: &ResultSet) -> Result<(), String> {
     Ok(())
 }
 
-// Generated shapes that hit a ledgered, deferred defect. The property skips
-// them so it keeps checking everything else; each `finding_*` test below pins
-// the defect itself. Delete each function, and its call, with its fix.
-
-/// Ledger row 170: values of different types order numbers first in
-/// `ORDER BY`, `min` and `max`. Only a value of `Kind::Any` mixes types.
-/// Delete with the fix.
-fn hits_row_170(q: &Query) -> bool {
-    let extreme_of_mixed = |p: &Projection| {
-        p.items.iter().any(|(item, _, kind)| {
-            *kind == Kind::Any && matches!(item, Item::Agg(AggFn::Min | AggFn::Max, ..))
-        })
-    };
-    let orders_mixed = !q.order.is_empty() && q.ret.items.iter().any(|i| i.2 == Kind::Any);
-    orders_mixed
-        || extreme_of_mixed(&q.ret)
-        || q.with.as_ref().is_some_and(|(p, _)| extreme_of_mixed(p))
-}
-
 fn no_params() -> BTreeMap<String, Value> {
     BTreeMap::new()
 }
@@ -1461,9 +1440,6 @@ proptest! {
         let (g, db) = build(&nodes, &edges, &updates, usize::from(snapshot_slot));
         for choices in &queries {
             let q = gen_query(choices);
-            if hits_row_170(&q) {
-                continue;
-            }
             let text = render_query(&q);
             let want = evaluate(&g, &q);
             match db.query(&text, &no_params()) {
@@ -1719,7 +1695,6 @@ fn finding_an_aggregating_return_after_an_aggregating_with_runs() {
 /// strings, booleans, numbers, null (the TCK's `max` over mixed values is the
 /// number, `min` the list). query.md says only that null sorts last.
 #[test]
-#[ignore = "ledger row 170, fixed in 0.10.1: un-ignore with the fix"]
 fn finding_values_of_different_types_order_as_opencypher_orders_them() {
     let m = |v: Value| vec![("m", v)];
     let db = fixed_db(&[

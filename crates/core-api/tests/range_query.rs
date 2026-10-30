@@ -327,19 +327,19 @@ fn order_by_limit_is_a_top_k_from_the_index_with_nulls_where_a_sort_puts_them() 
     let asc = "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 4";
     assert!(plan_of(asc).contains("order: Some"), "{}", plan_of(asc));
     let (rs, used) = qp(&db, asc, &[]);
-    assert_eq!(keys(&rs, "n"), ["b", "c", "d", "a"]);
+    assert_eq!(keys(&rs, "n"), ["g", "e", "f", "b"]);
     assert_eq!(used, 1);
     let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 20", &[]);
     assert_eq!(
         keys(&rs, "n"),
-        ["b", "c", "d", "a", "e", "f", "g", "m1", "m2"]
+        ["g", "e", "f", "b", "c", "d", "a", "m1", "m2"]
     );
     let (rs, used) = qp(
         &db,
         "MATCH (n:Item) RETURN n ORDER BY n.val DESC SKIP 1 LIMIT 3",
         &[],
     );
-    assert_eq!(keys(&rs, "n"), ["m2", "g", "f"]);
+    assert_eq!(keys(&rs, "n"), ["m2", "a", "c"]);
     assert_eq!(used, 1);
     // A WHERE that is not the range on the sorted field keeps the sort whole.
     let other =

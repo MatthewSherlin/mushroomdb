@@ -507,11 +507,12 @@ impl UnifiedIndex {
     /// starts at, so a caller that needs the first few stops after them.
     ///
     /// With both bounds `None`, every indexed node, class by class in sort
-    /// order: numbers (`Int` and `Float` together, by `f64` total order),
-    /// strings, `Bool`s, `Date`s, `LocalDateTime`s, `DateTime`s, binaries.
-    /// The nodes of one key come in id order whichever the direction, and
-    /// `DateTime`s at one instant are one key (the order does not sort them by
-    /// offset), so a caller cutting the order should cut between keys.
+    /// order (openCypher ascending): `Date`s, `LocalDateTime`s, `DateTime`s,
+    /// binaries, strings, `Bool`s, numbers (`Int` and `Float` together, by
+    /// `f64` total order).  The nodes of one key come in id order whichever
+    /// the direction, and `DateTime`s at one instant are one key (the order
+    /// does not sort them by offset), so a caller cutting the order should cut
+    /// between keys.
     pub fn lookup_ordered(
         &self,
         label: &str,
@@ -827,7 +828,7 @@ fn key_range<'a>(
 }
 
 /// A class [`UnifiedIndex::lookup_ordered`] walks with no bound: one a range
-/// orders within, or `Bool` (between strings and dates), walked as its two keys.
+/// orders within, or `Bool` (between strings and numbers), walked as its two keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortClass {
     Ordered(OrderClass),
@@ -835,14 +836,15 @@ enum SortClass {
 }
 
 /// The indexed classes in the order a scan's `ORDER BY` sorts them.
+/// openCypher ascending: temporal types < binary < string < boolean < number.
 const SORT_CLASSES: [SortClass; 7] = [
-    SortClass::Ordered(OrderClass::Numeric),
-    SortClass::Ordered(OrderClass::Str),
-    SortClass::Bool,
     SortClass::Ordered(OrderClass::Date),
     SortClass::Ordered(OrderClass::LocalDateTime),
     SortClass::Ordered(OrderClass::DateTime),
     SortClass::Ordered(OrderClass::Binary),
+    SortClass::Ordered(OrderClass::Str),
+    SortClass::Bool,
+    SortClass::Ordered(OrderClass::Numeric),
 ];
 
 type Bucket<'a> = (&'a ValueKey, &'a IdSet);
@@ -1236,16 +1238,17 @@ mod tests {
 
     /// A value's place in `ORDER BY`, as far as `lookup_ordered` sorts:
     /// class, then value (a `DateTime` by instant only).
+    /// openCypher ascending: temporal types < binary < string < boolean < number.
     fn sort_place(v: &Value) -> (u8, f64, Vec<u8>) {
         match v {
-            Value::Int(i) => (0, *i as f64, vec![]),
-            Value::Float(f) => (0, *f, vec![]),
-            Value::Str(s) => (1, 0.0, s.as_bytes().to_vec()),
-            Value::Bool(b) => (2, f64::from(u8::from(*b)), vec![]),
-            Value::Date(d) => (3, f64::from(*d), vec![]),
-            Value::LocalDateTime(us) => (4, *us as f64, vec![]),
-            Value::DateTime { micros_utc, .. } => (5, *micros_utc as f64, vec![]),
-            Value::Binary(b) => (6, 0.0, b.clone()),
+            Value::Date(d) => (0, f64::from(*d), vec![]),
+            Value::LocalDateTime(us) => (1, *us as f64, vec![]),
+            Value::DateTime { micros_utc, .. } => (2, *micros_utc as f64, vec![]),
+            Value::Binary(b) => (3, 0.0, b.clone()),
+            Value::Str(s) => (4, 0.0, s.as_bytes().to_vec()),
+            Value::Bool(b) => (5, f64::from(u8::from(*b)), vec![]),
+            Value::Int(i) => (6, *i as f64, vec![]),
+            Value::Float(f) => (6, *f, vec![]),
             other => unreachable!("not indexed: {other:?}"),
         }
     }

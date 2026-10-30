@@ -565,7 +565,11 @@ LIMIT 3
 ```
 
 Each key takes its own `ASC` (the default) or `DESC`. Null is the largest value, so
-nulls sort last ascending and first descending. `RETURN DISTINCT` and a `RETURN` with an aggregate sort only what
+nulls sort last ascending and first descending. When a column holds values of
+different types, the openCypher cross-type order applies ascending: lists,
+then strings, then booleans, then numbers, then null. `min` and `max` follow the
+same order. Comparisons with `<`, `>`, `<=`, `>=` between different types return
+nothing. `RETURN DISTINCT` and a `RETURN` with an aggregate sort only what
 they project; any other key is the error `ORDER BY over a non-projected
 expression is not allowed with DISTINCT/aggregation`.
 
