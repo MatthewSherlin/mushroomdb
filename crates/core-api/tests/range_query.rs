@@ -349,6 +349,61 @@ fn order_by_limit_is_a_top_k_from_the_index_with_nulls_where_a_sort_puts_them() 
     assert_eq!(keys(&rs, "n"), ["c", "d"]);
 }
 
+/// A mixed graph: some list-valued, some int-valued, some null.  `ORDER BY`
+/// in both directions with `LIMIT` matches the unindexed full sort.
+/// Mutations (SET to list and back, REMOVE, node delete) keep the order
+/// correct, exercising the `non_scalar` bookkeeping in the range index.
+#[test]
+fn order_by_limit_with_non_scalar_values_matches_full_sort() {
+    let mut db = item_db(
+        "nonscalar",
+        &[
+            ("a", Value::Int(1)),
+            ("b", Value::List(vec![Value::Int(99)])),
+            ("c", Value::Int(3)),
+            ("d", Value::List(vec![])),
+            ("e", Value::Int(2)),
+        ],
+    );
+    // Two nodes without the property (null): sort last ascending.
+    db.insert_node("Item", "n1", vec![]).unwrap();
+    db.insert_node("Item", "n2", vec![("other".into(), Value::Int(0))])
+        .unwrap();
+    // ASC: lists before ints, nulls last.
+    let asc = "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 20";
+    assert_as_scan(&db, asc, &[]);
+    // DESC: nulls first, then ints, then lists.
+    let desc = "MATCH (n:Item) RETURN n ORDER BY n.val DESC LIMIT 20";
+    assert_as_scan(&db, desc, &[]);
+    // LIMIT 3 ASC: two lists (empty list < non-empty list), then the smallest int.
+    let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 3", &[]);
+    assert_eq!(keys(&rs, "n"), ["d", "b", "a"]);
+    // Mutate: SET b (list) → int.  b is no longer non-scalar.
+    db.set_prop("b", "val", Value::Int(0)).unwrap();
+    let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 3", &[]);
+    // d (list), b=0, a=1 (ints).
+    assert_eq!(keys(&rs, "n"), ["d", "b", "a"]);
+    // Mutate: REMOVE d's property (null).
+    db.remove_prop("d", "val").unwrap();
+    let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 3", &[]);
+    // b=0, a=1, e=2 (no more lists, d is now null).
+    assert_eq!(keys(&rs, "n"), ["b", "a", "e"]);
+    // Mutate: SET d → list again.
+    db.set_prop("d", "val", Value::List(vec![Value::Int(7)])).unwrap();
+    let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 2", &[]);
+    // d (list), b=0.
+    assert_eq!(keys(&rs, "n"), ["d", "b"]);
+    // All queries answer as the unindexed scan does.
+    for q in [
+        "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 20",
+        "MATCH (n:Item) RETURN n ORDER BY n.val DESC LIMIT 20",
+        "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 3",
+        "MATCH (n:Item) RETURN n ORDER BY n.val DESC LIMIT 3",
+    ] {
+        assert_as_scan(&db, q, &[]);
+    }
+}
+
 /// `cypher` on `db` against the same query with its `WHERE` turned into
 /// `(…) OR false` (or `WHERE true` added), which no fold reads: the scan.
 /// Returns the shared answer as Debug text.

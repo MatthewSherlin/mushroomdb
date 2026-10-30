@@ -10,7 +10,7 @@
 
 ### Changed (behaviour)
 
-- **`ORDER BY` and `min` / `max` now follow openCypher's cross-type order.** Values of different types now sort lists first, then strings, then booleans, then numbers, then null — the openCypher order. Previously, numbers sorted first. `MATCH (a) RETURN a.m AS m ORDER BY m` over `m` = 1, `'a'`, `true` used to return `1, 'a', true`; it now returns `'a', true, 1`. `min` over a mixed column returns the string; `max` returns the number. Comparisons with `<`, `>`, `<=`, `>=` between two values of different types still return nothing (unchanged). Affected: any `ORDER BY`, `min`, or `max` over a property or expression whose values span more than one type, in 0.10.0 and earlier, on every surface that runs Cypher (row 170).
+- **`ORDER BY` and `min` / `max` now follow openCypher's cross-type order.** Values of different types now sort in openCypher's ascending order: map < list < Date < LocalDateTime < DateTime < Duration < binary < string < boolean < number < null. Previously, numbers sorted first. `MATCH (a) RETURN a.m AS m ORDER BY m` over `m` = 1, `'a'`, `true` used to return `1, 'a', true`; it now returns `'a', true, 1`. `min` over a mixed column returns the string; `max` returns the number. Comparisons with `<`, `>`, `<=`, `>=` between two values of different types still return nothing (unchanged). Affected: any `ORDER BY`, `min`, or `max` over a property or expression whose values span more than one type, in 0.10.0 and earlier, on every surface that runs Cypher (row 170).
 
 ## v0.10.0 — Cypher, Bolt, and a store you host yourself
 

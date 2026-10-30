@@ -2029,12 +2029,25 @@ fn range_scan_ids(
             let (mut ids, _) = top_k(view, scan.field, walk, keep, &keeps);
             // With a range, a node with no index entry fails it. Without
             // one, such nodes (no property, or a list, map or `Duration`)
-            // sort among the rows: descending, nulls come first; ascending,
-            // before all indexed types (openCypher: list/map/Duration sort
-            // before temporal, string, boolean and number), so they must
-            // always be considered when there is no range bound.
+            // sort among the rows.  Descending: nulls come first, so every
+            // unindexed node is a candidate.  Ascending: list/map/Duration
+            // sort before all indexed types; nulls sort last.  In the
+            // ascending case, `non_scalar_ids` gives the list/map/Duration
+            // nodes cheaply; the O(n) full walk for nulls is skipped when
+            // `ids` already meets `keep` (nulls cannot displace anything).
             if !bounded {
-                ids.extend(unindexed_ids(view, index, scan));
+                if desc {
+                    ids.extend(unindexed_ids(view, index, scan));
+                } else {
+                    ids.extend(index.non_scalar_ids(scan.label, scan.field));
+                    if ids.len() < keep {
+                        // Fewer candidates than needed; null nodes (which sort
+                        // last) may fill the gap.  `unindexed_ids` returns
+                        // non-scalar and null together; `dedup` below removes
+                        // the overlap with what we already added.
+                        ids.extend(unindexed_ids(view, index, scan));
+                    }
+                }
             }
             ids.sort_unstable();
             ids
