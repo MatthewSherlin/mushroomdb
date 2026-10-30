@@ -56,6 +56,7 @@ pub use db::{
 };
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
+pub use reader::seed_layer_moves_this_thread;
 
 /// The similarity floor `find_similar` applies when the caller names none.
 ///

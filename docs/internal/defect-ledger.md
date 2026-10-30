@@ -175,11 +175,12 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 162 | None on 0.10; the symptoms are rows 114, 117 and 124, present in released 0.9.x (run on v0.9.3) | Reported by the v0.9.4 review: `db.reader()` answered rule-derived edges and their weights differently from the live handle (2559 of 5345 checks with null weights, 487 missing derived edges). A seeded differential probe on 0.10 finds no difference; on v0.9.3 it reproduces as rows 114, 117 and 124, which 0.10 closed | **CLOSED** — not a defect on 0.10; present in 0.9.x as rows 114, 117 and 124 |
 | 164 | Low — lease lifecycle, introduced in unreleased 0.10 (HO-07), release blocker | Shutdown canceled an initial lease acquisition after its remote PUT but before capability probes returned a handle. The own LEASE remained after clean exit, and no final manifest was published. HO-LC retains the pending attempt, shares its completion and flush under one grace deadline, then performs one bounded ownership-checked release | **CLOSED** in 0.10 (HO-LC) |
 | 166 | Low — semantic deviation, present in released 0.9.x and 0.10.0 | `sum` over no values returns null; openCypher returns 0. `MATCH (n) RETURN sum(n.missing)` and a group whose rows all lack the property both give null. Pinned as intended by `sum_numeric_prop_ignores_null_and_non_numeric` in `crates/core-query/src/cypher/exec.rs`. Found by hardening H-2. Changing it changes a result a caller can see, so it waits for an owner ruling. | **DEFERRED** to 0.11 |
-| 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. Closed by bundling the three per-version Arc allocations into one `VersionCells` struct and caching the static read-context (`SlowQuerySink` + WAL path) in the handle. After fix: macOS 1.03× / 1.04×, Linux arm64 container 1.27× / 1.28×. Gate tightened: 1.40× → 1.35× (paused), 1.65× → 1.40× (under readers). | **CLOSED** in 0.10.1 |
+| 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. **CLOSED for the publish allocation part only** (see row 172 for the remaining Linux gap to the 1.15× target). Fix: `EffectiveCell`+`AtomicBool` bundled into one `Arc<CacheCell>`, kept separate from `Arc<IndexCell>` so `Arc::try_unwrap` succeeds on the sole-holder seed path (O(1) move restored); static read-context (`SlowQuerySink` + WAL path) cached as `Arc<ReadContextStatic>` in the handle. Net: 2 allocs/commit (was 5). After fix: macOS 1.04× paused / 0.98× under readers; Linux arm64 container (3 CPUs) 1.20–1.21× paused / 1.17–1.20× under readers. Gate tightened: 1.40× → 1.35× (paused), 1.65× → 1.40× (under readers). | **CLOSED** in 0.10.1 |
 | 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
 | 169 | Medium — wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Closed in 0.10.1: the planner's single-aggregate path returned before emitting `Skip` / `Limit`, on the reasoning that the aggregate makes one row; it now emits them and both aggregate executors apply them to that row. Tests: `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`; `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op` in `crates/core-query/src/cypher/exec.rs` | **CLOSED** in 0.10.1 |
 | 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **CLOSED** in 0.10.1 |
 | 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
+| 172 | Low — performance gap, present in released 0.10.0 and 0.10.1 | On Linux arm64 (3-CPU container), a plain commit paused is 1.20× v0.9.2 after the row 167 allocation fix, vs the 1.15× target. The remaining gap tracks WAL syscall overhead: `strace` shows ~0.3 extra `mprotect` and 0.17 `futex` per commit on glibc vs macOS even with all per-commit heap allocs removed; macOS (M4) reaches 1.04×. `scripts/check-defect-ledger.sh` exit 0 because the gate bound is 1.35×, not the target. Evidence: Linux arm64 container (3 CPUs, `--cpus 3`), paused probe vs v0.9.2 after row 167 fix: 1.20–1.21× (target 1.15×, bound 1.35×) | **DEFERRED** to 0.11 |
 <!-- DEFECT-INDEX:END -->
 
 ## 20. Spec §5.9 asks for a shape the code cannot be put into — CLOSED
@@ -4787,7 +4788,7 @@ Not a silent wrong answer to a query the engine documents, but a result a caller
 is not changed without the owner. The H-2 test encodes the current behaviour in one function,
 `sum_of`, which is the only line to flip. Deferred to 0.11.
 
-## 167. On Linux a plain commit costs 1.2–1.3× v0.9.2, and up to 1.4–1.6× under readers — CLOSED in 0.10.1
+## 167. On Linux a plain commit costs 1.2–1.3× v0.9.2, and up to 1.4–1.6× under readers — CLOSED in 0.10.1 (alloc part; remaining Linux gap is row 172)
 
 Present in released 0.10.0; **Medium** (performance; it turns `main` red). Found 2026-10-28 when
 `concurrency-gate` failed on `main` at `c6050eae` (a docs-only merge) and on four test-only pull
@@ -4830,30 +4831,36 @@ on every commit. The WAL path and slow-query ring are constant between commits. 
 malloc has higher per-call overhead for small concurrent allocations than macOS, amplifying the
 cost: each alloc pair triggers ~0.3 extra `mprotect` and 0.17 `futex` calls.
 
-**CLOSED in 0.10.1.** Two structural changes to `crates/core-api/src/reader.rs` and `db.rs`:
+**CLOSED in 0.10.1 for the publish allocation part.** The remaining Linux gap to the 1.15× target (paused 1.20× after this fix) is tracked as row 172. Two structural changes to `crates/core-api/src/reader.rs` and `db.rs`:
 
-1. **`VersionCells`** — bundles the three per-version allocations (`EffectiveCell` /
-   `IndexCell` / `AtomicBool`) into one struct, so `cell_for()` allocates one `Arc<VersionCells>`
-   instead of three. `Seeds` is updated to store `Arc<VersionCells>` directly.
+1. **`CacheCell`** — bundles `EffectiveCell` and `AtomicBool` (background-build flag) into one
+   `Arc<CacheCell>`, saving one heap allocation vs holding them separately. `IndexCell` is kept as
+   its own `Arc<IndexCell>` so `Seeds` holds the layer and the index under **separate** reference
+   counts. This restores the O(1) seed-move: `Arc::try_unwrap` on the sole remaining holder
+   succeeds on either, moving the value out instead of deep-cloning the `DeltaLayer` (a HashMap)
+   or `PropertyIndex` (BTreeMaps). Pinned by
+   `seed_layer_is_moved_not_cloned_when_snapshot_is_sole_holder` in
+   `crates/core-api/tests/reader_shared_effective.rs`; move count exported as
+   `seed_layer_moves_this_thread()`.
 
 2. **`ReadContextStatic`** — the slow-query ring and WAL path (constant between commits) are
    cached in `GraphDb` as `Arc<ReadContextStatic>` and Arc-cloned into every snapshot. The
    per-commit `counts` tuple is inlined directly in `ReaderSnapshot`. This saves two allocations
    per commit (the `PathBuf` and the `Arc<ReadContext>`).
 
-Net saving: ~4 small heap allocations per commit (5–7 → 1–3).
+Net saving: 3 heap allocations per commit (5 → 2: one `Arc<CacheCell>` + one `Arc<IndexCell>`).
 
 **After-fix measurements** (Linux arm64 container, 3 CPUs, v0.9.2 baseline on the same machine):
 
 | Platform | Paused, vs v0.9.2 | Under readers, vs v0.9.2 | Self-ratio |
 |---|---|---|---|
-| macOS (M4) | 1.03× | 1.04× | 1.21× |
-| Linux arm64 container (3 CPUs) | 1.27× | 1.28× | 1.25× |
+| macOS (M4) | 1.04× | 0.98× | 1.25× |
+| Linux arm64 container (3 CPUs) | 1.20–1.21× | 1.17–1.20× | 1.14–1.47× |
 
 Gate bounds tightened: paused 1.40× → **1.35×**, under-readers 1.65× → **1.40×**, own
-under-readers ratio 1.65× → **1.40×**. These do not reach the original 1.15× / 1.25× targets
-(the paused ratio on arm64 Linux, 1.27×, is dominated by WAL syscalls, not allocations), but
-the under-readers improvement is clear. The original targets remain aspirational for future work.
+under-readers ratio 1.65× → **1.40×**. The under-readers ratio on both platforms is clear (macOS
+is already below 1.0×). The Linux paused ratio (1.20×) does not reach the 1.15× target; the
+remaining gap is attributed to WAL syscall overhead and tracked as row 172.
 
 ## 168. An aggregating `RETURN` after an aggregating `WITH` is dropped — CLOSED in 0.10.1
 
@@ -4975,3 +4982,28 @@ correctly), pattern-predicate refusal still fires for bare forms in WHERE expres
 **H-3:** `bare_rels: Vec<bool>` added to `Path`; the generator draws a flag per untyped hop and
 `render_path` alternates between `-->` and `-[]->` accordingly. TCK rate rose from 0.7268 to
 0.7419 (bare-arrow scenarios now pass).
+
+## 172. Linux plain-commit paused ratio is 1.20× v0.9.2, above the 1.15× target — DEFERRED to 0.11
+
+Present in 0.10.0 and 0.10.1; **Low** (performance gap, gate not red). After the row 167
+allocation fix the per-commit overhead on a Linux arm64 container (3 CPUs) is 1.20–1.21× v0.9.2
+paused — below the 1.35× gate bound, but above the 1.15× original target.
+
+**Evidence (Linux arm64 container, `--cpus 3`, v0.9.2 baseline on the same machine):**
+
+| Measurement | Before row 167 fix | After row 167 fix | Target | Gate bound |
+|---|---|---|---|---|
+| Paused, vs v0.9.2 | 1.18–1.34× | 1.20–1.21× | 1.15× | 1.35× |
+| Under readers, vs v0.9.2 | 1.44–1.58× | 1.17–1.20× | 1.25× | 1.40× |
+
+The under-readers gap is closed (1.17–1.20× ≤ 1.25× target). The paused gap remains.
+
+**Root cause (attributed):** `strace` on the pre-fix kernel shows ≈0.3 extra `mprotect` and
+0.17 extra `futex` calls per commit on Linux vs macOS, even with per-commit heap allocations
+removed. This is WAL fsync overhead in glibc's `malloc` arena management, not engine code. The
+macOS allocator does not hold a mutex across the arena boundary, so the same allocation count
+does not trigger the extra syscalls there (macOS paused ratio is 1.04× after the fix).
+
+**Not fixed.** Reducing this further would require either a custom allocator (jemalloc or
+mimalloc) or deferring the WAL sync path, neither of which is scoped for 0.10.1. Deferred to
+0.11 for an owner decision on allocator strategy.

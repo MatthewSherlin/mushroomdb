@@ -502,11 +502,12 @@ pub struct ReaderSnapshot {
     pub version: u64,
     /// Role → mask memo, shared with the `GraphDb` this snapshot came from.
     role_masks: Arc<RoleMaskCache>,
-    /// The delta-tail layer (`cache`), query index, and background-build flag,
-    /// all shared with every snapshot of the same version.  One `Arc` instead
-    /// of three: publishing a commit allocates three fewer small objects per
-    /// commit on Linux (row 167).
-    cells: Arc<VersionCells>,
+    /// The delta-tail layer and background-build flag, shared with every
+    /// snapshot of the same version.  Bundled into one `Arc<CacheCell>` so
+    /// only two allocations — this and `index` — are paid per commit on the
+    /// write path (row 167; previously five: three cell Arcs + PathBuf +
+    /// Arc<ReadContext>).
+    cache: Arc<CacheCell>,
     /// The handle's slow-query ring and WAL path — constant across commits,
     /// Arc-cloned from the handle rather than allocated fresh each commit
     /// (row 167).
@@ -515,67 +516,68 @@ pub struct ReaderSnapshot {
     /// them at capture — this snapshot's version.  Inlined so changing
     /// counts per commit does not require a new `Arc<ReadContext>` allocation.
     counts: (usize, usize, u64),
+    /// The query index, shared with every snapshot of the same version.
+    /// Separate from `cache` so each can be taken by move independently when
+    /// the seeds extend a longer tail.
+    index: Arc<IndexCell>,
     /// The layer and index of an earlier snapshot whose tail is a prefix of
-    /// this one's, for `cells.cache` and `cells.index` to extend instead of
-    /// rebuild.
+    /// this one's, for `cache.layer` and `index` to extend instead of rebuild.
     seeds: Arc<Seeds>,
 }
 
 /// The latest built cells of one fold, which a later version takes and
 /// extends; see [`SharedEffective`]. Only built cells are registered.
-///
-/// The seeds now store `Arc<VersionCells>` — the same `Arc` the snapshot
-/// holds — so no extra `Arc<OnceLock<…>>` is needed and the register
-/// entries share memory with live snapshots at zero extra cost.
 #[derive(Default)]
 pub(crate) struct Seeds {
-    layer: std::sync::Mutex<Option<(Arc<VersionCells>, usize)>>,
-    index: std::sync::Mutex<Option<(Arc<VersionCells>, usize)>>,
+    layer: std::sync::Mutex<Option<(Arc<CacheCell>, usize)>>,
+    index: std::sync::Mutex<Option<(Arc<IndexCell>, usize)>>,
 }
 
-/// Offer `cells` for `len` deltas to the fold's layer register, keeping
-/// whichever covers more of the tail.
-fn register_layer(
-    slot: &std::sync::Mutex<Option<(Arc<VersionCells>, usize)>>,
-    cells: &Arc<VersionCells>,
-    len: usize,
-) {
+/// Offer a built `cell` for `len` deltas to the fold's register, keeping
+/// whichever of it and the registered one covers more of the tail.
+fn register<T>(slot: &std::sync::Mutex<Option<(Arc<T>, usize)>>, cell: &Arc<T>, len: usize) {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if slot.as_ref().is_none_or(|(_, have)| *have < len) {
-        *slot = Some((Arc::clone(cells), len));
+        *slot = Some((Arc::clone(cell), len));
     }
 }
 
-/// Offer `cells` for `len` deltas to the fold's index register, keeping
-/// whichever covers more of the tail.
-fn register_index(
-    slot: &std::sync::Mutex<Option<(Arc<VersionCells>, usize)>>,
-    cells: &Arc<VersionCells>,
-    len: usize,
-) {
-    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.as_ref().is_none_or(|(_, have)| *have < len) {
-        *slot = Some((Arc::clone(cells), len));
+thread_local! {
+    /// How many times the seeded layer was taken by move — `Arc::try_unwrap`
+    /// succeeded — on this thread.  A test that drops a snapshot and then
+    /// builds the next one may assert this incremented.
+    static SEED_LAYER_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The layer held by `cache` — by move when no other reference to that
+/// `CacheCell` exists, by clone otherwise — or `None` when it was never
+/// built.  Counts every move in [`SEED_LAYER_MOVES`] so tests can assert the
+/// O(1) path was taken.
+fn take_layer(cache: Arc<CacheCell>) -> Option<std::result::Result<DeltaLayer, String>> {
+    match Arc::try_unwrap(cache) {
+        Ok(c) => {
+            SEED_LAYER_MOVES.with(|n| n.set(n.get() + 1));
+            c.layer.into_inner()
+        }
+        Err(shared) => shared.layer.get().cloned(),
     }
 }
 
-/// The layer held by `cells` — by move when no other reference to that
-/// `VersionCells` exists, by clone otherwise — or `None` when it was never
-/// built.
-fn take_layer(cells: Arc<VersionCells>) -> Option<std::result::Result<DeltaLayer, String>> {
-    match Arc::try_unwrap(cells) {
-        Ok(vc) => vc.cache.into_inner(),
-        Err(shared) => shared.cache.get().cloned(),
+/// The value a built index cell holds — by move when no other reference
+/// exists, by clone otherwise — or `None` when it was never built.
+fn take_index(cell: Arc<IndexCell>) -> Option<Option<PropertyIndex>> {
+    match Arc::try_unwrap(cell) {
+        Ok(once) => once.into_inner(),
+        Err(shared) => shared.get().cloned(),
     }
 }
 
-/// The index held by `cells` — by move when no other reference exists, by
-/// clone otherwise — or `None` when it was never built.
-fn take_index(cells: Arc<VersionCells>) -> Option<Option<PropertyIndex>> {
-    match Arc::try_unwrap(cells) {
-        Ok(vc) => vc.index.into_inner(),
-        Err(shared) => shared.index.get().cloned(),
-    }
+/// How many times the seeded layer was taken by move (not cloned) on the
+/// current thread since the process started.  Used by tests to verify the
+/// O(1) seed-extend path fires.
+#[doc(hidden)]
+pub fn seed_layer_moves_this_thread() -> u64 {
+    SEED_LAYER_MOVES.with(|n| n.get())
 }
 
 /// The parts of a [`ReaderSnapshot`]'s context that are constant across
@@ -609,19 +611,17 @@ type EffectiveCell = OnceLock<std::result::Result<DeltaLayer, String>>;
 /// A snapshot's query index, built at most once. See [`ReaderSnapshot::query_index`].
 type IndexCell = OnceLock<Option<PropertyIndex>>;
 
-/// The three per-version cells — layer, index, and builder flag — that a
-/// snapshot shares with every other handle on the same version.  One `Arc`
-/// allocation instead of three separate ones (`Arc<EffectiveCell>`,
-/// `Arc<IndexCell>`, `Arc<AtomicBool>`) that were paid on every commit (row
-/// 167: measurably slower on Linux where `malloc` for small objects costs
-/// more under concurrent load than on macOS).
+/// The delta-tail layer and the background-build flag for one version,
+/// bundled into one `Arc` allocation.  Pairing them saves one heap alloc
+/// per commit compared with holding `Arc<EffectiveCell>` and
+/// `Arc<AtomicBool>` separately (row 167).
 ///
-/// The seeds mechanism now stores `Arc<VersionCells>` directly instead of
-/// individual inner `Arc<OnceLock<…>>`, so `cache` and `index` are fields
-/// rather than heap allocations of their own.
-pub(crate) struct VersionCells {
-    pub(crate) cache: EffectiveCell,
-    pub(crate) index: IndexCell,
+/// The index lives in its own `Arc<IndexCell>` so the seeds can hold the
+/// layer and the index under separate reference counts, which lets
+/// `Arc::try_unwrap` succeed on either when it is the sole remaining holder
+/// — moving the value out instead of cloning it.
+pub(crate) struct CacheCell {
+    pub(crate) layer: EffectiveCell,
     pub(crate) background: std::sync::atomic::AtomicBool,
 }
 
@@ -656,7 +656,8 @@ pub(crate) struct SharedEffective {
     base: Option<Arc<MappedBase>>,
     len: usize,
     last: Option<Arc<CommitDelta>>,
-    cells: Arc<VersionCells>,
+    cache: Arc<CacheCell>,
+    index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
 }
 
@@ -678,7 +679,8 @@ pub(crate) struct SnapshotParts {
 
 /// What [`SharedEffective::cell_for`] hands a new snapshot.
 pub(crate) struct SharedCell {
-    cells: Arc<VersionCells>,
+    cache: Arc<CacheCell>,
+    index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
 }
 
@@ -712,7 +714,8 @@ impl SharedEffective {
                 && same_arc(entry.last.as_ref(), deltas.last())
             {
                 return SharedCell {
-                    cells: Arc::clone(&entry.cells),
+                    cache: Arc::clone(&entry.cache),
+                    index: Arc::clone(&entry.index),
                     seeds: Arc::clone(&entry.seeds),
                 };
             }
@@ -722,22 +725,28 @@ impl SharedEffective {
                 seeds = Some(Arc::clone(&entry.seeds));
             }
         }
-        // One Arc allocation for all three per-version cells (row 167).
-        let cells = Arc::new(VersionCells {
-            cache: OnceLock::new(),
-            index: OnceLock::new(),
+        // Two Arc allocations per commit: one for the layer+background-flag
+        // bundle (CacheCell) and one for the index (row 167).
+        let cache = Arc::new(CacheCell {
+            layer: OnceLock::new(),
             background: std::sync::atomic::AtomicBool::new(false),
         });
+        let index = Arc::new(IndexCell::new());
         let seeds = seeds.unwrap_or_default();
         *slot = Some(SharedEffective {
             frozen: Arc::clone(frozen),
             base: base.clone(),
             len: deltas.len(),
             last: deltas.last().cloned(),
-            cells: Arc::clone(&cells),
+            cache: Arc::clone(&cache),
+            index: Arc::clone(&index),
             seeds: Arc::clone(&seeds),
         });
-        SharedCell { cells, seeds }
+        SharedCell {
+            cache,
+            index,
+            seeds,
+        }
     }
 }
 
@@ -927,9 +936,10 @@ impl ReaderSnapshot {
             tail_derived,
             version,
             role_masks,
-            cells: shared.cells,
+            cache: shared.cache,
             context,
             counts,
+            index: shared.index,
             seeds: shared.seeds,
         }
     }
@@ -944,9 +954,10 @@ impl ReaderSnapshot {
             tail_derived: Arc::clone(&self.tail_derived),
             version: self.version,
             role_masks: Arc::clone(&self.role_masks),
-            cells: Arc::clone(&self.cells),
+            cache: Arc::clone(&self.cache),
             context: Arc::clone(&self.context),
             counts: self.counts,
+            index: Arc::clone(&self.index),
             seeds: Arc::clone(&self.seeds),
         }
     }
@@ -986,7 +997,7 @@ impl ReaderSnapshot {
             return Ok(None);
         }
         let mut built = false;
-        let cached = self.cells.cache.get_or_init(|| {
+        let cached = self.cache.layer.get_or_init(|| {
             built = true;
             count_build(true);
             match self.seeded_layer() {
@@ -996,7 +1007,7 @@ impl ReaderSnapshot {
             .map_err(|e| e.to_string())
         });
         if built && cached.is_ok() {
-            register_layer(&self.seeds.layer, &self.cells, self.deltas.len());
+            register(&self.seeds.layer, &self.cache, self.deltas.len());
         }
         cached
             .as_ref()
@@ -1184,14 +1195,14 @@ impl ReaderSnapshot {
         }
         let view = self.view(None)?;
         let mut built = false;
-        let index = self.cells.index.get_or_init(|| {
+        let index = self.index.get_or_init(|| {
             built = true;
             count_build(false);
             self.seeded_index(&view)
                 .unwrap_or_else(|| self.layered_index(&view))
         });
         if built && index.is_some() {
-            register_index(&self.seeds.index, &self.cells, self.deltas.len());
+            register(&self.seeds.index, &self.index, self.deltas.len());
         }
         Ok(index.as_ref())
     }
@@ -1199,17 +1210,17 @@ impl ReaderSnapshot {
     /// The seed's layer extended by the deltas after it, or `None` when there
     /// is no usable seed (the caller then builds the layer from the tail).
     fn seeded_layer(&self) -> Option<Result<DeltaLayer>> {
-        let (cells, len) = self
+        let (cache, len) = self
             .seeds
             .layer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()?;
         if len > self.deltas.len() {
-            register_layer(&self.seeds.layer, &cells, len);
+            register(&self.seeds.layer, &cache, len);
             return None;
         }
-        let mut layer = take_layer(cells)?.ok()?;
+        let mut layer = take_layer(cache)?.ok()?;
         Some(
             layer
                 .extend(&self.frozen, &self.base, &self.deltas[len..])
@@ -1220,17 +1231,17 @@ impl ReaderSnapshot {
     /// The seed's index layer with the nodes the later deltas touched
     /// re-indexed, or `None` when there is no usable seed.
     fn seeded_index(&self, view: &GraphView<'_>) -> Option<Option<PropertyIndex>> {
-        let (cells, len) = self
+        let (index, len) = self
             .seeds
             .index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()?;
         if len > self.deltas.len() {
-            register_index(&self.seeds.index, &cells, len);
+            register(&self.seeds.index, &index, len);
             return None;
         }
-        let mut layer = take_index(cells)??;
+        let mut layer = take_index(index)??;
         let mut stale = std::collections::BTreeSet::new();
         let mut unresolved = false;
         for delta in &self.deltas[len..] {
@@ -1258,10 +1269,10 @@ impl ReaderSnapshot {
     /// published it.
     #[doc(hidden)]
     pub fn layer_and_index_built(&self) -> bool {
-        let layer = self.deltas.is_empty() || self.cells.cache.get().is_some();
+        let layer = self.deltas.is_empty() || self.cache.layer.get().is_some();
         let index = self.deltas.is_empty()
             || self.frozen.prop_index.enabled_pairs().next().is_none()
-            || self.cells.index.get().is_some();
+            || self.index.get().is_some();
         layer && index
     }
 
@@ -1285,7 +1296,7 @@ impl ReaderSnapshot {
 
     /// Mark this version's cells as built by the background builder.
     pub(crate) fn mark_built_in_background(&self) {
-        self.cells
+        self.cache
             .background
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1294,7 +1305,7 @@ impl ReaderSnapshot {
     /// test checks to know it is reading builder-built cells.
     #[doc(hidden)]
     pub fn built_in_background(&self) -> bool {
-        self.cells
+        self.cache
             .background
             .load(std::sync::atomic::Ordering::Acquire)
     }
