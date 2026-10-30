@@ -8,6 +8,10 @@
 - **`SKIP` and `LIMIT` apply to an aggregate with no grouping key.** `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` returned the one aggregate row; they now return no rows, as openCypher does. Affected: a `RETURN` of a single aggregate and nothing else with `SKIP` of at least 1 or `LIMIT 0`, in 0.10.0 and 0.9.x, on every surface that runs Cypher. What is unchanged: `LIMIT 1` or more and `SKIP 0` still return the row, `ORDER BY` on that row is still accepted and does nothing, and grouped aggregates and several aggregates in one `RETURN` already paged correctly (row 169).
 - **Bare-arrow relationship patterns (`-->`, `<--`, `--`) are now accepted.** `MATCH (a)-->(b)`, `MATCH (a)<--(b)` and `MATCH (a)--(b)` previously failed with `expected '[' in a relationship pattern (found Dash)`; only the bracketed forms `-[]->`, `<-[]-`, `-[]-` were accepted. The bare forms are now equivalent to their bracketed counterparts everywhere relationship patterns are allowed (MATCH, OPTIONAL MATCH, MERGE). `query.md` already documented them as accepted (row 171).
 
+### Changed (behaviour)
+
+- **`ORDER BY` and `min` / `max` now follow openCypher's cross-type order.** Values of different types now sort in openCypher's ascending order: map < list < Date < LocalDateTime < DateTime < Duration < binary < string < boolean < number < null. Previously, numbers sorted first. `MATCH (a) RETURN a.m AS m ORDER BY m` over `m` = 1, `'a'`, `true` used to return `1, 'a', true`; it now returns `'a', true, 1`. `min` over a mixed column returns the string; `max` returns the number. Comparisons with `<`, `>`, `<=`, `>=` between two values of different types still return nothing (unchanged). Affected: any `ORDER BY`, `min`, or `max` over a property or expression whose values span more than one type, in 0.10.0 and earlier, on every surface that runs Cypher (row 170).
+
 ## v0.10.0 — Cypher, Bolt, and a store you host yourself
 
 

@@ -222,12 +222,13 @@ fn close(a: &Option<Value>, b: &Option<Value>) -> bool {
     }
 }
 
-/// openCypher order across kinds, as far as the generator reaches: numbers
-/// sort before strings; numbers by value, strings lexically.
+/// openCypher order across kinds, as far as the generator reaches: strings
+/// sort before numbers (openCypher: string < boolean < number); strings
+/// lexically, numbers by value.
 fn rank(v: &Option<Value>) -> (u8, f64, String) {
     match v {
-        Some(Value::Str(t)) => (1, 0.0, t.clone()),
-        other => (0, num(other).unwrap(), String::new()),
+        Some(Value::Str(t)) => (0, 0.0, t.clone()),
+        other => (1, num(other).unwrap(), String::new()),
     }
 }
 

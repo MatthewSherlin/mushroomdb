@@ -2026,19 +2026,34 @@ fn range_scan_ids(
                 Some(p) => Box::new(index.lookup_prefix(scan.label, scan.field, p)),
                 None => Box::new(index.lookup_ordered(scan.label, scan.field, lo, hi, desc)),
             };
-            let (mut ids, cut) = top_k(view, scan.field, walk, keep, &keeps);
+            let (mut ids, _) = top_k(view, scan.field, walk, keep, &keeps);
             // With a range, a node with no index entry fails it. Without
             // one, such nodes (no property, or a list, map or `Duration`)
-            // sort among the rows: descending, nulls come first; ascending,
-            // after numbers, strings and Bools — so only a cut past those
-            // can need them.
-            let settled_before_unindexed = !desc
-                && matches!(
-                    cut,
-                    Some(Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_))
-                );
-            if !bounded && !settled_before_unindexed {
-                ids.extend(unindexed_ids(view, index, scan));
+            // sort among the rows.  Descending: nulls come first, so every
+            // unindexed node is a candidate.  Ascending: list/map/Duration
+            // sort before all indexed types; nulls sort last.  In the
+            // ascending case, `non_scalar_ids` gives the list/map/Duration
+            // nodes cheaply; the O(n) full walk for nulls is skipped when
+            // `ids` already meets `keep` (nulls cannot displace anything).
+            if !bounded {
+                if desc {
+                    ids.extend(unindexed_ids(view, index, scan));
+                } else {
+                    // The set holds every such node; keep only the ones this
+                    // view reads, as `top_k` and `unindexed_ids` do.
+                    ids.extend(
+                        index
+                            .non_scalar_ids(scan.label, scan.field)
+                            .filter(|&id| keeps(id)),
+                    );
+                    if ids.len() < keep {
+                        // Fewer candidates than needed; null nodes (which sort
+                        // last) may fill the gap.  `unindexed_ids` returns
+                        // non-scalar and null together; `dedup` below removes
+                        // the overlap with what we already added.
+                        ids.extend(unindexed_ids(view, index, scan));
+                    }
+                }
             }
             ids.sort_unstable();
             ids

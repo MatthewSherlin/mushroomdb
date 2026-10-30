@@ -178,7 +178,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. | **DEFERRED** to 0.10.1 |
 | 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
 | 169 | Medium — wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Closed in 0.10.1: the planner's single-aggregate path returned before emitting `Skip` / `Limit`, on the reasoning that the aggregate makes one row; it now emits them and both aggregate executors apply them to that row. Tests: `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`; `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op` in `crates/core-query/src/cypher/exec.rs` | **CLOSED** in 0.10.1 |
-| 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **DEFERRED** to 0.10.1 |
+| 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **CLOSED** in 0.10.1 |
 | 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
 <!-- DEFECT-INDEX:END -->
 
@@ -4889,12 +4889,12 @@ row) is now `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op`. Tests:
 `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` (un-ignored), the H-3 property without
 `hits_row_169`, and the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`.
 
-## 170. Values of different types sort numbers first, where openCypher sorts them last — DEFERRED to 0.10.1
+## 170. Values of different types sort numbers first, where openCypher sorts them last — CLOSED in 0.10.1
 
 Present in 0.10.0, verified on `main`; **Low** (semantic deviation, undocumented). Found
 2026-10-29 by H-3.
 
-The engine orders values of different types numbers < strings < booleans < lists < null, in
+The engine ordered values of different types numbers < strings < booleans < lists < null, in
 `ORDER BY` and in `min` / `max`. openCypher's orderability is lists < strings < booleans <
 numbers < null; the TCK's `max` over mixed values is the number and `min` the list.
 
@@ -4905,8 +4905,13 @@ MATCH (a) RETURN min(a.m) AS lo, max(a.m) AS hi     => 1, true        (openCyphe
 ```
 
 query.md says only that null is the largest value. **Owner decision, 2026-10-29:** adopt the
-openCypher order. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them`
-(ignored until the fix); the H-3 property skips the shape in `hits_row_170`.
+openCypher order. **Fixed in 0.10.1:** `class_rank` in `crates/core-query/src/value_ops.rs`
+updated to openCypher order (map < list < temporal < binary < string < boolean < number < null);
+`SORT_CLASSES` in `crates/core-storage/src/range_index.rs` updated to match; top-k
+`settled_before_unindexed` guard removed (unindexed nodes now sort before all indexed types so
+they always participate). Tests: `finding_values_of_different_types_order_as_opencypher_orders_them`
+in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_170_*` tests in
+`crates/core-query/src/cypher/tests/h3.rs`.
 
 ## 171. query.md documents `-->`, but the parser refuses it — CLOSED in 0.10.1
 
