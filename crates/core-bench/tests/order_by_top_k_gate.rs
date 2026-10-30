@@ -35,8 +35,6 @@ fn build_db() -> GraphDb<RealFs> {
     let dir = tmp_dir();
     let mut db = GraphDb::open(&dir).expect("open");
     db.enable_range_index("by_val", "Item", "val").unwrap();
-    let props: Vec<(String, Value)> =
-        vec![("val".into(), Value::Int(0))];
     // Insert in batches to stay fast.
     let batch_size = 1_000;
     for batch_start in (0..NODES).step_by(batch_size) {

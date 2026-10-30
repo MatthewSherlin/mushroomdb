@@ -389,7 +389,8 @@ fn order_by_limit_with_non_scalar_values_matches_full_sort() {
     // b=0, a=1, e=2 (no more lists, d is now null).
     assert_eq!(keys(&rs, "n"), ["b", "a", "e"]);
     // Mutate: SET d → list again.
-    db.set_prop("d", "val", Value::List(vec![Value::Int(7)])).unwrap();
+    db.set_prop("d", "val", Value::List(vec![Value::Int(7)]))
+        .unwrap();
     let (rs, _) = qp(&db, "MATCH (n:Item) RETURN n ORDER BY n.val LIMIT 2", &[]);
     // d (list), b=0.
     assert_eq!(keys(&rs, "n"), ["d", "b"]);
