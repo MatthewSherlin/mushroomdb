@@ -27,8 +27,7 @@ fn chain() -> Fx {
 }
 
 fn run_q(fx: &Fx, q: &str) -> Vec<Option<Value>> {
-    let rs =
-        run(&fx.view(), q, &BTreeMap::new()).unwrap_or_else(|e| panic!("`{q}` failed: {e}"));
+    let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap_or_else(|e| panic!("`{q}` failed: {e}"));
     (0..rs.len()).map(|i| rs.row(i)[0].clone()).collect()
 }
 
@@ -141,10 +140,7 @@ fn bare_undirected_matches_same_as_bracketed() {
 fn two_hop_bare_right_arrow_chain() {
     let fx = chain();
     let bare = run_q(&fx, "MATCH (a {id:'ada'})-->(b)-->(c) RETURN c.id");
-    let bracketed = run_q(
-        &fx,
-        "MATCH (a {id:'ada'})-[]->(b)-[]->(c) RETURN c.id",
-    );
+    let bracketed = run_q(&fx, "MATCH (a {id:'ada'})-[]->(b)-[]->(c) RETURN c.id");
     assert_eq!(bare, bracketed);
     assert_eq!(bare, vec![Some(s("cam"))]);
 }
@@ -154,10 +150,7 @@ fn two_hop_bare_right_arrow_chain() {
 fn mixed_bare_and_bracketed_in_one_pattern() {
     let fx = chain();
     let mixed = run_q(&fx, "MATCH (a {id:'ada'})-->(b)-[]->(c) RETURN c.id");
-    let all_bracketed = run_q(
-        &fx,
-        "MATCH (a {id:'ada'})-[]->(b)-[]->(c) RETURN c.id",
-    );
+    let all_bracketed = run_q(&fx, "MATCH (a {id:'ada'})-[]->(b)-[]->(c) RETURN c.id");
     assert_eq!(mixed, all_bracketed);
 }
 
