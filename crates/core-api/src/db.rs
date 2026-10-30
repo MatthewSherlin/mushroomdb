@@ -2160,6 +2160,11 @@ pub struct GraphDb<F: Fs> {
     /// the same fold and delta tail, so a snapshot per request does not apply
     /// the tail once per request. See [`crate::reader::SharedEffective`].
     shared_effective: std::sync::Mutex<Option<crate::reader::SharedEffective>>,
+    /// The slow-query ring and WAL path, constant between commits.  Arc-cloned
+    /// into every reader snapshot instead of being allocated fresh each commit
+    /// (row 167: two fewer small heap allocations per commit on Linux).
+    /// Rebuilt when `set_slow_query_threshold_ms` changes the threshold.
+    reader_context_static: Arc<crate::reader::ReadContextStatic>,
     /// How many commits have occurred since the last fold.
     commits_since_fold: usize,
     /// When true, `log_then_apply_with` buffers event notifications instead of
@@ -2978,6 +2983,23 @@ impl<F: Fs> GraphDb<F> {
     /// filesystem and options in place. Only [`load_from_disk`] makes it
     /// usable.
     fn new_empty(fs: F, opts: OpenOptions) -> Self {
+        // Build the static reader context up front so the struct literal can
+        // reference `slow_queries` and `slow_query_threshold_ms` in one place.
+        let slow_query_threshold_ms: u64 = std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let slow_queries = Arc::new(std::sync::Mutex::new(SlowQueryLog {
+            entries: std::collections::VecDeque::new(),
+            total: 0,
+        }));
+        let reader_context_static = Arc::new(crate::reader::ReadContextStatic {
+            slow: SlowQuerySink {
+                threshold_ms: slow_query_threshold_ms,
+                log: Arc::clone(&slow_queries),
+            },
+            wal_path: fs.wal_path(),
+        });
         Self {
             fs,
             ids: Arc::new(IdMap::new()),
@@ -3039,14 +3061,9 @@ impl<F: Fs> GraphDb<F> {
             // Nothing is proven until `load_from_disk` has looked at the store.
             snapshot_preserved_history: false,
             pending_write_authz: None,
-            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
-            slow_queries: Arc::new(std::sync::Mutex::new(SlowQueryLog {
-                entries: std::collections::VecDeque::new(),
-                total: 0,
-            })),
+            slow_query_threshold_ms,
+            slow_queries,
+            reader_context_static,
             warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
@@ -4796,15 +4813,14 @@ impl<F: Fs> GraphDb<F> {
             // this commit, so it shares the memo and its version key.
             version: self.commit_seq,
             role_masks: Arc::clone(&self.role_masks),
-            context: crate::reader::ReadContext {
-                slow: self.slow_query_sink(),
-                counts: (
-                    self.ids.live_len(),
-                    self.ids.len() - self.ids.live_len(),
-                    self.corrected_edge_count(),
-                ),
-                wal_path: self.fs.wal_path(),
-            },
+            // Arc::clone instead of allocating a new PathBuf + Arc<ReadContext>
+            // on every commit (row 167).
+            context: Arc::clone(&self.reader_context_static),
+            counts: (
+                self.ids.live_len(),
+                self.ids.len() - self.ids.live_len(),
+                self.corrected_edge_count(),
+            ),
             shared: effective,
         });
         Some(snap)
@@ -17090,6 +17106,12 @@ impl<F: Fs> GraphDb<F> {
     /// threads.
     pub fn set_slow_query_threshold_ms(&mut self, ms: u64) {
         self.slow_query_threshold_ms = ms;
+        // Rebuild the cached static context so new snapshots see the updated
+        // threshold.  The wal_path is stable; only the threshold changed.
+        self.reader_context_static = Arc::new(crate::reader::ReadContextStatic {
+            slow: self.slow_query_sink(),
+            wal_path: self.fs.wal_path(),
+        });
     }
 
     /// Snapshot of the slow-query ring buffer and lifetime counter.
