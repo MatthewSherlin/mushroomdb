@@ -301,6 +301,8 @@ def parse_stub(source: str) -> dict:
             continue
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             continue  # the module docstring, or the docstring under an alias
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "__version__":
+            continue  # left out, like the `__dunder__` methods
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             after = tree.body[i + 1] if i + 1 < len(tree.body) else None
             doc = ""

@@ -265,6 +265,11 @@ class ReviewFindings(unittest.TestCase):
             gen.parse_stub(source)
         self.assertIn("get", str(raised.exception))
 
+    def test_the_version_attribute_is_left_out_and_any_other_annotated_name_fails(self):
+        gen.parse_stub('__version__: str\n"""Doc."""\nclass GraphDb:\n    def close(self) -> None: ...\n')
+        with self.assertRaisesRegex(gen.Problem, "AnnAssign"):
+            gen.parse_stub("DEFAULT: str\nclass GraphDb:\n    def close(self) -> None: ...\n")
+
     def test_a_module_level_function_fails_by_name(self):
         with self.assertRaises(gen.Problem) as raised:
             gen.parse_stub('def connect(path: str) -> None:\n    """Doc."""\n')
