@@ -153,7 +153,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 139 | High — silent wrong rows, present in released 0.9.x (since 0.2.0) | A filtered scan with LIMIT and no ORDER BY (`MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k`, with or without SKIP, `<op>` any of `=`, `<>`, `<`, `<=`, `>`, `>=`; on 0.9.x `=` only when the filtered node is not the first the MATCH scans, as in `MATCH (m:M), (n:L) WHERE n.f = 3 … LIMIT k`) runs the fused scan-and-filter, whose column handle read the overlay and never the snapshot base, so it dropped every node whose value a snapshot held: two nodes, `snapshot()`, a third, and `WHERE n.val <> 3 … LIMIT 5` returned only the third. Confirmed on v0.9.2. Found by TY-10. Closed by QL-FS in 0.10, and in 0.9.3 by the backport (`ColumnsView::view_column`): the column handle reads what a property read reads — the layer (0.10), the overlay, the tombstones, then the base | **CLOSED** in 0.9.3 and 0.10 (QL-FS) |
 | 140 | Low, introduced in 0.10 (TX-4), never released | A transaction begun by a role token or a `read`-tier key cannot write. `Transaction` has no authz-aware commit, so an HTTP `/tx` transaction (and, by the same engine, a Bolt `BEGIN`) for such an identity reads through the role's mask on its begin snapshot and refuses any write with 403. `/query` lets a role with a write scope write; a transaction does not. Fail-closed and documented, never wider than the role | **DEFERRED** to 0.11 |
 | 141 | High — 0.10 regression, introduced in 0.10 (HO-07 × HO-01), never released | `serve --tls-cert/--tls-key` panicked building the TLS config: two rustls crypto providers compiled, none installed. HO-01's image builds the CLI with `--features tls`, whose axum-server brings rustls's aws-lc-rs provider; HO-07's backup client (object_store, reqwest) brings ring. With both compiled in rustls has no default provider, and `RustlsConfig::from_pem_file` (`ServerConfig::builder()`) panicked in the HTTP task, so the image could not serve native TLS. 0.9.2 had only aws-lc-rs in the CLI's graph and shipped no TLS build. Found in TX-16. Closed by TX-16: HTTP and Bolt build their config with `server::load_server_config`, which uses the installed provider, else aws-lc-rs; tests that install no provider pin it, and CI now builds the TLS binary | **CLOSED** in 0.10 (TX-16) |
-| 142 | Low, introduced in 0.10 (HO-04 × TX-16), never released | A key revoked by a `keys.json` reload (`SIGHUP`) keeps working on an already-open Bolt connection until it closes. A Bolt connection authenticates once, at `HELLO`, and keeps the identity it resolved then; HTTP resolves the key on every request and refuses it on the next one. Documented in `docs/site/bolt.md` (Scoped access, "Revoking a credential") | **DEFERRED** to 0.11 |
+| 142 | Low, introduced in 0.10 (HO-04 × TX-16), never released | A key revoked by a `keys.json` reload (`SIGHUP`) keeps working on an already-open Bolt connection until it closes. A Bolt connection authenticates once, at `HELLO`, and keeps the identity it resolved then; HTTP resolves the key on every request and refuses it on the next one. Documented in `docs/site/bolt.md` (Scoped access, "Revoking a credential") | **CLOSED** in 0.10 |
 | 143 | Low — missing counter, introduced in 0.10 (QL-09b), never released | No write result counted the relationships a statement created. `UNWIND … MATCH (a), (b) CREATE (a)-[:K]->(b)` created the edge and reported `created = 0`, and a `MERGE` that created only a relationship reported nothing. That count is correct under the documented meaning of `created` (nodes inserted, as on 0.9.x), but there was no relationship counter beside it. On v0.9.2 (checked with `git show v0.9.2:crates/core-api/src/db.rs`, `exec_create`) neither `UNWIND` writes nor relationship `MERGE` existed. Its one edge-creating path, `CREATE (a:L {…})-[:K]->(b:L {…})`, reported `created = 2` with nothing for the edge. Found by the QL-12 review. Closed by QL-CX: the write row gains a fourth column, `relationships_created` (after `created`, `properties_set` and `deleted`, which keep their positions and meanings), filled on every create path: `CREATE`, `MERGE`, `UNWIND … CREATE/MERGE`, `MATCH … CREATE/MERGE`, and `CREATE` and `MERGE` inside a transaction (the `UNWIND` and `MATCH … CREATE/MERGE` forms are refused inside a transaction in this build). Tests: `row_143_every_create_path_counts_its_relationships` and `row_143_a_transaction_counts_its_relationships_too` in `crates/core-api/tests/ql_cx.rs`, plus `relationships_created` assertions beside the `created` ones in `cypher_merge_edge.rs`, `cypher_writes.rs` and `ql_09b.rs` | **CLOSED** in 0.10 (QL-CX) |
 | 144 | Medium — refused statement, introduced in 0.10 (TX-1, QL-09b, QL-CX), never released | Inside a transaction (Rust `begin_transaction`, HTTP `/tx`, Bolt `BEGIN`, so every driver's managed write transaction) the per-row write forms were refused with `not supported in mushroomdb 0.10 inside a transaction: …`: `MATCH … CREATE` / `MATCH … MERGE` and `UNWIND … <write>` (the transaction refused `WriteStatement::UnwindWrite`, because the per-row executor read `GraphDb`, not the transaction's layered view), and also `MATCH … SET n = {…}` / `SET n += {…}`, `MATCH … SET … RETURN` and `MATCH … REMOVE … RETURN`. So "find two nodes, connect them" — `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)` — failed over Bolt `BEGIN`; only auto-commit `RUN` ran it. Transactions are new in 0.10, so no release had it. Found by the QL-CX review. Closed by TX-MW: the per-row executor and the `MATCH … SET` / `REMOVE` executors compute their ops over a `RowSource` (the store, or the transaction's base snapshot with its buffer laid over it), and the transaction buffers those ops instead of committing them, so every form runs with auto-commit's results and counts. Tests: `crates/core-api/tests/tx_mw.rs` (a randomized differential of the same statements auto-commit vs inside one transaction, read-your-write, rollback, conflict on the same pair, constraint at commit), `crates/server/tests/http_tx.rs::match_then_create_connects_two_nodes_inside_a_transaction`, `crates/bolt/tests/tx.rs::begin_match_create_commit_connects_two_nodes` | **CLOSED** in 0.10 (TX-MW) |
 | 145 | Medium — wrong values, introduced in 0.10 (TX-1), never released | Inside a transaction, `MATCH … SET` evaluated every value against the state before the statement, not against the statement's own earlier rows and items as auto-commit does. Over four rows matching one node, `MATCH (n {id: 'a'}), (m:Person) SET n.v = n.v + 1` added 1, not 4; `SET n.v = 10, n.w = n.v + 0` set `w` from the old `v`. The transaction's own `stage_match_set` projected each value in the MATCH query. Found by TX-MW's differential. Closed by TX-MW: the transaction computes `MATCH … SET` through the auto-commit executor (`match_set_ops` over the transaction's `RowSource`). Test: `match_set_reads_its_own_earlier_rows_inside_a_transaction` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
@@ -4341,7 +4341,7 @@ its own provider choice. Evidence:
 - CI (`.github/workflows/ci.yml`) builds the CLI with `--features tls` and runs both, plus the Bolt
   listener's TLS test.
 
-## 142. A key revoked by a `keys.json` reload keeps working on an open Bolt connection — DEFERRED to 0.11
+## 142. A key revoked by a `keys.json` reload keeps working on an open Bolt connection — CLOSED
 
 Found on 2026-10-22 when TX-17 documented Bolt's scoped access. Introduced in the 0.10 cycle where HO-04
 (`keys.json` with a `SIGHUP` reload) met TX-16 (the Bolt listener); never released.
@@ -4349,14 +4349,55 @@ Found on 2026-10-22 when TX-17 documented Bolt's scoped access. Introduced in th
 A Bolt connection authenticates once, at `HELLO`, and keeps the `Identity` it resolved for its whole life.
 A `SIGHUP` reload replaces the key set both listeners read, so a new `HELLO` with a removed key is refused,
 and HTTP, which resolves the key on every request, refuses it on the next one. A connection that
-authenticated before the reload keeps running statements with the revoked key until the client closes
-it. A change to the role a credential names is not affected: a scoped statement resolves the role's mask
-when it runs. `docs/site/bolt.md` (Scoped access, "Revoking a credential") says so and tells the
-operator to close such connections or restart.
+authenticated before the reload kept running statements with the revoked key until the client closed it.
+A change to the role a credential names was not affected: a scoped statement resolves the role's mask
+when it runs.
 
-**DEFERRED to 0.11.** The fix is for a reload to reach open connections: each statement (or each
-`BEGIN`/auto-commit `RUN`) checks that its key is still in the current key set, or the reload closes the
-connections whose key it removed.
+**Fix:** `Connection` now stores the `AuthToken` credentials presented at `HELLO` (not the resolved
+`Identity`). At the start of every `RUN`, `BEGIN`, and `COMMIT`, `recheck_key` calls
+`authenticator.authenticate` against the current key table. If the key is no longer present the request
+fails with `Unauthorized` (`Neo.ClientError.Security.Unauthorized`) and the connection moves to the
+`Failed` state (which rolls back an open transaction, as any failed request does). If the key's tier
+or role has changed, the behaviour depends on whether a transaction is open: **outside a transaction**
+the new identity takes effect silently on the next statement; **inside a transaction** any identity
+change is refused with `Forbidden` and the transaction is rolled back so the changed identity's view
+is not mixed with the original transaction's snapshot. Static `--token` auth and no-auth (open server)
+modes are unaffected: no `auth_token` is stored for them, so `recheck_key` returns immediately. The
+per-request cost for key-file connections is one blake3 hash of the token plus one `RwLock` read,
+proportional to the key-file size and negligible against the cost of a query.
+
+Decisions:
+- **Open explicit transaction when the key is revoked:** the next `RUN` inside the transaction fails
+  with `Unauthorized`, which moves the connection to `Failed` and rolls back the transaction, matching
+  the state-machine semantics of any failed `RUN`.
+- **Streaming result (`PULL`) in progress:** `PULL` and `DISCARD` are not re-checked. The result is
+  already computed; refusing mid-stream would be confusing and does not gate new database work.
+- **`COMMIT`:** re-checked. A key revoked between `RUN` and `COMMIT` is refused with `Unauthorized`
+  and the transaction is rolled back. Any other identity change (tier or role) is refused with
+  `Forbidden` and the transaction is rolled back. `ROLLBACK` is always safe and is not re-checked.
+- **Changed tier / role (not removed) outside a transaction:** identity updates silently; the next
+  statement runs with the new identity. A tier narrowed to `read` means the next write fails
+  `Forbidden`. Inside a transaction any identity change is refused (see the unified rule above).
+- **Role A → role B mid-transaction:** without the in-transaction guard, the scoped transaction's
+  snapshot mask was fixed at role A's snapshot, but `run_in_tx` was called with role B's identity.
+  The guard (`scoped && !tx.is_scoped()`) did not fire because the transaction is still scoped; the
+  result was that A's view was returned. The unified identity-change rule closes this data-leak path.
+- **Bolt failure message:** `BoltError::Unauthorized` for revocation, `BoltError::Forbidden` for any
+  identity change, each mapping to their corresponding `Neo.ClientError.Security.*` code. Drivers do
+  not retry `ClientError`, so no driver loop.
+- **Connection closed afterwards:** the connection moves to `Failed` (not `Defunct`); the client
+  may `RESET` and start a new transaction under the current identity.
+
+Evidence: `row_142_a_revoked_key_is_refused_on_its_next_run`,
+`row_142_a_revoked_key_is_refused_on_its_next_begin`,
+`row_142_a_key_whose_tier_changes_to_read_is_refused_on_writes`,
+`row_142_a_transaction_open_when_its_key_is_revoked_fails_on_its_next_run`,
+`row_142_an_unrelated_key_on_another_connection_is_unaffected`,
+`row_142_a_committed_write_after_key_revocation_does_not_persist`,
+`row_142_a_committed_write_after_key_downgrade_to_read_does_not_persist`, and
+`row_142_a_changed_role_in_an_open_transaction_is_refused`
+in `crates/bolt/tests/keys.rs`.
+All eight were red on `main` before the fix and green after.
 
 ## 143. No write result counted the relationships a statement created — CLOSED
 
