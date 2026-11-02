@@ -801,6 +801,11 @@ jobs:
           # runners that sat queued past the 24h cap in v0.1.0.
           - os: macos-15
             target: x86_64-apple-darwin
+          # The runners `release.yml` builds on, so the lowest glibc it states is run here.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
           - os: windows-latest
