@@ -3162,381 +3162,454 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// `origin` decides whether the two repair writes this function can make
     /// are appropriate; see [`LoadOrigin`].
+    ///
+    /// # Row 121 — snapshot replaced during load
+    ///
+    /// A WAL-replacing snapshot writes `snapshot.bin` first, then renames
+    /// `wal.bin` away and writes a new baseline.  If another process completes
+    /// both renames between the point where this function reads `snapshot.bin`
+    /// and the point where it would record `snapshot_ident`, the handle ends up
+    /// with the old snapshot's state paired with the new snapshot's WAL, stored
+    /// under the new snapshot's identity.  No subsequent staleness check can
+    /// detect the mixture.
+    ///
+    /// Fix: capture `snapshot_ident` before reading anything.  After the WAL
+    /// replay, re-read it and compare.  A mismatch means a peer completed a
+    /// snapshot in the window; reset and retry, up to three attempts in all.  The bound
+    /// fails closed — returning an error — rather than returning mixed state.
+    /// On a store under continuous snapshot pressure (a large store with a very
+    /// aggressive snapshot schedule) three attempts can all lose the race, and
+    /// a long-lived handle that exhausts them via `refresh` is then degraded
+    /// until it is reopened.  That is the documented trade-off.
+    ///
+    /// On non-Unix platforms `snapshot_ident` uses `(len, mtime_nanos)`, not
+    /// an inode, so an equal-length replacement within a mtime quantum would
+    /// go undetected — the same limitation as the existing staleness check in
+    /// `refresh_checking`.  This does not worsen row 122.
     fn load_from_disk(&mut self, origin: LoadOrigin) -> Result<usize> {
-        // Both writes below are crash recovery, and only an open is entitled to
-        // perform them. A read-only handle promises to touch nothing, and a
-        // reload driven by `refresh` is looking at a store another process is
-        // actively writing: what looks like a torn tail there is a peer
-        // mid-append, and what looks like an orphaned archive may be one that
-        // peer is about to reference.
-        let may_repair = origin == LoadOrigin::Open && !self.open_opts.read_only;
-        let repair_wal = self.open_opts.repair_wal && may_repair;
-        let db = self;
-        db.wal_horizon_floor = db.fs.read_horizon_floor()?;
-        db.archive_genesis_chain = db.fs.has_genesis_marker();
-        // Opening cleanup: remove orphaned archives — archives whose frames all
-        // fall below the horizon floor.  Orphans arise when a crash interrupted
-        // the retention-prune sequence after the floor was written but before
-        // all surplus archives were deleted.  Safe to delete: floor already
-        // accounts for their frames.
-        if may_repair {
-            db.cleanup_orphaned_archives()?;
-        }
-        let _t0 = std::time::Instant::now();
-        // Peek 6 bytes to determine snapshot version without reading the full
-        // file. For RealFs this is a true partial read (O(1)); for SimFs the
-        // default impl reads all bytes and truncates (still correct).
-        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
-        // V8, V9 and V10 share the mmap-able container; V9 only adds section 12
-        // and V10 adds nothing but its version stamp. A version outside that set
-        // falls through to the full-read path below, where `snapshot::decode`
-        // either handles it (V5–V7) or refuses it by name — which is what stops
-        // an older binary before it reaches the WAL.
-        let is_v8 = snap_header.len() >= 6
-            && &snap_header[0..4] == b"GDB1"
-            && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
-                snap_header[4],
-                snap_header[5],
-            ]));
-        // The version this store is stamped with, or `None` when it has never
-        // been snapshotted. Read from the same six bytes, with no second read.
-        let snapshot_version = if snap_header.len() >= 6 && &snap_header[0..4] == b"GDB1" {
-            Some(u16::from_le_bytes([snap_header[4], snap_header[5]]))
-        } else {
-            None
-        };
-        // A V11 snapshot is the store's own word that it has opted in (C9);
-        // the replay below finds the same from any V11-only record it meets.
-        if snapshot_version.is_some_and(|v| v >= core_storage::snapshot::VERSION_11) {
-            db.v11_features = true;
-        }
-        // The declarations a V11 snapshot carries itself (section 18), applied
-        // at the `held` boundary of the replay below — the point of the WAL
-        // the snapshot was taken at. `None` for every earlier snapshot.
-        let mut snapshot_declarations = None;
-        // No snapshot means no snapshot has ever truncated the WAL, so this
-        // handle can prove the history is whole. Once a snapshot exists that
-        // this handle did not take, it cannot: see `snapshot_preserved_history`.
-        db.snapshot_preserved_history = snap_header.is_empty();
-        if is_v8 {
-            // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
-            // No 2.4GB heap Vec is allocated on RealFs.
-            let mapped = Arc::new(
-                if let Some(snap_path) = db.fs.snapshot_path() {
-                    core_storage::v8::MappedBase::map(&snap_path)
-                } else {
-                    let snap_bytes = db.fs.read(FileId::Snapshot)?;
-                    core_storage::v8::MappedBase::from_bytes(snap_bytes)
-                }
-                .map_err(|e| GraphError::Corrupt {
-                    detail: format!("v8: mmap open: {e:?}"),
-                })?,
-            );
-            db.restore_v8_base(Arc::clone(&mapped))?;
-            trace_open!("restore_v8_base", _t0);
-            db.base = Some(mapped);
-            trace_open!("base assigned", _t0);
-            // Only a snapshot from a writer that could leave a deleted node's
-            // edges behind is searched for them.
-            if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
-                db.drop_edges_of_retired_nodes();
+        // Bounded retry: if the snapshot is replaced during our load, reset and
+        // try again.  The bound fails closed — an error — rather than returning
+        // mixed state.  Exhaustion on a refresh leaves the handle degraded.
+        const MAX_LOAD_ATTEMPTS: u8 = 3;
+        for load_attempt in 0..MAX_LOAD_ATTEMPTS {
+            // Reset state before every non-first attempt.  The first call
+            // arrives with a clean handle (either freshly constructed or
+            // already reset by the caller before a reload).
+            if load_attempt > 0 {
+                self.reset_for_reload();
             }
-            // Only a snapshot whose state has not had the lost-provenance
-            // repair is repaired at the first write (ledger rows 111, 113).
-            if db.base.as_ref().is_some_and(|base| base.prov_reconciled()) {
+            // Capture the snapshot identity before reading anything — the
+            // anchor for the consistency check at the end of this attempt.
+            let before_snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+
+            // Both writes below are crash recovery, and only an open is entitled to
+            // perform them. A read-only handle promises to touch nothing, and a
+            // reload driven by `refresh` is looking at a store another process is
+            // actively writing: what looks like a torn tail there is a peer
+            // mid-append, and what looks like an orphaned archive may be one that
+            // peer is about to reference.
+            let may_repair = origin == LoadOrigin::Open && !self.open_opts.read_only;
+            let repair_wal = self.open_opts.repair_wal && may_repair;
+            // Explicit reborrow so the loop can rebind `db` on every iteration
+            // without moving `self` (a move would prevent a second iteration).
+            let db = &mut *self;
+            db.wal_horizon_floor = db.fs.read_horizon_floor()?;
+            db.archive_genesis_chain = db.fs.has_genesis_marker();
+            // Opening cleanup: remove orphaned archives — archives whose frames all
+            // fall below the horizon floor.  Orphans arise when a crash interrupted
+            // the retention-prune sequence after the floor was written but before
+            // all surplus archives were deleted.  Safe to delete: floor already
+            // accounts for their frames.
+            if may_repair {
+                db.cleanup_orphaned_archives()?;
+            }
+            let _t0 = std::time::Instant::now();
+            // Peek 6 bytes to determine snapshot version without reading the full
+            // file. For RealFs this is a true partial read (O(1)); for SimFs the
+            // default impl reads all bytes and truncates (still correct).
+            let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+            // V8, V9 and V10 share the mmap-able container; V9 only adds section 12
+            // and V10 adds nothing but its version stamp. A version outside that set
+            // falls through to the full-read path below, where `snapshot::decode`
+            // either handles it (V5–V7) or refuses it by name — which is what stops
+            // an older binary before it reaches the WAL.
+            let is_v8 = snap_header.len() >= 6
+                && &snap_header[0..4] == b"GDB1"
+                && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
+                    snap_header[4],
+                    snap_header[5],
+                ]));
+            // The version this store is stamped with, or `None` when it has never
+            // been snapshotted. Read from the same six bytes, with no second read.
+            let snapshot_version = if snap_header.len() >= 6 && &snap_header[0..4] == b"GDB1" {
+                Some(u16::from_le_bytes([snap_header[4], snap_header[5]]))
+            } else {
+                None
+            };
+            // A V11 snapshot is the store's own word that it has opted in (C9);
+            // the replay below finds the same from any V11-only record it meets.
+            if snapshot_version.is_some_and(|v| v >= core_storage::snapshot::VERSION_11) {
+                db.v11_features = true;
+            }
+            // The declarations a V11 snapshot carries itself (section 18), applied
+            // at the `held` boundary of the replay below — the point of the WAL
+            // the snapshot was taken at. `None` for every earlier snapshot.
+            let mut snapshot_declarations = None;
+            // No snapshot means no snapshot has ever truncated the WAL, so this
+            // handle can prove the history is whole. Once a snapshot exists that
+            // this handle did not take, it cannot: see `snapshot_preserved_history`.
+            db.snapshot_preserved_history = snap_header.is_empty();
+            if is_v8 {
+                // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
+                // No 2.4GB heap Vec is allocated on RealFs.
+                let mapped = Arc::new(
+                    if let Some(snap_path) = db.fs.snapshot_path() {
+                        core_storage::v8::MappedBase::map(&snap_path)
+                    } else {
+                        let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                        core_storage::v8::MappedBase::from_bytes(snap_bytes)
+                    }
+                    .map_err(|e| GraphError::Corrupt {
+                        detail: format!("v8: mmap open: {e:?}"),
+                    })?,
+                );
+                db.restore_v8_base(Arc::clone(&mapped))?;
+                trace_open!("restore_v8_base", _t0);
+                db.base = Some(mapped);
+                trace_open!("base assigned", _t0);
+                // Only a snapshot from a writer that could leave a deleted node's
+                // edges behind is searched for them.
+                if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
+                    db.drop_edges_of_retired_nodes();
+                }
+                // Only a snapshot whose state has not had the lost-provenance
+                // repair is repaired at the first write (ledger rows 111, 113).
+                if db.base.as_ref().is_some_and(|base| base.prov_reconciled()) {
+                    db.engine.mark_lost_provenance_reconciled();
+                }
+                db.load_fulltext_from_base();
+                trace_open!("full-text index read from the snapshot", _t0);
+                snapshot_declarations = db
+                    .base
+                    .as_ref()
+                    .map(|b| b.declarations())
+                    .transpose()?
+                    .flatten();
+            } else if !snap_header.is_empty() {
+                // Legacy V5-V7: full read required for decode.
+                let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                    db.restore_snapshot_state(state)?;
+                }
+            }
+            // else: snap_header is empty = no snapshot file, fresh store. A store
+            // with no snapshot has nothing for the lost-provenance repair to find.
+            if snap_header.is_empty() {
                 db.engine.mark_lost_provenance_reconciled();
             }
-            db.load_fulltext_from_base();
-            trace_open!("full-text index read from the snapshot", _t0);
-            snapshot_declarations = db
+            //
+            // Seed commit_seq from the highest seq persisted in last_change so that
+            // WAL-replay frames (which start at commit_seq+1) always exceed any seq
+            // already stored in the snapshot.  Without this, a db with one snapshot
+            // commit would save last_change["a"]=1, then on reopen the first WAL
+            // frame would replay at seq=1 again — colliding and making WAL-tail
+            // mutations indistinguishable from the snapshot baseline.
+            //
+            // Safety invariant (seq-recycling):
+            //   Recycled seqs (those below the seeded baseline) were NEVER stored in
+            //   last_change because they belonged to a previous db lifetime — a new
+            //   db starts at commit_seq=0 with an empty last_change.  Therefore no
+            //   CAS precondition can carry a recycled seq as its `expected` value
+            //   and accidentally match a live node's last_change entry.
+            //
+            // `expected:0` on a deleted-then-reinserted node:
+            //   After deletion, last_changed() returns None; callers that call
+            //   last_changed() and then use NodeUnchangedSince get None.unwrap_or(0)
+            //   = 0.  The reinserted node gets seq > 0, so a subsequent CAS with
+            //   expected=0 correctly conflicts.  The only way to observe actual=0 in
+            //   a CasConflict would be a caller that invented expected=0 without ever
+            //   calling last_changed() — unreachable via the documented API contract.
+            if let Some(&max_seq) = db.last_change.values().max() {
+                db.commit_seq = db.commit_seq.max(max_seq);
+            }
+            // Taken before the read: a file replaced between the two then reads
+            // as a different identity later, which reloads — the safe direction.
+            db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
+            let bytes = db.fs.read(FileId::Wal)?;
+            let (records, valid_len) = decode_all(&bytes);
+            // The valid prefix is replayed either way; `repair_wal` only decides
+            // whether the truncation is written back. A reader that races a live
+            // appender must not persist a truncation the writer never asked for.
+            if valid_len < bytes.len() && repair_wal {
+                db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+                db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
+            }
+            // WAL-present path: build indexes eagerly BEFORE replay so that the
+            // first replayed record does not trigger the lazy-init guard (which
+            // would call reindex_all_load_state on an empty graph, defeating the
+            // point of restoring IVF/HNSW blobs from the snapshot).
+            if !records.is_empty() {
+                db.ensure_v8_base_sections_loaded();
+                trace_open!("lazy sections loaded (WAL path)", _t0);
+            }
+            // Scoped to this call: `refresh()` also replays frames and is *not*
+            // followed by a rebuild, so its backfill must still run.
+            //
+            // And only when a rebuild does follow. An index read from the snapshot
+            // is kept, so a pair declared after that snapshot is indexed by its
+            // own backfill or not at all.
+            // Every decoded frame occupies an index, replayed or not: markers
+            // are state no-ops but they are not index no-ops.
+            let decoded_frames = records.len() as u64;
+            // A snapshot that kept its WAL says how much of it it already holds.
+            // Those frames are counted, and not applied a second time.
+            //
+            // So does the intent of a snapshot that was to replace its WAL and
+            // did not get that far: the same state, reached by a crash.
+            let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes)?;
+            // An intent that is not about this snapshot and this WAL is left over
+            // from a snapshot that finished, or never wrote its snapshot. It has
+            // to go before this handle appends: once new frames follow, a WAL can
+            // come to begin with the bytes an old intent names. It goes at the
+            // first append and not here, because only an appender holds the write
+            // lock, and a handle without it may be looking at a peer's snapshot
+            // half way through.
+            db.intent_unsettled = intent_left_over;
+            let held = db
                 .base
                 .as_ref()
-                .map(|b| b.declarations())
-                .transpose()?
-                .flatten();
-        } else if !snap_header.is_empty() {
-            // Legacy V5-V7: full read required for decode.
-            let snap_bytes = db.fs.read(FileId::Snapshot)?;
-            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-                db.restore_snapshot_state(state)?;
+                .and_then(|base| base.wal_mark())
+                .or(interrupted)
+                .filter(|mark| mark.matches(&bytes))
+                .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
+                // The mark was taken at the end of a whole WAL, so it ends on a
+                // frame boundary; one that does not is not this WAL's.
+                .filter(|(len, (_, consumed))| consumed == len)
+                .map(|(_, (held, _))| held.len());
+            let marked_wal_is_here = held.is_some();
+            let held = held.unwrap_or(0);
+            // A snapshot that kept its WAL has its index read on the strength of
+            // its mark. If the WAL beside it is not the one marked — it lost its
+            // tail, or was repaired shorter — the whole of it replays over the
+            // snapshot, and what that produces is not what the index was read
+            // for: a replayed insert can relabel a node and leave a posting under
+            // a field its new label does not index. The index is set aside and
+            // built after the replay, as it was before it could be read.
+            if db.fulltext_loaded && !db.base_wal_truncated && !marked_wal_is_here {
+                db.fulltext = Arc::new(core_storage::fulltext::FulltextIndex::new());
+                db.fulltext_loaded = false;
             }
-        }
-        // else: snap_header is empty = no snapshot file, fresh store. A store
-        // with no snapshot has nothing for the lost-provenance repair to find.
-        if snap_header.is_empty() {
-            db.engine.mark_lost_provenance_reconciled();
-        }
-        //
-        // Seed commit_seq from the highest seq persisted in last_change so that
-        // WAL-replay frames (which start at commit_seq+1) always exceed any seq
-        // already stored in the snapshot.  Without this, a db with one snapshot
-        // commit would save last_change["a"]=1, then on reopen the first WAL
-        // frame would replay at seq=1 again — colliding and making WAL-tail
-        // mutations indistinguishable from the snapshot baseline.
-        //
-        // Safety invariant (seq-recycling):
-        //   Recycled seqs (those below the seeded baseline) were NEVER stored in
-        //   last_change because they belonged to a previous db lifetime — a new
-        //   db starts at commit_seq=0 with an empty last_change.  Therefore no
-        //   CAS precondition can carry a recycled seq as its `expected` value
-        //   and accidentally match a live node's last_change entry.
-        //
-        // `expected:0` on a deleted-then-reinserted node:
-        //   After deletion, last_changed() returns None; callers that call
-        //   last_changed() and then use NodeUnchangedSince get None.unwrap_or(0)
-        //   = 0.  The reinserted node gets seq > 0, so a subsequent CAS with
-        //   expected=0 correctly conflicts.  The only way to observe actual=0 in
-        //   a CasConflict would be a caller that invented expected=0 without ever
-        //   calling last_changed() — unreachable via the documented API contract.
-        if let Some(&max_seq) = db.last_change.values().max() {
-            db.commit_seq = db.commit_seq.max(max_seq);
-        }
-        // Taken before the read: a file replaced between the two then reads
-        // as a different identity later, which reloads — the safe direction.
-        db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
-        let bytes = db.fs.read(FileId::Wal)?;
-        let (records, valid_len) = decode_all(&bytes);
-        // The valid prefix is replayed either way; `repair_wal` only decides
-        // whether the truncation is written back. A reader that races a live
-        // appender must not persist a truncation the writer never asked for.
-        if valid_len < bytes.len() && repair_wal {
-            db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
-            db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
-        }
-        // WAL-present path: build indexes eagerly BEFORE replay so that the
-        // first replayed record does not trigger the lazy-init guard (which
-        // would call reindex_all_load_state on an empty graph, defeating the
-        // point of restoring IVF/HNSW blobs from the snapshot).
-        if !records.is_empty() {
-            db.ensure_v8_base_sections_loaded();
-            trace_open!("lazy sections loaded (WAL path)", _t0);
-        }
-        // Scoped to this call: `refresh()` also replays frames and is *not*
-        // followed by a rebuild, so its backfill must still run.
-        //
-        // And only when a rebuild does follow. An index read from the snapshot
-        // is kept, so a pair declared after that snapshot is indexed by its
-        // own backfill or not at all.
-        // Every decoded frame occupies an index, replayed or not: markers
-        // are state no-ops but they are not index no-ops.
-        let decoded_frames = records.len() as u64;
-        // A snapshot that kept its WAL says how much of it it already holds.
-        // Those frames are counted, and not applied a second time.
-        //
-        // So does the intent of a snapshot that was to replace its WAL and
-        // did not get that far: the same state, reached by a crash.
-        let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes)?;
-        // An intent that is not about this snapshot and this WAL is left over
-        // from a snapshot that finished, or never wrote its snapshot. It has
-        // to go before this handle appends: once new frames follow, a WAL can
-        // come to begin with the bytes an old intent names. It goes at the
-        // first append and not here, because only an appender holds the write
-        // lock, and a handle without it may be looking at a peer's snapshot
-        // half way through.
-        db.intent_unsettled = intent_left_over;
-        let held = db
-            .base
-            .as_ref()
-            .and_then(|base| base.wal_mark())
-            .or(interrupted)
-            .filter(|mark| mark.matches(&bytes))
-            .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
-            // The mark was taken at the end of a whole WAL, so it ends on a
-            // frame boundary; one that does not is not this WAL's.
-            .filter(|(len, (_, consumed))| consumed == len)
-            .map(|(_, (held, _))| held.len());
-        let marked_wal_is_here = held.is_some();
-        let held = held.unwrap_or(0);
-        // A snapshot that kept its WAL has its index read on the strength of
-        // its mark. If the WAL beside it is not the one marked — it lost its
-        // tail, or was repaired shorter — the whole of it replays over the
-        // snapshot, and what that produces is not what the index was read
-        // for: a replayed insert can relabel a node and leave a posting under
-        // a field its new label does not index. The index is set aside and
-        // built after the replay, as it was before it could be read.
-        if db.fulltext_loaded && !db.base_wal_truncated && !marked_wal_is_here {
-            db.fulltext = Arc::new(core_storage::fulltext::FulltextIndex::new());
-            db.fulltext_loaded = false;
-        }
-        db.fulltext_rebuild_follows = !db.fulltext_loaded;
-        db.fulltext_reindexed_a_node = false;
-        db.replaying_at_open = true;
-        // The declarations a V11 snapshot carries (section 18) are the state at
-        // the point of the WAL the snapshot was taken at, so they are applied
-        // there: after the `held` frames, before the first frame the snapshot
-        // does not hold. Earlier would let a held declaration that was later
-        // replaced be skipped as already declared, and the reopened store
-        // would differ from the never-closed one. For a WAL that was replaced
-        // (`held == 0`) the WAL repeats them as its baseline, and for one
-        // archived away before its baseline was written they are all there is.
-        // A declaration is never checked against the data.
-        let section_recs = snapshot_declarations
-            .as_ref()
-            .map(declarations_as_records)
-            .unwrap_or_default();
-        let replayed = db.apply_frames_at(records, held, section_recs);
-        db.fulltext_rebuild_follows = false;
-        db.replaying_at_open = false;
-        let replayed = replayed?;
-        // ── The multiplicity declaration, recovered from the stamp ───────────
-        //
-        // The opt-in is re-emitted into every baseline WAL a snapshot writes, so
-        // ordinarily the replay above has already found it. But
-        // `snapshot_with(archive_wal)` renames the live WAL away and writes its
-        // replacement afterwards, and between those two points the store holds
-        // no live declaration at all. A crash there — or a single `Err` from any
-        // call in between — used to opt the store back out on the next open
-        // (defect #22): it would stop counting and write a **V9** snapshot while
-        // the archives still carried discriminant 23, which is the exact state
-        // the V10 stamp exists to prevent.
-        //
-        // The V10 stamp is what carries the conclusion. The archive clause is a
-        // scope restriction, not a second proof — an earlier version of this
-        // comment, and defect #22, claimed otherwise, and defect #33 corrects
-        // it. Taking the two in order:
-        //
-        // **The stamp.** `snapshot_with` stamps the snapshot from
-        // `self.multiplicity` *before* it touches the WAL, and nothing rewrites
-        // a V10 snapshot at V9 while the store believes it is opted in. So a
-        // V10 stamp says this store reached `enable_multiplicity` far enough to
-        // write the snapshot — and, decisively, that every older binary already
-        // refuses this store by name. Opting in here can cost such a reader
-        // nothing it was not already being told.
-        //
-        // **What the archive clause does not prove.** It is *not* evidence that
-        // the archive was taken while the store was opted in. A store can
-        // archive at V9 and opt in afterwards, leaving a V10 snapshot standing
-        // beside an archive whose WAL carries no declaration at all — see
-        // `a_failed_opt_in_beside_an_archive_comes_back_opted_in`. The inference
-        // held in the success case by coincidence, not by construction.
-        //
-        // **What it does buy: scope.** Without it the recovery would also fire
-        // on a store that reached the V10 snapshot write and then failed with no
-        // archive in sight. That store must stay opted out, and can: no WAL was
-        // renamed away, nothing carries discriminant 23, and its next snapshot
-        // rewrites at V9, which puts it back within reach of every older reader.
-        // An archive is the marker for the one state that is not recoverable
-        // that way — a WAL renamed away that may hold the only copy of the
-        // declaration. `no_crash_leaves_discriminant_23_unguarded` pins that
-        // line: it sweeps a workload with no archives at all and refuses a
-        // V10-implies-enabled rule.
-        //
-        // **The invariant, whichever way the clause goes:** the recovery never
-        // opts in a store whose snapshot is not V10. A V9 store has made no
-        // promise to an older reader, so opting it in would start writing
-        // discriminant 23 behind a stamp that does not guard it. Pinned by
-        // `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` and
-        // `the_recovery_does_not_opt_a_store_in_by_itself`.
-        //
-        // What this recovery cannot do is make the opt-in atomic; it is not,
-        // and `enable_multiplicity` says so. See defects #32-#34.
-        //
-        // A V11 store says it in section 18 rather than with its version: V11
-        // is above V10, and a store with any V11 feature writes V11 whether it
-        // counts multiplicity or not. The section's flag is written from the
-        // same `self.multiplicity` the V10 stamp is, so it carries exactly the
-        // fact the stamp did, and the recovery is the same one.
-        let stamped_multiplicity = snapshot_version == Some(core_storage::snapshot::VERSION_10)
-            || snapshot_declarations
+            db.fulltext_rebuild_follows = !db.fulltext_loaded;
+            db.fulltext_reindexed_a_node = false;
+            db.replaying_at_open = true;
+            // The declarations a V11 snapshot carries (section 18) are the state at
+            // the point of the WAL the snapshot was taken at, so they are applied
+            // there: after the `held` frames, before the first frame the snapshot
+            // does not hold. Earlier would let a held declaration that was later
+            // replaced be skipped as already declared, and the reopened store
+            // would differ from the never-closed one. For a WAL that was replaced
+            // (`held == 0`) the WAL repeats them as its baseline, and for one
+            // archived away before its baseline was written they are all there is.
+            // A declaration is never checked against the data.
+            let section_recs = snapshot_declarations
                 .as_ref()
-                .is_some_and(|d: &core_storage::v8::SnapshotDeclarations| d.multiplicity);
-        if !db.multiplicity && stamped_multiplicity && !db.fs.list_archives()?.is_empty() {
-            db.multiplicity = true;
-        }
-        // The cursor sits at the end of the valid prefix, not the end of the
-        // file: a torn or still-being-written tail is unconsumed by definition
-        // and stays visible to `is_stale` until it decodes.
-        db.wal_consumed = valid_len as u64;
-        // The frame cursor counts the same sequence `all_frames` returns:
-        // surviving archives first, then the live WAL, offset by the floor.
-        // Counting the archives separately rather than calling
-        // `wal_total_commits` keeps the live WAL from being decoded twice on
-        // every open, and costs nothing on a store that has never archived.
-        db.wal_frames_written = db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
-        db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
-        // What was just replayed is not this handle's fsync to vouch for: a
-        // reader of the durable position fsyncs it once before counting it.
-        db.durable_wal.loaded(
-            db.snapshot_ident,
-            db.wal_ident,
-            db.wal_frames_written - decoded_frames,
-            db.wal_consumed,
-            db.wal_frames_written,
-        );
-        trace_open!("wal replay done", _t0);
-        // Rebuild view values after WAL replay only when there is no V8 base.
-        // With a V8 base, view values are correct in the snapshot and are updated
-        // incrementally during WAL replay (on_edge_changed / on_prop_changed).
-        // A full rebuild would read overlay-only props (empty after restore_v8_base)
-        // and overwrite correct base values with wrong results (e.g. NeighborAgg
-        // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
-        // base value).
-        if db.base.is_none() {
-            let topo_view = TopologyView::owned(&db.topo);
-            db.view_store.rebuild_all(
-                Arc::make_mut(&mut db.props),
-                &topo_view,
-                &db.ids,
-                &db.syms,
-                &db.labels,
+                .map(declarations_as_records)
+                .unwrap_or_default();
+            let replayed = db.apply_frames_at(records, held, section_recs);
+            db.fulltext_rebuild_follows = false;
+            db.replaying_at_open = false;
+            let replayed = replayed?;
+            // ── The multiplicity declaration, recovered from the stamp ───────────
+            //
+            // The opt-in is re-emitted into every baseline WAL a snapshot writes, so
+            // ordinarily the replay above has already found it. But
+            // `snapshot_with(archive_wal)` renames the live WAL away and writes its
+            // replacement afterwards, and between those two points the store holds
+            // no live declaration at all. A crash there — or a single `Err` from any
+            // call in between — used to opt the store back out on the next open
+            // (defect #22): it would stop counting and write a **V9** snapshot while
+            // the archives still carried discriminant 23, which is the exact state
+            // the V10 stamp exists to prevent.
+            //
+            // The V10 stamp is what carries the conclusion. The archive clause is a
+            // scope restriction, not a second proof — an earlier version of this
+            // comment, and defect #22, claimed otherwise, and defect #33 corrects
+            // it. Taking the two in order:
+            //
+            // **The stamp.** `snapshot_with` stamps the snapshot from
+            // `self.multiplicity` *before* it touches the WAL, and nothing rewrites
+            // a V10 snapshot at V9 while the store believes it is opted in. So a
+            // V10 stamp says this store reached `enable_multiplicity` far enough to
+            // write the snapshot — and, decisively, that every older binary already
+            // refuses this store by name. Opting in here can cost such a reader
+            // nothing it was not already being told.
+            //
+            // **What the archive clause does not prove.** It is *not* evidence that
+            // the archive was taken while the store was opted in. A store can
+            // archive at V9 and opt in afterwards, leaving a V10 snapshot standing
+            // beside an archive whose WAL carries no declaration at all — see
+            // `a_failed_opt_in_beside_an_archive_comes_back_opted_in`. The inference
+            // held in the success case by coincidence, not by construction.
+            //
+            // **What it does buy: scope.** Without it the recovery would also fire
+            // on a store that reached the V10 snapshot write and then failed with no
+            // archive in sight. That store must stay opted out, and can: no WAL was
+            // renamed away, nothing carries discriminant 23, and its next snapshot
+            // rewrites at V9, which puts it back within reach of every older reader.
+            // An archive is the marker for the one state that is not recoverable
+            // that way — a WAL renamed away that may hold the only copy of the
+            // declaration. `no_crash_leaves_discriminant_23_unguarded` pins that
+            // line: it sweeps a workload with no archives at all and refuses a
+            // V10-implies-enabled rule.
+            //
+            // **The invariant, whichever way the clause goes:** the recovery never
+            // opts in a store whose snapshot is not V10. A V9 store has made no
+            // promise to an older reader, so opting it in would start writing
+            // discriminant 23 behind a stamp that does not guard it. Pinned by
+            // `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` and
+            // `the_recovery_does_not_opt_a_store_in_by_itself`.
+            //
+            // What this recovery cannot do is make the opt-in atomic; it is not,
+            // and `enable_multiplicity` says so. See defects #32-#34.
+            //
+            // A V11 store says it in section 18 rather than with its version: V11
+            // is above V10, and a store with any V11 feature writes V11 whether it
+            // counts multiplicity or not. The section's flag is written from the
+            // same `self.multiplicity` the V10 stamp is, so it carries exactly the
+            // fact the stamp did, and the recovery is the same one.
+            let stamped_multiplicity = snapshot_version == Some(core_storage::snapshot::VERSION_10)
+                || snapshot_declarations
+                    .as_ref()
+                    .is_some_and(|d: &core_storage::v8::SnapshotDeclarations| d.multiplicity);
+            if !db.multiplicity && stamped_multiplicity && !db.fs.list_archives()?.is_empty() {
+                db.multiplicity = true;
+            }
+            // The cursor sits at the end of the valid prefix, not the end of the
+            // file: a torn or still-being-written tail is unconsumed by definition
+            // and stays visible to `is_stale` until it decodes.
+            db.wal_consumed = valid_len as u64;
+            // The frame cursor counts the same sequence `all_frames` returns:
+            // surviving archives first, then the live WAL, offset by the floor.
+            // Counting the archives separately rather than calling
+            // `wal_total_commits` keeps the live WAL from being decoded twice on
+            // every open, and costs nothing on a store that has never archived.
+            db.wal_frames_written =
+                db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
+            // Row 121 fix: recheck the snapshot identity now that the WAL replay is
+            // complete.  A mismatch means another process finished a WAL-replacing
+            // snapshot between our snapshot read and now, leaving us with mixed
+            // state.  The `db` reborrow is not used in the retry branch, so NLL
+            // ends it before `self.reset_for_reload()` at the top of the next
+            // iteration — no borrow-checker issue.
+            let after_snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
+            if after_snapshot_ident != before_snapshot_ident {
+                // The snapshot was replaced during this load attempt.  `db` is not
+                // used below this point in this branch; NLL releases the borrow of
+                // `self` here, allowing reset_for_reload() at the loop head.
+                if load_attempt + 1 < MAX_LOAD_ATTEMPTS {
+                    continue;
+                }
+                return Err(GraphError::Io(std::io::Error::other(
+                    "snapshot replaced on each of 3 consecutive load attempts; \
+                 the store is under continuous snapshot pressure or the \
+                 filesystem modification timestamp has insufficient resolution",
+                )));
+            }
+            // Identities match: the state we built is consistent with what is on
+            // disk.  Use the pre-read identity (equal to after_snapshot_ident)
+            // rather than issuing a third metadata call.
+            db.snapshot_ident = before_snapshot_ident;
+            // What was just replayed is not this handle's fsync to vouch for: a
+            // reader of the durable position fsyncs it once before counting it.
+            db.durable_wal.loaded(
+                db.snapshot_ident,
+                db.wal_ident,
+                db.wal_frames_written - decoded_frames,
+                db.wal_consumed,
+                db.wal_frames_written,
             );
-        }
-        // The full-text index after WAL replay. One read from the snapshot has
-        // had the replay applied to it record by record and is kept — unless
-        // the replay indexed a node the snapshot already held, which doubles
-        // that node's postings. Then, and wherever no index was read, it is
-        // built from the declared pairs and the stored values.
-        db.fulltext_loaded = db.fulltext_loaded && !db.fulltext_reindexed_a_node;
-        if db.fulltext_loaded {
-            #[cfg(debug_assertions)]
-            {
-                let mut rebuilt = (*db.fulltext).clone();
-                rebuilt.rebuild_all(
+            trace_open!("wal replay done", _t0);
+            // Rebuild view values after WAL replay only when there is no V8 base.
+            // With a V8 base, view values are correct in the snapshot and are updated
+            // incrementally during WAL replay (on_edge_changed / on_prop_changed).
+            // A full rebuild would read overlay-only props (empty after restore_v8_base)
+            // and overwrite correct base values with wrong results (e.g. NeighborAgg
+            // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
+            // base value).
+            if db.base.is_none() {
+                let topo_view = TopologyView::owned(&db.topo);
+                db.view_store.rebuild_all(
+                    Arc::make_mut(&mut db.props),
+                    &topo_view,
+                    &db.ids,
+                    &db.syms,
+                    &db.labels,
+                );
+            }
+            // The full-text index after WAL replay. One read from the snapshot has
+            // had the replay applied to it record by record and is kept — unless
+            // the replay indexed a node the snapshot already held, which doubles
+            // that node's postings. Then, and wherever no index was read, it is
+            // built from the declared pairs and the stored values.
+            db.fulltext_loaded = db.fulltext_loaded && !db.fulltext_reindexed_a_node;
+            if db.fulltext_loaded {
+                #[cfg(debug_assertions)]
+                {
+                    let mut rebuilt = (*db.fulltext).clone();
+                    rebuilt.rebuild_all(
+                        &db.ids,
+                        &db.labels,
+                        &db.syms,
+                        build_props_view(&db.props, &db.base),
+                    );
+                    debug_assert!(
+                        rebuilt == *db.fulltext,
+                        "the full-text index read from the snapshot is not the one a rebuild gives"
+                    );
+                }
+            } else {
+                Arc::make_mut(&mut db.fulltext).rebuild_all(
                     &db.ids,
                     &db.labels,
                     &db.syms,
                     build_props_view(&db.props, &db.base),
                 );
-                debug_assert!(
-                    rebuilt == *db.fulltext,
-                    "the full-text index read from the snapshot is not the one a rebuild gives"
-                );
             }
-        } else {
-            Arc::make_mut(&mut db.fulltext).rebuild_all(
+            trace_open!("full-text index ready", _t0);
+            db.drop_indexes_over_view_properties();
+            Arc::make_mut(&mut db.prop_index).rebuild_all(
                 &db.ids,
                 &db.labels,
                 &db.syms,
                 build_props_view(&db.props, &db.base),
             );
-        }
-        trace_open!("full-text index ready", _t0);
-        db.drop_indexes_over_view_properties();
-        Arc::make_mut(&mut db.prop_index).rebuild_all(
-            &db.ids,
-            &db.labels,
-            &db.syms,
-            build_props_view(&db.props, &db.base),
-        );
-        // Namespaces: one pass over the `ns` column, after the snapshot is
-        // restored and the WAL replayed. Replay maintains `node_ns` record by
-        // record as well; this pass is what makes a snapshot-only open right,
-        // and it reads nothing on a store with no `ns` column.
-        db.rebuild_node_ns();
-        // A mid-build snapshot's HNSW blob carries `complete == false`.
-        // Register it so `serve`'s ticker sees work without waiting for a write.
-        db.register_outstanding_index_builds();
-        // Load roles sidecar. Missing file = no roles (Some(vec![])).
-        // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
-        db.roles = Self::load_roles_from_fs(&db.fs)?;
-        // The time sidecar. Absent is the normal case for any store written
-        // before v0.6.11 and is not an error; unreadable is recorded so date
-        // queries can say "damaged" rather than "none recorded".
-        db.load_commit_times_from_fs();
-        // Capture the initial MVCC fold so reader() is ready immediately.
-        db.fold_now();
-        trace_open!("open_with complete", _t0);
-        Ok(replayed)
+            // Namespaces: one pass over the `ns` column, after the snapshot is
+            // restored and the WAL replayed. Replay maintains `node_ns` record by
+            // record as well; this pass is what makes a snapshot-only open right,
+            // and it reads nothing on a store with no `ns` column.
+            db.rebuild_node_ns();
+            // A mid-build snapshot's HNSW blob carries `complete == false`.
+            // Register it so `serve`'s ticker sees work without waiting for a write.
+            db.register_outstanding_index_builds();
+            // Load roles sidecar. Missing file = no roles (Some(vec![])).
+            // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
+            db.roles = Self::load_roles_from_fs(&db.fs)?;
+            // The time sidecar. Absent is the normal case for any store written
+            // before v0.6.11 and is not an error; unreadable is recorded so date
+            // queries can say "damaged" rather than "none recorded".
+            db.load_commit_times_from_fs();
+            // Capture the initial MVCC fold so reader() is ready immediately.
+            db.fold_now();
+            trace_open!("open_with complete", _t0);
+            // The retry loop started above; this is the success exit for one
+            // attempt.  `return` exits the function directly.
+            return Ok(replayed);
+        } // end for load_attempt
+          // Unreachable: the loop's exhausted-attempts case returns an Err above.
+        #[allow(unreachable_code)]
+        Err(GraphError::Io(std::io::Error::other(
+            "load_from_disk: unreachable exhaustion path",
+        )))
     }
 
     /// Apply decoded WAL frames to in-memory state, exactly as the open-path

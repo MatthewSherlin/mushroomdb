@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.2
+
+### Fixed
+
+- **A snapshot replaced between the snapshot read and the WAL read in `load_from_disk` no longer
+  leaves the handle with mixed state.** Previously, `load_from_disk` captured `snapshot_ident`
+  after WAL replay. A peer that completed a WAL-replacing snapshot in between left the handle
+  holding the old snapshot's data under the new snapshot's identity, invisibly — no staleness
+  check or refresh could tell. The fix captures the identity before any read, rechecks it after
+  the replay, and resets and retries (up to three attempts) on a mismatch. Present in released
+  0.9.x and 0.10.x (row 121).
+
 ## v0.10.1 — aggregates and mixed-type ordering are right, and commits cost less on Linux
 
 ### Performance
@@ -51,7 +63,7 @@ See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
 - **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
 - **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
 
-Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 101, 120, 121, 122, 136, 137, 140, 142, 152, 155, 156 and 159 stay deferred.
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Row 121 closed in 0.10.2. Rows 101, 120, 122, 136, 137, 140, 142, 152, 155, 156 and 159 stay deferred.
 
 ### Deprecated
 

@@ -132,7 +132,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 118 | Medium — performance, present in released 0.9.2 | `ingest` and `write_batch` are quadratic in the batch size: validating each node insert walked every entry the batch had already recorded (`MutPreview::note_insert_node`, `retain` over the whole overlay), and `note_delete_node` and the rename migration did the same. 100,000 nodes in 50,000-row batches took 41 s (2.4k nodes/s); 200,000 nodes at `--batch-size` 500/2,000/10,000 took 7.6/4.6/12.9 s. Found by the first throughput run of `mushroomdb import` | **CLOSED** in 0.10 |
 | 119 | Low, present in released 0.9.x | A snapshot of a store that has never committed fails: `snapshot_with` with `archive_wal` (the default of `mushroomdb snapshot` and of every automatic snapshot) renamed a `wal.bin` that does not exist, after writing `snapshot.intent`, so `mushroomdb snapshot <fresh-dir>` exits "No such file or directory" and leaves the intent behind | **CLOSED** in 0.10 |
 | 120 | Low | CSV import: relationship property columns are not supported. Edges carry no user properties in the engine, so `mushroomdb import` refuses a relationships file with a property column rather than dropping the values. The engine half is done in 0.10: QL-RP gives edges user properties in the write path and the WAL (`SetEdgePropId` / `RemoveEdgePropId`, V11 records 28 and 29, written by Cypher `CREATE`/`MERGE` maps and `SET`/`REMOVE r.p`). The import still refuses the columns: mapping them onto those records, and carrying them in the JSONL export, is what remains | **DEFERRED** to 0.11 (import columns only; engine half closed in 0.10 by QL-RP) |
-| 121 | Medium, present in released 0.9.x | `load_from_disk` reads `snapshot.bin` first but takes `snapshot_ident` only after the WAL replay (db.rs, after `wal_frames_written` is set). A peer that completes both renames of a WAL-replacing snapshot in between leaves the handle with the old snapshot's state plus the new snapshot's baseline WAL, recorded under the new identities, and no later staleness check or refresh can tell. The 0.10 WAL-file identity check (HO-07) does not close it, since that identity is also taken after the rename. Found by the second re-review of HO-07. Owner: engine follow-up | **DEFERRED** to 0.11 |
+| 121 | Medium, present in released 0.9.x | `load_from_disk` reads `snapshot.bin` first but takes `snapshot_ident` only after the WAL replay (db.rs, after `wal_frames_written` is set). A peer that completes both renames of a WAL-replacing snapshot in between leaves the handle with the old snapshot's state plus the new snapshot's baseline WAL, recorded under the new identities, and no later staleness check or refresh can tell. The 0.10 WAL-file identity check (HO-07) does not close it, since that identity is also taken after the rename. Found by the second re-review of HO-07. Owner: engine follow-up | **CLOSED** in 0.10.2 |
 | 122 | Medium, present in released 0.9.x, non-Unix only | On Windows and other non-Unix platforms there is no WAL-file identity: `file_ident` returns `None` (core-storage/src/fs.rs), so `refresh_checking(true)` in `enter_write_scope` compares `None` with `None`. A peer that replaces `wal.bin` with a file of exactly this handle's cursor length, with the snapshot unchanged, is invisible to the length checks; the handle's next write appends frames encoded against the old file, and the store then fails to open (`Corrupt`). Unix is covered by the HO-07 inode check. Found by the fourth re-review of HO-07. Owner: engine follow-up; fix is a platform identity (Windows file index via `GetFileInformationByHandle`) | **DEFERRED** — target release not yet set |
 | 123 | Medium | An equality index (`enable_index`) over a property a view owns answers from stale postings until the next open: a view writes its property inside `apply` without passing `prop_index`, so with a Degree view `deg` on `User`, `MATCH (n:User) WHERE n.deg = 1` returns 0 rows live and 1 after a reopen. A range index over a view property is refused both ways (0.10 TY-8), and so is a unique constraint (TY-5); the equality index was not. Found by TY-8 | **CLOSED** in 0.10 (TY-5b) |
 | 124 | Medium, present in released 0.9.x | The lock-free reader answers a weighted rule's edge score as `null` for every score written since its last fold: a rule writes `weight_prop` straight into the edge-property overlay with no WAL record, and `CommitDelta` carried no edge properties. Reached through role-token `POST /query` and the public `SharedDb::reader()` / `ReaderSnapshot::query`. Found by TX-5's e2e run | **CLOSED** in 0.10 |
@@ -3608,7 +3608,7 @@ rule's weights already were (the edge-property overlay, snapshot section 5). Wha
 remains for 0.11 is the import mapping property columns onto those ops, and the
 JSONL export carrying them.
 
-## 121. A reload can mix two snapshots' state under the newer identities — DEFERRED to 0.11
+## 121. A reload can mix two snapshots' state under the newer identities — CLOSED
 
 Found on 2026-10-20 by the second re-review of the 0.10 backup worker (HO-07). Present in
 released 0.9.x.
@@ -3623,7 +3623,27 @@ mixed until the next snapshot changes the identity again.
 The WAL-file identity that HO-07 added to `refresh` does not close this, because that identity is
 also taken after the rename. The fix is to take the snapshot's identity from the file actually
 read, before reading it, and to re-check it after the replay, reloading when it moved. That is an
-engine follow-up, outside the backup unit that found it. 0.10 shipped without it. It is deferred to 0.11.
+engine follow-up, outside the backup unit that found it. 0.10 shipped without it.
+
+**Closed, 0.10.2.** `load_from_disk` now captures `snapshot_ident` before any read and rechecks
+it after the WAL replay (both via `fs.snapshot_ident()`). A mismatch resets in-memory state and
+retries — up to three attempts — using the same `reset_for_reload` path that `refresh` uses. The
+bound fails closed: all attempts exhausted returns an `Io` error, not mixed state. Known limit: a
+store under continuous snapshot pressure (large store, aggressive snapshot schedule) can exhaust
+all attempts; a long-lived handle that hits this via `refresh` is then degraded until reopened.
+The fix costs two extra metadata calls (no file reads) per `load_from_disk` invocation; the open
+performance gate passes. On non-Unix platforms `snapshot_ident` uses `(len, mtime_nanos)` rather
+than an inode, so an equal-length replacement within a mtime quantum would go undetected, the same
+limitation as the existing staleness check; this does not worsen row 122. Tests in
+`crates/core-api/tests/snapshot.rs`:
+`a_snapshot_replaced_during_load_is_detected_and_reloaded` — an `InterceptWalIdent` Fs wrapper
+fires on the first `wal_ident()` call, replacing both files via atomic rename; asserts both nodes
+visible after open and `refresh()` returns 0 new frames.
+`a_snapshot_replaced_on_every_load_attempt_returns_an_error` — the hook fires on every
+`wal_ident()` call, exhausting all three attempts; asserts the `Io` error on open and that a fresh
+open then reads the correct (latest) state.
+`a_snapshot_replaced_on_every_reload_attempt_degrades_the_handle` — same exhaustion through
+`refresh`; asserts the handle is degraded and a fresh open then reads the correct state.
 
 ## 122. On non-Unix platforms an equal-length WAL replacement followed by a write leaves a store that does not open — DEFERRED, target not yet set
 

@@ -2107,6 +2107,14 @@ handle's state. The handle detects this by the snapshot file's identity changing
 and rebuilds itself from disk with the options it was opened with, which is
 transparent to the caller apart from taking longer.
 
+The reload is guarded against the race where a second snapshot completes between
+the first snapshot read and the identity capture: the load makes up to three
+attempts on a mismatch, failing closed with an error rather than returning mixed
+state. A store under continuous snapshot pressure (large store, aggressive
+snapshot schedule) can exhaust all attempts. A long-lived handle that hits this
+via `refresh` is then degraded and returns an error on every subsequent write
+until it is reopened.
+
 Nothing is written during a refresh, so a read-only handle can refresh freely.
 
 `is_stale()` answers the same question without doing the work. It costs two
