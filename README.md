@@ -51,6 +51,36 @@ mushroomdb explain — person-01 ↔ proj-01: 2 relationship(s)
 `demo` writes 60 nodes and seven rules. Nobody inserted either of those edges: the rules derived
 them, and each one says which rule, at what score, on which values.
 
+## Same question, two answers
+
+An AI assistant should only retrieve what the person asking may see. Bind the role to the handle,
+and vector search and graph walks both obey it, so your app has no filtering step to forget:
+
+```python
+support = db.scoped(role="support")
+finance = db.scoped(role="finance")
+
+support.find_similar("embedding", question_vector)   # never returns the restricted documents
+finance.find_similar("embedding", question_vector)   # may
+```
+
+```text
+support asks: Why is the Acme renewal at risk?
+  [postmortem] Postmortem: the billing outage delayed the Acme renewal invoices.
+  [runbook] Runbook: how to replay failed invoices after a billing outage.
+
+finance asks: Why is the Acme renewal at risk?
+  [contract-dispute] Legal is disputing the liability cap, so the Acme renewal is at risk.
+  [postmortem] Postmortem: the billing outage delayed the Acme renewal invoices.
+  [runbook] Runbook: how to replay failed invoices after a billing outage.
+```
+
+Revoke a document with one write and the next read no longer returns it. The whole script runs
+offline with no API keys: [`examples/permissioned-assistant`](examples/permissioned-assistant).
+
+Not building with AI? [`examples/team-matching`](examples/team-matching) matches people to projects
+with one rule, using the same engine.
+
 ## Run it as a server
 
 The Docker image starts HTTP on port 8080. A non-loopback bind requires a token:
