@@ -218,14 +218,15 @@ kubectl apply -f deploy/k8s/statefulset.yaml
 ## How CI checks the templates and the backup
 
 The `hosting-templates` workflow (`.github/workflows/hosting-templates.yml`)
-runs on every push and pull request into `main` and `release/**`.
+runs on every push to `main` and every pull request into `main` or `release/**`.
 
 | Job | Runs | What it checks |
 | --- | --- | --- |
-| `s3-backup` | Always | Every S3-gated test against a MinIO started in the job, then `scripts/minio-smoke-test.sh` |
+| `s3-backup` | Except on a docs-only pull request | Every S3-gated test against a MinIO started in the job, then `scripts/minio-smoke-test.sh` |
 | `fly-lint` | When `deploy/**`, the `Dockerfile` or the workflow change | `flyctl config validate --strict` on `deploy/fly/fly.toml`; a warning fails it too |
 | `k8s-lint` | Same | `kubeconform -strict` on `deploy/k8s/statefulset.yaml`, and `docker compose config` on the Compose file |
-| `docker-build` | On pushes that change the image's inputs | `docker build --no-cache`, with `--features tls` as the Dockerfile builds it. On pull requests, the `docker` job in `ci.yml` builds and runs the same Dockerfile |
+
+The `docker` job in `ci.yml` builds and runs the same Dockerfile.
 
 The S3-gated tests read `MUSHROOMDB_TEST_S3_ENDPOINT`. Without it each one
 prints `skipping the S3 test` and passes, which is why the main workflow,
