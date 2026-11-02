@@ -162,7 +162,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
           - os: ubuntu-latest
