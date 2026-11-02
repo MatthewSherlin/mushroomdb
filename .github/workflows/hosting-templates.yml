@@ -5,16 +5,16 @@ name: hosting-templates
 #   crates/cli/tests/serve_backup.rs) returns early without
 #   MUSHROOMDB_TEST_S3_ENDPOINT, and nothing else in CI starts an S3 service,
 #   so they passed by skipping. `s3-backup` runs them against MinIO on every
-#   push and PR into main and release/**, and fails on any skip.
+#   push to main and every PR that touches more than docs, and fails on any skip.
 # - The deploy templates, linted when deploy/**, the Dockerfile or this file
 #   change (decided by the `changes` job: GitHub's path filters apply to a
-#   whole workflow, and s3-backup must never be filtered).
+#   whole workflow, and s3-backup must run for any code change).
 #
 # Third-party actions are pinned by commit SHA, downloaded tools by version
 # and SHA-256, and the MinIO image by digest.
 on:
   push:
-    branches: [main, "release/**"]
+    branches: [main]
   pull_request:
     branches: [main, "release/**"]
   workflow_dispatch:
@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 # A newer push to the same pull request cancels the run it supersedes. Pushes
-# to main and release/** each run to the end.
+# to main each run to the end.
 concurrency:
   group: hosting-templates-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       templates: ${{ steps.diff.outputs.templates }}
-      image: ${{ steps.diff.outputs.image }}
+      code: ${{ steps.diff.outputs.code }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
@@ -53,20 +53,27 @@ jobs:
           # A new branch, a manual run or an unknown base: check everything.
           if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
             echo "templates=true" >> "$GITHUB_OUTPUT"
-            echo "image=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           files="$(git diff --name-only "$base"...HEAD)"
           printf '%s\n' "$files"
           any() { grep -qE "$1" <<<"$files" && echo true || echo false; }
           echo "templates=$(any '^(deploy/|Dockerfile$|\.github/workflows/hosting-templates\.yml$)')" >> "$GITHUB_OUTPUT"
-          echo "image=$(any '^(deploy/|Dockerfile$|crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|ui/|\.github/workflows/hosting-templates\.yml$)')" >> "$GITHUB_OUTPUT"
+          # The same docs-only list as ci.yml's `changes` job.
+          if grep -vE '^((README\.md|CHANGELOG\.md|llms(-full)?\.txt|LICENSE-[A-Z0-9]+)$|docs/internal/|docs/assets/|examples/)' <<<"$files" >/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Every S3-gated cargo test against a real MinIO, plus the end-to-end smoke
-  # script. Never path-filtered. MinIO is started with `docker run` rather than
+  # script. Skipped only for a docs-only pull request. MinIO is started with `docker run` rather than
   # a `services:` container because a service container cannot be given the
   # `server /data` command this image needs.
   s3-backup:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -191,16 +198,3 @@ jobs:
         env:
           MUSHROOMDB_TOKEN: not-a-real-token
         run: docker compose -f deploy/docker-compose/docker-compose.yml config -q
-
-  # The image, with --features tls as the Dockerfile builds it. ci.yml's
-  # `docker` job already builds the same Dockerfile on push to main and on pull
-  # requests, so this job runs only on release/** pushes (where ci.yml does not
-  # trigger) to keep the image gate in place for release branches.
-  docker-build:
-    needs: [changes]
-    if: startsWith(github.ref, 'refs/heads/release/') && needs.changes.outputs.image == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: docker build --no-cache -t mushroomdb:hosting-templates .

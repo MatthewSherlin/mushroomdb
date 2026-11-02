@@ -22,6 +22,7 @@ jobs:
     outputs:
       python: ${{ steps.diff.outputs.python }}
       recall: ${{ steps.diff.outputs.recall }}
+      code: ${{ steps.diff.outputs.code }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
@@ -42,15 +43,27 @@ jobs:
           if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
             echo "python=true" >> "$GITHUB_OUTPUT"
             echo "recall=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           files="$(git diff --name-only "$base"...HEAD)"
           printf '%s\n' "$files"
           any() { grep -qE "$1" <<<"$files" && echo true || echo false; }
-          echo "python=$(any '^(bindings/python/|crates/|dogfood/|benchmarks/|Cargo\.(lock|toml)$|\.github/workflows/ci\.yml$)')" >> "$GITHUB_OUTPUT"
+          echo "python=$(any '^(bindings/python/|examples/|crates/|dogfood/|benchmarks/|Cargo\.(lock|toml)$|\.github/workflows/ci\.yml$)')" >> "$GITHUB_OUTPUT"
           echo "recall=$(any '^(crates/|Cargo\.(lock|toml)$|\.github/workflows/ci\.yml$)')" >> "$GITHUB_OUTPUT"
+          # A pull request touching only these runs the docs checks (plugin-validate,
+          # site) and, for examples/, python. No test reads them. Pages under
+          # docs/site/ are not listed: tests run their examples. Pushes to main
+          # still run everything.
+          if grep -vE '^((README\.md|CHANGELOG\.md|llms(-full)?\.txt|LICENSE-[A-Z0-9]+)$|docs/internal/|docs/assets/|examples/)' <<<"$files" >/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   test:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -199,6 +212,8 @@ jobs:
   # capped by the runner's cores, so a small runner times the code, not the
   # scheduler. Release only: the tests are #[ignore]d out of the debug run.
   concurrency-gate:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # A hung baseline child or writer loop must not hold a runner for six hours.
     timeout-minutes: 60
@@ -356,6 +371,8 @@ jobs:
   # when the first fails. tests/bolt/run_compat.sh starts the server on
   # loopback with a token, waits for /ready, and stops it afterwards.
   bolt-compat:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -471,6 +488,8 @@ jobs:
   # data, forever. Naming this job separately means a regression says
   # "format-compat" in CI, not the generic "test" job name.
   format-compat:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -545,6 +564,8 @@ jobs:
   # MUSHROOMDB_REQUIRE_SERVER=1 turns those skips into failures here: a job that
   # can skip everything is a job that proves nothing.
   ts-client:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -573,6 +594,8 @@ jobs:
   # workflow. It serves a fake release over localhost and drives both installers
   # against it, so it needs node, python3, curl and tar, but no Rust build.
   packaging:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -582,6 +605,8 @@ jobs:
       - run: bash packaging/tests/run.sh
 
   ui:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -680,8 +705,9 @@ jobs:
   # from this checkout, not the last PyPI release. Runs only when a PR touches
   # the binding, the engine crates or the adapters.
   test-integrations:
+    needs: [changes]
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
