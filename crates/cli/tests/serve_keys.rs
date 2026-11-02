@@ -330,11 +330,13 @@ fn sighup_loads_a_first_key_added_after_the_server_started() {
     assert_eq!(status(&server.addr, "/stats", "anything"), 200);
     let admin = keys_add(&dir, "ops", "admin", None);
     hangup(&server);
+    // Wait on the refusal: an open server also answers the new key with 200,
+    // so that answer doesn't show the reload has happened.
     assert!(
-        wait_for(&server.addr, "/stats", &admin, 200),
-        "the first key never started working"
+        wait_for(&server.addr, "/stats", "anything", 401),
+        "the first key never closed the server"
     );
-    assert_eq!(status(&server.addr, "/stats", "anything"), 401);
+    assert_eq!(status(&server.addr, "/stats", &admin), 200);
 }
 
 #[test]
