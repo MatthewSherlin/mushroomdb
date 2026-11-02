@@ -19,6 +19,14 @@ listening on bolt://127.0.0.1:7687
 
 `--bolt-port 0` picks a free port. Any other `--bolt-*` flag without a port is a startup error.
 
+In a container, bind all interfaces and name the host drivers should dial. Without `--bolt-advertised-host` a wildcard `--addr` is refused at startup:
+
+```text
+docker run --rm -p 8080:8080 -p 7687:7687 -e MUSHROOMDB_TOKEN=changeme \
+  ghcr.io/matthewsherlin/mushroomdb \
+  serve /data --addr 0.0.0.0:8080 --bolt-port 7687 --bolt-advertised-host localhost
+```
+
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|
 | `--bolt-port <port>` | `MUSHROOMDB_BOLT_PORT` | unset (off) | Serve Bolt on `--addr`'s IP and this port |

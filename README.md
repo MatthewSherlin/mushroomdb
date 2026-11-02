@@ -31,6 +31,9 @@ Embedded, it is a directory on disk: no account and no server to run.
 | Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db` |
 
+`install` detects Claude Code or Cursor. For Codex, or if neither is set up yet, add
+`--platform codex`, `claude-code`, `cursor` or `all`.
+
 There is also a Claude Code plugin and a `cargo install`. The
 [Install page](https://matthewsherlin.github.io/mushroomdb/docs/install.html) has a row for each, and says what each one leaves out.
 
@@ -103,13 +106,16 @@ listening on http://127.0.0.1:8080
 listening on bolt://127.0.0.1:7687
 ```
 
-Without a Bolt driver, run a Cypher query over HTTP:
+In a container the server binds a wildcard address, so Bolt also needs
+`--bolt-advertised-host`. [Bolt](https://matthewsherlin.github.io/mushroomdb/docs/bolt.html) has the full command.
+
+Without a Bolt driver, run a Cypher query over HTTP. The image starts with the demo graph:
 
 ```sh
 curl --silent --show-error \
   -H "Authorization: Bearer changeme" \
   -H 'Content-Type: application/json' \
-  --data '{"cypher":"MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name"}' \
+  --data '{"cypher":"MATCH (p:Person)-[:FIT]->(o:Project) RETURN p.name, o.name LIMIT 3"}' \
   'http://127.0.0.1:8080/query?format=json'
 ```
 

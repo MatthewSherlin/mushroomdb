@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import pytest
 import time
 
+import mushroomdb
 from mushroomdb import GraphDb
+
+
+def test_version_matches_the_package_metadata():
+    assert mushroomdb.__version__ == importlib.metadata.version("mushroomdb")
 
 
 def test_insert_node_label_then_key(tmp_path):

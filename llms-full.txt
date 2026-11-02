@@ -40,6 +40,9 @@ Embedded, it is a directory on disk: no account and no server to run.
 | Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db` |
 
+`install` detects Claude Code or Cursor. For Codex, or if neither is set up yet, add
+`--platform codex`, `claude-code`, `cursor` or `all`.
+
 There is also a Claude Code plugin and a `cargo install`. The
 [Install page](https://matthewsherlin.github.io/mushroomdb/docs/install.html) has a row for each, and says what each one leaves out.
 
@@ -112,13 +115,16 @@ listening on http://127.0.0.1:8080
 listening on bolt://127.0.0.1:7687
 ```
 
-Without a Bolt driver, run a Cypher query over HTTP:
+In a container the server binds a wildcard address, so Bolt also needs
+`--bolt-advertised-host`. [Bolt](https://matthewsherlin.github.io/mushroomdb/docs/bolt.html) has the full command.
+
+Without a Bolt driver, run a Cypher query over HTTP. The image starts with the demo graph:
 
 ```sh
 curl --silent --show-error \
   -H "Authorization: Bearer changeme" \
   -H 'Content-Type: application/json' \
-  --data '{"cypher":"MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name"}' \
+  --data '{"cypher":"MATCH (p:Person)-[:FIT]->(o:Project) RETURN p.name, o.name LIMIT 3"}' \
   'http://127.0.0.1:8080/query?format=json'
 ```
 
@@ -545,7 +551,7 @@ quickstart_container=$(docker run --detach \
   --publish 127.0.0.1:8080:8080 \
   --mount "source=$quickstart_volume,target=/data" \
   --env "MUSHROOMDB_TOKEN=$quickstart_token" \
-  ghcr.io/matthewsherlin/mushroomdb:v0.9.2 \
+  ghcr.io/matthewsherlin/mushroomdb \
   serve /data --addr 0.0.0.0:8080)
 curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
   http://127.0.0.1:8080/health
@@ -811,7 +817,14 @@ columns: p, proj, score
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
-  mushroomdb serve ./db
+  mushroomdb serve /absolute/path/to/db
+
+== suggested rule (teaser) ==
+  suggest_fe_person_person_org_id
+  Person → Person via FieldEqual { field: "org_id" }
+  est_edges: ~60
+  Field 'org_id' has low cardinality in Person (10 distinct value(s)) and Person (10 distinct value(s)), with 10 shared value(s). Suggests a categorical grouping predicate.
+  (run `mushroomdb suggest /absolute/path/to/db` for full analysis)
 listening on http://127.0.0.1:8080
 ```
 
@@ -5203,6 +5216,14 @@ listening on bolt://127.0.0.1:7687
 ```
 
 `--bolt-port 0` picks a free port. Any other `--bolt-*` flag without a port is a startup error.
+
+In a container, bind all interfaces and name the host drivers should dial. Without `--bolt-advertised-host` a wildcard `--addr` is refused at startup:
+
+```text
+docker run --rm -p 8080:8080 -p 7687:7687 -e MUSHROOMDB_TOKEN=changeme \
+  ghcr.io/matthewsherlin/mushroomdb \
+  serve /data --addr 0.0.0.0:8080 --bolt-port 7687 --bolt-advertised-host localhost
+```
 
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|

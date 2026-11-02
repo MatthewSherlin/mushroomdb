@@ -4307,6 +4307,7 @@ pyo3::create_exception!(
 
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<GraphDb>()?;
     m.add_class::<MemoryAccessor>()?;
     m.add_class::<Duration>()?;

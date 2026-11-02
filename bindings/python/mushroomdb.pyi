@@ -50,6 +50,9 @@ A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit 
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
 
+__version__: str
+"""The installed version, matching the package metadata."""
+
 class MushroomError(RuntimeError):
     """Base class for every error the engine raises.
 
