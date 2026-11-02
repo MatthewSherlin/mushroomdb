@@ -14,7 +14,7 @@ quickstart_container=$(docker run --detach \
   --publish 127.0.0.1:8080:8080 \
   --mount "source=$quickstart_volume,target=/data" \
   --env "MUSHROOMDB_TOKEN=$quickstart_token" \
-  ghcr.io/matthewsherlin/mushroomdb:v0.9.2 \
+  ghcr.io/matthewsherlin/mushroomdb \
   serve /data --addr 0.0.0.0:8080)
 curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
   http://127.0.0.1:8080/health

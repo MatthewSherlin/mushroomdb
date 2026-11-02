@@ -14,7 +14,7 @@
 #     --from-literal=token="$(openssl rand -hex 32)"
 #
 # PIN THE IMAGE: :latest is only the default. A store has one-way format
-# opt-ins, so set a version tag (for example ghcr.io/matthewsherlin/mushroomdb:0.10.0)
+# opt-ins, so set a version tag (for example ghcr.io/matthewsherlin/mushroomdb:v0.10.1)
 # before you rely on this, or a restart can pull a different version.
 apiVersion: v1
 kind: ConfigMap

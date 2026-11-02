@@ -220,7 +220,14 @@ columns: p, proj, score
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
-  mushroomdb serve ./db
+  mushroomdb serve /absolute/path/to/db
+
+== suggested rule (teaser) ==
+  suggest_fe_person_person_org_id
+  Person → Person via FieldEqual { field: "org_id" }
+  est_edges: ~60
+  Field 'org_id' has low cardinality in Person (10 distinct value(s)) and Person (10 distinct value(s)), with 10 shared value(s). Suggests a categorical grouping predicate.
+  (run `mushroomdb suggest /absolute/path/to/db` for full analysis)
 listening on http://127.0.0.1:8080
 ```
 
