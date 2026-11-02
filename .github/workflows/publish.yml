@@ -441,8 +441,11 @@ jobs:
           VER: ${{ needs.publish-npm-launcher.outputs.version }}
         run: |
           set -euxo pipefail
+          # Fetch the tarball, not just the metadata: `npm view` can answer
+          # minutes before the tarball stops returning E404 (v0.10.1). An
+          # empty cache each try makes npm go back to the registry.
           for i in $(seq 1 45); do
-            if npm view "mushroomdb@$VER" version >/dev/null 2>&1; then
+            if npm pack "mushroomdb@$VER" --pack-destination "$(mktemp -d)" --cache "$(mktemp -d)" >/dev/null 2>&1; then
               echo "mushroomdb@$VER is live on npm"
               exit 0
             fi
