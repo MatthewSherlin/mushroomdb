@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.10.2
+
+### Fixed
+
+- **A revoked or changed `keys.json` key is now refused consistently on an open Bolt connection.**
+  Previously, a key removed from `keys.json` and reloaded with `SIGHUP` kept working on already-open
+  Bolt connections until they closed. HTTP already refused it on every request. Now each `RUN`,
+  `BEGIN`, and `COMMIT` re-checks the credential against the current key table. A removed key fails
+  with `Neo.ClientError.Security.Unauthorized` and its open transaction is rolled back. Any identity
+  change while a transaction is open (tier or role change) is refused with `Forbidden` and the
+  transaction is rolled back — this prevents a changed role's view from leaking into a transaction
+  that was opened under a different role. Outside a transaction a tier or role change takes effect
+  silently on the next statement. Static `--token` and no-auth modes are unaffected. (ledger row 142)
+
 ## v0.10.1 — aggregates and mixed-type ordering are right, and commits cost less on Linux
 
 ### Performance

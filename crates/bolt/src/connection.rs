@@ -62,7 +62,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::BoltError;
 use crate::framing;
 use crate::handshake;
-use crate::messages::hello::{hello_success, Identity, TokenAuthenticator};
+use crate::messages::hello::{hello_success, AuthToken, Identity, TokenAuthenticator};
 use crate::messages::reset::reset_success;
 use crate::messages::route::{requested_database, RoutingConfig};
 use crate::messages::run::{
@@ -184,6 +184,13 @@ impl std::fmt::Debug for ConnectionState {
 pub struct Connection {
     state: ConnectionState,
     identity: Option<Identity>,
+    /// The credentials presented at `HELLO`, stored to re-verify on each
+    /// `RUN` and `BEGIN` so that a key revoked or re-tiered by a `keys.json`
+    /// reload takes effect before the next statement runs. `None` when the
+    /// server accepted the connection without credentials (open mode). The
+    /// credential value is never printed: `AuthToken`'s `Debug` impl
+    /// redacts it.
+    auth_token: Option<AuthToken>,
     authenticator: Arc<TokenAuthenticator>,
     tx_timeout: Duration,
     connection_id: String,
@@ -212,6 +219,7 @@ impl Connection {
         Self {
             state: ConnectionState::NotAuthenticated,
             identity: None,
+            auth_token: None,
             authenticator,
             tx_timeout,
             connection_id,
@@ -258,6 +266,46 @@ impl Connection {
     /// Who the client authenticated as; `None` before `HELLO` succeeds.
     pub fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
+    }
+
+    /// Re-verifies the key that authenticated this connection against the
+    /// current key set and updates `self.identity` if the tier or role has
+    /// changed. Called at the start of every `RUN`, `BEGIN` and `COMMIT` so
+    /// that a `keys.json` reload that revokes or re-tiers a key takes effect
+    /// before the next statement runs.
+    ///
+    /// Returns `Unauthorized` when the key has been removed from the key
+    /// set. Returns `Ok(())` immediately for connections that authenticated
+    /// without credentials (open server). Static `--token` and role-token
+    /// connections are re-checked at negligible cost and their result is
+    /// always the same, so they are unaffected.
+    fn recheck_key(&mut self) -> Result<(), BoltError> {
+        let Some(ref auth_token) = self.auth_token else {
+            // Open server or no-auth mode: no per-request check needed.
+            return Ok(());
+        };
+        let old_identity = self.identity.clone();
+        match self.authenticator.authenticate(auth_token) {
+            Ok(new_identity) => {
+                self.identity = Some(new_identity.clone());
+                // If the connection is currently in a transaction and the
+                // identity changed — a different role, a tier change, or any
+                // other delta — the transaction was opened under a different
+                // view and must not continue. Fail closed with Forbidden so
+                // the client resets and starts a new transaction under the
+                // current identity. Outside a transaction an identity change
+                // takes effect silently from the next statement.
+                if matches!(self.state, ConnectionState::InTx { .. })
+                    && old_identity.as_ref() != Some(&new_identity)
+                {
+                    return Err(BoltError::Forbidden(
+                        "key identity changed: start a new transaction".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// The negotiated `(major, minor)`.
@@ -393,6 +441,15 @@ impl Connection {
         match msg {
             ClientMessage::Hello(hello) => match self.authenticator.authenticate(&hello.auth) {
                 Ok(identity) => {
+                    // Store credentials only for credentialed auth. For an
+                    // open server (scheme: none or unknown) the is_open()
+                    // path runs only at HELLO, so no per-request re-check
+                    // is needed or possible.
+                    self.auth_token = matches!(
+                        hello.auth,
+                        AuthToken::Basic { .. } | AuthToken::Bearer { .. }
+                    )
+                    .then(|| hello.auth.clone());
                     self.identity = Some(identity);
                     self.state = ConnectionState::Ready;
                     vec![hello_success(&self.connection_id)]
@@ -514,6 +571,9 @@ impl Connection {
     /// A malformed request is a protocol violation; an unknown database, a
     /// bookmark timeout or a user to impersonate fails.
     fn handle_begin(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
+        if let Err(err) = self.recheck_key() {
+            return self.fail(err);
+        }
         let (Some(service), Some(identity)) = (self.service.clone(), self.identity.clone()) else {
             return self.fail(BoltError::NotSupported(
                 "BEGIN is not supported on a connection with no database".into(),
@@ -562,9 +622,21 @@ impl Connection {
     /// a transient `FAILURE` (the transaction is gone either way). Open
     /// results are not allowed (`allows`): the state machine has `COMMIT` in
     /// `TX_READY` only, so a client pulls or discards first, as the drivers do.
+    ///
+    /// Like `RUN` and `BEGIN`, `COMMIT` re-checks the key before acting.
+    /// `recheck_key` rolls back the transaction and returns `Forbidden` if the
+    /// identity changed (revocation or tier/role change) since the transaction
+    /// was opened, so writes that were authorized under a different identity do
+    /// not persist.
     fn handle_commit(&mut self, fields: &[PackValue]) -> Vec<ServerMessage> {
         if !fields.is_empty() {
             return self.violate(BoltError::Invalid("COMMIT takes no fields".into()));
+        }
+        if let Err(err) = self.recheck_key() {
+            // Key was revoked or identity changed: roll back the open
+            // transaction and fail. discard_work() inside fail() handles the
+            // rollback.
+            return self.fail(err);
         }
         let Some(tx) = self.take_tx() else {
             return self.violate(BoltError::Invalid("COMMIT needs a transaction".into()));
@@ -595,6 +667,9 @@ impl Connection {
     }
 
     fn handle_run(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
+        if let Err(err) = self.recheck_key() {
+            return self.fail(err);
+        }
         let (Some(service), Some(identity)) = (self.service.clone(), self.identity.clone()) else {
             return self.fail(BoltError::NotSupported(
                 "RUN is not supported on a connection with no database".into(),
