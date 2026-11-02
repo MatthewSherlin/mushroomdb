@@ -773,7 +773,7 @@ jobs:
         include:
           # Built on an Apple Silicon runner: the hosted Intel ones are the
           # runners that sat queued past the 24h cap in v0.1.0.
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
