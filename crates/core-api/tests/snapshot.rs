@@ -4213,3 +4213,527 @@ fn a_snapshot_after_a_kill_before_the_replacement_wal_succeeds_on_a_declared_sto
         assert_eq!(then.stats().nodes_live, 1, "missing={missing}");
     }
 }
+
+// ── Row 121: snapshot replaced during load_from_disk ─────────────────────────
+//
+// When another process completes both renames of a WAL-replacing snapshot
+// between the moment this handle reads snapshot.bin and the moment it records
+// snapshot_ident, the handle ends up with the old snapshot's state recorded
+// under the new snapshot's identity.  No later staleness check or refresh can
+// tell, so the mixed state is permanent.
+//
+// The fix: capture snapshot_ident before any read, recheck it after WAL replay,
+// and retry (up to 3 times) on a mismatch.
+//
+// Test strategy: a custom Fs wrapper intercepts the first wal_ident() call
+// inside load_from_disk (which fires after the snapshot is read but before the
+// identity is captured).  The interceptor atomically replaces snapshot.bin and
+// wal.bin on disk — exactly what a peer's snapshot_with would do — then returns.
+// Without the fix the handle loads alice-only state under the new (alice+bob)
+// snapshot identity, leaving bob permanently invisible.  With the fix it detects
+// the mismatch, resets, and reloads the current state.
+
+use core_storage::fs::{FileId, Fs, RealFs};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// One-shot hook type for `InterceptWalIdent`.
+type OnceHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// Wraps `RealFs` and fires a one-shot hook on the first `wal_ident()` call.
+///
+/// That call is the first WAL-related call in `load_from_disk`, immediately
+/// after the snapshot bytes have been consumed.  Firing there simulates a peer
+/// completing both renames of a new snapshot (snapshot.bin then wal.bin) inside
+/// the exact window the defect describes.
+struct InterceptWalIdent {
+    inner: RealFs,
+    hook: OnceHook,
+}
+
+impl Fs for InterceptWalIdent {
+    fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.inner.append(file, data)
+    }
+    fn sync(&mut self, file: FileId) -> std::io::Result<()> {
+        self.inner.sync(file)
+    }
+    fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
+        self.inner.read(file)
+    }
+    fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_atomic(file, data)
+    }
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.snapshot_path()
+    }
+    fn wal_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.wal_path()
+    }
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        self.inner.read_prefix(file, n)
+    }
+    fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
+        self.inner.read_range(file, from)
+    }
+    fn wal_len(&self) -> std::io::Result<u64> {
+        self.inner.wal_len()
+    }
+    fn wal_ident(&self) -> std::io::Result<Option<u64>> {
+        // Fire the hook exactly once, simulating a peer completing a snapshot
+        // between our snapshot read and our WAL identity capture.
+        if let Some(hook) = self.hook.lock().unwrap().take() {
+            hook();
+        }
+        self.inner.wal_ident()
+    }
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        self.inner.wal_len_and_ident()
+    }
+    fn snapshot_ident(&self) -> std::io::Result<Option<(u64, u64)>> {
+        self.inner.snapshot_ident()
+    }
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
+    fn unlock(&self) -> std::io::Result<()> {
+        self.inner.unlock()
+    }
+    fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        self.inner.list_archives()
+    }
+    fn read_archive(&self, n: u64) -> std::io::Result<Vec<u8>> {
+        self.inner.read_archive(n)
+    }
+    fn archive_wal(&mut self, n: u64) -> std::io::Result<()> {
+        self.inner.archive_wal(n)
+    }
+    fn delete_archive(&mut self, n: u64) -> std::io::Result<()> {
+        self.inner.delete_archive(n)
+    }
+    fn read_horizon_floor(&self) -> std::io::Result<u64> {
+        self.inner.read_horizon_floor()
+    }
+    fn write_horizon_floor(&mut self, floor: u64) -> std::io::Result<()> {
+        self.inner.write_horizon_floor(floor)
+    }
+    fn has_genesis_marker(&self) -> bool {
+        self.inner.has_genesis_marker()
+    }
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.inner.write_genesis_marker()
+    }
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.inner.delete_genesis_marker()
+    }
+}
+
+/// Row 121: a snapshot replaced between the snapshot read and the snapshot-
+/// identity capture during load_from_disk must be detected and the load retried.
+///
+/// Failure shape on main (unfixed): the handle loads alice-only state but
+/// records the alice+bob snapshot's identity, so refresh() never triggers a
+/// reload and bob is permanently missing.
+#[test]
+fn a_snapshot_replaced_during_load_is_detected_and_reloaded() {
+    // ── Phase 1: create the "before" state ──────────────────────────────────
+    // Store A starts with just "alice", then a non-archiving snapshot so that
+    // snapshot.bin is the authoritative state and wal.bin is the baseline.
+    let dir_a = tmp("row121-a");
+    {
+        let mut db = GraphDb::open(&dir_a).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+
+    // ── Phase 2: create the "after" state in a separate directory ───────────
+    // Store B has "alice" + "bob" and the same non-archiving snapshot.
+    let dir_b = tmp("row121-b");
+    {
+        let mut db = GraphDb::open(&dir_b).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node("Person", "bob", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+
+    // ── Phase 3: open store A with an intercepting filesystem ───────────────
+    // The hook fires once on the first wal_ident() call (after the snapshot is
+    // read but before the WAL is read).  It atomically replaces store A's
+    // snapshot.bin and wal.bin with store B's, replicating exactly what a peer
+    // snapshot_with would write.
+    let dir_a_hook = dir_a.clone();
+    let dir_b_hook = dir_b.clone();
+    let hook: OnceHook = Arc::new(Mutex::new(Some(Box::new(move || {
+        // Replace snapshot.bin atomically (temp-file + rename).
+        let snap_bytes = std::fs::read(dir_b_hook.join("snapshot.bin")).unwrap();
+        let snap_tmp = dir_a_hook.join("snapshot.bin.row121.tmp");
+        std::fs::write(&snap_tmp, &snap_bytes).unwrap();
+        std::fs::rename(&snap_tmp, dir_a_hook.join("snapshot.bin")).unwrap();
+        // Replace wal.bin atomically.
+        let wal_bytes = std::fs::read(dir_b_hook.join("wal.bin")).unwrap();
+        let wal_tmp = dir_a_hook.join("wal.bin.row121.tmp");
+        std::fs::write(&wal_tmp, &wal_bytes).unwrap();
+        std::fs::rename(&wal_tmp, dir_a_hook.join("wal.bin")).unwrap();
+    }))));
+
+    let fs = InterceptWalIdent {
+        inner: RealFs::new(&dir_a).unwrap(),
+        hook: Arc::clone(&hook),
+    };
+
+    // open_with uses a RealFs-backed load; no write lock held for the lifetime
+    // so the hook's file operations complete without contention.
+    let mut db = GraphDb::open_with(fs).unwrap();
+
+    // The hook must have fired: the "after" snapshot was put in place.
+    assert!(
+        hook.lock().unwrap().is_none(),
+        "hook must fire during load_from_disk"
+    );
+
+    // Row 121 fix: the load detects the replaced snapshot, resets, and reloads
+    // the current state.  Both alice and bob are visible.
+    assert_eq!(
+        db.stats().nodes_live,
+        2,
+        "both alice and bob must be visible after a clean reload (row 121)"
+    );
+
+    // Refresh must see nothing new: the handle's identities already match disk.
+    let added = db.refresh().unwrap();
+    assert_eq!(added, 0, "no new frames after a clean reload");
+    assert_eq!(db.stats().nodes_live, 2);
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Wraps `RealFs` and fires an action on every `wal_ident()` call while
+/// `enabled` is `true`.  Used to simulate a peer completing a new snapshot on
+/// every load attempt, exhausting `load_from_disk`'s retry budget.
+struct AlwaysInterceptWalIdent {
+    inner: RealFs,
+    enabled: Arc<AtomicBool>,
+    action: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Fs for AlwaysInterceptWalIdent {
+    fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.inner.append(file, data)
+    }
+    fn sync(&mut self, file: FileId) -> std::io::Result<()> {
+        self.inner.sync(file)
+    }
+    fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
+        self.inner.read(file)
+    }
+    fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_atomic(file, data)
+    }
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.snapshot_path()
+    }
+    fn wal_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.wal_path()
+    }
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        self.inner.read_prefix(file, n)
+    }
+    fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
+        self.inner.read_range(file, from)
+    }
+    fn wal_len(&self) -> std::io::Result<u64> {
+        self.inner.wal_len()
+    }
+    fn wal_ident(&self) -> std::io::Result<Option<u64>> {
+        if self.enabled.load(Ordering::Relaxed) {
+            (self.action)();
+        }
+        self.inner.wal_ident()
+    }
+    fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
+        self.inner.wal_len_and_ident()
+    }
+    fn snapshot_ident(&self) -> std::io::Result<Option<(u64, u64)>> {
+        self.inner.snapshot_ident()
+    }
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
+    fn unlock(&self) -> std::io::Result<()> {
+        self.inner.unlock()
+    }
+    fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        self.inner.list_archives()
+    }
+    fn read_archive(&self, n: u64) -> std::io::Result<Vec<u8>> {
+        self.inner.read_archive(n)
+    }
+    fn archive_wal(&mut self, n: u64) -> std::io::Result<()> {
+        self.inner.archive_wal(n)
+    }
+    fn delete_archive(&mut self, n: u64) -> std::io::Result<()> {
+        self.inner.delete_archive(n)
+    }
+    fn read_horizon_floor(&self) -> std::io::Result<u64> {
+        self.inner.read_horizon_floor()
+    }
+    fn write_horizon_floor(&mut self, floor: u64) -> std::io::Result<()> {
+        self.inner.write_horizon_floor(floor)
+    }
+    fn has_genesis_marker(&self) -> bool {
+        self.inner.has_genesis_marker()
+    }
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.inner.write_genesis_marker()
+    }
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.inner.delete_genesis_marker()
+    }
+}
+
+/// Row 121 (exhaustion, open): every load attempt loses the snapshot race;
+/// `open_with` returns the exhaustion `Io` error and never exposes mixed state.
+///
+/// The hook alternates between two peer stores (dir_b: 2 nodes, dir_c: 3 nodes)
+/// so each fire changes the snapshot length — no dependence on sub-second mtime
+/// resolution.
+#[test]
+fn a_snapshot_replaced_on_every_load_attempt_returns_an_error() {
+    let dir_a = tmp("row121-exh-open-a");
+    let dir_b = tmp("row121-exh-open-b");
+    let dir_c = tmp("row121-exh-open-c");
+    {
+        let mut db = GraphDb::open(&dir_a).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+    {
+        let mut db = GraphDb::open(&dir_b).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node("Person", "bob", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+    {
+        let mut db = GraphDb::open(&dir_c).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node("Person", "bob", vec![]).unwrap();
+        db.insert_node("Person", "charlie", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+
+    // Counter starts at 0: even fires copy dir_b (2 nodes), odd fires copy
+    // dir_c (3 nodes).  The length change guarantees a different snapshot_ident
+    // on every fire.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = Arc::clone(&counter);
+    let dir_a_clone = dir_a.clone();
+    let dir_b_clone = dir_b.clone();
+    let dir_c_clone = dir_c.clone();
+    let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let idx = counter_clone.fetch_add(1, Ordering::Relaxed);
+        let src = if idx.is_multiple_of(2) {
+            &dir_b_clone
+        } else {
+            &dir_c_clone
+        };
+        let snap = std::fs::read(src.join("snapshot.bin")).unwrap();
+        let snap_tmp = dir_a_clone.join("snapshot.bin.row121.tmp");
+        std::fs::write(&snap_tmp, &snap).unwrap();
+        std::fs::rename(&snap_tmp, dir_a_clone.join("snapshot.bin")).unwrap();
+        let wal = std::fs::read(src.join("wal.bin")).unwrap();
+        let wal_tmp = dir_a_clone.join("wal.bin.row121.tmp");
+        std::fs::write(&wal_tmp, &wal).unwrap();
+        std::fs::rename(&wal_tmp, dir_a_clone.join("wal.bin")).unwrap();
+    });
+
+    let fs = AlwaysInterceptWalIdent {
+        inner: RealFs::new(&dir_a).unwrap(),
+        enabled: Arc::new(AtomicBool::new(true)),
+        action,
+    };
+    // GraphDb<F> does not implement Debug, so use match rather than unwrap_err.
+    let err = match GraphDb::open_with(fs) {
+        Err(e) => e,
+        Ok(_) => panic!("expected open to fail with the exhaustion error"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("snapshot replaced on each of 3 consecutive load attempts"),
+        "expected exhaustion error, got: {msg}"
+    );
+
+    // No handle was returned, so no mixed state was exposed.  A fresh open
+    // reads the last content placed on disk by the hook.  Three fires:
+    // fire 0 → dir_b (2 nodes), fire 1 → dir_c (3 nodes), fire 2 → dir_b
+    // (2 nodes).  Final on-disk state: dir_b.
+    let fresh = GraphDb::open(&dir_a).unwrap();
+    assert_eq!(
+        fresh.stats().nodes_live,
+        2,
+        "fresh open after exhaustion reads the last snapshot placed on disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_c);
+}
+
+/// Row 121 (exhaustion, refresh): every reload attempt loses the snapshot race;
+/// `refresh` returns the exhaustion `Io` error and the handle is degraded until
+/// reopened.
+///
+/// Steps:
+///   1. Open dir_a (alice, 1 node) with the hook disabled → succeeds.
+///   2. Externally place dir_b (alice+bob, 2 nodes) on disk → handle stale.
+///   3. Enable the hook (counter=1 so first fire copies dir_c, 3 nodes).
+///   4. `refresh()` detects staleness and attempts a reload; every `wal_ident()`
+///      call fires the hook and changes the snapshot length so all three
+///      attempts mismatch.
+///   5. `refresh` returns the exhaustion error; the handle is degraded.
+///   6. Further mutations are refused with a degraded error.
+///   7. A fresh open reads the latest snapshot on disk.
+#[test]
+fn a_snapshot_replaced_on_every_reload_attempt_degrades_the_handle() {
+    let dir_a = tmp("row121-exh-reload-a");
+    let dir_b = tmp("row121-exh-reload-b");
+    let dir_c = tmp("row121-exh-reload-c");
+    {
+        let mut db = GraphDb::open(&dir_a).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+    {
+        let mut db = GraphDb::open(&dir_b).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node("Person", "bob", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+    {
+        let mut db = GraphDb::open(&dir_c).unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node("Person", "bob", vec![]).unwrap();
+        db.insert_node("Person", "charlie", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+
+    // Counter starts at 1: odd fires copy dir_c (3 nodes), even fires copy
+    // dir_b (2 nodes).  The external setup placed dir_b on disk; starting the
+    // counter at 1 ensures the first hook fire switches to dir_c so the length
+    // changes on every fire.
+    let counter = Arc::new(AtomicUsize::new(1));
+    let counter_clone = Arc::clone(&counter);
+    let enabled = Arc::new(AtomicBool::new(false));
+    let enabled_clone = Arc::clone(&enabled);
+    let dir_a_clone = dir_a.clone();
+    let dir_b_clone = dir_b.clone();
+    let dir_c_clone = dir_c.clone();
+    let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let idx = counter_clone.fetch_add(1, Ordering::Relaxed);
+        let src = if idx.is_multiple_of(2) {
+            &dir_b_clone
+        } else {
+            &dir_c_clone
+        };
+        let snap = std::fs::read(src.join("snapshot.bin")).unwrap();
+        let snap_tmp = dir_a_clone.join("snapshot.bin.row121.tmp");
+        std::fs::write(&snap_tmp, &snap).unwrap();
+        std::fs::rename(&snap_tmp, dir_a_clone.join("snapshot.bin")).unwrap();
+        let wal = std::fs::read(src.join("wal.bin")).unwrap();
+        let wal_tmp = dir_a_clone.join("wal.bin.row121.tmp");
+        std::fs::write(&wal_tmp, &wal).unwrap();
+        std::fs::rename(&wal_tmp, dir_a_clone.join("wal.bin")).unwrap();
+    });
+
+    // Phase 1: open with hook disabled → alice only.
+    let mut db = GraphDb::open_with(AlwaysInterceptWalIdent {
+        inner: RealFs::new(&dir_a).unwrap(),
+        enabled: Arc::clone(&enabled),
+        action: Arc::clone(&action),
+    })
+    .unwrap();
+    assert_eq!(db.stats().nodes_live, 1, "initial open: alice only");
+
+    // Phase 2: externally place dir_b on disk to make the handle stale.
+    {
+        let snap = std::fs::read(dir_b.join("snapshot.bin")).unwrap();
+        let snap_tmp = dir_a.join("snapshot.bin.row121.tmp");
+        std::fs::write(&snap_tmp, &snap).unwrap();
+        std::fs::rename(&snap_tmp, dir_a.join("snapshot.bin")).unwrap();
+        let wal = std::fs::read(dir_b.join("wal.bin")).unwrap();
+        let wal_tmp = dir_a.join("wal.bin.row121.tmp");
+        std::fs::write(&wal_tmp, &wal).unwrap();
+        std::fs::rename(&wal_tmp, dir_a.join("wal.bin")).unwrap();
+    }
+
+    // Phase 3: enable the hook so every wal_ident() during the reload fires.
+    enabled_clone.store(true, Ordering::Relaxed);
+
+    // Phase 4: refresh detects staleness and attempts a reload; the hook fires
+    // on each wal_ident() call.  Three fires: 1→dir_c, 2→dir_b, 3→dir_c.
+    // Every attempt sees a mismatch → exhaustion.
+    let result = db.refresh();
+    assert!(
+        result.is_err(),
+        "refresh must fail when every reload attempt loses the snapshot race"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("snapshot replaced on each of 3 consecutive load attempts"),
+        "expected exhaustion error, got: {msg}"
+    );
+
+    // Phase 5: the handle is degraded; further mutations are refused.
+    let write_err = db.insert_node("Person", "dave", vec![]).unwrap_err();
+    assert!(
+        write_err.to_string().contains("degraded"),
+        "write on degraded handle must report degraded: {write_err}"
+    );
+
+    // Phase 6: drop the degraded handle (releases the lock), then verify a
+    // fresh open reads the last snapshot placed on disk.
+    // Three fires: 1→dir_c (3), 2→dir_b (2), 3→dir_c (3).  Final: dir_c.
+    drop(db);
+    let fresh = GraphDb::open(&dir_a).unwrap();
+    assert_eq!(
+        fresh.stats().nodes_live,
+        3,
+        "fresh open after exhaustion reads the last snapshot placed on disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_c);
+}
