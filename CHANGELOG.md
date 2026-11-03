@@ -1,9 +1,10 @@
 # Changelog
 
-## v0.10.2
+## v0.10.2 — a revoked key stops working on an open connection, and the Linux binaries run on older systems
 
 ### Fixed
 
+- **The Linux binaries run on Ubuntu 22.04 and Debian 12.** The 0.10.1 glibc builds needed glibc 2.39, so `npx mushroomdb` and `install.sh` failed on those systems with `GLIBC_2.39' not found`. The floor is now glibc 2.35, and a release fails if a binary needs more. On an older x86_64 Linux, `MUSHROOMDB_FORCE_LIBC=musl npx mushroomdb` uses the static build.
 - **A snapshot replaced between the snapshot read and the WAL read in `load_from_disk` no longer
   leaves the handle with mixed state.** Previously, `load_from_disk` captured `snapshot_ident`
   after WAL replay. A peer that completed a WAL-replacing snapshot in between left the handle
@@ -20,6 +21,10 @@
   transaction is rolled back — this prevents a changed role's view from leaking into a transaction
   that was opened under a different role. Outside a transaction a tier or role change takes effect
   silently on the next statement. Static `--token` and no-auth modes are unaffected. (ledger row 142)
+
+### Added
+
+- **`mushroomdb.__version__`** in Python, matching the package metadata.
 
 ## v0.10.1 — aggregates and mixed-type ordering are right, and commits cost less on Linux
 
@@ -72,7 +77,7 @@ See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
 - **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
 - **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
 
-Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Row 121 closed in 0.10.2. Rows 101, 120, 122, 136, 137, 140, 142, 152, 155, 156 and 159 stay deferred.
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2. Rows 101, 120, 122, 136, 137, 140, 152, 155, 156 and 159 stay deferred.
 
 ### Deprecated
 
