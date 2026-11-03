@@ -829,6 +829,27 @@ jobs:
       - run: npm run build
         working-directory: ui
       - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release --target ${{ matrix.target }}
+      # The test suite does not run on Windows; these are the tests for the
+      # one Windows-specific engine path, the WAL-file identity (ledger row
+      # 122). Each name is run exactly, and a run that matches no test fails:
+      # cargo exits 0 on "0 passed", which would hide a renamed test.
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        name: WAL-identity tests (row 122, Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          one() {
+            out=$(cargo test "$@" -- --exact 2>&1) || { echo "$out"; exit 1; }
+            echo "$out" | grep -E '^test result: ok\. 1 passed' >/dev/null || {
+              echo "$out"; echo "expected exactly one test to run: $*" >&2; exit 1; }
+          }
+          one -p mushroomdb-storage --lib fs::tests::len_and_ident_is_stable_and_distinct
+          for t in a_write_after_an_equal_length_wal_replacement_leaves_an_openable_store \
+                   a_write_after_a_longer_wal_replacement_leaves_an_openable_store \
+                   the_first_append_learns_which_wal_file_it_created \
+                   a_replaced_wal_file_reloads_even_when_it_is_longer; do
+            one -p mushroomdb --test durable_wal "$t"
+          done
       - name: demo, query, snapshot, reopen
         shell: bash
         run: |

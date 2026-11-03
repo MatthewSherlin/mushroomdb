@@ -121,7 +121,8 @@ pub trait Fs {
     ///
     /// A snapshot replaces `wal.bin` by a rename, so the identity changes
     /// even when the new file's length happens to exceed the old cursor.
-    /// Metadata-only, like [`wal_len`](Fs::wal_len).
+    /// Metadata-only on Unix, like [`wal_len`](Fs::wal_len); see
+    /// [`len_and_ident`] for what the identity is on each platform.
     ///
     /// Default: `None` (an in-memory store has one WAL for its whole life).
     fn wal_ident(&self) -> std::io::Result<Option<u64>> {
@@ -131,7 +132,7 @@ pub trait Fs {
     /// [`wal_len`](Fs::wal_len) and [`wal_ident`](Fs::wal_ident) together:
     /// what a write scope checks before every append. `RealFs` reads both
     /// from one look at the file, so a commit pays one `stat` for them, not
-    /// two.
+    /// two (on Windows, one open and two queries of the handle).
     fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
         Ok((self.wal_len()?, self.wal_ident()?))
     }
@@ -542,19 +543,11 @@ impl Fs for RealFs {
     }
 
     fn wal_ident(&self) -> std::io::Result<Option<u64>> {
-        match std::fs::metadata(self.path(FileId::Wal)) {
-            Ok(m) => Ok(file_ident(&m)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(len_and_ident(&self.path(FileId::Wal))?.and_then(|(_, ident)| ident))
     }
 
     fn wal_len_and_ident(&self) -> std::io::Result<(u64, Option<u64>)> {
-        match std::fs::metadata(self.path(FileId::Wal)) {
-            Ok(m) => Ok((m.len(), file_ident(&m))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
-            Err(e) => Err(e),
-        }
+        Ok(len_and_ident(&self.path(FileId::Wal))?.unwrap_or((0, None)))
     }
 
     fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
@@ -703,8 +696,9 @@ impl Fs for RealFs {
     }
 }
 
-/// The inode number on Unix; `None` elsewhere, where the standard library
-/// offers no stable equivalent.
+/// The inode number on Unix; `None` elsewhere, where the metadata alone
+/// carries no stable equivalent. On Windows the identity needs an open
+/// handle: [`len_and_ident`] reads it.
 pub fn file_ident(meta: &std::fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -715,6 +709,96 @@ pub fn file_ident(meta: &std::fs::Metadata) -> Option<u64> {
     {
         let _ = meta;
         None
+    }
+}
+
+/// A file's length and identity from one look, or `None` when it is absent.
+///
+/// The identity is the inode on Unix, read by one `stat` as before. On
+/// Windows it is the file index from `GetFileInformationByHandle`, which
+/// needs a handle, so the file is opened. A rename over the name, as a
+/// snapshot does, gives a new identity even at the same length. Creation
+/// time would not do: Windows name tunneling carries it across a
+/// delete or rename-over, which is exactly the replacement this must see.
+/// On other platforms the identity is `None`.
+pub fn len_and_ident(path: &std::path::Path) -> std::io::Result<Option<(u64, Option<u64>)>> {
+    #[cfg(windows)]
+    let look = File::open(path).and_then(|f| {
+        let len = f.metadata()?.len();
+        Ok((len, win_file_ident::ident(&f)))
+    });
+    #[cfg(not(windows))]
+    let look = std::fs::metadata(path).map(|m| (m.len(), file_ident(&m)));
+    match look {
+        Ok(pair) => Ok(Some(pair)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Windows-only FFI for reading a file's volume-unique index via
+/// `GetFileInformationByHandle`.  Placed in a submodule so the `extern`
+/// block and the `#[repr(C)]` struct stay at item scope, where Rust requires
+/// them, while remaining invisible on non-Windows targets.
+#[cfg(windows)]
+mod win_file_ident {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// Mirrors the Win32 `BY_HANDLE_FILE_INFORMATION` struct.  Each FILETIME
+    /// is two consecutive DWORDs (low, high); laid out as `[u32; 2]` to avoid
+    /// a nested struct without changing alignment or size.
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    /// Return the file's unique index on its volume, or `None` on failure.
+    ///
+    /// Packs `nFileIndexHigh`/`nFileIndexLow` into a single `u64`. On NTFS
+    /// two files on one volume never share it; on ReFS it is a truncation
+    /// of a 128-bit id, which can in principle collide across a large set of
+    /// files but serves this check, which compares one file with its
+    /// replacement. Stable for the file's life; a file renamed over the
+    /// name brings its own.
+    pub(super) fn ident(f: &File) -> Option<u64> {
+        // SAFETY: `f` is a valid open handle; zeroed struct satisfies the
+        // output-parameter contract; no invariants are violated on failure.
+        let mut info = ByHandleFileInformation {
+            dw_file_attributes: 0,
+            ft_creation_time: [0; 2],
+            ft_last_access_time: [0; 2],
+            ft_last_write_time: [0; 2],
+            dw_volume_serial_number: 0,
+            n_file_size_high: 0,
+            n_file_size_low: 0,
+            n_number_of_links: 0,
+            n_file_index_high: 0,
+            n_file_index_low: 0,
+        };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+        if ok != 0 {
+            Some((info.n_file_index_high as u64) << 32 | info.n_file_index_low as u64)
+        } else {
+            None
+        }
     }
 }
 
@@ -856,8 +940,42 @@ mod tests {
         let replaced = fs.wal_len_and_ident().unwrap();
         assert_eq!(replaced, separate(&fs));
         assert_eq!(replaced.0, 6);
-        #[cfg(unix)]
-        assert_ne!(replaced.1, grown.1, "a rename gives the WAL a new identity");
+        // Where the WAL has an identity (Unix and Windows), a
+        // rename must produce a different identity.
+        if grown.1.is_some() {
+            assert_ne!(replaced.1, grown.1, "a rename gives the WAL a new identity");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `len_and_ident` gives an identity on Unix and Windows: the same for
+    /// two looks at one file, different for two files, and different after a
+    /// same-length file is renamed over the name (row 122).
+    #[test]
+    fn len_and_ident_is_stable_and_distinct() {
+        let d = std::env::temp_dir().join(format!("graphdb-fs-ident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path_a = d.join("a.bin");
+        let path_b = d.join("b.bin");
+        assert_eq!(len_and_ident(&path_a).unwrap(), None);
+        std::fs::write(&path_a, b"xy").unwrap();
+        std::fs::write(&path_b, b"xy").unwrap();
+
+        let (len_a, id_a) = len_and_ident(&path_a).unwrap().unwrap();
+        let (_, id_b) = len_and_ident(&path_b).unwrap().unwrap();
+        assert_eq!(len_a, 2);
+        assert_eq!(len_and_ident(&path_a).unwrap().unwrap().1, id_a);
+        #[cfg(any(unix, windows))]
+        {
+            assert!(id_a.is_some() && id_b.is_some());
+            assert_ne!(id_a, id_b, "two files, two identities");
+            std::fs::rename(&path_b, &path_a).unwrap();
+            let (len_after, id_after) = len_and_ident(&path_a).unwrap().unwrap();
+            assert_eq!(len_after, 2);
+            assert_eq!(id_after, id_b, "the name now names b's file");
+            assert_ne!(id_after, id_a, "a same-length rename over the name is seen");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

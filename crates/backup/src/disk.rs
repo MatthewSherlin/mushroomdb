@@ -48,9 +48,7 @@ pub struct DiskState {
 pub fn observe(dir: &Path) -> io::Result<DiskState> {
     let snapshot =
         not_found_is_none(std::fs::metadata(dir.join("snapshot.bin")))?.map(|m| ident_of(&m));
-    let wal_meta = not_found_is_none(std::fs::metadata(dir.join("wal.bin")))?;
-    let wal_len = wal_meta.as_ref().map_or(0, |m| m.len());
-    let wal = wal_meta.as_ref().and_then(file_ident);
+    let (wal_len, wal) = wal_len_and_ident(&dir.join("wal.bin"))?.unwrap_or((0, None));
     let intent_nonempty = not_found_is_none(std::fs::metadata(dir.join("snapshot.intent")))?
         .is_some_and(|m| m.len() > 0);
     Ok(DiskState {
@@ -74,18 +72,78 @@ impl DiskState {
     }
 }
 
-/// The inode number on Unix; `None` elsewhere. The same identity the engine
-/// records for `wal.bin`.
-fn file_ident(meta: &std::fs::Metadata) -> Option<u64> {
+/// `wal.bin`'s length and identity from one look, or `None` when absent: a
+/// `stat` and the inode on Unix, an open and the file index on Windows,
+/// `None` for the identity elsewhere.
+///
+/// Mirrors `core_storage::fs::len_and_ident`: both must agree on what counts
+/// as the same file so that the worker's view of `wal.bin` matches the
+/// engine's.
+fn wal_len_and_ident(path: &Path) -> io::Result<Option<(u64, Option<u64>)>> {
+    #[cfg(windows)]
+    let look = std::fs::File::open(path).and_then(|f| {
+        let len = f.metadata()?.len();
+        Ok((len, win_file_ident::ident(&f)))
+    });
     #[cfg(unix)]
-    {
+    let look = std::fs::metadata(path).map(|m| {
         use std::os::unix::fs::MetadataExt as _;
-        Some(meta.ino())
+        (m.len(), Some(m.ino()))
+    });
+    #[cfg(not(any(unix, windows)))]
+    let look = std::fs::metadata(path).map(|m| (m.len(), None));
+    not_found_is_none(look)
+}
+
+/// Windows-only FFI — see the identical copy in `core_storage::fs`.
+#[cfg(windows)]
+mod win_file_ident {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle as _;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
     }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        None
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    pub(super) fn ident(f: &File) -> Option<u64> {
+        // SAFETY: `f` is a valid open handle; zeroed struct satisfies the
+        // output-parameter contract; no invariants are violated on failure.
+        let mut info = ByHandleFileInformation {
+            dw_file_attributes: 0,
+            ft_creation_time: [0; 2],
+            ft_last_access_time: [0; 2],
+            ft_last_write_time: [0; 2],
+            dw_volume_serial_number: 0,
+            n_file_size_high: 0,
+            n_file_size_low: 0,
+            n_number_of_links: 0,
+            n_file_index_high: 0,
+            n_file_index_low: 0,
+        };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+        if ok != 0 {
+            Some((info.n_file_index_high as u64) << 32 | info.n_file_index_low as u64)
+        } else {
+            None
+        }
     }
 }
 

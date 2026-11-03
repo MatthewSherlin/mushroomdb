@@ -7385,8 +7385,8 @@ impl<F: Fs> GraphDb<F> {
         let frame = try_encode_record(&rec)?;
         self.fs.append(FileId::Wal, &frame)?;
         // The first append to a store with no WAL creates the file: learn
-        // which one it is. One stat, once (where a file identity exists).
-        if cfg!(unix) && self.wal_ident.is_none() {
+        // which one it is. One open, once (where a file identity exists).
+        if (cfg!(unix) || cfg!(windows)) && self.wal_ident.is_none() {
             self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
             self.durable_wal
                 .snapshot_is(self.snapshot_ident, self.wal_ident);

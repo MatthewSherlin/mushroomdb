@@ -157,24 +157,24 @@ there before anything is moved into place.
 
 ---
 
-## Known limit: a replaced WAL of the same length on non-Unix platforms
+## Known limit: a replaced WAL of the same length on non-Windows, non-Unix platforms
 
 Before every write, a handle checks that `wal.bin` is still the file its cursor
-describes. On Unix it compares the file's identity (the inode). On Windows and
-other non-Unix platforms there is no file identity yet, so the handle falls
-back to the WAL's length and the snapshot's identity.
+describes. On Unix it compares the file's identity (the inode). On Windows it
+compares the NTFS file index from `GetFileInformationByHandle`. On other
+platforms (e.g. wasm) there is no file identity, so the handle falls back to
+the WAL's length and the snapshot's identity.
 
 The condition: `wal.bin` is replaced by a different file of exactly the length
 this handle last saw, the snapshot is unchanged, and this handle then writes.
 No length check can see that. The handle appends frames that were encoded
 against the old file onto the new one, and **the store can then fail to open**
-with a `Corrupt` error. On Unix the identity check catches it, and the handle
-reloads before it writes.
+with a `Corrupt` error. On Unix and Windows the identity check catches it, and
+the handle reloads before it writes.
 
-On non-Unix platforms, do not replace a store's `wal.bin` from outside
+On other non-Unix platforms, do not replace a store's `wal.bin` from outside
 mushroomdb while other processes have the store open. Copy or restore WAL files
-only into a store that no process has open. A platform identity check (the
-Windows file index) is tracked as defect-ledger row 122.
+only into a store that no process has open.
 
 ## Worked example: the disposable sidecar
 
