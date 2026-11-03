@@ -472,7 +472,23 @@ jobs:
           git -c user.name=smoke -c user.email=smoke@example.test \
             commit -q --allow-empty -m "smoke test project"
 
-          npx -y "mushroomdb@$VER" install --project --platform claude-code
+          # The wait above can pass on one CDN edge while the next request
+          # lands on an edge still answering ETARGET (v0.10.3: 0.5s apart).
+          # Retry only on not-found; any other failure is a real break.
+          for i in $(seq 1 10); do
+            if npx -y "mushroomdb@$VER" install --project --platform claude-code 2>npx.err; then
+              cat npx.err >&2
+              break
+            fi
+            cat npx.err >&2
+            if ! grep -qE 'ETARGET|E404' npx.err || [ "$i" -eq 10 ]; then
+              exit 1
+            fi
+            echo "npm edge not serving mushroomdb@$VER yet — retrying ($i/10)…"
+            rm -rf "$HOME/.npm"
+            sleep 20
+          done
+          rm -f npx.err
 
           test -f .mcp.json
           command=$(jq -r '.mcpServers.mushroomdb.command' .mcp.json)
