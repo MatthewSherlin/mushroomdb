@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Check the roadmap in `README.md` and open issues before filing —
+        Check open issues and the deferred list in `CHANGELOG.md` before filing —
         the item may already be tracked.
 
   - type: textarea
@@ -59,7 +59,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: I searched existing issues and the roadmap in README.md
+        - label: I searched existing issues and the deferred list in CHANGELOG.md
           required: true
         - label: This is a general-purpose feature (not specific to one domain or label name)
           required: false

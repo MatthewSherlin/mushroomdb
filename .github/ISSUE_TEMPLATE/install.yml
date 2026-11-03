@@ -1,0 +1,55 @@
+name: Install problem
+description: mushroomdb would not install, or the installed binary would not run
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The [Install page](https://matthewsherlin.github.io/mushroomdb/docs/install.html)
+        lists every way to install and what each needs. On Linux, the prebuilt glibc
+        binary needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12). On an older x86_64
+        Linux, `MUSHROOMDB_FORCE_LIBC=musl npx mushroomdb` uses the static build.
+
+  - type: dropdown
+    id: method
+    attributes:
+      label: How you installed
+      options:
+        - npx mushroomdb / npm
+        - pip install mushroomdb
+        - cargo install / cargo add
+        - Docker image
+        - install.sh
+        - Claude Code plugin
+        - Release tarball
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: "e.g. npx mushroomdb install --db ./memory"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full output, including any error. Paste it as text, not a screenshot.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, CPU arch, and the version of the tool you installed with
+      placeholder: |
+        OS: Ubuntu 22.04 x86_64 (ldd --version: 2.35)
+        Node: 22.11.0 / Python: 3.12 / Rust: 1.92.0
+    validations:
+      required: true
