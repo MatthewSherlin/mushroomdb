@@ -284,7 +284,10 @@ fn a_peer_snapshot_shows_until_the_handle_catches_up() {
 /// here replaced by a longer copy, so a length check alone would read a tail
 /// at the old offset — the refresh must reload, and the position must name
 /// the file on disk.
-#[cfg(unix)]
+///
+/// Runs on Unix and Windows: both platforms return a file identity from
+/// `disk_wal_ident`, so the `assert_ne` is meaningful on both.
+#[cfg(any(unix, windows))]
 #[test]
 fn a_replaced_wal_file_reloads_even_when_it_is_longer() {
     let dir = tmp("walident");
@@ -308,7 +311,10 @@ fn a_replaced_wal_file_reloads_even_when_it_is_longer() {
     assert_eq!(a.read().node_count(), 4);
 }
 
-#[cfg(unix)]
+/// The first append learns the WAL file it created. On Unix and Windows a
+/// file identity is available, so `wal` in the durable position goes from
+/// `None` (no WAL yet) to `Some` (the new file) and matches `disk_wal_ident`.
+#[cfg(any(unix, windows))]
 #[test]
 fn the_first_append_learns_which_wal_file_it_created() {
     let dir = tmp("walcreate");
@@ -324,7 +330,11 @@ fn the_first_append_learns_which_wal_file_it_created() {
 /// `keys` under the label `B`, and return the replacement's length. The other
 /// label interns differently, so frames this store's handle encodes against
 /// its own interner do not decode on top of the replacement.
-#[cfg(unix)]
+///
+/// On Windows, `std::fs::rename` uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`, which works because `RealFs::append` does not
+/// hold the WAL open between writes (the `File` is dropped after each call).
+#[cfg(any(unix, windows))]
 fn replace_wal_with_another_stores(dir: &Path, name: &str, keys: &[&str]) -> u64 {
     let other = tmp(name);
     {
@@ -340,12 +350,17 @@ fn replace_wal_with_another_stores(dir: &Path, name: &str, keys: &[&str]) -> u64
     wal_len(dir)
 }
 
-/// A write scope appends at this handle's cursor, so it must not append to a
-/// WAL file that is not the one the cursor describes. When a peer replaced
-/// the WAL with a file of exactly the cursor's length, no length check can
-/// tell; only the file's identity can. Frames appended on top of the wrong
-/// file are encoded against the wrong state, and the store no longer opens.
-#[cfg(unix)]
+/// Row 122 regression: a write scope must not append to a WAL file that is
+/// not the one the cursor describes. When a peer replaced the WAL with a file
+/// of exactly the cursor's length, no length check can tell; only the file's
+/// identity can. Frames appended on top of the wrong file are encoded against
+/// the wrong state, and the store no longer opens.
+///
+/// Previously broken on Windows (and other non-Unix platforms) because
+/// `file_ident` returned `None`, so the identity comparison `None == None`
+/// never fired. Fixed by reading the NTFS file index via
+/// `GetFileInformationByHandle`.
+#[cfg(any(unix, windows))]
 #[test]
 fn a_write_after_an_equal_length_wal_replacement_leaves_an_openable_store() {
     let dir = tmp("waleqwrite");
@@ -371,7 +386,7 @@ fn a_write_after_an_equal_length_wal_replacement_leaves_an_openable_store() {
 }
 
 /// The same, with a replacement longer than the cursor.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_write_after_a_longer_wal_replacement_leaves_an_openable_store() {
     let dir = tmp("wallongwrite");

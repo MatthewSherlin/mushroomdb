@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **On Windows, a WAL replaced by a same-length file no longer leaves a store
+  that does not open.** A handle checks before each write that `wal.bin` is
+  still the file it has been appending to. On Windows it had no way to tell
+  two files apart, so a peer that replaced `wal.bin` with a file of exactly
+  the handle's length went unnoticed: the next write appended frames to the
+  wrong file and the store then failed to open with `Corrupt`. The check now
+  reads the file index Windows keeps for each file, which a rename over the
+  name changes; Unix already compared the inode and is unchanged. Platforms
+  that are neither Unix nor Windows still have no file identity. Present in
+  released 0.9.x and 0.10.x (ledger row 122).
+
 ## v0.10.2 — a revoked key stops working on an open connection, and the Linux binaries run on older systems
 
 ### Fixed
