@@ -1059,8 +1059,9 @@ each one leaves out.
 | Embed it in a Rust program | `cargo add mushroomdb` | The engine as a library | The CLI, the MCP server, the UI |
 | Embed it in a Python program | `pip install mushroomdb` | The engine as a module: rules, Cypher, vectors, history, scoped handles, the graph algorithms, full-text, and the memory calls (`remember`, `recall`, `upsert_entity`, `forget`) as data | The MCP server and the UI: it is a library, not a tool surface |
 | Build the CLI from crates.io | `cargo install mushroomdb-cli` | The `mushroomdb` binary | **The explorer UI.** This build has none, and `serve` answers the API only without saying so. Use the `npx` or Docker row to see the graph |
+| Put the release binary on your `PATH` (macOS, Linux) | `curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/mushroomdb/main/packaging/install.sh \| sh` | The latest release's `mushroomdb` binary, UI included, checksum-verified, in `~/.local/bin` with no sudo; `MUSHROOMDB_INSTALL_DIR` picks another directory | An assistant wired to it: run `mushroomdb install` after |
 
-Docker details, `install.sh`, and building the binary with the UI embedded are in
+Docker details and building the binary with the UI embedded are in
 [CONTRIBUTING.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/CONTRIBUTING.md).
 
 ## Platforms
