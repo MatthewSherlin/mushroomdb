@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://matthewsherlin.github.io/mushroomdb/docs/
+    about: Install, quickstart, Cypher, rules, access control and self-hosting.
+  - name: Report a security vulnerability
+    url: https://github.com/MatthewSherlin/mushroomdb/security/advisories/new
+    about: Report privately, not in a public issue. See SECURITY.md.
