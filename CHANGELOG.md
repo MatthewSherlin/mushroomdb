@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.10.3 — a replaced WAL is seen on Windows
 
 ### Fixed
 
@@ -92,7 +92,7 @@ See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
 - **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
 - **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
 
-Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2. Rows 101, 120, 122, 136, 137, 140, 152, 155, 156 and 159 stay deferred.
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2, row 122 in 0.10.3. Rows 101, 120, 136, 137, 140, 152, 155, 156 and 159 stay deferred.
 
 ### Deprecated
 
