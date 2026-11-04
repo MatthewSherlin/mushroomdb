@@ -3450,7 +3450,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.10.3", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.10.4", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -5267,7 +5267,7 @@ A Bolt connection that logs in with a role token, or with a `read` key, sees and
 - **`SHOW INDEXES` and `SHOW CONSTRAINTS`** list only the indexes and constraints on labels that a node the role can see carries, as they do over HTTP.
 - **Auto-commit writes.** A role with a write scope writes through the same scoped write path `/query` uses: a write outside the scope (a label it may not create, a namespace outside its binding) fails with `Forbidden` and the message HTTP gives with its 403, and a pattern naming a node the role cannot see matches nothing. A role with no write scope, and every `read` key, is refused every write (`read-tier key: writes are not permitted` for a key).
 - **Schema statements.** `CREATE` and `DROP` of an index or constraint fail with `Forbidden` for a role.
-- **Explicit transactions.** `BEGIN` resolves the role on the snapshot it freezes. Every statement reads through the role on that snapshot, so a commit that lands after `BEGIN` is not seen. A write fails with `Forbidden`: `role-bound token: writes are not permitted inside a transaction` for a role token, even one with a write scope, and the `read` key text for a key. Use auto-commit to write with a role (ledger row 140, planned for 0.11). `COMMIT` writes nothing and returns the bookmark of the commit the snapshot read. HTTP keeps its transaction open after a refused statement; on Bolt the failure ends the transaction, as the Bolt state machine requires, and the client sends `RESET`.
+- **Explicit transactions.** `BEGIN` resolves the role on the snapshot it freezes. Every statement reads through the role on that snapshot, so a commit that lands after `BEGIN` is not seen. A role token with a write scope writes inside a transaction exactly as it does in auto-commit: a write outside the scope, or targeting a node the role cannot see, fails with `Forbidden` and the same message HTTP gives. A role token with no write scope is refused every write (`role-bound token: writes are not permitted`). A `read` key is refused every write (`read-tier key: writes are not permitted`). `COMMIT` writes the buffered statements and returns their bookmark for a write-scope role (or the snapshot's commit when nothing was written), and writes nothing for a no-scope role or `read` key. HTTP keeps its transaction open after a refused statement; on Bolt the failure ends the transaction, as the Bolt state machine requires, and the client sends `RESET`.
 - **A role that no longer exists.** The role is resolved for each statement and at each `BEGIN`, not only at `HELLO`. Once the store no longer defines it, the next statement or `BEGIN` fails with `Unauthorized`, as HTTP answers 401. A change to the role's definition applies from the next auto-commit statement or `BEGIN`; an open transaction keeps the role as it was at its `BEGIN`.
 - **Revoking a credential.** A key removed from `keys.json` and reloaded with `SIGHUP` is refused on its next `RUN`, `BEGIN`, or `COMMIT` on any already-open Bolt connection, with `Neo.ClientError.Security.Unauthorized`; a revoked key's open transaction is rolled back. HTTP refuses it on its next request. If the key's tier or role is changed rather than removed, the behaviour depends on whether a transaction is open. **Outside a transaction:** the new identity takes effect silently on the next statement — a key demoted from `write` to `read` fails its next write with `Forbidden`. **Inside a transaction:** any change to the identity (tier or role) is refused immediately with `Forbidden` and the transaction is rolled back; the client can reset and start a new transaction under the updated identity. This rule covers `RUN`, `BEGIN`, and `COMMIT`: a `COMMIT` for a transaction whose key changed since `BEGIN` is also rolled back. A `PULL` or `DISCARD` that is already streaming its rows is not interrupted. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 - **No per-request narrowing.** The `/query` body fields `mask`, `namespace` and `as_of` have no Bolt equivalent. Bolt applies only the credential's own scope.
@@ -5393,7 +5393,7 @@ A bookmark is the text `mushroomdb:commit:<n>`, where `n` is a commit number. `C
 
 Every write statement that runs as an auto-commit `RUN` also runs inside `BEGIN` … `COMMIT`, with the same results and counts: `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`, `MATCH … MERGE`, `UNWIND … <write>` (such as `UNWIND $rows AS r MATCH … CREATE …`), the `SET n = {…}` / `SET n += {…}` map forms and `SET` / `REMOVE … RETURN`. So drivers' managed write transactions (`session.execute_write` and the like), which send `BEGIN`, run them too. Schema statements (`CREATE INDEX`, `CREATE CONSTRAINT` and the rest) are still refused inside a transaction. See [Write statements](query.md#write-statements).
 
-A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's or `read` key's transaction reads through its role and cannot write (see [Scoped access](#scoped-access)); use auto-commit to write with a role. A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
+A `COMMIT` or `ROLLBACK` while a result is still open is a protocol violation, as the Bolt state machine specifies; pull or discard the open results first, as the drivers do. A role-bound token's transaction reads through its role; a role with a write scope writes with the same scope restrictions as auto-commit, and a role with no write scope cannot write (see [Scoped access](#scoped-access)). A `write` or `admin` key from `keys.json` writes in a transaction; a `read` key cannot run a writing statement anywhere. See [Access keys and the write tier](http.md#access-keys-and-the-write-tier).
 
 A transaction idle for `--bolt-tx-timeout-secs` (30 seconds by default) is rolled back, and the next request fails with `TransactionTimedOut`. An open result idle as long is closed. There is no lifetime limit on a Bolt transaction and no cap on open ones beyond `--bolt-max-connections`, since a connection holds at most one. Every open transaction is in the server's memory: a restart rolls it back and nothing of it is written.
 
@@ -5503,8 +5503,9 @@ Bolt carries Cypher statements and the catalog procedures above. These are HTTP 
   of an association, node and relationship history, the algorithm routes, live streams (`/watch`,
   `/subscribe`) and the service routes (`/health`, `/ready`, `/stats`, `/metrics`). See the
   [HTTP API](http.md).
-- **Writes in a role-scoped transaction.** A role token's or `read` key's transaction is read-only
-  (ledger row 140, planned for 0.11); write with a role through auto-commit `RUN`.
+- **Writes in a role-scoped transaction with no write scope.** A role token with no write scope, and
+  every `read` key, cannot write inside a transaction. A role token with a write scope writes with
+  the same scope restrictions as auto-commit `RUN`.
 - **Schema statements inside a transaction**, `PROFILE`, impersonation (`imp_user`), Bolt 5.1 and later
   (`LOGON` / `LOGOFF`), and the Time, LocalTime, Point and named-time-zone value types.
 
@@ -5953,16 +5954,21 @@ bookmark back: pass `bookmark_text`, or a bookmark a Bolt commit returned, in a 
 no bookmark. A Bolt `BEGIN` or `RUN` given a bookmark waits until the store has reached that commit
 (5 s by default, `--bookmark-timeout-secs`), so a read on another session sees the write.
 
-## Scoped transactions are read-only
+## Scoped transactions
 
 A transaction begun with a role token or a `read`-tier key (HTTP and Bolt), or on a Python `scoped()`
-handle, reads through its role (for a `read` key, the role the key names) on the snapshot it began
-on, and **cannot write**. This holds even for a
-role whose write scope lets it write through `POST /query` or a Bolt auto-commit `RUN`: the
-transaction engine has no role-scoped commit yet. Its commit writes nothing and returns the commit it
-read. Role-scoped writes inside a transaction are planned for 0.11 (ledger row 140); until then, write
-with a role through auto-commit statements. The full token, `admin` keys and `write` keys run
-transactions without this limit.
+handle, reads through its role (for a `read` key, the role the key names) on the snapshot it began on.
+
+A role token with a **write scope** writes inside a transaction with the same authority it has for
+auto-commit statements (`POST /query`, Bolt auto-commit `RUN`): a write outside the scope (a label
+or edge type the role may not create, update, or delete), or one targeting a node the role's mask
+hides, is refused with `Forbidden` and the same message. Its `COMMIT` writes the buffered batch and
+returns the new bookmark, or the snapshot's commit if the transaction wrote nothing.
+
+A role token with **no write scope**, and every `read`-tier key, cannot write. Any write statement is
+refused with `Forbidden` (`role-bound token: writes are not permitted` or
+`read-tier key: writes are not permitted`), and its commit writes nothing, returning the commit the
+snapshot read. The full token, `admin` keys and `write` keys run transactions without this limit.
 
 ## Limits
 
@@ -6471,14 +6477,22 @@ MATCH (a:N)-[r:RATED]->(b:N)
 RETURN AVG(r.score)
 ```
 
-Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
-`AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
+Supported functions: `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `AVG(x)`, `MIN(x)`,
+`MAX(x)`, `COLLECT(x)`.
 
-Each takes a property or a bare variable (`UNWIND [1, 2] AS x RETURN max(x)`).
+Each takes any expression as its argument: a property (`n.age`), a bare variable
+(`UNWIND [1, 2] AS x RETURN max(x)`), or a general expression
+(`RETURN max(n.age + 1)`, `SUM(r.score * 2)`, `COLLECT(toLower(n.name))`).
 `SUM` of integers is an integer (an overflow past 64 bits is an error) and is a
 float once any input is a float; `AVG` is always a float. `MIN` and `MAX` order
 any non-null value, strings included. `SUM`, `AVG`, `MIN` and `MAX` of a node or
 relationship variable are errors.
+
+Null values in the expression result are silently skipped for all aggregates
+except `COUNT(*)`. `SUM` over a set where every value is null or non-numeric
+returns `0` (openCypher rule); `AVG`, `MIN`, and `MAX` over no values return
+`null`. The `0` returned by an empty `SUM` is always an integer, even when all
+non-null inputs that were encountered before they were discarded were floats.
 
 ### DISTINCT inside an aggregate
 
@@ -6510,7 +6524,7 @@ LIMIT 5
   RETURN clause.
 - `NULL` group-key values group together (openCypher semantics).
 - Empty input with no group-key items yields exactly one row (openCypher
-  semantics: `COUNT=0`, other aggregates `null`).
+  semantics: `COUNT=0`, `SUM=0`, `AVG`/`MIN`/`MAX`=`null`).
 - Group count is capped at 1,000,000 distinct keys per query.
 - `ORDER BY` + `LIMIT` sort the finished group table (top-k groups), not
   the input rows; the LIMIT push-down optimisation is intentionally
@@ -9154,13 +9168,15 @@ rolls back every open one.
   the drain and answers `POST /tx/begin` with `503`. A statement already running finishes, and then
   its transaction is rolled back too.
 - **Read-tier keys and role tokens.** A `read`-tier key or a role token may begin a transaction.
-  Its reads go through the role's mask, on the snapshot the transaction began on. It cannot write: a
-  write statement is `403`, with the same message `/query` gives (`read-tier key: writes are not
-  permitted` for a key), and the transaction stays open. This holds for a role token whose role
-  carries a write scope too, although `POST /query` would let it write: a transaction has no
-  role-aware commit yet (ledger row 140, planned for 0.11). Its commit writes nothing and returns the
-  commit number it read. `write`-tier and `admin` keys and the full token run the transaction engine
-  itself.
+  Its reads go through the role's mask, on the snapshot the transaction began on. A role token with
+  a write scope writes inside the transaction with the same authority it has for `POST /query`: a
+  write outside the scope or targeting a masked node is `403` with the same message, and the
+  transaction stays open. Its commit writes the buffered statements and returns their commit number,
+  or the snapshot's commit if nothing was written. A role token with no write scope, and every
+  `read`-tier key, cannot write: a write statement is `403` (`read-tier key: writes are not
+  permitted` for a key, `role-bound token: writes are not permitted` for a no-scope role), and its
+  commit writes nothing, returning the commit number it read. `write`-tier and `admin` keys and the
+  full token run the transaction engine itself.
 - **Schema statements.** `CREATE` and `DROP` of an index or constraint are refused inside a
   transaction, with a `400` that says so. `SHOW` is allowed.
 
@@ -17073,7 +17089,7 @@ What mushroomdb does not do, or does only up to a point. Each row says what was 
 | Limitation | Detail |
 |---|---|
 | Memory-first | The working graph lives in RAM. **Measured to 100,000 nodes and about 10 million derived edges**, on a 24 GiB machine, across two builds: on v0.1.1 (2026-08-24), 4.72 GiB peak while building it and 8.09 GiB to replay the WAL with no snapshot; on v0.2 (2026-08-28), 0.02 s at 31–41 MiB to reopen from a snapshot, which is memory-mapped rather than loaded. None of these was re-measured on the current build. Ten million nodes was the original design intent and is not a measurement. A memory-shaped run on 0.8.0 (entities with text, the memory schema, about 1.6 edges per node and one rule) reached **1,000,000 nodes at 2.65 GiB peak**, opening in 1.18 s from a snapshot and 11.3 s from the WAL, with `recall` at 66 ms p50; its one rule tripped its 1,000,000-edge budget, so that run says nothing about ten million derived edges at that size. In the 100,000-node run each rule was capped at 1,000,000 derived edges. See [`dogfood/results/scale-memory-1m.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-memory-1m.md). See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
-| Single writer; interactive transactions are snapshot-isolated and in memory | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Interactive transactions (HTTP `/tx/*`, Bolt `BEGIN`/`COMMIT`) group statements into one atomic commit under snapshot isolation, but live in the server's memory and are rolled back by a restart; see [Transactions](transactions.md). Isolation is snapshot isolation, not serializable: write skew is possible. A transaction begun with a role token or a `read` key cannot write (planned for 0.11). There are no cross-process transactions. |
+| Single writer; interactive transactions are snapshot-isolated and in memory | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Interactive transactions (HTTP `/tx/*`, Bolt `BEGIN`/`COMMIT`) group statements into one atomic commit under snapshot isolation, but live in the server's memory and are rolled back by a restart; see [Transactions](transactions.md). Isolation is snapshot isolation, not serializable: write skew is possible. A transaction begun with a role token that has a write scope writes with the same scope restrictions as auto-commit; a role token with no write scope, and every `read` key, cannot write inside a transaction. There are no cross-process transactions. |
 | Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a snapshot (measured on V8; the format is V9 now, V10 with multiplicity) vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
