@@ -504,7 +504,8 @@ relationship variable are errors.
 Null values in the expression result are silently skipped for all aggregates
 except `COUNT(*)`. `SUM` over a set where every value is null or non-numeric
 returns `0` (openCypher rule); `AVG`, `MIN`, and `MAX` over no values return
-`null`.
+`null`. The `0` returned by an empty `SUM` is always an integer, even when all
+non-null inputs that were encountered before they were discarded were floats.
 
 ### DISTINCT inside an aggregate
 

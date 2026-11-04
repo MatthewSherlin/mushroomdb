@@ -632,3 +632,58 @@ fn other_aggregates_over_empty_set_remain_null() {
         );
     }
 }
+
+// ── Review fixes: nested aggregates, nondeterminism, and grouped DISTINCT $param
+
+/// Nested aggregates inside an aggregate argument are refused at check time
+/// with the NestedAggregation kind (openCypher Return6 [14]).
+#[test]
+fn nested_aggregate_in_aggregate_arg_is_refused() {
+    let fx = Fx::new();
+    // max(count(x)) — count nested inside max.
+    let err = try_rows(&fx, "UNWIND [1,2] AS x RETURN max(count(x))")
+        .expect_err("max(count(x)) must be refused");
+    assert!(
+        err.contains("NestedAggregation"),
+        "expected NestedAggregation, got: {err}"
+    );
+    // count(DISTINCT sum(x)) — sum nested inside DISTINCT count.
+    let err = try_rows(&fx, "UNWIND [1,2] AS x RETURN count(DISTINCT sum(x))")
+        .expect_err("count(DISTINCT sum(x)) must be refused");
+    assert!(
+        err.contains("NestedAggregation"),
+        "expected NestedAggregation in DISTINCT case, got: {err}"
+    );
+}
+
+/// count(rand()) is refused at check time with NonConstantExpression
+/// (openCypher Return6 [15]).
+#[test]
+fn nondeterministic_function_in_aggregate_arg_is_refused() {
+    let fx = Fx::new();
+    let err = try_rows(&fx, "RETURN count(rand())").expect_err("count(rand()) must be refused");
+    assert!(
+        err.contains("NonConstantExpression"),
+        "expected NonConstantExpression, got: {err}"
+    );
+}
+
+/// Grouped query with a $param inside DISTINCT expression aggregate
+/// argument: the param must be found by pre-flight so the query does not
+/// fail with "missing parameter" (fix 3).
+#[test]
+fn grouped_sum_with_distinct_param_expression_argument() {
+    let fx = Fx::new();
+    let mut params = BTreeMap::new();
+    params.insert("inc".to_string(), Value::Int(10));
+    // DISTINCT $param + n.x inside a grouped aggregate.
+    let rs = run(
+        &fx.view(),
+        "UNWIND [1, 2, 2, 3] AS x RETURN count(DISTINCT $inc + x)",
+        &params,
+    )
+    .unwrap_or_else(|e| panic!("grouped DISTINCT $param query failed: {e}"));
+    assert_eq!(rs.len(), 1);
+    // $inc + x gives [11, 12, 12, 13]; DISTINCT → 3 unique.
+    assert_eq!(rs.row(0), &[int(3)]);
+}

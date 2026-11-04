@@ -1257,13 +1257,15 @@ fn collect_params_from_ops(
                     collect_ret_item_params(item, names, seen);
                 }
                 for (_, arg, _) in aggs {
-                    match arg {
-                        AggArg::Star => {}
-                        AggArg::Var(_) => {}
-                        AggArg::Prop { .. } => {}
-                        AggArg::Distinct(_) => {}
-                        // Collect $param names from expression arguments (row 159).
-                        AggArg::Expr(op) => collect_operand(op, names, seen),
+                    // Peel DISTINCT to reach the inner arg, mirroring the
+                    // Aggregate case above (row 159 fix 3: grouped DISTINCT
+                    // expression args must register their $params).
+                    let inner = match arg {
+                        AggArg::Distinct(inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    if let AggArg::Expr(op) = inner {
+                        collect_operand(op, names, seen);
                     }
                 }
             }
