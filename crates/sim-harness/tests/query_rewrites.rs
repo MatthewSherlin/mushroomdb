@@ -132,15 +132,10 @@ fn pred_strategy() -> impl Strategy<Value = Pred> {
     })
 }
 
-/// `sum` over no values. openCypher returns 0; the engine returns null and pins
-/// that in `exec.rs` (`sum_numeric_prop_ignores_null_and_non_numeric`). Kept
-/// as found until the owner rules on it; flipping it is this one function.
+/// `sum` over the values: 0 over none, as openCypher gives and the engine has
+/// since 0.10.4 (ledger row 166).
 fn sum_of(values: &[i64]) -> Option<Value> {
-    if values.is_empty() {
-        None
-    } else {
-        Some(Value::Int(values.iter().sum()))
-    }
+    Some(Value::Int(values.iter().sum()))
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
