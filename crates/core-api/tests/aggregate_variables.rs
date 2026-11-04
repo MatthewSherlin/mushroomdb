@@ -142,7 +142,9 @@ fn empty_and_all_null_inputs() {
         format!("{ONE} UNWIND [] AS x"),
         "MATCH (n:Unset) WITH n.v AS x".to_string(),
     ] {
-        for f in ["max", "min", "sum", "avg"] {
+        // openCypher row 166: sum over no numeric values is 0, not null.
+        assert_eq!(one(&db, &format!("{l} RETURN sum(x)")), int(0), "{l} sum");
+        for f in ["max", "min", "avg"] {
             assert_eq!(one(&db, &format!("{l} RETURN {f}(x)")), None, "{l} {f}");
         }
         assert_eq!(one(&db, &format!("{l} RETURN count(x)")), int(0));
@@ -303,7 +305,8 @@ fn reference(f: &str, vals: &[Option<Value>]) -> Option<Value> {
     };
     match f {
         "count" => int(present.len() as i64),
-        "sum" if nums.is_empty() => None,
+        // openCypher row 166: sum over no numeric values is 0, not null.
+        "sum" if nums.is_empty() => int(0),
         "sum" if present.iter().all(|v| matches!(v, Some(Value::Int(_)))) => int(present
             .iter()
             .map(|v| match v {
@@ -424,9 +427,10 @@ fn sum_of_integers_is_an_integer() {
         one(&db, &format!("{ONE} UNWIND [2.5, 1] AS x RETURN sum(x)")),
         float(3.5)
     );
+    // openCypher row 166: sum over empty set is 0, not null.
     assert_eq!(
         one(&db, &format!("{ONE} UNWIND [] AS x RETURN sum(x)")),
-        None
+        int(0)
     );
     // avg stays a float.
     assert_eq!(

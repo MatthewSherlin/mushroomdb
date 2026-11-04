@@ -579,17 +579,9 @@ const TCK_ONLY_NAMES: &[&str] = &["foo"];
 
 /// Aggregates the engine takes only over a variable (`sum(x)`), not over an
 /// expression (`sum([1, 2])`).
-const VARIABLE_ONLY_AGGREGATES: &[&str] = &[
-    "avg",
-    "collect",
-    "max",
-    "min",
-    "percentilecont",
-    "percentiledisc",
-    "stdev",
-    "stdevp",
-    "sum",
-];
+// Row 159: aggregate functions now accept any expression argument, not only a
+// variable or property.  The VARIABLE_ONLY_AGGREGATES note has been removed.
+const VARIABLE_ONLY_AGGREGATES: &[&str] = &[];
 
 /// The page `--function-table` writes: one row per Cypher function the TCK
 /// calls, plus every function the engine lists that no scenario calls. Two

@@ -40,6 +40,10 @@ pub const UNKNOWN_FUNCTION: &str = "UnknownFunction";
 /// An argument (or a property access, or an `IN` list) of a kind the
 /// operation cannot take.
 pub const INVALID_ARGUMENT_TYPE: &str = "InvalidArgumentType";
+/// An aggregate nested directly inside another aggregate's argument.
+pub const NESTED_AGGREGATION: &str = "NestedAggregation";
+/// A non-deterministic function used as an aggregate argument.
+pub const NON_CONSTANT_EXPRESSION: &str = "NonConstantExpression";
 
 /// Every error kind the check raises.
 pub const ERROR_KINDS: &[&str] = &[
@@ -52,6 +56,8 @@ pub const ERROR_KINDS: &[&str] = &[
     DIFFERENT_COLUMNS_IN_UNION,
     UNKNOWN_FUNCTION,
     INVALID_ARGUMENT_TYPE,
+    NESTED_AGGREGATION,
+    NON_CONSTANT_EXPRESSION,
 ];
 
 /// The refusal message: the kind, then what is wrong.
@@ -433,8 +439,32 @@ fn check_items(scope: &Scope, items: &[RetItem]) -> Result<(), String> {
                 if let AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } = func {
                     check_operand(scope, p, Ctx::Value)?;
                 }
-                if let AggArg::Prop { var, field } = arg {
-                    check_property(scope, var, field)?;
+                // Peel DISTINCT to reach the inner arg for checking.
+                let inner = match arg {
+                    AggArg::Distinct(inner) => inner.as_ref(),
+                    other => other,
+                };
+                match inner {
+                    AggArg::Prop { var, field } => check_property(scope, var, field)?,
+                    AggArg::Expr(op) => {
+                        // openCypher forbids aggregates nested inside aggregate arguments.
+                        if contains_aggregate(op) {
+                            return Err(refuse(
+                                NESTED_AGGREGATION,
+                                "aggregate functions cannot be nested inside an aggregate argument",
+                            ));
+                        }
+                        // Non-deterministic functions are disallowed in aggregate
+                        // arguments (openCypher Return6 [15]).
+                        if contains_nondeterministic(op) {
+                            return Err(refuse(
+                                NON_CONSTANT_EXPRESSION,
+                                "non-deterministic functions cannot be used as aggregate arguments",
+                            ));
+                        }
+                        check_operand(scope, op, Ctx::Value)?;
+                    }
+                    _ => {}
                 }
             }
             RetVal::FuncCall { name, args } => check_call(scope, name, args, Ctx::Value)?,
@@ -476,6 +506,26 @@ fn contains_aggregate(op: &Operand) -> bool {
     visit_operand(op, &mut |o| {
         if let Operand::FuncCall { name, .. } = o {
             if is_aggregate_name(name) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Non-deterministic functions that the openCypher spec disallows inside
+/// aggregate arguments (Return6 [15]: `count(rand())` is a SyntaxError).
+const NONDETERMINISTIC: &[&str] = &["rand"];
+
+/// Whether an operand calls a non-deterministic function anywhere inside it.
+fn contains_nondeterministic(op: &Operand) -> bool {
+    let mut found = false;
+    visit_operand(op, &mut |o| {
+        if let Operand::FuncCall { name, .. } = o {
+            if NONDETERMINISTIC
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+            {
                 found = true;
             }
         }

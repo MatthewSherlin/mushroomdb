@@ -1943,13 +1943,15 @@ impl<'a> Parser<'a> {
                 let arg = if self.eat(&Tok::Star) {
                     AggArg::Star
                 } else {
-                    let var = self.ident("expected variable or '*' in aggregate argument")?;
-                    if self.eat(&Tok::Dot) {
-                        let field =
-                            self.ident("expected field name after '.' in aggregate argument")?;
-                        AggArg::Prop { var, field }
-                    } else {
-                        AggArg::Var(var)
+                    // Parse a full expression (openCypher row 159: aggregate
+                    // arguments accept any expression).  `Var` and `Prop` are
+                    // mapped back to their fast-path variants so the executor's
+                    // optimised arms still fire for the common forms.
+                    let op = self.value_expr()?;
+                    match op {
+                        Operand::Var(v) => AggArg::Var(v),
+                        Operand::Prop { var, field } => AggArg::Prop { var, field },
+                        other => AggArg::Expr(Box::new(other)),
                     }
                 };
                 let arg = if distinct {

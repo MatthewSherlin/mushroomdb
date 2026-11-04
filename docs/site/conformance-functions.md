@@ -6,16 +6,16 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 
 | Function | In the engine | TCK scenarios | Notes |
 |---|---|---|---|
-| `abs` | implemented | 2 / 4 |  |
+| `abs` | implemented | 3 / 4 |  |
 | `atan` | implemented | — | no TCK scenarios |
 | `atan2` | implemented | — | no TCK scenarios |
-| `avg` | implemented | 1 / 6 | aggregate: takes a variable, not an expression |
+| `avg` | implemented | 1 / 6 |  |
 | `ceil` | implemented | 0 / 1 |  |
 | `coalesce` | implemented | 28 / 30 |  |
-| `collect` | implemented | 11 / 96 | aggregate: takes a variable, not an expression; 2 skipped |
+| `collect` | implemented | 74 / 96 | 2 skipped |
 | `contains` | implemented | — | no TCK scenarios |
 | `cos` | implemented | — | no TCK scenarios |
-| `count` | implemented | 97 / 183 | 3 skipped |
+| `count` | implemented | 101 / 183 | 3 skipped |
 | `date` | implemented | 153 / 177 | 45 skipped |
 | `date.realtime` | implemented | 1 / 1 |  |
 | `date.statement` | implemented | 1 / 1 |  |
@@ -47,7 +47,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `labels` | implemented | 6 / 12 | 10 skipped |
 | `last` | implemented | 0 / 1 |  |
 | `left` | implemented | — | no TCK scenarios |
-| `length` | implemented | 4 / 8 |  |
+| `length` | implemented | 5 / 8 |  |
 | `localdatetime` | implemented | 209 / 234 | 96 skipped |
 | `localdatetime.realtime` | implemented | 1 / 1 |  |
 | `localdatetime.statement` | implemented | 1 / 1 |  |
@@ -61,11 +61,11 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `log` | implemented | — | no TCK scenarios |
 | `log10` | implemented | — | no TCK scenarios |
 | `ltrim` | implemented | — | no TCK scenarios |
-| `max` | implemented | 22 / 29 | aggregate: takes a variable, not an expression |
-| `min` | implemented | 0 / 9 | aggregate: takes a variable, not an expression |
+| `max` | implemented | 22 / 29 |  |
+| `min` | implemented | 1 / 9 |  |
 | `nodes` | implemented | 3 / 12 |  |
-| `percentilecont` | implemented | 6 / 6 | aggregate: takes a variable, not an expression |
-| `percentiledisc` | implemented | 6 / 7 | aggregate: takes a variable, not an expression |
+| `percentilecont` | implemented | 6 / 6 |  |
+| `percentiledisc` | implemented | 6 / 7 |  |
 | `pi` | implemented | — | no TCK scenarios |
 | `properties` | implemented | 6 / 7 |  |
 | `rand` | implemented | 64 / 65 |  |
@@ -84,7 +84,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `startnode` | implemented | 0 / 1 |  |
 | `startswith` | implemented | — | no TCK scenarios |
 | `substring` | implemented | 1 / 1 |  |
-| `sum` | implemented | 6 / 31 | aggregate: takes a variable, not an expression |
+| `sum` | implemented | 7 / 31 |  |
 | `tail` | implemented | 0 / 9 |  |
 | `tan` | implemented | — | no TCK scenarios |
 | `textmatches` | implemented | — | no TCK scenarios |
@@ -97,7 +97,7 @@ Every Cypher function the openCypher TCK calls, and every function the engine li
 | `tobooleanornull` | implemented | — | no TCK scenarios |
 | `tofloat` | implemented | 5 / 11 |  |
 | `tofloatornull` | implemented | — | no TCK scenarios |
-| `tointeger` | implemented | 8 / 18 |  |
+| `tointeger` | implemented | 11 / 18 |  |
 | `tointegerornull` | implemented | — | no TCK scenarios |
 | `tolower` | implemented | 1 / 1 |  |
 | `tostring` | implemented | 22 / 29 | 3 skipped |
