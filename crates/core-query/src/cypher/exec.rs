@@ -829,7 +829,7 @@ fn execute_inner(
                     }
                     let (_, accs) = grp_groups.get_mut(&gk).unwrap();
                     for (acc, (func, arg, _)) in accs.iter_mut().zip(aggs.iter()) {
-                        update_acc(view, &vars, row, func, arg, acc)?;
+                        update_acc(view, &vars, row, func, arg, acc, params)?;
                     }
                 }
                 // Same openCypher rule as execute_group_aggregate: no-key multi-agg on
@@ -1242,6 +1242,16 @@ fn collect_params_from_ops(
                     let _ = collect_expr(expr, names, seen, 0);
                 }
             }
+            // Single-aggregate fast path: collect $params from an Expr arg.
+            PlanOp::Aggregate { arg, .. } => {
+                let inner = match arg {
+                    AggArg::Distinct(inner) => inner.as_ref(),
+                    other => other,
+                };
+                if let AggArg::Expr(op) = inner {
+                    collect_operand(op, names, seen);
+                }
+            }
             PlanOp::GroupAggregate { keys, aggs } => {
                 for (_, item) in keys {
                     collect_ret_item_params(item, names, seen);
@@ -1252,6 +1262,8 @@ fn collect_params_from_ops(
                         AggArg::Var(_) => {}
                         AggArg::Prop { .. } => {}
                         AggArg::Distinct(_) => {}
+                        // Collect $param names from expression arguments (row 159).
+                        AggArg::Expr(op) => collect_operand(op, names, seen),
                     }
                 }
             }
@@ -1279,7 +1291,17 @@ fn collect_ret_item_params(item: &RetItem, names: &mut Vec<String>, seen: &mut B
         RetVal::ScalarExpr(op) => {
             collect_operand(op, names, seen);
         }
-        RetVal::Prop { .. } | RetVal::Var(_) | RetVal::Agg { .. } => {}
+        RetVal::Prop { .. } | RetVal::Var(_) => {}
+        RetVal::Agg { arg, .. } => {
+            // Collect $param names from expression aggregate arguments (row 159).
+            let inner = match arg {
+                AggArg::Distinct(inner) => inner.as_ref(),
+                other => other,
+            };
+            if let AggArg::Expr(op) = inner {
+                collect_operand(op, names, seen);
+            }
+        }
     }
 }
 
@@ -1727,6 +1749,7 @@ fn intern_agg_arg(vars: &mut VarTable, arg: &AggArg) {
             vars.intern(var);
         }
         AggArg::Distinct(inner) => intern_agg_arg(vars, inner),
+        AggArg::Expr(op) => intern_operand(vars, op),
     }
 }
 
@@ -1737,6 +1760,7 @@ fn agg_arg_label(arg: &AggArg) -> String {
         AggArg::Var(v) => v.clone(),
         AggArg::Prop { var, field } => format!("{var}.{field}"),
         AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_label(inner)),
+        AggArg::Expr(op) => operand_label(op),
     }
 }
 
@@ -4691,8 +4715,9 @@ impl AggAcc {
                 any_float,
                 has_value,
             } => {
+                // openCypher row 166: sum over no numeric values is 0, not null.
                 if !has_value {
-                    None
+                    Some(Value::Int(0))
                 } else if any_float {
                     Some(Value::Float(ints as f64 + floats))
                 } else {
@@ -4793,6 +4818,7 @@ fn stat_input(
     row: &Row,
     arg: &AggArg,
     name: &str,
+    params: &Params,
 ) -> Result<Option<(f64, Value)>, String> {
     let value = match arg {
         AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
@@ -4805,6 +4831,7 @@ fn stat_input(
             None => None,
             Some(_) => return Err(format!("{name}(): expected a number, got a graph element")),
         },
+        AggArg::Expr(op) => resolve_operand(view, vars, row, op, params)?,
         _ => return Ok(None),
     };
     match value {
@@ -4926,6 +4953,7 @@ fn distinct_value(
     vars: &VarTable,
     row: &Row,
     arg: &AggArg,
+    params: &Params,
 ) -> Result<Option<Value>, String> {
     match arg {
         AggArg::Star => Ok(None),
@@ -4946,7 +4974,9 @@ fn distinct_value(
         }
         AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field),
         // The parser never nests DISTINCT; treat a nested one as its inner arg.
-        AggArg::Distinct(inner) => distinct_value(view, vars, row, inner),
+        AggArg::Distinct(inner) => distinct_value(view, vars, row, inner, params),
+        // Evaluate the expression; null means "not distinct / contributes nothing".
+        AggArg::Expr(op) => resolve_operand(view, vars, row, op, params),
     }
 }
 
@@ -4971,6 +5001,7 @@ fn scalar_agg_input(
     row: &Row,
     arg: &AggArg,
     name: &str,
+    params: &Params,
 ) -> Result<Option<Value>, String> {
     let value = match arg {
         AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field)?,
@@ -4983,6 +5014,8 @@ fn scalar_agg_input(
             None => None,
             Some(_) => return Err(format!("{name}(): expected a value, got a graph element")),
         },
+        // Evaluate any general expression; null propagates as "nothing to aggregate".
+        AggArg::Expr(op) => resolve_operand(view, vars, row, op, params)?,
         _ => None,
     };
     Ok(value.filter(|v| !matches!(v, Value::Null)))
@@ -5015,6 +5048,7 @@ fn update_acc(
     func: &AggFunc,
     arg: &AggArg,
     acc: &mut AggAcc,
+    params: &Params,
 ) -> Result<(), String> {
     // DISTINCT gate: resolve the row's value for the inner argument, drop the
     // row when this group has already seen it, and otherwise forward to the
@@ -5023,7 +5057,7 @@ fn update_acc(
         let AggAcc::Distinct { seen, inner } = acc else {
             return Ok(());
         };
-        let val = distinct_value(view, vars, row, inner_arg)?;
+        let val = distinct_value(view, vars, row, inner_arg, params)?;
         // An unbound / null argument contributes to no aggregate, DISTINCT or
         // not: `count(DISTINCT x)` counts distinct non-null values.
         let Some(val) = val else {
@@ -5032,7 +5066,7 @@ fn update_acc(
         if !seen.insert(group_key_normalize(&val)) {
             return Ok(());
         }
-        return update_acc(view, vars, row, func, inner_arg, inner);
+        return update_acc(view, vars, row, func, inner_arg, inner, params);
     }
     match (func, arg) {
         (AggFunc::Count, AggArg::Star) => {
@@ -5060,15 +5094,24 @@ fn update_acc(
                 }
             }
         }
+        // count(expr): evaluate and count non-null results.
+        (AggFunc::Count, AggArg::Expr(op)) => {
+            let val = resolve_operand(view, vars, row, op, params)?;
+            if val.is_some() {
+                if let AggAcc::Count(n) = acc {
+                    *n += 1;
+                }
+            }
+        }
         // sum / avg / min / max read one value per row: a property or a bare
         // variable bound to a scalar (`UNWIND … AS x`, `WITH … AS x`). Row 157:
         // the bare-variable form used to fall through to the catch-all arm and
         // contribute nothing, so these returned null.
         (
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
-            AggArg::Prop { .. } | AggArg::Var(_),
+            AggArg::Prop { .. } | AggArg::Var(_) | AggArg::Expr(_),
         ) => {
-            let Some(v) = scalar_agg_input(view, vars, row, arg, agg_name(func))? else {
+            let Some(v) = scalar_agg_input(view, vars, row, arg, agg_name(func), params)? else {
                 return Ok(());
             };
             match acc {
@@ -5128,6 +5171,16 @@ fn update_acc(
                 }
             }
         }
+        // collect(expr): evaluate and collect non-null results (row 159).
+        (AggFunc::Collect, AggArg::Expr(op)) => {
+            if let Some(val) = resolve_operand(view, vars, row, op, params)? {
+                if !matches!(val, Value::Null) {
+                    if let AggAcc::Collect(items) = acc {
+                        items.push(val);
+                    }
+                }
+            }
+        }
         (AggFunc::StDev | AggFunc::StDevP, _) => {
             if let AggAcc::StDev {
                 population,
@@ -5137,7 +5190,7 @@ fn update_acc(
             } = acc
             {
                 let name = if *population { "stDevP" } else { "stDev" };
-                if let Some((x, _)) = stat_input(view, vars, row, arg, name)? {
+                if let Some((x, _)) = stat_input(view, vars, row, arg, name, params)? {
                     *n += 1;
                     let delta = x - *mean;
                     *mean += delta / *n as f64;
@@ -5147,7 +5200,7 @@ fn update_acc(
         }
         (AggFunc::PercentileCont { .. } | AggFunc::PercentileDisc { .. }, _) => {
             if let AggAcc::Percentile { name, values, .. } = acc {
-                if let Some(entry) = stat_input(view, vars, row, arg, name)? {
+                if let Some(entry) = stat_input(view, vars, row, arg, name, params)? {
                     values.push(entry);
                 }
             }
@@ -5171,7 +5224,7 @@ fn agg_stream(
         Some(pair) => pair,
         None => {
             // Terminal row — delegate to shared update_acc helper.
-            update_acc(ctx.view, ctx.vars, row, ctx.func, ctx.arg, acc)?;
+            update_acc(ctx.view, ctx.vars, row, ctx.func, ctx.arg, acc, ctx.params)?;
             return Ok(());
         }
     };
@@ -5744,7 +5797,7 @@ fn group_stream(
             }
             let (_, accs) = groups.get_mut(&gk).unwrap();
             for (acc, (func, arg, _)) in accs.iter_mut().zip(ctx.aggs.iter()) {
-                update_acc(ctx.view, ctx.vars, row, func, arg, acc)?;
+                update_acc(ctx.view, ctx.vars, row, func, arg, acc, ctx.params)?;
             }
             return Ok(());
         }
@@ -8834,9 +8887,9 @@ LIMIT 10";
         // 10 + 20 = 30 (null skipped)
         assert_eq!(rs.row(0), &[Some(i(30))]);
 
-        // All props null → result is null.
+        // All props null → 0 (openCypher row 166: sum over empty numeric set is 0).
         let rs_null = run(&v, "MATCH (n:N) RETURN SUM(n.missing)", &params).expect("SUM null");
-        assert_eq!(rs_null.row(0), &[None]);
+        assert_eq!(rs_null.row(0), &[Some(i(0))]);
     }
 
     #[test]

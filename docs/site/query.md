@@ -490,14 +490,21 @@ MATCH (a:N)-[r:RATED]->(b:N)
 RETURN AVG(r.score)
 ```
 
-Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
-`AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
+Supported functions: `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `AVG(x)`, `MIN(x)`,
+`MAX(x)`, `COLLECT(x)`.
 
-Each takes a property or a bare variable (`UNWIND [1, 2] AS x RETURN max(x)`).
+Each takes any expression as its argument: a property (`n.age`), a bare variable
+(`UNWIND [1, 2] AS x RETURN max(x)`), or a general expression
+(`RETURN max(n.age + 1)`, `SUM(r.score * 2)`, `COLLECT(toLower(n.name))`).
 `SUM` of integers is an integer (an overflow past 64 bits is an error) and is a
 float once any input is a float; `AVG` is always a float. `MIN` and `MAX` order
 any non-null value, strings included. `SUM`, `AVG`, `MIN` and `MAX` of a node or
 relationship variable are errors.
+
+Null values in the expression result are silently skipped for all aggregates
+except `COUNT(*)`. `SUM` over a set where every value is null or non-numeric
+returns `0` (openCypher rule); `AVG`, `MIN`, and `MAX` over no values return
+`null`.
 
 ### DISTINCT inside an aggregate
 
@@ -529,7 +536,7 @@ LIMIT 5
   RETURN clause.
 - `NULL` group-key values group together (openCypher semantics).
 - Empty input with no group-key items yields exactly one row (openCypher
-  semantics: `COUNT=0`, other aggregates `null`).
+  semantics: `COUNT=0`, `SUM=0`, `AVG`/`MIN`/`MAX`=`null`).
 - Group count is capped at 1,000,000 distinct keys per query.
 - `ORDER BY` + `LIMIT` sort the finished group table (top-k groups), not
   the input rows; the LIMIT push-down optimisation is intentionally

@@ -218,6 +218,7 @@ fn agg_arg_text(arg: &AggArg) -> String {
         AggArg::Var(v) => v.clone(),
         AggArg::Prop { var, field } => format!("{var}.{field}"),
         AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_text(inner)),
+        AggArg::Expr(op) => operand_label(op),
     }
 }
 

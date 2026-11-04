@@ -144,6 +144,15 @@ pub enum AggArg {
     /// `DISTINCT *` and nested `DISTINCT`, so the inner argument is always
     /// `Star`-free and one level deep.
     Distinct(Box<AggArg>),
+    /// Any general expression: `MAX(n.age + 1)`, `SUM(1)`, `SUM($p)`,
+    /// `COLLECT(toLower(n.name))`, etc. (openCypher row 159).
+    ///
+    /// The fast-path `Var` and `Prop` variants are kept for the common cases;
+    /// this arm covers every other expression, evaluated per row via
+    /// `resolve_operand`.  The parser produces `Var`/`Prop` when the written
+    /// argument is exactly a bare variable or `var.field`, so existing queries
+    /// are unaffected and the executor's optimised arms still fire for them.
+    Expr(Box<Operand>),
 }
 
 /// Hop-count range for variable-length relationship patterns (`*min..max`).

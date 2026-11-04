@@ -433,8 +433,15 @@ fn check_items(scope: &Scope, items: &[RetItem]) -> Result<(), String> {
                 if let AggFunc::PercentileCont { p } | AggFunc::PercentileDisc { p } = func {
                     check_operand(scope, p, Ctx::Value)?;
                 }
-                if let AggArg::Prop { var, field } = arg {
-                    check_property(scope, var, field)?;
+                // Peel DISTINCT to reach the inner arg for checking.
+                let inner = match arg {
+                    AggArg::Distinct(inner) => inner.as_ref(),
+                    other => other,
+                };
+                match inner {
+                    AggArg::Prop { var, field } => check_property(scope, var, field)?,
+                    AggArg::Expr(op) => check_operand(scope, op, Ctx::Value)?,
+                    _ => {}
                 }
             }
             RetVal::FuncCall { name, args } => check_call(scope, name, args, Ctx::Value)?,
