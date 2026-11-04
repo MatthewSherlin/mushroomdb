@@ -23,7 +23,7 @@ use crate::messages::run::{
     map_get, parse_bookmark, read_key_refusal, role_mask_error, tx_role_write_refusal, RowCursor,
 };
 use crate::packstream::PackValue;
-use mushroomdb::{NodeMask, ReaderSnapshot, Value};
+use mushroomdb::{NodeMask, ReaderSnapshot, Transaction, Value, WriteScope};
 use std::collections::BTreeMap;
 
 /// A decoded `BEGIN`.
@@ -139,12 +139,59 @@ impl OpenTransaction for ReadOnlyTransaction {
     }
 }
 
-/// The transaction a role token or a `read` key gets, the twin of the HTTP
-/// `/tx` scoped body: every statement reads through the role's mask on the
-/// snapshot frozen at `BEGIN`, and every write is refused with the text
-/// HTTP gives. The transaction engine has no role-scoped write path, so such
-/// a transaction never writes, whatever write scope the role carries (ledger
-/// row 140). Its commit writes nothing and returns the snapshot's commit.
+/// The transaction a role token with a write scope gets.
+///
+/// Reads filter through the role's mask on the snapshot frozen at `BEGIN`;
+/// writes are validated against the role's scope (execute-time check for fast
+/// feedback, then again at commit under the write lock — the security gate).
+/// This is parity with auto-commit `RUN` (ledger row 140).
+pub struct RoleOwnedTransaction {
+    tx: Transaction,
+    role: String,
+    scope: WriteScope,
+    mask: NodeMask,
+}
+
+impl RoleOwnedTransaction {
+    pub(crate) fn new(tx: Transaction, role: String, scope: WriteScope, mask: NodeMask) -> Self {
+        Self {
+            tx,
+            role,
+            scope,
+            mask,
+        }
+    }
+}
+
+impl OpenTransaction for RoleOwnedTransaction {
+    fn rollback(self: Box<Self>) {}
+
+    fn commit(self: Box<Self>) -> Result<u64, BoltError> {
+        self.tx.commit_authz(self.role).map_err(BoltError::from)
+    }
+
+    fn execute(
+        &mut self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Box<dyn ResultCursor>, BoltError> {
+        let rs = self
+            .tx
+            .execute_authz(cypher, params, &self.scope, &self.mask)
+            .map_err(BoltError::from)?;
+        Ok(Box::new(RowCursor::new(rs, false, None)))
+    }
+
+    fn is_scoped(&self) -> bool {
+        true
+    }
+}
+
+/// The transaction a role token or a `read` key gets when the role has no
+/// write scope, the twin of the HTTP `/tx` scoped body: every statement reads
+/// through the role's mask on the snapshot frozen at `BEGIN`, and every write
+/// is refused with the text HTTP gives. Its commit writes nothing and returns
+/// the snapshot's commit.
 pub struct ScopedTransaction {
     snapshot: ReaderSnapshot,
     mask: NodeMask,

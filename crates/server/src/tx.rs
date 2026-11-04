@@ -46,11 +46,18 @@
 //!
 //! A full token, an `admin` key and a `write` key run the transaction engine
 //! itself: reads see the transaction's own writes and a commit is one WAL
-//! frame. A role token and a `read` key are scoped: the role's mask is
-//! resolved at `begin` and every read runs through it on the snapshot the
-//! transaction began on. Such a transaction never writes (403, the refusal
-//! `/query` gives), because the transaction engine has no role-scoped write
-//! path; its commit writes nothing and returns the snapshot's commit number.
+//! frame.
+//!
+//! A role token with a write scope (`write: Some(...)`) gets a
+//! `TxBody::RoleOwned` transaction: reads filter through the role's mask;
+//! writes are validated against the role's scope at execute time (for fast
+//! feedback) and again at commit time under the write lock (the security gate).
+//! This is parity with `/query`.
+//!
+//! A role token with no write scope (`write: None`) and a `read` key are
+//! scoped read-only: the role's mask is resolved at `begin` and every read
+//! runs through it on the snapshot the transaction began on; every write is
+//! refused with the same 403 `/query` gives.
 
 use super::{
     err_response, forbidden, graph_err, json_ok, request_token, role_mask_err, AppState,
@@ -64,7 +71,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mushroomdb::{
-    is_write_query, GraphError, NodeMask, ReaderSnapshot, ResultSet, Transaction, Value,
+    is_write_query, GraphError, NodeMask, ReaderSnapshot, ResultSet, Transaction, Value, WriteScope,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -163,7 +170,18 @@ impl TxLimits {
 pub(crate) enum TxBody {
     /// The transaction engine: writes buffer and commit as one WAL frame.
     Full(Box<Transaction>),
-    /// A role's read-only view of the snapshot the transaction began on.
+    /// A role token with a write scope: reads filter through the role mask;
+    /// writes are validated against the role scope, the same way `/query` does.
+    RoleOwned {
+        tx: Box<Transaction>,
+        /// The role name, used at commit for the definitive authz check.
+        role: String,
+        /// Write scope resolved at BEGIN from the same snapshot the tx froze.
+        scope: WriteScope,
+        /// Mask resolved at BEGIN from the same snapshot the tx froze.
+        mask: NodeMask,
+    },
+    /// A role with no write scope, or a `read`-tier key: read-only snapshot view.
     Scoped {
         snapshot: ReaderSnapshot,
         mask: NodeMask,
@@ -643,16 +661,46 @@ async fn begin(
     let db = state.db.clone();
     let body = match identity {
         AuthIdentity::Role(role) => {
-            let snapshot = db.reader();
-            let mask = match snapshot.mask_for_role(&role) {
-                Ok(mask) => mask,
-                Err(e) => return role_mask_err(e),
-            };
-            TxBody::Scoped {
-                snapshot,
-                mask,
-                read_tier_key: read_only_key.is_some(),
-                clock_micros: mushroomdb::clock_micros(),
+            if read_only_key.is_some() {
+                // `read`-tier key: always read-only regardless of role scope.
+                let snapshot = db.reader();
+                let mask = match snapshot.mask_for_role(&role) {
+                    Ok(mask) => mask,
+                    Err(e) => return role_mask_err(e),
+                };
+                TxBody::Scoped {
+                    snapshot,
+                    mask,
+                    read_tier_key: true,
+                    clock_micros: mushroomdb::clock_micros(),
+                }
+            } else {
+                // Role token: open the transaction and resolve scope+mask from
+                // the same snapshot it freezes (coherent starting point).
+                let result = tokio::task::spawn_blocking(move || {
+                    db.begin_transaction_for_role(&role)
+                        .map(|(tx, scope, mask)| (tx, scope, mask, role))
+                })
+                .await;
+                match result {
+                    Ok(Ok((tx, Some(scope), mask, role))) => TxBody::RoleOwned {
+                        tx: Box::new(tx),
+                        role,
+                        scope,
+                        mask,
+                    },
+                    Ok(Ok((tx, None, mask, _role))) => {
+                        // Role has no write scope: read-only snapshot transaction.
+                        TxBody::Scoped {
+                            snapshot: tx.into_base_snapshot(),
+                            mask,
+                            read_tier_key: false,
+                            clock_micros: mushroomdb::clock_micros(),
+                        }
+                    }
+                    Ok(Err(e)) => return role_mask_err(e),
+                    Err(_) => return err_response("begin task panicked"),
+                }
             }
         }
         // `Anonymous` reaches only `/health`; refuse it here all the same.
@@ -713,6 +761,11 @@ fn execute(
 ) -> Result<ResultSet, RunError> {
     match body {
         TxBody::Full(tx) => tx.execute(cypher, params).map_err(RunError::Engine),
+        TxBody::RoleOwned {
+            tx, scope, mask, ..
+        } => tx
+            .execute_authz(cypher, params, scope, mask)
+            .map_err(RunError::Engine),
         TxBody::Scoped {
             snapshot,
             mask,
@@ -820,6 +873,7 @@ async fn commit(
         };
         match body {
             TxBody::Full(tx) => tx.commit(),
+            TxBody::RoleOwned { tx, role, .. } => tx.commit_authz(role),
             // A scoped transaction wrote nothing: its bookmark is the commit it read.
             TxBody::Scoped { snapshot, .. } => Ok(snapshot.commit_seq()),
         }

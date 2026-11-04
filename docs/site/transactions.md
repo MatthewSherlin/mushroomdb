@@ -295,16 +295,21 @@ bookmark back: pass `bookmark_text`, or a bookmark a Bolt commit returned, in a 
 no bookmark. A Bolt `BEGIN` or `RUN` given a bookmark waits until the store has reached that commit
 (5 s by default, `--bookmark-timeout-secs`), so a read on another session sees the write.
 
-## Scoped transactions are read-only
+## Scoped transactions
 
 A transaction begun with a role token or a `read`-tier key (HTTP and Bolt), or on a Python `scoped()`
-handle, reads through its role (for a `read` key, the role the key names) on the snapshot it began
-on, and **cannot write**. This holds even for a
-role whose write scope lets it write through `POST /query` or a Bolt auto-commit `RUN`: the
-transaction engine has no role-scoped commit yet. Its commit writes nothing and returns the commit it
-read. Role-scoped writes inside a transaction are planned for 0.11 (ledger row 140); until then, write
-with a role through auto-commit statements. The full token, `admin` keys and `write` keys run
-transactions without this limit.
+handle, reads through its role (for a `read` key, the role the key names) on the snapshot it began on.
+
+A role token with a **write scope** writes inside a transaction with the same authority it has for
+auto-commit statements (`POST /query`, Bolt auto-commit `RUN`): a write outside the scope (a label
+or edge type the role may not create, update, or delete), or one targeting a node the role's mask
+hides, is refused with `Forbidden` and the same message. Its `COMMIT` writes the buffered batch and
+returns the new bookmark, or the snapshot's commit if the transaction wrote nothing.
+
+A role token with **no write scope**, and every `read`-tier key, cannot write. Any write statement is
+refused with `Forbidden` (`role-bound token: writes are not permitted` or
+`read-tier key: writes are not permitted`), and its commit writes nothing, returning the commit the
+snapshot read. The full token, `admin` keys and `write` keys run transactions without this limit.
 
 ## Limits
 

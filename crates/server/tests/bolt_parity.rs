@@ -563,11 +563,11 @@ async fn auto_commit_reads_and_writes_agree_for_every_identity() {
     }
 }
 
-/// Explicit transactions. A role token and a `read` key read through the role
-/// on the snapshot their transaction began on and refuse every write with the
-/// text HTTP gives (ledger row 140: such a transaction does not write, even
-/// for a role with a write scope). The full token runs the transaction engine
-/// on both protocols.
+/// Explicit transactions. A role token with a write scope writes inside a
+/// transaction with the same authority it has in auto-commit, and a role with
+/// no write scope (or a `read` key) is refused every write with the same text
+/// HTTP gives (ledger row 140). Both protocols behave identically. The full
+/// token runs the full transaction engine on both protocols.
 #[tokio::test]
 async fn transactions_agree_for_every_identity() {
     let mut seen = std::collections::BTreeSet::new();
@@ -618,11 +618,13 @@ async fn transactions_agree_for_every_identity() {
             assert_same(&label, &h, &b);
             seen.insert((token, shape(&b)));
             if matches!(b, Outcome::Rows { .. }) {
-                assert_eq!(
-                    http.commit(&h_tx).await,
-                    bolt_commit(&mut bolt),
-                    "{label}: COMMIT"
-                );
+                let h_ok = http.commit(&h_tx).await;
+                let b_ok = bolt_commit(&mut bolt);
+                if !b_ok {
+                    // Bolt commit failed; send RESET so the next BEGIN works.
+                    bolt.handle(ClientMessage::Reset);
+                }
+                assert_eq!(h_ok, b_ok, "{label}: COMMIT");
             } else {
                 http.rollback(&h_tx).await;
                 bolt.handle(ClientMessage::Reset);

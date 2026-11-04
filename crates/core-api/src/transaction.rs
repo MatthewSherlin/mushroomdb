@@ -88,6 +88,7 @@
 //! nothing, and the transaction stays usable.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use core_query::cypher::{
@@ -104,8 +105,9 @@ use crate::db::{
     unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass, RowSource, NS_PROP,
 };
 use crate::layer::DeltaLayer;
-use crate::mask::StoreId;
+use crate::mask::{NodeMask, StoreId};
 use crate::reader::ReaderSnapshot;
+use crate::roles::WriteScope;
 use crate::shared::SharedDb;
 
 /// An open interactive transaction. See the [module docs](self) for the
@@ -518,8 +520,9 @@ impl RowSource for TxRows<'_, '_> {
         Ok(merge_node_props(key_field, key_value, named_ns))
     }
 
-    /// A transaction carries no role (role-bound writes are refused inside
-    /// one), so every label is in scope.
+    /// Every label is in scope for the transaction's row source: the per-op
+    /// authz check (`check_new_ops_authz`) runs after the ops are staged and
+    /// handles scope enforcement for role-owned transactions.
     fn row_merge_scope(&self, _label: &str) -> Result<()> {
         Ok(())
     }
@@ -689,6 +692,16 @@ impl Transaction {
         self.base_snap.version
     }
 
+    /// Consume the transaction (discarding any buffer) and return the base
+    /// snapshot it was opened on.
+    ///
+    /// Used when a role-token transaction turns out to be read-only (the role
+    /// has no write scope): the caller repurposes the snapshot for a `Scoped`
+    /// body rather than creating a second snapshot.
+    pub fn into_base_snapshot(self) -> ReaderSnapshot {
+        self.base_snap
+    }
+
     /// Run one Cypher statement inside the transaction.
     ///
     /// A read returns what it would return against the base snapshot with this
@@ -771,7 +784,143 @@ impl Transaction {
     /// Discard the buffered writes. Nothing reaches the WAL.
     pub fn rollback(self) {}
 
+    /// Run one Cypher statement inside the transaction with role-scoped authz.
+    ///
+    /// Reads are filtered through `mask` so only nodes visible to the role
+    /// appear in results.  Writes are validated against `scope` at execute
+    /// time (fast user feedback); the authoritative check re-runs at
+    /// [`commit_authz`](Self::commit_authz) under the write lock (security gate).
+    ///
+    /// A write that violates scope or mask is refused with
+    /// [`GraphError::RoleWriteDenied`] and nothing is buffered.
+    ///
+    /// A read-tier key must NOT call this — it must be refused before this
+    /// point.
+    pub fn execute_authz(
+        &mut self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+        scope: &WriteScope,
+        mask: &NodeMask,
+    ) -> Result<ResultSet> {
+        let _transaction_clock = core_query::cypher::TransactionClock::enter(self.clock_micros);
+        let _statement_clock = core_query::cypher::StatementClock::enter();
+        let tokens = lex(cypher).map_err(query_err("lex"))?;
+        // EXPLAIN: show plan for any role; use Seen::All (index list is minor
+        // info, not a security gate here — same as the non-authz transaction).
+        if let Some(plan) =
+            crate::db::explain_answer(&tokens, &self.base_snap.frozen.schema, crate::db::Seen::All)?
+        {
+            return Ok(plan);
+        }
+        // Schema DDL is refused; SHOW lists the full schema (same as the
+        // non-authz transaction — schema metadata is not write-authorisation).
+        if let Some(stmt) = crate::db::ddl_statement(&tokens)? {
+            if !stmt.is_show() {
+                return Err(crate::db::schema_change_in_a_transaction());
+            }
+            return Ok(self.base_snap.frozen.schema.show(&stmt));
+        }
+        // CALL: runs against the masked view.
+        if let Some(call) = crate::db::call_statement(&tokens)? {
+            let schema = Arc::clone(&self.base_snap.frozen.schema);
+            return self
+                .with_masked_view(mask, |v| crate::db::run_call(&call, v, &schema, params))?;
+        }
+        if is_write_tokens(&tokens) {
+            let stmt = parse_write(&tokens).map_err(query_err("parse"))?;
+            return self.execute_write_authz(stmt, params, scope, mask);
+        }
+        // Read statement: execute against the masked view.
+        let union = parse_read(&tokens).map_err(query_err("parse"))?;
+        let plans = plan_union(&union).map_err(query_err("plan"))?;
+        let rs = self
+            .with_masked_view(mask, |v| {
+                execute_planned_union(v, &plans, &union.all_flags, &Params(params))
+                    .map(|rs| crate::db::finish_result(v, rs))
+            })?
+            .map_err(query_err("execute"))?;
+        let keys = self.read_set(&union, params);
+        self.record_keys(&keys);
+        Ok(rs)
+    }
+
+    /// Commit the buffered writes using the role-scoped CAS+authz path.
+    ///
+    /// This is the security-critical check: scope and mask are re-resolved
+    /// under the write lock against committed state plus the batch, so any
+    /// role changes made since BEGIN are visible and enforced.
+    ///
+    /// A transaction that wrote nothing writes no frame and returns
+    /// [`base_version`](Self::base_version).
+    ///
+    /// Fails with [`GraphError::CasConflict`] on an optimistic conflict
+    /// (retry from BEGIN) or [`GraphError::RoleWriteDenied`] if the role
+    /// no longer exists or its scope disallows an op.
+    pub fn commit_authz(self, role: String) -> Result<u64> {
+        if self.buffer.is_empty() {
+            return Ok(self.base_snap.version);
+        }
+        let mut keys: Vec<(String, u64)> = self.read_write_keys.into_iter().collect();
+        keys.sort();
+        let preconds = keys
+            .into_iter()
+            .map(|(key, expected)| Precondition::NodeUnchangedSince { key, expected })
+            .collect();
+        drop(self.overlay);
+        self.db
+            .submit_batch_cas_authz_with_seq(role, preconds, self.buffer)
+            .map(|(_, seq)| seq)
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
+
+    /// Run `f` over the transaction's state filtered by `mask`.
+    ///
+    /// When an overlay exists the mask is applied to its view, so the role's
+    /// visibility restriction applies to both base and transaction-local nodes.
+    /// Before any write (no overlay yet) a fresh layer over the base snapshot
+    /// tail is used — same cost as `with_view`, plus the mask probe.
+    fn with_masked_view<R>(
+        &self,
+        mask: &NodeMask,
+        f: impl FnOnce(&GraphView<'_>) -> R,
+    ) -> Result<R> {
+        match &self.overlay {
+            None => {
+                // No writes yet — view over the base snapshot's tail layer (or an
+                // empty layer if there is no tail) with the mask applied.
+                let (state, base, tail) = self.base_snap.layer_parts()?;
+                let base_layer = tail.cloned().unwrap_or_else(|| DeltaLayer::new(state));
+                Ok(f(&base_layer.view(state, base, Some(&mask.visible))))
+            }
+            Some(overlay) => {
+                let (state, base, _) = self.base_snap.layer_parts()?;
+                // Nodes created by earlier accepted statements in this tx have
+                // already passed the create gate; they must be visible to
+                // subsequent reads in the same tx, even though their dense ids
+                // were assigned after BEGIN (so they are absent from the frozen
+                // mask).  Extend the visible set for the duration of this read.
+                let tx_created_ids: Vec<u32> = {
+                    let unmasked = overlay.view(state, base, None);
+                    self.buffer
+                        .iter()
+                        .filter_map(|op| match op {
+                            BatchOp::InsertNode { key, .. } => unmasked.node_id(key),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                if tx_created_ids.is_empty() {
+                    Ok(f(&overlay.view(state, base, Some(&mask.visible))))
+                } else {
+                    use core_query::visible::VisibleSet;
+                    let extended = VisibleSet::from_ids(mask.visible.iter().chain(tx_created_ids));
+                    Ok(f(&overlay.view(state, base, Some(&extended))))
+                }
+            }
+        }
+    }
 
     /// Run `f` over the state statements read: the base snapshot with the
     /// transaction's overlay on top.
@@ -929,6 +1078,317 @@ impl Transaction {
         };
         self.accept(staged);
         Ok(rs)
+    }
+
+    /// Execute a write statement with role-scoped authz.
+    ///
+    /// Calls the standard `execute_write` path, then validates the new ops
+    /// against `scope` and `mask`.  On a scope/visibility violation the new
+    /// ops are removed and the overlay is reverted.
+    fn execute_write_authz(
+        &mut self,
+        stmt: WriteStatement,
+        params: &BTreeMap<String, Value>,
+        scope: &WriteScope,
+        mask: &NodeMask,
+    ) -> Result<ResultSet> {
+        let old_buf_len = self.buffer.len();
+        let old_records_len = self.records.len();
+        let rs = self.execute_write(stmt, params)?;
+        // Post-validate: execute-time scope/mask check for fast user feedback.
+        // The definitive check is commit_authz → submit_batch_cas_authz_with_seq.
+        if let Err(e) = self.check_new_ops_authz(old_buf_len, scope, mask) {
+            // Roll back what execute_write added to buffer + records + overlay.
+            self.buffer.truncate(old_buf_len);
+            self.records.truncate(old_records_len);
+            self.revert()?;
+            return Err(e);
+        }
+        Ok(rs)
+    }
+
+    /// Validate `self.buffer[old_buf_len..]` against `scope` and `mask`.
+    ///
+    /// Returns the first violation, or `Ok(())` when every op is allowed.
+    /// The check mirrors `check_single_op_authz` semantics for the ops a
+    /// transaction statement can produce.
+    fn check_new_ops_authz(
+        &self,
+        old_buf_len: usize,
+        scope: &WriteScope,
+        mask: &NodeMask,
+    ) -> Result<()> {
+        // Keys of nodes created by EARLIER accepted statements in this tx:
+        // they passed the create gate and are treated as visible for
+        // subsequent ops (same as batch_created in check_single_op_authz,
+        // since all ops are submitted together at commit).
+        let tx_created_before: HashSet<&str> = self.buffer[..old_buf_len]
+            .iter()
+            .filter_map(|op| match op {
+                BatchOp::InsertNode { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let new_ops = &self.buffer[old_buf_len..];
+
+        // Nodes inserted within this current statement's batch (tracked in
+        // order, so an InsertEdge that follows an InsertNode sees it).
+        let mut batch_created_now: Vec<&str> = Vec::new();
+        // Edges inserted within this current statement's batch.
+        let mut batch_edges_now: HashSet<(&str, &str, &str)> = HashSet::new();
+
+        for op in new_ops {
+            match op {
+                BatchOp::InsertNode { label, key, .. } => {
+                    if !scope.create_labels.contains(label) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (create_labels)",
+                                label
+                            ),
+                        });
+                    }
+                    batch_created_now.push(key.as_str());
+                }
+
+                BatchOp::InsertEdge {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                } => {
+                    if !scope.create_edge_types.contains(edge_type) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: edge type '{}' not in write scope \
+                                 (create_edge_types)",
+                                edge_type
+                            ),
+                        });
+                    }
+                    for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                        if !self.key_is_visible_in_tx_authz(
+                            ep_key,
+                            mask,
+                            &tx_created_before,
+                            &batch_created_now,
+                        ) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                    }
+                    batch_edges_now.insert((
+                        edge_type.as_str(),
+                        src_key.as_str(),
+                        dst_key.as_str(),
+                    ));
+                }
+
+                BatchOp::SetProp { key, .. } | BatchOp::RemoveProp { key, .. } => {
+                    // A node created by this role in this tx (same statement or
+                    // earlier): any prop write is allowed (§3.5 writer-just-created).
+                    if batch_created_now.contains(&key.as_str())
+                        || tx_created_before.contains(key.as_str())
+                    {
+                        // Allowed — the create gate already fired.
+                    } else {
+                        // Existing node: must be visible and in update_labels.
+                        if !self.key_is_visible_in_tx_authz(
+                            key,
+                            mask,
+                            &tx_created_before,
+                            &batch_created_now,
+                        ) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: target node not visible".into(),
+                            });
+                        }
+                        let label =
+                            self.label_in_tx(key)?
+                                .ok_or_else(|| GraphError::RoleWriteDenied {
+                                    reason: "role-bound token: target node not visible".into(),
+                                })?;
+                        if !scope.update_labels.contains(&label) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: format!(
+                                    "role-bound token: label '{}' not in write scope \
+                                     (update_labels)",
+                                    label
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                BatchOp::DeleteNode { key } => {
+                    if !self.key_is_visible_in_tx_authz(
+                        key,
+                        mask,
+                        &tx_created_before,
+                        &batch_created_now,
+                    ) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    // `execute_write` applies the deletion to the overlay before
+                    // this check runs, so `label_in_tx` (which reads the overlay)
+                    // returns `Ok(None)` for a node created earlier in this
+                    // transaction.  Recover the label from the InsertNode op in
+                    // the buffer instead.
+                    let label = if tx_created_before.contains(key.as_str())
+                        || batch_created_now.contains(&key.as_str())
+                    {
+                        self.buffer
+                            .iter()
+                            .rev()
+                            .find_map(|op| match op {
+                                BatchOp::InsertNode { key: k, label, .. } if k == key => {
+                                    Some(label.clone())
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| GraphError::RoleWriteDenied {
+                                reason: "role-bound token: target node not visible".into(),
+                            })?
+                    } else {
+                        self.label_in_tx(key)?
+                            .ok_or_else(|| GraphError::RoleWriteDenied {
+                                reason: "role-bound token: target node not visible".into(),
+                            })?
+                    };
+                    if !scope.delete_labels.contains(&label) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (delete_labels)",
+                                label
+                            ),
+                        });
+                    }
+                }
+
+                BatchOp::DeleteEdge {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                } => {
+                    // Derived-edge rejection runs at commit time (under the write
+                    // lock via check_single_op_authz) — not checked here.
+                    if !scope.delete_edge_types.contains(edge_type) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: edge type '{}' not in write scope \
+                                 (delete_edge_types)",
+                                edge_type
+                            ),
+                        });
+                    }
+                    for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                        if !self.key_is_visible_in_tx_authz(
+                            ep_key,
+                            mask,
+                            &tx_created_before,
+                            &batch_created_now,
+                        ) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                    }
+                }
+
+                BatchOp::SetEdgeProp {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    ..
+                }
+                | BatchOp::RemoveEdgeProp {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    ..
+                } => {
+                    // Edge inserted in the same statement: creating with its
+                    // properties is covered by the create gate.
+                    if batch_edges_now.contains(&(
+                        edge_type.as_str(),
+                        src_key.as_str(),
+                        dst_key.as_str(),
+                    )) {
+                        // Allowed — same-statement create edge.
+                    } else {
+                        if !scope.update_edge_types.contains(edge_type) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: format!(
+                                    "role-bound token: edge type '{}' not in write scope \
+                                     (update_edge_types)",
+                                    edge_type
+                                ),
+                            });
+                        }
+                        for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                            if !self.key_is_visible_in_tx_authz(
+                                ep_key,
+                                mask,
+                                &tx_created_before,
+                                &batch_created_now,
+                            ) {
+                                return Err(GraphError::RoleWriteDenied {
+                                    reason: "role-bound token: edge endpoint not visible".into(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // These ops cannot be produced by transaction statement forms
+                // (stage_ops already blocks them), but gate defensively.
+                BatchOp::RenameNode { .. }
+                | BatchOp::CreateRule(_)
+                | BatchOp::DeleteRule { .. }
+                | BatchOp::InsertNodeOnConflict { .. }
+                | BatchOp::InsertEdgeUpsert { .. } => {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: "role-bound token: this endpoint is not permitted".into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `key` is visible under `mask` in the transaction context.
+    ///
+    /// A node created by this role's transaction (in a prior accepted
+    /// statement or the current statement's earlier ops) is always visible:
+    /// its create gate already fired.  Any other node is checked against the
+    /// base snapshot's dense ID and the mask.
+    fn key_is_visible_in_tx_authz(
+        &self,
+        key: &str,
+        mask: &NodeMask,
+        tx_created_before: &HashSet<&str>,
+        batch_created_now: &[&str],
+    ) -> bool {
+        if tx_created_before.contains(key) || batch_created_now.contains(&key) {
+            return true; // created by this role in this tx
+        }
+        // Existing node: check the base snapshot's dense ID against the mask.
+        self.base_snap
+            .resolve_key(key)
+            .map(|id| mask.contains_id(id))
+            .unwrap_or(false)
+    }
+
+    /// The label of `key` in the transaction's current state (overlay over
+    /// base snapshot), or `None` when the node does not exist.
+    fn label_in_tx(&self, key: &str) -> Result<Option<String>> {
+        self.with_view(|v| {
+            v.node_id(key)
+                .and_then(|id| v.label_of(id).map(str::to_string))
+        })
     }
 
     /// `MATCH … SET` / `REMOVE` and the per-row forms: the ops are computed by
