@@ -102,7 +102,8 @@ use core_storage::{Direction, GraphError, Result, Value};
 
 use crate::db::{
     add_var, match_remove_ops, match_set_map_ops, match_set_ops, resolve_merge_set_value,
-    unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass, RowSource, NS_PROP,
+    unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass, RowSource, NS_DEFAULT,
+    NS_PROP,
 };
 use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, StoreId};
@@ -1223,9 +1224,11 @@ impl Transaction {
                     // Medium-1 parity fix): provide fast feedback at execute time
                     // so the status matches what /query returns for the same write.
                     if let Some(allowed) = namespaces {
+                        // Mirror check_single_op_authz: a node with no `ns`
+                        // prop is in NS_DEFAULT ("default"), not in "".
                         let ns = props
                             .iter()
-                            .find(|(f, _)| f == "ns")
+                            .find(|(f, _)| f == NS_PROP)
                             .and_then(|(_, v)| {
                                 if let Value::Str(s) = v {
                                     Some(s.as_str())
@@ -1233,7 +1236,7 @@ impl Transaction {
                                     None
                                 }
                             })
-                            .unwrap_or("");
+                            .unwrap_or(NS_DEFAULT);
                         if !allowed.iter().any(|n| n == ns) {
                             return Err(GraphError::RoleWriteDenied {
                                 reason: format!(

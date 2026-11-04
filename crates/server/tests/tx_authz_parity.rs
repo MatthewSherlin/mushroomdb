@@ -729,26 +729,22 @@ async fn open_with_secret_prop(name: &str) -> Env {
 async fn high1_merge_return_on_hidden_node_does_not_leak_via_http_tx() {
     let e = open_with_secret_prop("high1-http").await;
 
-    // Reference: /query must refuse with 403 (masked existence check).
+    // Reference: /query must refuse with 403 (MERGE treats hidden node as absent
+    // → tries to create Secret → create_labels scope check fires).
     let (q_st, q_body) = e
         .query(
             WRITER_TOK,
             "MERGE (s:Secret {id: 's1'}) RETURN s.sensitive AS x",
         )
         .await;
-    // The fix makes this 403 (MERGE sees node absent → tries to create Secret →
-    // create_labels scope check fires).  Assert it is NOT 200 with data.
-    assert_ne!(q_st, 200, "/query returned 200: {q_body}");
-    if q_st == 200 {
-        // Extra guard: if status is ever 200, the value must be absent.
-        let val = &q_body["rows"];
-        assert!(
-            !val.to_string().contains("top-secret-value"),
-            "/query leaked sensitive data: {q_body}"
-        );
-    }
+    let q_err = q_body["error"].as_str().unwrap_or("");
+    assert_ne!(q_st, 200, "/query must not succeed: {q_body}");
+    assert!(
+        !q_body.to_string().contains("top-secret-value"),
+        "/query leaked sensitive data: {q_body}"
+    );
 
-    // TX path must behave identically: not 200 with the sensitive value.
+    // TX path: status and error MUST equal /query — not merely "not 200".
     let id = e.begin_id(WRITER_TOK).await;
     let (run_st, run_body) = e
         .run(
@@ -757,7 +753,12 @@ async fn high1_merge_return_on_hidden_node_does_not_leak_via_http_tx() {
             "MERGE (s:Secret {id: 's1'}) RETURN s.sensitive AS x",
         )
         .await;
-    assert_ne!(run_st, 200, "/tx run returned 200: {run_body}");
+    let run_err = run_body["error"].as_str().unwrap_or("");
+    assert_eq!(
+        run_st, q_st,
+        "/tx status {run_st} ≠ /query status {q_st}: {run_body}"
+    );
+    assert_eq!(run_err, q_err, "/tx error ≠ /query error");
     assert!(
         !run_body.to_string().contains("top-secret-value"),
         "/tx leaked sensitive data: {run_body}"
@@ -1024,6 +1025,213 @@ async fn medium1_namespace_check_at_execute_time_in_http_tx() {
     assert_eq!(ok_st, 200, "/tx refused allowed ns: {ok_body}");
     let (cmt_st, _) = e.commit(&id2, WRITER_TOK).await;
     assert_eq!(cmt_st, 200, "commit of allowed-ns node failed");
+}
+
+// ── M1 over-refusal: no-ns-prop node belongs to the "default" namespace ───────
+//
+// A node created with no `ns` prop is in the "default" namespace (NS_DEFAULT),
+// matching how /query resolves it via `namespace_of_value`.  A role with
+// `namespaces:["default"]` must therefore ALLOW `CREATE (n:Foo {id:'x'})`,
+// and a role with `namespaces:["other"]` must REFUSE it — same as /query.
+//
+// The bug (before fix): `check_new_ops_authz` used `.unwrap_or("")`, mapping
+// no-ns to "", which is NOT in ["default"] → over-refusal → parity break.
+
+async fn open_with_ns_writer_for_label(name: &str, allowed_ns: &str, label: &str) -> Env {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "graphdb-tx-ns-label-{name}-{}-{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "ns-writer".into(),
+                labels: vec![label.to_string()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: Some(vec![allowed_ns.to_string()]),
+                write: Some(write_scope(&[label], &[])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let role_tokens: HashMap<String, String> =
+        [(WRITER_TOK.to_string(), "ns-writer".to_string())].into();
+
+    let app = router_with_tx_limits(
+        db.clone(),
+        Some(ADMIN.to_string()),
+        role_tokens,
+        None,
+        TxLimits {
+            max_open: 100,
+            idle_timeout: Duration::from_secs(30),
+            max_lifetime: Duration::from_secs(300),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Env {
+        base: format!("http://{addr}"),
+        http: reqwest::Client::new(),
+        db,
+    }
+}
+
+/// Positive parity: role has namespaces:["default"]; no-ns-prop CREATE must be
+/// allowed in both /query and /tx (default namespace = NS_DEFAULT = "default").
+#[tokio::test]
+async fn medium1_no_ns_prop_allowed_for_default_namespace_role_http() {
+    let e = open_with_ns_writer_for_label("med1-def-http", "default", "Foo").await;
+
+    // /query reference: CREATE with no ns prop → default namespace → allowed.
+    let (q_st, q_body) = e
+        .query(
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'def-aq'}) RETURN n.id AS id",
+        )
+        .await;
+    assert_eq!(
+        q_st, 200,
+        "/query refused default-ns node (no ns prop): {q_body}"
+    );
+
+    // /tx must agree: same status.
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e
+        .run(
+            &id,
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'def-tq'}) RETURN n.id AS id",
+        )
+        .await;
+    assert_eq!(
+        run_st, q_st,
+        "/tx status {run_st} ≠ /query status {q_st}: {run_body}"
+    );
+    let (cmt_st, cmt_body) = e.commit(&id, WRITER_TOK).await;
+    assert_eq!(cmt_st, 200, "commit of default-ns node failed: {cmt_body}");
+}
+
+/// Negative parity: role has namespaces:["other"]; no-ns-prop CREATE maps to
+/// "default" which is NOT in ["other"] → 403 in both /query and /tx, same error.
+#[tokio::test]
+async fn medium1_no_ns_prop_refused_for_non_default_namespace_role_http() {
+    let e = open_with_ns_writer_for_label("med1-other-http", "other", "Foo").await;
+
+    // /query reference: CREATE with no ns prop → default namespace → not in ["other"] → 403.
+    let (q_st, q_body) = e
+        .query(
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'other-aq'}) RETURN n.id AS id",
+        )
+        .await;
+    let q_err = q_body["error"].as_str().unwrap_or("");
+    assert_eq!(
+        q_st, 403,
+        "/query allowed node in default ns when role requires other ns: {q_body}"
+    );
+    assert!(
+        q_err.contains("namespace"),
+        "/query error should mention namespace: {q_err}"
+    );
+
+    // /tx must agree: same status and same error.
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e
+        .run(
+            &id,
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'other-tq'}) RETURN n.id AS id",
+        )
+        .await;
+    let run_err = run_body["error"].as_str().unwrap_or("");
+    assert_eq!(
+        run_st, q_st,
+        "/tx status {run_st} ≠ /query status {q_st}: {run_body}"
+    );
+    assert_eq!(run_err, q_err, "/tx error ≠ /query error");
+    e.rollback(&id, WRITER_TOK).await;
+}
+
+#[test]
+fn medium1_no_ns_prop_parity_via_bolt() {
+    // Positive: namespaces:["default"] — no-ns-prop node must be allowed.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        db.write()
+            .apply_schema(&Schema {
+                roles: vec![RoleDef {
+                    name: "ns-writer".into(),
+                    labels: vec!["Foo".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["default".to_string()]),
+                    write: Some(write_scope(&["Foo"], &[])),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Auto-commit reference: must succeed.
+        let mut conn_ac = make_bolt_conn(db.clone(), WRITER_TOK, Some("ns-writer"));
+        bolt_run(&mut conn_ac, "CREATE (n:Foo {id: 'def-bolt-ac'})")
+            .expect("auto-commit of default-ns node must succeed");
+
+        // Explicit tx: same, must succeed.
+        let mut conn_tx = make_bolt_conn(db, WRITER_TOK, Some("ns-writer"));
+        bolt_begin(&mut conn_tx).expect("BEGIN");
+        bolt_run(&mut conn_tx, "CREATE (n:Foo {id: 'def-bolt-tx'})")
+            .expect("tx of default-ns node must succeed");
+        assert!(bolt_commit(&mut conn_tx), "COMMIT of default-ns bolt tx");
+    }
+
+    // Negative: namespaces:["other"] — no-ns-prop node is in "default" ≠ "other" → error.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SharedDb::open(dir.path()).unwrap();
+        db.write()
+            .apply_schema(&Schema {
+                roles: vec![RoleDef {
+                    name: "ns-writer".into(),
+                    labels: vec!["Foo".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["other".to_string()]),
+                    write: Some(write_scope(&["Foo"], &[])),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Auto-commit reference: must refuse.
+        let mut conn_ac = make_bolt_conn(db.clone(), WRITER_TOK, Some("ns-writer"));
+        let ac_err = bolt_run(&mut conn_ac, "CREATE (n:Foo {id: 'other-bolt-ac'})")
+            .expect_err("auto-commit must refuse default-ns node when role requires other ns");
+        assert!(
+            ac_err.contains("namespace"),
+            "auto-commit error should mention namespace: {ac_err}"
+        );
+
+        // Explicit tx: same refusal, same error message.
+        let mut conn_tx = make_bolt_conn(db, WRITER_TOK, Some("ns-writer"));
+        bolt_begin(&mut conn_tx).expect("BEGIN");
+        let tx_err = bolt_run(&mut conn_tx, "CREATE (n:Foo {id: 'other-bolt-tx'})")
+            .expect_err("tx must refuse default-ns node when role requires other ns");
+        assert_eq!(tx_err, ac_err, "tx error must match auto-commit error");
+    }
 }
 
 #[test]
