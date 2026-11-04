@@ -20,7 +20,8 @@ const ALPHA: &str = "alpha-secret";
 const BETA: &str = "beta-secret";
 const RD: &str = "rd-key-0123456789abcdef0123456789abcdef";
 
-/// The refusal HTTP `/tx/{id}/run` gives a role token's write.
+/// The refusal for a role token with no write scope that writes inside an
+/// explicit transaction, the same text HTTP `/tx/{id}/run` gives.
 const TX_ROLE_WRITE_REFUSAL: &str =
     "role-bound token: writes are not permitted inside a transaction";
 /// The refusal HTTP gives a `read` key's write, in `/query` and in `/tx`.
@@ -279,20 +280,17 @@ fn a_role_transaction_reads_through_its_mask_on_its_begin_snapshot() {
     }
 }
 
+/// A role with no write scope and a `read` key are refused every write inside
+/// an explicit transaction, with the same text HTTP gives.
 #[test]
-fn a_write_in_a_role_transaction_is_refused_with_the_http_refusal() {
+fn a_no_scope_role_or_read_key_write_in_tx_is_refused_with_the_http_refusal() {
     let (db, _dir) = store();
     let before = ids(&db);
-    for (token, refusal) in [
-        (ALPHA, TX_ROLE_WRITE_REFUSAL),
-        (BETA, TX_ROLE_WRITE_REFUSAL),
-        (RD, READ_TIER_REFUSAL),
-    ] {
+    for (token, refusal) in [(BETA, TX_ROLE_WRITE_REFUSAL), (RD, READ_TIER_REFUSAL)] {
         for write in [
-            // Inside alpha's write scope: a transaction still does not write.
-            "CREATE (n:Doc {id: 'w1', ns: 'tenant-a'})",
-            "MATCH (n:Doc {id: 'a1'}) SET n.v = 1",
-            "MATCH (n:Doc {id: 'a2'}) DETACH DELETE n",
+            "CREATE (n:Doc {id: 'w1', ns: 'tenant-b'})",
+            "MATCH (n:Doc {id: 'b1'}) SET n.v = 1",
+            "MATCH (n:Doc {id: 'b1'}) DETACH DELETE n",
             "CREATE INDEX v FOR (n:Doc) ON (n.v)",
         ] {
             let mut conn = connected(&db, token);
@@ -307,6 +305,48 @@ fn a_write_in_a_role_transaction_is_refused_with_the_http_refusal() {
         }
     }
     assert_eq!(ids(&db), before, "nothing was written");
+}
+
+/// A role with a write scope writes inside an explicit transaction with the
+/// same authority it has for auto-commit `RUN`.
+#[test]
+fn a_write_scope_role_can_write_in_an_explicit_tx() {
+    let (db, _dir) = store();
+    // In-scope create succeeds.
+    let mut conn = connected(&db, ALPHA);
+    conn.handle(begin());
+    rows(&mut conn, "CREATE (n:Doc {id: 'tx1', ns: 'tenant-a'})");
+    let out = conn.handle(commit());
+    assert!(
+        matches!(out.as_slice(), [ServerMessage::Success(meta)]
+            if meta.iter().any(|(k, _)| k == "bookmark")),
+        "{out:?}"
+    );
+    assert!(ids(&db).contains(&"tx1".to_string()));
+
+    // Out-of-scope create (wrong label) is refused with the same text as auto-commit.
+    let mut conn = connected(&db, ALPHA);
+    conn.handle(begin());
+    let err = failure(
+        &mut conn,
+        run("CREATE (n:Secret {id: 'tx2', ns: 'tenant-a'})"),
+    );
+    assert!(
+        matches!(err, BoltError::Forbidden(_)),
+        "out-of-scope: {err:?}"
+    );
+    assert!(!ids(&db).contains(&"tx2".to_string()));
+
+    // Schema statement still refused inside any transaction (SyntaxError, not
+    // Forbidden — the statement cannot run inside a transaction regardless of
+    // identity, so the error is "bad request" rather than authorization).
+    let mut conn = connected(&db, ALPHA);
+    conn.handle(begin());
+    let err = failure(&mut conn, run("CREATE INDEX v FOR (n:Doc) ON (n.v)"));
+    assert!(
+        matches!(err, BoltError::SyntaxError(_)),
+        "schema in tx: {err:?}"
+    );
 }
 
 #[test]

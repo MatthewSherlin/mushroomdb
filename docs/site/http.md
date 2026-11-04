@@ -1160,13 +1160,15 @@ rolls back every open one.
   the drain and answers `POST /tx/begin` with `503`. A statement already running finishes, and then
   its transaction is rolled back too.
 - **Read-tier keys and role tokens.** A `read`-tier key or a role token may begin a transaction.
-  Its reads go through the role's mask, on the snapshot the transaction began on. It cannot write: a
-  write statement is `403`, with the same message `/query` gives (`read-tier key: writes are not
-  permitted` for a key), and the transaction stays open. This holds for a role token whose role
-  carries a write scope too, although `POST /query` would let it write: a transaction has no
-  role-aware commit yet (ledger row 140, planned for 0.11). Its commit writes nothing and returns the
-  commit number it read. `write`-tier and `admin` keys and the full token run the transaction engine
-  itself.
+  Its reads go through the role's mask, on the snapshot the transaction began on. A role token with
+  a write scope writes inside the transaction with the same authority it has for `POST /query`: a
+  write outside the scope or targeting a masked node is `403` with the same message, and the
+  transaction stays open. Its commit writes the buffered statements and returns their commit number,
+  or the snapshot's commit if nothing was written. A role token with no write scope, and every
+  `read`-tier key, cannot write: a write statement is `403` (`read-tier key: writes are not
+  permitted` for a key, `role-bound token: writes are not permitted` for a no-scope role), and its
+  commit writes nothing, returning the commit number it read. `write`-tier and `admin` keys and the
+  full token run the transaction engine itself.
 - **Schema statements.** `CREATE` and `DROP` of an index or constraint are refused inside a
   transaction, with a `400` that says so. `SHOW` is allowed.
 
