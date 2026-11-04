@@ -101,9 +101,9 @@ use core_storage::wal::WalRecord;
 use core_storage::{Direction, GraphError, Result, Value};
 
 use crate::db::{
-    add_var, match_remove_ops, match_set_map_ops, match_set_ops, resolve_merge_set_value,
-    unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass, RowSource, NS_DEFAULT,
-    NS_PROP,
+    add_var, match_remove_ops, match_set_map_ops, match_set_ops, namespace_of_value,
+    resolve_merge_set_value, unwind_rows, write_counts, BatchOp, MatchWrite, Precondition, RowPass,
+    RowSource, NS_PROP,
 };
 use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, StoreId};
@@ -1224,19 +1224,24 @@ impl Transaction {
                     // Medium-1 parity fix): provide fast feedback at execute time
                     // so the status matches what /query returns for the same write.
                     if let Some(allowed) = namespaces {
-                        // Mirror check_single_op_authz: a node with no `ns`
-                        // prop is in NS_DEFAULT ("default"), not in "".
-                        let ns = props
-                            .iter()
-                            .find(|(f, _)| f == NS_PROP)
-                            .and_then(|(_, v)| {
-                                if let Value::Str(s) = v {
-                                    Some(s.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(NS_DEFAULT);
+                        let ns_val = props.iter().find(|(f, _)| f == NS_PROP).map(|(_, v)| v);
+                        // Mirror normalise_insert_ns: a non-string ns is invalid.
+                        // Catching it here gives /tx/run the same 400 /query
+                        // returns before the WAL is ever written.
+                        if let Some(v) = ns_val {
+                            if !matches!(v, Value::Str(_)) {
+                                return Err(GraphError::RuleInvalid {
+                                    detail: format!(
+                                        "node {key}: {NS_PROP} must be a string naming a \
+                                         namespace, got {v:?}"
+                                    ),
+                                });
+                            }
+                        }
+                        // Use the same function /query uses so the resolved
+                        // namespace (including the None → NS_DEFAULT mapping)
+                        // is identical to the authz gate's view.
+                        let ns = namespace_of_value(ns_val);
                         if !allowed.iter().any(|n| n == ns) {
                             return Err(GraphError::RoleWriteDenied {
                                 reason: format!(

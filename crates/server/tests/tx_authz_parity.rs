@@ -1287,3 +1287,44 @@ fn medium1_namespace_check_at_execute_time_via_bolt() {
     .expect("allowed namespace must succeed");
     assert!(bolt_commit(&mut conn_ok), "COMMIT of allowed-ns tx");
 }
+
+// ── M1: non-string ns prop is invalid — same error in /tx as in /query ────────
+//
+// /query rejects `ns: 5` (a non-string) in normalise_insert_ns before the WAL
+// append.  check_new_ops_authz now mirrors that check at execute time, so
+// /tx/run returns the same 400 and error text as /query, using the same node
+// key so the messages are bit-for-bit identical.
+
+#[tokio::test]
+async fn medium1_non_string_ns_prop_rejected_same_as_query_http() {
+    let e = open_with_ns_writer_for_label("med1-nonstr-http", "default", "Foo").await;
+
+    // /query reference: CREATE with a non-string ns → 400 (normalise_insert_ns
+    // rejects non-string ns values before WAL append).
+    // Using key "nonstr-x" in both queries so the error message is identical.
+    let (q_st, q_body) = e
+        .query(
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'nonstr-x', ns: 5}) RETURN n.id AS id",
+        )
+        .await;
+    let q_err = q_body["error"].as_str().unwrap_or("");
+    assert_ne!(q_st, 200, "/query must not accept non-string ns: {q_body}");
+
+    // /tx must give the same status and error (same key so error text is equal).
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e
+        .run(
+            &id,
+            WRITER_TOK,
+            "CREATE (n:Foo {id: 'nonstr-x', ns: 5}) RETURN n.id AS id",
+        )
+        .await;
+    let run_err = run_body["error"].as_str().unwrap_or("");
+    assert_eq!(
+        run_st, q_st,
+        "/tx status {run_st} ≠ /query status {q_st}: {run_body}"
+    );
+    assert_eq!(run_err, q_err, "/tx error ≠ /query error");
+    e.rollback(&id, WRITER_TOK).await;
+}

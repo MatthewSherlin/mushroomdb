@@ -27,11 +27,11 @@ use core_storage::v8::encode::{
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, try_encode_record, WalRecord};
 use core_storage::EdgePropsView;
+pub use core_storage::{namespace_of_value, valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 use core_storage::{
-    namespace_of_value, ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result,
-    Topology, UniqueConstraint, Value, ValueKey, BINARY_MAX_BYTES,
+    ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology,
+    UniqueConstraint, Value, ValueKey, BINARY_MAX_BYTES,
 };
-pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 
 /// Index of [`NS_DEFAULT`] in `GraphDb::ns_names` — always zero, so the
 /// open-time pass over a store with no `ns` column fills `node_ns` with one
