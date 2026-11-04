@@ -10,9 +10,10 @@
 //!   the reply. A role token's reads run under its mask. Bookmarks in `extra`
 //!   delay the statement until the store has reached them.
 //! - **In a transaction** (state `InTx`): `Transaction::execute`, which buffers
-//!   writes and reads its own writes. A role token's or `read` key's
-//!   transaction reads through the role's mask on its `BEGIN` snapshot and
-//!   refuses writes, as HTTP `/tx` does (see `messages::tx::ScopedTransaction`).
+//!   writes and reads its own writes. A role token with a write scope gets a
+//!   `RoleOwnedTransaction`: reads filter through the role's mask and writes are
+//!   validated against the scope, parity with auto-commit `RUN`. A role with no
+//!   write scope or a `read` key gets a `ScopedTransaction` and refuses writes.
 //!
 //! The reply to `RUN` is `SUCCESS {fields, t_first}`; rows stay in a cursor
 //! until `PULL {n, qid}` sends up to `n` of them as `RECORD`s (`n = -1` is all)
@@ -50,7 +51,9 @@ use super::{check_depth, MAX_PACK_LEN, TAG_RECORD};
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
 use crate::messages::hello::Identity;
-use crate::messages::tx::{BeginRequest, ReadOnlyTransaction, ScopedTransaction};
+use crate::messages::tx::{
+    BeginRequest, ReadOnlyTransaction, RoleOwnedTransaction, ScopedTransaction,
+};
 use crate::packstream::{PackStruct, PackValue, MAX_DEPTH};
 
 /// How long a statement waits for the store to reach a bookmark.
@@ -225,9 +228,9 @@ impl StreamRequest {
     }
 }
 
-/// The refusal for a role token that writes in an explicit transaction, word
-/// for word what HTTP `/tx/{id}/run` gives it: the transaction engine has no
-/// role-scoped write path (ledger row 140).
+/// The refusal for a role token with no write scope that writes in an explicit
+/// transaction, word for word what HTTP `/tx/{id}/run` gives it. Only emitted
+/// by [`ScopedTransaction`] (a no-write-scope role).
 pub(crate) fn tx_role_write_refusal() -> BoltError {
     BoltError::Forbidden("role-bound token: writes are not permitted inside a transaction".into())
 }
@@ -388,36 +391,58 @@ impl QueryService {
     /// the snapshot every statement of the transaction reads. Blocks while it
     /// waits. A `mode: "r"` request gets a transaction that refuses writes.
     ///
-    /// A role token or a `read` key gets a [`ScopedTransaction`], as HTTP
-    /// `/tx/begin` gives it a scoped body: the role's mask is resolved here, on
-    /// the snapshot every statement reads, so a role the store no longer
-    /// defines is refused at `BEGIN`. It is read-only whatever `mode` says.
+    /// A `read` key or a role with no write scope gets a [`ScopedTransaction`]:
+    /// reads filter through the role's mask on the frozen snapshot and every
+    /// write is refused, parity with HTTP `/tx`. A role with a write scope gets
+    /// a [`RoleOwnedTransaction`]: reads filter through the mask and writes are
+    /// validated against the scope, parity with auto-commit `RUN`. In both
+    /// cases the role is resolved here, so a role the store no longer defines
+    /// is refused at `BEGIN`.
     pub fn begin(
         &self,
         identity: &Identity,
         request: &BeginRequest,
     ) -> Result<Box<dyn OpenTransaction>, BoltError> {
         self.wait_for_bookmarks(&request.bookmarks)?;
-        let role = match identity {
-            Identity::Full | Identity::Write => None,
-            Identity::Role(role) => Some((role, false)),
-            Identity::ReadOnlyRole(role) => Some((role, true)),
-        };
-        if let Some((role, read_tier_key)) = role {
-            let snapshot = self.db.reader();
-            let mask = snapshot.mask_for_role(role).map_err(role_mask_error)?;
-            return Ok(Box::new(ScopedTransaction::new(
-                snapshot,
-                mask,
-                read_tier_key,
-            )));
+        match identity {
+            Identity::Full | Identity::Write => {
+                let tx: Box<dyn OpenTransaction> = Box::new(self.db.begin_transaction());
+                Ok(if request.read_only {
+                    Box::new(ReadOnlyTransaction::new(tx))
+                } else {
+                    tx
+                })
+            }
+            Identity::ReadOnlyRole(role) => {
+                // `read`-tier key: always a scoped, read-only transaction.
+                let snapshot = self.db.reader();
+                let mask = snapshot.mask_for_role(role).map_err(role_mask_error)?;
+                Ok(Box::new(ScopedTransaction::new(snapshot, mask, true)))
+            }
+            Identity::Role(role) => {
+                let (tx, scope, mask, namespaces) = self
+                    .db
+                    .begin_transaction_for_role(role)
+                    .map_err(role_mask_error)?;
+                Ok(match scope {
+                    Some(scope) if !request.read_only => {
+                        // Write-scope role, non-read-only BEGIN: writes allowed.
+                        Box::new(RoleOwnedTransaction::new(
+                            tx,
+                            role.clone(),
+                            scope,
+                            mask,
+                            namespaces,
+                        ))
+                    }
+                    _ => {
+                        // No write scope, or client asked for `mode: "r"`:
+                        // scoped read-only, writes refused with the role text.
+                        Box::new(ScopedTransaction::new(tx.into_base_snapshot(), mask, false))
+                    }
+                })
+            }
         }
-        let tx: Box<dyn OpenTransaction> = Box::new(self.db.begin_transaction());
-        Ok(if request.read_only {
-            Box::new(ReadOnlyTransaction::new(tx))
-        } else {
-            tx
-        })
     }
 
     /// Waits until the store has reached the highest of `bookmarks`: polls

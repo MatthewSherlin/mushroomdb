@@ -128,6 +128,7 @@ use crate::db::{
     WRITE_LOCK_WAIT,
 };
 use crate::durable_wal::{DurableWal, WalPosition};
+use crate::mask::NodeMask;
 use crate::reader::ReaderSnapshot;
 use crate::transaction::Transaction;
 use crate::GraphDb;
@@ -1401,6 +1402,87 @@ impl SharedDb {
         });
         receive(rx).map(|a| a.inserted)
     }
+
+    /// Like [`submit_batch_cas_with_seq`] but with role-scoped write authz.
+    ///
+    /// Used by [`Transaction::commit_authz`]: the transaction's CAS
+    /// preconditions (snapshot isolation) and the role's scope+mask check are
+    /// both enforced under the **same** write guard as the mutation, with no
+    /// TOCTOU window between them.
+    ///
+    /// A CAS conflict → [`GraphError::CasConflict`]; a scope / visibility
+    /// violation → [`GraphError::RoleWriteDenied`]; both write nothing.
+    pub(crate) fn submit_batch_cas_authz_with_seq(
+        &self,
+        role: String,
+        preconds: Vec<Precondition>,
+        ops: Vec<BatchOp>,
+    ) -> Result<((usize, usize), u64)> {
+        if let Some(msg) = self.queue.degraded_message() {
+            return Err(GraphError::Io(std::io::Error::other(msg)));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.queue.enqueue(Submission {
+            ops,
+            preconds,
+            own_commit: true,
+            authz_role: Some(role),
+            done: tx,
+        });
+        let applied = receive(rx)?;
+        let seq = applied.commit_seq.ok_or_else(|| {
+            GraphError::Io(std::io::Error::other(
+                "group-commit drain thread reported no commit number for a CAS+authz submission",
+            ))
+        })?;
+        Ok((applied.inserted, seq))
+    }
+
+    /// Open a transaction and resolve the role's write scope and mask from the
+    /// same snapshot it freezes.
+    ///
+    /// Returns `(Transaction, write_scope, mask)`.  When the role has no write
+    /// scope (`write: None`) the second element is `None`.
+    ///
+    /// The mask and scope are resolved from the same read-lock capture as the
+    /// transaction's base snapshot, so they are coherent with the transaction's
+    /// starting point.  The authoritative check at commit still runs under the
+    /// write lock (the definitive security gate).
+    #[allow(clippy::type_complexity)]
+    pub fn begin_transaction_for_role(
+        &self,
+        role: &str,
+    ) -> Result<(
+        Transaction,
+        Option<crate::roles::WriteScope>,
+        NodeMask,
+        Option<Vec<String>>,
+    )> {
+        use crate::roles::WriteScope;
+        let (base_snap, base_store) = {
+            let db = self.read();
+            (db.reader(), db.store_id())
+        };
+        // Resolve mask, scope, and namespaces from the same snapshot the
+        // transaction reads.
+        let mask = base_snap.mask_for_role(role)?;
+        let role_def = base_snap
+            .frozen
+            .roles
+            .as_deref()
+            .ok_or_else(|| GraphError::Corrupt {
+                detail: "roles.json was corrupt at open; re-open to restore role access".into(),
+            })?
+            .iter()
+            .find(|r| r.name == role)
+            .ok_or_else(|| GraphError::KeyNotFound {
+                key: format!("role:{role}"),
+            })?;
+        let scope: Option<WriteScope> = role_def.write.clone();
+        let namespaces: Option<Vec<String>> = role_def.namespaces.clone();
+        let tx = Transaction::new(self.clone(), base_snap, base_store);
+        Ok((tx, scope, mask, namespaces))
+    }
 }
 
 /// Wait for the drain thread's answer to one submission.
@@ -1630,9 +1712,9 @@ fn drain_loop(
 
             for (preconds, own_commit, ops, authz_role) in submissions {
                 if let Some(role) = authz_role {
-                    // Authz submission: process individually (breaks coalescing).
-                    // Flush accumulated non-CAS batch first so authz evaluation
-                    // sees their writes already applied.
+                    // Authz submission (or CAS+authz): process individually (breaks
+                    // coalescing).  Flush accumulated non-CAS batch first so authz
+                    // evaluation sees their writes already applied.
                     if !pending_non_cas.is_empty() {
                         let batch = std::mem::take(&mut pending_non_cas);
                         r.extend(uncounted(db.commit_group_nosync(batch)));
@@ -1640,7 +1722,13 @@ fn drain_loop(
                     // Resolve WriteAuthz under the write guard (§5 lock discipline:
                     // scope + mask resolved in the same guard as the mutation;
                     // authz check fires BEFORE any WAL write).
-                    let result = (|| -> Result<(usize, usize)> {
+                    //
+                    // The IIFE executes and drops immediately, ending all immutable
+                    // borrows on `db` before the mutable calls below.  Using a
+                    // shared closure that is later called from inside a mutable
+                    // closure hits E0502 — both closures would live simultaneously
+                    // and Rust cannot prove their borrow windows don't overlap.
+                    let authz = (|| -> Result<WriteAuthz> {
                         let scope = {
                             // Temporary scope so the borrow on db.roles ends
                             // before write_batch_authz_nosync borrows db mutably.
@@ -1658,10 +1746,27 @@ fn drain_loop(
                             })?
                         };
                         let mask = db.mask_for_role(&role)?;
-                        let authz = WriteAuthz { role, scope, mask };
-                        db.write_batch_authz_nosync(Some(&authz), ops)
+                        Ok(WriteAuthz { role, scope, mask })
                     })();
-                    r.push(result.map(Applied::uncounted));
+
+                    if !preconds.is_empty() || own_commit {
+                        // CAS+authz: check preconditions first, then apply with authz.
+                        // Both checks run under the same write guard — no TOCTOU.
+                        let result = authz.and_then(|authz| {
+                            db.check_preconditions(&preconds)?;
+                            db.write_batch_authz_nosync(Some(&authz), ops)
+                        });
+                        // Read commit_seq under the same guard that applied the batch.
+                        r.push(result.map(|inserted| Applied {
+                            inserted,
+                            commit_seq: Some(db.commit_seq()),
+                        }));
+                    } else {
+                        // Authz-only (no CAS): existing path.
+                        let result =
+                            authz.and_then(|authz| db.write_batch_authz_nosync(Some(&authz), ops));
+                        r.push(result.map(Applied::uncounted));
+                    }
                 } else if preconds.is_empty() && !own_commit {
                     // Non-CAS: accumulate for a batched commit_group_nosync call.
                     pending_non_cas.push(ops);

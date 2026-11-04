@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.10.4 — aggregates take expressions, and a role's transaction can write
+
+### Fixed
+
+- **An aggregate takes any expression.** `max(n.age + 1)`, `count(1)`, `sum($p)`,
+  `collect(toLower(n.name))` and `count(DISTINCT expr)` were parse errors (`expected
+  variable or '*' in aggregate argument`); only a variable, `var.field` or `*` worked.
+  A nested aggregate (`max(count(x))`) and `rand()` inside one are refused by name, as
+  openCypher refuses them. Present in released 0.9.x and 0.10.x (ledger row 159).
+- **`sum` over no values is 0, not null.** `MATCH (n) RETURN sum(n.missing)` and a group
+  whose rows all lack the value now give 0, as openCypher does. `avg`, `min` and `max`
+  over nothing are still null. A caller that tested a `sum` for null sees 0 instead.
+  Present in released 0.9.x and 0.10.x (ledger row 166).
+- **A role token with a write scope can write inside a transaction.** An HTTP `/tx`
+  transaction or a Bolt `BEGIN` for such a role refused every write with 403, while
+  `/query` let the same role write within its scope. A transaction now allows and refuses
+  exactly what `/query` does for that role, with the same status and message, and reads in
+  it still see only what the role may see. A `read` key and a role with no write scope stay
+  read-only. Present in released 0.10.x (ledger row 140).
+- **`mushroomdb why` dims its first line on a terminal.** The `(untrusted graph data …)`
+  line is for a model reading the output, and on a terminal it read as a warning. A
+  terminal shows it dimmed, and `NO_COLOR` or `TERM=dumb` shows it plain. Piped output
+  is unchanged.
+
 ## v0.10.3 — a replaced WAL is seen on Windows
 
 ### Fixed
@@ -92,7 +116,7 @@ See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
 - **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
 - **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
 
-Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2, row 122 in 0.10.3. Rows 101, 120, 136, 137, 140, 152, 155, 156 and 159 stay deferred.
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2, row 122 in 0.10.3, rows 140, 159 and 166 in 0.10.4. Rows 101, 120, 136, 137, 152, 155 and 156 stay deferred.
 
 ### Deprecated
 

@@ -41,8 +41,9 @@
 //! integer is never equal to a float.
 //!
 //! Where the engine deliberately differs from openCypher and documents it,
-//! the documented behaviour is one named function that points at its source:
-//! `sum_of_nothing` (ledger row 166). Every other difference is an engine bug.
+//! the documented behaviour is one named function that points at its source.
+//! There is none today: `sum_of_nothing` was one until 0.10.4 closed ledger
+//! row 166. Every difference is an engine bug.
 //! Three found when this test was written are ledger rows 168–170, pinned,
 //! shrunk, as the `finding_*` tests at the end. All three are fixed in 0.10.1.
 //! Shapes the engine refuses outright (`WITH DISTINCT`;
@@ -1142,13 +1143,10 @@ fn equivalence_key(v: &Val) -> String {
     }
 }
 
-/// `sum` over no values. openCypher returns 0; the engine returns null and
-/// pins it in `core-query`'s `exec.rs`
-/// (`sum_numeric_prop_ignores_null_and_non_numeric`). Documented deviation,
-/// ledger row 166, deferred to 0.11 for an owner ruling. Flipping it is this
-/// one function.
+/// `sum` over no values: 0, as openCypher gives and the engine has since
+/// 0.10.4 (ledger row 166).
 fn sum_of_nothing() -> Val {
-    Val::Null
+    Val::Int(0)
 }
 
 /// openCypher `sum`: an integer over integers, a float once any input is a
@@ -1598,8 +1596,8 @@ fn the_reference_follows_opencypher_on_known_cases() {
     assert_eq!(eval_pred(&g, &row, &Pred::Or(null_cmp(), t())), Some(true));
     assert_eq!(eval_pred(&g, &row, &Pred::Xor(null_cmp(), t())), None);
     assert_eq!(eval_pred(&g, &row, &Pred::Not(null_cmp())), None);
-    // An aggregate with no grouping key over no rows is one row; sum is the
-    // engine's documented null (row 166), count is 0.
+    // An aggregate with no grouping key over no rows is one row; sum and
+    // count are both 0 (row 166).
     let q = Query {
         paths: vec![Path {
             nodes: vec![("a".into(), Some(1))],
@@ -1624,7 +1622,7 @@ fn the_reference_follows_opencypher_on_known_cases() {
         skip: None,
         limit: None,
     };
-    assert_eq!(evaluate(&g, &q).rows, vec![vec![Val::Int(0), Val::Null]]);
+    assert_eq!(evaluate(&g, &q).rows, vec![vec![Val::Int(0), Val::Int(0)]]);
 }
 
 // ---------------------------------------------------------------------------

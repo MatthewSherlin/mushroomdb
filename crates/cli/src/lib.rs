@@ -3090,6 +3090,19 @@ pub fn run_why(db_dir: &Path, a: &str, b: &str) -> Result<String, CliError> {
     ))
 }
 
+/// `why`'s reply as it goes to stdout. A person at a terminal reads the
+/// framing line as a warning, so `styled` dims it; the text stays, because an
+/// agent may be reading through a terminal too. Piped output is untouched.
+pub fn why_for_stdout(out: String, styled: bool) -> String {
+    let framing = mushroomdb::digest::UNTRUSTED_FRAMING;
+    match out.strip_prefix(framing) {
+        Some(rest) if styled => {
+            format!("\x1b[2m{}\x1b[0m\n{rest}", framing.trim_end_matches('\n'))
+        }
+        _ => out,
+    }
+}
+
 /// Run a graph algorithm and return a formatted string.
 ///
 /// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` and
@@ -3861,6 +3874,25 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn why_for_stdout_dims_the_framing_only_when_styled() {
+        let framing = mushroomdb::digest::UNTRUSTED_FRAMING;
+        let out = format!("{framing}mushroomdb explain — a ↔ b: 0 relationship(s)\n");
+        assert_eq!(why_for_stdout(out.clone(), false), out);
+        let styled = why_for_stdout(out.clone(), true);
+        assert_eq!(
+            styled,
+            format!(
+                "\x1b[2m{}\x1b[0m\nmushroomdb explain — a ↔ b: 0 relationship(s)\n",
+                framing.trim_end_matches('\n')
+            )
+        );
+        // The framing text survives styling: strip the escapes and it is back.
+        assert_eq!(styled.replace("\x1b[2m", "").replace("\x1b[0m", ""), out);
+        // A reply without the framing is never touched.
+        assert_eq!(why_for_stdout("plain\n".into(), true), "plain\n");
     }
 
     fn directed_pairs(db: &SharedDb, etype: &str) -> BTreeSet<(String, String)> {

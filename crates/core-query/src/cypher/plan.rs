@@ -5,8 +5,9 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem,
-    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
+    operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand,
+    OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
+    UnwindExpr, WithStage,
 };
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
@@ -2194,6 +2195,7 @@ fn check_agg_arg_bound(arg: &AggArg, bound: &BTreeSet<String>) -> Result<(), Str
         AggArg::Var(v) => require_bound(v, bound, "RETURN"),
         AggArg::Prop { var, .. } => require_bound(var, bound, "RETURN"),
         AggArg::Distinct(inner) => check_agg_arg_bound(inner, bound),
+        AggArg::Expr(op) => check_operand_bound(op, bound, "RETURN"),
     }
 }
 
@@ -2230,6 +2232,7 @@ fn agg_arg_name(arg: &AggArg) -> String {
         AggArg::Var(v) => v.clone(),
         AggArg::Prop { var, field } => format!("{var}.{field}"),
         AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_name(inner)),
+        AggArg::Expr(op) => operand_label(op),
     }
 }
 

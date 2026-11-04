@@ -92,15 +92,17 @@ fn strings_have_a_minimum_and_a_maximum() {
         one(&fx, &format!("{l} RETURN min(x)")),
         Some(Value::Str("a".into()))
     );
-    // Not a number: sum and avg skip it, as for a property.
-    assert_eq!(one(&fx, &format!("{l} RETURN sum(x)")), None);
+    // Not a number: sum skips it; no numeric values → 0 (openCypher row 166).
+    assert_eq!(one(&fx, &format!("{l} RETURN sum(x)")), int(0));
 }
 
 #[test]
 fn empty_and_all_null_inputs() {
     let fx = Fx::new();
     for l in ["UNWIND [] AS x", "UNWIND [null, null] AS x"] {
-        for f in ["max", "min", "sum", "avg"] {
+        // openCypher row 166: sum over no numeric values is 0, not null.
+        assert_eq!(one(&fx, &format!("{l} RETURN sum(x)")), int(0), "{l} sum");
+        for f in ["max", "min", "avg"] {
             assert_eq!(one(&fx, &format!("{l} RETURN {f}(x)")), None, "{l} {f}");
         }
         assert_eq!(one(&fx, &format!("{l} RETURN count(x)")), int(0));
@@ -285,7 +287,8 @@ fn reference(f: &str, vals: &[Option<Value>]) -> Option<Value> {
         "collect" => Some(Value::List(
             present.iter().map(|v| v.clone().unwrap()).collect(),
         )),
-        "sum" if nums.is_empty() => None,
+        // openCypher row 166: sum over no numeric values is 0, not null.
+        "sum" if nums.is_empty() => int(0),
         "sum" if all_int => int(present
             .iter()
             .filter_map(|v| match v {
@@ -453,7 +456,8 @@ fn sum_of_integers_is_an_integer() {
     assert_eq!(one(&fx, "UNWIND [1, 2, 3] AS x RETURN sum(x)"), int(6));
     assert_eq!(one(&fx, "UNWIND [1, 2.5] AS x RETURN sum(x)"), float(3.5));
     assert_eq!(one(&fx, "UNWIND [2.5, 1] AS x RETURN sum(x)"), float(3.5));
-    assert_eq!(one(&fx, "UNWIND [] AS x RETURN sum(x)"), None);
+    // openCypher row 166: sum over empty set is 0, not null.
+    assert_eq!(one(&fx, "UNWIND [] AS x RETURN sum(x)"), int(0));
     // Exact above 2^53, where a float sum would round.
     assert_eq!(
         one(&fx, "UNWIND [9007199254740993, 1] AS x RETURN sum(x)"),
@@ -472,4 +476,214 @@ fn a_null_scalar_variable_is_not_counted_or_collected() {
         Some(Value::List(vec![]))
     );
     assert_eq!(one(&fx, "UNWIND [1, null, 2] AS x RETURN count(x)"), int(2));
+}
+
+// ── Row 159: aggregate arguments accept any expression ───────────────────────
+
+/// `max(1)` — literal expression, should give 1 for each matched row and return 1.
+#[test]
+fn aggregate_literal_expression_argument() {
+    let fx = Fx::new();
+    // Three rows, max(1) → 1.
+    assert_eq!(one(&fx, "UNWIND [10, 20, 30] AS x RETURN max(1)"), int(1));
+    // sum(1) counts rows.
+    assert_eq!(one(&fx, "UNWIND [10, 20, 30] AS x RETURN sum(1)"), int(3));
+    // sum(2) over two rows → 4.
+    assert_eq!(one(&fx, "UNWIND [10, 20] AS x RETURN sum(2)"), int(4));
+}
+
+/// `max(x + 1)` — arithmetic expression over a variable.
+#[test]
+fn aggregate_arithmetic_expression_argument() {
+    let fx = Fx::new();
+    assert_eq!(one(&fx, "UNWIND [1, 2, 3] AS x RETURN max(x + 1)"), int(4));
+    assert_eq!(one(&fx, "UNWIND [1, 2, 3] AS x RETURN min(x + 1)"), int(2));
+    assert_eq!(
+        one(&fx, "UNWIND [1, 2, 3] AS x RETURN sum(x + 1)"),
+        int(9) // (2+3+4)
+    );
+    assert_eq!(
+        one(&fx, "UNWIND [1.0, 2.0, 3.0] AS x RETURN avg(x * 2)"),
+        float(4.0) // avg of 2, 4, 6
+    );
+}
+
+/// `max(n.age + 1)` — arithmetic expression over a property.
+#[test]
+fn aggregate_expression_over_property() {
+    let mut fx = Fx::new();
+    fx.add("N", "a", vec![("age", Value::Int(10))]);
+    fx.add("N", "b", vec![("age", Value::Int(20))]);
+    fx.add("N", "c", vec![("age", Value::Int(5))]);
+    assert_eq!(one(&fx, "MATCH (n:N) RETURN max(n.age + 1)"), int(21));
+    assert_eq!(one(&fx, "MATCH (n:N) RETURN min(n.age + 1)"), int(6));
+    assert_eq!(
+        one(&fx, "MATCH (n:N) RETURN sum(n.age + 1)"),
+        int(38) // (11+21+6)
+    );
+}
+
+/// `collect(toLower(n.name))` — scalar function in aggregate argument.
+#[test]
+fn aggregate_function_call_expression_argument() {
+    let mut fx = Fx::new();
+    fx.add("N", "a", vec![("name", Value::Str("Alice".into()))]);
+    fx.add("N", "b", vec![("name", Value::Str("Bob".into()))]);
+    let rs = rows(&fx, "MATCH (n:N) RETURN collect(toLower(n.name)) AS names");
+    assert_eq!(rs.len(), 1);
+    // Both lowercased names collected (order may vary).
+    if let Some(Value::List(lst)) = &rs[0][0] {
+        let mut got: Vec<String> = lst
+            .iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["alice".to_string(), "bob".to_string()]);
+    } else {
+        panic!("expected a list, got {:?}", rs[0][0]);
+    }
+}
+
+/// `count(DISTINCT n.age + 1)` — DISTINCT wrapping an expression.
+#[test]
+fn aggregate_distinct_expression_argument() {
+    let fx = Fx::new();
+    // Values [1, 2, 2, 3]: +1 → [2, 3, 3, 4]; DISTINCT → 3 unique.
+    assert_eq!(
+        one(&fx, "UNWIND [1, 2, 2, 3] AS x RETURN count(DISTINCT x + 1)"),
+        int(3)
+    );
+    // sum(DISTINCT x + 1) → 2+3+4 = 9.
+    assert_eq!(
+        one(&fx, "UNWIND [1, 2, 2, 3] AS x RETURN sum(DISTINCT x + 1)"),
+        int(9)
+    );
+}
+
+/// Grouped aggregation with an expression argument.
+#[test]
+fn grouped_aggregation_with_expression_argument() {
+    let fx = Fx::new();
+    let r = rows(
+        &fx,
+        "UNWIND [{k: 'a', v: 1}, {k: 'b', v: 5}, {k: 'a', v: 3}] AS r \
+         WITH r.k AS k, r.v AS x \
+         RETURN k, max(x + 10) ORDER BY k",
+    );
+    assert_eq!(r.len(), 2);
+    // Group 'a': max(1+10, 3+10) = 13.
+    assert_eq!(r[0], vec![Some(Value::Str("a".into())), int(13)]);
+    // Group 'b': max(5+10) = 15.
+    assert_eq!(r[1], vec![Some(Value::Str("b".into())), int(15)]);
+}
+
+// ── Row 166: sum over no values returns 0 ────────────────────────────────────
+
+/// `MATCH (n) RETURN sum(n.missing)` — the property is absent on all rows.
+#[test]
+fn sum_over_all_null_property_returns_zero() {
+    let mut fx = Fx::new();
+    fx.add("N", "a", vec![]);
+    fx.add("N", "b", vec![]);
+    let rs = rows(&fx, "MATCH (n:N) RETURN sum(n.missing)");
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0][0], int(0));
+}
+
+/// `MATCH (n:Ghost) RETURN sum(n.x)` — no rows matched at all.
+#[test]
+fn sum_over_empty_match_returns_zero() {
+    let fx = Fx::new();
+    let rs = rows(&fx, "MATCH (n:Ghost) RETURN sum(n.x)");
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0][0], int(0));
+}
+
+/// A grouped sum where one group has all-null values → that group's sum is 0.
+#[test]
+fn grouped_sum_all_null_group_returns_zero() {
+    let mut fx = Fx::new();
+    fx.add(
+        "N",
+        "a",
+        vec![("kind", Value::Str("x".into())), ("v", Value::Int(5))],
+    );
+    fx.add("N", "b", vec![("kind", Value::Str("y".into()))]); // no v
+    let rs = rows(&fx, "MATCH (n:N) RETURN n.kind, sum(n.v) ORDER BY n.kind");
+    assert_eq!(rs.len(), 2);
+    // Group 'x' has v=5.
+    assert_eq!(rs[0][1], int(5));
+    // Group 'y' has no v → sum is 0 (row 166).
+    assert_eq!(rs[1][1], int(0));
+}
+
+/// avg/min/max over no values still return null (not 0).
+#[test]
+fn other_aggregates_over_empty_set_remain_null() {
+    let fx = Fx::new();
+    for f in ["avg", "min", "max"] {
+        assert_eq!(
+            one(&fx, &format!("MATCH (n:Ghost) RETURN {f}(n.x)")),
+            None,
+            "{f} over empty should be null"
+        );
+    }
+}
+
+// ── Review fixes: nested aggregates, nondeterminism, and grouped DISTINCT $param
+
+/// Nested aggregates inside an aggregate argument are refused at check time
+/// with the NestedAggregation kind (openCypher Return6 [14]).
+#[test]
+fn nested_aggregate_in_aggregate_arg_is_refused() {
+    let fx = Fx::new();
+    // max(count(x)) — count nested inside max.
+    let err = try_rows(&fx, "UNWIND [1,2] AS x RETURN max(count(x))")
+        .expect_err("max(count(x)) must be refused");
+    assert!(
+        err.contains("NestedAggregation"),
+        "expected NestedAggregation, got: {err}"
+    );
+    // count(DISTINCT sum(x)) — sum nested inside DISTINCT count.
+    let err = try_rows(&fx, "UNWIND [1,2] AS x RETURN count(DISTINCT sum(x))")
+        .expect_err("count(DISTINCT sum(x)) must be refused");
+    assert!(
+        err.contains("NestedAggregation"),
+        "expected NestedAggregation in DISTINCT case, got: {err}"
+    );
+}
+
+/// count(rand()) is refused at check time with NonConstantExpression
+/// (openCypher Return6 [15]).
+#[test]
+fn nondeterministic_function_in_aggregate_arg_is_refused() {
+    let fx = Fx::new();
+    let err = try_rows(&fx, "RETURN count(rand())").expect_err("count(rand()) must be refused");
+    assert!(
+        err.contains("NonConstantExpression"),
+        "expected NonConstantExpression, got: {err}"
+    );
+}
+
+/// Grouped query with a $param inside DISTINCT expression aggregate
+/// argument: the param must be found by pre-flight so the query does not
+/// fail with "missing parameter" (fix 3).
+#[test]
+fn grouped_sum_with_distinct_param_expression_argument() {
+    let fx = Fx::new();
+    let mut params = BTreeMap::new();
+    params.insert("inc".to_string(), Value::Int(10));
+    // DISTINCT $param + n.x inside a grouped aggregate.
+    let rs = run(
+        &fx.view(),
+        "UNWIND [1, 2, 2, 3] AS x RETURN count(DISTINCT $inc + x)",
+        &params,
+    )
+    .unwrap_or_else(|e| panic!("grouped DISTINCT $param query failed: {e}"));
+    assert_eq!(rs.len(), 1);
+    // $inc + x gives [11, 12, 12, 13]; DISTINCT → 3 unique.
+    assert_eq!(rs.row(0), &[int(3)]);
 }

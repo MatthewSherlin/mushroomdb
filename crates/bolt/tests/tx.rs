@@ -523,9 +523,10 @@ fn a_read_mode_transaction_refuses_writes_and_still_reads() {
 }
 
 #[test]
-fn a_role_token_cannot_write_in_a_transaction() {
+fn a_no_write_scope_role_token_cannot_write_in_a_transaction() {
     let (db, _dir) = open_db();
-    // The role must exist: BEGIN resolves its mask, as HTTP `/tx/begin` does.
+    // A role with no write scope cannot write inside a BEGIN/COMMIT block.
+    // (A role with write scope CAN write; see scoped.rs tests.)
     db.write()
         .apply_schema(&mushroomdb::Schema {
             roles: vec![mushroomdb::RoleDef {
@@ -534,10 +535,7 @@ fn a_role_token_cannot_write_in_a_transaction() {
                 labels: vec!["Role".into()],
                 visible_where: None,
                 namespaces: None,
-                write: Some(mushroomdb::WriteScope {
-                    create_labels: vec!["Role".into()],
-                    ..Default::default()
-                }),
+                write: None,
             }],
             ..Default::default()
         })
