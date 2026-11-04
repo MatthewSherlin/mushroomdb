@@ -75,6 +75,18 @@ fn why_names_the_rule_and_the_values_the_two_share() {
 }
 
 #[test]
+fn why_piped_keeps_the_framing_line_plain() {
+    let db = store("piped");
+    let (ok, out) = run(&["why", &db, "ada", "grace"]);
+    assert!(ok, "why failed: {out}");
+    assert!(
+        out.starts_with(mushroomdb::digest::UNTRUSTED_FRAMING),
+        "piped output must open with the framing line: {out}"
+    );
+    assert!(!out.contains('\x1b'), "no escapes when piped: {out}");
+}
+
+#[test]
 fn why_on_two_unrelated_keys_says_so_rather_than_erroring() {
     let db = store("unrelated");
     let (ok, out) = run(&[

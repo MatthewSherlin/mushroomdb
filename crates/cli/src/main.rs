@@ -132,7 +132,12 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
-        Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
+        Ok(Command::Why { db_dir, a, b }) => {
+            let styled = io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+                && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
+            print_or_fail(cli::run_why(&db_dir, &a, &b).map(|out| cli::why_for_stdout(out, styled)))
+        }
         Ok(Command::Version) => {
             println!("{}", cli::version_string());
             ExitCode::SUCCESS
