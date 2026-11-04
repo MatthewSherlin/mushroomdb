@@ -647,3 +647,435 @@ fn bolt_out_of_scope_label_refused_same_as_auto_commit() {
         .expect_err("tx must refuse out-of-scope label");
     assert!(tx_err.contains("not in write scope"), "tx error: {tx_err}");
 }
+
+// ── Security regression: HIGH-1 — MERGE+RETURN must not leak hidden node data ─
+//
+// A MERGE on a key that exists as a hidden node followed by RETURN must NOT
+// expose the hidden node's properties.  After the fix `has_key` uses the masked
+// view, so the hidden node appears absent, MERGE creates a new node, and
+// `check_new_ops_authz` refuses it (Secret is not in scope) → 403.
+// Before the fix, `has_key` saw the hidden node, MERGE produced zero ops, the
+// scope check passed on an empty slice, and RETURN projected through the
+// unmasked view → 200 with sensitive data.
+
+async fn open_with_secret_prop(name: &str) -> Env {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "graphdb-tx-sec-{name}-{}-{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                labels: vec!["Task".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: Some(write_scope(&["Task"], &["LINKS"])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Seed the visible Task node and a hidden Secret node with sensitive data.
+    db.write()
+        .insert_node("Task", "t1", vec![("id".into(), Value::Str("t1".into()))])
+        .unwrap();
+    db.write()
+        .insert_node(
+            "Secret",
+            "s1",
+            vec![
+                ("id".into(), Value::Str("s1".into())),
+                ("sensitive".into(), Value::Str("top-secret-value".into())),
+            ],
+        )
+        .unwrap();
+
+    let role_tokens: HashMap<String, String> =
+        [(WRITER_TOK.to_string(), "writer".to_string())].into();
+
+    let app = router_with_tx_limits(
+        db.clone(),
+        Some(ADMIN.to_string()),
+        role_tokens,
+        None,
+        TxLimits {
+            max_open: 100,
+            idle_timeout: Duration::from_secs(30),
+            max_lifetime: Duration::from_secs(300),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Env {
+        base: format!("http://{addr}"),
+        http: reqwest::Client::new(),
+        db,
+    }
+}
+
+#[tokio::test]
+async fn high1_merge_return_on_hidden_node_does_not_leak_via_http_tx() {
+    let e = open_with_secret_prop("high1-http").await;
+
+    // Reference: /query must refuse with 403 (masked existence check).
+    let (q_st, q_body) = e
+        .query(
+            WRITER_TOK,
+            "MERGE (s:Secret {id: 's1'}) RETURN s.sensitive AS x",
+        )
+        .await;
+    // The fix makes this 403 (MERGE sees node absent → tries to create Secret →
+    // create_labels scope check fires).  Assert it is NOT 200 with data.
+    assert_ne!(q_st, 200, "/query returned 200: {q_body}");
+    if q_st == 200 {
+        // Extra guard: if status is ever 200, the value must be absent.
+        let val = &q_body["rows"];
+        assert!(
+            !val.to_string().contains("top-secret-value"),
+            "/query leaked sensitive data: {q_body}"
+        );
+    }
+
+    // TX path must behave identically: not 200 with the sensitive value.
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e
+        .run(
+            &id,
+            WRITER_TOK,
+            "MERGE (s:Secret {id: 's1'}) RETURN s.sensitive AS x",
+        )
+        .await;
+    assert_ne!(run_st, 200, "/tx run returned 200: {run_body}");
+    assert!(
+        !run_body.to_string().contains("top-secret-value"),
+        "/tx leaked sensitive data: {run_body}"
+    );
+    e.rollback(&id, WRITER_TOK).await;
+}
+
+#[test]
+fn high1_merge_return_on_hidden_node_does_not_leak_via_bolt_tx() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                labels: vec!["Task".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: Some(write_scope(&["Task"], &[])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    db.write()
+        .insert_node(
+            "Secret",
+            "hs1",
+            vec![
+                ("id".into(), Value::Str("hs1".into())),
+                ("sensitive".into(), Value::Str("top-secret-bolt".into())),
+            ],
+        )
+        .unwrap();
+
+    // Explicit-tx Bolt path: MERGE+RETURN on a hidden key must not leak.
+    let mut conn = make_bolt_conn(db, WRITER_TOK, Some("writer"));
+    bolt_begin(&mut conn).expect("BEGIN");
+    let result = bolt_run(
+        &mut conn,
+        "MERGE (s:Secret {id: 'hs1'}) RETURN s.sensitive AS x",
+    );
+    match &result {
+        Ok(fields) => {
+            for f in fields {
+                assert_ne!(
+                    f,
+                    &PackValue::String("top-secret-bolt".into()),
+                    "Bolt tx MERGE+RETURN leaked sensitive data: {fields:?}"
+                );
+            }
+        }
+        Err(_) => { /* 403 at execute time is the expected outcome */ }
+    }
+    // Don't commit — no need to.
+}
+
+// ── Security regression: HIGH-2 — MATCH…SET…RETURN must not bind hidden nodes ─
+//
+// `MATCH (a:Task {id: 't1'}), (b:Secret {id: 's1'}) SET a.marker = 1 RETURN b.sensitive AS x`
+// With the fix `execute_rows` uses the masked view for both the MATCH and
+// RETURN passes, so `b` does not bind → no rows returned (not 200 with data).
+
+#[tokio::test]
+async fn high2_match_set_return_hidden_bound_does_not_leak_via_http_tx() {
+    let e = open_with_secret_prop("high2-http").await;
+
+    let cypher =
+        "MATCH (a:Task {id: 't1'}), (b:Secret {id: 's1'}) SET a.marker = 1 RETURN b.sensitive AS x";
+
+    // /query reference: must not return sensitive data.
+    let (q_st, q_body) = e.query(WRITER_TOK, cypher).await;
+    assert_eq!(q_st, 200, "/query failed: {q_body}");
+    assert_eq!(
+        q_body["rows"],
+        json!([]),
+        "/query bound hidden node and returned data: {q_body}"
+    );
+    assert!(
+        !q_body.to_string().contains("top-secret-value"),
+        "/query leaked sensitive data: {q_body}"
+    );
+
+    // TX path must match /query.
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e.run(&id, WRITER_TOK, cypher).await;
+    assert_eq!(run_st, 200, "/tx run failed: {run_body}");
+    assert_eq!(
+        run_body["rows"],
+        json!([]),
+        "/tx returned rows with hidden bound variable: {run_body}"
+    );
+    assert!(
+        !run_body.to_string().contains("top-secret-value"),
+        "/tx leaked sensitive data: {run_body}"
+    );
+    e.rollback(&id, WRITER_TOK).await;
+}
+
+#[test]
+fn high2_match_set_return_hidden_bound_does_not_leak_via_bolt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "writer".into(),
+                labels: vec!["Task".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: None,
+                write: Some(write_scope(&["Task"], &[])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    db.write()
+        .insert_node("Task", "t1", vec![("id".into(), Value::Str("t1".into()))])
+        .unwrap();
+    db.write()
+        .insert_node(
+            "Secret",
+            "s1",
+            vec![
+                ("id".into(), Value::Str("s1".into())),
+                ("sensitive".into(), Value::Str("top-secret-bolt-h2".into())),
+            ],
+        )
+        .unwrap();
+
+    let cypher =
+        "MATCH (a:Task {id: 't1'}), (b:Secret {id: 's1'}) SET a.marker = 1 RETURN b.sensitive AS x";
+
+    let mut conn_ac = make_bolt_conn(db.clone(), WRITER_TOK, Some("writer"));
+    // Auto-commit: hidden node must not bind.
+    let ac_rows = bolt_run(&mut conn_ac, cypher).expect("auto-commit HIGH-2 must not error");
+    for f in &ac_rows {
+        assert_ne!(
+            f,
+            &PackValue::String("top-secret-bolt-h2".into()),
+            "auto-commit HIGH-2 leaked sensitive data: {ac_rows:?}"
+        );
+    }
+
+    // Explicit tx path.
+    let mut conn_tx = make_bolt_conn(db, WRITER_TOK, Some("writer"));
+    bolt_begin(&mut conn_tx).expect("BEGIN HIGH-2");
+    let tx_rows = bolt_run(&mut conn_tx, cypher).expect("tx HIGH-2 must not error");
+    for f in &tx_rows {
+        assert_ne!(
+            f,
+            &PackValue::String("top-secret-bolt-h2".into()),
+            "tx HIGH-2 leaked sensitive data: {tx_rows:?}"
+        );
+    }
+    bolt_commit(&mut conn_tx);
+}
+
+// ── Security regression: Medium-1 — namespace check at execute time ───────────
+//
+// A role with `namespaces: ["allowed"]` must refuse `CREATE` of a node whose
+// `ns` property is not in that list, at execute time (not only at commit).
+// This matches how /query handles namespace restrictions (ledger row 140 parity).
+
+async fn open_with_ns_role(name: &str) -> Env {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "graphdb-tx-ns-{name}-{}-{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "ns-writer".into(),
+                labels: vec!["Task".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: Some(vec!["allowed-ns".to_string()]),
+                write: Some(write_scope(&["Task"], &[])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let role_tokens: HashMap<String, String> =
+        [(WRITER_TOK.to_string(), "ns-writer".to_string())].into();
+
+    let app = router_with_tx_limits(
+        db.clone(),
+        Some(ADMIN.to_string()),
+        role_tokens,
+        None,
+        TxLimits {
+            max_open: 100,
+            idle_timeout: Duration::from_secs(30),
+            max_lifetime: Duration::from_secs(300),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Env {
+        base: format!("http://{addr}"),
+        http: reqwest::Client::new(),
+        db,
+    }
+}
+
+#[tokio::test]
+async fn medium1_namespace_check_at_execute_time_in_http_tx() {
+    let e = open_with_ns_role("med1-http").await;
+
+    // Auto-commit reference: forbidden namespace → 403.
+    let (q_st, q_body) = e
+        .query(
+            WRITER_TOK,
+            "CREATE (n:Task {id: 'ns-aq', ns: 'forbidden-ns'})",
+        )
+        .await;
+    assert_eq!(q_st, 403, "/query allowed forbidden ns: {q_body}");
+    let q_err = q_body["error"].as_str().unwrap_or("");
+    assert!(
+        q_err.contains("namespace"),
+        "/query error should mention namespace: {q_err}"
+    );
+
+    // TX path: same 403 at execute time (not commit).
+    let id = e.begin_id(WRITER_TOK).await;
+    let (run_st, run_body) = e
+        .run(
+            &id,
+            WRITER_TOK,
+            "CREATE (n:Task {id: 'ns-tq', ns: 'forbidden-ns'})",
+        )
+        .await;
+    assert_eq!(run_st, 403, "/tx allowed forbidden ns: {run_body}");
+    let run_err = run_body["error"].as_str().unwrap_or("");
+    assert!(
+        run_err.contains("namespace"),
+        "/tx error should mention namespace: {run_err}"
+    );
+    // Transaction must still be usable after the refusal.
+    let (rq_st, _) = e.run(&id, WRITER_TOK, "RETURN 1 AS x").await;
+    assert_eq!(rq_st, 200, "tx unusable after namespace refusal");
+    e.rollback(&id, WRITER_TOK).await;
+
+    // Allowed namespace succeeds.
+    let id2 = e.begin_id(WRITER_TOK).await;
+    let (ok_st, ok_body) = e
+        .run(
+            &id2,
+            WRITER_TOK,
+            "CREATE (n:Task {id: 'ns-ok', ns: 'allowed-ns'})",
+        )
+        .await;
+    assert_eq!(ok_st, 200, "/tx refused allowed ns: {ok_body}");
+    let (cmt_st, _) = e.commit(&id2, WRITER_TOK).await;
+    assert_eq!(cmt_st, 200, "commit of allowed-ns node failed");
+}
+
+#[test]
+fn medium1_namespace_check_at_execute_time_via_bolt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "ns-writer".into(),
+                labels: vec!["Task".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: Some(vec!["allowed-ns".to_string()]),
+                write: Some(write_scope(&["Task"], &[])),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut conn_ac = make_bolt_conn(db.clone(), WRITER_TOK, Some("ns-writer"));
+    // Auto-commit reference: forbidden namespace.
+    let ac_err = bolt_run(
+        &mut conn_ac,
+        "CREATE (n:Task {id: 'ns-bolt-ac', ns: 'forbidden-ns'})",
+    )
+    .expect_err("auto-commit must refuse forbidden namespace");
+    assert!(
+        ac_err.contains("namespace"),
+        "auto-commit error should mention namespace: {ac_err}"
+    );
+
+    // Explicit tx: forbidden namespace refused at execute time.
+    let mut conn_tx = make_bolt_conn(db.clone(), WRITER_TOK, Some("ns-writer"));
+    bolt_begin(&mut conn_tx).expect("BEGIN");
+    let tx_err = bolt_run(
+        &mut conn_tx,
+        "CREATE (n:Task {id: 'ns-bolt-tx', ns: 'forbidden-ns'})",
+    )
+    .expect_err("tx must refuse forbidden namespace at execute time");
+    assert!(
+        tx_err.contains("namespace"),
+        "tx error should mention namespace: {tx_err}"
+    );
+
+    // Allowed namespace succeeds in explicit tx.
+    let mut conn_ok = make_bolt_conn(db, WRITER_TOK, Some("ns-writer"));
+    bolt_begin(&mut conn_ok).expect("BEGIN ok");
+    bolt_run(
+        &mut conn_ok,
+        "CREATE (n:Task {id: 'ns-bolt-ok', ns: 'allowed-ns'})",
+    )
+    .expect("allowed namespace must succeed");
+    assert!(bolt_commit(&mut conn_ok), "COMMIT of allowed-ns tx");
+}

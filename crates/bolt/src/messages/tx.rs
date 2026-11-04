@@ -150,15 +150,24 @@ pub struct RoleOwnedTransaction {
     role: String,
     scope: WriteScope,
     mask: NodeMask,
+    /// The role's namespace restriction, if any (Medium-1 parity fix).
+    namespaces: Option<Vec<String>>,
 }
 
 impl RoleOwnedTransaction {
-    pub(crate) fn new(tx: Transaction, role: String, scope: WriteScope, mask: NodeMask) -> Self {
+    pub(crate) fn new(
+        tx: Transaction,
+        role: String,
+        scope: WriteScope,
+        mask: NodeMask,
+        namespaces: Option<Vec<String>>,
+    ) -> Self {
         Self {
             tx,
             role,
             scope,
             mask,
+            namespaces,
         }
     }
 }
@@ -177,7 +186,13 @@ impl OpenTransaction for RoleOwnedTransaction {
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
         let rs = self
             .tx
-            .execute_authz(cypher, params, &self.scope, &self.mask)
+            .execute_authz(
+                cypher,
+                params,
+                &self.scope,
+                &self.mask,
+                self.namespaces.as_deref(),
+            )
             .map_err(BoltError::from)?;
         Ok(Box::new(RowCursor::new(rs, false, None)))
     }

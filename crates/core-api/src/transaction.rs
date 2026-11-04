@@ -736,7 +736,7 @@ impl Transaction {
         }
         if is_write_tokens(&tokens) {
             let stmt = parse_write(&tokens).map_err(query_err("parse"))?;
-            return self.execute_write(stmt, params);
+            return self.execute_write(stmt, params, None);
         }
         let union = parse_read(&tokens).map_err(query_err("parse"))?;
         let plans = plan_union(&union).map_err(query_err("plan"))?;
@@ -796,12 +796,17 @@ impl Transaction {
     ///
     /// A read-tier key must NOT call this — it must be refused before this
     /// point.
+    /// Execute a Cypher statement with role-scoped authorisation.
+    ///
+    /// `namespaces` is the role's allowed namespaces (`None` = unrestricted).
+    /// Pass `role_def.namespaces.as_deref()` at the call site.
     pub fn execute_authz(
         &mut self,
         cypher: &str,
         params: &BTreeMap<String, Value>,
         scope: &WriteScope,
         mask: &NodeMask,
+        namespaces: Option<&[String]>,
     ) -> Result<ResultSet> {
         let _transaction_clock = core_query::cypher::TransactionClock::enter(self.clock_micros);
         let _statement_clock = core_query::cypher::StatementClock::enter();
@@ -829,7 +834,7 @@ impl Transaction {
         }
         if is_write_tokens(&tokens) {
             let stmt = parse_write(&tokens).map_err(query_err("parse"))?;
-            return self.execute_write_authz(stmt, params, scope, mask);
+            return self.execute_write_authz(stmt, params, scope, mask, namespaces);
         }
         // Read statement: execute against the masked view.
         let union = parse_read(&tokens).map_err(query_err("parse"))?;
@@ -934,41 +939,87 @@ impl Transaction {
         }
     }
 
-    /// Whether `key` is a live node in the transaction's state.
-    fn has_key(&self, key: &str) -> Result<bool> {
-        self.with_view(|v| v.node_id(key).is_some())
+    /// Whether `key` is a live, visible node in the transaction's state.
+    ///
+    /// Pass `Some(mask)` on the authz path so hidden nodes appear absent
+    /// (MERGE then creates instead of silently matching the hidden node).
+    /// `node_id` alone is not sufficient: it returns the dense id regardless of
+    /// visibility; `visible(id)` is the second check that closes the gap.
+    fn has_key(&self, key: &str, mask: Option<&NodeMask>) -> Result<bool> {
+        self.with_view_opt(mask, |v| v.node_id(key).is_some_and(|id| v.visible(id)))
     }
 
     /// A stored property of `key` in the transaction's state (base snapshot
-    /// plus the overlay); `None` when the node or the property is absent.
-    fn stored_prop(&self, key: &str, field: &str) -> Result<Option<Value>> {
-        self.with_view(|v| {
+    /// plus the overlay); `None` when the node or the property is absent or
+    /// hidden through `mask`.
+    fn stored_prop(
+        &self,
+        key: &str,
+        field: &str,
+        mask: Option<&NodeMask>,
+    ) -> Result<Option<Value>> {
+        self.with_view_opt(mask, |v| {
             let id = v.node_id(key)?;
+            if !v.visible(id) {
+                return None;
+            }
             v.prop(id, field).map(|vr| vr.into_value())
         })
     }
 
     /// Whether `src -[edge_type]-> dst` is in the transaction's state.
-    fn edge_present(&self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
-        self.with_view(|v| {
+    ///
+    /// Returns `false` when either endpoint is hidden through `mask`.
+    fn edge_present(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        mask: Option<&NodeMask>,
+    ) -> Result<bool> {
+        self.with_view_opt(mask, |v| {
             let (Some(src), Some(dst), Some(sym)) =
                 (v.node_id(src_key), v.node_id(dst_key), v.sym(edge_type))
             else {
                 return false;
             };
+            if !v.visible(src) || !v.visible(dst) {
+                return false;
+            }
             v.topo.neighbors(sym, Direction::Out, src).contains(&dst)
         })
     }
 
     /// Every distinct edge incident on `key` in the transaction's state, as
     /// `(src_key, dst_key)`; empty when `key` is not live.
-    fn incident_edges(&self, key: &str) -> Result<Vec<(String, String)>> {
-        self.with_view(|v| incident_edges_in(v, key))
+    fn incident_edges(&self, key: &str, mask: Option<&NodeMask>) -> Result<Vec<(String, String)>> {
+        self.with_view_opt(mask, |v| incident_edges_in(v, key))
     }
 
-    /// Run `f` over the transaction's state as a [`RowSource`].
-    fn with_rows<R>(&self, f: impl FnOnce(&TxRows<'_, '_>) -> R) -> Result<R> {
-        self.with_view(|view| f(&TxRows { view, db: &self.db }))
+    /// `with_view` or `with_masked_view` depending on whether `mask` is `Some`.
+    ///
+    /// Pass `Some(mask)` on the authz path so hidden nodes never appear in
+    /// MATCH results, existence checks, or RETURN projections.  Pass `None`
+    /// on the non-authz transaction path (the full overlay is intentional).
+    fn with_view_opt<R>(
+        &self,
+        mask: Option<&NodeMask>,
+        f: impl FnOnce(&GraphView<'_>) -> R,
+    ) -> Result<R> {
+        match mask {
+            Some(m) => self.with_masked_view(m, f),
+            None => self.with_view(f),
+        }
+    }
+
+    /// Run `f` over the transaction's state as a [`RowSource`], dispatching
+    /// through `with_masked_view` when `mask` is `Some` and `with_view` otherwise.
+    fn with_rows_opt<R>(
+        &self,
+        mask: Option<&NodeMask>,
+        f: impl FnOnce(&TxRows<'_, '_>) -> R,
+    ) -> Result<R> {
+        self.with_view_opt(mask, |view| f(&TxRows { view, db: &self.db }))
     }
 
     /// Add `keys` not yet in the conflict set, each with the `last_change` it
@@ -1041,32 +1092,41 @@ impl Transaction {
         self.records.extend(staged.records);
     }
 
+    /// Execute a write statement.
+    ///
+    /// `mask` is `Some` on the authz path: every existence lookup and every
+    /// RETURN projection runs through the masked view so hidden nodes never
+    /// appear in results (fixes HIGH-1 and HIGH-2 from the security review).
+    /// Pass `None` on the non-authz transaction path.
     fn execute_write(
         &mut self,
         stmt: WriteStatement,
         params: &BTreeMap<String, Value>,
+        mask: Option<&NodeMask>,
     ) -> Result<ResultSet> {
         let mut staged = Staged::default();
         let outcome = match stmt {
-            WriteStatement::Create(s) => self.stage_create(s, &mut staged)?,
+            WriteStatement::Create(s) => self.stage_create(s, &mut staged, mask)?,
             stmt @ (WriteStatement::MatchSet(_)
             | WriteStatement::MatchSetMap(_)
             | WriteStatement::MatchRemove(_)
-            | WriteStatement::UnwindWrite(_)) => return self.execute_rows(stmt, params),
-            WriteStatement::MatchDelete(s) => self.stage_match_delete(s, params, &mut staged)?,
-            WriteStatement::MatchDeleteNode(s) => {
-                self.stage_match_delete_node(s, params, &mut staged)?
+            | WriteStatement::UnwindWrite(_)) => return self.execute_rows(stmt, params, mask),
+            WriteStatement::MatchDelete(s) => {
+                self.stage_match_delete(s, params, &mut staged, mask)?
             }
-            WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
+            WriteStatement::MatchDeleteNode(s) => {
+                self.stage_match_delete_node(s, params, &mut staged, mask)?
+            }
+            WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged, mask)?,
         };
         // Only this statement's records are applied: the overlay already
         // holds every earlier statement's.
         self.apply(&staged.records)?;
         let rs = match outcome {
             Outcome::Counts(rs) => rs,
-            Outcome::Return(q, stats) => match self
-                .with_view(|v| run(v, &q, params).map(|rs| crate::db::finish_result(v, rs)))
-            {
+            Outcome::Return(q, stats) => match self.with_view_opt(mask, |v| {
+                run(v, &q, params).map(|rs| crate::db::finish_result(v, rs))
+            }) {
                 Ok(Ok(rs)) => rs.with_stats(stats),
                 Ok(Err(e)) | Err(e) => {
                     if !staged.records.is_empty() {
@@ -1082,22 +1142,28 @@ impl Transaction {
 
     /// Execute a write statement with role-scoped authz.
     ///
-    /// Calls the standard `execute_write` path, then validates the new ops
-    /// against `scope` and `mask`.  On a scope/visibility violation the new
-    /// ops are removed and the overlay is reverted.
+    /// Uses the masked view for all reads so hidden nodes never appear in
+    /// MATCH results, existence checks, or RETURN projections (HIGH-1/HIGH-2).
+    /// Then validates the new ops against `scope`, `mask`, and `namespaces`.
+    /// On a scope/visibility/namespace violation the new ops are rolled back.
+    ///
+    /// `namespaces` is the role's allowed namespaces (`None` = unrestricted).
     fn execute_write_authz(
         &mut self,
         stmt: WriteStatement,
         params: &BTreeMap<String, Value>,
         scope: &WriteScope,
         mask: &NodeMask,
+        namespaces: Option<&[String]>,
     ) -> Result<ResultSet> {
         let old_buf_len = self.buffer.len();
         let old_records_len = self.records.len();
-        let rs = self.execute_write(stmt, params)?;
-        // Post-validate: execute-time scope/mask check for fast user feedback.
-        // The definitive check is commit_authz → submit_batch_cas_authz_with_seq.
-        if let Err(e) = self.check_new_ops_authz(old_buf_len, scope, mask) {
+        // Pass `Some(mask)` so the entire write path (MATCH, existence checks,
+        // RETURN projections) uses the masked view.
+        let rs = self.execute_write(stmt, params, Some(mask))?;
+        // Post-validate: execute-time scope/mask/namespace check for fast user
+        // feedback. The definitive check is commit_authz.
+        if let Err(e) = self.check_new_ops_authz(old_buf_len, scope, mask, namespaces) {
             // Roll back what execute_write added to buffer + records + overlay.
             self.buffer.truncate(old_buf_len);
             self.records.truncate(old_records_len);
@@ -1112,11 +1178,14 @@ impl Transaction {
     /// Returns the first violation, or `Ok(())` when every op is allowed.
     /// The check mirrors `check_single_op_authz` semantics for the ops a
     /// transaction statement can produce.
+    ///
+    /// `namespaces` is the role's allowed namespaces (`None` = unrestricted).
     fn check_new_ops_authz(
         &self,
         old_buf_len: usize,
         scope: &WriteScope,
         mask: &NodeMask,
+        namespaces: Option<&[String]>,
     ) -> Result<()> {
         // Keys of nodes created by EARLIER accepted statements in this tx:
         // they passed the create gate and are treated as visible for
@@ -1140,7 +1209,8 @@ impl Transaction {
 
         for op in new_ops {
             match op {
-                BatchOp::InsertNode { label, key, .. } => {
+                BatchOp::InsertNode { label, key, props } => {
+                    // Label scope check (mirrors check_single_op_authz row 1).
                     if !scope.create_labels.contains(label) {
                         return Err(GraphError::RoleWriteDenied {
                             reason: format!(
@@ -1148,6 +1218,30 @@ impl Transaction {
                                 label
                             ),
                         });
+                    }
+                    // Namespace check (mirrors check_single_op_authz rows 2-3,
+                    // Medium-1 parity fix): provide fast feedback at execute time
+                    // so the status matches what /query returns for the same write.
+                    if let Some(allowed) = namespaces {
+                        let ns = props
+                            .iter()
+                            .find(|(f, _)| f == "ns")
+                            .and_then(|(_, v)| {
+                                if let Value::Str(s) = v {
+                                    Some(s.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or("");
+                        if !allowed.iter().any(|n| n == ns) {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: format!(
+                                    "role-bound token: namespace '{ns}' not in the role's \
+                                     namespaces"
+                                ),
+                            });
+                        }
                     }
                     batch_created_now.push(key.as_str());
                 }
@@ -1394,10 +1488,15 @@ impl Transaction {
     /// `MATCH … SET` / `REMOVE` and the per-row forms: the ops are computed by
     /// the code auto-commit runs, over the transaction's state, then buffered;
     /// a `RETURN` reads the transaction with them laid over it.
+    ///
+    /// `mask` is `Some` on the authz path: MATCH and RETURN both use the
+    /// masked view so hidden-node data never leaks through a RETURN clause
+    /// that projects from a hidden variable (HIGH-2 fix).
     fn execute_rows(
         &mut self,
         stmt: WriteStatement,
         params: &BTreeMap<String, Value>,
+        mask: Option<&NodeMask>,
     ) -> Result<ResultSet> {
         // The statement's read part, for the conflict set: taken before the
         // statement is consumed, run after it succeeds.
@@ -1408,39 +1507,40 @@ impl Transaction {
             WriteStatement::UnwindWrite(s) => s.read.clone(),
             _ => match_query(Vec::new(), None),
         };
-        let (prepared, mut staged) = self.with_rows(|src| -> Result<(Prepared, Staged)> {
-            let mut prepared = match stmt {
-                WriteStatement::MatchSet(s) => Prepared::Match(match_set_ops(src, s, params)?),
-                WriteStatement::MatchSetMap(s) => {
-                    Prepared::Match(match_set_map_ops(src, s, params)?)
+        let (prepared, mut staged) =
+            self.with_rows_opt(mask, |src| -> Result<(Prepared, Staged)> {
+                let mut prepared = match stmt {
+                    WriteStatement::MatchSet(s) => Prepared::Match(match_set_ops(src, s, params)?),
+                    WriteStatement::MatchSetMap(s) => {
+                        Prepared::Match(match_set_map_ops(src, s, params)?)
+                    }
+                    WriteStatement::MatchRemove(s) => {
+                        Prepared::Match(match_remove_ops(src, s, params)?)
+                    }
+                    WriteStatement::UnwindWrite(s) => {
+                        Prepared::Rows(Box::new(unwind_rows(src, &s, params)?))
+                    }
+                    other => {
+                        return Err(GraphError::QueryError {
+                            detail: format!("internal: not a per-row statement: {other:?}"),
+                        })
+                    }
+                };
+                let mut staged = stage_ops(src, prepared.take_ops())?;
+                // A key a MERGE found but did not write still guards the commit,
+                // as the plain MERGE's does.
+                if let Prepared::Rows(pass) = &prepared {
+                    for key in pass.merge_keys() {
+                        staged.touch(key);
+                    }
                 }
-                WriteStatement::MatchRemove(s) => {
-                    Prepared::Match(match_remove_ops(src, s, params)?)
-                }
-                WriteStatement::UnwindWrite(s) => {
-                    Prepared::Rows(Box::new(unwind_rows(src, &s, params)?))
-                }
-                other => {
-                    return Err(GraphError::QueryError {
-                        detail: format!("internal: not a per-row statement: {other:?}"),
-                    })
-                }
-            };
-            let mut staged = stage_ops(src, prepared.take_ops())?;
-            // A key a MERGE found but did not write still guards the commit,
-            // as the plain MERGE's does.
-            if let Prepared::Rows(pass) = &prepared {
-                for key in pass.merge_keys() {
-                    staged.touch(key);
-                }
-            }
-            Ok((prepared, staged))
-        })??;
+                Ok((prepared, staged))
+            })??;
         // Every node the statement read, as a plain read records them: a
         // concurrent change to a node it matched or filtered on is a conflict.
         staged.keys.extend(self.statement_read_set(&read, params)?);
         self.apply(&staged.records)?;
-        match self.with_rows(|src| prepared.result(src, params)) {
+        match self.with_rows_opt(mask, |src| prepared.result(src, params)) {
             Ok(Ok(rs)) => {
                 self.accept(staged);
                 Ok(rs)
@@ -1454,7 +1554,12 @@ impl Transaction {
         }
     }
 
-    fn stage_create(&self, stmt: CreateStmt, staged: &mut Staged) -> Result<Outcome> {
+    fn stage_create(
+        &self,
+        stmt: CreateStmt,
+        staged: &mut Staged,
+        mask: Option<&NodeMask>,
+    ) -> Result<Outcome> {
         let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
         for node in &stmt.nodes {
             let var = node.var.as_deref().unwrap_or("_cn0");
@@ -1471,7 +1576,7 @@ impl Transaction {
             };
             // Caught here, not at COMMIT: the overlay cannot hold two nodes
             // under one key, and the batch would refuse it anyway.
-            if self.has_key(&key)? || var_to_key.values().any(|k| k == &key) {
+            if self.has_key(&key, mask)? || var_to_key.values().any(|k| k == &key) {
                 return Err(GraphError::DuplicateKey { key });
             }
             var_to_key.insert(var.to_string(), key);
@@ -1518,6 +1623,7 @@ impl Transaction {
         stmt: MatchDeleteStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
+        mask: Option<&NodeMask>,
     ) -> Result<Outcome> {
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
@@ -1528,7 +1634,7 @@ impl Transaction {
         }
         let mut q = match_query(matches, stmt.where_expr);
         q.returns = var_items(&node_vars);
-        let match_rs = self.with_view(|v| run(v, &q, params))??;
+        let match_rs = self.with_view_opt(mask, |v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
         let mut deleted = 0i64;
         for row in 0..match_rs.len() {
@@ -1560,13 +1666,14 @@ impl Transaction {
         stmt: MatchDeleteNodeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
+        mask: Option<&NodeMask>,
     ) -> Result<Outcome> {
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
         bind_node_vars(&mut matches, &mut 0, &mut node_vars);
         let mut q = match_query(matches, stmt.where_expr);
         q.returns = var_items(&node_vars);
-        let match_rs = self.with_view(|v| run(v, &q, params))??;
+        let match_rs = self.with_view_opt(mask, |v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
         // In row order, each once: the deletes are buffered in this order.
         let mut doomed: Vec<String> = Vec::new();
@@ -1583,7 +1690,9 @@ impl Transaction {
         // of them is removed — and counted — once, with the first.
         let mut gone: HashSet<&str> = HashSet::new();
         for key in &doomed {
-            let edges = self.incident_edges(key)?;
+            // incident_edges uses None (unmasked): we need all edges for
+            // correctness of DETACH DELETE, not just what the role can see.
+            let edges = self.incident_edges(key, None)?;
             if !stmt.detach && !edges.is_empty() {
                 return Err(GraphError::QueryError {
                     detail: format!(
@@ -1621,9 +1730,10 @@ impl Transaction {
         stmt: MergeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
+        mask: Option<&NodeMask>,
     ) -> Result<Outcome> {
         if stmt.edge.is_some() {
-            return self.stage_merge_edge(stmt, params, staged);
+            return self.stage_merge_edge(stmt, params, staged, mask);
         }
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
@@ -1645,7 +1755,7 @@ impl Transaction {
                 }
             }
         }
-        let existed = self.has_key(&key)?;
+        let existed = self.has_key(&key, mask)?;
         staged.touch(&key);
         let mut created = 0i64;
         let mut properties_set = 0i64;
@@ -1663,7 +1773,7 @@ impl Transaction {
                 if sc.field == "id" {
                     crate::db::check_key_property_write(
                         &key,
-                        self.stored_prop(&key, "id")?.as_ref(),
+                        self.stored_prop(&key, "id", mask)?.as_ref(),
                         Some(&value),
                     )?;
                 }
@@ -1714,6 +1824,7 @@ impl Transaction {
         stmt: MergeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
+        mask: Option<&NodeMask>,
     ) -> Result<Outcome> {
         let Some(edge) = stmt.edge.clone() else {
             return Err(GraphError::QueryError {
@@ -1759,14 +1870,15 @@ impl Transaction {
         for sc in &stmt.on_match {
             match_sets.push((set_target(&sc.var)?, sc));
         }
-        let start_existed = self.has_key(&start_key)?;
-        let end_existed = self.has_key(&end_key)?;
+        let start_existed = self.has_key(&start_key, mask)?;
+        let end_existed = self.has_key(&end_key, mask)?;
         let (src_key, dst_key) = match edge.dir {
             core_query::cypher::RelDir::Left => (end_key.as_str(), start_key.as_str()),
             _ => (start_key.as_str(), end_key.as_str()),
         };
-        let edge_existed =
-            start_existed && end_existed && self.edge_present(&edge.etype, src_key, dst_key)?;
+        let edge_existed = start_existed
+            && end_existed
+            && self.edge_present(&edge.etype, src_key, dst_key, mask)?;
         staged.touch(&start_key);
         staged.touch(&end_key);
         let mut created = 0i64;
@@ -1802,7 +1914,7 @@ impl Transaction {
                     || (stmt.var.as_deref() == Some(sc.var.as_str()) && start_existed)
                     || (edge.end_var.as_deref() == Some(sc.var.as_str()) && end_existed)
                 {
-                    self.stored_prop(key, "id")?
+                    self.stored_prop(key, "id", mask)?
                 } else if stmt.var.as_deref() == Some(sc.var.as_str()) {
                     (stmt.key_field == "id").then(|| stmt.key_value.clone())
                 } else {

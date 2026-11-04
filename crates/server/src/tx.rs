@@ -180,6 +180,8 @@ pub(crate) enum TxBody {
         scope: WriteScope,
         /// Mask resolved at BEGIN from the same snapshot the tx froze.
         mask: NodeMask,
+        /// Namespace restriction resolved at BEGIN (Medium-1 parity fix).
+        namespaces: Option<Vec<String>>,
     },
     /// A role with no write scope, or a `read`-tier key: read-only snapshot view.
     Scoped {
@@ -679,17 +681,18 @@ async fn begin(
                 // the same snapshot it freezes (coherent starting point).
                 let result = tokio::task::spawn_blocking(move || {
                     db.begin_transaction_for_role(&role)
-                        .map(|(tx, scope, mask)| (tx, scope, mask, role))
+                        .map(|(tx, scope, mask, namespaces)| (tx, scope, mask, namespaces, role))
                 })
                 .await;
                 match result {
-                    Ok(Ok((tx, Some(scope), mask, role))) => TxBody::RoleOwned {
+                    Ok(Ok((tx, Some(scope), mask, namespaces, role))) => TxBody::RoleOwned {
                         tx: Box::new(tx),
                         role,
                         scope,
                         mask,
+                        namespaces,
                     },
-                    Ok(Ok((tx, None, mask, _role))) => {
+                    Ok(Ok((tx, None, mask, _namespaces, _role))) => {
                         // Role has no write scope: read-only snapshot transaction.
                         TxBody::Scoped {
                             snapshot: tx.into_base_snapshot(),
@@ -762,9 +765,13 @@ fn execute(
     match body {
         TxBody::Full(tx) => tx.execute(cypher, params).map_err(RunError::Engine),
         TxBody::RoleOwned {
-            tx, scope, mask, ..
+            tx,
+            scope,
+            mask,
+            namespaces,
+            ..
         } => tx
-            .execute_authz(cypher, params, scope, mask)
+            .execute_authz(cypher, params, scope, mask, namespaces.as_deref())
             .map_err(RunError::Engine),
         TxBody::Scoped {
             snapshot,

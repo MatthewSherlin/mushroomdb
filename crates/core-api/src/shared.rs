@@ -1448,18 +1448,25 @@ impl SharedDb {
     /// transaction's base snapshot, so they are coherent with the transaction's
     /// starting point.  The authoritative check at commit still runs under the
     /// write lock (the definitive security gate).
+    #[allow(clippy::type_complexity)]
     pub fn begin_transaction_for_role(
         &self,
         role: &str,
-    ) -> Result<(Transaction, Option<crate::roles::WriteScope>, NodeMask)> {
+    ) -> Result<(
+        Transaction,
+        Option<crate::roles::WriteScope>,
+        NodeMask,
+        Option<Vec<String>>,
+    )> {
         use crate::roles::WriteScope;
         let (base_snap, base_store) = {
             let db = self.read();
             (db.reader(), db.store_id())
         };
-        // Resolve mask and scope from the same snapshot the transaction reads.
+        // Resolve mask, scope, and namespaces from the same snapshot the
+        // transaction reads.
         let mask = base_snap.mask_for_role(role)?;
-        let scope: Option<WriteScope> = base_snap
+        let role_def = base_snap
             .frozen
             .roles
             .as_deref()
@@ -1470,11 +1477,11 @@ impl SharedDb {
             .find(|r| r.name == role)
             .ok_or_else(|| GraphError::KeyNotFound {
                 key: format!("role:{role}"),
-            })?
-            .write
-            .clone();
+            })?;
+        let scope: Option<WriteScope> = role_def.write.clone();
+        let namespaces: Option<Vec<String>> = role_def.namespaces.clone();
         let tx = Transaction::new(self.clone(), base_snap, base_store);
-        Ok((tx, scope, mask))
+        Ok((tx, scope, mask, namespaces))
     }
 }
 

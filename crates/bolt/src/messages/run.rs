@@ -420,14 +420,20 @@ impl QueryService {
                 Ok(Box::new(ScopedTransaction::new(snapshot, mask, true)))
             }
             Identity::Role(role) => {
-                let (tx, scope, mask) = self
+                let (tx, scope, mask, namespaces) = self
                     .db
                     .begin_transaction_for_role(role)
                     .map_err(role_mask_error)?;
                 Ok(match scope {
                     Some(scope) if !request.read_only => {
                         // Write-scope role, non-read-only BEGIN: writes allowed.
-                        Box::new(RoleOwnedTransaction::new(tx, role.clone(), scope, mask))
+                        Box::new(RoleOwnedTransaction::new(
+                            tx,
+                            role.clone(),
+                            scope,
+                            mask,
+                            namespaces,
+                        ))
                     }
                     _ => {
                         // No write scope, or client asked for `mode: "r"`:
