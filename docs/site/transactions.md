@@ -178,7 +178,7 @@ for _ in range(3):
   a rollback.
 - A `read_only=True` handle cannot begin one (`ReadOnly`). A transaction on a `scoped()` handle reads
   through the scope and cannot write (`ReadOnly`); see
-  [Scoped transactions are read-only](#scoped-transactions-are-read-only).
+  [Scoped transactions](#scoped-transactions).
 - `close()` raises while a transaction is open on the store.
 - Many transactions may run at once from different threads; one transaction used from two threads is
   serialised. An embedded transaction has no timeout.
