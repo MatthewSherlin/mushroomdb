@@ -50,6 +50,7 @@ pub const DEFAULT_SUB_CAPACITY: usize = 65_536;
 /// ```
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DbEvent {
     /// A rule derived a new edge.
     EdgeFired {
@@ -100,6 +101,22 @@ pub enum DbEvent {
     /// A property was removed from a node.
     PropRemoved {
         key: String,
+        field: String,
+        commit_seq: u64,
+    },
+    /// A property was set on a relationship (QL-RP, row 155).
+    EdgePropSet {
+        edge_type: String,
+        src: String,
+        dst: String,
+        field: String,
+        commit_seq: u64,
+    },
+    /// A property was removed from a relationship (QL-RP, row 155).
+    EdgePropRemoved {
+        edge_type: String,
+        src: String,
+        dst: String,
         field: String,
         commit_seq: u64,
     },
@@ -254,6 +271,8 @@ pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
                 | DbEvent::EdgeDeleted { .. }
                 | DbEvent::PropSet { .. }
                 | DbEvent::PropRemoved { .. }
+                | DbEvent::EdgePropSet { .. }
+                | DbEvent::EdgePropRemoved { .. }
         ),
     }
 }

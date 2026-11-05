@@ -510,6 +510,24 @@ export type DbEvent =
       commit_seq: number;
     }
   | {
+      /** A property was set on a relationship (QL-RP, row 155). */
+      type: "edge_prop_set";
+      edge_type: string;
+      src: string;
+      dst: string;
+      field: string;
+      commit_seq: number;
+    }
+  | {
+      /** A property was removed from a relationship (QL-RP, row 155). */
+      type: "edge_prop_removed";
+      edge_type: string;
+      src: string;
+      dst: string;
+      field: string;
+      commit_seq: number;
+    }
+  | {
       /**
        * One or more events were dropped because the subscriber's queue was full
        * (capacity 65,536). The caller must re-read graph state to recover
@@ -843,6 +861,10 @@ export type MutationEvent =
   | { node_inserted: { label: string; key: string } }
   | { prop_set: { key: string; field: string } }
   | { prop_removed: { key: string; field: string } }
+  /** A property was set on a relationship (QL-RP, row 155). */
+  | { edge_prop_set: { edge_type: string; src: string; dst: string; field: string } }
+  /** A property was removed from a relationship (QL-RP, row 155). */
+  | { edge_prop_removed: { edge_type: string; src: string; dst: string; field: string } }
   | { edge_inserted: { edge_type: string; src: string; dst: string } }
   | { edge_deleted: { edge_type: string; src: string; dst: string } }
   | { node_deleted: { key: string } }

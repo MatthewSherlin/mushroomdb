@@ -241,6 +241,16 @@ fn edge_json(edge: &ExportEdge) -> serde_json::Value {
             .clone()
             .map_or(serde_json::Value::Null, Into::into),
     );
+    // Edge properties (QL-RP, row 120). Only written when non-empty so that
+    // existing files remain byte-identical for edges that carry none.
+    if !edge.props.is_empty() {
+        let props_obj: serde_json::Map<_, _> = edge
+            .props
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_json(v)))
+            .collect();
+        obj.insert("props".into(), serde_json::Value::Object(props_obj));
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -514,17 +524,50 @@ pub fn write_csv(
     w.flush()?;
 
     // ── relationships.csv ──────────────────────────────────────────────────
+    // Pass 1: discover edge-property columns (manual edges only).
+    let mut rel_kinds: BTreeMap<String, CsvKind> = BTreeMap::new();
+    source.for_each_edge(&mut |edge| {
+        if edge.derived {
+            return Ok(());
+        }
+        for (name, value) in &edge.props {
+            stats.non_finite_floats += count_non_finite(value);
+            let kind = CsvKind::of(value);
+            match rel_kinds.get_mut(name.as_str()) {
+                Some(k) if *k != kind => *k = CsvKind::Json,
+                Some(_) => {}
+                None => {
+                    rel_kinds.insert(name.clone(), kind);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // Pass 2: write rows.
     let mut w = csv::Writer::from_path(dest.join("relationships.csv")).map_err(csv_error)?;
-    w.write_record([":START_ID", ":END_ID", ":TYPE"])
-        .map_err(csv_error)?;
+    let mut rel_header = vec![
+        ":START_ID".to_string(),
+        ":END_ID".to_string(),
+        ":TYPE".to_string(),
+    ];
+    rel_header.extend(rel_kinds.iter().map(|(n, k)| format!("{n}:{}", k.suffix())));
+    w.write_record(&rel_header).map_err(csv_error)?;
     source.for_each_edge(&mut |edge| {
         stats.edges += 1;
         stats.derived_edges += usize::from(edge.derived);
         if edge.derived {
             return Ok(());
         }
-        w.write_record([&edge.src, &edge.dst, &edge.edge_type])
-            .map_err(csv_error)
+        let mut row = vec![edge.src.clone(), edge.dst.clone(), edge.edge_type.clone()];
+        for (name, kind) in &rel_kinds {
+            row.push(
+                edge.props
+                    .get(name.as_str())
+                    .map(|v| csv_cell(v, *kind))
+                    .unwrap_or_default(),
+            );
+        }
+        w.write_record(&row).map_err(csv_error)
     })?;
     w.flush()?;
 

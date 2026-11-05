@@ -39,6 +39,17 @@ use crate::CliError;
 use mushroomdb::{AutoFk, GraphDb, IngestOptions, RealFs, Value};
 
 type Db = GraphDb<RealFs>;
+
+/// A pending edge row: `(edge_type, src_key, dst_key, props, line_number)`.
+/// The five-element tuple is an internal implementation detail; the type alias
+/// keeps `clippy::type_complexity` happy in the functions that hold batches.
+type EdgeRow = (String, String, String, Vec<(String, Value)>, u64);
+
+/// A parsed rel-CSV row: `(edge_type, src_key, dst_key, props)` with no line number.
+type RelCsvRow = (String, String, String, Vec<(String, Value)>);
+
+/// A parsed JSONL edge line: `(edge_type, src_key, dst_key, derived, props)`.
+type JsonlEdgeRow = (String, String, String, bool, Vec<(String, Value)>);
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -475,11 +486,15 @@ pub fn parse_node_row(
     Ok((label.to_string(), row))
 }
 
-/// Parse one relationship row into `(type, start, end)`.
+/// Parse one relationship row into `(type, start, end, props)`.
+///
+/// Property columns follow the same conventions as node property columns;
+/// an empty cell is an absent property.
 pub fn parse_rel_row(
     schema: &RelSchema,
     record: &csv::StringRecord,
-) -> Result<(String, String, String), String> {
+    array_delimiter: char,
+) -> Result<RelCsvRow, String> {
     if record.len() != schema.width {
         return Err(format!(
             "expected {} fields, found {}",
@@ -499,7 +514,21 @@ pub fn parse_rel_row(
     if edge_type.is_empty() {
         return Err("empty :TYPE".to_string());
     }
-    Ok((edge_type.to_string(), start.to_string(), end.to_string()))
+    let mut props = Vec::new();
+    for col in &schema.props {
+        let text = &record[col.index];
+        if text.is_empty() {
+            continue;
+        }
+        let value = parse_cell(col, text, array_delimiter)?;
+        props.push((col.name.clone(), value));
+    }
+    Ok((
+        edge_type.to_string(),
+        start.to_string(),
+        end.to_string(),
+        props,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -820,18 +849,11 @@ fn import_rels(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliErr
     let mut reader = reader_for(path, run.opts)?;
     let header = read_header(&mut reader, &file)?;
     let schema = parse_rel_header(&header).map_err(|e| CliError(format!("{file}:1: {e}")))?;
-    if let Some(p) = schema.props.first() {
-        return Err(CliError(format!(
-            "{file}:1: relationship property column `{}` is not supported in mushroomdb 0.10: \
-             edges carry no properties; remove the column",
-            p.name
-        )));
-    }
     for w in &schema.warnings {
         run.report.warnings.push(format!("{file}:1: {w}"));
     }
 
-    let mut batch: Vec<(String, String, String, u64)> = Vec::new();
+    let mut batch: Vec<EdgeRow> = Vec::new();
     let mut record = csv::StringRecord::new();
     loop {
         match reader.read_record(&mut record) {
@@ -846,13 +868,14 @@ fn import_rels(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliErr
             }
         }
         let line = record.position().map_or(0, csv::Position::line);
-        let (edge_type, start, end) = match parse_rel_row(&schema, &record) {
-            Ok(parsed) => parsed,
-            Err(reason) => {
-                run.bad_row(&file, line, &reason)?;
-                continue;
-            }
-        };
+        let (edge_type, start, end, props) =
+            match parse_rel_row(&schema, &record, run.opts.array_delimiter) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    run.bad_row(&file, line, &reason)?;
+                    continue;
+                }
+            };
         let missing = [(":START_ID", &start), (":END_ID", &end)]
             .into_iter()
             .find(|(_, id)| !db.has_node(id));
@@ -861,7 +884,7 @@ fn import_rels(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliErr
             run.bad_row(&file, line, &reason)?;
             continue;
         }
-        batch.push((edge_type, start, end, line));
+        batch.push((edge_type, start, end, props, line));
         if batch.len() >= run.opts.batch_size {
             flush_edges(db, &mut batch, &file, run)?;
         }
@@ -870,10 +893,13 @@ fn import_rels(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliErr
     Ok(())
 }
 
-fn commit_edges(db: &mut Db, edges: &[(String, String, String, u64)]) -> mushroomdb::Result<usize> {
+fn commit_edges(db: &mut Db, edges: &[EdgeRow]) -> mushroomdb::Result<usize> {
     let (_, inserted) = db.write_batch(|b| {
-        for (edge_type, start, end, _) in edges {
+        for (edge_type, start, end, props, _) in edges {
             b.insert_edge(edge_type, start, end);
+            for (field, value) in props {
+                b.set_edge_prop(edge_type, start, end, field, value.clone());
+            }
         }
     })?;
     Ok(inserted)
@@ -881,7 +907,7 @@ fn commit_edges(db: &mut Db, edges: &[(String, String, String, u64)]) -> mushroo
 
 fn flush_edges(
     db: &mut Db,
-    batch: &mut Vec<(String, String, String, u64)>,
+    batch: &mut Vec<EdgeRow>,
     file: &str,
     run: &mut Run<'_>,
 ) -> Result<(), CliError> {
@@ -895,8 +921,8 @@ fn flush_edges(
             run.committed();
         }
         Err(batch_err) => {
-            let first = edges.first().map_or(0, |e| e.3);
-            let last = edges.last().map_or(0, |e| e.3);
+            let first = edges.first().map_or(0, |e| e.4);
+            let last = edges.last().map_or(0, |e| e.4);
             if !run.opts.ignore_errors {
                 // The engine rejected the batch whole and nothing of it was
                 // committed; strict mode does not go looking for which row.
@@ -920,7 +946,7 @@ fn flush_edges(
                         run.report.edges_inserted += inserted;
                         any = true;
                     }
-                    Err(e) => run.bad_row(file, edge.3, &e.to_string())?,
+                    Err(e) => run.bad_row(file, edge.4, &e.to_string())?,
                 }
             }
             if any {
@@ -1079,14 +1105,14 @@ fn parse_node_value(json: serde_json::Value, typed: bool) -> Result<NodeRecord, 
     })
 }
 
-/// One `edges.jsonl` line: `(edge_type, src, dst, derived)`.
-fn parse_edge_line(text: &str) -> Result<(String, String, String, bool), String> {
+/// One `edges.jsonl` line: `(edge_type, src, dst, derived, props)`.
+fn parse_edge_line(text: &str) -> Result<JsonlEdgeRow, String> {
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
     parse_edge_value(&json)
 }
 
-fn parse_edge_value(json: &serde_json::Value) -> Result<(String, String, String, bool), String> {
+fn parse_edge_value(json: &serde_json::Value) -> Result<JsonlEdgeRow, String> {
     let serde_json::Value::Object(obj) = json else {
         return Err("an edge line must be a JSON object".to_string());
     };
@@ -1096,7 +1122,29 @@ fn parse_edge_value(json: &serde_json::Value) -> Result<(String, String, String,
         None => Err(format!("the line has no `{name}`")),
     };
     let derived = matches!(obj.get("derived"), Some(serde_json::Value::Bool(true)));
-    Ok((field("edge_type")?, field("src")?, field("dst")?, derived))
+    // Parse optional `"props"` object — written by the exporter when non-empty.
+    let props = match obj.get("props") {
+        None | Some(serde_json::Value::Null) => vec![],
+        Some(serde_json::Value::Object(map)) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                if let Some(val) = json_to_exact_value(v.clone())
+                    .map_err(|e| format!("edge props field {k:?}: {e}"))?
+                {
+                    out.push((k.clone(), val));
+                }
+            }
+            out
+        }
+        Some(_) => return Err("`props` must be a JSON object when present".to_string()),
+    };
+    Ok((
+        field("edge_type")?,
+        field("src")?,
+        field("dst")?,
+        derived,
+        props,
+    ))
 }
 
 /// A line source over a file, or standard input for `-`. Reports each non-blank
@@ -1157,9 +1205,9 @@ fn import_nodes_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(),
 
 fn import_edges_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(), CliError> {
     let file = path.display().to_string();
-    let mut batch: Vec<(String, String, String, u64)> = Vec::new();
+    let mut batch: Vec<EdgeRow> = Vec::new();
     for_each_line(path, |line, text| {
-        let (edge_type, src, dst, derived) = match parse_edge_line(text) {
+        let (edge_type, src, dst, derived, props) = match parse_edge_line(text) {
             Ok(parsed) => parsed,
             Err(reason) => return run.bad_row(&file, line, &reason),
         };
@@ -1174,7 +1222,7 @@ fn import_edges_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<(),
             let reason = format!("{field} `{key}` is not a node in the nodes file or the store");
             return run.bad_row(&file, line, &reason);
         }
-        batch.push((edge_type, src, dst, line));
+        batch.push((edge_type, src, dst, props, line));
         if batch.len() >= run.opts.batch_size {
             flush_edges(db, &mut batch, &file, run)?;
         }
@@ -1216,7 +1264,7 @@ fn import_stream_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<()
     let file = path.display().to_string();
     let mut records: Vec<NodeRecord> = Vec::new();
     let mut batch_keys: HashSet<String> = HashSet::new();
-    let mut edges: Vec<(String, String, String, u64)> = Vec::new();
+    let mut edges: Vec<EdgeRow> = Vec::new();
     let mut rules: Vec<(u64, mushroomdb::RuleDef)> = Vec::new();
     for_each_line(path, |line, text| {
         let json: serde_json::Value = match serde_json::from_str(text) {
@@ -1242,7 +1290,7 @@ fn import_stream_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<()
                 }
             }
             Some("edge") => {
-                let (edge_type, src, dst, derived) = match parse_edge_value(&json) {
+                let (edge_type, src, dst, derived, props) = match parse_edge_value(&json) {
                     Ok(parsed) => parsed,
                     Err(reason) => return run.bad_row(&file, line, &reason),
                 };
@@ -1264,7 +1312,7 @@ fn import_stream_jsonl(db: &mut Db, path: &Path, run: &mut Run<'_>) -> Result<()
                     );
                     return run.bad_row(&file, line, &reason);
                 }
-                edges.push((edge_type, src, dst, line));
+                edges.push((edge_type, src, dst, props, line));
                 if edges.len() >= run.opts.batch_size {
                     flush_edges(db, &mut edges, &file, run)?;
                 }
