@@ -367,10 +367,7 @@ impl ResultSet {
     /// Attach the entity tree for each cell, row-major.
     ///
     /// # Panics — if `entity_trees.len()` is not `len() * columns().len()`.
-    pub(crate) fn set_value_entity_trees(
-        &mut self,
-        entity_trees: Vec<Option<ValueEntityTree>>,
-    ) {
+    pub(crate) fn set_value_entity_trees(&mut self, entity_trees: Vec<Option<ValueEntityTree>>) {
         assert_eq!(
             entity_trees.len(),
             self.rows.len() * self.columns.len(),
