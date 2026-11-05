@@ -168,7 +168,7 @@ Every pull request and push to `main` runs the official Python driver 6.4.1 and 
 
 The separate `bolt-drivers-best-effort` job attempts three checks each for Java 6.3.0, Go 6.3.0 and .NET 6.4.0: connect and authenticate, read an integer count, and commit an explicit transaction whose write is read back. Go and .NET pass all three. Java passes none: its client rejects the server's product identifier during connection, so no Java query or transaction is checked. Each language has its own step and summary result; Java's failure remains visible there even when the job is green. These steps do not block a merge and do not cover the full twelve-scenario suite above.
 
-Where these drivers meet the server's current limits: a node or relationship inside a map built in the query, inside a list that mixes kinds, or behind a function arrives as its key or its `{type, start, end}` map, not as a Node or Relationship structure (see [Nodes, relationships and paths](#nodes-relationships-and-paths)). No scenario depends on that form.
+No scenario depends on nodes or relationships inside maps or mixed lists arriving as structures.
 
 ## Transactions and bookmarks
 
@@ -248,7 +248,7 @@ A result column that is a bare node, relationship or path variable (`RETURN n`, 
 - **`id(n)` in a query is the node's key**, not the Bolt integer id, so `MATCH (n) WHERE id(n) = $node_id` with a driver's integer id matches nothing. Match on the key instead (`n.id`, or the element id without its `n:`).
 - **Paths** list each node and relationship once; `indices` walks them as Bolt defines, a negative relationship index meaning the hop goes against the relationship's direction.
 - **Scoped connections.** A role-bound token gets only nodes its role can see, and a relationship only when both its ends are visible, as with every other read (see [Scoped access](#scoped-access)).
-- **Lists.** `collect(n)`, `collect(r)`, `collect(p)`, a list of variables of one kind (`[a, b]`) and a path's `p.nodes` and `p.relationships` arrive as lists of Node, Relationship or Path structures. A node or relationship inside a map built in the query (`{who: n}`), or in a list that mixes kinds or values, stays its key or map.
+- **Lists and maps.** `collect(n)`, `collect(r)`, `collect(p)`, a list of variables of one kind (`[a, b]`) and a path's `p.nodes` and `p.relationships` arrive as lists of Node, Relationship or Path structures. A node or relationship inside a map built in the query (`{who: n}`), in a mixed list (`[n, r]`, `[n, 1]`), or behind a function expression (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n`) also arrives as a Node or Relationship structure, not as its key or `{type, start, end}` map. `elementId()` accepts any expression that yields a node or relationship, including `startNode(r)`, `endNode(r)` and `nodes(p)[0]`.
 
 HTTP, Python and the other surfaces render the same columns as they always have: a node as its key string, a path as a map, and a relationship as the map `{type, start, end}` (see [Query language](query.md#return-of-relationships-and-paths)).
 
