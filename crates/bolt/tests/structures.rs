@@ -459,3 +459,101 @@ fn element_id_matches_the_structures_and_the_functions_render_like_the_path_fiel
     assert_eq!(structure(&rows[0][6]).tag, 0x4E, "startNode(r) is a Node");
     assert_eq!(structure(&rows[0][7]).fields[3], s(&node_element_id("bob")));
 }
+
+// TX-NS row 152: nodes and relationships inside maps and mixed lists arrive as
+// structures, not as keys or {type,start,end} maps.
+#[test]
+fn nodes_and_relationships_inside_a_map_or_mixed_list_are_structures() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+
+    // {who: n}: map field containing a node is a Node structure (0x4E).
+    let (rows, _) = query(&mut conn, "MATCH (n {id: 'ada'}) RETURN {who: n}");
+    let PackValue::Map(fields) = &rows[0][0] else {
+        panic!("not a map: {:?}", rows[0][0])
+    };
+    let who = fields
+        .iter()
+        .find(|(k, _)| k == "who")
+        .map(|(_, v)| v)
+        .unwrap();
+    assert_eq!(
+        structure(who).tag,
+        0x4E,
+        "{{who: n}} who field: {:?}",
+        rows[0][0]
+    );
+
+    // [a, r]: mixed node + relationship list.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) RETURN [a, r]",
+    );
+    let PackValue::List(items) = &rows[0][0] else {
+        panic!("not a list: {:?}", rows[0][0])
+    };
+    assert_eq!(structure(&items[0]).tag, 0x4E, "node in [a, r]");
+    assert_eq!(structure(&items[1]).tag, 0x52, "rel in [a, r]");
+
+    // [n, 1]: node and a plain integer.
+    let (rows, _) = query(&mut conn, "MATCH (n {id: 'ada'}) RETURN [n, 1]");
+    let PackValue::List(items) = &rows[0][0] else {
+        panic!("not a list: {:?}", rows[0][0])
+    };
+    assert_eq!(structure(&items[0]).tag, 0x4E, "node in [n, 1]");
+    assert_eq!(items[1], PackValue::Int(1), "int in [n, 1]");
+}
+
+// TX-NS row 152: computed expressions — head, coalesce, CASE — that yield a
+// node or relationship arrive as structures.
+#[test]
+fn computed_node_expressions_are_structures() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+
+    // head([n]) → single Node structure (head of a list literal of nodes).
+    let (rows, _) = query(&mut conn, "MATCH (n {id: 'ada'}) RETURN head([n]) AS h");
+    assert_eq!(
+        structure(&rows[0][0]).tag,
+        0x4E,
+        "head([n]): {:?}",
+        rows[0][0]
+    );
+
+    // WITH collect(n) AS ns RETURN head(ns) → single Node structure.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}) WITH collect(n) AS ns RETURN head(ns) AS h",
+    );
+    assert_eq!(
+        structure(&rows[0][0]).tag,
+        0x4E,
+        "head(collect_ns): {:?}",
+        rows[0][0]
+    );
+
+    // coalesce(n, m) → first non-null node is a Node structure.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}), (m {id: 'bob'}) RETURN coalesce(n, m)",
+    );
+    assert_eq!(
+        structure(&rows[0][0]).tag,
+        0x4E,
+        "coalesce(n, m): {:?}",
+        rows[0][0]
+    );
+
+    // CASE WHEN … THEN n ELSE m END → matched node is a Node structure.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}), (m {id: 'bob'}) \
+         RETURN CASE WHEN n.id = 'ada' THEN n ELSE m END",
+    );
+    assert_eq!(
+        structure(&rows[0][0]).tag,
+        0x4E,
+        "CASE…THEN n: {:?}",
+        rows[0][0]
+    );
+}

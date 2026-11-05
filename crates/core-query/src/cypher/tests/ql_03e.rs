@@ -326,3 +326,54 @@ fn id_still_returns_the_key() {
         Some(s("ada"))
     );
 }
+
+// QL-03e row 156: elementId() works for any expression yielding a node or
+// relationship, not just bare variable bindings.
+#[test]
+fn element_id_of_a_function_expression_is_the_bolt_element_id() {
+    let fx = graph();
+    let view = fx.view();
+    // elementId(startNode(r)) → same id as the start node.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH ({id: 'ada'})-[r:K]->() RETURN elementId(startNode(r))"
+        ),
+        Some(s(&node_element_id("ada")))
+    );
+    // elementId(endNode(r)) → same id as the end node.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH ()-[r:K]->({id: 'bob'}) RETURN elementId(endNode(r))"
+        ),
+        Some(s(&node_element_id("bob")))
+    );
+    // elementId(nodes(p)[0]) → element id of the first node in the path.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH p = ({id: 'ada'})-[:K]->() RETURN elementId(nodes(p)[0])"
+        ),
+        Some(s(&node_element_id("ada")))
+    );
+    // WITH startNode(r) AS a RETURN elementId(a) → same id as the node.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH ({id: 'ada'})-[r:K]->() \
+             WITH startNode(r) AS a \
+             RETURN elementId(a)"
+        ),
+        Some(s(&node_element_id("ada")))
+    );
+}
+
+#[test]
+fn element_id_of_non_entity_expression_is_still_an_error() {
+    let fx = graph();
+    let view = fx.view();
+    // A plain property (not a node or relationship) must still be refused.
+    let e = err(&view, "MATCH (n {id: 'ada'}) RETURN elementId(n.id)");
+    assert!(e.contains("elementId()"), "{e}");
+}
