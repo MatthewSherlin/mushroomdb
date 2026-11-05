@@ -214,19 +214,18 @@ fn csv_import_dangling_relationship_endpoints_name_the_line() {
     );
 }
 
+/// Row 120: relationship property columns are now accepted (previously refused).
+/// The property is stored and readable from the resulting graph.
 #[test]
-fn csv_import_relationship_properties_are_refused() {
+fn csv_import_relationship_properties_are_accepted() {
     let dir = tmp("relprops");
-    let e = import_err(
-        &dir,
-        ":ID,:LABEL\na,P\n",
-        Some(":START_ID,:END_ID,:TYPE,since:int\na,a,K,1\n"),
-        &opts(),
-    );
-    assert!(
-        e.contains("r.csv:1:") && e.contains("since") && e.contains("not supported"),
-        "{e}"
-    );
+    let nodes = write(&dir, "n.csv", ":ID,:LABEL\na,P\n");
+    let rels = write(&dir, "r.csv", ":START_ID,:END_ID,:TYPE,since:int\na,a,K,1\n");
+    let report = run_import(&dir.join("db"), Some(&nodes), Some(&rels), &opts()).unwrap();
+    assert_eq!((report.nodes_inserted, report.edges_inserted), (1, 1));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert_eq!(db.get_edge_prop("K", "a", "a", "since"), Some(Value::Int(1)));
 }
 
 #[test]
