@@ -24,7 +24,10 @@
 
 use crate::cypher::ast::{ret_val_label, AggArg, AggFunc, Operand, RetItem, RetVal};
 use crate::cypher::plan::PlanOp;
-use crate::result::{Entity, EntityKind, NodeEntity, PathEntity, RelationshipEntity, ResultSet};
+use crate::result::{
+    Entity, EntityKind, NodeEntity, PathEntity, RelationshipEntity, ResultSet, ValueEntityTree,
+    ValueKindTag,
+};
 use crate::view::GraphView;
 use core_storage::Value;
 use std::cell::Cell;
@@ -67,14 +70,28 @@ pub fn attach_requested_entities(view: &GraphView, rs: &mut ResultSet) {
 /// role's mask applies). A result with no such column is left alone. A cell
 /// that does not resolve — a null, or a value that is not what its column's
 /// kind says — gets no entity and is sent as its value.
+///
+/// Also fills value entity trees for columns that have a [`ValueKindTag`]
+/// (embedded entities inside maps and mixed lists).
 pub fn attach_entities(view: &GraphView, rs: &mut ResultSet) {
     let kinds = rs.column_kinds().to_vec();
-    if kinds.iter().all(Option::is_none) {
+    let has_flat_kinds = kinds.iter().any(Option::is_some);
+    let has_kind_trees = rs.has_value_kind_trees();
+    if !has_flat_kinds && !has_kind_trees {
         return;
     }
     let width = rs.columns().len();
     let mut cache = NodeCache::default();
+    // Collect kind trees once (to avoid re-borrowing rs during the loops).
+    let kind_trees: Vec<Option<ValueKindTag>> = (0..width)
+        .map(|col| rs.value_kind_tree(col).cloned())
+        .collect();
     let mut entities = Vec::with_capacity(rs.len() * width);
+    let mut value_trees: Vec<Option<ValueEntityTree>> = if has_kind_trees {
+        Vec::with_capacity(rs.len() * width)
+    } else {
+        Vec::new()
+    };
     for row in 0..rs.len() {
         for (col, cell) in rs.row(row).iter().enumerate() {
             let entity = match (kinds.get(col).copied().flatten(), cell) {
@@ -82,9 +99,21 @@ pub fn attach_entities(view: &GraphView, rs: &mut ResultSet) {
                 _ => None,
             };
             entities.push(entity);
+            if has_kind_trees {
+                let tree = match (kind_trees.get(col).and_then(|t| t.as_ref()), cell) {
+                    (Some(tag), Some(value)) => {
+                        resolve_value_entity_tree(view, tag, value, &mut cache)
+                    }
+                    _ => None,
+                };
+                value_trees.push(tree);
+            }
         }
     }
     rs.set_entities(entities);
+    if has_kind_trees {
+        rs.set_value_entity_trees(value_trees);
+    }
 }
 
 /// Nodes already read for this result: a node that appears in many rows (a
@@ -200,6 +229,84 @@ fn path(view: &GraphView, value: &Value, cache: &mut NodeCache) -> Option<PathEn
         nodes,
         relationships,
     })
+}
+
+/// Resolve a [`ValueEntityTree`] from a cell value using its [`ValueKindTag`].
+/// Returns `None` when the value does not match the expected shape (null cell,
+/// type mismatch). The cache is shared with flat entity resolution so nodes
+/// read once per result.
+fn resolve_value_entity_tree(
+    view: &GraphView,
+    tag: &ValueKindTag,
+    value: &Value,
+    cache: &mut NodeCache,
+) -> Option<ValueEntityTree> {
+    match tag {
+        ValueKindTag::Node => match value {
+            Value::Str(key) => cache.node(view, key).map(ValueEntityTree::Node),
+            _ => None,
+        },
+        ValueKindTag::Relationship => {
+            relationship(view, value, cache).map(ValueEntityTree::Relationship)
+        }
+        ValueKindTag::Path => path(view, value, cache).map(ValueEntityTree::Path),
+        ValueKindTag::UniformList(elem_kind) => {
+            let Value::List(items) = value else {
+                return None;
+            };
+            let resolved: Vec<Option<ValueEntityTree>> = items
+                .iter()
+                .map(|item| {
+                    resolve_value_entity_tree(view, &elem_kind_to_tag(*elem_kind), item, cache)
+                })
+                .collect();
+            Some(ValueEntityTree::List(resolved))
+        }
+        ValueKindTag::MixedList(element_tags) => {
+            let Value::List(items) = value else {
+                return None;
+            };
+            let resolved: Vec<Option<ValueEntityTree>> = element_tags
+                .iter()
+                .zip(items.iter())
+                .map(|(tag, item)| {
+                    tag.as_ref()
+                        .and_then(|t| resolve_value_entity_tree(view, t, item, cache))
+                })
+                .collect();
+            Some(ValueEntityTree::List(resolved))
+        }
+        ValueKindTag::Map(field_tags) => {
+            let Value::Map(map) = value else {
+                return None;
+            };
+            let resolved: Vec<(String, ValueEntityTree)> = field_tags
+                .iter()
+                .filter_map(|(key, tag)| {
+                    let v = map.get(key)?;
+                    resolve_value_entity_tree(view, tag, v, cache).map(|tree| (key.clone(), tree))
+                })
+                .collect();
+            if resolved.is_empty() {
+                None
+            } else {
+                Some(ValueEntityTree::Map(resolved))
+            }
+        }
+    }
+}
+
+/// Convert a flat `EntityKind` to its matching `ValueKindTag` atom or uniform
+/// list variant (for use inside `resolve_value_entity_tree`).
+fn elem_kind_to_tag(kind: EntityKind) -> ValueKindTag {
+    match kind {
+        EntityKind::Node => ValueKindTag::Node,
+        EntityKind::Relationship => ValueKindTag::Relationship,
+        EntityKind::Path => ValueKindTag::Path,
+        EntityKind::NodeList => ValueKindTag::UniformList(EntityKind::Node),
+        EntityKind::RelationshipList => ValueKindTag::UniformList(EntityKind::Relationship),
+        EntityKind::PathList => ValueKindTag::UniformList(EntityKind::Path),
+    }
 }
 
 /// The [`EntityKind`] of each column `plan` returns: a RETURN item (or a
@@ -346,22 +453,40 @@ fn ret_val_operand(value: &RetVal) -> Option<Operand> {
     }
 }
 
-fn operand_kind(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<EntityKind> {
+pub(crate) fn operand_kind(
+    op: &Operand,
+    scope: &HashMap<String, EntityKind>,
+) -> Option<EntityKind> {
     match op {
         Operand::Var(v) => scope.get(v).copied(),
         Operand::Prop { var, field } => path_part_kind(var, field, scope),
         Operand::FuncCall { name, args } => func_kind(name, args, scope),
-        // `[a, b]`: a list of variables that all hold elements of one kind.
+        // `[a, b]` or `[startNode(r), endNode(r)]`: a list of expressions all of
+        // the same entity kind produces a uniform list of that kind.
         Operand::ListLit(items) if !items.is_empty() => {
-            let mut kinds = items.iter().map(|item| match item {
-                Operand::Var(v) => scope.get(v).copied(),
-                _ => None,
-            });
+            let mut kinds = items.iter().map(|item| operand_kind(item, scope));
             let first = kinds.next()??;
             kinds
                 .all(|k| k == Some(first))
                 .then(|| first.list_of())
                 .flatten()
+        }
+        // `nodes(p)[0]`, `collect(n)[i]`: subscript of a list of one entity kind
+        // yields one element of that kind.
+        Operand::Index { base, .. } => operand_kind(base, scope)?.element(),
+        // `CASE WHEN cond THEN n ELSE m END`: entity kind when every branch
+        // (including ELSE) returns the same entity kind (null branches are fine).
+        Operand::Case { branches, default } => {
+            let branch_kinds: Vec<Option<EntityKind>> = branches
+                .iter()
+                .map(|(_, op)| operand_kind(op, scope))
+                .chain(default.iter().map(|d| operand_kind(d, scope)))
+                .collect();
+            let first = branch_kinds.iter().flatten().next().copied()?;
+            branch_kinds
+                .iter()
+                .all(|k| *k == Some(first))
+                .then_some(first)
         }
         _ => None,
     }
@@ -369,16 +494,38 @@ fn operand_kind(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<Ent
 
 /// `nodes(p)` and `relationships(p)` of a path variable are what `p.nodes` and
 /// `p.relationships` are; `startNode(r)` and `endNode(r)` of a relationship
-/// variable are nodes.
-fn func_kind(
+/// variable are nodes; `head`/`last` of a list of entities yield one element;
+/// `coalesce` of arguments that are all the same entity kind yields that kind.
+pub(crate) fn func_kind(
     name: &str,
     args: &[Operand],
     scope: &HashMap<String, EntityKind>,
 ) -> Option<EntityKind> {
+    let norm = name.to_ascii_lowercase();
+    // `head(x)` / `last(x)` where x is any expression with a list entity kind.
+    if (norm == "head" || norm == "last") && args.len() == 1 {
+        return operand_kind(&args[0], scope)?.element();
+    }
+    // `coalesce(a, b, …)`: entity kind when all non-null args are the same kind.
+    if norm == "coalesce" && !args.is_empty() {
+        let non_null_kinds: Vec<Option<EntityKind>> = args
+            .iter()
+            .filter(|a| !matches!(a, Operand::Lit(Value::Null)))
+            .map(|a| operand_kind(a, scope))
+            .collect();
+        if !non_null_kinds.is_empty() {
+            let first = non_null_kinds.iter().flatten().next().copied()?;
+            if non_null_kinds.iter().all(|k| *k == Some(first)) {
+                return Some(first);
+            }
+        }
+        return None;
+    }
+    // Single-variable forms.
     let [Operand::Var(var)] = args else {
         return None;
     };
-    match (name.to_ascii_lowercase().as_str(), scope.get(var)) {
+    match (norm.as_str(), scope.get(var)) {
         ("nodes", Some(EntityKind::Path)) => Some(EntityKind::NodeList),
         ("relationships", Some(EntityKind::Path)) => Some(EntityKind::RelationshipList),
         ("startnode" | "endnode", Some(EntityKind::Relationship)) => Some(EntityKind::Node),
@@ -426,4 +573,108 @@ pub(crate) fn merge_kinds(
         .zip(next)
         .map(|(a, b)| if a == b { *a } else { None })
         .collect()
+}
+
+/// The entity kinds of ALL variables that are live after the plan finishes,
+/// following `WITH` projections. Used by the executor to annotate its variable
+/// table so `elementId()` can resolve element ids for aliased node/relationship
+/// expressions (e.g. `WITH startNode(r) AS a RETURN elementId(a)`).
+pub(crate) fn all_var_kinds(plan: &[PlanOp]) -> HashMap<String, EntityKind> {
+    let mut scope: HashMap<String, EntityKind> = HashMap::new();
+    let mut ignored = Vec::new();
+    bind_ops(plan, &mut scope, &mut ignored);
+    scope
+}
+
+/// Build a [`ValueKindTag`] tree for an operand that may contain graph
+/// elements nested inside a map literal or a heterogeneous list literal.
+/// Returns `None` for operands whose entity content is already fully described
+/// by a flat [`EntityKind`] (uniform lists, bare variables, functions that
+/// return a single entity), since those are handled by the existing mechanism.
+fn operand_kind_tree(op: &Operand, scope: &HashMap<String, EntityKind>) -> Option<ValueKindTag> {
+    match op {
+        // A map literal is a Tier-2 case whenever at least one field holds an entity.
+        Operand::MapLit(fields) => {
+            let entity_fields: Vec<(String, ValueKindTag)> = fields
+                .iter()
+                .filter_map(|(k, v)| operand_kind_tree(v, scope).map(|t| (k.clone(), t)))
+                .collect();
+            if entity_fields.is_empty() {
+                None
+            } else {
+                Some(ValueKindTag::Map(entity_fields))
+            }
+        }
+        // A list literal with heterogeneous or partial entity content.
+        Operand::ListLit(items) if !items.is_empty() => {
+            // If the flat mechanism already handles this (uniform list of one entity
+            // kind), skip it — no Tier-2 tag needed.
+            if operand_kind(op, scope).is_some() {
+                return None;
+            }
+            let element_tags: Vec<Option<ValueKindTag>> = items
+                .iter()
+                .map(|item| operand_kind_tree(item, scope))
+                .collect();
+            if element_tags.iter().any(Option::is_some) {
+                Some(ValueKindTag::MixedList(element_tags))
+            } else {
+                None
+            }
+        }
+        // Other operands: convert a flat entity kind to its ValueKindTag atom,
+        // but only for single-entity or uniform-list kinds that need to appear
+        // *nested* inside a larger structure (e.g. a list of node-lists).
+        other => {
+            let kind = operand_kind(other, scope)?;
+            match kind {
+                EntityKind::Node => Some(ValueKindTag::Node),
+                EntityKind::Relationship => Some(ValueKindTag::Relationship),
+                EntityKind::Path => Some(ValueKindTag::Path),
+                EntityKind::NodeList => Some(ValueKindTag::UniformList(EntityKind::Node)),
+                EntityKind::RelationshipList => {
+                    Some(ValueKindTag::UniformList(EntityKind::Relationship))
+                }
+                EntityKind::PathList => Some(ValueKindTag::UniformList(EntityKind::Path)),
+            }
+        }
+    }
+}
+
+/// Per-column [`ValueKindTag`] trees for `plan`'s output: only filled for
+/// columns that have embedded graph elements in maps or heterogeneous lists
+/// (i.e. where the flat [`EntityKind`] mechanism does not apply). Columns that
+/// already have a flat [`EntityKind`] get `None` here.
+pub(crate) fn output_value_kind_trees(plan: &[PlanOp]) -> Vec<Option<ValueKindTag>> {
+    let mut scope: HashMap<String, EntityKind> = HashMap::new();
+    let mut flat_kinds: Vec<Option<EntityKind>> = Vec::new();
+    bind_ops(plan, &mut scope, &mut flat_kinds);
+    // Walk the plan to find the Project op that produces the output columns,
+    // using the final scope for entity kind analysis.
+    for op in plan.iter().rev() {
+        if let PlanOp::Project { items } = op {
+            return items
+                .iter()
+                .zip(flat_kinds.iter().chain(std::iter::repeat(&None)))
+                .map(|(item, flat)| {
+                    // Skip columns already covered by the flat mechanism.
+                    if flat.is_some() {
+                        return None;
+                    }
+                    match &item.value {
+                        RetVal::ScalarExpr(op) => operand_kind_tree(op, &scope),
+                        RetVal::FuncCall { name, args } => {
+                            let op = Operand::FuncCall {
+                                name: name.clone(),
+                                args: args.clone(),
+                            };
+                            operand_kind_tree(&op, &scope)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+        }
+    }
+    vec![None; flat_kinds.len()]
 }
