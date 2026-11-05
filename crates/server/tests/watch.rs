@@ -8,7 +8,7 @@
 
 use futures_util::StreamExt;
 use mushroomdb::{MutationEvent, SharedDb, Value};
-use serde_json::Value as Json;
+use serde_json::{json, Value as Json};
 use server::serve;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -283,15 +283,18 @@ async fn watch_receives_edge_prop_set() {
         .unwrap();
 
     // BatchApplied will also arrive; find the EdgePropSet frame.
-    let expected = serde_json::to_value(MutationEvent::EdgePropSet {
-        edge_type: "KNOWS".into(),
-        src: "a".into(),
-        dst: "b".into(),
-        field: "since".into(),
-    })
-    .unwrap();
+    // Edge-prop events on /watch come from the DbEvent subscription bridge and
+    // are serialised as {"edge_prop_set":{...}} without commit_seq.
+    let expected = json!({
+        "edge_prop_set": {
+            "edge_type": "KNOWS",
+            "src": "a",
+            "dst": "b",
+            "field": "since"
+        }
+    });
     let mut found = false;
-    for _ in 0..5 {
+    for _ in 0..10 {
         let frame = next_text(&mut ws).await;
         if frame == expected {
             found = true;
@@ -324,15 +327,18 @@ async fn watch_receives_edge_prop_removed() {
         })
         .unwrap();
 
-    let expected = serde_json::to_value(MutationEvent::EdgePropRemoved {
-        edge_type: "KNOWS".into(),
-        src: "a".into(),
-        dst: "b".into(),
-        field: "since".into(),
-    })
-    .unwrap();
+    // Edge-prop events on /watch come from the DbEvent subscription bridge and
+    // are serialised as {"edge_prop_removed":{...}} without commit_seq.
+    let expected = json!({
+        "edge_prop_removed": {
+            "edge_type": "KNOWS",
+            "src": "a",
+            "dst": "b",
+            "field": "since"
+        }
+    });
     let mut found = false;
-    for _ in 0..5 {
+    for _ in 0..10 {
         let frame = next_text(&mut ws).await;
         if frame == expected {
             found = true;

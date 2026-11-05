@@ -975,16 +975,19 @@ fn query_sub_does_not_skip_with_expand() {
 }
 
 // ---------------------------------------------------------------------------
-// Row 155: edge-property events on MutationEvent sink and DbEvent subscription
+// Row 155: edge-property events on DbEvent subscription (and /watch bridge)
 // ---------------------------------------------------------------------------
 
-/// Binding (row 155): `set_edge_prop` via BatchBuilder emits
-/// `MutationEvent::EdgePropSet` on the legacy sink.
+/// Binding (row 155): a single-op edge-prop `write_batch` commits durably but
+/// emits NO `MutationEvent` on the legacy sink.  `event_from_record` returns
+/// `None` for `SetEdgePropId` (the pub `MutationEvent` has no variant for it,
+/// to avoid a breaking API change), and `BatchApplied` is only emitted when
+/// a batch has more than one inner op.  Edge-prop events are visible on
+/// `DbEvent` subscriptions (`subscribe_writes`) and on `/watch` via its bridge.
 #[test]
-fn mutation_event_sink_receives_edge_prop_set() {
+fn mutation_event_sink_emits_nothing_for_single_op_edge_prop_batch() {
     let dir = tmp("ev-edge-prop-set");
     let mut db = GraphDb::open(&dir).unwrap();
-    let evs = attach(&mut db);
 
     db.insert_node("Person", "alice", vec![]).unwrap();
     db.insert_node("Person", "bob", vec![]).unwrap();
@@ -992,55 +995,55 @@ fn mutation_event_sink_receives_edge_prop_set() {
         b.insert_edge("KNOWS", "alice", "bob");
     })
     .unwrap();
-    // Clear setup events before the actual assertion.
-    evs.lock().unwrap().clear();
 
+    let evs = attach(&mut db);
+
+    // Single-op batch: only SetEdgePropId inside.
     db.write_batch(|b| {
         b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2024));
     })
     .unwrap();
 
     let got = take(&evs);
+    // No MutationEvent for a single-op edge-prop batch.
     assert!(
-        got.iter().any(|e| matches!(
-            e,
-            MutationEvent::EdgePropSet { edge_type, src, dst, field }
-            if edge_type == "KNOWS" && src == "alice" && dst == "bob" && field == "since"
-        )),
-        "expected EdgePropSet, got {got:?}"
+        got.is_empty(),
+        "expected no MutationEvent for single-op edge-prop batch, got {got:?}"
+    );
+    // The write did commit — the prop is readable.
+    assert_eq!(
+        db.get_edge_prop("KNOWS", "alice", "bob", "since"),
+        Some(Value::Int(2024))
     );
 }
 
-/// Binding (row 155): `RemoveEdgePropId` WAL record emits
-/// `MutationEvent::EdgePropRemoved` on the legacy sink.
+/// Binding (row 155): a multi-op `write_batch` that sets two edge-props at
+/// once emits `BatchApplied` on the mutation sink (ops=2 ≥ 2 threshold).
+/// Neither op has a dedicated `MutationEvent` variant; `BatchApplied` fires
+/// for the batch as a whole.
 #[test]
-fn mutation_event_sink_receives_edge_prop_removed() {
+fn mutation_event_sink_emits_batch_applied_when_edge_prop_is_one_of_many_ops() {
     let dir = tmp("ev-edge-prop-removed");
     let mut db = GraphDb::open(&dir).unwrap();
 
     db.insert_node("Person", "alice", vec![]).unwrap();
     db.insert_node("Person", "bob", vec![]).unwrap();
-    db.write_batch(|b| {
-        b.insert_edge("KNOWS", "alice", "bob");
-        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2024));
-    })
-    .unwrap();
+    db.insert_edge("KNOWS", "alice", "bob").unwrap();
 
     let evs = attach(&mut db);
 
+    // Two SetEdgePropId ops in one batch → ops=2 → BatchApplied fires.
     db.write_batch(|b| {
-        b.remove_edge_prop("KNOWS", "alice", "bob", "since");
+        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2024));
+        b.set_edge_prop("KNOWS", "alice", "bob", "weight", Value::Float(1.0));
     })
     .unwrap();
 
     let got = take(&evs);
     assert!(
-        got.iter().any(|e| matches!(
-            e,
-            MutationEvent::EdgePropRemoved { edge_type, src, dst, field }
-            if edge_type == "KNOWS" && src == "alice" && dst == "bob" && field == "since"
-        )),
-        "expected EdgePropRemoved, got {got:?}"
+        got.iter()
+            .any(|e| matches!(e, MutationEvent::BatchApplied { .. })),
+        "expected BatchApplied for two-op edge-prop batch, got {got:?}"
     );
 }
 

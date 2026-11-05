@@ -284,7 +284,6 @@ pub(crate) struct QuerySubEntry {
 /// (`{"node_inserted":{"label":"A","key":"k"}}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum MutationEvent {
     NodeInserted {
         label: String,
@@ -326,20 +325,6 @@ pub enum MutationEvent {
     Ingested {
         label: String,
         inserted: usize,
-    },
-    /// A property was set on a relationship (QL-RP, row 155).
-    EdgePropSet {
-        edge_type: String,
-        src: String,
-        dst: String,
-        field: String,
-    },
-    /// A property was removed from a relationship (QL-RP, row 155).
-    EdgePropRemoved {
-        edge_type: String,
-        src: String,
-        dst: String,
-        field: String,
     },
 }
 
@@ -438,32 +423,11 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // A count changes neither the node nor the edge population: the pair it
         // counts was already there, which is why it is written at all.
         | WalRecord::SetEdgeCount { .. }
-        // Relationship-property events (row 155).
+        // A relationship property has no mutation event of its own (0.10).
+        | WalRecord::SetEdgePropId { .. }
+        | WalRecord::RemoveEdgePropId { .. }
         // RenameNode carries no node/edge count change; no special event.
         | WalRecord::RenameNode { .. } => None,
-        WalRecord::SetEdgePropId {
-            etype,
-            src,
-            dst,
-            field,
-            ..
-        } => Some(MutationEvent::EdgePropSet {
-            edge_type: intern.resolve(*etype)?.to_string(),
-            src: ids.key_of(*src)?.to_string(),
-            dst: ids.key_of(*dst)?.to_string(),
-            field: intern.resolve(*field)?.to_string(),
-        }),
-        WalRecord::RemoveEdgePropId {
-            etype,
-            src,
-            dst,
-            field,
-        } => Some(MutationEvent::EdgePropRemoved {
-            edge_type: intern.resolve(*etype)?.to_string(),
-            src: ids.key_of(*src)?.to_string(),
-            dst: ids.key_of(*dst)?.to_string(),
-            field: intern.resolve(*field)?.to_string(),
-        }),
     }
 }
 
@@ -877,12 +841,10 @@ pub struct BackupReport {
 ///
 /// Returned by [`GraphDb::all_edges_for_export`].
 ///
-/// Does not derive `Eq`/`Ord`/`PartialOrd`: `weight` is an `f64` (NaN breaks
-/// a total order) and `props` contains `Value` (which does not implement
-/// `PartialOrd`). Callers that need a stable edge ordering already sort by
+/// Does not derive `Eq`/`Ord`: `weight` is an `f64` and NaN breaks a total
+/// order. Callers that need a stable edge ordering already sort by
 /// `(edge_type, src, dst)` explicitly (see `all_edges_for_export`).
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct ExportEdge {
     pub edge_type: String,
     pub src: String,
@@ -894,12 +856,6 @@ pub struct ExportEdge {
     /// derived and numeric (`Int`/`Float`). `None` for manual edges, derived
     /// edges whose rule declares no `weight_prop`, or a non-numeric value.
     pub weight: Option<f64>,
-    /// User-defined properties on this edge (QL-RP, row 120).
-    ///
-    /// For derived edges the map may contain the rule's weight property
-    /// (included as a user-visible property) but rule-internal properties
-    /// (`count`) are excluded.  Empty for edges that carry no user properties.
-    pub props: std::collections::BTreeMap<String, Value>,
 }
 
 /// One edge type's shape, as [`GraphDb::edge_type_census`] counts it.
@@ -12985,8 +12941,6 @@ impl<F: Fs> GraphDb<F> {
                             Some(Value::Int(i)) => Some(i as f64),
                             _ => None,
                         });
-                    let mut edge_props = ep.props_of(etype_sym, id, nbr);
-                    edge_props.remove(EDGE_COUNT_PROP);
                     edges.push(ExportEdge {
                         edge_type: edge_type.clone(),
                         src: key.to_string(),
@@ -12994,7 +12948,6 @@ impl<F: Fs> GraphDb<F> {
                         derived,
                         rule,
                         weight,
-                        props: edge_props,
                     });
                 }
             }
@@ -13144,8 +13097,6 @@ impl<F: Fs> GraphDb<F> {
                             Some(Value::Int(i)) => Some(i as f64),
                             _ => None,
                         });
-                    let mut edge_props = ep.props_of(etype_sym, id, nbr);
-                    edge_props.remove(EDGE_COUNT_PROP);
                     each(ExportEdge {
                         edge_type: edge_type.to_string(),
                         src: src.to_string(),
@@ -13153,7 +13104,6 @@ impl<F: Fs> GraphDb<F> {
                         derived: rule.is_some(),
                         rule: rule.map(str::to_string),
                         weight,
-                        props: edge_props,
                     })?;
                 }
             }

@@ -25,7 +25,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AccessKeys, AsOfScope, AutoFk, BackupReport,
-    BatchOp, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
+    BatchOp, DbEvent, DegreeConfig, Dir, GraphError, IngestOptions, KeyTier, MaskMode, NodeMask,
     PageRankConfig, PropPredicate, ReaderSnapshot, ResultSet, SchemaError, SchemaErrorKind,
     SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
@@ -916,12 +916,95 @@ fn build_app_with_cors(
          replaces the sink and terminates all existing /watch subscribers \
          with RecvError::Closed"
     );
-    let (tx, _) = tokio::sync::broadcast::channel(1024);
+    let (tx, _) = tokio::sync::broadcast::channel::<String>(1024);
+    // Serialize each MutationEvent to JSON and broadcast the string.
     {
         let tx = tx.clone();
         db.write().set_event_sink(Box::new(move |ev| {
-            let _ = tx.send(ev);
+            if let Ok(json) = serde_json::to_string(&ev) {
+                let _ = tx.send(json);
+            }
         }));
+    }
+    // Bridge edge-prop DbEvents to /watch (row 155).
+    // `subscribe_writes()` is called here, synchronously, so the subscription is
+    // registered before this function returns.  Any write that fires after
+    // `start_state` completes is guaranteed to reach the bridge.  The polling
+    // loop runs in a persistent blocking thread so the async runtime is not
+    // blocked on `recv_timeout`.  Only `EdgePropSet` and `EdgePropRemoved` are
+    // forwarded; every other DbEvent variant is handled by the event_sink above
+    // or is not relevant to the mutation-log stream.
+    //
+    // Lifetime: the bridge holds a `Weak` reference to `bridge_keepalive`.
+    // When every `AppState` clone is dropped (server shutdown), the `Arc` is
+    // released and the `Weak` upgrade fails → bridge exits its loop.  This
+    // prevents the tokio blocking-thread pool from hanging on shutdown.
+    let bridge_keepalive = std::sync::Arc::new(());
+    {
+        let tx = tx.clone();
+        let alive_weak = std::sync::Arc::downgrade(&bridge_keepalive);
+        match db.write().subscribe_writes() {
+            Err(e) => {
+                tracing::warn!("watch edge-prop bridge: subscribe_writes failed: {e}");
+            }
+            Ok(sub) => {
+                // `spawn_blocking` requires a tokio runtime.  When
+                // `build_app_with_cors` is called from a sync context (e.g.
+                // unit tests that build a Router without a running runtime),
+                // skip the bridge; edge-prop events won't appear on /watch
+                // in that context, which is acceptable since no server is up.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::task::spawn_blocking(move || {
+                        let idle = std::time::Duration::from_millis(100);
+                        loop {
+                            match sub.recv_timeout(idle) {
+                                Some(DbEvent::EdgePropSet {
+                                    edge_type,
+                                    src,
+                                    dst,
+                                    field,
+                                    ..
+                                }) => {
+                                    let frame = serde_json::json!({
+                                        "edge_prop_set": {
+                                            "edge_type": edge_type,
+                                            "src": src,
+                                            "dst": dst,
+                                            "field": field
+                                        }
+                                    });
+                                    let _ = tx.send(frame.to_string());
+                                }
+                                Some(DbEvent::EdgePropRemoved {
+                                    edge_type,
+                                    src,
+                                    dst,
+                                    field,
+                                    ..
+                                }) => {
+                                    let frame = serde_json::json!({
+                                        "edge_prop_removed": {
+                                            "edge_type": edge_type,
+                                            "src": src,
+                                            "dst": dst,
+                                            "field": field
+                                        }
+                                    });
+                                    let _ = tx.send(frame.to_string());
+                                }
+                                _ => {
+                                    // On each timeout, check if the server has shut
+                                    // down (all AppState clones dropped).
+                                    if alive_weak.upgrade().is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } // end if tokio runtime available
+            }
+        }
     }
     let state = AppState {
         db,
@@ -935,6 +1018,7 @@ fn build_app_with_cors(
         ready,
         access_keys: keys,
         txs,
+        _bridge_keepalive: bridge_keepalive,
     };
     let app = Router::new()
         .route("/health", get(health))

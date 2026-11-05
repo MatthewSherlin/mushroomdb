@@ -11,7 +11,7 @@ mod subscribe;
 pub mod tls;
 mod ws;
 
-use mushroomdb::{AccessKeys, MutationEvent, SharedDb};
+use mushroomdb::{AccessKeys, SharedDb};
 
 pub use http::{
     register_backup_metrics, register_bolt_metrics, BackupMetrics, BoltMetrics, TxLimits,
@@ -59,10 +59,15 @@ pub(crate) enum AuthIdentity {
 pub(crate) struct ReadOnlyKey;
 
 /// Router state: the database plus the watch broadcast fan-out.
+///
+/// `watch` carries pre-serialised JSON strings so that `MutationEvent`
+/// variants (externally-tagged, from the event sink) and edge-prop events
+/// (derived from `DbEvent` subscriptions, row 155) share one channel without
+/// changing the pub `MutationEvent` type.
 #[derive(Clone)]
 struct AppState {
     db: SharedDb,
-    watch: tokio::sync::broadcast::Sender<MutationEvent>,
+    watch: tokio::sync::broadcast::Sender<String>,
     /// Full-access bearer token (`--token` / `MUSHROOMDB_TOKEN`).
     token: Option<String>,
     /// Role-bound tokens: bearer value → role name.
@@ -86,6 +91,11 @@ struct AppState {
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Open interactive transactions (`/tx/*`).
     txs: http::TxStore,
+    /// Keepalive handle for the edge-prop bridge background thread (row 155).
+    /// The bridge holds a `Weak` reference to this `Arc`; when every
+    /// `AppState` clone is dropped — meaning the server is shutting down —
+    /// the `Weak` becomes dangling and the bridge thread exits its loop.
+    _bridge_keepalive: std::sync::Arc<()>,
 }
 
 pub use access_keys::watch_sighup;

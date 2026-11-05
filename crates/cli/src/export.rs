@@ -34,6 +34,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Edge properties map for a single edge.
+type EdgeProps = BTreeMap<String, Value>;
+
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
@@ -122,6 +125,17 @@ pub trait ExportSource {
         &self,
         each: &mut dyn FnMut(ExportEdge) -> Result<(), crate::CliError>,
     ) -> Result<(), crate::CliError>;
+    /// Iterate over edges paired with their property maps (QL-RP, row 120).
+    ///
+    /// Default impl delegates to `for_each_edge` with an empty property map;
+    /// override to supply real properties (e.g. from
+    /// `GraphDb::all_edges_with_props_for_export`).
+    fn for_each_edge_with_props(
+        &self,
+        each: &mut dyn FnMut(ExportEdge, EdgeProps) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        self.for_each_edge(&mut |edge| each(edge, BTreeMap::new()))
+    }
     /// The label of the node `key`.
     fn label_of(&self, key: &str) -> Option<String>;
 }
@@ -138,6 +152,15 @@ impl ExportSource for mushroomdb::GraphDb<mushroomdb::RealFs> {
         each: &mut dyn FnMut(ExportEdge) -> Result<(), crate::CliError>,
     ) -> Result<(), crate::CliError> {
         self.for_each_edge_for_export(each)
+    }
+    fn for_each_edge_with_props(
+        &self,
+        each: &mut dyn FnMut(ExportEdge, EdgeProps) -> Result<(), crate::CliError>,
+    ) -> Result<(), crate::CliError> {
+        for (edge, props) in self.all_edges_with_props_for_export() {
+            each(edge, props)?;
+        }
+        Ok(())
     }
     fn label_of(&self, key: &str) -> Option<String> {
         self.node_ref(key).map(|n| n.label().to_string())
@@ -229,7 +252,7 @@ fn node_json(node: &NodeInfo, typed: bool) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-fn edge_json(edge: &ExportEdge) -> serde_json::Value {
+fn edge_json(edge: &ExportEdge, props: &EdgeProps) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("edge_type".into(), edge.edge_type.clone().into());
     obj.insert("src".into(), edge.src.clone().into());
@@ -243,9 +266,8 @@ fn edge_json(edge: &ExportEdge) -> serde_json::Value {
     );
     // Edge properties (QL-RP, row 120). Only written when non-empty so that
     // existing files remain byte-identical for edges that carry none.
-    if !edge.props.is_empty() {
-        let props_obj: serde_json::Map<_, _> = edge
-            .props
+    if !props.is_empty() {
+        let props_obj: serde_json::Map<_, _> = props
             .iter()
             .map(|(k, v)| (k.clone(), value_to_json(v)))
             .collect();
@@ -296,10 +318,10 @@ pub fn write_jsonl(
     })?;
     f.flush()?;
     let mut f = create_file(dest.join("edges.jsonl"))?;
-    source.for_each_edge(&mut |edge| {
+    source.for_each_edge_with_props(&mut |edge, props| {
         stats.edges += 1;
         stats.derived_edges += usize::from(edge.derived);
-        json_line(&mut f, &edge_json(&edge))
+        json_line(&mut f, &edge_json(&edge, &props))
     })?;
     f.flush()?;
     write_rules_jsonl(rules, dest)?;
@@ -331,10 +353,10 @@ pub fn write_jsonl_single(
         stats.nodes += 1;
         typed_json_line(&mut f, "node", &node_json(&node, true))
     })?;
-    source.for_each_edge(&mut |edge| {
+    source.for_each_edge_with_props(&mut |edge, props| {
         stats.edges += 1;
         stats.derived_edges += usize::from(edge.derived);
-        typed_json_line(&mut f, "edge", &edge_json(&edge))
+        typed_json_line(&mut f, "edge", &edge_json(&edge, &props))
     })?;
     for rule in rules {
         let line = serde_json::json!({ "rule": rule });
@@ -525,12 +547,19 @@ pub fn write_csv(
 
     // ── relationships.csv ──────────────────────────────────────────────────
     // Pass 1: discover edge-property columns (manual edges only).
+    // Collect all edge rows with props so we can do two logical passes without
+    // calling the (potentially expensive) source twice.
+    let mut all_edge_rows: Vec<(ExportEdge, EdgeProps)> = Vec::new();
+    source.for_each_edge_with_props(&mut |edge, props| {
+        all_edge_rows.push((edge, props));
+        Ok(())
+    })?;
     let mut rel_kinds: BTreeMap<String, CsvKind> = BTreeMap::new();
-    source.for_each_edge(&mut |edge| {
+    for (edge, props) in &all_edge_rows {
         if edge.derived {
-            return Ok(());
+            continue;
         }
-        for (name, value) in &edge.props {
+        for (name, value) in props {
             stats.non_finite_floats += count_non_finite(value);
             let kind = CsvKind::of(value);
             match rel_kinds.get_mut(name.as_str()) {
@@ -541,8 +570,7 @@ pub fn write_csv(
                 }
             }
         }
-        Ok(())
-    })?;
+    }
     // Pass 2: write rows.
     let mut w = csv::Writer::from_path(dest.join("relationships.csv")).map_err(csv_error)?;
     let mut rel_header = vec![
@@ -552,23 +580,23 @@ pub fn write_csv(
     ];
     rel_header.extend(rel_kinds.iter().map(|(n, k)| format!("{n}:{}", k.suffix())));
     w.write_record(&rel_header).map_err(csv_error)?;
-    source.for_each_edge(&mut |edge| {
+    for (edge, props) in all_edge_rows {
         stats.edges += 1;
         stats.derived_edges += usize::from(edge.derived);
         if edge.derived {
-            return Ok(());
+            continue;
         }
         let mut row = vec![edge.src.clone(), edge.dst.clone(), edge.edge_type.clone()];
         for (name, kind) in &rel_kinds {
             row.push(
-                edge.props
+                props
                     .get(name.as_str())
                     .map(|v| csv_cell(v, *kind))
                     .unwrap_or_default(),
             );
         }
-        w.write_record(&row).map_err(csv_error)
-    })?;
+        w.write_record(&row).map_err(csv_error)?;
+    }
     w.flush()?;
 
     if !rules.is_empty() {

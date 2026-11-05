@@ -861,9 +861,11 @@ export type MutationEvent =
   | { node_inserted: { label: string; key: string } }
   | { prop_set: { key: string; field: string } }
   | { prop_removed: { key: string; field: string } }
-  /** A property was set on a relationship (QL-RP, row 155). */
+  /** A property was set on a relationship (QL-RP, row 155).
+   *  Delivered via the edge-prop subscription bridge; no `commit_seq`. */
   | { edge_prop_set: { edge_type: string; src: string; dst: string; field: string } }
-  /** A property was removed from a relationship (QL-RP, row 155). */
+  /** A property was removed from a relationship (QL-RP, row 155).
+   *  Delivered via the edge-prop subscription bridge; no `commit_seq`. */
   | { edge_prop_removed: { edge_type: string; src: string; dst: string; field: string } }
   | { edge_inserted: { edge_type: string; src: string; dst: string } }
   | { edge_deleted: { edge_type: string; src: string; dst: string } }
