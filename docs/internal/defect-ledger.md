@@ -3589,7 +3589,7 @@ when it committed nothing. Tests in `crates/core-api/tests/snapshot_empty_store.
 `the_first_archive_after_an_empty_snapshot_still_holds_the_history`) and
 `csv_import_header_only_files_import_nothing_and_leave_no_intent` in `crates/cli/tests/csv_import.rs`.
 
-## 120. CSV import refuses relationship property columns — DEFERRED
+## 120. CSV import refuses relationship property columns — CLOSED in 0.10.5
 
 `mushroomdb import` (PF-03a) takes `:START_ID`, `:END_ID` and `:TYPE` from a relationships file
 and nothing else: the engine's edges carry no user properties, so a property column has nowhere to
@@ -3607,6 +3607,15 @@ V11 records `SetEdgePropId` (28) and `RemoveEdgePropId` (29) and stored where a
 rule's weights already were (the edge-property overlay, snapshot section 5). What
 remains for 0.11 is the import mapping property columns onto those ops, and the
 JSONL export carrying them.
+
+**CLOSED in 0.10.5.** Import mapping and JSONL export complete: `import_rels` reads
+typed prop columns (`name:type` header suffixes, same conventions as nodes), commits
+them via `BatchBuilder::set_edge_prop`; `edge_json` in the exporter includes a `"props"` key
+when non-empty; `for_each_edge_for_export` and `all_edges_for_export` populate
+`ExportEdge::props` from the edge-property overlay. CSV export writes typed prop columns
+in the relationships file header. Export→import JSONL and CSV round-trips preserve all
+edge properties. `BatchBuilder::remove_edge_prop` added as a pub API counterpart to
+`set_edge_prop`.
 
 ## 121. A reload can mix two snapshots' state under the newer identities — CLOSED
 
@@ -4638,7 +4647,7 @@ snapshot merge lays an untombstoned overlay entry over the archived one field by
 does. Evidence: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in
 `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen).
 
-## 155. Relationship-property writes emit no mutation or subscription event — DEFERRED to 0.11
+## 155. Relationship-property writes emit no mutation or subscription event — CLOSED in 0.10.5
 
 Found by the QL-RP review (M4). Introduced in the 0.10 cycle with QL-RP; never released.
 
@@ -4655,6 +4664,15 @@ Found by the QL-RP review (M4). Introduced in the 0.10 cycle with QL-RP; never r
 **DEFERRED to 0.11.** The fix is a pair of event variants (`edge_prop_set`, `edge_prop_removed`, with
 `edge_type`, `src`, `dst`, `field`) on both streams, emitted where the records are applied, and their
 documentation in `docs/site/http.md` and `docs/site/subscriptions.md`.
+
+**CLOSED in 0.10.5.** Added `MutationEvent::EdgePropSet` / `EdgePropRemoved` (externally-tagged,
+snake_case; `#[non_exhaustive]` added to `MutationEvent`) and `DbEvent::EdgePropSet` /
+`EdgePropRemoved` (internally-tagged, snake_case; `#[non_exhaustive]` already present on `DbEvent`).
+`event_from_record` and `write_events_from_record` in `crates/core-api/src/db.rs` now return these
+events for `WalRecord::SetEdgePropId` and `RemoveEdgePropId` instead of `None`. `SubFilter::Writes`
+includes both new variants. TypeScript union types in `clients/typescript/src/types.ts` updated.
+`docs/site/http.md` and `docs/site/subscriptions.md` updated. Authz: both endpoints return 403 for
+all role tokens and write-tier keys (middleware-level), so no per-event filtering is needed.
 
 ## 156. `elementId()` refuses anything but a bare node or relationship variable — DEFERRED to 0.11
 
