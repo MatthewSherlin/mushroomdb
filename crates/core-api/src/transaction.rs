@@ -559,7 +559,6 @@ impl RowSource for TxRows<'_, '_> {
 
 /// A `MATCH … SET` / `REMOVE` or per-row statement's ops, computed over the
 /// transaction's state and not yet buffered.
-#[allow(clippy::large_enum_variant)]
 enum Prepared {
     Match(MatchWrite),
     Rows(Box<RowPass>),

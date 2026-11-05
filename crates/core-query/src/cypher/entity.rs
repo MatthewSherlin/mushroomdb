@@ -474,13 +474,22 @@ pub(crate) fn operand_kind(
         // `nodes(p)[0]`, `collect(n)[i]`: subscript of a list of one entity kind
         // yields one element of that kind.
         Operand::Index { base, .. } => operand_kind(base, scope)?.element(),
-        // `CASE WHEN cond THEN n ELSE m END`: entity kind when every branch
-        // (including ELSE) returns the same entity kind (null branches are fine).
+        // `CASE WHEN cond THEN n ELSE m END`: entity kind when every non-null
+        // branch returns the same entity kind. A null-literal branch
+        // (`ELSE NULL`) is a wildcard and does not disqualify; a branch with an
+        // unknown/scalar kind (not a null literal) does.
         Operand::Case { branches, default } => {
+            let is_null_lit = |op: &Operand| matches!(op, Operand::Lit(Value::Null));
             let branch_kinds: Vec<Option<EntityKind>> = branches
                 .iter()
+                .filter(|(_, op)| !is_null_lit(op))
                 .map(|(_, op)| operand_kind(op, scope))
-                .chain(default.iter().map(|d| operand_kind(d, scope)))
+                .chain(
+                    default
+                        .iter()
+                        .filter(|d| !is_null_lit(d))
+                        .map(|d| operand_kind(d, scope)),
+                )
                 .collect();
             let first = branch_kinds.iter().flatten().next().copied()?;
             branch_kinds

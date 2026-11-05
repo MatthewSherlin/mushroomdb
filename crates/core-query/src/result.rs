@@ -181,6 +181,19 @@ impl WriteStats {
     }
 }
 
+/// Heap-allocated sidecar for entity tree data, boxed to keep [`ResultSet`]
+/// small. Only allocated for queries whose columns include computed expressions
+/// with embedded graph elements (maps, mixed lists, function expressions).
+#[derive(Debug, Clone)]
+struct EntityTreeSidecar {
+    /// Per-column entity kind tag trees. One per column; `None` for columns
+    /// without nested entity structure.
+    kind_trees: Vec<Option<ValueKindTag>>,
+    /// Row-major value entity trees, resolved from `kind_trees` when entity
+    /// detail is requested. `None` until attached by `set_value_entity_trees`.
+    entity_trees: Option<Vec<Option<ValueEntityTree>>>,
+}
+
 /// A query result: named columns and rows of values.
 ///
 /// Beside the rows it may carry three things no renderer has to read: the
@@ -194,13 +207,8 @@ pub struct ResultSet {
     kinds: Vec<Option<EntityKind>>,
     /// Row-major, `columns.len()` cells per row; `None` until attached.
     entities: Option<Vec<Option<Entity>>>,
-    /// Per-column entity kind tag trees for computed expressions (maps, mixed
-    /// lists, functions) whose structure the flat `EntityKind` cannot represent.
-    /// One entry per column (all `None` for plain results). Set by the executor.
-    value_kind_trees: Vec<Option<ValueKindTag>>,
-    /// Row-major value entity trees, resolved from `value_kind_trees` and the
-    /// actual cell values when entity detail is requested. `None` until attached.
-    value_entity_trees: Option<Vec<Option<ValueEntityTree>>>,
+    /// Boxed entity tree sidecar; `None` when no column has an entity kind tree.
+    trees: Option<Box<EntityTreeSidecar>>,
     /// Boxed: most results are reads, and a `ResultSet` is held inline in
     /// other types.
     stats: Option<Box<WriteStats>>,
@@ -215,14 +223,12 @@ impl PartialEq for ResultSet {
 impl ResultSet {
     pub fn new(columns: Vec<String>) -> Self {
         let kinds = vec![None; columns.len()];
-        let value_kind_trees = vec![None; kinds.len()];
         Self {
             columns,
             rows: Vec::new(),
             kinds,
             entities: None,
-            value_kind_trees,
-            value_entity_trees: None,
+            trees: None,
             stats: None,
         }
     }
@@ -237,8 +243,10 @@ impl ResultSet {
         if let Some(entities) = self.entities.as_mut() {
             entities.resize(self.rows.len() * self.columns.len(), None);
         }
-        if let Some(trees) = self.value_entity_trees.as_mut() {
-            trees.resize(self.rows.len() * self.columns.len(), None);
+        if let Some(sidecar) = self.trees.as_mut() {
+            if let Some(entity_trees) = sidecar.entity_trees.as_mut() {
+                entity_trees.resize(self.rows.len() * self.columns.len(), None);
+            }
         }
     }
 
@@ -279,8 +287,10 @@ impl ResultSet {
     pub fn set_column_kinds(&mut self, mut kinds: Vec<Option<EntityKind>>) {
         kinds.resize(self.columns.len(), None);
         self.kinds = kinds;
-        // Ensure value_kind_trees has the same length.
-        self.value_kind_trees.resize(self.columns.len(), None);
+        // If a sidecar exists, keep its kind_trees length in sync.
+        if let Some(sidecar) = self.trees.as_mut() {
+            sidecar.kind_trees.resize(self.columns.len(), None);
+        }
     }
 
     /// The graph element behind cell (`row`, `col`), when entity details were
@@ -316,13 +326,27 @@ impl ResultSet {
     /// graph elements that the flat `EntityKind` cannot represent (e.g. a map
     /// or mixed list). `None` when the column has no such structure.
     pub(crate) fn value_kind_tree(&self, col: usize) -> Option<&ValueKindTag> {
-        self.value_kind_trees.get(col)?.as_ref()
+        self.trees.as_ref()?.kind_trees.get(col)?.as_ref()
     }
 
     /// Set the per-column entity kind tag trees. Called by the executor.
-    pub(crate) fn set_value_kind_trees(&mut self, mut trees: Vec<Option<ValueKindTag>>) {
-        trees.resize(self.columns.len(), None);
-        self.value_kind_trees = trees;
+    /// Allocates the sidecar only when at least one entry is `Some`.
+    pub(crate) fn set_value_kind_trees(&mut self, mut kind_trees: Vec<Option<ValueKindTag>>) {
+        kind_trees.resize(self.columns.len(), None);
+        if kind_trees.iter().any(Option::is_some) {
+            match self.trees.as_mut() {
+                Some(sidecar) => sidecar.kind_trees = kind_trees,
+                None => {
+                    self.trees = Some(Box::new(EntityTreeSidecar {
+                        kind_trees,
+                        entity_trees: None,
+                    }));
+                }
+            }
+        } else if let Some(sidecar) = self.trees.as_mut() {
+            // Sidecar already exists (for entity_trees); keep kind_trees in sync.
+            sidecar.kind_trees = kind_trees;
+        }
     }
 
     /// The resolved entity tree for cell (`row`, `col`), when entity details
@@ -332,7 +356,9 @@ impl ResultSet {
         if col >= self.columns.len() {
             return None;
         }
-        self.value_entity_trees
+        self.trees
+            .as_ref()?
+            .entity_trees
             .as_ref()?
             .get(row * self.columns.len() + col)?
             .as_ref()
@@ -340,20 +366,33 @@ impl ResultSet {
 
     /// Attach the entity tree for each cell, row-major.
     ///
-    /// # Panics — if `trees.len()` is not `len() * columns().len()`.
-    pub(crate) fn set_value_entity_trees(&mut self, trees: Vec<Option<ValueEntityTree>>) {
+    /// # Panics — if `entity_trees.len()` is not `len() * columns().len()`.
+    pub(crate) fn set_value_entity_trees(
+        &mut self,
+        entity_trees: Vec<Option<ValueEntityTree>>,
+    ) {
         assert_eq!(
-            trees.len(),
+            entity_trees.len(),
             self.rows.len() * self.columns.len(),
             "value entity tree table does not match the ResultSet"
         );
-        self.value_entity_trees = Some(trees);
+        match self.trees.as_mut() {
+            Some(sidecar) => sidecar.entity_trees = Some(entity_trees),
+            None => {
+                self.trees = Some(Box::new(EntityTreeSidecar {
+                    kind_trees: vec![None; self.columns.len()],
+                    entity_trees: Some(entity_trees),
+                }));
+            }
+        }
     }
 
     /// Whether any column has a value kind tree (meaning the result may contain
     /// embedded graph elements in maps or mixed lists).
     pub(crate) fn has_value_kind_trees(&self) -> bool {
-        self.value_kind_trees.iter().any(Option::is_some)
+        self.trees
+            .as_ref()
+            .is_some_and(|s| s.kind_trees.iter().any(Option::is_some))
     }
 
     /// What the write statement that produced this result changed.
