@@ -259,3 +259,85 @@ async fn watch_answers_a_client_that_closes_while_nothing_is_written() {
     .await;
     assert_eq!(answered, Ok(true), "the server did not complete the close");
 }
+
+// ---------------------------------------------------------------------------
+// Row 155: edge-property events on /watch
+// ---------------------------------------------------------------------------
+
+/// Binding (row 155): setting a property on an edge emits `edge_prop_set` on
+/// `/watch`.
+#[tokio::test]
+async fn watch_receives_edge_prop_set() {
+    let db = SharedDb::open(&tmp("watch-edge-prop-set")).unwrap();
+    db.write().insert_node("P", "a", vec![]).unwrap();
+    db.write().insert_node("P", "b", vec![]).unwrap();
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect(addr).await;
+
+    db.write()
+        .write_batch(|b| {
+            b.set_edge_prop("KNOWS", "a", "b", "since", Value::Int(2024));
+        })
+        .unwrap();
+
+    // BatchApplied will also arrive; find the EdgePropSet frame.
+    let expected = serde_json::to_value(MutationEvent::EdgePropSet {
+        edge_type: "KNOWS".into(),
+        src: "a".into(),
+        dst: "b".into(),
+        field: "since".into(),
+    })
+    .unwrap();
+    let mut found = false;
+    for _ in 0..5 {
+        let frame = next_text(&mut ws).await;
+        if frame == expected {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "expected EdgePropSet frame on /watch");
+}
+
+/// Binding (row 155): removing a property from an edge emits
+/// `edge_prop_removed` on `/watch`.
+#[tokio::test]
+async fn watch_receives_edge_prop_removed() {
+    let db = SharedDb::open(&tmp("watch-edge-prop-removed")).unwrap();
+    db.write().insert_node("P", "a", vec![]).unwrap();
+    db.write().insert_node("P", "b", vec![]).unwrap();
+    db.write()
+        .write_batch(|b| {
+            b.insert_edge("KNOWS", "a", "b");
+            b.set_edge_prop("KNOWS", "a", "b", "since", Value::Int(2024));
+        })
+        .unwrap();
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect(addr).await;
+
+    db.write()
+        .write_batch(|b| {
+            b.remove_edge_prop("KNOWS", "a", "b", "since");
+        })
+        .unwrap();
+
+    let expected = serde_json::to_value(MutationEvent::EdgePropRemoved {
+        edge_type: "KNOWS".into(),
+        src: "a".into(),
+        dst: "b".into(),
+        field: "since".into(),
+    })
+    .unwrap();
+    let mut found = false;
+    for _ in 0..5 {
+        let frame = next_text(&mut ws).await;
+        if frame == expected {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "expected EdgePropRemoved frame on /watch");
+}

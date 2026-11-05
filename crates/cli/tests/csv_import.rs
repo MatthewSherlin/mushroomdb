@@ -795,3 +795,113 @@ fn csv_import_throughput_above_50k_per_second() {
         rate(bulk)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row 120: relationship property columns in CSV import
+// ---------------------------------------------------------------------------
+
+/// Binding (row 120): typed property columns in the rels CSV header are
+/// imported and stored on the edge.
+///
+/// Header format: `:START_ID,:END_ID,:TYPE,<prop>[:<type>],...`
+#[test]
+fn csv_import_rel_props_typed() {
+    let nodes = ":ID,:LABEL\np1,Person\np2,Person\n";
+    let rels = ":START_ID,:END_ID,:TYPE,since:int,label\np1,p2,KNOWS,2020,friend\n";
+    let dir = tmp("rel-props-typed");
+    let nodes_path = write(&dir, "nodes.csv", nodes);
+    let rels_path = write(&dir, "rels.csv", rels);
+    let report = run_import(
+        &dir.join("db"),
+        Some(&nodes_path),
+        Some(&rels_path),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!((report.nodes_inserted, report.edges_inserted), (2, 1));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert_eq!(
+        db.get_edge_prop("KNOWS", "p1", "p2", "since"),
+        Some(Value::Int(2020))
+    );
+    assert_eq!(
+        db.get_edge_prop("KNOWS", "p1", "p2", "label"),
+        Some(Value::Str("friend".into()))
+    );
+}
+
+/// Binding (row 120): an empty cell for a rel property column is skipped
+/// (the property is not stored); other columns on the same row are unaffected.
+#[test]
+fn csv_import_rel_prop_empty_cell_is_skipped() {
+    let nodes = ":ID,:LABEL\np1,Person\np2,Person\np3,Person\n";
+    let rels = ":START_ID,:END_ID,:TYPE,since:int\np1,p2,KNOWS,2020\np1,p3,KNOWS,\n";
+    let dir = tmp("rel-props-empty");
+    let nodes_path = write(&dir, "nodes.csv", nodes);
+    let rels_path = write(&dir, "rels.csv", rels);
+    let report = run_import(
+        &dir.join("db"),
+        Some(&nodes_path),
+        Some(&rels_path),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(report.edges_inserted, 2);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert_eq!(
+        db.get_edge_prop("KNOWS", "p1", "p2", "since"),
+        Some(Value::Int(2020))
+    );
+    // Empty cell → property not stored.
+    assert_eq!(db.get_edge_prop("KNOWS", "p1", "p3", "since"), None);
+}
+
+/// Binding (row 120): a boolean rel property column (`active:boolean`) is
+/// parsed correctly (`true`/`false`).
+#[test]
+fn csv_import_rel_prop_boolean_typed() {
+    let nodes = ":ID,:LABEL\na,N\nb,N\n";
+    let rels = ":START_ID,:END_ID,:TYPE,active:boolean\na,b,E,true\n";
+    let dir = tmp("rel-props-bool");
+    let nodes_path = write(&dir, "nodes.csv", nodes);
+    let rels_path = write(&dir, "rels.csv", rels);
+    run_import(
+        &dir.join("db"),
+        Some(&nodes_path),
+        Some(&rels_path),
+        &opts(),
+    )
+    .unwrap();
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert_eq!(
+        db.get_edge_prop("E", "a", "b", "active"),
+        Some(Value::Bool(true))
+    );
+}
+
+/// Binding (row 120): a float rel property column (`score:float`) is parsed
+/// correctly.
+#[test]
+fn csv_import_rel_prop_float_typed() {
+    let nodes = ":ID,:LABEL\na,N\nb,N\n";
+    let rels = ":START_ID,:END_ID,:TYPE,score:float\na,b,E,0.75\n";
+    let dir = tmp("rel-props-float");
+    let nodes_path = write(&dir, "nodes.csv", nodes);
+    let rels_path = write(&dir, "rels.csv", rels);
+    run_import(
+        &dir.join("db"),
+        Some(&nodes_path),
+        Some(&rels_path),
+        &opts(),
+    )
+    .unwrap();
+    let db = GraphDb::open(&dir.join("db")).unwrap();
+    assert_eq!(
+        db.get_edge_prop("E", "a", "b", "score"),
+        Some(Value::Float(0.75))
+    );
+}

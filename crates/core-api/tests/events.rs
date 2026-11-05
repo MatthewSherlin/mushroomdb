@@ -605,6 +605,8 @@ fn subscribe_writes_receives_write_events_only() {
                     | DbEvent::EdgeDeleted { .. }
                     | DbEvent::PropSet { .. }
                     | DbEvent::PropRemoved { .. }
+                    | DbEvent::EdgePropSet { .. }
+                    | DbEvent::EdgePropRemoved { .. }
                     | DbEvent::Lagged { .. }
             ),
             "write subscription received unexpected edge event: {ev:?}"
@@ -970,4 +972,119 @@ fn query_sub_does_not_skip_with_expand() {
         "Expand queries must always re-execute (v0.4.3 conservative boundary)"
     );
     let _ = sub;
+}
+
+// ---------------------------------------------------------------------------
+// Row 155: edge-property events on MutationEvent sink and DbEvent subscription
+// ---------------------------------------------------------------------------
+
+/// Binding (row 155): `set_edge_prop` via BatchBuilder emits
+/// `MutationEvent::EdgePropSet` on the legacy sink.
+#[test]
+fn mutation_event_sink_receives_edge_prop_set() {
+    let dir = tmp("ev-edge-prop-set");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let evs = attach(&mut db);
+
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.write_batch(|b| {
+        b.insert_edge("KNOWS", "alice", "bob");
+    })
+    .unwrap();
+    // Clear setup events before the actual assertion.
+    evs.lock().unwrap().clear();
+
+    db.write_batch(|b| {
+        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2024));
+    })
+    .unwrap();
+
+    let got = take(&evs);
+    assert!(
+        got.iter().any(|e| matches!(
+            e,
+            MutationEvent::EdgePropSet { edge_type, src, dst, field }
+            if edge_type == "KNOWS" && src == "alice" && dst == "bob" && field == "since"
+        )),
+        "expected EdgePropSet, got {got:?}"
+    );
+}
+
+/// Binding (row 155): `RemoveEdgePropId` WAL record emits
+/// `MutationEvent::EdgePropRemoved` on the legacy sink.
+#[test]
+fn mutation_event_sink_receives_edge_prop_removed() {
+    let dir = tmp("ev-edge-prop-removed");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.write_batch(|b| {
+        b.insert_edge("KNOWS", "alice", "bob");
+        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2024));
+    })
+    .unwrap();
+
+    let evs = attach(&mut db);
+
+    db.write_batch(|b| {
+        b.remove_edge_prop("KNOWS", "alice", "bob", "since");
+    })
+    .unwrap();
+
+    let got = take(&evs);
+    assert!(
+        got.iter().any(|e| matches!(
+            e,
+            MutationEvent::EdgePropRemoved { edge_type, src, dst, field }
+            if edge_type == "KNOWS" && src == "alice" && dst == "bob" && field == "since"
+        )),
+        "expected EdgePropRemoved, got {got:?}"
+    );
+}
+
+/// Binding (row 155): `subscribe_writes` delivers `DbEvent::EdgePropSet` and
+/// `DbEvent::EdgePropRemoved` (they satisfy `SubFilter::Writes`).
+#[test]
+fn subscribe_writes_receives_edge_prop_events() {
+    let dir = tmp("sub-edge-prop");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Person", "a", vec![]).unwrap();
+    db.insert_node("Person", "b", vec![]).unwrap();
+    db.insert_edge("KNOWS", "a", "b").unwrap();
+
+    let sub = db.subscribe_writes().unwrap();
+
+    db.write_batch(|b| {
+        b.set_edge_prop("KNOWS", "a", "b", "weight", Value::Float(0.9));
+    })
+    .unwrap();
+
+    let events = drain_sub(&sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DbEvent::EdgePropSet { edge_type, src, dst, field, .. }
+            if edge_type == "KNOWS" && src == "a" && dst == "b" && field == "weight"
+        )),
+        "subscribe_writes must deliver EdgePropSet, got {events:?}"
+    );
+
+    // Now remove it.
+    db.write_batch(|b| {
+        b.remove_edge_prop("KNOWS", "a", "b", "weight");
+    })
+    .unwrap();
+
+    let events = drain_sub(&sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DbEvent::EdgePropRemoved { edge_type, src, dst, field, .. }
+            if edge_type == "KNOWS" && src == "a" && dst == "b" && field == "weight"
+        )),
+        "subscribe_writes must deliver EdgePropRemoved, got {events:?}"
+    );
 }

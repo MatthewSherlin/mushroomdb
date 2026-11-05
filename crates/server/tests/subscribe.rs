@@ -415,3 +415,68 @@ async fn subscribe_ws_query_row_with_a_null_element_is_delivered() {
     let ev = next_text(&mut ws).await;
     assert_eq!(ev["type"], "query_row_added", "{ev}");
 }
+
+// ---------------------------------------------------------------------------
+// Row 155: edge-property events on /subscribe
+// ---------------------------------------------------------------------------
+
+/// Binding (row 155): `{"writes":true}` on `/subscribe` delivers
+/// `edge_prop_set` and `edge_prop_removed` events (tagged JSON, snake_case).
+#[tokio::test]
+async fn subscribe_ws_writes_receives_edge_prop_events() {
+    let db = SharedDb::open(&tmp("ws-edge-prop")).unwrap();
+    db.write().insert_node("P", "a", vec![]).unwrap();
+    db.write().insert_node("P", "b", vec![]).unwrap();
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect_subscribe(addr, r#"{"writes":true}"#).await;
+
+    // Set a property; the queue may also hold edge_inserted from the setup
+    // — drain until we find the edge_prop_set event.
+    db.write()
+        .write_batch(|b| {
+            b.set_edge_prop("KNOWS", "a", "b", "since", Value::Int(2024));
+        })
+        .unwrap();
+
+    let mut found_set = false;
+    for _ in 0..10 {
+        let ev = next_text(&mut ws).await;
+        if ev["type"] == "edge_prop_set" {
+            assert_eq!(ev["edge_type"], "KNOWS", "{ev}");
+            assert_eq!(ev["src"], "a", "{ev}");
+            assert_eq!(ev["dst"], "b", "{ev}");
+            assert_eq!(ev["field"], "since", "{ev}");
+            assert!(ev["commit_seq"].is_number(), "{ev}");
+            found_set = true;
+            break;
+        }
+    }
+    assert!(found_set, "edge_prop_set event not received on /subscribe");
+
+    // Remove the property.
+    db.write()
+        .write_batch(|b| {
+            b.remove_edge_prop("KNOWS", "a", "b", "since");
+        })
+        .unwrap();
+
+    let mut found_removed = false;
+    for _ in 0..10 {
+        let ev = next_text(&mut ws).await;
+        if ev["type"] == "edge_prop_removed" {
+            assert_eq!(ev["edge_type"], "KNOWS", "{ev}");
+            assert_eq!(ev["src"], "a", "{ev}");
+            assert_eq!(ev["dst"], "b", "{ev}");
+            assert_eq!(ev["field"], "since", "{ev}");
+            assert!(ev["commit_seq"].is_number(), "{ev}");
+            found_removed = true;
+            break;
+        }
+    }
+    assert!(
+        found_removed,
+        "edge_prop_removed event not received on /subscribe"
+    );
+}
