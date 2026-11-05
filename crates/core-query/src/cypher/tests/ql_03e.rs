@@ -377,3 +377,31 @@ fn element_id_of_non_entity_expression_is_still_an_error() {
     let e = err(&view, "MATCH (n {id: 'ada'}) RETURN elementId(n.id)");
     assert!(e.contains("elementId()"), "{e}");
 }
+
+// Row 152 / 156: a CASE expression with an ELSE NULL branch still has a node
+// kind (the null branch is a wildcard). Both elementId() on the CASE and an
+// alias for the CASE in a WITH must work.
+#[test]
+fn element_id_of_case_else_null_expression_is_the_bolt_element_id() {
+    let fx = graph();
+    let view = fx.view();
+    // Direct: elementId(CASE … ELSE NULL END) on a matching row.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH (n {id: 'ada'}) \
+             RETURN elementId(CASE WHEN n.id = 'ada' THEN n ELSE NULL END)"
+        ),
+        Some(s(&node_element_id("ada")))
+    );
+    // Via WITH alias: the alias carries the node kind.
+    assert_eq!(
+        one(
+            &view,
+            "MATCH (n {id: 'ada'}) \
+             WITH CASE WHEN n.id = 'ada' THEN n ELSE NULL END AS a \
+             RETURN elementId(a)"
+        ),
+        Some(s(&node_element_id("ada")))
+    );
+}

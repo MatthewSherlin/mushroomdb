@@ -502,6 +502,24 @@ fn nodes_and_relationships_inside_a_map_or_mixed_list_are_structures() {
     };
     assert_eq!(structure(&items[0]).tag, 0x4E, "node in [n, 1]");
     assert_eq!(items[1], PackValue::Int(1), "int in [n, 1]");
+
+    // {rel: r}: map field containing a relationship is a Relationship structure
+    // (0x52), not a {type, start, end} map.
+    let (rows, _) = query(&mut conn, "MATCH ()-[r:KNOWS]->() RETURN {rel: r}");
+    let PackValue::Map(fields) = &rows[0][0] else {
+        panic!("not a map: {:?}", rows[0][0])
+    };
+    let rel_val = fields
+        .iter()
+        .find(|(k, _)| k == "rel")
+        .map(|(_, v)| v)
+        .unwrap();
+    assert_eq!(
+        structure(rel_val).tag,
+        0x52,
+        "{{rel: r}} rel field: {:?}",
+        rows[0][0]
+    );
 }
 
 // TX-NS row 152: computed expressions — head, coalesce, CASE — that yield a
@@ -554,6 +572,20 @@ fn computed_node_expressions_are_structures() {
         structure(&rows[0][0]).tag,
         0x4E,
         "CASE…THEN n: {:?}",
+        rows[0][0]
+    );
+
+    // CASE WHEN … THEN n ELSE NULL END: null branch is a wildcard, so the
+    // result is still a Node structure (0x4E) on the matching branch.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}) \
+         RETURN CASE WHEN n.id = 'ada' THEN n ELSE NULL END",
+    );
+    assert_eq!(
+        structure(&rows[0][0]).tag,
+        0x4E,
+        "CASE…ELSE NULL: {:?}",
         rows[0][0]
     );
 }
