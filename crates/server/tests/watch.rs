@@ -304,6 +304,55 @@ async fn watch_receives_edge_prop_set() {
     assert!(found, "expected EdgePropSet frame on /watch");
 }
 
+/// Binding (row 155, M1): when the bridge's edge-prop subscription queue
+/// overflows, `DbEvent::Lagged { missed }` is forwarded to `/watch` as
+/// `{"lagged": N}` — the same frame shape as broadcast-channel lag.
+///
+/// Mechanism: `set_sub_capacity(2)` limits the bridge's subscription queue to
+/// 2 events.  A single `write_batch` with 5 `set_edge_prop` ops pushes all 5
+/// `EdgePropSet` events atomically inside `distribute_events`, before the
+/// bridge thread can drain any.  With capacity 2 the third through fifth
+/// events are dropped and `Lagged { missed: 3 }` is queued.  The bridge
+/// forwards `{"lagged":3}` to the broadcast channel.
+#[tokio::test]
+async fn watch_bridge_lag_emits_lagged_frame() {
+    let db = SharedDb::open(&tmp("bridge-lag")).unwrap();
+    db.write().insert_node("P", "a", vec![]).unwrap();
+    db.write().insert_node("P", "b", vec![]).unwrap();
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+
+    // Narrow the bridge subscription to 2 slots so a 5-event atomic batch
+    // overflows it deterministically.
+    db.write().set_sub_capacity(2);
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect(addr).await;
+
+    // A single write_batch fires all 5 EdgePropSet events inside one
+    // distribute_events call, before the bridge can drain any.
+    db.write()
+        .write_batch(|b| {
+            for i in 0_i64..5 {
+                b.set_edge_prop("KNOWS", "a", "b", &format!("f{i}"), Value::Int(i));
+            }
+        })
+        .unwrap();
+
+    // Collect up to 20 frames; the {"lagged":3} frame must appear.
+    let mut found_lag = false;
+    for _ in 0..20 {
+        let frame = next_text(&mut ws).await;
+        if frame.get("lagged").is_some() {
+            found_lag = true;
+            break;
+        }
+    }
+    assert!(
+        found_lag,
+        "expected {{\"lagged\":N}} frame on /watch when bridge subscription overflows"
+    );
+}
+
 /// Binding (row 155): removing a property from an edge emits
 /// `edge_prop_removed` on `/watch`.
 #[tokio::test]

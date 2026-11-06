@@ -927,13 +927,17 @@ fn build_app_with_cors(
         }));
     }
     // Bridge edge-prop DbEvents to /watch (row 155).
-    // `subscribe_writes()` is called here, synchronously, so the subscription is
-    // registered before this function returns.  Any write that fires after
-    // `start_state` completes is guaranteed to reach the bridge.  The polling
-    // loop runs in a persistent blocking thread so the async runtime is not
-    // blocked on `recv_timeout`.  Only `EdgePropSet` and `EdgePropRemoved` are
-    // forwarded; every other DbEvent variant is handled by the event_sink above
-    // or is not relevant to the mutation-log stream.
+    // `subscribe_edge_props()` is called here, synchronously, so the
+    // subscription is registered before this function returns.  Any write that
+    // fires after `start_state` completes is guaranteed to reach the bridge.
+    // The narrower `EdgePropsOnly` filter means only edge-property commits wake
+    // the bridge loop, keeping the subscription queue and lag risk low.  The
+    // polling loop runs in a persistent blocking thread so the async runtime is
+    // not blocked on `recv_timeout`.
+    //
+    // `Lagged` events from the subscription (dropped events due to a full
+    // queue) are forwarded as `{"lagged": N}` — the same frame shape that
+    // `ws::watch_text` emits when the broadcast channel itself lags.
     //
     // Lifetime: the bridge holds a `Weak` reference to `bridge_keepalive`.
     // When every `AppState` clone is dropped (server shutdown), the `Arc` is
@@ -943,9 +947,9 @@ fn build_app_with_cors(
     {
         let tx = tx.clone();
         let alive_weak = std::sync::Arc::downgrade(&bridge_keepalive);
-        match db.write().subscribe_writes() {
+        match db.write().subscribe_edge_props() {
             Err(e) => {
-                tracing::warn!("watch edge-prop bridge: subscribe_writes failed: {e}");
+                tracing::warn!("watch edge-prop bridge: subscribe_edge_props failed: {e}");
             }
             Ok(sub) => {
                 // `spawn_blocking` requires a tokio runtime.  When
@@ -992,9 +996,16 @@ fn build_app_with_cors(
                                     });
                                     let _ = tx.send(frame.to_string());
                                 }
+                                Some(DbEvent::Lagged { missed }) => {
+                                    // Forward the bridge's own queue overflow as
+                                    // the same {"lagged": N} frame that ws.rs
+                                    // emits for broadcast-channel lag.
+                                    let _ =
+                                        tx.send(serde_json::json!({"lagged": missed}).to_string());
+                                }
                                 _ => {
-                                    // On each timeout, check if the server has shut
-                                    // down (all AppState clones dropped).
+                                    // On each timeout (None), check if the server
+                                    // has shut down (all AppState clones dropped).
                                     if alive_weak.upgrade().is_none() {
                                         break;
                                     }

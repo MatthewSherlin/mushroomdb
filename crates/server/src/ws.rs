@@ -121,4 +121,17 @@ mod tests {
     fn subscribed_ack_is_true_object() {
         assert_eq!(SUBSCRIBED_ACK, r#"{"subscribed":true}"#);
     }
+
+    /// Binding: `MutationEvent::NodeDeleted` serialises to externally-tagged
+    /// JSON with a snake_case discriminant.  This pins the wire format that
+    /// the event sink pre-serialises and that `watch_text` forwards unchanged.
+    #[test]
+    fn mutation_event_node_deleted_serializes_to_externally_tagged_json() {
+        let ev = mushroomdb::MutationEvent::NodeDeleted { key: "x".into() };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(json, r#"{"node_deleted":{"key":"x"}}"#);
+        // watch_text must pass the pre-serialised string through as-is.
+        let text = watch_text(Ok(json.clone())).unwrap();
+        assert_eq!(text, json);
+    }
 }

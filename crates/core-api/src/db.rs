@@ -8253,6 +8253,30 @@ impl<F: Fs> GraphDb<F> {
         Ok(Subscription(inner))
     }
 
+    /// Subscribe to edge-property mutation events only
+    /// ([`DbEvent::EdgePropSet`] and [`DbEvent::EdgePropRemoved`]).
+    ///
+    /// Narrower than [`subscribe_writes`]: does not receive node, non-edge-prop
+    /// or edge-structure events, so only edge-property commits wake the
+    /// subscriber.  Used by the `/watch` bridge to avoid inflating its queue
+    /// and lag risk with every other write kind.
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    pub fn subscribe_edge_props(&mut self) -> core_storage::Result<Subscription> {
+        if self.read_only {
+            return Err(core_storage::GraphError::ReadOnly);
+        }
+        let inner = SubInner::new(self.sub_capacity());
+        self.subscriptions.push(SubEntry {
+            filter: SubFilter::EdgePropsOnly,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
+        self.engine.set_emit_deltas(true);
+        Ok(Subscription(inner))
+    }
+
     /// Subscribe to incremental Cypher query results.
     ///
     /// Parses and plans `cypher`; rejects the query if the plan is not in the

@@ -1522,6 +1522,13 @@ The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_t
 `edge_prop_set` and `edge_prop_removed` (fields: `edge_type`, `src`, `dst`, `field`). The lag
 notice here is `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
 
+`edge_prop_set` and `edge_prop_removed` reach `/watch` via a separate internal path (a
+`DbEvent` subscription bridge) rather than the main event sink. They carry the same fields but
+no `commit_seq`, and may arrive slightly after other event types from the same commit. If the
+bridge's internal queue overflows under sustained edge-property write load, a `{"lagged": n}`
+frame is emitted before the next deliverable event — identical in shape to the broadcast-channel
+lag notice above.
+
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
 the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
 

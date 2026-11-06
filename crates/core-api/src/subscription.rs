@@ -1,9 +1,10 @@
 //! Post-commit subscription API.
 //!
-//! [`GraphDb`] exposes three subscription entry-points:
+//! [`GraphDb`] exposes four subscription entry-points:
 //! - [`GraphDb::subscribe_rule`] — edge-fire / retract events for one named rule.
 //! - [`GraphDb::subscribe_all_rules`] — edge events for every rule.
 //! - [`GraphDb::subscribe_writes`] — node and property mutations.
+//! - [`GraphDb::subscribe_edge_props`] — edge-property mutations only.
 //!
 //! All three return a [`Subscription`] handle. Dropping it unregisters the
 //! subscriber on the next commit (via [`Weak`] upgrade failure in the distribution
@@ -249,6 +250,11 @@ pub(crate) enum SubFilter {
     AllRules,
     /// Write events only (node/prop mutations; no edge-fire/retract).
     Writes,
+    /// Edge-property mutations only ([`DbEvent::EdgePropSet`] and
+    /// [`DbEvent::EdgePropRemoved`]).  Narrower than [`Writes`]: does not wake
+    /// on node, non-edge-prop or edge-structure events.  Used by the `/watch`
+    /// bridge so only edge-prop commits wake the forwarding loop.
+    EdgePropsOnly,
 }
 
 pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
@@ -273,6 +279,10 @@ pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
                 | DbEvent::PropRemoved { .. }
                 | DbEvent::EdgePropSet { .. }
                 | DbEvent::EdgePropRemoved { .. }
+        ),
+        SubFilter::EdgePropsOnly => matches!(
+            event,
+            DbEvent::EdgePropSet { .. } | DbEvent::EdgePropRemoved { .. }
         ),
     }
 }

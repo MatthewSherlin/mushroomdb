@@ -36,7 +36,7 @@
 //! all-or-nothing: batches committed before an error or a crash stay.
 
 use crate::CliError;
-use mushroomdb::{AutoFk, GraphDb, IngestOptions, RealFs, Value};
+use mushroomdb::{AutoFk, GraphDb, IngestOptions, RealFs, Value, EDGE_COUNT_PROP};
 
 type Db = GraphDb<RealFs>;
 
@@ -390,6 +390,16 @@ pub fn parse_rel_header(record: &csv::StringRecord) -> Result<RelSchema, String>
     let cols = classify_header(record)?;
     if !cols.id.is_empty() || !cols.key.is_empty() || !cols.label.is_empty() {
         return Err("a relationships file has a node column (:ID or :LABEL)".to_string());
+    }
+    // Reject reserved edge-property column names at header parse (line 1) so the
+    // user gets a clear error naming the column before any data row is processed.
+    // `EDGE_COUNT_PROP` ("count") is reserved by the engine (check_edge_prop_write
+    // refuses it); importing a column with that name would fail on every data row.
+    if let Some(col) = cols.props.iter().find(|c| c.name == EDGE_COUNT_PROP) {
+        return Err(format!(
+            "relationship property column `{}` uses a reserved name",
+            col.name
+        ));
     }
     Ok(RelSchema {
         start_index: exactly_one(&cols.start, ":START_ID")?,
@@ -1597,6 +1607,22 @@ mod tests {
         assert!(e.contains(":END_ID"), "{e}");
         let e = parse_rel_header(&rec(&[":ID", ":START_ID", ":END_ID", ":TYPE"])).unwrap_err();
         assert!(e.contains("node column"), "{e}");
+    }
+
+    /// Row 155: a relationship-property column whose name the engine refuses
+    /// (EDGE_COUNT_PROP = "count", and any typed variant like "count:int") must
+    /// be rejected at header parse, naming the column, before any data row.
+    #[test]
+    fn csv_import_reserved_rel_prop_name_refused_at_header() {
+        let e = parse_rel_header(&rec(&[":START_ID", ":END_ID", ":TYPE", "count"])).unwrap_err();
+        assert!(e.contains("`count`"), "expected column name in error: {e}");
+        assert!(e.contains("reserved"), "expected 'reserved' in error: {e}");
+        // Typed variant also rejected.
+        let e =
+            parse_rel_header(&rec(&[":START_ID", ":END_ID", ":TYPE", "count:int"])).unwrap_err();
+        assert!(e.contains("`count`"), "expected column name in error: {e}");
+        // A non-reserved column is accepted.
+        parse_rel_header(&rec(&[":START_ID", ":END_ID", ":TYPE", "weight:float"])).unwrap();
     }
 
     type ParsedRow = Result<(String, BTreeMap<String, Value>), String>;
