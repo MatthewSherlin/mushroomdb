@@ -28,7 +28,7 @@ pub use algo::{
 pub use core_query::cypher::{clock_micros, with_entity_detail};
 pub use core_query::{
     node_element_id, relationship_element_id, CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity,
-    PathEntity, RelationshipEntity, ResultSet, WriteStats,
+    PathEntity, RelationshipEntity, ResultSet, ValueEntityTree, WriteStats,
 };
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{

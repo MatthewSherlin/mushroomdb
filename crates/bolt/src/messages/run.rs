@@ -609,7 +609,20 @@ impl ResultCursor for RowCursor {
                 .iter()
                 .enumerate()
                 .map(|(col, cell)| {
-                    graph::pack_cell(self.result.entity(index, col), cell.as_ref(), version, 0)
+                    // Tier 2: computed values that embed graph elements (maps, mixed
+                    // lists, `head(collect(n))`, etc.) — resolved to a ValueEntityTree.
+                    // Tier 1: flat entity columns (bare node/rel/path variables).
+                    match self.result.value_entity_tree(index, col) {
+                        Some(tree) => {
+                            graph::pack_cell_with_entity_tree(tree, cell.as_ref(), version, 0)
+                        }
+                        None => graph::pack_cell(
+                            self.result.entity(index, col),
+                            cell.as_ref(),
+                            version,
+                            0,
+                        ),
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| self.committed_note(err))?;

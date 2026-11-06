@@ -1511,7 +1511,7 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
-| `elementId(x)` | node or relationship variable | `String` | the element id a Bolt driver reads as `element_id` (`n:<key>` for a node, `r:<type>\|<start>\|<end>` for a relationship). Opaque but stable: match it, do not parse it. Null in → null; any other argument is a named error |
+| `elementId(x)` | any expression yielding a node or relationship | `String` | the element id a Bolt driver reads as `element_id` (`n:<key>` for a node, `r:<type>\|<start>\|<end>` for a relationship). Opaque but stable: match it, do not parse it. Accepts bare variables, function results (`startNode(r)`, `endNode(r)`, `nodes(p)[0]`) and aliased expressions (`WITH startNode(r) AS a RETURN elementId(a)`). Null in → null; a non-entity argument is a named error |
 | `startNode(r)`, `endNode(r)` | relationship variable | node | the relationship's source or destination node; over Bolt a Node, elsewhere its key. Null when that end is hidden by the caller's mask |
 | `nodes(p)` | path | `List` | the path's nodes in walk order; the same as `p.nodes`, so over Bolt a list of Nodes |
 | `relationships(p)` | path | `List` | the path's relationships in walk order, each a `{type, start, end}` map; the same as `p.relationships`, so over Bolt a list of Relationships |

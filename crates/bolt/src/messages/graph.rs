@@ -45,7 +45,9 @@
 //! 1-based position (negative when the hop goes against the relationship's
 //! direction), then the position of the node reached.
 
-use mushroomdb::{Entity, NodeEntity, PathEntity, RelationshipEntity, Value, WriteStats};
+use mushroomdb::{
+    Entity, NodeEntity, PathEntity, RelationshipEntity, Value, ValueEntityTree, WriteStats,
+};
 
 use crate::error::BoltError;
 use crate::packstream::{
@@ -101,6 +103,67 @@ pub fn pack_cell(
         (_, Some(value)) => pack_value(value, version, depth)?,
         (_, None) => PackValue::Null,
     })
+}
+
+/// One result cell that holds a computed value with embedded graph elements
+/// (a map with entity fields, a mixed list, or a single-entity expression like
+/// `head(collect(n))`). The `tree` describes the entity structure nested inside
+/// `value`; `value` is the raw engine value. The cell is packed so that every
+/// graph element in the tree becomes the matching Bolt structure.
+///
+/// Falls back to [`pack_value`] for `ValueEntityTree` variants that need no
+/// special treatment at this level.
+pub fn pack_cell_with_entity_tree(
+    tree: &ValueEntityTree,
+    value: Option<&Value>,
+    version: (u8, u8),
+    depth: usize,
+) -> Result<PackValue, BoltError> {
+    match tree {
+        ValueEntityTree::Node(node) => pack_node(node, version, depth),
+        ValueEntityTree::Relationship(rel) => pack_relationship(rel, version, depth),
+        ValueEntityTree::Path(path) => pack_path(path, version, depth),
+        ValueEntityTree::List(items) => {
+            let empty = vec![];
+            let values = match value {
+                Some(Value::List(v)) => v,
+                _ => &empty,
+            };
+            let packed = items
+                .iter()
+                .enumerate()
+                .map(|(i, tree_item)| {
+                    let val = values.get(i);
+                    match tree_item {
+                        Some(t) => pack_cell_with_entity_tree(t, val, version, depth + 1),
+                        None => pack_value(val.unwrap_or(&Value::Null), version, depth + 1),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PackValue::List(packed))
+        }
+        ValueEntityTree::Map(fields) => {
+            let empty_map: std::collections::BTreeMap<String, Value> = Default::default();
+            let map = match value {
+                Some(Value::Map(m)) => m,
+                _ => &empty_map,
+            };
+            let packed: Vec<(String, PackValue)> = map
+                .iter()
+                .map(|(k, v)| -> Result<(String, PackValue), BoltError> {
+                    let tree_field = fields.iter().find(|(fk, _)| fk == k);
+                    let pv = match tree_field {
+                        Some((_, t)) => pack_cell_with_entity_tree(t, Some(v), version, depth + 1)?,
+                        None => pack_value(v, version, depth + 1)?,
+                    };
+                    Ok((k.clone(), pv))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PackValue::Map(packed))
+        }
+        // Safety net: non-exhaustive future variants fall back to plain value.
+        _ => pack_value(value.unwrap_or(&Value::Null), version, depth),
+    }
 }
 
 fn properties(
