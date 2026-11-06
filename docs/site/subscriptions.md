@@ -7,7 +7,7 @@ mushroomdb exposes a post-commit event stream for both rule-derived edge events 
 | Feature | v1 (this doc) |
 |---|---|
 | Rule edge events (`EdgeFired`, `EdgeRetracted`) | yes |
-| Write events (`NodeInserted`, `NodeDeleted`, `PropSet`, `PropRemoved`, `EdgeInserted`, `EdgeDeleted`) | yes |
+| Write events (`NodeInserted`, `NodeDeleted`, `PropSet`, `PropRemoved`, `EdgeInserted`, `EdgeDeleted`, `EdgePropSet`, `EdgePropRemoved`) | yes |
 | Incremental query subscriptions (differential dataflow) | roadmap |
 
 ## Rust API
@@ -24,9 +24,9 @@ let sub = db.subscribe_all_rules()?;
 let sub = db.subscribe_writes()?;
 ```
 
-A relationship's own properties (`SET r.p`, a `CREATE` relationship map) are not announced
-yet: no write event carries them (ledger row 155, planned for 0.11). A query subscription that
-reads `r.p` is re-run on the commit and does see the new value.
+Relationship-property writes (`SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`,
+`CREATE` relationship map) emit `EdgePropSet` and `EdgePropRemoved` events on both
+`subscribe_writes()` and `/subscribe` with `{"writes": true}` (row 155, closed in 0.10.5).
 
 Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
 
@@ -56,6 +56,8 @@ pub enum DbEvent {
     EdgeDeleted      { edge_type, src, dst, commit_seq },
     PropSet          { key, field, commit_seq },
     PropRemoved      { key, field, commit_seq },
+    EdgePropSet      { edge_type, src, dst, field, commit_seq },
+    EdgePropRemoved  { edge_type, src, dst, field, commit_seq },
     Lagged           { missed },
     QueryRowAdded    { columns: Vec<String>, row: Vec<Option<Value>> },
     QueryRowRemoved  { columns: Vec<String>, row: Vec<Option<Value>> },

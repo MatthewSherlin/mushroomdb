@@ -4,12 +4,14 @@ use crate::cypher::ast::{
     operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
     OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN, REL_ENDS_FN,
 };
-use crate::cypher::entity::{merge_kinds, output_kinds};
+use crate::cypher::entity::{
+    all_var_kinds, merge_kinds, operand_kind, output_kinds, output_value_kind_trees,
+};
 use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
-use crate::result::ResultSet;
+use crate::result::{EntityKind, ResultSet};
 use crate::traverse::{expand, Dir, EdgeRef};
 use crate::value_ops::{cmp_optional, values_equal};
 use crate::view::GraphView;
@@ -216,6 +218,10 @@ type Row = Vec<Option<Cell>>;
 
 struct VarTable {
     names: Vec<String>,
+    /// Statically-determined entity kind for each slot, used to resolve
+    /// `elementId()` on Cell::Scalar values that result from entity-returning
+    /// function projections (e.g. `WITH startNode(r) AS a`).
+    kinds: Vec<Option<EntityKind>>,
 }
 
 impl VarTable {
@@ -224,11 +230,45 @@ impl VarTable {
             return i;
         }
         self.names.push(name.to_string());
+        self.kinds.push(None);
         self.names.len() - 1
     }
 
     fn slot(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|n| n == name)
+    }
+
+    /// The statically-determined entity kind of slot `i`, or `None`.
+    fn kind(&self, slot: usize) -> Option<EntityKind> {
+        self.kinds.get(slot).copied().flatten()
+    }
+
+    /// Set the entity kind of `slot`. Called once during var-table setup,
+    /// not per row.
+    fn set_kind(&mut self, slot: usize, kind: Option<EntityKind>) {
+        if let Some(k) = self.kinds.get_mut(slot) {
+            *k = kind;
+        }
+    }
+
+    /// Build an entity kind scope for use with `operand_kind()`, merging the
+    /// static per-slot kinds (set from plan analysis) with the dynamic kinds
+    /// inferred from the current row's cells.
+    fn kind_scope(&self, row: &Row) -> HashMap<String, EntityKind> {
+        self.names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                // Dynamic kind from the current cell takes precedence.
+                let dynamic = match row.get(i).and_then(|c| c.as_ref()) {
+                    Some(Cell::Node(_)) => Some(EntityKind::Node),
+                    Some(Cell::Rel(_)) => Some(EntityKind::Relationship),
+                    Some(Cell::Path(_)) => Some(EntityKind::Path),
+                    _ => None,
+                };
+                dynamic.or_else(|| self.kind(i)).map(|k| (name.clone(), k))
+            })
+            .collect()
     }
 }
 
@@ -500,6 +540,7 @@ pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<Res
     let _clock = crate::cypher::temporal::StatementClock::enter();
     let mut rs = execute_inner(view, plan, params, row_bound(plan))?;
     rs.set_column_kinds(output_kinds(plan));
+    rs.set_value_kind_trees(output_value_kind_trees(plan));
     Ok(rs)
 }
 
@@ -1400,7 +1441,10 @@ fn collect_expr(
 }
 
 fn collect_vars(plan: &[PlanOp]) -> VarTable {
-    let mut vars = VarTable { names: Vec::new() };
+    let mut vars = VarTable {
+        names: Vec::new(),
+        kinds: Vec::new(),
+    };
     for op in plan {
         match op {
             PlanOp::ScanLabel { var, .. } => {
@@ -1657,6 +1701,13 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             }
             _ => {}
+        }
+    }
+    // Pre-populate entity kinds from plan analysis so elementId() can resolve
+    // element ids for Cell::Scalar slots (e.g. `WITH startNode(r) AS a`).
+    for (name, kind) in all_var_kinds(plan) {
+        if let Some(slot) = vars.slot(&name) {
+            vars.set_kind(slot, Some(kind));
         }
     }
     vars
@@ -2582,18 +2633,37 @@ fn label_test(
 /// node or relationship variable (null in gives null). `elementId` is the id
 /// Bolt sends; `startNode` and `endNode` give the end's key, null when the end
 /// is hidden by the mask.
+///
+/// `elementId` now also accepts any expression whose entity kind (from the
+/// plan or from the current row's bindings) is `Node` or `Relationship`:
+/// `elementId(startNode(r))`, `elementId(nodes(p)[0])`, and an aliased node
+/// from a `WITH` clause (`WITH startNode(r) AS a RETURN elementId(a)`).
 fn entity_func(
     fname: &str,
     args: &[Operand],
     view: &GraphView,
     vars: &VarTable,
     row: &Row,
+    params: &Params,
 ) -> Result<Option<Value>, String> {
     if args.len() != 1 {
         return Err(format!(
             "{fname}() requires exactly 1 argument, got {}",
             args.len()
         ));
+    }
+    // For non-variable arguments to elementId, evaluate the expression and
+    // use the operand's statically-determined entity kind to interpret the result.
+    if fname == "elementId" {
+        if let Operand::Lit(Value::Null) = &args[0] {
+            return Ok(None);
+        }
+        if !matches!(&args[0], Operand::Var(_)) {
+            let scope = vars.kind_scope(row);
+            let kind = operand_kind(&args[0], &scope);
+            let val = resolve_operand(view, vars, row, &args[0], params)?;
+            return element_id_from_kind_and_value(fname, kind, val);
+        }
     }
     let var_name = match &args[0] {
         Operand::Var(var_name) => var_name,
@@ -2634,6 +2704,13 @@ fn entity_func(
                 key(e.dst),
             ))))
         }
+        // A Cell::Scalar produced by a WITH projection of a node/rel function
+        // (e.g. `WITH startNode(r) AS a`): use the tracked entity kind.
+        ("elementId", Cell::Scalar(v)) => {
+            let kind = vars.kind(slot);
+            let val = Some(v.clone());
+            element_id_from_kind_and_value(fname, kind, val)
+        }
         ("startNode", Cell::Rel(e)) => Ok(end_key(e.src)),
         ("endNode", Cell::Rel(e)) => Ok(end_key(e.dst)),
         ("elementId", _) => Err(format!(
@@ -2641,6 +2718,37 @@ fn entity_func(
         )),
         (_, _) => Err(format!(
             "{fname}() argument `{var_name}` is not a relationship"
+        )),
+    }
+}
+
+/// Extract the element id from an already-evaluated value given its entity kind.
+/// Used by `entity_func` for both non-variable arguments and for Cell::Scalar
+/// values whose kind is tracked in VarTable.
+fn element_id_from_kind_and_value(
+    fname: &str,
+    kind: Option<EntityKind>,
+    val: Option<Value>,
+) -> Result<Option<Value>, String> {
+    match (kind, val) {
+        (_, None | Some(Value::Null)) => Ok(None),
+        (Some(EntityKind::Node), Some(Value::Str(key))) => {
+            Ok(Some(Value::Str(crate::result::node_element_id(&key))))
+        }
+        (Some(EntityKind::Relationship), Some(Value::Map(map))) => {
+            let get_str = |field: &str| match map.get(field) {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
+            match (get_str("type"), get_str("start"), get_str("end")) {
+                (Some(t), Some(s), Some(e)) => Ok(Some(Value::Str(
+                    crate::result::relationship_element_id(&t, &s, &e),
+                ))),
+                _ => Ok(None),
+            }
+        }
+        _ => Err(format!(
+            "{fname}() argument must be a node or relationship expression (e.g. {fname}(startNode(r)))"
         )),
     }
 }
@@ -2806,7 +2914,7 @@ fn eval_func(
                 "startnode" => "startNode",
                 _ => "endNode",
             };
-            entity_func(fname, args, view, vars, row)
+            entity_func(fname, args, view, vars, row, params)
         }
         "nodes" | "relationships" | "length" => {
             let fname = match norm.as_str() {
@@ -3499,7 +3607,10 @@ pub fn eval_operand(
     params: &Params,
     bindings: &[(&str, Binding)],
 ) -> Result<Option<Value>, String> {
-    let mut vars = VarTable { names: Vec::new() };
+    let mut vars = VarTable {
+        names: Vec::new(),
+        kinds: Vec::new(),
+    };
     let mut row: Row = Vec::new();
     for (name, binding) in bindings {
         let slot = vars.intern(name);
@@ -9567,6 +9678,7 @@ LIMIT 10";
         let view = fx.view();
         let vars = super::VarTable {
             names: vec!["a".into(), "b".into()],
+            kinds: vec![None; 2],
         };
         let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
         let empty_params = BTreeMap::new();
@@ -9608,6 +9720,7 @@ LIMIT 10";
         let view = fx.view();
         let vars = super::VarTable {
             names: vec!["a".into(), "b".into()],
+            kinds: vec![None; 2],
         };
         let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
         let empty_params = BTreeMap::new();
@@ -10119,7 +10232,10 @@ LIMIT 10";
     fn binarith_div_min_over_neg1_does_not_panic() {
         let fx = Fx::new();
         let view = fx.view();
-        let vars = VarTable { names: vec![] };
+        let vars = VarTable {
+            names: vec![],
+            kinds: vec![],
+        };
         let row: Row = vec![];
         let params = BTreeMap::new();
 

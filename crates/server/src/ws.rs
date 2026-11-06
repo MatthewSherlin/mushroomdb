@@ -13,7 +13,6 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use mushroomdb::MutationEvent;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -48,10 +47,7 @@ pub async fn watch(
         .into_response()
 }
 
-async fn write_events(
-    mut socket: WebSocket,
-    mut rx: tokio::sync::broadcast::Receiver<MutationEvent>,
-) {
+async fn write_events(mut socket: WebSocket, mut rx: tokio::sync::broadcast::Receiver<String>) {
     if socket
         .send(Message::Text(SUBSCRIBED_ACK.into()))
         .await
@@ -86,9 +82,13 @@ async fn write_events(
 }
 
 /// Map a broadcast recv result to a JSON text payload. `None` ends the loop.
-pub(crate) fn watch_text(result: Result<MutationEvent, RecvError>) -> Option<String> {
+///
+/// Each `Ok(s)` is already a serialised JSON string (produced by the event
+/// sink and the edge-prop bridge in `http.rs`). `Lagged` injects a
+/// `{"lagged": N}` frame so clients know they may have missed events.
+pub(crate) fn watch_text(result: Result<String, RecvError>) -> Option<String> {
     match result {
-        Ok(ev) => Some(serde_json::to_string(&ev).expect("MutationEvent is always serializable")),
+        Ok(json) => Some(json),
         Err(RecvError::Lagged(n)) => Some(serde_json::json!({"lagged": n}).to_string()),
         Err(RecvError::Closed) => None,
     }
@@ -110,13 +110,28 @@ mod tests {
     }
 
     #[test]
-    fn event_frame_is_externally_tagged_json() {
-        let text = watch_text(Ok(MutationEvent::NodeDeleted { key: "k".into() })).unwrap();
-        assert_eq!(text, r#"{"node_deleted":{"key":"k"}}"#);
+    fn event_frame_is_already_serialized_json() {
+        // The sink pre-serialises events; watch_text just forwards the string.
+        let json = r#"{"node_deleted":{"key":"k"}}"#.to_string();
+        let text = watch_text(Ok(json.clone())).unwrap();
+        assert_eq!(text, json);
     }
 
     #[test]
     fn subscribed_ack_is_true_object() {
         assert_eq!(SUBSCRIBED_ACK, r#"{"subscribed":true}"#);
+    }
+
+    /// Binding: `MutationEvent::NodeDeleted` serialises to externally-tagged
+    /// JSON with a snake_case discriminant.  This pins the wire format that
+    /// the event sink pre-serialises and that `watch_text` forwards unchanged.
+    #[test]
+    fn mutation_event_node_deleted_serializes_to_externally_tagged_json() {
+        let ev = mushroomdb::MutationEvent::NodeDeleted { key: "x".into() };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(json, r#"{"node_deleted":{"key":"x"}}"#);
+        // watch_text must pass the pre-serialised string through as-is.
+        let text = watch_text(Ok(json.clone())).unwrap();
+        assert_eq!(text, json);
     }
 }

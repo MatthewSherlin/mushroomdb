@@ -131,7 +131,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 117 | Low | The lock-free reader (HTTP read routes) can miss a derived edge that one batch retracts and re-derives, until the next reload. Present in released 0.9.x | **CLOSED** |
 | 118 | Medium — performance, present in released 0.9.2 | `ingest` and `write_batch` are quadratic in the batch size: validating each node insert walked every entry the batch had already recorded (`MutPreview::note_insert_node`, `retain` over the whole overlay), and `note_delete_node` and the rename migration did the same. 100,000 nodes in 50,000-row batches took 41 s (2.4k nodes/s); 200,000 nodes at `--batch-size` 500/2,000/10,000 took 7.6/4.6/12.9 s. Found by the first throughput run of `mushroomdb import` | **CLOSED** in 0.10 |
 | 119 | Low, present in released 0.9.x | A snapshot of a store that has never committed fails: `snapshot_with` with `archive_wal` (the default of `mushroomdb snapshot` and of every automatic snapshot) renamed a `wal.bin` that does not exist, after writing `snapshot.intent`, so `mushroomdb snapshot <fresh-dir>` exits "No such file or directory" and leaves the intent behind | **CLOSED** in 0.10 |
-| 120 | Low | CSV import: relationship property columns are not supported. Edges carry no user properties in the engine, so `mushroomdb import` refuses a relationships file with a property column rather than dropping the values. The engine half is done in 0.10: QL-RP gives edges user properties in the write path and the WAL (`SetEdgePropId` / `RemoveEdgePropId`, V11 records 28 and 29, written by Cypher `CREATE`/`MERGE` maps and `SET`/`REMOVE r.p`). The import still refuses the columns: mapping them onto those records, and carrying them in the JSONL export, is what remains | **DEFERRED** to 0.11 (import columns only; engine half closed in 0.10 by QL-RP) |
+| 120 | Low | CSV import: relationship property columns are not supported. Edges carry no user properties in the engine, so `mushroomdb import` refuses a relationships file with a property column rather than dropping the values. The engine half is done in 0.10: QL-RP gives edges user properties in the write path and the WAL (`SetEdgePropId` / `RemoveEdgePropId`, V11 records 28 and 29, written by Cypher `CREATE`/`MERGE` maps and `SET`/`REMOVE r.p`). The import still refuses the columns: mapping them onto those records, and carrying them in the JSONL export, is what remains | **CLOSED** in 0.10.5 — `mushroomdb import` takes typed property columns on a relationships file, and the JSONL and CSV exports carry them back |
 | 121 | Medium, present in released 0.9.x | `load_from_disk` reads `snapshot.bin` first but takes `snapshot_ident` only after the WAL replay (db.rs, after `wal_frames_written` is set). A peer that completes both renames of a WAL-replacing snapshot in between leaves the handle with the old snapshot's state plus the new snapshot's baseline WAL, recorded under the new identities, and no later staleness check or refresh can tell. The 0.10 WAL-file identity check (HO-07) does not close it, since that identity is also taken after the rename. Found by the second re-review of HO-07. Owner: engine follow-up | **CLOSED** in 0.10.2 |
 | 122 | Medium, present in released 0.9.x, non-Unix only | On Windows and other non-Unix platforms there is no WAL-file identity: `file_ident` returns `None` (core-storage/src/fs.rs), so `refresh_checking(true)` in `enter_write_scope` compares `None` with `None`. A peer that replaces `wal.bin` with a file of exactly this handle's cursor length, with the snapshot unchanged, is invisible to the length checks; the handle's next write appends frames encoded against the old file, and the store then fails to open (`Corrupt`). Unix is covered by the HO-07 inode check. Found by the fourth re-review of HO-07. Owner: engine follow-up; fix is a platform identity (Windows file index via `GetFileInformationByHandle`) | **CLOSED** in 0.10.3 (Windows); gap remains on other non-Unix platforms (e.g. wasm) |
 | 123 | Medium | An equality index (`enable_index`) over a property a view owns answers from stale postings until the next open: a view writes its property inside `apply` without passing `prop_index`, so with a Degree view `deg` on `User`, `MATCH (n:User) WHERE n.deg = 1` returns 0 rows live and 1 after a reopen. A range index over a view property is refused both ways (0.10 TY-8), and so is a unique constraint (TY-5); the equality index was not. Found by TY-8 | **CLOSED** in 0.10 (TY-5b) |
@@ -163,10 +163,10 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 149 | Low — missing summary, introduced in 0.10 (TX-3), never released | A write's closing Bolt `SUCCESS` carried no `stats`, so a driver's `summary.counters` read zero for every write (`contains_updates` false), and the engine counted nothing finer than the write row: `deleted` mixed nodes and relationships, and a `CREATE` or `MERGE` counted no properties. Found by TX-18. Closed by TX-NS: every write path (auto-commit and inside a transaction, `RETURN` or not, DDL included) records `WriteStats` on its result: nodes and relationships created and deleted apart, properties set (including those a new node is written with), labels added, indexes and constraints added and removed; Bolt sends the counters that moved under the names drivers read. The write row keeps its columns and meanings. Tests: `every_write_statement_reports_exact_stats` and `a_transaction_reports_the_same_stats_as_auto_commit` in `crates/core-api/tests/tx_ns.rs`, `a_write_success_carries_its_counters` in `crates/bolt/tests/structures.rs` | **CLOSED** in 0.10 (TX-NS) |
 | 150 | Low — wrong counter, present in released 0.9.x (checked against v0.9.2) | A plain `MERGE … ON CREATE SET …` / `ON MATCH SET …`, node or relationship form, reported `properties_set = 0` in its write row though it set properties; `UNWIND … MERGE` counted them. On v0.9.2 (`git show v0.9.2:crates/core-api/src/db.rs`, `exec_merge`) the row is built with a literal 0 in that column. Counter only, data correct. Found by QL-PM. Closed by TX-NS: `exec_merge`, `exec_merge_edge` and the transaction's `stage_merge` / `stage_merge_edge` count the `ON CREATE` or `ON MATCH` items they apply, so every path agrees with `UNWIND … MERGE`. Test: `row_150_merge_set_items_are_counted_in_properties_set` in `crates/core-api/tests/tx_ns.rs` (auto-commit and inside a transaction) | **CLOSED** in 0.10 (TX-NS) |
 | 151 | Low — reported inconsistency, not reproduced; introduced in 0.10 (QL-06, QL-PM) if at all, never released | Reported by the QL-PM review: `SET n += $props` / `SET n = $props` (plain, `ON CREATE` / `ON MATCH`, `UNWIND` form) with an `id` key on a name-keyed node writes an `id` that differs from the key, while `SET n.id` is refused (the id≡key rule, row 128). Checked by QL-RP on the 0.10 branch (base `2bc2498`), auto-commit and inside a transaction: every map form gives the answer `SET n.id` gives. On a node whose `id` equals its key, every form — `SET n.id`, `SET n += $m`, `SET n = $m`, `MERGE … ON MATCH SET n += $m`, `MERGE … ON CREATE SET n += $m`, the `UNWIND` form — refuses a diverging `id` (`cannot change the key property `id` …; renaming a node is rename_node`) and writes nothing. On a name-keyed node (`MERGE (:P {name: 'x'})`, no `id` equal to its key) `SET n.id` and the map forms alike store `id` as an ordinary property, which is the documented rule (row 128, `query.md`): a node whose `id` differs from its key, or that has none, treats `id` as an ordinary property. v0.9.2 has neither the map forms nor the id≡key rule (`git show v0.9.2:crates/core-query/src/cypher/ast.rs` has no `MatchSetMapStmt`; `git show v0.9.2:crates/core-api/src/db.rs` has no `id_mirrors_key`), so no release had it. No code change; the parity is pinned. Test: `row_151_map_forms_and_set_id_give_the_same_answer` in `crates/core-api/tests/ql_rp.rs` | **CLOSED** in 0.10 (QL-RP) — not a defect, pinned |
-| 152 | Low, introduced in 0.10 (TX-NS), present in released 0.10.x | Over Bolt, a node or relationship nested anywhere but a bare column or a one-kind list arrives as its key or `{type, start, end}` map, not as a graph structure: inside a map built in the query (`RETURN {who: n}`), in a list that mixes kinds or values (`[n, r]`, `[n, 1]`), in a list of lists (`collect([a, b])`), or through a computed value (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n`). The column kind is worked out from the plan, and these positions have no single element kind to name. Bare columns, `collect(n/r/p)`, `[a, b]` of one kind and `p.nodes` / `p.relationships` are structures (TX-NS). Documented in `docs/site/bolt.md` (Nodes, relationships and paths, "Lists") | **DEFERRED** to 0.11 |
+| 152 | Low, introduced in 0.10 (TX-NS), present in released 0.10.x | Over Bolt, a node or relationship nested anywhere but a bare column or a one-kind list arrives as its key or `{type, start, end}` map, not as a graph structure: inside a map built in the query (`RETURN {who: n}`), in a list that mixes kinds or values (`[n, r]`, `[n, 1]`), in a list of lists (`collect([a, b])`), or through a computed value (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n`). The column kind is worked out from the plan, and these positions have no single element kind to name. Bare columns, `collect(n/r/p)`, `[a, b]` of one kind and `p.nodes` / `p.relationships` are structures (TX-NS). Documented in `docs/site/bolt.md` (Nodes, relationships and paths, "Lists") | **CLOSED** in 0.10.5 |
 | 154 | Low — wrong values, present in released 0.9.x (by code identity with v0.9.2) | A retracted rule's saved edge weight came back live, then vanished at the next snapshot. With two weighted rules over one edge type — `ra` (weight `wa`) owning an edge, `rb` (weight `wb`) also matching it — a snapshot archives `wa`; when `ra` retracts and `rb` claims the edge, `ra`'s `remove_edge` tombstones the key and `rb`'s `EdgeProps::set` cleared the tombstone, so the live read showed `wa = 1.0` beside `wb`, for a rule that no longer owned the edge. The next snapshot's merge emitted the overlay entry alone, so the same read then gave `wa = null`: the answer changed across a snapshot. The mechanism is the same in v0.9.2 (`git show v0.9.2:crates/core-storage/src/edge_props.rs`, `set` removes the tombstone; `v8/seam.rs` `EdgePropsView::get` falls through to the base after the tombstone check; `edge_props_merge_to_data` is byte-identical to 2bc2498's; the retract-then-claim path is in `core-rules/src/engine.rs`), reproduced on 0.10 base `2bc2498` by the QL-RP review; not run on a v0.9.2 binary. Found by the QL-RP review. Closed by QL-RP: `EdgeProps::set` keeps a tombstone (the entry is then the edge's whole map), and the snapshot merge lays an untombstoned overlay entry over the archived one field by field, as every read does. Test: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen) | **CLOSED** in 0.10 (QL-RP) |
-| 155 | Low — missing event, introduced in 0.10 (QL-RP), present in released 0.10.x | A relationship-property write from Cypher (`CREATE`/`MERGE` with a relationship map, `SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`) emits no mutation or subscription event, so `/watch` and `/subscribe` consumers do not see it: the engine applies `SetEdgePropId` / `RemoveEdgePropId` without a `MutationEvent` or `DbEvent` variant to carry them. The write itself is durable and visible to every read. Found by the QL-RP review (M4) | **DEFERRED** to 0.11 |
-| 156 | Low — refused query, introduced in 0.10 (QL-03e), present in released 0.10.x | `elementId()` accepts only a bare node or relationship variable: `elementId(startNode(r))` and `elementId(nodes(p)[0])` are refused, so a node reached through a function or a list index has no element id in Cypher. `elementId(n)` / `elementId(r)` on a variable work and match the Bolt structures' `element_id`. Loud, not wrong results | **DEFERRED** to 0.11 |
+| 155 | Low — missing event, introduced in 0.10 (QL-RP), present in released 0.10.x | A relationship-property write from Cypher (`CREATE`/`MERGE` with a relationship map, `SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`) emits no mutation or subscription event, so `/watch` and `/subscribe` consumers do not see it: the engine applies `SetEdgePropId` / `RemoveEdgePropId` without a `MutationEvent` or `DbEvent` variant to carry them. The write itself is durable and visible to every read. Found by the QL-RP review (M4) | **CLOSED** in 0.10.5 — a relationship-property write emits `edge_prop_set` / `edge_prop_removed` on `/watch` and `/subscribe`; adding them to `DbEvent` is a breaking change, noted in the changelog |
+| 156 | Low — refused query, introduced in 0.10 (QL-03e), present in released 0.10.x | `elementId()` accepts only a bare node or relationship variable: `elementId(startNode(r))` and `elementId(nodes(p)[0])` are refused, so a node reached through a function or a list index has no element id in Cypher. `elementId(n)` / `elementId(r)` on a variable work and match the Bolt structures' `element_id`. Loud, not wrong results | **CLOSED** in 0.10.5 |
 | 157 | High — silent wrong results, present in released 0.9.x (checked against v0.9.2) | `sum`, `avg`, `min` and `max` over a bare variable (`UNWIND [1,2] AS x RETURN max(x)`, or a variable carried through `WITH`) returned null: the accumulator had an arm for a property argument and none for a variable, so every row fell to the catch-all arm and contributed nothing. `count`, `collect`, `stDev` and the percentiles already read a variable. `min` / `max` also skipped every non-number, so they returned null over strings even for a property. Found by QL-10's TCK run (Aggregation2). Closed by QL-AG: the four read a scalar variable as they read a property, `min` / `max` order any non-null value, and a node, relationship or path argument is a named error | **CLOSED** in 0.10 (QL-AG) |
 | 158 | Medium — wrong result type, present in released 0.9.x (checked against v0.9.2) | `sum` of integers returned a float (`sum` over `10`, `20` gave `30.0`): the accumulator was one `f64`, so an all-integer sum had the wrong type and lost exactness above 2^53. openCypher returns an integer for all-integer input and a float once any input is a float. Closed by QL-AG: integers add exactly as `i64`, an overflow is the error `sum(): integer overflow`, and a float anywhere makes the result a float; `avg`, `stDev` and the percentiles stay float, as openCypher has them | **CLOSED** in 0.10 (QL-AG) |
 | 159 | Low — refused query, present in released 0.9.x (checked against v0.9.2) | An aggregate's argument must be a variable, `var.field` or `*`: `max(x + 1)`, `max(1)` and `max($p)` are parse errors (`expected variable or '*' in aggregate argument`). Loud, not wrong results. Needs expression arguments in `AggArg` and in every site that reads one (`distinct_value`, `stat_input`, variable interning, column naming) | **CLOSED** in 0.10.4 — an aggregate takes any expression; a nested aggregate and `rand()` inside one are refused by name |
@@ -3589,7 +3589,7 @@ when it committed nothing. Tests in `crates/core-api/tests/snapshot_empty_store.
 `the_first_archive_after_an_empty_snapshot_still_holds_the_history`) and
 `csv_import_header_only_files_import_nothing_and_leave_no_intent` in `crates/cli/tests/csv_import.rs`.
 
-## 120. CSV import refuses relationship property columns — DEFERRED
+## 120. CSV import refuses relationship property columns — CLOSED in 0.10.5
 
 `mushroomdb import` (PF-03a) takes `:START_ID`, `:END_ID` and `:TYPE` from a relationships file
 and nothing else: the engine's edges carry no user properties, so a property column has nowhere to
@@ -3597,7 +3597,7 @@ go. The import refuses such a header with the column named, at file line 1, inst
 edges and dropping the values. Supporting the columns needs edge properties in the engine's write
 path and WAL, which is a format change.
 
-**DEFERRED to 0.11.**
+**Was DEFERRED to 0.11.**
 
 **Update (0.10, QL-RP).** The engine half is done: edges carry user properties
 in the write path and the WAL. Cypher writes them (`CREATE (a)-[:T {k: v}]->(b)`,
@@ -3607,6 +3607,15 @@ V11 records `SetEdgePropId` (28) and `RemoveEdgePropId` (29) and stored where a
 rule's weights already were (the edge-property overlay, snapshot section 5). What
 remains for 0.11 is the import mapping property columns onto those ops, and the
 JSONL export carrying them.
+
+**CLOSED in 0.10.5.** `import_rels` reads property columns on a relationships file with the
+nodes file's `name:type` conventions and writes them with `BatchBuilder::set_edge_prop` in the same
+batch as the edge; an empty cell sets nothing, and a column the engine refuses as an edge property
+(`count`) is refused at file line 1, naming it. The JSONL export writes a `"props"` object on an
+edge that has user properties and the CSV export writes typed columns; both read back. `ExportEdge`
+is unchanged: the exporters read the properties through a new `ExportSource::for_each_edge_with_props`.
+Evidence: the relationship-property tests in `crates/cli/tests/csv_import.rs` and
+`crates/cli/tests/export_round_trip.rs`.
 
 ## 121. A reload can mix two snapshots' state under the newer identities — CLOSED
 
@@ -4598,22 +4607,40 @@ Reported by the QL-PM review. Introduced in the 0.10 cycle (QL-06, QL-PM) if at 
 **Closed (QL-RP), no code change:** the parity is pinned by
 `row_151_map_forms_and_set_id_give_the_same_answer` in `crates/core-api/tests/ql_rp.rs`.
 
-## 152. Over Bolt, a node inside a map, a mixed list or a computed value is its key — DEFERRED to 0.11
+## 152. Over Bolt, a node inside a map, a mixed list or a computed value is its key — CLOSED in 0.10.5
 
 Found by the TX-NS review. Introduced in the 0.10 cycle with TX-NS's graph structures; never released.
 
 A result column carries an entity kind worked out from the plan: a bare node, relationship or path
 variable, or a list of one kind of them (`collect(v)`, `[a, b]`, `p.nodes`, `p.relationships`). Bolt
-sends those as Node, Relationship and Path structures. A node or relationship anywhere else keeps the
+sent those as Node, Relationship and Path structures. A node or relationship anywhere else kept the
 value every other surface renders (a key, a `{type, start, end}` map): in a map built in the query
 (`RETURN {who: n}`), in a list that mixes kinds or holds values (`[n, r]`, `[n, 1]`), in a list of lists,
 or behind a function or expression (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n`). A driver
-reads a string or a map there, not a Node. `docs/site/bolt.md` (Nodes, relationships and paths,
-"Lists") says so.
+read a string or a map there, not a Node.
 
-**DEFERRED to 0.11.** The fix is a per-value kind rather than a per-column one: the executor tags each
-graph element where it is produced, so a renderer can find it at any depth. That is a new value form, or
-a parallel tag tree beside the row, and is larger than this unit.
+**Closed, 0.10.5.** Two new mechanisms work alongside the existing flat `EntityKind` tier (unchanged):
+
+- `ValueKindTag` (`pub(crate)`) in `crates/core-query/src/result.rs`: a plan-time tree describing how
+  graph elements nest inside a computed column — `Map(Vec<(String, ValueKindTag)>)` for map fields,
+  `MixedList(Vec<Option<ValueKindTag>>)` for per-element-tagged lists. `output_value_kind_trees`
+  (entity.rs) walks the final `Project` op and fills one tag tree per column.
+- `ValueEntityTree` (`pub #[non_exhaustive]`) in the same file: the resolved graph element tree beside
+  a computed cell value — same variants, plus `Map`, which the existing `Entity` enum cannot carry
+  (pub without `#[non_exhaustive]`). `attach_entities` (entity.rs) now also fills value entity trees.
+- `pack_cell_with_entity_tree` in `crates/bolt/src/messages/graph.rs`: recursively packs a
+  `ValueEntityTree` into Bolt structures, calling `pack_node` / `pack_relationship` / `pack_path` for
+  the leaves and `PackValue::Map` / `PackValue::List` for the containers.
+- `RowCursor::take` in `crates/bolt/src/messages/run.rs`: checks `value_entity_tree(row, col)` first
+  (Tier 2) and falls back to `pack_cell` (Tier 1) when absent. HTTP and CLI never set the entity-detail
+  flag, so they receive byte-identical results.
+
+Also extends `operand_kind` and `func_kind` (entity.rs) to cover `Index` subscript, `Case`, `head`/`last`
+(list element) and `coalesce` (common kind), so uniform kinds propagate through computed expressions and
+the flat mechanism picks them up without entering Tier 2 when they can.
+
+Tests: `nodes_and_relationships_inside_a_map_or_mixed_list_are_structures` and
+`computed_node_expressions_are_structures` in `crates/bolt/tests/structures.rs`.
 
 ## 154. A retracted rule's saved edge weight came back live, then vanished at the next snapshot — CLOSED
 
@@ -4638,7 +4665,7 @@ snapshot merge lays an untombstoned overlay entry over the archived one field by
 does. Evidence: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in
 `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen).
 
-## 155. Relationship-property writes emit no mutation or subscription event — DEFERRED to 0.11
+## 155. Relationship-property writes emit no mutation or subscription event — CLOSED in 0.10.5
 
 Found by the QL-RP review (M4). Introduced in the 0.10 cycle with QL-RP; never released.
 
@@ -4652,27 +4679,51 @@ Found by the QL-RP review (M4). Introduced in the 0.10 cycle with QL-RP; never r
 
 **Severity: Low**: a missing notification; the write is durable and every read sees it.
 
-**DEFERRED to 0.11.** The fix is a pair of event variants (`edge_prop_set`, `edge_prop_removed`, with
-`edge_type`, `src`, `dst`, `field`) on both streams, emitted where the records are applied, and their
-documentation in `docs/site/http.md` and `docs/site/subscriptions.md`.
+**Was DEFERRED to 0.11**, with the fix named as a pair of event variants on both streams.
 
-## 156. `elementId()` refuses anything but a bare node or relationship variable — DEFERRED to 0.11
+**CLOSED in 0.10.5.** `DbEvent` gains `EdgePropSet` and `EdgePropRemoved` (`edge_type`, `src`,
+`dst`, `field`, `commit_seq`), returned by `write_events_from_record` for records 28 and 29, so
+`/subscribe` with `writes: true` delivers `edge_prop_set` / `edge_prop_removed`. `DbEvent` was an
+exhaustive pub enum, so the new variants, and the `#[non_exhaustive]` added with them, break a
+downstream `match` without a catch-all arm; the owner accepted that for a patch release and the
+changelog says so. `MutationEvent` is unchanged, so `/watch` gets the two events from a bridge in
+`crates/server/src/http.rs`: a `subscribe_edge_props()` subscription (filter `EdgePropsOnly`)
+read on a blocking thread and sent into the same broadcast as `{"edge_prop_set": {…}}` /
+`{"edge_prop_removed": {…}}`, with the subscription's `Lagged` sent as `{"lagged": N}`. The
+bridge's events can arrive after the other events of the same commit; `docs/site/http.md` says so.
+Both endpoints refuse role tokens, so no per-event filter is needed. Evidence: the edge-prop tests
+in `crates/core-api/tests/events.rs`, `crates/server/tests/watch.rs` (including
+`watch_bridge_lag_emits_lagged_frame`) and the `/subscribe` test in `crates/server`.
+
+## 156. `elementId()` refuses anything but a bare node or relationship variable — CLOSED in 0.10.5
 
 Allocated by the controller for bundle-18. Introduced in the 0.10 cycle with QL-03e; never released (0.9.x has no
 `elementId()`).
 
 - `elementId(n)` and `elementId(r)` on a bound variable return the same string as the Bolt Node / Relationship
   structure's `element_id`.
-- An argument that is any other expression yielding a node or relationship is refused:
+- An argument that is any other expression yielding a node or relationship was refused:
   `elementId(startNode(r))`, `elementId(endNode(r))`, `elementId(nodes(p)[0])`.
 
 **Severity: Low**: a refusal (`elementId() argument must be a node or relationship variable`), not a wrong
-result. Passing the element through `WITH` does not help: `WITH startNode(r) AS a RETURN elementId(a)` is refused
-too (``argument `a` is not a node or a relationship``). Binding the node in the pattern itself (`MATCH (a)-[r]->(b)
-RETURN elementId(a)`) is the workaround.
+result. Passing the element through `WITH` did not help: `WITH startNode(r) AS a RETURN elementId(a)` was refused
+too (``argument `a` is not a node or a relationship``). Binding the node in the pattern itself was the workaround.
 
-**DEFERRED to 0.11.** The fix is to resolve the element id from the evaluated value rather than from the variable
-binding, which needs the value to carry its kind (the same per-value tag row 152 needs).
+**Closed, 0.10.5.** Three changes in `crates/core-query/src/cypher/exec.rs` and `entity.rs`:
+
+1. `operand_kind` / `func_kind` generalized (entity.rs): `Index` subscript of a list kind returns its element kind;
+   `Case` with uniform branch kinds returns that kind; `head`/`last` returns the list argument's element kind;
+   `coalesce` with all-same non-null kinds returns that kind.
+2. `VarTable` extended with `kinds: Vec<Option<EntityKind>>` (exec.rs). `collect_vars` populates them from
+   `all_var_kinds(plan)`, so `WITH startNode(r) AS a` leaves `a` with kind `Node` in the slot table.
+3. `entity_func` extended (exec.rs): for a non-variable `elementId` argument, evaluates the expression,
+   determines its kind with `operand_kind` over the execution-time scope (`kind_scope`), and delegates to the new
+   `element_id_from_kind_and_value` helper. For a `Cell::Scalar` with a tracked kind (aliased entity function
+   output), reads the kind from the slot table.
+
+Non-entity arguments still produce the named error. Tests:
+`element_id_of_a_function_expression_is_the_bolt_element_id` and
+`element_id_of_non_entity_expression_is_still_an_error` in `crates/core-query/src/cypher/tests/ql_03e.rs`.
 
 ## 157. Aggregates over a bare variable returned null — CLOSED
 

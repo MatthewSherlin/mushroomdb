@@ -28,7 +28,7 @@ pub use algo::{
 pub use core_query::cypher::{clock_micros, with_entity_detail};
 pub use core_query::{
     node_element_id, relationship_element_id, CmpOp, Dir, Entity, EntityKind, Filter, NodeEntity,
-    PathEntity, RelationshipEntity, ResultSet, WriteStats,
+    PathEntity, RelationshipEntity, ResultSet, ValueEntityTree, WriteStats,
 };
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
@@ -51,8 +51,8 @@ pub use db::{
     ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats,
     NodeInfo, NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats,
     SchemaError, SchemaErrorKind, SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, SnapshotStop,
-    Stats, WhatIf, WriteAuthz, GENERATED_KEY_PREFIX, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
-    NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
+    Stats, WhatIf, WriteAuthz, EDGE_COUNT_PROP, GENERATED_KEY_PREFIX,
+    MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};

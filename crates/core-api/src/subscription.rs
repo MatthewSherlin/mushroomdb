@@ -1,9 +1,10 @@
 //! Post-commit subscription API.
 //!
-//! [`GraphDb`] exposes three subscription entry-points:
+//! [`GraphDb`] exposes four subscription entry-points:
 //! - [`GraphDb::subscribe_rule`] — edge-fire / retract events for one named rule.
 //! - [`GraphDb::subscribe_all_rules`] — edge events for every rule.
 //! - [`GraphDb::subscribe_writes`] — node and property mutations.
+//! - [`GraphDb::subscribe_edge_props`] — edge-property mutations only.
 //!
 //! All three return a [`Subscription`] handle. Dropping it unregisters the
 //! subscriber on the next commit (via [`Weak`] upgrade failure in the distribution
@@ -50,6 +51,7 @@ pub const DEFAULT_SUB_CAPACITY: usize = 65_536;
 /// ```
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DbEvent {
     /// A rule derived a new edge.
     EdgeFired {
@@ -100,6 +102,22 @@ pub enum DbEvent {
     /// A property was removed from a node.
     PropRemoved {
         key: String,
+        field: String,
+        commit_seq: u64,
+    },
+    /// A property was set on a relationship (QL-RP, row 155).
+    EdgePropSet {
+        edge_type: String,
+        src: String,
+        dst: String,
+        field: String,
+        commit_seq: u64,
+    },
+    /// A property was removed from a relationship (QL-RP, row 155).
+    EdgePropRemoved {
+        edge_type: String,
+        src: String,
+        dst: String,
         field: String,
         commit_seq: u64,
     },
@@ -232,6 +250,11 @@ pub(crate) enum SubFilter {
     AllRules,
     /// Write events only (node/prop mutations; no edge-fire/retract).
     Writes,
+    /// Edge-property mutations only ([`DbEvent::EdgePropSet`] and
+    /// [`DbEvent::EdgePropRemoved`]).  Narrower than [`Writes`]: does not wake
+    /// on node, non-edge-prop or edge-structure events.  Used by the `/watch`
+    /// bridge so only edge-prop commits wake the forwarding loop.
+    EdgePropsOnly,
 }
 
 pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
@@ -254,6 +277,12 @@ pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
                 | DbEvent::EdgeDeleted { .. }
                 | DbEvent::PropSet { .. }
                 | DbEvent::PropRemoved { .. }
+                | DbEvent::EdgePropSet { .. }
+                | DbEvent::EdgePropRemoved { .. }
+        ),
+        SubFilter::EdgePropsOnly => matches!(
+            event,
+            DbEvent::EdgePropSet { .. } | DbEvent::EdgePropRemoved { .. }
         ),
     }
 }

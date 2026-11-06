@@ -519,6 +519,7 @@ fn bind_path_hides_a_node_the_mask_hides_on_its_own() {
     let knows = fx.view().sym("KNOWS").unwrap();
     let vars = VarTable {
         names: ["a", "b", "r", "p"].map(String::from).to_vec(),
+        kinds: vec![None; 4],
     };
     let row = vec![
         Some(Cell::Node(id("ada"))),

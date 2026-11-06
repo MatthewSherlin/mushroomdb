@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.10.5 — graph values over Bolt, relationship-property events and imports
+
+### Fixed
+
+- **Over Bolt, a node or relationship anywhere in a value is a graph structure.** A
+  node, relationship or path inside a map built in the query (`RETURN {who: n}`), a
+  list that mixes kinds or values (`[n, r]`, `[n, 1]`), a list of lists, or behind an
+  expression (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n ELSE NULL END`)
+  arrived as its key or a `{type, start, end}` map. A driver now reads a Node,
+  Relationship or Path there, as it already did for a bare column. HTTP and CLI output
+  are unchanged. Present in released 0.10.x (ledger row 152).
+- **`elementId()` takes any expression that yields a node or relationship.**
+  `elementId(startNode(r))`, `elementId(nodes(p)[0])` and `WITH startNode(r) AS a
+  RETURN elementId(a)` were refused; they now return the same id as the Bolt
+  structure. Any other argument is still refused, and the message now reads
+  `elementId() argument must be a node or relationship expression (e.g.
+  elementId(startNode(r)))`. Present in released 0.10.x (ledger row 156).
+- **A relationship-property write emits an event.** `CREATE`/`MERGE` with a
+  relationship map, `SET r.p`, `SET r += …`, `SET r = …` and `REMOVE r.p` sent nothing
+  to `/watch` or `/subscribe` (`writes: true`). They now send `edge_prop_set` and
+  `edge_prop_removed` with `edge_type`, `src`, `dst` and `field`. On `/watch` these
+  two can arrive just after the other events of the same commit. Present in released
+  0.10.x (ledger row 155).
+- **`mushroomdb import` takes property columns on a relationships file.** A
+  relationships CSV with a property column was refused at line 1. Its columns now use
+  the nodes file's `name:type` conventions and are written with the edge; `count` is
+  reserved and still refused at line 1. The JSONL export carries an edge's properties
+  under `"props"`, the CSV export writes them as columns, and both import back
+  (ledger row 120).
+
+### Breaking (Rust API)
+
+- **`DbEvent` has two new variants and is now `#[non_exhaustive]`.** Code that matches
+  on `mushroomdb::DbEvent` with no catch-all arm stops compiling on 0.10.5; add a `_ =>`
+  arm. The JSON of every existing event is unchanged, and `MutationEvent` and
+  `ExportEdge` are unchanged.
+
 ## v0.10.4 — aggregates take expressions, and a role's transaction can write
 
 ### Fixed
@@ -116,7 +153,7 @@ See [Upgrade from 0.9](docs/site/upgrade-from-0.9.md).
 - **`/algo/*` refuses a JSON array.** The body has to be an object. The TypeScript client rejects a config that names another algorithm's fields (row 90, those two subcases).
 - **A key, predicate or label of only invisible characters now includes C1 controls, the soft hyphen, the word joiner and variation selectors** (row 90, that subcase).
 
-Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2, row 122 in 0.10.3, rows 140, 159 and 166 in 0.10.4. Rows 101, 120, 136, 137, 152, 155 and 156 stay deferred.
+Ledger rows closed in 0.10, beyond the ones already closed in an earlier release: 44, 51, 54, 62, 63, 64, 65, 66, 67, 69, 70, 85, 88, 102, 114, 118, 119, 123–127, 130, 132, 134, 138, 139 (also 0.9.3), 141, 143–151, 154, 157, 158, 160, 161, 164. Row 90 is partly closed; the in-batch retraction is still deferred. Rows 121 and 142 closed in 0.10.2, row 122 in 0.10.3, rows 140, 159 and 166 in 0.10.4, rows 120, 152, 155 and 156 in 0.10.5. Rows 101, 136 and 137 stay deferred.
 
 ### Deprecated
 
