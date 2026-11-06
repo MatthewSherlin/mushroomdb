@@ -9526,10 +9526,16 @@ lag notice):
 
 The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_type`, `src`,
 `dst`), `node_deleted` (`key`), `rule_created`, `rule_deleted` and `rule_rebuilt` (`name`),
-`batch_applied` (`ops`) and `ingested` (`label`, `inserted`). The lag notice here is
-`{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
-A write to a relationship's own properties (`SET r.p`, a `CREATE` relationship map) has no frame
-yet, here or on `/subscribe` (ledger row 155, planned for 0.11).
+`batch_applied` (`ops`) and `ingested` (`label`, `inserted`). Relationship-property writes emit
+`edge_prop_set` and `edge_prop_removed` (fields: `edge_type`, `src`, `dst`, `field`). The lag
+notice here is `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
+
+`edge_prop_set` and `edge_prop_removed` reach `/watch` via a separate internal path (a
+`DbEvent` subscription bridge) rather than the main event sink. They carry the same fields but
+no `commit_seq`, and may arrive slightly after other event types from the same commit. If the
+bridge's internal queue overflows under sustained edge-property write load, a `{"lagged": n}`
+frame is emitted before the next deliverable event — identical in shape to the broadcast-channel
+lag notice above.
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
 the WebSocket URL when the client cannot set headers. A role-bound token or a write-tier key gets 403.
@@ -9559,6 +9565,7 @@ Then one frame an event, each with a `type`:
 | `node_deleted` | `key` |
 | `edge_inserted`, `edge_deleted` | `edge_type`, `src`, `dst` |
 | `prop_set`, `prop_removed` | `key`, `field` |
+| `edge_prop_set`, `edge_prop_removed` | `edge_type`, `src`, `dst`, `field` |
 | `query_row_added`, `query_row_removed` | `columns`, `row` |
 
 Every event but the two query-row ones also carries `commit_seq`, the commit it happened at.
@@ -12875,7 +12882,7 @@ mushroomdb exposes a post-commit event stream for both rule-derived edge events 
 | Feature | v1 (this doc) |
 |---|---|
 | Rule edge events (`EdgeFired`, `EdgeRetracted`) | yes |
-| Write events (`NodeInserted`, `NodeDeleted`, `PropSet`, `PropRemoved`, `EdgeInserted`, `EdgeDeleted`) | yes |
+| Write events (`NodeInserted`, `NodeDeleted`, `PropSet`, `PropRemoved`, `EdgeInserted`, `EdgeDeleted`, `EdgePropSet`, `EdgePropRemoved`) | yes |
 | Incremental query subscriptions (differential dataflow) | roadmap |
 
 ## Rust API
@@ -12892,9 +12899,9 @@ let sub = db.subscribe_all_rules()?;
 let sub = db.subscribe_writes()?;
 ```
 
-A relationship's own properties (`SET r.p`, a `CREATE` relationship map) are not announced
-yet: no write event carries them (ledger row 155, planned for 0.11). A query subscription that
-reads `r.p` is re-run on the commit and does see the new value.
+Relationship-property writes (`SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`,
+`CREATE` relationship map) emit `EdgePropSet` and `EdgePropRemoved` events on both
+`subscribe_writes()` and `/subscribe` with `{"writes": true}` (row 155, closed in 0.10.5).
 
 Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
 
@@ -12924,6 +12931,8 @@ pub enum DbEvent {
     EdgeDeleted      { edge_type, src, dst, commit_seq },
     PropSet          { key, field, commit_seq },
     PropRemoved      { key, field, commit_seq },
+    EdgePropSet      { edge_type, src, dst, field, commit_seq },
+    EdgePropRemoved  { edge_type, src, dst, field, commit_seq },
     Lagged           { missed },
     QueryRowAdded    { columns: Vec<String>, row: Vec<Option<Value>> },
     QueryRowRemoved  { columns: Vec<String>, row: Vec<Option<Value>> },

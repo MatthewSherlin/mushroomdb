@@ -8153,10 +8153,41 @@ impl<F: Fs> GraphDb<F> {
             // A count is not an edge event: the pair it counts already fired one
             // when it was first inserted.
             | WalRecord::SetEdgeCount { .. }
-            // A relationship property has no write event of its own (0.10).
-            | WalRecord::SetEdgePropId { .. }
-            | WalRecord::RemoveEdgePropId { .. }
             | WalRecord::RenameNode { .. } => vec![],
+            // Relationship-property events (row 155).
+            WalRecord::SetEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+                ..
+            } => (|| {
+                Some(DbEvent::EdgePropSet {
+                    edge_type: intern.resolve(*etype)?.to_string(),
+                    src: ids.key_of(*src)?.to_string(),
+                    dst: ids.key_of(*dst)?.to_string(),
+                    field: intern.resolve(*field)?.to_string(),
+                    commit_seq: seq,
+                })
+            })()
+            .into_iter()
+            .collect(),
+            WalRecord::RemoveEdgePropId {
+                etype,
+                src,
+                dst,
+                field,
+            } => (|| {
+                Some(DbEvent::EdgePropRemoved {
+                    edge_type: intern.resolve(*etype)?.to_string(),
+                    src: ids.key_of(*src)?.to_string(),
+                    dst: ids.key_of(*dst)?.to_string(),
+                    field: intern.resolve(*field)?.to_string(),
+                    commit_seq: seq,
+                })
+            })()
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -8216,6 +8247,30 @@ impl<F: Fs> GraphDb<F> {
         let inner = SubInner::new(self.sub_capacity());
         self.subscriptions.push(SubEntry {
             filter: SubFilter::Writes,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
+        self.engine.set_emit_deltas(true);
+        Ok(Subscription(inner))
+    }
+
+    /// Subscribe to edge-property mutation events only
+    /// ([`DbEvent::EdgePropSet`] and [`DbEvent::EdgePropRemoved`]).
+    ///
+    /// Narrower than [`subscribe_writes`]: does not receive node, non-edge-prop
+    /// or edge-structure events, so only edge-property commits wake the
+    /// subscriber.  Used by the `/watch` bridge to avoid inflating its queue
+    /// and lag risk with every other write kind.
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    pub fn subscribe_edge_props(&mut self) -> core_storage::Result<Subscription> {
+        if self.read_only {
+            return Err(core_storage::GraphError::ReadOnly);
+        }
+        let inner = SubInner::new(self.sub_capacity());
+        self.subscriptions.push(SubEntry {
+            filter: SubFilter::EdgePropsOnly,
             inner: std::sync::Arc::downgrade(&inner),
         });
         self.engine.set_emit_deltas(true);
@@ -19471,6 +19526,49 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
     pub fn remove_prop(&mut self, key: &str, field: &str) -> &mut Self {
         self.ops.push(BatchOp::RemoveProp {
             key: key.into(),
+            field: field.into(),
+        });
+        self
+    }
+
+    /// Set property `field` of the edge `src_key -[edge_type]-> dst_key`.
+    ///
+    /// The edge must exist by the time this op is applied (a preceding
+    /// `insert_edge` in the same batch suffices). `count` is reserved; a
+    /// rule-owned edge type is refused.
+    pub fn set_edge_prop(
+        &mut self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+        value: Value,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::SetEdgeProp {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+            field: field.into(),
+            value,
+        });
+        self
+    }
+
+    /// Remove property `field` from the edge `src_key -[edge_type]-> dst_key`.
+    ///
+    /// A no-op when the field is not set. `count` is reserved; a rule-owned
+    /// edge type is refused.
+    pub fn remove_edge_prop(
+        &mut self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::RemoveEdgeProp {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
             field: field.into(),
         });
         self

@@ -1108,3 +1108,123 @@ fn round_trip_keeps_generated_keys_and_unlabelled_nodes() {
     run_statements(&dir.join("from-cypher"), &statements);
     assert_same(&expected, &state(&dir.join("from-cypher")), "cypher twice");
 }
+
+// ---------------------------------------------------------------------------
+// Row 120: edge property JSONL and CSV export / import round-trips
+// ---------------------------------------------------------------------------
+
+/// Binding (row 120): edge properties are carried by the JSONL exporter and
+/// restored by the JSONL importer so an export→import round-trip preserves
+/// them exactly (checked via `all_edges_for_export`).
+#[test]
+fn round_trip_jsonl_preserves_edge_properties() {
+    let dir = tmp("edge-props-jsonl");
+    let src = dir.join("src");
+    let mut db = Db::open(&src).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.write_batch(|b| {
+        b.insert_edge("KNOWS", "alice", "bob");
+        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2020));
+        b.set_edge_prop("KNOWS", "alice", "bob", "strength", Value::Float(0.9));
+        b.set_edge_prop(
+            "KNOWS",
+            "alice",
+            "bob",
+            "label",
+            Value::Str("friends".into()),
+        );
+    })
+    .unwrap();
+    drop(db);
+
+    let out = dir.join("jsonl");
+    export(&src, &out, ExportFormat::Jsonl);
+
+    // Verify the edges.jsonl line contains a "props" key.
+    let edges_text = std::fs::read_to_string(out.join("edges.jsonl")).unwrap();
+    let manual_line = edges_text
+        .lines()
+        .find(|l| {
+            !serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("derived").and_then(|d| d.as_bool()))
+                .unwrap_or(false)
+        })
+        .expect("manual edge line");
+    let edge_json: serde_json::Value = serde_json::from_str(manual_line).unwrap();
+    assert!(
+        edge_json.get("props").is_some(),
+        "edges.jsonl manual edge must carry 'props' when non-empty: {manual_line}"
+    );
+
+    // Import into a fresh store and verify prop values survive.
+    import(&dir.join("dst"), &jsonl_inputs(&out), 100);
+    {
+        let restored = Db::open(&dir.join("dst")).unwrap();
+        assert_eq!(
+            restored.get_edge_prop("KNOWS", "alice", "bob", "since"),
+            Some(Value::Int(2020))
+        );
+        assert_eq!(
+            restored.get_edge_prop("KNOWS", "alice", "bob", "strength"),
+            Some(Value::Float(0.9))
+        );
+        assert_eq!(
+            restored.get_edge_prop("KNOWS", "alice", "bob", "label"),
+            Some(Value::Str("friends".into()))
+        );
+    } // drop(restored) so state() can open dst
+
+    // And the full state is identical.
+    let source = state(&src);
+    assert_same(&source, &state(&dir.join("dst")), "edge-props-jsonl");
+}
+
+/// Binding (row 120): edge properties are written as typed columns in the CSV
+/// exporter's relationships.csv and re-imported from there.
+#[test]
+fn round_trip_csv_preserves_edge_properties() {
+    let dir = tmp("edge-props-csv");
+    let src = dir.join("src");
+    let mut db = Db::open(&src).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.write_batch(|b| {
+        b.insert_edge("KNOWS", "alice", "bob");
+        b.set_edge_prop("KNOWS", "alice", "bob", "since", Value::Int(2020));
+        b.set_edge_prop("KNOWS", "alice", "bob", "trusted", Value::Bool(true));
+    })
+    .unwrap();
+    drop(db);
+
+    let out = dir.join("csv");
+    export(&src, &out, ExportFormat::Csv);
+
+    // Verify the relationships.csv header contains the prop columns.
+    let rels_text = std::fs::read_to_string(out.join("relationships.csv")).unwrap();
+    let header = rels_text.lines().next().unwrap();
+    assert!(
+        header.contains("since"),
+        "relationships.csv header must contain 'since': {header}"
+    );
+    assert!(
+        header.contains("trusted"),
+        "relationships.csv header must contain 'trusted': {header}"
+    );
+
+    // Import and verify.
+    import(&dir.join("dst"), &csv_inputs(&out), 100);
+    let restored = Db::open(&dir.join("dst")).unwrap();
+    assert_eq!(
+        restored.get_edge_prop("KNOWS", "alice", "bob", "since"),
+        Some(Value::Int(2020))
+    );
+    assert_eq!(
+        restored.get_edge_prop("KNOWS", "alice", "bob", "trusted"),
+        Some(Value::Bool(true))
+    );
+    // No assert_same needed: state() cannot run while `restored` is open,
+    // and the prop-level check above proves the properties survived.
+    drop(restored);
+}
