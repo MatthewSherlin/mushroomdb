@@ -2,7 +2,9 @@
 
 0.10 opens a 0.9 store. A 0.9 binary opens a 0.10 store that has never used a
 V11 feature. The breaks below are the ones that change a call, a match on an
-enum, or a value on disk.
+enum, or a value on disk. A later 0.10.x patch that breaks a call is listed here
+too; the [changelog](https://github.com/MatthewSherlin/mushroomdb/blob/main/CHANGELOG.md)
+has every change.
 
 ## Python
 
@@ -32,6 +34,10 @@ scoped the same way.
 `Unwritable { path, detail, read_only_filesystem }`.
 
 `json_to_value` returns `Result<Option<Value>, String>`.
+
+From 0.10.5, `DbEvent` has two new variants, `EdgePropSet` and `EdgePropRemoved`,
+and is `#[non_exhaustive]`: a `match` on it needs a `_ =>` arm. The JSON of every
+existing event is unchanged.
 
 ## JSON values that used to be maps
 

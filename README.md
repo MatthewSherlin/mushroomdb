@@ -17,7 +17,7 @@ Embedded, it is a directory on disk: no account and no server to run.
 
 *Pre-1.0 alpha — APIs and formats may change between minor versions.*
 
-**[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
+**[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Get started](https://matthewsherlin.github.io/mushroomdb/docs/get-started.html) · [Agent-memory quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
 
 ![A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write](docs/assets/ingest-git-cascade.gif)
 
@@ -27,6 +27,7 @@ Embedded, it is a directory on disk: no account and no server to run.
 |---|---|
 | Use it from Python | `pip install mushroomdb` |
 | Use it from Rust | `cargo add mushroomdb` |
+| Use it from TypeScript (client for a server) | `npm install mushroomdb-client` |
 | Run it as a server (HTTP, optional Bolt) | `docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb` |
 | Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db` |

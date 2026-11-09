@@ -26,7 +26,7 @@ Embedded, it is a directory on disk: no account and no server to run.
 
 *Pre-1.0 alpha — APIs and formats may change between minor versions.*
 
-**[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
+**[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Get started](https://matthewsherlin.github.io/mushroomdb/docs/get-started.html) · [Agent-memory quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
 
 ![A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write](docs/assets/ingest-git-cascade.gif)
 
@@ -36,6 +36,7 @@ Embedded, it is a directory on disk: no account and no server to run.
 |---|---|
 | Use it from Python | `pip install mushroomdb` |
 | Use it from Rust | `cargo add mushroomdb` |
+| Use it from TypeScript (client for a server) | `npm install mushroomdb-client` |
 | Run it as a server (HTTP, optional Bolt) | `docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb` |
 | Give Claude Code, Cursor or Codex a memory | `npx mushroomdb install --db ./memory` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db` |
@@ -602,6 +603,9 @@ Looking to use mushroomdb as a graph database? See [Get started](get-started.md)
 Two commands put a populated store behind an assistant. Four calls are what the
 store is for. Graphing a repository is at the bottom of this page.
 
+The commands below are the `mushroomdb` binary. Without it installed, run each
+as `npx mushroomdb …`; [Install](install.md) has the other ways to get it.
+
 ---
 
 ## 1. A store
@@ -753,15 +757,10 @@ Real enforcement is the HTTP server's role tokens (`serve --role-token`):
 
 ---
 
-## Requirements
-
-- Rust toolchain 1.92.0 (pinned in `rust-toolchain.toml`; `rustup` will
-  install it automatically on first `cargo` run in the repo)
-- The repo cloned locally
-
----
-
 ## Building from source
+
+This needs the repo cloned locally and Rust 1.92.0 (pinned in
+`rust-toolchain.toml`; `rustup` installs it on the first `cargo` run in the repo).
 
 Build the release binary with the UI embedded:
 
@@ -1012,8 +1011,9 @@ To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
 - Default bind is `127.0.0.1:8080`. Pass `--addr host:port` to change it.
   Non-loopback binds require `--token` or `MUSHROOMDB_TOKEN`.
 - Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.16 min at 100k
-  nodes, 9 rules). Call `snapshot()` before close; opening from a snapshot then takes 0.02 s at
-  100k (measured on V8). See [docs/site/timetravel.md](timetravel.md).
+  nodes and 9 rules, on a benchmark graph rather than the demo store). Call `snapshot()` before
+  close; opening from a snapshot then takes 0.02 s at 100k (measured on V8). See
+  [docs/site/timetravel.md](timetravel.md).
 
 ---
 
@@ -1079,9 +1079,8 @@ The glibc builds need glibc 2.35 or newer: Ubuntu 22.04, Debian 12 and later. On
 Linux, `MUSHROOMDB_FORCE_LIBC=musl npx mushroomdb` uses the static build; on an older arm64 Linux,
 use `pip install mushroomdb` or `cargo install mushroomdb-cli`.
 
-The Intel macOS, musl and Windows builds are new after 0.7.2. Each is built on every pull
-request and run through a demo store, a query, three snapshots and a backup; the test suite
-itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
+Each build is made on every pull request and run through a demo store, a query, three
+snapshots and a backup; the test suite itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
 is Apple Silicon and Linux. `pip install mushroomdb` has wheels for Apple Silicon and the two
 glibc Linux targets; elsewhere it builds from source and needs a Rust toolchain. On anything
 else, `cargo install mushroomdb-cli`.
@@ -12775,7 +12774,9 @@ Every option of every method is in the package's own
 
 0.10 opens a 0.9 store. A 0.9 binary opens a 0.10 store that has never used a
 V11 feature. The breaks below are the ones that change a call, a match on an
-enum, or a value on disk.
+enum, or a value on disk. A later 0.10.x patch that breaks a call is listed here
+too; the [changelog](https://github.com/MatthewSherlin/mushroomdb/blob/main/CHANGELOG.md)
+has every change.
 
 ## Python
 
@@ -12805,6 +12806,10 @@ scoped the same way.
 `Unwritable { path, detail, read_only_filesystem }`.
 
 `json_to_value` returns `Result<Option<Value>, String>`.
+
+From 0.10.5, `DbEvent` has two new variants, `EdgePropSet` and `EdgePropRemoved`,
+and is `#[non_exhaustive]`: a `match` on it needs a `_ =>` arm. The JSON of every
+existing event is unchanged.
 
 ## JSON values that used to be maps
 

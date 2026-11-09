@@ -32,9 +32,8 @@ The glibc builds need glibc 2.35 or newer: Ubuntu 22.04, Debian 12 and later. On
 Linux, `MUSHROOMDB_FORCE_LIBC=musl npx mushroomdb` uses the static build; on an older arm64 Linux,
 use `pip install mushroomdb` or `cargo install mushroomdb-cli`.
 
-The Intel macOS, musl and Windows builds are new after 0.7.2. Each is built on every pull
-request and run through a demo store, a query, three snapshots and a backup; the test suite
-itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
+Each build is made on every pull request and run through a demo store, a query, three
+snapshots and a backup; the test suite itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
 is Apple Silicon and Linux. `pip install mushroomdb` has wheels for Apple Silicon and the two
 glibc Linux targets; elsewhere it builds from source and needs a Rust toolchain. On anything
 else, `cargo install mushroomdb-cli`.
