@@ -5,7 +5,8 @@ use crate::cypher::ast::{
     OrderTarget, RetItem, RetVal, UnwindExpr, LABEL_TEST_FN, REL_ENDS_FN,
 };
 use crate::cypher::entity::{
-    all_var_kinds, merge_kinds, operand_kind, output_kinds, output_value_kind_trees,
+    all_var_kinds, merge_kinds, merge_value_kind_trees, operand_kind, output_kinds,
+    output_value_kind_trees,
 };
 use crate::cypher::plan::{PathHop, PlanOp, RangeBound, RangeOrder};
 use crate::cypher::temporal;
@@ -591,8 +592,10 @@ pub fn execute_planned_union(
                 // all_flags has one entry per boundary; index i-1 for part i.
                 let all = all_flags.get(i - 1).copied().unwrap_or(false);
                 let kinds = merge_kinds(prev.column_kinds(), rs.column_kinds());
+                let trees = merge_value_kind_trees(&prev, &rs);
                 let mut combined = combine_result_sets(prev, rs, all);
                 combined.set_column_kinds(kinds);
+                combined.set_value_kind_trees(trees);
                 combined
             }
         });
