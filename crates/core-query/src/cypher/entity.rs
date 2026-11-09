@@ -584,6 +584,23 @@ pub(crate) fn merge_kinds(
         .collect()
 }
 
+/// The [`ValueKindTag`] trees of two `UNION` parts, merged like
+/// [`merge_kinds`]: a column keeps its tree only when both parts agree, so
+/// one part's plain value is never read as the other part's graph element.
+pub(crate) fn merge_value_kind_trees(
+    acc: &ResultSet,
+    next: &ResultSet,
+) -> Vec<Option<ValueKindTag>> {
+    (0..acc.columns().len())
+        .map(
+            |col| match (acc.value_kind_tree(col), next.value_kind_tree(col)) {
+                (Some(a), Some(b)) if a == b => Some(a.clone()),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
 /// The entity kinds of ALL variables that are live after the plan finishes,
 /// following `WITH` projections. Used by the executor to annotate its variable
 /// table so `elementId()` can resolve element ids for aliased node/relationship
@@ -648,6 +665,38 @@ fn operand_kind_tree(op: &Operand, scope: &HashMap<String, EntityKind>) -> Optio
             }
         }
     }
+}
+
+/// Set on `rs` the [`ValueKindTag`] trees of a write statement's `RETURN`
+/// (`MATCH … SET … RETURN`), which has no read plan to work them out from:
+/// `scope` holds the kinds of the variables its `MATCH` bound. A column `rs`
+/// already gives a flat kind gets no tree, as in a read.
+pub fn set_write_return_kind_trees(
+    rs: &mut ResultSet,
+    returns: &[RetItem],
+    scope: &HashMap<String, EntityKind>,
+) {
+    let trees = returns
+        .iter()
+        .enumerate()
+        .map(|(col, item)| {
+            if rs.column_kind(col).is_some() {
+                return None;
+            }
+            match &item.value {
+                RetVal::ScalarExpr(op) => operand_kind_tree(op, scope),
+                RetVal::FuncCall { name, args } => operand_kind_tree(
+                    &Operand::FuncCall {
+                        name: name.clone(),
+                        args: args.clone(),
+                    },
+                    scope,
+                ),
+                _ => None,
+            }
+        })
+        .collect();
+    rs.set_value_kind_trees(trees);
 }
 
 /// Per-column [`ValueKindTag`] trees for `plan`'s output: only filled for

@@ -589,3 +589,74 @@ fn computed_node_expressions_are_structures() {
         rows[0][0]
     );
 }
+
+// A `UNION` keeps a map's node structures when every part agrees on them, and
+// never reads one part's plain value as another part's node.
+#[test]
+fn a_union_keeps_nodes_inside_maps_only_when_every_part_agrees() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+
+    for union in ["UNION", "UNION ALL"] {
+        let (rows, _) = query(
+            &mut conn,
+            &format!(
+                "MATCH (n {{id: 'ada'}}) RETURN {{who: n}} AS v \
+                 {union} MATCH (n {{id: 'bob'}}) RETURN {{who: n}} AS v"
+            ),
+        );
+        assert_eq!(rows.len(), 2, "{union}: {rows:?}");
+        for row in &rows {
+            let who = map_get(&row[0], "who").unwrap();
+            assert_eq!(structure(who).tag, 0x4E, "{union} who field: {:?}", row[0]);
+        }
+    }
+
+    // The second part's `who` is the string 'bob', which is also a node key:
+    // it stays a string.
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}) RETURN {who: n} AS v \
+         UNION ALL MATCH (m {id: 'bob'}) RETURN {who: m.id} AS v",
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        map_get(&rows[1][0], "who"),
+        Some(&s("bob")),
+        "{:?}",
+        rows[1][0]
+    );
+}
+
+// A write statement's `RETURN` sends a node inside a map, a mixed list or a
+// computed expression as a structure, as a read does.
+#[test]
+fn a_set_return_sends_nodes_inside_maps_and_expressions_as_structures() {
+    let (db, _dir) = store();
+    let mut conn = connected(&db, FULL, (5, 0));
+
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (n {id: 'ada'}) SET n.seen = true RETURN {who: n} AS v, [n, 1] AS l, \
+         coalesce(n, n) AS c",
+    );
+    let who = map_get(&rows[0][0], "who").unwrap();
+    assert_eq!(structure(who).tag, 0x4E, "{{who: n}}: {:?}", rows[0][0]);
+    let PackValue::List(items) = &rows[0][1] else {
+        panic!("not a list: {:?}", rows[0][1])
+    };
+    assert_eq!(structure(&items[0]).tag, 0x4E, "[n, 1]: {:?}", rows[0][1]);
+    assert_eq!(
+        structure(&rows[0][2]).tag,
+        0x4E,
+        "coalesce: {:?}",
+        rows[0][2]
+    );
+
+    let (rows, _) = query(
+        &mut conn,
+        "MATCH (a {id: 'ada'})-[r:KNOWS]->(b) SET r.since = 2020 RETURN {rel: r} AS v",
+    );
+    let rel = map_get(&rows[0][0], "rel").unwrap();
+    assert_eq!(structure(rel).tag, 0x52, "{{rel: r}}: {:?}", rows[0][0]);
+}

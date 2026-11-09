@@ -20,7 +20,8 @@ pub use ast::{
     UnwindWriteStmt, WithStage, WriteStatement, YieldItem, LABEL_TEST_FN, ONE_ROW_VAR, REL_ENDS_FN,
 };
 pub use entity::{
-    attach_entities, attach_requested_entities, entity_detail_requested, with_entity_detail,
+    attach_entities, attach_requested_entities, entity_detail_requested,
+    set_write_return_kind_trees, with_entity_detail,
 };
 pub use exec::{
     eval_operand, execute, execute_planned_union, execute_union, plan_union, Binding, Params,

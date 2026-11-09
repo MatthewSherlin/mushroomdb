@@ -57,6 +57,23 @@ impl MatchWrite {
                         })
                         .collect(),
                 );
+                // A node inside a map or mixed list in the RETURN is a graph
+                // element too; a relationship variable reads its value column.
+                let scope = self
+                    .rows
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| !rel_vars.contains(name))
+                    .filter_map(|(col, name)| {
+                        let var = rel_vars
+                            .iter()
+                            .find(|r| rel_value_alias(r) == *name)
+                            .unwrap_or(name);
+                        Some((var.clone(), self.rows.column_kind(col)?))
+                    })
+                    .collect();
+                core_query::cypher::set_write_return_kind_trees(&mut rs, &returns, &scope);
                 src.row_view(|view| finish_result(view, rs))
             }
             None => write_counts(0, self.props, 0, 0),

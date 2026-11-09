@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Over Bolt, a `UNION` keeps the graph structures inside its maps and mixed
+  lists.** A `UNION` of parts that each return a node inside a map (`RETURN {who:
+  n} AS v UNION …`) sent the node as its key again, as before 0.10.5; a `UNION ALL`
+  read every part's value with the first part's shape, so a later part's string
+  that matched a node key could arrive as that Node. A column now keeps its
+  structures when every part agrees on them, as a bare node column already did.
+  HTTP and CLI output are unchanged. Present in released 0.10.5 (ledger row 173).
+- **Over Bolt, a write statement's `RETURN` sends nodes inside values as graph
+  structures.** `MATCH … SET … RETURN {who: n}`, `RETURN [n, 1]` and `RETURN
+  coalesce(n, m)` after a `SET` or `REMOVE` sent the node as its key; only a bare
+  `RETURN n` was a Node. They now arrive as they do from a read. HTTP and CLI
+  output are unchanged. Present in released 0.10.5 (ledger row 174).
+
 ## v0.10.5 — graph values over Bolt, relationship-property events and imports
 
 ### Fixed

@@ -181,6 +181,8 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **CLOSED** in 0.10.1 |
 | 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
 | 172 | Low — performance gap, present in released 0.10.0 and 0.10.1 | On Linux arm64 (3-CPU container), a plain commit paused is 1.20× v0.9.2 after the row 167 allocation fix, vs the 1.15× target. The remaining gap tracks WAL syscall overhead: `strace` shows ~0.3 extra `mprotect` and 0.17 `futex` per commit on glibc vs macOS even with all per-commit heap allocs removed; macOS (M4) reaches 1.04×. `scripts/check-defect-ledger.sh` exit 0 because the gate bound is 1.35×, not the target. Evidence: Linux arm64 container (3 CPUs, `--cpus 3`), paused probe vs v0.9.2 after row 167 fix: 1.20–1.21× (target 1.15×, bound 1.35×) | **DEFERRED** to 0.11 |
+| 173 | Low — wrong value shape over Bolt, present in released 0.10.5 | A `UNION` dropped the row 152 structures: `MATCH (n:A) RETURN {node: n} AS v UNION MATCH (m:B) RETURN {node: m} AS v` sent `node` as the key, because the deduplicating combine built a fresh result without the value kind trees and only the flat column kinds were restored. `UNION ALL` kept the first part's trees for every row, so a later part's string equal to a node key was sent as that Node. Found by the review of PR #154. | **CLOSED** in 0.10.6 — trees merged across parts like the flat kinds |
+| 174 | Low — wrong value shape over Bolt, present in released 0.10.5 | A `MATCH … SET/REMOVE … RETURN` built its result without row 152's value kind trees: `MATCH (n {id: 'ada'}) SET n.seen = true RETURN {who: n}`, `[n, 1]` and `coalesce(n, n)` sent the node as its key; only a bare variable column was a structure. Found by the review of the row 173 fix. | **CLOSED** in 0.10.6 — the write `RETURN` sets its trees from the `MATCH`'s variable kinds |
 <!-- DEFECT-INDEX:END -->
 
 ## 20. Spec §5.9 asks for a shape the code cannot be put into — CLOSED
@@ -5139,3 +5141,38 @@ does not trigger the extra syscalls there (macOS paused ratio is 1.04× after th
 **Not fixed.** Reducing this further would require either a custom allocator (jemalloc or
 mimalloc) or deferring the WAL sync path, neither of which is scoped for 0.10.1. Deferred to
 0.11 for an owner decision on allocator strategy.
+
+## 173. A `UNION` drops the structures inside maps and mixed lists, or reads one part's value with another's shape — CLOSED in 0.10.6
+
+Introduced in 0.10.5 with row 152; **Low** (a driver reads a value of the wrong shape; no data is
+changed). Found by the review of PR #154.
+
+`execute_planned_union` in `crates/core-query/src/cypher/exec.rs` merged each part's flat column kinds
+(`merge_kinds`) but not the row 152 value kind trees. A deduplicating `UNION` built a fresh
+`ResultSet` in `combine_result_sets`, so the trees were lost and `attach_entities` skipped the Tier 2
+path: `{node: n}` arrived with `node` as its key. A `UNION ALL` returned the first part's
+`ResultSet`, whose trees then applied to every row, so a later part's `{who: m.id}` with `m.id` equal
+to a node key was sent as that Node.
+
+**Closed, 0.10.6.** `merge_value_kind_trees` (entity.rs) keeps a column's tree only when both parts
+carry the same one, as `merge_kinds` does for the flat kind, and the union sets the merged trees on
+the combined result. A part that returns null for the column keeps the column flat, as it already
+does for a bare node column. Test: `a_union_keeps_nodes_inside_maps_only_when_every_part_agrees` in
+`crates/bolt/tests/structures.rs`.
+
+## 174. A write statement's `RETURN` sends a node inside a value as its key — CLOSED in 0.10.6
+
+Introduced in 0.10.5 with row 152, which covered reads only; **Low**. Found by the review of the
+row 173 fix.
+
+`MatchWrite::result` in `crates/core-api/src/db/match_write.rs` projects a `MATCH … SET … RETURN`
+with `project_set_return_rows`, which has no read plan, and set only the flat kind of a bare
+variable column. `{who: n}`, `[n, 1]`, `coalesce(n, m)` and `{rel: r}` reached Bolt with no value
+kind tree, so `attach_entities` skipped them and the node went out as its key.
+
+**Closed, 0.10.6.** `set_write_return_kind_trees` (new, `pub`, in
+`crates/core-query/src/cypher/entity.rs`) builds each `RETURN` column's tree with the same
+`operand_kind_tree` a read uses, from a scope of the `MATCH`'s variable kinds; a relationship
+variable takes the kind of its value column. Test:
+`a_set_return_sends_nodes_inside_maps_and_expressions_as_structures` in
+`crates/bolt/tests/structures.rs`.
