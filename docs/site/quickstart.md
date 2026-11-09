@@ -5,6 +5,9 @@ Looking to use mushroomdb as a graph database? See [Get started](get-started.md)
 Two commands put a populated store behind an assistant. Four calls are what the
 store is for. Graphing a repository is at the bottom of this page.
 
+The commands below are the `mushroomdb` binary. Without it installed, run each
+as `npx mushroomdb …`; [Install](install.md) has the other ways to get it.
+
 ---
 
 ## 1. A store
@@ -156,15 +159,10 @@ Real enforcement is the HTTP server's role tokens (`serve --role-token`):
 
 ---
 
-## Requirements
-
-- Rust toolchain 1.92.0 (pinned in `rust-toolchain.toml`; `rustup` will
-  install it automatically on first `cargo` run in the repo)
-- The repo cloned locally
-
----
-
 ## Building from source
+
+This needs the repo cloned locally and Rust 1.92.0 (pinned in
+`rust-toolchain.toml`; `rustup` installs it on the first `cargo` run in the repo).
 
 Build the release binary with the UI embedded:
 
@@ -415,8 +413,9 @@ To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
 - Default bind is `127.0.0.1:8080`. Pass `--addr host:port` to change it.
   Non-loopback binds require `--token` or `MUSHROOMDB_TOKEN`.
 - Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.16 min at 100k
-  nodes, 9 rules). Call `snapshot()` before close; opening from a snapshot then takes 0.02 s at
-  100k (measured on V8). See [docs/site/timetravel.md](timetravel.md).
+  nodes and 9 rules, on a benchmark graph rather than the demo store). Call `snapshot()` before
+  close; opening from a snapshot then takes 0.02 s at 100k (measured on V8). See
+  [docs/site/timetravel.md](timetravel.md).
 
 ---
 
