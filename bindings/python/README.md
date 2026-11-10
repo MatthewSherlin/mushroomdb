@@ -1,6 +1,6 @@
 # mushroomdb (Python)
 
-Python bindings for [mushroomdb](https://github.com/MatthewSherlin/mushroomdb) —
+Python bindings for [mushroomdb](https://github.com/MatthewSherlin/mushroomdb):
 the embedded graph database where edges are declared, not inserted.
 
 ```python
@@ -27,7 +27,7 @@ report = db.delete_node("alice")                     # {"manual_edges", "derived
 `upsert_node` writes only the fields you pass whose value differs from the
 stored one. Fields you omit are left alone, and unchanged fields produce no WAL
 record, so rules do not re-fire needlessly. An existing key under a different
-label raises `ValueError` — relabelling is not an upsert.
+label raises `ValueError`; relabelling is not an upsert.
 
 To change properties on many nodes, use one call rather than one per node:
 
@@ -39,7 +39,7 @@ db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "stale": None})
 It is one commit: unchanged values write nothing, an unknown key raises
 `KeyNotFound` and nothing is written, and rules fire on what changed inside
 that commit. `wal_total_commits()` moves by one frame, or by two when a rule
-derived or retracted an edge — never by the number of nodes.
+derived or retracted an edge, never by the number of nodes.
 
 It is a raw property write, like `set_prop`. On an entity node, `name` and the
 two alias lists are maintained by `upsert_entity` and `remember`: a `name`
@@ -75,7 +75,7 @@ reader = db.scoped(role="reader-a")
 tenant = db.scoped(namespace="tenant-a", keys=visible_ids)
 ```
 
-It shares the parent's store and mutex — not a second open, no second lock —
+It shares the parent's store and mutex (not a second open, no second lock)
 and refuses every write. Legs intersect, so `scoped()` on a scoped handle
 narrows further and can never widen; an unknown `role` raises at `scoped()`,
 not on the first read. `refresh()` is allowed: it writes nothing.
@@ -103,13 +103,13 @@ a caller:
 | `mask=` (an explicit key allow-list) | `scoped(keys=…)` |
 | `visible_where` in `roles.json` | carried inside `role=` |
 
-None of them is deprecated — they are the right tool when the narrowing really
+None of them is deprecated; they are the right tool when the narrowing really
 does belong to one call.
 
 **`where=` is not one of them.** It is a predicate on the *data*, not on the
 caller: an argument this call chose, filtering a result set the caller was
 already entitled to see. A role's `visible_where` takes the same dict shape and
-is the opposite thing — part of who the caller is, not passed by them. Do not
+is the opposite thing: part of who the caller is, not passed by them. Do not
 use `where=` as an access control. It composes with a scope, intersecting.
 
 `db.roles()` lists what `roles.json` defines. It raises `Corrupt` if that file
@@ -120,12 +120,12 @@ Full detail: [masks.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/d
 ## Vector search
 
 Scores are cosine similarity in `[-1, 1]` (`score >= min`). A distance of
-`1 - sim` is the caller's conversion — on `pairwise_similar` too. Convert after
+`1 - sim` is the caller's conversion (on `pairwise_similar` too). Convert after
 the call rather than baking a distance threshold into `min`.
 
 **`mask=` alone is the approximate path.** `exact=True` and a `where=`
-predicate each force an exact GEMM brute-force. A `mask=` allow-list — and a
-`scoped()` handle — do not: they narrow which nodes may be returned without
+predicate each force an exact GEMM brute-force. A `mask=` allow-list (and a
+`scoped()` handle) do not: they narrow which nodes may be returned without
 changing which kernel runs, so the answer stays approximate whenever an HNSW
 rule covers the field. Under a mask the beam widens until it has `k` visible
 hits, so the result is never short while more visible hits exist, but it is
@@ -137,11 +137,11 @@ hits = db.find_similar("embedding", query_vec, mask=visible)              # appr
 hits = db.find_similar("embedding", query_vec, mask=visible, exact=True)  # exact
 ```
 
-When no approximate rule covers the field — check with
-`has_vector_rule("embedding")` — every call is already an exact brute-force
+When no approximate rule covers the field (check with
+`has_vector_rule("embedding")`), every call is already an exact brute-force
 scan.
 
-**`min` defaults to `0.8`** — here, in the MCP `find_similar` tool and on HTTP
+**`min` defaults to `0.8`**: here, in the MCP `find_similar` tool and on HTTP
 `POST /find_similar`. Through 0.6 this binding and HTTP defaulted to `0.0`: a
 call that never named `min` now drops every hit below `0.8`, and nothing
 raises. Pass `min=0.0` for the old behaviour. `pairwise_similar` still defaults
@@ -150,8 +150,8 @@ to `0.0`.
 **`where=` uses the property index only when a `label` accompanies it.** The
 index is keyed on `(label, field)`, so both `label=` and a prior
 `enable_index(label, field)` are needed for the index path. Without them the
-call scans the labelled set, or the whole live set when there is no label —
-correct, just slower, and nothing tells you at runtime which path you took.
+call scans the labelled set, or the whole live set when there is no label
+(correct, just slower, and nothing tells you at runtime which path you took).
 
 ```python
 db.enable_index("Document", "status")
@@ -187,7 +187,7 @@ db.create_rule({
 })
 ```
 
-The **canonical predicate shape is snake_case** — `{"kind": ..., "fields": [...]}`
+The **canonical predicate shape is snake_case**: `{"kind": ..., "fields": [...]}`
 plus whatever numeric knob the kind takes (`min`, `tolerance`, `km`, or `parts`
 for `all`/`any`). This is exactly the shape `explain` emits, so an explanation
 round-trips straight back into a new rule:
@@ -200,7 +200,7 @@ db.create_rule(clone)
 
 | kind | extra keys |
 |---|---|
-| `key_match`, `field_equal` | — |
+| `key_match`, `field_equal` | none |
 | `overlap`, `vector_similar` | `min` |
 | `numeric_within` | `tolerance` |
 | `geo_radius` | `km` |
@@ -250,7 +250,7 @@ db.degree_centrality(direction="in")["scores"]  # not degree() / degrees()
 db.communities(edge_types=["CITES"])["communities"]
 ```
 
-`budget_ms` defaults to `0` — no time limit — so the same store gives the
+`budget_ms` defaults to `0` (no time limit), so the same store gives the
 same answer; pass one to bound a call and read `converged` / `truncated`.
 `degree()` and `degrees()` are a different thing: the degree of the keys you
 name, which can be scoped and filtered.
@@ -299,11 +299,11 @@ db.memory.identity_clusters()["clusters"]  # which keys are one entity
   row into an assistant's context makes that sanitisation yours to do, and
   this binding exposes no helper for it. `recall` does not offer the digest.
 - `forget` is a tombstone, not a redaction: history still reads it. A fact a
-  rule derived raises `RuleOwned`, whose message is the whole refusal — which
+  rule derived raises `RuleOwned`, whose message is the whole refusal: which
   rule owns the edge and the fields it reads.
 - A store this binding creates has no memory schema. `remember` declares the
   text fields it needs as it goes; the identity preset is applied from the
-  command line — `mushroomdb schema apply <db> --memory-identity` — with the
+  command line (`mushroomdb schema apply <db> --memory-identity`) with the
   handle closed.
 - `recall`, `schema_report` and `identity_clusters` raise `ValueError` on a
   `scoped()` handle; `remember`, `upsert_entity` and `forget` are writes and
@@ -331,7 +331,7 @@ written, so retrying later is always safe.
 
 A handle does not poll the store, so another process's commits stay invisible
 until you ask for them. `refresh()` applies them in place and returns how many
-arrived — no `close()` and reopen:
+arrived (no `close()` and reopen):
 
 ```python
 n = db.refresh()   # rules fire and derived edges appear, as on a fresh open
@@ -354,7 +354,7 @@ A commit another process is midway through writing is left alone and picked up
 by the next `refresh()`; a partial write is never an error.
 
 **Keep a store that several processes open on a local disk.** Advisory locks
-over a network filesystem — NFS, SMB, EFS — are not supported, and both the
+over a network filesystem (NFS, SMB, EFS) are not supported, and both the
 lock and the staleness check fail silently there. The supported arrangements,
 with a worked disposable-sidecar example, are in
 [multiprocess.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/site/multiprocess.md).
@@ -366,8 +366,8 @@ can observe intermediate states while a batch is being applied.
 ## Errors
 
 There is an exception class for each engine error. `MushroomError(RuntimeError)` is the base and
-eighteen subclasses hang off it — `KeyNotFound`, `ReadOnly`, `Corrupt`, `CasConflict`,
-`RoleWriteDenied` and the rest — each carrying `.code`, a stable snake_case string, and the
+eighteen subclasses hang off it (`KeyNotFound`, `ReadOnly`, `Corrupt`, `CasConflict`,
+`RoleWriteDenied` and the rest), each carrying `.code`, a stable snake_case string, and the
 variant's own fields as attributes. **`.code` is the compatibility surface**: classes may be
 added, a code is never respelled. Because the base subclasses `RuntimeError`, every
 `except RuntimeError` written against an earlier release keeps catching what it caught. A test

@@ -1,4 +1,4 @@
-# Scale run — memory-shaped workload (1M-node)
+# Scale run: memory-shaped workload (1M-node)
 
 ## Machine / date
 
@@ -18,7 +18,7 @@ RELATED_TO (ring), ATTENDED (every 5th person→event).  One FieldEqual rule:
 
 Peak RSS is `resource.ru_maxrss` (process-lifetime, Darwin bytes).  Current RSS
 is `ps -o rss=` after the phase.  Bindings are embedded Rust via
-`mushroomdb.GraphDb` — not HTTP.  This is a memory-schema workload (Person, Org,
+`mushroomdb.GraphDb`, not HTTP.  This is a memory-schema workload (Person, Org,
 Project, Concept, Event nodes) with **synthetic Zipf-distributed text**; numbers
 are not apples-to-apples with any production deployment (different hardware,
 no network, synthetic text, no real embeddings).
@@ -47,18 +47,18 @@ no network, synthetic text, no real embeddings).
 | reopen_snap | 100,000 | ok | 2.313 s | 1.13 GiB | 791.91 MiB | snap_write=2.200 s open=112.50 ms size=41.61 MiB |
 | reopen_snap | 300,000 | ok | 2.677 s | 1.36 GiB | 692.34 MiB | snap_write=2.321 s open=356.21 ms size=79.28 MiB |
 | reopen_snap | 1,000,000 | ok | 6.824 s | 2.65 GiB | 1.21 GiB | snap_write=5.645 s open=1.179 s size=209.31 MiB |
-| recall | 100,000 | ok | — | — | — | p50=7.01 ms p95=10.33 ms p99=10.78 ms |
-| recall | 300,000 | ok | — | — | — | p50=21.33 ms p95=28.09 ms p99=29.21 ms |
-| recall | 1,000,000 | ok | — | — | — | p50=66.09 ms p95=99.41 ms p99=107.73 ms |
-| lookup | 100,000 | ok | — | — | — | node_info p50=3.9 µs p95=10.6 µs \| node_edges p50=45.0 µs p95=67.5 µs |
-| lookup | 300,000 | ok | — | — | — | node_info p50=4.8 µs p95=585.0 µs \| node_edges p50=53.1 µs p95=1.61 ms |
-| lookup | 1,000,000 | ok | — | — | — | node_info p50=11.0 µs p95=582.2 µs \| node_edges p50=56.1 µs p95=303.2 µs |
-| query | 100,000 | ok | — | — | — | count=40k wall=2.31 ms; 1-hop n=1 wall=18.70 ms |
-| query | 300,000 | ok | — | — | — | count=120k wall=3.42 ms; 1-hop n=1 wall=80.32 ms |
-| query | 1,000,000 | ok | — | — | — | count=400k wall=11.64 ms; 1-hop n=1 wall=281.55 ms (slow-query log) |
-| incr | 100,000 | ok | — | — | — | set_prop p50=23.99 ms p95=42.58 ms n=100 |
-| incr | 300,000 | ok | — | — | — | set_prop p50=27.52 ms p95=66.80 ms n=100 |
-| incr | 1,000,000 | ok | — | — | — | set_prop p50=21.29 ms p95=69.42 ms n=100 |
+| recall | 100,000 | ok | n/a | n/a | n/a | p50=7.01 ms p95=10.33 ms p99=10.78 ms |
+| recall | 300,000 | ok | n/a | n/a | n/a | p50=21.33 ms p95=28.09 ms p99=29.21 ms |
+| recall | 1,000,000 | ok | n/a | n/a | n/a | p50=66.09 ms p95=99.41 ms p99=107.73 ms |
+| lookup | 100,000 | ok | n/a | n/a | n/a | node_info p50=3.9 µs p95=10.6 µs \| node_edges p50=45.0 µs p95=67.5 µs |
+| lookup | 300,000 | ok | n/a | n/a | n/a | node_info p50=4.8 µs p95=585.0 µs \| node_edges p50=53.1 µs p95=1.61 ms |
+| lookup | 1,000,000 | ok | n/a | n/a | n/a | node_info p50=11.0 µs p95=582.2 µs \| node_edges p50=56.1 µs p95=303.2 µs |
+| query | 100,000 | ok | n/a | n/a | n/a | count=40k wall=2.31 ms; 1-hop n=1 wall=18.70 ms |
+| query | 300,000 | ok | n/a | n/a | n/a | count=120k wall=3.42 ms; 1-hop n=1 wall=80.32 ms |
+| query | 1,000,000 | ok | n/a | n/a | n/a | count=400k wall=11.64 ms; 1-hop n=1 wall=281.55 ms (slow-query log) |
+| incr | 100,000 | ok | n/a | n/a | n/a | set_prop p50=23.99 ms p95=42.58 ms n=100 |
+| incr | 300,000 | ok | n/a | n/a | n/a | set_prop p50=27.52 ms p95=66.80 ms n=100 |
+| incr | 1,000,000 | ok | n/a | n/a | n/a | set_prop p50=21.29 ms p95=69.42 ms n=100 |
 
 ---
 
@@ -120,7 +120,7 @@ in ~80k postings; scoring them takes ~90 ms.
 
 **WAL-only reopen** replays all WAL frames including every `CreateNode` and the
 `CreateRule` record for `same_team`.  The FieldEqual rule re-fires on every Person
-node during replay.  The full-text index is rebuilt at open — it is not stored in
+node during replay.  The full-text index is rebuilt at open; it is not stored in
 the WAL.  WAL reopen cost therefore scales with both the node count and the WAL
 frame count (which includes 10k `remember` frames at all scales).
 
@@ -147,7 +147,7 @@ derived edges, 10k `remember` provenance records, and the full-text index.
 The `same_team` rule (Person→Person FieldEqual on `team_id`, `max_edges=None`)
 uses the global 1M-edge cap.  With 80 Persons per team at 100k scale
 (400k persons ÷ 5k teams), each person could match 79 others (79 < 1M),
-but the global total would reach 31.6M — well above 1M.  The cap trips at 1M
+but the global total would reach 31.6M, well above 1M.  The cap trips at 1M
 derived edges at all three scales.
 
 | scale | rule wall | tripped | derived edges |
@@ -167,7 +167,7 @@ or a narrower predicate.
 
 ## Engine defects found
 
-- **Slow-query log at 1M: 1-hop Cypher traversal** — the query
+- **Slow-query log at 1M: 1-hop Cypher traversal**: the query
   `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst`
   logged a slow-query warning at 281 ms (threshold 250 ms) at scale=1M.
   At 100k this query ran in 18.70 ms; at 300k, 80.32 ms; at 1M, 281.55 ms.

@@ -1,6 +1,6 @@
 # mushroomdb
 
-**The graph that stays true — and knows who's allowed to see it.**
+**The graph that stays true, and knows who's allowed to see it.**
 
 mushroomdb is an embedded graph database for agents and apps that reason over entities. You
 declare a relationship as a rule, once; every write after that derives the matching edges, scores

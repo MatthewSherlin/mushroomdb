@@ -45,7 +45,7 @@ Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git
 
 {{usage serve}}
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it (`npx`, Docker and the release binaries do; `cargo install` does not). `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
 
 ### `mcp`
 
@@ -65,13 +65,13 @@ Run a Cypher read or write (`--query` also accepted). Pass the statement in shel
 
 {{usage asof}}
 
-Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then
+Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339): the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then
 
 ### `why`
 
 {{usage why}}
 
-Every rule edge between two keys with the evidence that derived it, or a note that there is none — the shell form of `explain_association`
+Every rule edge between two keys with the evidence that derived it, or a note that there is none (the shell form of `explain_association`)
 
 ### `stats`
 
@@ -89,9 +89,9 @@ Rank candidate linking rules (scored top-k 32, KeyMatch 512)
 
 {{usage algo}}
 
-**`pagerank`/`wcc`/`degree`** — PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
+**`pagerank`/`wcc`/`degree`**: PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
 
-**`communities`** — Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
+**`communities`**: Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
 
 ## Build and maintain a store
 
@@ -119,7 +119,7 @@ Idempotently apply a schema file (rules, views, fulltext indexes), the built-in 
 
 {{usage build-index}}
 
-Drive a rule's vector index to completion a slice at a time, for an operator who wants the build finished before traffic arrives — a rule created over a large corpus derives no edges until its index is whole. After a restart, the first write or this command is what registers an unfinished build
+Drive a rule's vector index to completion a slice at a time, for an operator who wants the build finished before traffic arrives: a rule created over a large corpus derives no edges until its index is whole. After a restart, the first write or this command is what registers an unfinished build
 
 ### `snapshot`
 
@@ -149,7 +149,7 @@ Migrate an older store format in place
 
 {{usage backup}}
 
-Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
+Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve`; use `POST /backup` for live-served stores
 
 ### `restore`
 
@@ -177,13 +177,13 @@ Bulk-load CSV or JSONL files. `--jsonl` reads the single file `export --format j
 
 {{usage recall}}
 
-Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin and prints a `recall` digest for it — a question in ordinary words is enough — and nothing when the store has nothing to say. Wired automatically by `install`
+Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin and prints a `recall` digest for it (a question in ordinary words is enough) and nothing when the store has nothing to say. Wired automatically by `install`
 
 ### `brief`
 
 {{usage brief}}
 
-The store's schema in one block — labels, edge types, how deep its history runs, who may read it, and one worked call per question kind — capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart`
+The store's schema in one block (labels, edge types, how deep its history runs, who may read it, and one worked call per question kind), capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart`
 
 ## Version and help
 
@@ -213,7 +213,7 @@ store at the same time. A writer that cannot get the lock within two seconds exi
 `another mushroomdb process is writing; retry`, having written nothing. Readers never take the
 lock and never wait; `recall` opens read-only (`read_only: true`) so an unattended hook can never
 delay a writer or fail because one is running. What the lock does *not* give you: cross-process
-transactions, and subscription events for a peer's writes — a commit absorbed by `refresh()` is
+transactions, and subscription events for a peer's writes: a commit absorbed by `refresh()` is
 visible on the next read but notifies nobody. Full model:
 [`docs/site/concurrency.md`](concurrency.md).
 

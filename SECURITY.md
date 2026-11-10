@@ -14,13 +14,13 @@ configured, every HTTP request except `GET /health` must present
 and WebSockets; HTML responses set the cookie so `/assets/*` load. `GET
 /health` stays reachable without a credential so a load balancer can probe
 it, and answers `{"ok": true}` alone unless the caller presents the
-full-access token — before v0.6.12 it disclosed live node and edge counts to
+full-access token (before v0.6.12 it disclosed live node and edge counts to
 anyone, which `/stats` and `/metrics` refuse even to an authenticated
-role-bound token. The
+role-bound token). The
 process refuses to start if `--addr` is not loopback and no token is set.
 
-For TLS options — terminating at a reverse proxy (recommended) or using the
-native `--features tls` rustls path — see
+For TLS options (terminating at a reverse proxy, recommended, or using the
+native `--features tls` rustls path), see
 [docs/site/deployment.md](docs/site/deployment.md).
 
 The `mushroomdb mcp` mode reads and writes to a local database via stdio
@@ -56,4 +56,6 @@ performance-only regressions without a safety component.
 
 ## Supported versions
 
-Pre-v0.1 — no stable release yet. Fixes land on `main`.
+mushroomdb is pre-1.0 alpha. Security fixes ship in the next patch release of
+the current minor version (0.10.x) and land on `main`. An older minor version
+may get a backport for a serious issue, but is not guaranteed one.

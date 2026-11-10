@@ -2,7 +2,7 @@
 
 mushroomdb ships an incrementally-maintained inverted index for keyword search over
 node properties. It is designed for graph-native use cases: finding nodes by text
-content, ranking by match quality, and combining results with graph traversal — not
+content, ranking by match quality, and combining results with graph traversal, not
 for replacing a dedicated search engine.
 
 ## Enabling an index
@@ -45,8 +45,8 @@ and more query groups rank higher.
 | Form | Meaning |
 |------|---------|
 | `word` | stemmed term match (Snowball EN) |
-| `"two words"` | phrase — both tokens must appear adjacent (stemmed adjacency) |
-| `-word` | negation — excludes matching documents |
+| `"two words"` | phrase: both tokens must appear adjacent (stemmed adjacency) |
+| `-word` | negation: excludes matching documents |
 | `word*` | prefix match (trailing `*`; unstemmed, literal prefix) |
 | `a b` | AND: both atoms must match |
 | `a OR b` | OR: either group must match |
@@ -67,7 +67,7 @@ returns results whose text starts with `"databas"` before any stemming is applie
 
 A phrase query (`"graph database"`) checks that the stemmed forms of both tokens
 appear at adjacent positions within a single document field. Adjacent means
-sequential token-stream positions — no gap. Phrases never match across list-element
+sequential token-stream positions, with no gap. Phrases never match across list-element
 boundaries: a field stored as `["graph theory", "database design"]` does not satisfy
 `"graph database"` because the tokens come from different list elements.
 
@@ -77,7 +77,7 @@ A leading `-` excludes all documents that contain the negated term. Negation app
 to any atom: `-word`, `-prefix*`, or `"-phrase"`.
 
 A query consisting entirely of negation (e.g., `-foo` with no positive terms) returns
-**no results** — there is no baseline to subtract from. A group that contains only
+**no results**; there is no baseline to subtract from. A group that contains only
 negated atoms contributes nothing to the final score even when combined with other OR
 groups (e.g., `"graph OR -database"` scores as if the second group were absent).
 
@@ -126,7 +126,7 @@ This performs a per-row scratch scan (O(scan) per row) and is correct for small
 graphs. For large indexed fields, prefer `db.search()` which uses the inverted index
 (O(tokens)).
 
-Cypher `textMatches` results use omit mode — hidden nodes are omitted regardless of
+Cypher `textMatches` results use omit mode: hidden nodes are omitted regardless of
 the `stub_hidden` setting.
 
 ## What this is not

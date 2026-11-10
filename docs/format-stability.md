@@ -34,8 +34,8 @@ stays V11). The decoder supports V5 through V11. V5–V8 stores are
 **automatically migrated** to V9 on `GraphDb::open` (see Automatic migration
 below); a V10 or V11 store is already current and is never rewritten down.
 
-V8, V9, V10 and V11 are the *same container* — same magic, header page,
-directory entries and per-section CRC — and all four decode through
+V8, V9, V10 and V11 are the *same container* (same magic, header page,
+directory entries and per-section CRC), and all four decode through
 `MappedBase`. The version still moves each time, because each step is not
 backward-safe:
 
@@ -45,9 +45,9 @@ backward-safe:
 - A pre-v0.6.10 reader opening a V10 store would meet WAL discriminant 23 and
   truncate the WAL at it (see *Discriminant 23 is opt-in* below). It refuses
   with `snapshot: unsupported version 10` instead, and never opens the WAL.
-- A 0.9.x reader opening a V11 store would meet a WAL frame it cannot decode —
-  a 0.10 value (bincode tags 6–10) or a constraint or range-index declaration
-  (discriminants 24–27) — and truncate the WAL at it. It refuses with
+- A 0.9.x reader opening a V11 store would meet a WAL frame it cannot decode
+  (a 0.10 value (bincode tags 6–10) or a constraint or range-index declaration
+  (discriminants 24–27)) and truncate the WAL at it. It refuses with
   `snapshot: unsupported version 11` instead, and never opens the WAL.
 
 V10 adds no section, no field and no byte of data. V11 adds section 18 and
@@ -79,7 +79,7 @@ Section ids (fixed):
 | ID | Name | Encoding |
 |----|------|----------|
 | 0  | TOPOLOGY   | rkyv `CsrData` (zero-copy archived CSR) |
-| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store). In V11 a column of `Date`, `LocalDateTime`, `DateTime`, `Duration` or `Binary` values — or a mixed column holding one — is written in the existing `Mixed` shape, a bincode `HashMap<u32, Value>` whose values use bincode tags 6–10; the archived layout does not change. Any other version refuses to write one |
+| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store). In V11 a column of `Date`, `LocalDateTime`, `DateTime`, `Duration` or `Binary` values (or a mixed column holding one) is written in the existing `Mixed` shape, a bincode `HashMap<u32, Value>` whose values use bincode tags 6–10; the archived layout does not change. Any other version refuses to write one |
 | 2  | IDS        | rkyv `IdMapData` (zero-copy archived id map) |
 | 3  | SYMS       | rkyv `InternerData` (zero-copy archived symbol interner) |
 | 4  | META       | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
@@ -90,13 +90,13 @@ Section ids (fixed):
 | 9  | VIEWS      | rkyv `ViewsSectionData` (view definition bincode blobs) |
 | 10 | IVF_STATE  | bincode `BTreeMap<String, PerRuleIvfState>` (IVF centroid + cluster state per approximate rule) |
 | 11 | LAST_CHANGE | bincode `HashMap<u32, u64>` (per-node-id → last-commit-seq; used for CAS precondition checks) |
-| 12 | STRINGS    | rkyv `StringTableData` — the one table every `ColumnData::Str` in section 1 indexes (V9+; absent in V5–V8, where each column carries its own copy) |
+| 12 | STRINGS    | rkyv `StringTableData`: the one table every `ColumnData::Str` in section 1 indexes (V9+; absent in V5–V8, where each column carries its own copy) |
 | 13 | FULLTEXT   | the full-text index's own blob: magic `MFTS`, a version, LEB128 varints, a trailing CRC32. Optional: written only when a full-text pair is declared (0.8+). A snapshot without it, and a reader that does not know the id, rebuild the index at open. The blob's version changes with the tokenizer or the layout, without a container change |
 | 14 | WAL_MARK   | 20 bytes: magic `MWAL`, the length of WAL the snapshot holds (u64 LE), a CRC32 of all of it, a CRC32 of the 16 bytes before. Optional: written only by a snapshot that keeps its WAL (0.7.2+). With it, an open counts the frames the snapshot holds and applies only the declarations among them. A snapshot without it, and a reader that does not know the id, replay the whole WAL over the snapshot. A mark that does not read back is ignored the same way at open, though `verify` reports its section as failed |
-| 15 | EDGES_SWEPT | 4 bytes, `MSWP`. Written by every snapshot from 0.7.2 on. It says the writer removes a deleted node's edges from the snapshot it was working over, so the topology holds no edge to or from a retired id. An open of a snapshot without it — one 0.7.1 or earlier wrote — looks for such edges and drops them (ledger row 95) |
-| 16 | PROV_RECONCILED | 4 bytes, `MREC`. Optional (0.9.2+). It says the state the snapshot holds has had the lost-provenance repair of ledger rows 111 and 113: no rule counts an edge the graph does not hold, and no top-k source is short of an edge 0.8.0 took from it. Written only by a writer that ran the repair, opened a snapshot that says so, or opened none. An open of a snapshot with it skips the repair, which on such a state changes nothing; an open of one without it — or a reader that does not know the id — runs the repair at the first write (ledger row 116) |
-| 17 | DERIVED_BITS | Magic `MDRV`, then one bit per `u32` of the TOPOLOGY section (bit `i` is bit `i % 8` of byte `i / 8` after the magic). Bit `i` is set when the four bytes at offset `4 * i` of the TOPOLOGY section are a neighbour entry — in an out-row or in an in-row — of an edge some rule owns. Optional (0.10+): written by a snapshot whose state has at least one such edge, left out otherwise. With it, a reader answers whether a base edge is rule-derived from the bit at that edge's own entry, with no search and nothing built at open or first read. A snapshot without it — one an earlier version wrote, or one with no derived edge — is read by building the answer from PROVENANCE at the first read that needs it. A reader that does not know the id ignores it; a 0.9.x writer snapshotting such a store leaves it out, so it never goes stale beside the topology it indexes. Unlike the other large sections it is validated eagerly, once per base on first use: the magic, the length (the magic plus one bit per `u32` of the topology section) and the CRC32 against its directory entry. On any mismatch the reader warns once and answers from PROVENANCE instead, so it never returns a wrong answer from damaged bits, and `verify` reports the mismatch |
-| 18 | DECLARATIONS | Magic `MDCL`, a `u16` LE section version (2 in 0.10), then the fields of `SnapshotDeclarations` one after another in bincode: `multiplicity: bool`, `constraints: Vec<UniqueConstraint { name, label, field }>` (version 1), then `indexes: Vec<(label, field)>` and `range_indexes: Vec<(name, label, field)>` (version 2). V11 only: every V11 snapshot writes it and no other version does, so a store that never opted in writes what 0.9.x writes. The open applies these declarations at the point of the WAL the snapshot was taken at — after the frames a keep-WAL snapshot holds, before the first one it does not — and takes `multiplicity` as the V10 stamp's fact (a V11 store cannot say it with its version). So a snapshot whose WAL was archived away before its baseline WAL was written still carries the store's constraints, indexes and opt-in. **Adding a field:** append it, with a default that means "not declared", and bump the version; a reader decodes the fields it knows in order, reads a field the payload ends before as its default (an older writer), and ignores bytes after the last field it knows (a newer writer). Any other change needs a new section id. Small: its CRC32 is checked on every read, and a section that fails it, has no magic or version, or whose fields do not decode, refuses the open rather than drop a constraint. A reader that does not know the id is a reader that refuses V11 already |
+| 15 | EDGES_SWEPT | 4 bytes, `MSWP`. Written by every snapshot from 0.7.2 on. It says the writer removes a deleted node's edges from the snapshot it was working over, so the topology holds no edge to or from a retired id. An open of a snapshot without it (one 0.7.1 or earlier wrote) looks for such edges and drops them (ledger row 95) |
+| 16 | PROV_RECONCILED | 4 bytes, `MREC`. Optional (0.9.2+). It says the state the snapshot holds has had the lost-provenance repair of ledger rows 111 and 113: no rule counts an edge the graph does not hold, and no top-k source is short of an edge 0.8.0 took from it. Written only by a writer that ran the repair, opened a snapshot that says so, or opened none. An open of a snapshot with it skips the repair, which on such a state changes nothing; an open of one without it (or a reader that does not know the id) runs the repair at the first write (ledger row 116) |
+| 17 | DERIVED_BITS | Magic `MDRV`, then one bit per `u32` of the TOPOLOGY section (bit `i` is bit `i % 8` of byte `i / 8` after the magic). Bit `i` is set when the four bytes at offset `4 * i` of the TOPOLOGY section are a neighbour entry (in an out-row or in an in-row) of an edge some rule owns. Optional (0.10+): written by a snapshot whose state has at least one such edge, left out otherwise. With it, a reader answers whether a base edge is rule-derived from the bit at that edge's own entry, with no search and nothing built at open or first read. A snapshot without it (one an earlier version wrote, or one with no derived edge) is read by building the answer from PROVENANCE at the first read that needs it. A reader that does not know the id ignores it; a 0.9.x writer snapshotting such a store leaves it out, so it never goes stale beside the topology it indexes. Unlike the other large sections it is validated eagerly, once per base on first use: the magic, the length (the magic plus one bit per `u32` of the topology section) and the CRC32 against its directory entry. On any mismatch the reader warns once and answers from PROVENANCE instead, so it never returns a wrong answer from damaged bits, and `verify` reports the mismatch |
+| 18 | DECLARATIONS | Magic `MDCL`, a `u16` LE section version (2 in 0.10), then the fields of `SnapshotDeclarations` one after another in bincode: `multiplicity: bool`, `constraints: Vec<UniqueConstraint { name, label, field }>` (version 1), then `indexes: Vec<(label, field)>` and `range_indexes: Vec<(name, label, field)>` (version 2). V11 only: every V11 snapshot writes it and no other version does, so a store that never opted in writes what 0.9.x writes. The open applies these declarations at the point of the WAL the snapshot was taken at (after the frames a keep-WAL snapshot holds, before the first one it does not) and takes `multiplicity` as the V10 stamp's fact (a V11 store cannot say it with its version). So a snapshot whose WAL was archived away before its baseline WAL was written still carries the store's constraints, indexes and opt-in. **Adding a field:** append it, with a default that means "not declared", and bump the version; a reader decodes the fields it knows in order, reads a field the payload ends before as its default (an older writer), and ignores bytes after the last field it knows (a newer writer). Any other change needs a new section id. Small: its CRC32 is checked on every read, and a section that fails it, has no magic or version, or whose fields do not decode, refuses the open rather than drop a constraint. A reader that does not know the id is a reader that refuses V11 already |
 
 Resolution rule for string columns, in one sentence: **if the shared table is
 present it is the table; otherwise the column's own `strings` is.** That is what
@@ -118,7 +118,7 @@ at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
 root-pointer lookup, no pointer-walk). This is sound for encoder-produced
 uncorrupted data, but a bit-flip on a relative-pointer field causes
 `ArchivedVec::as_slice` to resolve an out-of-bounds address before any length
-check — genuine UB, not a panic. Within-payload corruption that does not affect
+check (genuine UB, not a panic). Within-payload corruption that does not affect
 relative pointers yields wrong query results rather than a safety violation.
 Mitigated by `mushroomdb verify` (full-section CRC32 audit on demand) and
 planned Miri/ASAN CI coverage. The `snapshot::decode` path (used during
@@ -147,19 +147,19 @@ available discriminant.
 `SetEdgeCount` (23) carries insert-count multiplicity. It is written **only**
 on a store that has called `enable_multiplicity()`. A store that never calls it
 contains no discriminant-23 record, keeps writing V9 snapshots, and stays
-readable by every release from v0.6.0 on — indefinitely, not just until its next
-snapshot. That is the property the whole design rests on.
+readable by every release from v0.6.0 on (indefinitely, not just until its next
+snapshot). That is the property the whole design rests on.
 
 Opting in cannot be undone, and there is no call that undoes it. Unlike an
-unreadable index blob — which degrades, because the reader falls back to a
-correct exhaustive scan — an unreadable WAL record cannot degrade: the reader
+unreadable index blob (which degrades, because the reader falls back to a
+correct exhaustive scan), an unreadable WAL record cannot degrade: the reader
 cannot know what the record would have changed.
 
 Left to itself, an older reader would do something worse than refusing.
 `decode_all` treats any frame it cannot deserialise as a corrupt tail and
 returns the valid prefix, so a pre-v0.6.10 binary replaying such a WAL would
-stop at the first discriminant-23 frame, lose every commit after it, and — with
-`repair_wal`, which is on by default — **write that truncation back to disk**.
+stop at the first discriminant-23 frame, lose every commit after it, and (with
+`repair_wal`, which is on by default) **write that truncation back to disk**.
 Silent data loss, persisted, at exactly the moment an operator is reaching for a
 downgrade.
 
@@ -171,7 +171,7 @@ puts the loud failure in front of the silent one:
 - `enable_multiplicity()` writes a **V10 snapshot first**, in the same call,
   before it appends the discriminant-23 declaration. The store is therefore
   never in a state where the record is on disk without the V10 stamp that
-  guards it — not even across a crash.
+  guards it, not even across a crash.
 - Every later snapshot the store takes is V10 too, for as long as multiplicity
   is enabled.
 - A pre-v0.6.10 binary opening that store stops at
@@ -186,7 +186,7 @@ puts it back. Opt in when you want the feature, not by default.
 The ordering above is the property the design rests on. Atomicity is not, and
 the call does not have it. A failed `enable_multiplicity()` reports `Err` and
 leaves that handle reporting `is_multiplicity_enabled() == false`, but the store
-can still be opted in — immediately, or from its next open:
+can still be opted in (immediately, or from its next open):
 
 - The declaration is appended to `wal.bin` and *then* fsynced. A failed barrier
   leaves the record on disk; the next open replays it and the store is opted in.
@@ -212,7 +212,7 @@ The 0.10 value types (`Date`, `LocalDateTime`, `DateTime`, `Duration`,
 `DropConstraint` 25, `EnableRangeIndex` 26, `DisableRangeIndex` 27) are V11-only
 records: 0.9.x cannot decode a frame that carries one. There is no call to opt
 in. A store opts in by using a feature, at its **first V11-only record of any
-kind** — on every write path (`insert_node`, `set_prop`, `set_props`, batches,
+kind**, on every write path (`insert_node`, `set_prop`, `set_props`, batches,
 ingest, Cypher, HTTP, Python, `create_constraint`, `enable_range_index`):
 
 - That write first takes a **V11 snapshot that keeps the WAL**, then appends its
@@ -220,8 +220,8 @@ ingest, Cypher, HTTP, Python, `create_constraint`, `enable_range_index`):
   a state where the record is on disk without the V11 stamp. On a large store the
   first such write costs one full snapshot write. A read that only takes a typed
   parameter changes nothing.
-- A write refused before its record is built — an over-size `Binary`, a
-  `DateTime` offset beyond ±18:00, a constraint whose data conflicts — does not
+- A write refused before its record is built (an over-size `Binary`, a
+  `DateTime` offset beyond ±18:00, a constraint whose data conflicts) does not
   upgrade. A write refused after the upgrade (a unique-constraint violation)
   leaves the store V11 with nothing V11 written: the safe direction.
 - If the V11 snapshot fails, the write fails and nothing is appended. The handle
@@ -261,7 +261,7 @@ call that moves a V11 store back, and no downgrade path for one.
 `Value::Null` is never stored, in V11 as before: a write carrying one is refused.
 
 Which `Intern` records a `Batch` frame carries, and where they sit inside it,
-is **not** part of the format contract — only that replaying a frame's records
+is **not** part of the format contract: only that replaying a frame's records
 in order reproduces the write-time symbol assignment. Since v0.5.0 a `Batch`
 containing `CreateRule` pre-interns the rule's `edge_type` immediately before
 that record, because rule backfill would otherwise intern it lazily on replay
@@ -325,7 +325,7 @@ re-snapshot before upgrading.
 2. A new snapshot at the current VERSION is written via
    `snapshot_with(keep_wal: true)`, preserving all WAL history.
 3. If the migration step fails, the original files are intact (the `.bak` was
-   committed before the new snapshot was attempted) and the error is returned —
+   committed before the new snapshot was attempted) and the error is returned;
    log-and-continue is never used.
 4. The next clean open at the current VERSION deletes the `.bak`.
 
@@ -333,15 +333,15 @@ A V10 (multiplicity-enabled) or V11 snapshot is **not** migrated: it is at or
 above the version this binary writes, so it is treated as current and left alone.
 Steps 1 and 2 would only rewrite it as another V10 or V11 snapshot.
 
-> **Production note — ANN index re-fit cost.** Stores with approximate
+> **Production note: ANN index re-fit cost.** Stores with approximate
 > (`approximate: true`) rules must re-fit k-means ANN indexes during migration
 > because the index structures are rebuilt in-process before the new snapshot is
 > written. On a 2.2 GiB V5 dogfood store with 9 rules (measured 2026-08-27,
 > Apple M-series, macOS), the first migrating open took **~10–11 minutes** with a
-> peak memory footprint of **~35 GB** (max RSS **~8.3 GB** as of 2026-08-28 — fits a 16 GB machine without heavy swap; the VM-footprint remainder is
+> peak memory footprint of **~35 GB** (max RSS **~8.3 GB** as of 2026-08-28, fits a 16 GB machine without heavy swap; the VM-footprint remainder is
 > VM/compressed memory pressure). On a 24 GB machine this left little headroom;
 > on a more memory-constrained host the OS may kill the process mid-migration.
-> The migration is crash-safe — originals and `.bak` remain intact; simply retry
+> The migration is crash-safe: originals and `.bak` remain intact; simply retry
 > or rerun. However, for production stores with large ANN indexes, run
 > `mushroomdb migrate <dir>` **offline before starting `serve`** so that the
 > serving process never blocks on or gets killed during a migration.
@@ -369,8 +369,8 @@ Performs a **truncating** migration (WAL is truncated after the new snapshot,
 unlike the automatic open-path which preserves the WAL). Keeps `.bak`.
 
 Output:
-- `migrated V<from> -> V<current>` — migration succeeded.
-- `already current (V<current>)` — no migration needed.
+- `migrated V<from> -> V<current>`: migration succeeded.
+- `already current (V<current>)`: no migration needed.
 
 ---
 
@@ -382,7 +382,7 @@ Output:
 | Clean open at current VERSION with `.bak` present | `.bak` deleted |
 | `auto_migrate: false` | `.bak` never touched |
 | `mushroomdb migrate` (old-version snapshot) | `.bak` written; remains after CLI exits |
-| `mushroomdb migrate` (WAL-only store — no snapshot) | no `.bak` written (nothing to back up) |
+| `mushroomdb migrate` (WAL-only store, no snapshot) | no `.bak` written (nothing to back up) |
 
 The `.bak` file is safe to delete manually once you have verified the migrated
 store is correct.
@@ -419,10 +419,10 @@ Every WAL-archiving snapshot (`snapshot --archive-wal`) renames the current
 `wal.bin` to `wal.<commit>.archive` and writes a fresh snapshot.  A continuous
 sequence of archives, together with `wal.genesis` (marks an unbroken chain from
 the store's first commit) and `wal.floor` (the lowest reachable commit index),
-lets `open_at` replay any commit in the archive chain — not just commits in the
-current `wal.bin`.
+lets `open_at` replay any commit in the archive chain (not just commits in the
+current `wal.bin`).
 
-### 1 — Take a consistent backup
+### 1: Take a consistent backup
 
 **If the store is idle** (no concurrent writer process):
 
@@ -435,7 +435,7 @@ mushroomdb backup <db-dir> <backup-dir>
 ```
 
 **If the store is live-served** (a `mushroomdb serve` process is running), use
-the HTTP endpoint — the server holds the read lock during the copy, which is
+the HTTP endpoint: the server holds the read lock during the copy, which is
 the correct cross-process synchronisation point:
 
 ```sh
@@ -456,7 +456,7 @@ curl -X POST http://localhost:8080/backup \
 It then opens the backup read-only and runs the CRC verifier; the reported
 `verified: true` confirms byte-for-byte integrity before the command returns.
 
-### 2 — Keep WAL archives (retention policy)
+### 2: Keep WAL archives (retention policy)
 
 ```sh
 # Unlimited retention (default) — keep every archive ever taken.
@@ -471,7 +471,7 @@ reachable.  The `wal.genesis` marker is removed whenever the chain is broken
 (e.g. when a WAL-truncating snapshot is taken after archives exist, or when
 the floor advances past zero).
 
-### 3 — Recover to a specific commit
+### 3: Recover to a specific commit
 
 ```sh
 # List how many commits exist in the WAL.
@@ -515,6 +515,6 @@ databases.
 ## Panic policy
 
 Corrupt, truncated, or adversarial on-disk bytes always produce a typed
-`GraphError::Corrupt` — never a panic. The complete policy, including which
+`GraphError::Corrupt`, never a panic. The complete policy, including which
 `.expect()` calls are retained as post-validation invariants and why, is in
 [docs/site/panic-policy.md](site/panic-policy.md).

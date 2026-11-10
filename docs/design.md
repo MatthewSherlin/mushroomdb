@@ -1,4 +1,4 @@
-# The original design, August 2026 — a historical record
+# The original design, August 2026: a historical record
 
 > **This is the design the project started from. It is dated 2026-08-14, the day before the first
 > commit, and was last revised on 2026-08-26, during the first releases; the only edits since are
@@ -14,7 +14,7 @@
 > [`docs/format-stability.md`](format-stability.md), and the pages under [`docs/site/`](site/index.md).
 
 **Date:** 2026-08-14
-**Status:** Historical — superseded by the implementation
+**Status:** Historical, superseded by the implementation
 **Language:** Rust (core), TypeScript (UI), Python/TS/Rust bindings at launch
 
 ---
@@ -46,7 +46,7 @@ One-line positioning: *"The embedded graph database that builds itself."*
 
 A people-organization-posting matching workload. Current pain: 5+ second neighborhood
 queries, hand-built batch edge-scoring scripts, UI unusable beyond ~40 nodes. This
-workload is a worked example only — see the Generality Guarantee.
+workload is a worked example only: see the Generality Guarantee.
 
 ## 2. Generality Guarantee
 
@@ -72,7 +72,7 @@ ingestion posture.
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
 | Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Testing | Deterministic simulation testing (a named system-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs system A deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes — 4.72 GiB peak while building. See docs/site/limits.md.)* |
+| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes, 4.72 GiB peak while building. See docs/site/limits.md.)* |
 
 ### Explicit non-goals (v1)
 
@@ -160,7 +160,7 @@ Exact `VectorSimilar` is a scan. R-tree indexes are deferred; see
    old vs new field values and touch only affected partner edges.
 4. **Publish:** the write guard is released; concurrent `SharedDb` readers then
    observe node + derived edges together. Auto-linking is synchronous and
-   transactional — never an eventually-consistent background job. Epoch / ArcSwap
+   transactional, never an eventually-consistent background job. Epoch / ArcSwap
    snapshot publish is deferred; see
    `docs/superpowers/specs/2026-08-25-best-graph-db.md` and
    `docs/concurrency-decision.md`.
@@ -187,9 +187,9 @@ All results are Arrow tables (plus `.to_dicts()` convenience).
 `RETURN`/`ORDER BY`/`LIMIT`/`SKIP`, `CREATE`/`SET`/`DELETE`, parameters, core
 function library (aggregations, string/math). Not in v1: full `MERGE` semantics
 (simple upsert only), subqueries, `FOREACH`. Parser produces a logical plan shared
-with the traversal API — one executor, two front doors.
+with the traversal API (one executor, two front doors).
 
-**Server/UI transport:** WebSocket sessions, incremental Arrow IPC batch delivery —
+**Server/UI transport:** WebSocket sessions, incremental Arrow IPC batch delivery:
 first batch in milliseconds, cosmos.gl lays out while the rest streams. UI node
 expansion = `neighborhood()` call, not a Cypher round-trip. Server enforces
 per-query timeout and result-size caps.
@@ -201,7 +201,7 @@ per-query timeout and result-size caps.
    label/type/score.
 2. **Query console:** Cypher / traversal-API input; results as graph or table.
 3. **Rule inspector:** list rules, edge counts per rule, non-participation counts,
-   duplicate-edge-type flags, and per-edge "why" panel (`db.explain` — rule + score
+   duplicate-edge-type flags, and per-edge "why" panel (`db.explain`: rule + score
    breakdown on edge click). This view is the UI expression of the flagship feature.
 
 Not v1: general editing/admin UI, dashboards, saved queries.
@@ -209,11 +209,11 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 ## 8. Error Handling & Durability Contract
 
 - **Contract:** a committed write survives crash, power loss, kill -9. Torn WAL
-  tails detected via CRC and dropped whole — never half-applied. Recovery is
+  tails detected via CRC and dropped whole, never half-applied. Recovery is
   snapshot decompress + WAL replay. Current V6 zstd-bincode open is ~8.88 s at
   100k nodes. Sub-second (mmap) open is deferred; see
   `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
-- **Fsync:** default `FsyncPolicy::Strict` — every WAL commit fsyncs (Darwin
+- **Fsync:** default `FsyncPolicy::Strict`: every WAL commit fsyncs (Darwin
   `F_FULLFSYNC` on the file). Ingest/`write_batch` emit one `Batch` frame and
   fsync once (`Batched`). `Relaxed` skips WAL `fs.sync`; `snapshot()` is still
   durable via `write_atomic`. DST crash sweeps stay Strict.
@@ -269,7 +269,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 
 *As they stood on 2026-08-14. The name, the repository and the snapshot format all exist now.*
 
-- **Name** — required before repo creation; "graph-db" is a placeholder.
+- **Name**: required before repo creation; "graph-db" is a placeholder.
 - Git repo not yet initialized (user performs/authorizes git actions explicitly).
 - UDF rule escape hatch design (fast-follow, not v1).
 - LLM-extraction plugin (post-v1, optional, opt-in cost model).

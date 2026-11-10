@@ -1,9 +1,9 @@
-# Scale run — representative matching workload (100k protocol)
+# Scale run: representative matching workload (100k protocol)
 
 ## Machine / date
 
 - **Date:** 2026-08-24T18:24:27
-- **Host:** mac.lan
+- **Host:** Apple M4 Pro laptop
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -13,7 +13,7 @@
 
 Peak RSS is `resource.ru_maxrss` (process-lifetime, Darwin bytes).
 Current RSS is `ps -o rss=` after the phase. Bindings are embedded Rust
-via `mushroomdb.GraphDb` — not HTTP. This is a representative matching
+via `mushroomdb.GraphDb`, not HTTP. This is a representative matching
 workload (Talent / Company / Job nodes) with **synthetic hash-chain
 embeddings**; numbers are not apples-to-apples with any specific
 production deployment (different hardware, no network, real embeddings).
@@ -68,7 +68,7 @@ open decompresses on load. V5 snapshots are readable by v0.1.1 code (backward-co
 - **Per-query recall (n=100 queries evaluated):** mean=0.991 median=1.000 min=0.625 max=1.000
 - **Queries skipped (empty exact set):** 0
 
-## Backfill (phase 2) — streaming with caps (T1)
+## Backfill (phase 2): streaming with caps (T1)
 
 - **Status:** `ok`
 - **Method:** streaming backfill with max_edges caps (T1)
@@ -87,7 +87,7 @@ open decompresses on load. V5 snapshots are readable by v0.1.1 code (backward-co
 store rather than building a `BTreeMap<(src,dst), score>` first.
 Combined with explicit `max_edges` caps, cartesian predicates at 70k×20k
 no longer OOM the process. Uncapped low-selectivity rules are still O(pairs)
-by definition — the cap is the mechanism. Document and enforce caps on any
+by definition; the cap is the mechanism. Document and enforce caps on any
 new rule instance that may reach high-fanout at production scale.
 
 ## Incremental / Big-3 / explain
@@ -103,17 +103,17 @@ new rule instance that may reach high-fanout at production scale.
 
 **WAL reopen:** WAL replay applies each `CreateRule` record, which triggers rule
 re-application on the full node set (same as initial backfill). Derived edges are
-not stored in the WAL — only rule declarations + node inserts. The dominant cost
+not stored in the WAL; only rule declarations + node inserts. The dominant cost
 at this rule set is IVF-Flat re-derivation (~7.68 min).
 
 **V6 snapshot reopen:** V6 snapshot includes `topo` (all edges, including derived)
 and `provenance` (rule engine state), compressed with zstd (level 3). `open_with`
-decompresses and restores from snapshot without re-firing rules — derived edges +
+decompresses and restores from snapshot without re-firing rules; derived edges +
 IVF centroids loaded from snapshot payload. Snapshot size: 1.1 GiB.
 
-- **WAL reopen:** 8.16 min (ok) — close + open; CreateRule WAL records trigger rule re-application on full node set; IVF-Flat re-derivation is bottleneck
-- **V6 snapshot write:** 22.563 s — `snapshot()` serializes derived edges + IVF centroids, compresses with zstd level-3 (1.1 GiB on disk)
-- **V6 snapshot open:** 8.880 s (ok) — `open_with` decompresses V6 stream and restores state; no rule re-fire
+- **WAL reopen:** 8.16 min (ok): close + open; CreateRule WAL records trigger rule re-application on full node set; IVF-Flat re-derivation is bottleneck
+- **V6 snapshot write:** 22.563 s: `snapshot()` serializes derived edges + IVF centroids, compresses with zstd level-3 (1.1 GiB on disk)
+- **V6 snapshot open:** 8.880 s (ok): `open_with` decompresses V6 stream and restores state; no rule re-fire
 
 ## Oracle
 
@@ -121,14 +121,14 @@ IVF centroids loaded from snapshot payload. Snapshot size: 1.1 GiB.
 
 ## Comparison vs reported pain points
 
-**CONTEXT — not apples-to-apples.** Reference numbers come from a
+**CONTEXT: not apples-to-apples.** Reference numbers come from a
 reported production workload (different hardware, networked multi-shard
 search, real high-dim vectors). Ours are a local embedded
 process on the machine above, synthetic hash-chain embeddings.
 
 | Path | Reported (production) | mushroomdb this run |
 |---|---|---|
-| Talent→Company matcher (Big-3) | 5+ second queries | p50=7.1 µs p95=15.5 µs mean_matches=0.0 — intersection empty (matcher rules not live at this scale) |
+| Talent→Company matcher (Big-3) | 5+ second queries | p50=7.1 µs p95=15.5 µs mean_matches=0.0 (intersection empty: matcher rules not live at this scale) |
 | Search fan-out | 14 sharded a named system indices + in-memory merge | derived-edge `neighbors` on declared rules |
 | Semantic / vector | a named system `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 7.81 min recall=0.080 |
 | Ingest 100k | (not published) | 1.37 min peak 4.12 GiB (ingest_batch 10k chunks) |
@@ -154,9 +154,9 @@ version=5, uncompressed bincode), not V6 as the earlier reopen section says.
 V7 write (from opened V5 state): 34.3-35.2 s, convert-process peak RSS
 7.4-7.5 GiB. Node/edge counts identical after reopen: nodes=100500
 edges=10009748. (First two V7 runs at `a21b6f2`; third at `af9c682` after
-the V7 meta gained the `wal_truncated` flag — within noise.)
+the V7 meta gained the `wal_truncated` flag, within noise.)
 
-**G3 bar (< 1 s): FAIL — ~11 s, ~11x over.** V7 halves disk size but is
+**G3 bar (< 1 s): FAIL, ~11 s, ~11x over.** V7 halves disk size but is
 ~1 s slower to open and peaks 2-4 GiB higher than V5 on the same binary.
 
 Stage profile of the V7 open (`crates/core-storage/examples/v7_profile.rs`):
@@ -174,7 +174,7 @@ data volume, not the old HashMap layouts. The 1536-dim embeddings alone are
 10M derived edges carry ~550 MiB of provenance/edge-prop meta. Any owned
 decompress-and-deserialize open of this dataset pays multiple seconds before
 the first query; < 1 s needs zero-copy/lazy loading (mmap + packed columns
-read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
+read in place, deferred provenance), explicitly deferred by the Phase 3 plan
 (no memmap2/rkyv without sign-off).
 
 **G3 gate: RESOLVED BY V8.** See the GB gate section below.
@@ -189,7 +189,7 @@ read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
 
 - **Host:** same machine (Apple M4 Pro 12-core, 24 GiB RAM, macOS 15.7.3 arm64)
 - **Store:** 1.8 GiB V8 snapshot of the 100k-node dogfood dataset (same nodes/edges;
-  V8 is 1.8 GiB vs the V5 baseline's 2.2 GiB — 18% smaller; V5→V8 re-encodes
+  V8 is 1.8 GiB vs the V5 baseline's 2.2 GiB, 18% smaller; V5→V8 re-encodes
   IVF centroids from JSON-in-bincode to rkyv, which accounts for most of the shrink)
 - **Measurement:** `/usr/bin/time -l` (Darwin `ru_maxrss`); three runs per query type;
   warm file cache, cold process. **Cold-cache numbers not measured** (requires `sudo purge`);
@@ -207,7 +207,7 @@ read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
 | Fix 3a: access_unchecked (no rkyv walk) | `e27c2f7` | 0.22 s | 1.88 GiB |
 | Fix 3b: 6-byte version sniff (no 2.4 GB read) | `b0798a1` | **0.02 s** (runs 2–3) | **31–41 MiB** |
 
-Run 1 (dyld/linker cold, first-ever process on this binary) was 0.25 s and ~120 MiB —
+Run 1 (dyld/linker cold, first-ever process on this binary) was 0.25 s and ~120 MiB;
 a one-time OS cost. Subsequent runs of the same binary are 0.02 s.
 
 ### Per-query RSS (runs 2–3, warm file cache, cold process)
@@ -231,10 +231,10 @@ mushroomdb verify ./scale-100000-db
 ### Migration footprint (V5 → V8)
 
 - Wall time: ~30 s (M-series, macOS, sufficient swap)
-- Peak memory (2026-08-28, post memory-diet): ~35 GB VM footprint, ~8.3 GB max RSS — down from the pre-diet ~54 GB footprint; .bak now fs::copy, encode borrows instead of cloning, decoded V5 state freed after remap. Remaining floor is the V5 bincode decode itself (streaming decode = backlog, no installed base).
+- Peak memory (2026-08-28, post memory-diet): ~35 GB VM footprint, ~8.3 GB max RSS, down from the pre-diet ~54 GB footprint; .bak now fs::copy, encode borrows instead of cloning, decoded V5 state freed after remap. Remaining floor is the V5 bincode decode itself (streaming decode = backlog, no installed base).
 - On 24 GiB hosts, migration leaves little headroom and may OOM on more constrained hosts.
   Run `mushroomdb migrate <dir>` offline before starting `serve`. The migration is
-  crash-safe — original files and `.bak` remain intact on failure.
+  crash-safe; original files and `.bak` remain intact on failure.
 
 ### Trust model
 

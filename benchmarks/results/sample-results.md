@@ -1,9 +1,13 @@
-# Comparative benchmark — mushroomdb
+# Sample report: mushroomdb only
+
+A run of the comparison harness with no other system installed, kept to show the report
+format. The cross-engine comparison is
+[head-to-head-10k-v2.md](head-to-head-10k-v2.md).
 
 ## Machine / date
 
 - **Date:** 2026-08-20T08:00:27
-- **Host:** mac.lan
+- **Host:** Apple M4 Pro laptop
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -14,7 +18,7 @@
 
 See `benchmarks/README.md` for the full honesty section.
 Short version: mushroomdb numbers are **embedded Rust** (no network RTT);
-competitor numbers are over bolt/localhost. `rule_derive` is ours-only —
+competitor numbers are over bolt/localhost. `rule_derive` is ours-only;
 competitors have no auto-derivation equivalent, so it is excluded from
 the cross-engine table.
 
@@ -22,31 +26,31 @@ the cross-engine table.
 
 | workload | mushroomdb | system A | system B | system C |
 | --- | --- | --- | --- | --- |
-| bulk_ingest | 8.647 s | not installed — skipped | not installed — skipped | not installed — skipped |
-| neighborhood_depth1 (p50) | 1.0 µs | not installed — skipped | not installed — skipped | not installed — skipped |
-| neighborhood_depth1 (p95) | 3.5 µs | not installed — skipped | not installed — skipped | not installed — skipped |
-| neighborhood_depth2 (p50) | 0.8 µs | not installed — skipped | not installed — skipped | not installed — skipped |
-| cypher scan-filter-project | 4.61 ms | not installed — skipped | not installed — skipped | not installed — skipped |
-| cypher two-hop join | 1.278 s | not installed — skipped | not installed — skipped | not installed — skipped | ¹
+| bulk_ingest | 8.647 s | not run | not run | not run |
+| neighborhood_depth1 (p50) | 1.0 µs | not run | not run | not run |
+| neighborhood_depth1 (p95) | 3.5 µs | not run | not run | not run |
+| neighborhood_depth2 (p50) | 0.8 µs | not run | not run | not run |
+| cypher scan-filter-project | 4.61 ms | not run | not run | not run |
+| cypher two-hop join | 1.278 s | not run | not run | not run | ¹
 
-## mushroomdb — bulk ingest throughput
+## mushroomdb: bulk ingest throughput
 
 - **Nodes ingested:** 10,000
 - **Wall time:** 8.647 s
 - **Throughput:** 1.2k nodes/s
 - **Chunk size:** 2k nodes / ingest_batch call (5 sequential chunks at 10k scale)
 
-## mushroomdb — neighbourhood latencies
+## mushroomdb: neighbourhood latencies
 
 - **depth-1 (node_edges):** p50=1.0 µs p95=3.5 µs (n=20)
 - **depth-2 (node_edges + neighbors + second-hop):** p50=0.8 µs p95=1.7 µs (n=20)
 
-## mushroomdb — Cypher workloads
+## mushroomdb: Cypher workloads
 
 - **scan-filter-project** (`MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key`): rows=1400 wall=4.61 ms
-- **two-hop join** (`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): rows=0 wall=1.278 s — query error: execute: intermediate result exceeds 1000000 rows — the executor has no LIMIT pushdown yet (roadmap item): the join materializes before LIMIT applies; add a LIMIT or constrain patterns with shared variables
+- **two-hop join** (`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): rows=0 wall=1.278 s; query error: intermediate result exceeds 1000000 rows; the executor has no LIMIT pushdown yet (roadmap item): the join materializes before LIMIT applies; add a LIMIT or constrain patterns with shared variables
 
-## mushroomdb — rule_derive (ours-only)
+## mushroomdb: rule_derive (ours-only)
 
 > **Auto-derivation has no competitor equivalent.**
 > Edges are derived automatically when rules are declared and on every
@@ -63,10 +67,10 @@ the cross-engine table.
 
 ## Competitors
 
-- **system A:** not installed — skipped  
-  _system A adapter: 'system A' Python driver not installed — install with 'pip install system A' to enable system A benchmarks._
-- **system B:** not installed — skipped  
-  _'system B' not installed — pip install system B (No module named 'system B')_
-- **system C:** not installed — skipped  
-  _system C adapter: no bolt driver installed — install with 'pip install a named system' or 'pip install system A' to enable system C benchmarks._
+- **system A:** not run  
+  _system A adapter: 'system A' Python driver not installed; install with 'pip install system A' to enable system A benchmarks._
+- **system B:** not run  
+  _'system B' not installed: pip install system B (No module named 'system B')_
+- **system C:** not run  
+  _system C adapter: no bolt driver installed; install with 'pip install a named system' or 'pip install system A' to enable system C benchmarks._
 

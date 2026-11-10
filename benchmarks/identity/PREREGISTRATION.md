@@ -1,7 +1,7 @@
-# SAME_AS quality gate — pre-registration (spec §8.3)
+# SAME_AS quality gate: pre-registration (spec §8.3)
 
 Written 2026-09-30 and committed before any identity code exists. An
-amendment is dated, says why, and is made before a run — never after one.
+amendment is dated, says why, and is made before a run, never after one.
 
 Corrected 2026-10-01, before any run and before any identity code: the
 rationale of floor 3 is restated truthfully and the Alex nodes' expected
@@ -10,20 +10,20 @@ behaviour is disclosed. No floor, label or number changed.
 ## What is measured
 
 The identity preset, `memory_schema::memory_identity()`: `Overlap` on each
-node's normalised `aliases` list at Jaccard ≥ 0.6, eleven rules — same-label
+node's normalised `aliases` list at Jaccard ≥ 0.6, eleven rules: same-label
 for Person, Org, Project, Concept, Event and the provisional Entity, and
 Entity → each entity label. The set is `benchmarks/identity/labelled.json`:
 34 nodes, 21 identities, 561 pairs, 18 positive. Every node is written through
-`remember` in list order — `entities[]` when its label is known, `about` when
-it is a stub — on a store with the memory defaults and the preset applied.
+`remember` in list order: `entities[]` when its label is known, `about` when
+it is a stub, on a store with the memory defaults and the preset applied.
 
 Two predictions are scored against the labels:
 
-1. **pairwise** — the `SAME_AS` claims, one per unordered pair;
-2. **clusters** — co-membership in the complete-linkage identities `analyze`
+1. **pairwise**: the `SAME_AS` claims, one per unordered pair;
+2. **clusters**: co-membership in the complete-linkage identities `analyze`
    reports.
 
-## The floors — each prediction must clear all three
+## The floors: each prediction must clear all three
 
 1. **Precision ≥ 0.90.** At most one false link in ten. Spec O-3 settled
    "precision over recall": a false link puts a wrong fact in every answer
@@ -49,7 +49,7 @@ Two predictions are scored against the labels:
 
 The set and the floors were written by the same author, who could compute
 every score by hand, and a pilot against the plan-writing prototype gave
-**9 true positives, 1 false positive, 9 false negatives on both predictions —
+**9 true positives, 1 false positive, 9 false negatives on both predictions;
 precision 0.900, recall 0.500.** So the gate is expected to pass at the
 precision floor with no margin: one more false link fails it. That is
 deliberate. This is a regression floor on a disclosed baseline, not a blind
@@ -70,7 +70,7 @@ john, smith}: 3/5 = 0.6, which reaches the floor and links.
 The one expected false positive is the identical-full-name pair,
 `john-smith-nyc` and `john-smith-sf`: two strangers with one name are
 indistinguishable to an alias rule. The link is visible, scored and
-explainable, and can be undone by changing either node's aliases — which is
+explainable, and can be undone by changing either node's aliases, which is
 link-first's whole argument for accepting it.
 
 ## Procedure
@@ -84,7 +84,7 @@ link-first's whole argument for accepting it.
 The runner computes the verdict and exits 1 when a floor is missed. Its
 `summary.md` is committed as it came out, PASSED or FAILED.
 
-## Amendment, 2026-10-01 — after the first run, before the second
+## Amendment, 2026-10-01: after the first run, before the second
 
 Amended 2026-10-01, after the first run (`results/20261001T061131Z`) and
 before the second: owner decision Q2 added explicit alias claims
@@ -112,14 +112,14 @@ and labelled set unchanged.
 ### The expectation, stated before the run
 
 Unchanged from the first run: **9 true positives, 1 false positive, 9 false
-negatives on both predictions — precision 0.900, recall 0.500, PASSED at the
+negatives on both predictions: precision 0.900, recall 0.500, PASSED at the
 precision floor with no margin.**
 
 Why nothing is expected to move:
 
 - A claim fires only when a declared alias equals a stub's key. The set
-  declares three aliases — `Ada Lovelace` (on `countess-lovelace`), `J. Doe`
-  (on `jd`) and `J Doe` (on `jane-doe`) — and holds five stubs, keyed
+  declares three aliases: `Ada Lovelace` (on `countess-lovelace`), `J. Doe`
+  (on `jd`) and `J Doe` (on `jane-doe`), and holds five stubs, keyed
   `Matthew_Sherlin`, `matt`, `Ada_Lovelace`, `MushroomDB` and `alex`. No
   declared alias equals a stub's key: `Ada Lovelace` is not `Ada_Lovelace`,
   and the match is exact. So no `KeyMatch` rule derives an edge.
@@ -133,7 +133,7 @@ gain is shown by tests instead: in `crates/core-api/tests/memory_identity.rs`,
 (the link, at 1.0, in both orders),
 `a_name_that_merely_spells_a_stubs_key_does_not_link_it` (the false positive a
 `KeyMatch` on `aliases` would add: `alex-1`, named "Alex", against the `alex`
-stub — two of them in this set, which would put precision at 0.750) and
+stub (two of them in this set, which would put precision at 0.750) and
 `a_claim_matches_the_stubs_key_exactly_so_case_differs_do_not_link`.
 
 What the new rules could do to this gate is add a false positive, not remove a
@@ -151,10 +151,10 @@ below 0.90 on either prediction is FAILED.
 
 The first run's directory is left as it is.
 
-## Amendment, 2026-10-01 (second amendment) — after the second run, before the third
+## Amendment, 2026-10-01 (second amendment): after the second run, before the third
 
 Amended 2026-10-01 (second amendment), after the second run
-(`results/20261001T143503Z`) and before the third: owner decision — declared
+(`results/20261001T143503Z`) and before the third: owner decision: declared
 aliases no longer count toward `Overlap`. Floors and labelled set unchanged.
 
 The owner also decided, the same day, to add an `Entity→Entity` claim rule,
@@ -169,9 +169,9 @@ the third run is unchanged at sixteen rules.**
 
 - **The derivation of `aliases`.** It was the key, the name, the name's words
   and every alias a caller declared, accumulated across writes. It is now
-  exactly what the node's current key and current name imply — the key
+  exactly what the node's current key and current name imply: the key
   lowercased, the name in canonical form, and each word of a name of two or
-  more words — recomputed on each describing write. A declared alias is kept
+  more words, recomputed on each describing write. A declared alias is kept
   only in `alias_keys`, where the five `KeyMatch` claim rules read it.
 - **The first two results were measured on the earlier derivation**
   (`results/20261001T061131Z` and `results/20261001T143503Z`). They are left as
@@ -189,16 +189,16 @@ its key and name with declared aliases excluded, `Overlap` at ≥ 0.6 over the
 label pairs the sixteen rules cover, and a claim wherever a declared alias
 equals a stub's key.
 
-**9 true positives, 1 false positive, 9 false negatives on both predictions —
+**9 true positives, 1 false positive, 9 false negatives on both predictions;
 precision 0.900, recall 0.500, PASSED at the precision floor with no margin.
 No pair changes side.**
 
 The set declares three aliases, on three nodes, so only pairs touching those
 nodes can move at all:
 
-- `jd` ~ `jane-doe`. Before: each held five aliases and they shared four —
+- `jd` ~ `jane-doe`. Before: each held five aliases and they shared four:
   `jane doe`, `jane`, `doe` and the declared `j doe` (`J. Doe` and `J Doe` fold
-  to the same form) — 4/6. Now: {jd, jane doe, jane, doe} against {jane-doe,
+  to the same form): 4/6. Now: {jd, jane doe, jane, doe} against {jane-doe,
   jane doe, jane, doe}, 3/5 = 0.6. Still linked, now exactly on the floor. A
   true positive before and after.
 - `countess-lovelace` against `ada-lovelace` and against `Ada_Lovelace`.

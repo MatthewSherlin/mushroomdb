@@ -1,4 +1,4 @@
-# mushroomdb dogfood — matching workload fixtures
+# mushroomdb dogfood: matching workload fixtures
 
 Validation of the shipped product (Python bindings) against a representative
 matching domain. Zero engine / UI / bindings source changes.
@@ -16,7 +16,7 @@ Test data; all data is synthetic or anonymized.
 | `users.json` | 7 User |
 | `applications.json` | 1 `INQUIRED` user→job |
 
-Plan 10 Task 1 cited 10 talent / 4 companies / 4 jobs / ~13 inquiries —
+Plan 10 Task 1 cited 10 talent / 4 companies / 4 jobs / ~13 inquiries;
 those counts do not match the copied files. Tests assert the verbatim
 counts. No `user_connections` JSON is in that fixture set (`CONNECTED` = 0).
 
@@ -35,7 +35,7 @@ and `MATCHES_DESIGN_STYLE` produce empty edge sets (honest).
   headcount (`<10/<50/<200/<500/else`; ListingsHub codes `110`…`50` and range
   strings like `10-50` / `50-200`)
 - `embedding` (Talent/Company only): synthetic 1536-dim unit vector, seeded
-  hash of industry + small per-key jitter. Documented as synthetic — fixtures
+  hash of industry + small per-key jitter. Documented as synthetic; fixtures
   have no production vectors. Same-industry pairs cosine ≫ 0.85.
 
 ## Rules (`rules.SIX_RULES`, 10 instances)

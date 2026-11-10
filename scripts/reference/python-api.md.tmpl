@@ -16,8 +16,8 @@ print(db.query("MATCH (p:Person) RETURN p.name AS name"))
 db.close()
 ```
 
-This page is the reference. For worked examples — rules, vector search, scoped handles,
-concurrency — see the Python sections of the [Python guide](python.md).
+This page is the reference. For worked examples (rules, vector search, scoped handles,
+concurrency), see the Python sections of the [Python guide](python.md).
 
 A handle is also a context manager: `with mushroomdb.GraphDb.open(path) as db:` closes it on
 exit.

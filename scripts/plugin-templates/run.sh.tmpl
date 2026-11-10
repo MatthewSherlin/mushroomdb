@@ -2,14 +2,14 @@
 # mushroomdb plugin hooks: run the package, without paying npx every time.
 #
 # `npx -y mushroomdb@<version> …` costs about half a second before it does any
-# work — a cache check, a version resolve and a Node process of its own — and
+# work (a cache check, a version resolve and a Node process of its own) and
 # the hooks that call it fire on every prompt and every session start. This script
 # pays that once, writes down where the package put its native binary, and
 # execs that binary from then on.
 #
 # Measured warm, `--version` end to end: npx 514 ms, `node <launcher>` 118 ms,
 # the native binary 7 ms. The launcher is only a shim that spawns the binary
-# anyway, so Node's startup is nearly the whole difference — hence the order
+# anyway, so Node's startup is nearly the whole difference, hence the order
 # below.
 #
 # The cache is one line of text per resolved path, named for the version that
@@ -21,13 +21,13 @@
 # ELSE. A line in it is a path this script `exec`s with the hook's arguments
 # and the prompt payload on stdin, so where it may be read from is a security
 # question, not a convenience one. Both of those directories are already the
-# user's own — anything able to write there can already edit their shell
-# startup files — but a world-writable fallback such as /tmp would let any
+# user's own (anything able to write there can already edit their shell
+# startup files), but a world-writable fallback such as /tmp would let any
 # local user drop in a path and have the next prompt run it. So when neither
 # variable is set there is no cache at all: the script resolves every time,
 # which is the same graceful degradation as a cache that cannot be written.
 #
-# Rendered from scripts/plugin-templates/run.sh.tmpl — edit that, then run
+# Rendered from scripts/plugin-templates/run.sh.tmpl; edit that, then run
 # scripts/render-plugin.sh.
 set -u
 
@@ -46,10 +46,10 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# read_cache <file> — the single line in it, if there is a cache to read.
+# read_cache <file>: the single line in it, if there is a cache to read.
 read_cache() { [ -n "$1" ] && [ -f "$1" ] && cat "$1" 2>/dev/null; }
 
-# remember <file> <path> — best effort, and a no-op with no cache directory; a
+# remember <file> <path>: best effort, and a no-op with no cache directory; a
 # cache that cannot be written just means the next hook resolves again.
 remember() {
   [ -n "$1" ] || return 0
@@ -86,7 +86,7 @@ if have npx; then
   fi
 fi
 
-# 4. Whatever went wrong above, the slow form still works — when there is an
+# 4. Whatever went wrong above, the slow form still works, when there is an
 #    npx to run it with. Without one there is no rung left, and `exec` on a
 #    missing program prints `run.sh: line N: exec: npx: not found` and exits
 #    127. On UserPromptSubmit that is an error line before every prompt. The

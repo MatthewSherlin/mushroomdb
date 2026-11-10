@@ -137,7 +137,7 @@ assert!(matches!(refused, Err(GraphError::CasConflict { .. })));
   fails it returns `GraphError::CasConflict`, which names the key, and writes nothing.
 - Create a rule in a batch of its own.
 
-**Error semantics — validate-then-apply:** the closure queues ops without
+**Error semantics (validate-then-apply):** the closure queues ops without
 touching the database. `commit` validates every op before writing anything.
 If op N fails validation (duplicate key, unknown key, rule-owned edge) the
 entire batch is rejected: no WAL bytes written, no in-memory state changes.

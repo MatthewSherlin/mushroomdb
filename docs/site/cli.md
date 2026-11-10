@@ -90,7 +90,7 @@ mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-tok
                    MUSHROOMDB_TX_MAX, MUSHROOMDB_TX_TIMEOUT_SECS and MUSHROOMDB_TX_MAX_LIFETIME_SECS
 ```
 
-Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not. `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
+Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` or an admin key on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it (`npx`, Docker and the release binaries do; `cargo install` does not). `--bolt-port` also serves Bolt on `--addr`'s IP, with the same credentials, and TLS when `--tls-cert` is given; see [Bolt protocol](bolt.md) for the `--bolt-*` flags and their variables. `--tx-max`, `--tx-timeout-secs` and `--tx-max-lifetime-secs` set the limits on [HTTP transactions](http.md#transactions), each winning over its environment variable
 
 ### `mcp`
 
@@ -127,7 +127,7 @@ mushroomdb asof <db-dir> --commit N|--at <date> [--query "MATCH ..."|--file <pat
                    --commit and --at
 ```
 
-Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then
+Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339): the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then
 
 ### `why`
 
@@ -137,7 +137,7 @@ mushroomdb why <db-dir> <a> <b>
                                  derived it, or a note that there is none
 ```
 
-Every rule edge between two keys with the evidence that derived it, or a note that there is none — the shell form of `explain_association`
+Every rule edge between two keys with the evidence that derived it, or a note that there is none (the shell form of `explain_association`)
 
 ### `stats`
 
@@ -164,9 +164,9 @@ mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
 mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
 ```
 
-**`pagerank`/`wcc`/`degree`** — PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
+**`pagerank`/`wcc`/`degree`**: PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
 
-**`communities`** — Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
+**`communities`**: Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
 
 ## Build and maintain a store
 
@@ -221,7 +221,7 @@ mushroomdb build-index <db-dir> [--rule <name>]
                    created over a large corpus derives no edges until its index is whole
 ```
 
-Drive a rule's vector index to completion a slice at a time, for an operator who wants the build finished before traffic arrives — a rule created over a large corpus derives no edges until its index is whole. After a restart, the first write or this command is what registers an unfinished build
+Drive a rule's vector index to completion a slice at a time, for an operator who wants the build finished before traffic arrives: a rule created over a large corpus derives no edges until its index is whole. After a restart, the first write or this command is what registers an unfinished build
 
 ### `snapshot`
 
@@ -271,7 +271,7 @@ mushroomdb backup <db-dir> <dest>   process-local consistent copy of the databas
                                     use POST /backup on the HTTP server for live-serve backups
 ```
 
-Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores
+Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve`; use `POST /backup` for live-served stores
 
 ### `restore`
 
@@ -332,7 +332,7 @@ Bulk-load CSV or JSONL files. `--jsonl` reads the single file `export --format j
 mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
 ```
 
-Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin and prints a `recall` digest for it — a question in ordinary words is enough — and nothing when the store has nothing to say. Wired automatically by `install`
+Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin and prints a `recall` digest for it (a question in ordinary words is enough) and nothing when the store has nothing to say. Wired automatically by `install`
 
 ### `brief`
 
@@ -342,7 +342,7 @@ mushroomdb brief <db-dir>|--auto    hook body: the store's schema in one block �
                                     question kind; byte-stable, so a session host caches it once
 ```
 
-The store's schema in one block — labels, edge types, how deep its history runs, who may read it, and one worked call per question kind — capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart`
+The store's schema in one block (labels, edge types, how deep its history runs, who may read it, and one worked call per question kind), capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart`
 
 ## Version and help
 
@@ -391,7 +391,7 @@ store at the same time. A writer that cannot get the lock within two seconds exi
 `another mushroomdb process is writing; retry`, having written nothing. Readers never take the
 lock and never wait; `recall` opens read-only (`read_only: true`) so an unattended hook can never
 delay a writer or fail because one is running. What the lock does *not* give you: cross-process
-transactions, and subscription events for a peer's writes — a commit absorbed by `refresh()` is
+transactions, and subscription events for a peer's writes: a commit absorbed by `refresh()` is
 visible on the next read but notifies nobody. Full model:
 [`docs/site/concurrency.md`](concurrency.md).
 

@@ -1,6 +1,6 @@
 # Running several processes against one store
 
-[concurrency.md](concurrency.md) describes the two mechanisms — the advisory
+[concurrency.md](concurrency.md) describes the two mechanisms: the advisory
 write lock and the WAL frame cursor. This page is the other half: which
 *arrangements* of processes those mechanisms support, and what each one does
 when it goes wrong.
@@ -22,8 +22,8 @@ from a lock file.
 
 The writer opens read-write and holds the store's `LOCK` for as long as its
 handle lives. Every reader opens with `read_only=True`, which never takes the
-lock, never makes the writer wait, and writes nothing to disk at open — not
-even a WAL repair the reader might otherwise think warranted.
+lock, never makes the writer wait, and writes nothing to disk at open (not
+even a WAL repair the reader might otherwise think warranted).
 
 Readers pick up the writer's commits by calling `refresh()`. Nothing pushes:
 a handle does not poll the store on its own, and no commit reaches a reader
@@ -42,8 +42,8 @@ r.node_info("d-1")
 
 **The failure mode is staleness, and it is the documented cost.** A reader that
 never refreshes keeps answering from the last state it loaded. Those answers are
-internally consistent — a commit is applied whole or not at all, so no read ever
-observes half of one — they are simply from the past. That is not a bug to be
+internally consistent: a commit is applied whole or not at all, so no read ever
+observes half of one; they are simply from the past. That is not a bug to be
 reported; it is what "no polling" buys, and `refresh()` is the entire remedy.
 
 Two related facts are worth having in hand:
@@ -52,7 +52,7 @@ Two related facts are worth having in hand:
   child may both call it freely.
 - **A commit the writer is midway through appending is left alone.** The
   trailing bytes are not yet a whole frame, so `refresh()` skips them, returns
-  the count of complete frames it did apply — possibly zero — and the handle
+  the count of complete frames it did apply (possibly zero) and the handle
   stays stale until that frame lands. A partial write is a wait, not an error
   (`crates/core-api/tests/multiprocess.rs`,
   `partial_trailing_frame_is_not_an_error`).
@@ -64,15 +64,15 @@ read; the notification is not.
 
 ## Supported: N writers, serialised by the lock
 
-Several processes may write to one store. They do not write at the same time —
-the lock serialises them — and the serialisation is visible, not silent.
+Several processes may write to one store. They do not write at the same time;
+the lock serialises them, and the serialisation is visible, not silent.
 
 Where the `Busy` surfaces depends on which handle you are holding, and the
 difference matters when you are laying out processes:
 
 - **A plain read-write handle takes the lock at open and holds it for its
   lifetime.** `GraphDb.open("./store")` is this handle, and so is every
-  one-shot CLI command. A second one — in this process or any other — polls for
+  one-shot CLI command. A second one (in this process or any other) polls for
   up to `WRITE_LOCK_WAIT` (2 s, `WRITE_LOCK_WAIT` in `crates/core-api/src/db.rs`)
   and then raises `MushroomBusy`. **The refusal arrives at `open`, not at the
   first write.**
@@ -91,7 +91,7 @@ except MushroomBusy:
 ```
 
 **Retrying is always safe.** When the lock is refused, nothing was written to
-the WAL and no in-memory state changed — the handle never got far enough to
+the WAL and no in-memory state changed; the handle never got far enough to
 mutate anything. `Busy` means "another process is writing right now", never
 "something is wrong with the store". There is no partial commit to clean up and
 no state to reconcile before the retry.
@@ -118,7 +118,7 @@ failure is silent in both of the mechanisms this page rests on:
 - **The lock stops being exclusive.** `LOCK` is an OS advisory lock on an open
   file description. Its behaviour over a network filesystem depends on the
   protocol version, the mount options and the server's lock daemon, and where
-  it degrades it does so by granting — two processes each believe they hold the
+  it degrades it does so by granting: two processes each believe they hold the
   lock and interleave frames into one WAL. Nothing raises. The corruption
   surfaces later, as a WAL that does not decode.
 - **Staleness detection stops being prompt.** `refresh()` and `is_stale()` both
@@ -126,8 +126,8 @@ failure is silent in both of the mechanisms this page rests on:
   mount that caches attributes can report the old length for as long as its
   attribute timeout, so a reader will not see a commit that has already landed.
 
-A single-process store on a network mount is a different question — one
-process, one handle, no lock contention — but multi-process coordination over a
+A single-process store on a network mount is a different question (one
+process, one handle, no lock contention), but multi-process coordination over a
 network filesystem is exactly the folklore this page exists to replace. Do not
 rely on it.
 
@@ -137,14 +137,14 @@ There is **no supported way to turn the lock off**, and this is worth saying
 plainly because the shape gets proposed. No `OpenOptions` field, no Python
 argument, no CLI flag and no environment variable disables it. The one
 unlocked open in the codebase, `GraphDb::open_unlocked`, is `pub(crate)` and
-exists solely so `SharedDb` can take the lock per write instead of per handle —
+exists solely so `SharedDb` can take the lock per write instead of per handle:
 it is a change of *granularity*, not an opt-out.
 
 What can still happen, because the lock is **advisory**:
 
 - **A program that is not mushroomdb edits the store directory.** The lock
   coordinates cooperating mushroomdb processes. It does not stop an unrelated
-  process — a backup tool writing in place, a sync client, a shell redirect —
+  process (a backup tool writing in place, a sync client, a shell redirect)
   from touching `wal.bin` or the snapshot. Nothing detects it at the time.
 - **Two paths to the same directory look like two stores.** The lock is held per
   inode, so two processes reaching the same bytes through different mounts or
@@ -182,7 +182,7 @@ The shape this page was written for. A store that is **rebuilt on boot**, not
 backed up: one writer per task, readers refreshing on an interval, and nothing
 in the store that could not be regenerated from the system of record.
 
-**On boot — rebuild, one writer, then let go of the lock.**
+**On boot: rebuild, one writer, then let go of the lock.**
 
 ```python
 import mushroomdb
@@ -201,10 +201,10 @@ rebuild()
 ```
 
 `snapshot()` needs the lock too, and the handle above already holds it. On a
-store whose contents are disposable the snapshot is not about durability — it
+store whose contents are disposable the snapshot is not about durability; it
 is about the next open being a load rather than a replay.
 
-**Per task — one writer, opened and closed.**
+**Per task: one writer, opened and closed.**
 
 ```python
 from mushroomdb import GraphDb, MushroomBusy
@@ -223,7 +223,7 @@ another task's writer gets it next. `MushroomBusy` here is a re-queue, not an
 error to log at warning level: on a disposable store the work is derived from
 state that is still there.
 
-**Readers — open once, refresh on an interval.**
+**Readers: open once, refresh on an interval.**
 
 ```python
 import threading, time
@@ -243,7 +243,7 @@ the WAL and rebuilds indexes, which is the expensive thing `refresh()` exists to
 avoid. One long-lived read-only handle plus an interval refresh is the shape.
 
 Scoping composes with all of this. `reader.scoped(role="tenant-a")` is a child
-of the one open handle — no second open, no second lock — and it may `refresh()`
+of the one open handle (no second open, no second lock) and it may `refresh()`
 like any other. See [masks.md](masks.md#scoped-one-front-door-for-visibility).
 
 ### Choosing the interval

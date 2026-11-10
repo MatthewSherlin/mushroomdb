@@ -1,4 +1,4 @@
-# Prompt-hook latency on a large memory store — procedure
+# Prompt-hook latency on a large memory store: procedure
 
 Written 2026-10-01, before the first run. No result existed when this was committed.
 
@@ -22,8 +22,8 @@ Built by `cargo run --release -p mushroomdb-cli --example hook_latency_store -- 
 
 The generator is deterministic: the same command builds the same store.
 
-The people's names are drawn from the same 2,000 words as the notes — person `p` is named
-word `p` and word `p + 1000` — so every name word also occurs in about 600 notes.
+The people's names are drawn from the same 2,000 words as the notes: person `p` is named
+word `p` and word `p + 1000`, so every name word also occurs in about 600 notes.
 
 ## What is timed
 
@@ -31,9 +31,9 @@ word `p` and word `p + 1000` — so every name word also occurs in about 600 not
 
 For each of three prompts, 20 runs, each a new process, wall clock from spawn to exit:
 
-1. a name the store holds — `"wlomipuka wlomipulo"`, the two words of `person-0421`'s name;
-2. two common words of the vocabulary — `"wkakakaka wlokakaka"`, each in about 600 notes;
-3. a prompt that matches nothing — `"zzqx vvkw"`.
+1. a name the store holds: `"wlomipuka wlomipulo"`, the two words of `person-0421`'s name;
+2. two common words of the vocabulary: `"wkakakaka wlokakaka"`, each in about 600 notes;
+3. a prompt that matches nothing: `"zzqx vvkw"`.
 
 The prompt reaches the hook as it does from the host: a JSON object on stdin whose `prompt`
 field carries the text.

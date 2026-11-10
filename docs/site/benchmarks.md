@@ -1,7 +1,8 @@
 # Benchmarks
 
 mushroomdb's own numbers. Each row names the committed file it comes from, and each file records
-its machine, date and command. Embedded: no figure includes a network round-trip.
+its machine, date and command. Embedded: no figure includes a network round-trip. They were
+measured on earlier releases, as the last column says, and have not been rerun on 0.10.
 
 | Workload | Result | Measured |
 |---|---|---|
@@ -25,7 +26,7 @@ the medians of three above: backfill 8.611 s for 0.6.12 against 8.584 s for this
 tree is
 [`mushroomdb-10k-0.7.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/results/mushroomdb-10k-0.7.md). Rows 8–9:
 [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md), warm file cache, cold process;
-cold-cache was not measured. A memory-shaped run to 1,000,000 nodes on the 0.8.0 wheel — ingest, `remember`, `recall`, open from a snapshot and from the WAL — is
+cold-cache was not measured. A memory-shaped run to 1,000,000 nodes on the 0.8.0 wheel (ingest, `remember`, `recall`, open from a snapshot and from the WAL) is
 [`dogfood/results/scale-memory-1m.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-memory-1m.md).
 
 Runs from 2026-08-21 and 2026-08-24 reported 2.85–3.51 s for the rule backfill. That was a
@@ -41,15 +42,15 @@ and the earlier 784 ms ingest was a single shot
 Rule engine against hand-rolled maintenance (10,000 nodes, 1,000 specialty updates, drift 0 for
 all three): per-operation hand-written **64.93 min**, batched hand-written **24.98 s**, rule
 engine **17.58 s**. Both hand-rolled variants were written by the engine team with full
-knowledge of retraction semantics — drift 0 is a property of that, not of hand-rolling in
+knowledge of retraction semantics: drift 0 is a property of that, not of hand-rolling in
 general. [`benchmarks/results/handrolled-vs-rules.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/results/handrolled-vs-rules.md)
 
 **Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
-twenty relationship questions of one generated world written three ways — as JSON files, as a
+twenty relationship questions of one generated world written three ways: as JSON files, as a
 single relational file, and as a mushroomdb store. **The pre-registered gate passed on 0.6.12**, in
 [`20260928T195302Z`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/summary.md), on a
-2,000-entity world — the first run in which it has. The graph arm scored **1.000 on all twenty
+2,000-entity world (the first run in which it has). The graph arm scored **1.000 on all twenty
 tasks and all sixty cells** against the relational baseline's 0.990, at **$0.0614 against
 $0.1127**:
 
@@ -64,8 +65,8 @@ That run was on 0.6.12, whose default listing was 19 tools; 0.7's is 23 and abou
 so the cost row is not 0.7's. The suite has not been re-run on 0.7.
 
 180 cells, 0 timeouts, 0 errors, 0 dropped. Correctness had been amended on 2026-09-11 to pass on
-a tie, because the relational arm saturated at 1.00 and the original wording — exceed both baselines,
-interval excluding zero — was judged unpassable; **this run passes the original wording.** Every
+a tie, because the relational arm saturated at 1.00 and the original wording (exceed both baselines,
+interval excluding zero) was judged unpassable; **this run passes the original wording.** Every
 one of the six sub-1.0 cells belongs to a baseline, and each key they missed was named correctly by
 the graph arm in the same rep:
 [`classification.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/classification.md).

@@ -38,7 +38,7 @@ That number is not read-path degradation. `1r0w` is one reader doing 16
 depth-1 neighborhoods (~1.15 µs each) plus spawn/join. `16r1w` is the same
 reader loop **plus 16 exclusive `set_prop` calls** (each a WAL fsync, same
 order as `rule_incremental_fire` ~4 ms) while readers spin until `stop`.
-16 × ~4 ms ≈ 64–80 ms — the whole `*r1w` wave.
+16 × ~4 ms ≈ 64–80 ms: the whole `*r1w` wave.
 
 Same writer burst, more readers:
 
@@ -81,7 +81,7 @@ a measured 25% hit on this 10k graph.
 The binding ratio is 1887× because the numerator includes 16 fsyncs and the
 denominator does not. Read-path degradation with writer work held fixed is
 +10.3% (`16r1w` vs `4r1w`), below the 25% bar. That +10.3% is **7.2 ms**
-and sits inside the `16r1w` MAD of **6.9 ms** — read-scaling overhead is
+and sits inside the `16r1w` MAD of **6.9 ms**; read-scaling overhead is
 statistically indistinguishable from noise. Do not treat +10.3% as a
 measured lock tax; re-measure the epoch-readers trigger on a harness that
 isolates per-read latency. `parking_lot` cannot remove WAL fsync and is
@@ -106,7 +106,7 @@ applies the mutation to the inactive side, then flips an `AtomicPtr` /
 | Reads | Lock-free. No park on the tokio worker. |
 | Writes | Applied twice (once per replica) or applied once and copied. |
 | Memory | 2× the in-memory graph. |
-| Storage | Current mutable `GraphDb` is enough — no immutability rewrite. |
+| Storage | Current mutable `GraphDb` is enough: no immutability rewrite. |
 | Consistency | A `read()` guard pins one replica for its lifetime, same as today. |
 
 Cost is honest: 2× RAM on a design that already holds the working graph
@@ -114,8 +114,8 @@ in memory (4.72 GiB peak at the 100,000 nodes measured), and 2× CPU on
 every write. Two write strategies, both unfinished:
 
 - **Snapshot-copy** (apply once, clone onto the inactive side) is a full
-  in-memory graph clone — multi-GB already at the 100,000 nodes
-  measured, paid on every publish.
+  in-memory graph clone (multi-GB already at the 100,000 nodes
+  measured), paid on every publish.
 - **Apply-twice** (replay the mutation on each replica) can diverge unless
   every write is applied deterministically and in the same order on both
   sides. A missed fire, a non-deterministic rule walk, or a one-sided
@@ -138,7 +138,7 @@ ArcSwap here would clone the world per write. **Not** a pre-1.0 swap.
 1. **Pre-1.0:** keep `std::sync::RwLock`. Numbers do not support
    `parking_lot`. If multi-client HTTP starts parking worker threads, wrap
    `read()`/`write()` in `tokio::task::spawn_blocking` (already noted on
-   `router`) — that is a runtime placement fix, not a lock swap.
+   `router`); that is a runtime placement fix, not a lock swap.
 2. **When lock-free reads are required and storage is still mutable:**
    left-right dual replica. Same `read()` / `write()` types; 2× memory is
    the fee.

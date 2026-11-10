@@ -28,7 +28,7 @@ Relationship-property writes (`SET r.p`, `SET r += …`, `SET r = …`, `REMOVE 
 `CREATE` relationship map) emit `EdgePropSet` and `EdgePropRemoved` events on both
 `subscribe_writes()` and `/subscribe` with `{"writes": true}` (row 155, closed in 0.10.5).
 
-Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
+Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber**; the next commit prunes the dead entry; no resources leak.
 
 ### Reading events
 
@@ -66,7 +66,7 @@ pub enum DbEvent {
 
 `commit_seq` is a monotonically increasing counter per `log_then_apply_with` call. All events from a single `write_batch` or Cypher statement share the same `commit_seq` and arrive as a contiguous run in declaration order.
 
-### Overflow — Lagged
+### Overflow: Lagged
 
 Each subscription has a bounded queue (default: 65,536 events). When the queue is full, events are dropped and the internal missed counter is incremented. The next read that finds an empty queue and a non-zero miss count returns `DbEvent::Lagged { missed: N }` before continuing with queued events.
 
@@ -113,7 +113,7 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 
 ## Query subscription skip optimization (v0.4.3)
 
-`subscribe_query` re-executes the plan on every commit. v0.4.3 adds a label-skip fast-path: if the commit can be proven to touch only nodes with a label that does not match the subscription's leading scan, re-execution is skipped entirely — the result set cannot have changed.
+`subscribe_query` re-executes the plan on every commit. v0.4.3 adds a label-skip fast-path: if the commit can be proven to touch only nodes with a label that does not match the subscription's leading scan, re-execution is skipped entirely; the result set cannot have changed.
 
 ### When a subscription is skipped
 

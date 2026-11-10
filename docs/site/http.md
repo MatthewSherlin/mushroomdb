@@ -35,7 +35,7 @@ read the same three ways, though the server never sets the cookie for one. A rol
 receives a node-visibility mask derived from the
 named role's label selectors (defined in `schema.json` or `roles.json`), and
 optionally narrowed by one property test on those labels. The mask is resolved
-live at request time against the same DB snapshot used for the query — one
+live at request time against the same DB snapshot used for the query: one
 read-lock acquisition, memoised per commit so a scoped reader between two writes
 resolves its role once.
 
@@ -49,27 +49,27 @@ A role may carry a `visible_where` predicate beside its labels:
 }
 ```
 
-`visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }` — the predicate
+`visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }`: the predicate
 narrows the labels leg only, never `keys`, and a node missing the property fails
 it. Only `eq` (one value) and `in` (a list) exist, exactly one per predicate, and
 a predicate on a role with no labels is refused. Values may be written as plain
 JSON scalars, as above, or in the graph's tagged encoding (`{"Str": "published"}`)
-— both are accepted, and the tagged form is what the server writes back. See
+; both are accepted, and the tagged form is what the server writes back. See
 [masks.md](masks.md#narrowing-a-role-by-a-property).
 
 Role-token behavior per endpoint:
 
 | Endpoint | Role-token response |
 |---|---|
-| `GET /health` | 200 `{"ok":true}` — reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
-| `GET /ready` | 200 `{"ok":true}` — reachable without a credential, like `/health` |
-| `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
+| `GET /health` | 200 `{"ok":true}`: reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
+| `GET /ready` | 200 `{"ok":true}`: reachable without a credential, like `/health` |
+| `POST /query` (read) | 200: rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
 | `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
 | `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
 | `DELETE /node/{key}` | 200 if node visible and `label` in `delete_labels`; 403 otherwise |
 | `POST /edges` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
 | `DELETE /edges/{t}/{s}/{d}` | 200 if type in `delete_edge_types` and both endpoints visible; 403 otherwise |
-| `POST /edges/upsert` | 200 if type in `create_edge_types`, every existing endpoint visible, and — for an endpoint it has to create — `placeholder_label` in `create_labels`; 403 otherwise |
+| `POST /edges/upsert` | 200 if type in `create_edge_types`, every existing endpoint visible, and, for an endpoint it has to create, `placeholder_label` in `create_labels`; 403 otherwise |
 | `PUT /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `DELETE /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `POST /ingest` | 200 if `label` in `create_labels`; 403 otherwise (all-or-nothing) |
@@ -79,12 +79,12 @@ Role-token behavior per endpoint:
 | `GET /node/{key}/history` | 200 with edge-event entries whose `other` endpoint is hidden filtered out; 404 if the target key is hidden or absent |
 | `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
-| `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
-| `GET /schema/indexes`, `GET /schema/constraints` | 200 — only the rows whose label the role can see a node of, as `SHOW` lists them |
+| `POST /find_similar` | 200: vector search; client `mask` intersects role mask (never widens) |
+| `GET /schema/indexes`, `GET /schema/constraints` | 200: only the rows whose label the role can see a node of, as `SHOW` lists them |
 | `POST`/`DELETE /schema/indexes`, `/schema/constraints` | 403 (schema changes are not permitted to a role token) |
 | `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
-| `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
+| `POST /rules` | 403 (administrative: all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
 | `GET /suggest` | 403 (scans full graph) |
 | `POST /algo/*` | 403 (full-graph algorithms) |
@@ -94,7 +94,7 @@ Role-token behavior per endpoint:
 | `POST /backup` | 403 |
 
 Roles without a `write` scope (or roles defined in a v1 sidecar) receive 403 on all
-write endpoints — exactly the v1 read-only behavior.
+write endpoints: exactly the v1 read-only behavior.
 
 **Never-widen invariant:** unknown token → 401; token bound to a role name not
 present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
@@ -102,7 +102,7 @@ role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
 any role carries a write scope, v3 when any role carries a `visible_where`
 predicate, v4 when any role is bound to one or more namespaces). A version this
-binary does not recognise poisons the roles state rather than loading it —
+binary does not recognise poisons the roles state rather than loading it;
 denying beats over-granting.
 
 ## Access keys and the write tier
@@ -201,7 +201,7 @@ All fields default to empty (read-only). `update_edge_types` lets a role write
 the properties of an existing relationship of those types (Cypher `SET r.p`,
 `SET r += …`, `REMOVE r.p`) between two visible nodes; creating a relationship
 with its property map needs only `create_edge_types`. Each label field must be a subset of the
-role's read `labels` — `apply_schema` rejects disjoint write and read scopes with
+role's read `labels`: `apply_schema` rejects disjoint write and read scopes with
 an error naming the role and offending label.
 
 Example `schema.json` role definition:
@@ -226,7 +226,7 @@ No write a role performs may make data visible to itself or any other party that
 was not already visible before the write. Concretely:
 
 - A role may only update or delete nodes currently in its read mask.
-- MERGE on a hidden key returns 403 "target node not visible" — indistinguishable
+- MERGE on a hidden key returns 403 "target node not visible", indistinguishable
   from a non-existent key (no existence oracle).
 - Edge creation requires both endpoints to be in the role's read mask.
 - When a role's CREATE triggers a derivation rule that links to a hidden neighbor,
@@ -250,13 +250,13 @@ All write denials return 403 with a structured JSON body:
 ```
 
 The "target node not visible" response is identical for hidden nodes and
-non-existent nodes — the role cannot distinguish the two cases.
+non-existent nodes; the role cannot distinguish the two cases.
 
 The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
 **create** a node inside them, because a node it could never read back would be a
 write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and a
 `MERGE` that names `ns`. A create naming no namespace is a create in `default`, so a
-role not bound to `default` is refused there too — except a `MERGE` whose executing
+role not bound to `default` is refused there too, except a `MERGE` whose executing
 role is bound to exactly one namespace, which stamps that namespace on the create
 arm. A role bound to two or more namespaces cannot `MERGE`-create unless the
 pattern names one `ns`; the refusal is
@@ -291,7 +291,7 @@ See [masks.md](masks.md#namespaces).
 
 **Accepted structural disclosure:** a role holding `create_labels` for some label
 can learn whether a given key exists in the global key namespace by attempting a
-CREATE — if the key is hidden (exists under a different label) the response is
+CREATE; if the key is hidden (exists under a different label) the response is
 "target node not visible" rather than the success response for a truly absent key.
 This key-existence signal is structural and predates write scopes (a full-token
 INSERT does the same via DuplicateKey). The disclosure is confined to roles holding
@@ -321,7 +321,7 @@ An error the server's own handlers raise is one JSON object, `{"error": "<what w
 | 400 | A field is missing or wrong, or the engine refused the request: an unknown key on a write, a duplicate key, a rule-owned edge, a query that does not parse |
 | 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
 | 403 | A role-bound token asked for something outside its role. The message says what |
-| 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
+| 404 | A key that does not exist on a read route, `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history`, or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
 | 409 | `POST /nodes/{key}/rename` onto a key that is taken, or a write that would give a second node a value a unique constraint covers; on `/tx/*`, a commit conflict or a transaction that is busy |
 | 410 | On `/tx/*`, a transaction rolled back after sitting idle past its timeout |
 | 413 | A request body over 64 MiB, or a `Binary` value over 1 MiB |
@@ -391,7 +391,7 @@ Liveness. It needs no token and never answers 401, so a load balancer can call i
 {"ok": true}
 ```
 
-With the full-access token — or on a server started with no token at all — it also says what
+With the full-access token, or on a server started with no token at all, it also says what
 it is serving:
 
 ```json
@@ -434,7 +434,7 @@ Use `/health` to ask whether the process is alive and `/ready` to ask whether to
 ```
 
 `namespaces` (v0.6.6) lists every namespace with at least one live node, in name
-order, always including `default` — so a store that has never named a namespace
+order, always including `default`; so a store that has never named a namespace
 reports exactly one entry. The route requires a full-access token, as it always did,
 which is also what keeps the roster from being a cross-tenant disclosure: a role token
 gets 403 here. MCP `stats` takes `role` / `namespace` to narrow the roster instead.
@@ -586,7 +586,7 @@ backup read-only and runs the CRC verifier.
 
 Responses:
 
-- `200 OK` — backup completed and verified. Body:
+- `200 OK`: backup completed and verified. Body:
 
   ```json
   {
@@ -596,11 +596,11 @@ Responses:
   }
   ```
 
-- `500 Internal Server Error` — backup succeeded but verification failed
+- `500 Internal Server Error`: backup succeeded but verification failed
   (`verified: false` in body). Treat as a failure; do not use the backup.
 
 **This is the correct path for live-served stores.** Running `mushroomdb backup` CLI
-against a directory that a `serve` process is writing to is unsafe — the CLI copies
+against a directory that a `serve` process is writing to is unsafe; the CLI copies
 are not atomic across processes. Use `POST /backup` when the server is running.
 
 See [format-stability.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the PITR (point-in-time
@@ -628,18 +628,18 @@ a 400, and a list holding a null cannot be stored. A null inside a map parameter
 
 `stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
 request resolved to appear as `{"key": "…", "restricted": true}` rather than being
-omitted. That mask is whichever one applies — a client `mask`, a `namespace` alone, or
-the two intersected — so a `namespace`-only request honours `stub_hidden` exactly as a
+omitted. That mask is whichever one applies, a client `mask`, a `namespace` alone, or
+the two intersected, so a `namespace`-only request honours `stub_hidden` exactly as a
 key allow-list does. See [masks.md](masks.md) for the full policy. Note: Cypher result
-rows are **always omit-only** — `stub_hidden` has no effect on which rows the query
+rows are **always omit-only**; `stub_hidden` has no effect on which rows the query
 returns; it only affects the node-info, edges, and neighborhood endpoints.
 
-Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
+Role tokens: `stub_hidden` is silently ignored, except with `as_of`, where it is
 refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are
 always fully omitted for role-token requests.
 
 `as_of` (optional): a 0-based WAL commit index. The query is answered from the
-graph as it existed at that commit, read-only — a write statement with `as_of`
+graph as it existed at that commit, read-only; a write statement with `as_of`
 is a 400. It composes with a role token and with a client `mask`, both of which
 are resolved against the graph as it was then; a role token plus a client mask
 still intersects, never widens. The role *definition* itself is the current one
@@ -672,8 +672,8 @@ reuse). To revoke history, prune archives or narrow the role. See
 }
 ```
 
-It **intersects** every other restriction — a role token's own `namespaces` binding,
-a client `mask`, and `as_of` — so it can only narrow, never widen: a token bound to
+It **intersects** every other restriction, a role token's own `namespaces` binding,
+a client `mask`, and `as_of`, so it can only narrow, never widen: a token bound to
 `tenant-a` asking for `tenant-b` gets an empty result, not the union. A role bound to
 namespaces needs no `namespace` in the body at all; the resolver applies its binding
 to `POST /query` and to `GET /node/{key}`, `/edges`, `/neighborhood` and the history
@@ -683,7 +683,7 @@ you name the nodes that name no namespace). A name no node uses is an empty mask
 invalid name is a 400 naming the rule. Like `mask`, passing it makes the request a
 read. See [masks.md](masks.md#namespaces-on-every-surface).
 
-**Cost.** An `as_of` read — role-token reads included — replays the WAL under
+**Cost.** An `as_of` read, role-token reads included, replays the WAL under
 the store's read guard for the duration of the query; it does not use the
 lock-free epoch snapshot that a plain read uses. Replay cost grows with the
 number of commits since the last truncating snapshot, so on a large store take
@@ -722,15 +722,15 @@ operators), `RETURN` with optional `AS`, `ORDER BY`, `SKIP`, `LIMIT`.
 Relationship patterns `->`, `<-`, `-` with optional type and variable.
 
 **Write statements** sent to `/query` (server routes to write-lock automatically):
-- `CREATE (n:Label {id: 'key', ...})` — insert node(s) and optional edges
-- `MATCH … SET n.field = value` — update properties
-- `MATCH … REMOVE n.field` — remove properties (a missing property is a no-op)
-- `MATCH … SET n += {k: v, …}` / `SET n = {k: v, …}` — merge a map into the node's properties (a null value removes that one), or replace them all
-- `MATCH … DELETE r` — delete a manual edge; error if derived
-- `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
-- `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
-- `UNWIND $rows AS r CREATE (:Label {id: r.id, …})` — and `… MERGE …`, `… MATCH … SET …`: the writes run per row and commit as one batch; each write is scope-checked as the single statement is, so one row outside scope refuses the whole statement
-- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`). `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` finds or creates both nodes and the edge (never a duplicate); the role needs scope on both labels and the edge type
+- `CREATE (n:Label {id: 'key', ...})`: insert node(s) and optional edges
+- `MATCH … SET n.field = value`: update properties
+- `MATCH … REMOVE n.field`: remove properties (a missing property is a no-op)
+- `MATCH … SET n += {k: v, …}` / `SET n = {k: v, …}`: merge a map into the node's properties (a null value removes that one), or replace them all
+- `MATCH … DELETE r`: delete a manual edge; error if derived
+- `MATCH (n) DETACH DELETE n`: delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
+- `MATCH (n) DELETE n`: delete isolated node (error if any edges remain; use DETACH DELETE)
+- `UNWIND $rows AS r CREATE (:Label {id: r.id, …})`: and `… MERGE …`, `… MATCH … SET …`: the writes run per row and commit as one batch; each write is scope-checked as the single statement is, so one row outside scope refuses the whole statement
+- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`: match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`). `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` finds or creates both nodes and the edge (never a duplicate); the role needs scope on both labels and the edge type
 
 **Aggregate functions** in `RETURN`:
 
@@ -745,7 +745,7 @@ Supported: `COUNT(*)`, `COUNT(var)` (non-null bindings), `SUM(n.prop)`,
 `AVG(n.prop)`, `MIN(n.prop)`, `MAX(n.prop)`. Null/non-numeric property
 values are silently skipped for SUM/AVG/MIN/MAX.
 
-**Grouped aggregation** — one or more non-aggregate items act as group keys:
+**Grouped aggregation**: one or more non-aggregate items act as group keys:
 
 ```json
 {"cypher": "MATCH (p:Person) RETURN p.city, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 5"}
@@ -780,7 +780,7 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
 `"node key not found"`.
 
 `namespace` (optional, v0.6.6) is the namespace **every node this call creates** lands
-in — the reserved, write-once `ns` property, named on the call:
+in, the reserved write-once `ns` property, named on the call:
 
 ```json
 {"label": "Person", "namespace": "tenant-a", "rows": [{"id": "alice"}]}
@@ -790,7 +790,7 @@ A row carrying its own `ns` must name the same namespace; a disagreement is a 40
 naming the row, and nothing is written. Omitted means the `default` namespace, and an
 explicit `"default"` stores nothing, so a store that never passes one never grows an
 `ns` column. `POST /nodes` takes the same field for the one node it creates. A
-namespace is set at insert and cannot be changed afterwards — `PUT` or `DELETE` on
+namespace is set at insert and cannot be changed afterwards; `PUT` or `DELETE` on
 `/node/{key}/prop/ns` is a 400 carrying the `NamespaceImmutable` text. See
 [masks.md](masks.md#namespaces).
 
@@ -815,12 +815,12 @@ Body is a `RuleDef` object:
 ```
 
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
-for scored predicates, **512** for KeyMatch (and KeyMatch-rooted `All`) — one
+for scored predicates, **512** for KeyMatch (and KeyMatch-rooted `All`): one
 per element a list-valued FK field can name; a scalar FK field still resolves to
 at most one destination, so the higher cap is inert there. Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
 express that hatch (null fills the default). Python `None` and a missing key
-behave the same as HTTP null — both fill the predicate default.
+behave the same as HTTP null; both fill the predicate default.
 
 **Symmetric predicates:** when `src_label == dst_label`, the rule fires in both
 directions (the updated node is evaluated as source AND as destination). This
@@ -829,7 +829,7 @@ creates edges in both directions. An undirected Cypher pattern
 (`-[:T]->`) or add `RETURN DISTINCT a, b`.
 
 `namespace` (optional, v0.6.6) scopes the rule to one namespace: it sees only that
-namespace's nodes — source, via hop and destination — so every edge it derives stays
+namespace's nodes, source, via hop and destination, so every edge it derives stays
 inside. Omitted (or null) means a global rule, which is the only kind that may derive
 an edge across a boundary. An invalid name is a 400 and nothing is installed. See
 [rules.md](rules.md#namespace-scoping).
@@ -837,8 +837,8 @@ an edge across a boundary. An invalid name is a 400 and nothing is installed. Se
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
 
-**202 while the index builds.** A VectorSimilar rule — in **either** mode, since
-both build the vector index — over more than 2,048 vectors cannot index its
+**202 while the index builds.** A VectorSimilar rule, in **either** mode since
+both build the vector index, over more than 2,048 vectors cannot index its
 corpus in one commit, so the route installs the rule, indexes the first slice,
 and returns `202 Accepted` with the progress instead of `200`:
 
@@ -846,7 +846,7 @@ and returns `202 Accepted` with the progress instead of `200`:
 {"rule": "sim", "building": {"indexed": 2048, "total": 120000}}
 ```
 
-The rule derives **no** edges until the build finishes — never a partial set —
+The rule derives **no** edges until the build finishes, never a partial set,
 and `GET /stats` reports the same progress under `building`. Every write
 advances the build by one slice, `mushroomdb serve` advances it once a second
 (including after a restart: open registers a build a snapshot cut short, so
@@ -960,12 +960,12 @@ Request body:
 
 `field` and `vector` are required. `k` defaults to 10.
 `min` defaults to **0.8**, as it does over MCP and in the Python binding. It was **0.0** here
-through 0.6 — a request that names no `min` now drops every hit below 0.8. Pass `"min": 0.0`
+through 0.6; a request that names no `min` now drops every hit below 0.8. Pass `"min": 0.0`
 for the old behaviour.
 `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; invalid
 `where` is 400. `exact: true` skips HNSW.
 
-Response: `{"hits": [[key, score], …]}` — the same `(key, similarity)` pairs Python
+Response: `{"hits": [[key, score], …]}`: the same `(key, similarity)` pairs Python
 `find_similar` returns. Scores are cosine similarity in `[-1, 1]`; `score >= min`.
 
 ## Reading a node
@@ -1023,10 +1023,10 @@ Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 
 With `stub_hidden=true` and a client mask, hidden **direct** neighbors of visited nodes
 appear as stub rows (`label: null`). The BFS frontier is not expanded through hidden
-nodes — stub rows are terminal.
+nodes; stub rows are terminal.
 
 Returns 404 with `{"error": "node key not found: …"}` for unknown keys, including under
-a client mask — the same body as `GET /node/{key}`.
+a client mask: the same body as `GET /node/{key}`.
 
 ### `GET /node/{key}/history`
 
@@ -1046,14 +1046,14 @@ Response:
 }
 ```
 
-`total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
+`total_commits` is the horizon upper bound (exclusive): the number of WAL frames
 visible in the current window. `horizon` is the oldest commit still retained; it is `0`
 until archives are pruned, and when it is greater than `0` the events before it were
 pruned and are not in `history`. History before the last WAL-truncating snapshot is not
 visible. See [Horizon contract](#horizon-contract) below.
 
 Role tokens: if the requested key is outside the role's visibility mask, the response
-is identical to querying an absent key (404) — no existence oracle.
+is identical to querying an absent key (404): no existence oracle.
 
 ## History between two nodes
 
@@ -1078,7 +1078,7 @@ Response:
 
 `event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
 `null` for manually written edges. `total_commits` is the horizon upper bound, and
-`horizon` is the oldest commit still retained — events before it were pruned and are not
+`horizon` is the oldest commit still retained; events before it were pruned and are not
 in `events`.
 
 Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
@@ -1087,8 +1087,8 @@ the response is 404 for that key (no existence oracle).
 ### `GET /history/was_linked`
 
 Point-in-time check: was an edge of `edge_type` between `a` and `b` active at `at_commit`?
-`at_commit` is a 0-based WAL commit index, or an RFC 3339 date — `2026-06-19`, or
-`2026-06-19T12:00:00Z` — which resolves to the last commit at or before it. All four
+`at_commit` is a 0-based WAL commit index, or an RFC 3339 date, `2026-06-19` or
+`2026-06-19T12:00:00Z`, which resolves to the last commit at or before it. All four
 parameters are required: `GET /history/was_linked?a=alice&b=bob&edge_type=KNOWS&at_commit=2026-06-19`.
 The `at_commit` in the response is the commit index it resolved to.
 
@@ -1117,7 +1117,7 @@ response body; `GET /history/was_linked` names both bounds in the 400 it returns
 commit outside the range. `GET /stats` reports the same floor as `history_floor`.
 
 When the WAL is empty (after a truncating snapshot and before any new writes),
-`total_commits` is 0. Pre-snapshot commits are not visible — history restarts from the
+`total_commits` is 0. Pre-snapshot commits are not visible; history restarts from the
 first WAL frame after the snapshot. Use
 `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
 snapshots, or `archive_wal: true` to keep it in archives.
@@ -1286,7 +1286,7 @@ is in its `update_labels`; otherwise 403.
 
 ### `DELETE /node/{key}/prop/{field}`
 
-Remove one property. It takes no body. `200 {"ok": true}` — also when the node has no such
+Remove one property. It takes no body. `200 {"ok": true}`: also when the node has no such
 field, which is not an error.
 
 400 when the key does not exist or a materialized view owns the field. A rule that read the
@@ -1306,16 +1306,16 @@ Request body:
 
 Responses:
 
-- `200 OK` — `{"ok": true}` — rename succeeded.
-- `404 Not Found` — old key does not exist.
-- `409 Conflict` — new key already exists.
+- `200 OK`: `{"ok": true}`, rename succeeded.
+- `404 Not Found`: old key does not exist.
+- `409 Conflict`: new key already exists.
 
-The rename is one WAL frame. A node that stores its key as an `id` property — one
-created by `upsert_entity` or by a Cypher `CREATE {id: …}` — has that `id` rewritten to
+The rename is one WAL frame. A node that stores its key as an `id` property, one
+created by `upsert_entity` or by a Cypher `CREATE {id: …}`, has that `id` rewritten to
 the new key in the same frame, so `n.id` and `key(n)` keep agreeing; an `id` holding any
 other value is left alone. All edges referencing the
 node continue to work under the new key. Node history and time-travel (`open_at`)
-correctly scope events to the identity that held the key at each commit — recycling
+correctly scope events to the identity that held the key at each commit; recycling
 a key for a different node does not contaminate the previous identity's history.
 
 ### `POST /edges`
@@ -1326,7 +1326,7 @@ Create one edge between two nodes that exist.
 {"type": "KNOWS", "src": "ada", "dst": "grace"}
 ```
 
-All three are required. `200 {"ok": true}` — also when the edge is already there.
+All three are required. `200 {"ok": true}`: also when the edge is already there.
 
 400 when a rule already owns that edge, or when the two nodes are in different namespaces. A
 missing endpoint is `400 {"error":"node key not found: grace"}`; to have it created, use
@@ -1367,7 +1367,7 @@ placeholder nodes within the same batch frame.
 
 ### `DELETE /edges/{etype}/{src}/{dst}`
 
-Delete one edge that was written by hand. `200 {"ok": true}` — also when there is no such edge
+Delete one edge that was written by hand. `200 {"ok": true}`: also when there is no such edge
 between the two nodes.
 
 An edge a rule derived cannot be deleted this way:
@@ -1507,7 +1507,7 @@ Withdraw the constraint. `204` with no body. Its equality index stays.
 
 Connect with any WebSocket client. After upgrade the first text frame is
 `{"subscribed":true}`. Subsequent frames are `MutationEvent` JSON,
-externally tagged snake_case — one frame per committed mutation (or a
+externally tagged snake_case: one frame per committed mutation (or a
 lag notice):
 
 ```json
@@ -1526,7 +1526,7 @@ notice here is `{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "misse
 `DbEvent` subscription bridge) rather than the main event sink. They carry the same fields but
 no `commit_seq`, and may arrive slightly after other event types from the same commit. If the
 bridge's internal queue overflows under sustained edge-property write load, a `{"lagged": n}`
-frame is emitted before the next deliverable event — identical in shape to the broadcast-channel
+frame is emitted before the next deliverable event, identical in shape to the broadcast-channel
 lag notice above.
 
 When the server is started with a token, send it as a header or a cookie, or as `?token=` on
@@ -1543,7 +1543,7 @@ After the upgrade, send one text frame saying what you want:
 
 Ask for at least one of the three. `rules` names the rules whose edges to follow, `writes` adds
 node, edge and property events, and `cypher` follows the rows of one query, re-run on each
-commit — give it a `LIMIT`. The server answers `{"subscribed": true}`. A frame that asks for
+commit; give it a `LIMIT`. The server answers `{"subscribed": true}`. A frame that asks for
 nothing gets that answer and is then closed, having nothing to send. A frame that is not JSON,
 a rule that does not exist or a query that does not parse gets `{"error": "…"}` and is closed.
 
@@ -1562,7 +1562,7 @@ Then one frame an event, each with a `type`:
 
 Every event but the two query-row ones also carries `commit_seq`, the commit it happened at.
 `weight` is there only when the rule scores its edges; a key-match rule's `edge_fired` has
-none. The values in `row` are in the store's tagged form — `[{"Str": "Ada"}]`, not `["Ada"]`.
+none. The values in `row` are in the store's tagged form: `[{"Str": "Ada"}]`, not `["Ada"]`.
 Frames of different kinds are not ordered against each other: a write event may arrive after
 a rule event from a later commit, so order by `commit_seq`.
 

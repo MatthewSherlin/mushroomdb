@@ -6,7 +6,7 @@
 [![crates.io](https://img.shields.io/crates/v/mushroomdb-cli?logo=rust&label=crates.io)](https://crates.io/crates/mushroomdb-cli)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**The graph that stays true — and knows who's allowed to see it.**
+**The graph that stays true, and knows who's allowed to see it.**
 
 A graph database you embed in your process or run as a server. Cypher, the Bolt protocol,
 transactions, full-text and vector search, and a history you can query as of any commit.
@@ -15,7 +15,7 @@ You declare a relationship as a rule, once. Every write after that derives the m
 scores them, and retracts them when they stop being true, and each edge can say why it exists.
 Embedded, it is a directory on disk: no account and no server to run.
 
-*Pre-1.0 alpha — APIs and formats may change between minor versions.*
+*Pre-1.0 alpha: APIs and formats may change between minor versions.*
 
 **[Documentation](https://matthewsherlin.github.io/mushroomdb/docs/)** · [Get started](https://matthewsherlin.github.io/mushroomdb/docs/get-started.html) · [Agent-memory quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Changelog](CHANGELOG.md)
 
@@ -143,8 +143,8 @@ From then on every insert and every property change evaluates the rule increment
 writes the edge, stores the score, and retracts the edge in the same write that makes it untrue.
 There is no re-index step and no batch job.
 
-Six kinds of predicate ship — key match, field equality, list overlap, numeric distance, geographic
-radius and vector similarity — and they compose with `All` and `Any`.
+Six kinds of predicate ship (key match, field equality, list overlap, numeric distance, geographic
+radius and vector similarity), and they compose with `All` and `Any`.
 [Rules](https://matthewsherlin.github.io/mushroomdb/docs/rules.html) has each one with an example.
 The Rust `RuleDef` struct is in the [Rust reference](https://matthewsherlin.github.io/mushroomdb/docs/rust.html).
 

@@ -1,6 +1,6 @@
 # SAME_AS quality gate
 
-Labelled set: `benchmarks/identity/labelled.json` — 34 nodes, 561 labelled pairs, 18 of them the same entity. Identity preset: `Overlap` on `aliases` at ≥ 0.6.
+Labelled set: `benchmarks/identity/labelled.json`: 34 nodes, 561 labelled pairs, 18 of them the same entity. Identity preset: `Overlap` on `aliases` at ≥ 0.6.
 
 ## Gate
 

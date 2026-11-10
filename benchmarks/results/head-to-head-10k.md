@@ -1,9 +1,9 @@
-# Head-to-head benchmark — mushroomdb vs. system A / system B / system C
+# Head-to-head benchmark: mushroomdb vs. system A / system B / system C
 
 ## Machine / date / versions
 
 - **Date:** 2026-08-20
-- **Host:** mac.lan (Apple M4 Pro, 12 cores, arm64)
+- **Host:** Apple M4 Pro laptop (12 cores, arm64)
 - **OS:** macOS 15.7.3
 - **RAM:** 24 GiB
 - **Python:** 3.12.12
@@ -21,9 +21,9 @@
 ## Honesty notes
 
 - **mushroomdb** numbers are **embedded Rust** (no network RTT, no serialization overhead).
-  system B is also embedded — its numbers are directly comparable to mushroomdb's.
+  system B is also embedded; its numbers are directly comparable to mushroomdb's.
   system A and system C numbers go over bolt/localhost (~0.1–1 ms round-trip per query).
-- **rule_derive** is mushroomdb-only — competitors have no auto-derivation equivalent.
+- **rule_derive** is mushroomdb-only; competitors have no auto-derivation equivalent.
   It is excluded from the cross-engine table. See `benchmarks/README.md` for the full explanation.
 - **Sequential runs required** due to port conflict: system A and system C both default to
   `bolt://localhost:7687`. Run 1 (system A up) and Run 2 (system C up) were executed separately
@@ -38,7 +38,7 @@
   triggered an engine error: *"intermediate result exceeds 1,000,000 rows"*.
   The query returned 0 rows. The rule_derive backfill generates a dense edge set;
   the query pattern without anchored variables causes a cartesian explosion before the LIMIT
-  is applied. This is a known limitation — `wall_s` reflects the time to error, not a full result.
+  is applied. This is a known limitation: `wall_s` reflects the time to error, not a full result.
 
 ---
 
@@ -62,7 +62,7 @@
 
 ---
 
-## mushroomdb — rule_derive (ours-only, excluded from cross-engine table)
+## mushroomdb: rule_derive (ours-only, excluded from cross-engine table)
 
 > **Auto-derivation has no competitor equivalent.**
 > Edges are derived automatically when rules are declared and on every subsequent
@@ -83,12 +83,12 @@
 | mushroomdb | Run 1 (system A up) | embedded, unaffected by bolt servers | YES |
 | system A | Run 1 (system A up) | `bench-system A` (`system A:5-community`, `system A_AUTH=none`) on `:7687`; adapter auth `("system A","system A")` accepted | YES |
 | system B | Run 1 (system A up) | embedded, unaffected by bolt servers | YES |
-| system C (Run 1) | Run 1 (system A up) | system C adapter connected to system A on `:7687` (port conflict — confirmed by post-run node count: 20,000 nodes in system A after both adapters ingested) | **INVALID — excluded** |
-| system A (Run 2) | Run 2 (system C up) | system A adapter connected to system C on `:7687` (same port conflict, reverse) | **INVALID — excluded** |
+| system C (Run 1) | Run 1 (system A up) | system C adapter connected to system A on `:7687` (port conflict; confirmed by post-run node count: 20,000 nodes in system A after both adapters ingested) | **INVALID, excluded** |
+| system A (Run 2) | Run 2 (system C up) | system A adapter connected to system C on `:7687` (same port conflict, reverse) | **INVALID, excluded** |
 | system C | Run 2 (system C up) | `bench-system C` (`system C/system C:latest`) on `:7687`; adapter via system A driver bolt fallback | YES |
-| system B (Run 2) | Run 2 (system C up) | same as Run 1 — consistent within 2% | consistent; Run 1 used |
+| system B (Run 2) | Run 2 (system C up) | same as Run 1, consistent within 2% | consistent; Run 1 used |
 
 **Port conflict detection method:** After Run 1 with system A up, queried system A directly:
-`MATCH (n) RETURN labels(n)[0], count(n)` — result was 14,000 Talent / 4,000 Company / 2,000 Job
+`MATCH (n) RETURN labels(n)[0], count(n)`: result was 14,000 Talent / 4,000 Company / 2,000 Job
 (20,000 total = 10,000 system A adapter + 10,000 system C adapter both wrote to system A).
 This conclusively proves system C's Run 1 numbers measured system A, not system C.

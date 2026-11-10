@@ -2,7 +2,7 @@
 
 A linking rule is a schema object that declares when mushroomdb should create
 an edge between two nodes. Once declared, the rule fires automatically on every
-`insert_node` and `set_prop` call — incrementally, not in batch.
+`insert_node` and `set_prop` call: incrementally, not in batch.
 
 Derived edges carry rule provenance (visible via `explain` and the UI why
 panel) and are retracted automatically when the properties that matched them
@@ -10,7 +10,7 @@ change.
 
 ![Rule fire, retraction, and explain arithmetic on the demo store](../assets/rule-fire-explain.gif)
 
-Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it shows
+Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape`: it shows
 the FIT edges before and after a `SET` that retracts one and fires another,
 then calls `explain` on the edge that survives.
 
@@ -56,7 +56,7 @@ fields via auto-FK inference at ingest time.
 Predicate::KeyMatch { field: "org_id".into() }
 ```
 
-**Demo example:** `auto_fk_person_org_id` — every Person whose `org_id`
+**Demo example:** `auto_fk_person_org_id`: every Person whose `org_id`
 field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 30 such edges exist (one per Person).
 
@@ -70,11 +70,11 @@ nothing are ignored until that node appears, at which point the edge is filled
 in; drop an element and only that edge is retracted, in the same write. Non-string
 elements are skipped and duplicates collapse into a single edge. At most
 `MAX_KEYMATCH_LIST` = 512 elements are considered, in stored order, so one node
-can never fan out without bound — the same list always produces the same edges.
+can never fan out without bound; the same list always produces the same edges.
 
 Firing per element is the default, not an opt-in: a KeyMatch rule that omits
 `max_edges` gets 512, the same number, from every front door that fills the
-cap — `POST /rules`, MCP `create_rule`, the Python binding, `suggest`, and the
+cap: `POST /rules`, MCP `create_rule`, the Python binding, `suggest`, and the
 auto-FK rules declared at ingest time. A scalar FK field names at most one
 destination, so the higher cap is inert there and scalar rules behave exactly as
 they did. Rules stored before this change keep the `max_edges` they were written
@@ -103,10 +103,10 @@ the exception: they score over the via set, so `explain` reports their stored
 score only.
 
 For a rule declared with no `weight_prop` at all (only reachable via the Rust
-API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
+API; the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
 still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
 `EdgeFired` subscription event's `weight` field (`Option<f64>`) is absent
-(omitted) from the JSON payload — because it only looks up the stored prop,
+(omitted) from the JSON payload, because it only looks up the stored prop,
 not the predicate.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
@@ -117,8 +117,8 @@ not the predicate.
 ### 3. Overlap
 
 Computes the Jaccard coefficient between the **same list-valued field on both
-nodes** — `field` names one property, read on the source and on the
-destination — and writes an edge when the coefficient meets a minimum
+nodes** (`field` names one property, read on the source and on the
+destination) and writes an edge when the coefficient meets a minimum
 threshold.
 
 ```rust
@@ -127,7 +127,7 @@ Predicate::Overlap { field: "skills".into(), min: 0.5 }
 
 **Score:** Jaccard value, stored on the edge via `weight_prop`.
 
-**Demo example:** `skill_fit` — Person.skills vs Project.skills, min 0.5.
+**Demo example:** `skill_fit`: Person.skills vs Project.skills, min 0.5.
 After the demo:
 
 ```text
@@ -150,7 +150,7 @@ and the same field on the destination is within a tolerance. Score is
 Predicate::NumericWithin { field: "founded_year".into(), tolerance: 2.0 }
 ```
 
-**Demo example:** `founded_within` — Org.founded_year, tolerance 2. An Org
+**Demo example:** `founded_within`: Org.founded_year, tolerance 2. An Org
 founded in 2010 and one in 2011 score `1 - 1/2 = 0.5`. 34 FOUNDED_WITHIN
 edges in the demo dataset.
 
@@ -165,7 +165,7 @@ within a radius (in km). Score is `1 - distance / radius`.
 Predicate::GeoRadius { field: "office".into(), km: 50.0 }
 ```
 
-**Demo example:** `nearby_office` — Org.office, 50 km. Uses real city
+**Demo example:** `nearby_office`: Org.office, 50 km. Uses real city
 coordinates. 16 NEARBY edges in the demo dataset.
 
 **Field format:** the field must contain a two-element numeric list
@@ -184,10 +184,10 @@ Predicate::VectorSimilar { field: "embedding".into(), min: 0.8 }
 
 **Score:** cosine similarity, stored on the edge via `weight_prop`.
 
-**Demo example:** `similar_interests` — Person.embedding, dim 8, min 0.8.
+**Demo example:** `similar_interests`: Person.embedding, dim 8, min 0.8.
 114 edges in the demo dataset.
 
-**Candidates come from the vector index — 0.6.6, behaviour change.** A
+**Candidates come from the vector index: 0.6.6, behaviour change.** A
 VectorSimilar rule with `approximate: false` used to compare every pair of
 vectors on the two sides: O(n²), measured at 147 s to create the rule over
 5,000 nodes at dim 1536 (`exact_vector_rule_recall_5k` with
@@ -199,21 +199,21 @@ has something to conclude.
 
 **The index is a candidate generator here and never a silent filter.** There is
 exactly one outcome that lets it narrow the candidate set: a beam that comes back
-*full* — as many hits as it had room for — whose worst hit is below `min`. That
+*full* (as many hits as it had room for) whose worst hit is below `min`. That
 beam has proved what it left out, because everything it rejected is farther from
 the query than a node already known to fail the predicate. Every other outcome
 falls back to **every vector on that side of the rule**, the same candidate set
 the rule used before 0.6.6:
 
 - a beam that comes back short of its own width, which is what an HNSW layer 0
-  that is not one connected component looks like — a corpus of identical or
+  that is not one connected component looks like: a corpus of identical or
   near-identical embeddings is the case that produces it;
 - the 4,096 ceiling reached with the worst hit still at or above `min`, so a
   cluster denser than the ceiling costs a scan and never costs recall (the
   comparison carries a small tolerance, because a graph search answers in `f32`;
   the rounding can only buy an extra doubling, never drop a pair);
 - a beam that would be as wide as the index itself, which is every rule over
-  fewer vectors than the default width — small rules stay exhaustive and never
+  fewer vectors than the default width; small rules stay exhaustive and never
   walk the graph at all;
 - an index that cannot answer the query at all: no graph yet, a dimension that is
   not the query's, or one that skipped a vector it was handed (see
@@ -228,28 +228,28 @@ candidate set is the intersection, and `evaluate` then decides every pair as it
 always has.
 
 Scores did not move. Every candidate the beam offers is re-scored exactly,
-from the stored `f64` vectors, by the same code that scored the full scan —
+from the stored `f64` vectors, by the same code that scored the full scan,
 so the similarity on the edge, the `weight_prop` value and the `max_edges`
 ranking are bit-for-bit what they were. What changed is the candidate set: the
 derived edge set is no longer *provably* every pair above `min`, it is every
 pair above `min` that the beam found. The committed floor for that is **recall
 ≥ 0.98** against an O(n²) ground truth, asserted by
 `exact_vector_rule_recall_5k` (5,000 nodes, dim 1536, in
-`crates/sim-harness/tests/oracle_equivalence.rs`), which measures 1.0000 —
-495,000 of 495,000 pairs — on that fixture. On a corpus small enough for the
+`crates/sim-harness/tests/oracle_equivalence.rs`), which measures 1.0000
+(495,000 of 495,000 pairs) on that fixture. On a corpus small enough for the
 beam to reach every vector the two paths agree edge-for-edge
 (`index_backed_vector_rule_equals_brute_force_on_a_fixed_set`).
 
 **Buying the guarantee back:** set `MUSHROOMDB_VECTOR_SCAN=1` and every exact
-VectorSimilar rule returns to the full scan — O(n²), every pair above `min`
+VectorSimilar rule returns to the full scan: O(n²), every pair above `min`
 provably found, and the backfill time that goes with it. Rules with
 `approximate: true` are unaffected by the variable.
 
 ---
 
-## Composing predicates — All and Any
+## Composing predicates: All and Any
 
-### All — require every branch
+### All: require every branch
 
 Require multiple conditions on the same edge by wrapping predicates in
 `All`:
@@ -263,10 +263,10 @@ Predicate::All(vec![
 
 The edge is written only when every sub-predicate fires. The score is the
 **minimum** of the individual sub-predicate scores (`score.min(part_score)`
-per part — verified in `crates/core-rules/src/def.rs`, test
+per part, verified in `crates/core-rules/src/def.rs`, test
 `all_takes_min_score_and_requires_every_part`).
 
-### Any — require at least one branch
+### Any: require at least one branch
 
 Match when at least one branch fires by wrapping predicates in `Any`:
 
@@ -278,7 +278,7 @@ Predicate::Any(vec![
 ```
 
 The edge is written when **any** sub-predicate fires. The score is the
-**maximum** of the satisfied branches' scores (`score.max(branch_score)` —
+**maximum** of the satisfied branches' scores (`score.max(branch_score)`,
 verified in `crates/core-rules/src/def.rs`, test
 `any_score_is_max_when_both_branches_match`).
 
@@ -322,7 +322,7 @@ RuleDef {
 ```
 
 **How it works:** at rule creation time, an HNSW graph is built over the
-destination-side vectors (cosine similarity, in-tree implementation — no
+destination-side vectors (cosine similarity, in-tree implementation, no
 external ANN dependency). Each node insertion incrementally updates the HNSW
 graph. On each lookup, the HNSW index returns the approximate k nearest
 neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
@@ -339,7 +339,7 @@ persisted graph fails to load (the reason is logged).
 | Candidates | HNSW, beam widened until its worst hit is below `min`; every other outcome is every vector on the side | HNSW approximate k-NN, one pass at k |
 | Scores | Exact, from the stored vectors | Exact, from the stored vectors |
 | Edge recall | floor 0.98 asserted by `exact_vector_rule_recall_5k`, measured 1.0 (5k/dim 1536, fixed-seed probe); exhaustive below one beam width | floors min 0.90 / mean 0.95 asserted by `hnsw_5k_1536_recall`, measured min 1.0 / mean 1.0 (5k/dim 1536, fixed-seed probe) |
-| Determinism | Same data **and same write order** → same edges; at the beam boundary the candidate set follows the graph, whose shape depends on insertion order | Yes — same rule + data → same graph |
+| Determinism | Same data **and same write order** → same edges; at the beam boundary the candidate set follows the graph, whose shape depends on insertion order | Yes: same rule + data → same graph |
 | WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
 **Creation time, measured** (release, 5,000 nodes × 1,536-D, fixed-seed probe,
@@ -353,7 +353,7 @@ both printed by `exact_vector_rule_recall_5k`):
 The index path replaces a quadratic derivation with a beam and pays a one-time
 graph build for it. That build is the term that moves: measured mid-release, at
 the halved parameters but still on the `f64` distance, creation came out at
-287 s — *slower* than the scan it removed. (That is a within-release figure,
+287 s (*slower* than the scan it removed). (That is a within-release figure,
 not a 0.6.5 one: 0.6.5 had no index-backed exact rule to time.)
 The halved [index parameters](#vector-index-parameters) and the `f32` slab
 kernel cut it to the figure above. Quote the test, not this table, after any
@@ -363,11 +363,11 @@ margin widens with the corpus.
 
 Use approximate mode when a lower recall floor and a bounded `k` per source are
 acceptable. When completeness is required (safety-critical graph closure,
-compliance checks) neither mode is enough on its own — set
+compliance checks) neither mode is enough on its own: set
 `MUSHROOMDB_VECTOR_SCAN=1`, which is the only path that proves it.
 
 **What an exact rule now costs in memory and on disk.** It builds and keeps the
-same two graphs an approximate rule does — one per side — at the same
+same two graphs an approximate rule does (one per side) at the same
 [per-vector cost](#vector-index-parameters) (6,663 B per node at 5,000 × 1,536-D
 and the defaults), so a rule whose src and dst labels are the same indexes the
 corpus twice: about 33 MB per side at that size. Both graphs are written into the
@@ -390,7 +390,7 @@ installs the rule, files every non-vector index leg, indexes the first 2,048
 vectors, and **returns before its edges exist**.
 
 This applies to both kinds of VectorSimilar rule from 0.6.6 on, because both
-build a graph — an `approximate: false` rule over more than 2,048 vectors is
+build a graph; an `approximate: false` rule over more than 2,048 vectors is
 sliced exactly as an approximate one is. (A rule whose vector predicate sits
 under an `Any`, and any rule created while `MUSHROOMDB_VECTOR_SCAN=1` is set,
 builds no graph and is never deferred.)
@@ -426,7 +426,7 @@ While a rule is in that state:
   3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
      completion now, one progress line per slice, for an operator who wants the
      build done before traffic arrives. `--rule` narrows the report, not the
-     work — pending builds share one write lock. `GraphDb::pump_index_build` is
+     work: pending builds share one write lock. `GraphDb::pump_index_build` is
      the Rust equivalent: one write lock and at most one slice per pending rule
      per call, and `Err(ReadOnly)` on a read-only handle (it could advance the
      index but not commit the backfill).
@@ -435,13 +435,13 @@ A store killed mid-build reopens with the rule present, its index partly built,
 and that build already registered: `stats().building` is populated from the
 blob's `complete == false` flag, so `serve`'s ticker and `pump_index_build`
 have something to advance without a write. The snapshot's graph covers what it
-carried; the remainder is sliced the same way `create_rule` sliced it — one
+carried; the remainder is sliced the same way `create_rule` sliced it: one
 batch per pump, under the write lock, never the whole rest of the corpus in
 one pass. A handful of vectors written after a *complete* snapshot still land
 inline on open: that is the fast path 0.6.5 fixed and it stays. A snapshot
 taken after that reopen but before the next pump still records the index as
 incomplete, so a reader opening that snapshot answers by brute force until a
-write, `serve`, or `build-index` pumps it — slower, never wrong. A live handle
+write, `serve`, or `build-index` pumps it (slower, never wrong). A live handle
 whose build is still outstanding takes the same door.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
@@ -451,7 +451,7 @@ exactly the state the snapshot persisted, so a vector it has to supply really
 was missing from the persisted graph rather than being the in-flight write's
 own; the record's own hook files that write a moment later through the normal
 insert path. (Ids are dense and never reused, so the snapshot's id count is kept
-as a second line of defence for any caller that still populates lazily — a
+as a second line of defence for any caller that still populates lazily: a
 `what_if` clone, say.)
 
 **`what_if` while a build is pending.** `what_if_set_prop` answers from a clone
@@ -462,7 +462,7 @@ right about the end state and early about the timing.
 
 ### Vector index parameters
 
-The HNSW graph has one shape, store-wide — not per rule. Nothing in it is
+The HNSW graph has one shape, store-wide, not per rule. Nothing in it is
 persisted: the parameters bound how a graph is *built*, never how a built graph
 is *read*, so a snapshot written under one shape opens correctly under any
 other.
@@ -470,10 +470,10 @@ other.
 | Parameter | Default | Was (0.6.5) | Raising it buys | Raising it costs |
 |---|---|---|---|---|
 | `m` | 16 | 32 | Denser upper layers, so the descent needs fewer restarts | Build time and memory on every layer above 0 |
-| `m0` | 64 | 128 | Denser layer 0, the layer every query finishes in | Memory per vector, and build time quadratically — the prune scores every candidate against every neighbour already kept |
+| `m0` | 64 | 128 | Denser layer 0, the layer every query finishes in | Memory per vector, and build time quadratically: the prune scores every candidate against every neighbour already kept |
 | `ef_construction` | 200 | 400 | A better candidate pool at insert time, so better neighbours | Build time, linearly |
 | `ef_search` | 400 | 400 | Recall per query | Query latency, linearly. It is a *floor* under the query's own `k`: asking for more than 400 neighbours widens the beam to match |
-| `prune` | `both` | n/a | n/a — `both` is already the higher-recall setting | `own` builds ~5× faster and drops below the recall floor on clustered corpora. See below |
+| `prune` | `both` | n/a | n/a: `both` is already the higher-recall setting | `own` builds ~5× faster and drops below the recall floor on clustered corpora. See below |
 
 Since 0.6.6 the new node's neighbours are chosen by a diversity test taken from
 the HNSW paper's §3.5 heuristic (Algorithm 4): a candidate is kept only when it
@@ -500,7 +500,7 @@ point back into the cluster the diversity test just turned down. Keeping the
 untested far candidates instead preserves the longer-range links that make a
 cluster reachable from outside it. Expect a different graph from a textbook
 implementation, and do not "fix" the deviation without re-running these three
-gates — `select_neighbors_first_rejection` in `crates/core-rules/src/hnsw.rs`
+gates: `select_neighbors_first_rejection` in `crates/core-rules/src/hnsw.rs`
 carries the same table.
 
 `ef_search` did **not** fall with the rest. At 1,536 dimensions the
@@ -508,7 +508,7 @@ nearest-neighbour distribution is flat enough that recall is a beam-width
 problem before it is a graph-shape problem, and `hnsw_5k_1536_recall` rejects
 every narrower beam: at `ef_search` = 128 its min recall@10 is 0.30 at
 `m0` = 32 and 0.70 at `m0` = 64, against a floor of 0.90. The shape the 0.6.6
-design sketch proposed — `16,32,200,128` — was rejected on that measurement: its
+design sketch proposed (`16,32,200,128`) was rejected on that measurement: its
 min recall@10 is **0.30** against the gate's floor of 0.90.
 
 ### `prune`: how far the heuristic reaches
@@ -521,7 +521,7 @@ Measured three ways, all at `m,ef_construction,ef_search` = `16,200,400`:
 
 | `m0` | `prune` | Clustered recall, 5 000 × 1 536-D (floor 0.90) | Backfill | Adjacency |
 |---|---|---|---|---|
-| 64 | `own` | **0.8581 — below the floor** | 123.1 s | 519 B/node |
+| 64 | `own` | **0.8581 (below the floor)** | 123.1 s | 519 B/node |
 | **64** | **`both` (default)** | **1.0000** | **180.5 s** | **519 B/node** |
 | 128 | `own` | 1.0000 | 269.4 s | 1 031 B/node |
 
@@ -534,8 +534,8 @@ history.
 `own` is **4.5×** faster to build on a corpus of genuinely distinct vectors
 (9.56 s against 43.34 s for the raw 5 000 × 1 536-D index, with identical
 `hnsw_5k_1536_recall` at min 1.0000 / mean 1.0000), which is why it exists. But
-the corpus that matters has **clusters wider than `m0`** — 100 members against
-an `m0` of 64 — and there the neighbour side is exactly where the long-range
+the corpus that matters has **clusters wider than `m0`** (100 members against
+an `m0` of 64) and there the neighbour side is exactly where the long-range
 links get discarded: `own` loses 14% of the derived edges and misses the floor.
 
 Both ways of fixing that work, and `both` at `m0` = 64 wins on every axis: it is
@@ -561,7 +561,7 @@ MUSHROOMDB_HNSW_PARAMS=16,64,300,256 mushroomdb serve ./db
 ```
 
 It is read once per process, before the first insert. Unset, malformed, or
-carrying a zero in any numeric field, it falls back to the defaults above — a
+carrying a zero in any numeric field, it falls back to the defaults above: a
 zero `m0` is a graph with no edges. It is for benchmarking and for an operator
 who has measured their own corpus; there is no per-rule knob.
 
@@ -570,10 +570,10 @@ who has measured their own corpus; there is no per-rule knob.
 of the vector, so 256 B + 6,144 B at the defaults with a 1,536-D embedding.
 Layers above 0 add `m × 4` bytes for the minority of nodes that have them, and
 the reverse-adjacency index that makes a removal O(in-degree) holds one more
-`u32` per link — so the adjacency figure roughly doubles in practice. Halving
+`u32` per link, so the adjacency figure roughly doubles in practice. Halving
 `m0` halves all of it. Measured at 5,000 × 1,536-D: **6,663.2 B per node**
 (519.2 adjacency + 6,144 vector), against 12,807.2 before the index's copy became
-`f32` — a 48.0 % cut, and the persisted index blob halves with it.
+`f32`: a 48.0 % cut, and the persisted index blob halves with it.
 
 ### The distance kernel
 
@@ -582,7 +582,7 @@ addressed by slot, and the store keeps the `f64` properties untouched. That is
 safe for one reason, and it is a rule every caller has to keep: **the index
 supplies candidates, and the score comes from the `f64` vectors.**
 
-An `f32` dot of two 1,536-D unit vectors is accurate to about 2e-6 — far below
+An `f32` dot of two 1,536-D unit vectors is accurate to about 2e-6, far below
 the granularity at which candidate *order* matters, which is why the recall gates
 below are unchanged on the `f32` path, and nowhere near good enough to *report*.
 An exact duplicate scores 0.9999999 there, so a threshold of `min = 1.0` applied
@@ -604,7 +604,7 @@ to the index's own number would return nothing at all. So:
   cluster wider than the 16-candidate margin. If more than sixteen vectors sit
   within about 1e-6 of each other across the `k` boundary, the index's `f32` order
   decides which of those interchangeable members is fetched, so the scan may
-  return a different — equally-scoring — node. Ask for an exact top-`k` over a
+  return a different (equally-scoring) node. Ask for an exact top-`k` over a
   corpus of near-duplicates through a rule with `approximate: false`, which never
   touches the index.
 
@@ -616,10 +616,10 @@ serial dependency chain as long as the vector: compiled for aarch64, the old
 `f64` loop vectorised its *multiplies* (`fmul.2d`) and then added them one at a
 time (`fadd d0, d0, …`), 1,536 links of 3–4 cycle latency each. Choosing the
 summation order in the source is what lets the compiler emit four-lane work for
-both halves — `ldp q, q` / `fmul.4s` / `fadd.4s`, eight lanes per iteration.
+both halves: `ldp q, q` / `fmul.4s` / `fadd.4s`, eight lanes per iteration.
 (`std::simd` would say this declaratively and is nightly-only; the toolchain is
 pinned stable, and `-C target-cpu=native` is not available to a published crate,
-so NEON on aarch64 and SSE2 on x86-64 — four-wide, no FMA — are what this buys.
+so NEON on aarch64 and SSE2 on x86-64 (four-wide, no FMA) are what this buys.
 Expect a smaller win on x86-64 than the figures below, which are aarch64.)
 
 What it cost in work per insert is nothing: the evaluation count at 1,000 and
@@ -637,12 +637,12 @@ size. What it bought, at 5,000 × 1,536-D:
 **One fixed dimension per index**, and **the index steps aside when it cannot
 answer for everything.** A slab has one stride, so the dimension of the vectors
 an index holds is settled by the ones it is given, and an embedding of any other
-length is **skipped** — logged once per index, not indexed, not counted. Two
+length is **skipped**: logged once per index, not indexed, not counted. Two
 consequences, and the second is the one that keeps results correct:
 
 * A skipped vector is never an edge. It could not have been one anyway: a
   `vector_similar` predicate refuses a pair of unequal length, before and after
-  0.6.6. (Since 0.6.6 this holds for `approximate: false` too — an exact rule
+  0.6.6. (Since 0.6.6 this holds for `approximate: false` too; an exact rule
   [takes its candidates from the index](#6-vectorsimilar) as well, and the
   fallback in the next bullet is what keeps it exact.)
 * An index that skipped anything, or whose dimension is not the query's, **stops
@@ -662,7 +662,7 @@ a collection with one model rather than mixing two.
 Earlier versions (v1–v3) still load, converting the vectors in memory with no
 vector re-inserted and no distance computed. A reader older than this one meeting
 a v4 blob fails its version check
-and leaves that rule on its full-scan fallback — slower, never wrong. The
+and leaves that rule on its full-scan fallback (slower, never wrong). The
 snapshot format does not move: it carries the index as opaque bytes.
 
 **The recall these defaults are held to**, by tests that run in CI's
@@ -672,8 +672,8 @@ snapshot format does not move: it carries the index as opaque bytes.
 |---|---|---|
 | `hnsw_5k_1536_recall` (`crates/core-rules/src/hnsw.rs`) | 5,000 × 1,536-D, 50 queries | min recall@10 ≥ 0.90, mean ≥ 0.95 |
 | `recall_survives_insert_remove_churn` (same file) | 5,000 × 1,536-D, then an insert/remove/re-insert sequence | min recall@10 ≥ 0.90, mean ≥ 0.95 against brute force over the survivors |
-| `degree_and_adjacency_bytes_stay_within_the_shape` (same file, **runs on every `cargo test`**) | 1,200 × 32-D | max degree ≤ `m0` on layer 0 and ≤ `m` above; adjacency ≤ `2 × (m0 + m) × 4` B/node — measured 519.7 against a 640 ceiling |
-| `clustered_recall_survives_clusters_wider_than_m0` (same file) | 40 clusters of 120 × 128-D — clusters wider than `m0`, both `prune` shapes | `own`: min ≥ 0.40, mean ≥ 0.90; `both`: min ≥ 0.70, mean ≥ 0.95; and `both` ≥ `own` |
+| `degree_and_adjacency_bytes_stay_within_the_shape` (same file, **runs on every `cargo test`**) | 1,200 × 32-D | max degree ≤ `m0` on layer 0 and ≤ `m` above; adjacency ≤ `2 × (m0 + m) × 4` B/node: measured 519.7 against a 640 ceiling |
+| `clustered_recall_survives_clusters_wider_than_m0` (same file) | 40 clusters of 120 × 128-D: clusters wider than `m0`, both `prune` shapes | `own`: min ≥ 0.40, mean ≥ 0.90; `both`: min ≥ 0.70, mean ≥ 0.95; and `both` ≥ `own` |
 | `approximate_recall_above_floor_1536dim_1k` (`crates/sim-harness/tests/oracle_equivalence.rs`) | 1,024 × 1,536-D derived edge set | recall ≥ 0.90 |
 | `approximate_recall_5k_timing` (same file) | 5,000 × 1,536-D derived edge set, index pumped to completion first | recall ≥ 0.90 |
 | `exact_vector_rule_recall_5k` (same file) | the same corpus, `approximate: false` | recall ≥ 0.98 |
@@ -710,7 +710,7 @@ on purpose.** The build grows **15.48×** from 2,000 to 10,000 vectors against a
 ceiling of 8×, and the 50,000 case takes **17 minutes** against a ceiling of
 five. What the 50,000 row adds is the reason: from 10,000 to 50,000 the same
 step costs only **7.71×**, which is inside the ceiling. The steep first step is a
-regime, not an asymptote — at 2,000 nodes a beam that may touch
+regime, not an asymptote: at 2,000 nodes a beam that may touch
 `ef_construction × m0` = 12,800 distinct nodes cannot touch more than 2,000, so
 the small point is measured where an insert is effectively exhaustive, and the
 §3.5 prune's candidate walk is still getting denser. Counted rather than timed:
@@ -718,8 +718,8 @@ an insert evaluates 12,739 distances at 1,000 nodes and 23,901 at 5,000, a climb
 of 1.88× with no N in either formula, and `dist_evals_per_insert_is_bounded`
 gates exactly that count in CI.
 
-Closing the rest means cutting the *count* — `ef_construction`, or a budget that
-truncates the prune's walk — and both change the graph, so both are the recall
+Closing the rest means cutting the *count* (`ef_construction`, or a budget that
+truncates the prune's walk) and both change the graph, so both are the recall
 table's business. Until then, building a large vector index is something to do
 once, ahead of traffic (see *Creating a rule over a large corpus* above), not
 something to absorb inline.
@@ -734,7 +734,7 @@ decides which:
 | `namespace` | What the rule sees | What it may derive |
 |---|---|---|
 | `None` (default) | every node in the store | any pair, including one that crosses a namespace boundary |
-| `Some("tenant-a")` | only nodes whose `ns` is `tenant-a` — source, via hop and destination alike | only pairs inside `tenant-a`, by construction |
+| `Some("tenant-a")` | only nodes whose `ns` is `tenant-a`: source, via hop and destination alike | only pairs inside `tenant-a`, by construction |
 
 ```rust
 db.create_rule(RuleDef {
@@ -762,15 +762,15 @@ db.create_rule(RuleDef {
   ([masks.md](masks.md#no-cross-namespace-edges)).
 - A name that is not a valid namespace (1–64 of `[A-Za-z0-9_.-]`) is refused when the
   rule is created.
-- A rule persisted before this field existed decodes as `namespace: None` — global,
+- A rule persisted before this field existed decodes as `namespace: None`, global,
   which is the behaviour it had.
 
 `namespace` is accepted wherever a `RuleDef` is: `POST /rules`, the MCP `create_rule`
 tool, Python's `create_rule({... "namespace": "tenant-a"})`, and a
 `mushroomdb schema apply` schema file. Omitting it is a global rule on all four.
 
-Namespaces themselves — the reserved `ns` property, how a role binds to one, and the
-cross-namespace edge refusal — are documented in
+Namespaces themselves (the reserved `ns` property, how a role binds to one, and the
+cross-namespace edge refusal) are documented in
 [masks.md](masks.md#namespaces).
 
 ---
@@ -807,16 +807,16 @@ or `null` for a plain two-node rule.
 A via-hop rule reads edges. Those edges can themselves be rule-derived, so
 one write cascades: setting `File.top_author_id` refires the FK rule that
 owns `TOP_AUTHOR`, and the new `TOP_AUTHOR` edge immediately refires every
-via-hop rule that hops over `TOP_AUTHOR` — `KNOWS`, say. All of it lands in
+via-hop rule that hops over `TOP_AUTHOR`: `KNOWS`, say. All of it lands in
 the same commit. Retraction chains the same way: an edge that disappears
-takes the edges derived from it with it — including when the edge disappears
+takes the edges derived from it with it, including when the edge disappears
 because you deleted the rule that owned it, or removed one of its endpoints.
 
 The rules of the cascade:
 
 - **Depth 4.** A write chains at most four levels past the rule that fired
   first. A longer chain stops there, leaving the levels beyond it at their
-  previous values, and no later write repairs them — a write that touches the
+  previous values, and no later write repairs them; a write that touches the
   root chains four levels again and never reaches the fifth. The cap is
   `MAX_CHAIN_DEPTH`, exported from the crate root. When a write hits it with
   work still pending, `stats().chain_truncations` goes up; a non-zero value
@@ -836,7 +836,7 @@ The rules of the cascade:
 - **Deterministic.** Derived edges are consumed in the order they were
   written and rules are visited in name order, so a chain produces the same
   result every time. WAL replay runs the identical hooks, so a reopened store
-  reproduces the identical chained edges — and the identical truncations.
+  reproduces the identical chained edges, and the identical truncations.
 - **Nothing derives onto a node being deleted.** A delete retracts that
   node's derived edges and chains those retractions, but the node is excluded
   from every role a rule could put it in while the delete is in flight, so the
@@ -867,7 +867,7 @@ View-fed rules remain designed, not shipped.
 ## Backfill and max_edges
 
 When a rule is declared on a graph that already has nodes, mushroomdb
-backfills — it evaluates the predicate against all existing node pairs.
+backfills: it evaluates the predicate against all existing node pairs.
 For rules without a `max_edges` cap this is O(|src_nodes| × |dst_nodes|)
 pair evaluations.
 
@@ -888,14 +888,14 @@ affected sources automatically backfill from the next-best candidate.
 
 **Always set `max_edges` on high-fanout rules at large scale.** A
 `FieldEqual` rule on 70k Talent × 20k Company nodes with `max_edges: Some(5)`
-produces at most 5 edges per source — evaluation stays linear in |src_nodes|.
+produces at most 5 edges per source; evaluation stays linear in |src_nodes|.
 
 After a rule is declared, incremental firing on each new write is cheap
 (sub-millisecond for most predicates) because only the changed node's
 field wakes the rule.
 
 > **Ceiling note:** `max_edges: Some(k)` is the *only* ceiling for per-source
-> rules — there is no additional defensive cap. A rule with `k = 1_000_000`
+> rules; there is no additional defensive cap. A rule with `k = 1_000_000`
 > on a graph with 100k source nodes can create up to 10¹¹ edges during
 > backfill. Choose k relative to the expected candidate-set size per source.
 

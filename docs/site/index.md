@@ -13,7 +13,7 @@ It speaks [Cypher](query.md), keeps [time-travel history](timetravel.md), and se
 ## What it does
 
 You declare a rule once. mushroomdb evaluates it on every subsequent write and
-maintains the matching edges automatically — adding them when properties align,
+maintains the matching edges automatically, adding them when properties align,
 retracting them when they no longer do. The graph builds itself.
 
 This is different from running a similarity script after each batch load or
@@ -25,7 +25,7 @@ Six predicate kinds ship today:
 
 | Display name | Wire shape (JSON `predicate` field) | What it tests |
 |---|---|---|
-| KeyMatch | `{"KeyMatch": {"field": "..."}}` | FK equality — one node's field matches another's key |
+| KeyMatch | `{"KeyMatch": {"field": "..."}}` | FK equality: one node's field matches another's key |
 | FieldEqual | `{"FieldEqual": {"field": "..."}}` | Exact match on a named field (any `ValueKey`: string, int, float, bool) |
 | Overlap | `{"Overlap": {"field": "...", "min": 0.5}}` | Jaccard coefficient on list-valued fields, min threshold |
 | NumericWithin | `{"NumericWithin": {"field": "...", "tolerance": 2.0}}` | Absolute numeric difference within a tolerance |
@@ -41,7 +41,7 @@ All six compose with `All` to require multiple conditions on the same edge.
 mushroomdb is embedded-first: it runs in your process, against a directory on
 disk, with no network round-trip and no server to start. The optional `serve`
 command adds an HTTP API and a bundled graph explorer when you want them, and
-several processes can share one store — see [Concurrency](concurrency.md).
+several processes can share one store; see [Concurrency](concurrency.md).
 
 `ingest-git` stays supported as a **data source**: commits, pull requests, files and authors become
 entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
@@ -54,7 +54,7 @@ roadmap, is in [Architecture](architecture.md).
 
 ## Status
 
-Pre-1.0 alpha — APIs and formats may change between minor versions. Single
+Pre-1.0 alpha: APIs and formats may change between minor versions. Single
 writer; multi-statement transactions are snapshot-isolated. Toolchain pinned to Rust 1.92.0.
 
 The current release is on the [releases page](https://github.com/MatthewSherlin/mushroomdb/releases).
@@ -63,53 +63,53 @@ The current release is on the [releases page](https://github.com/MatthewSherlin/
 
 ## Pages in this section
 
-- [Get started](get-started.md) — pick a language: [Rust](get-started-rust.md), [Python](get-started-python.md), [TypeScript](get-started-typescript.md), [Docker](get-started-docker.md), or [an existing Cypher app over Bolt](get-started-bolt.md)
-- [Drivers and Bolt](drivers-bolt.md) — connect the official graph-database drivers over Bolt, and which of their features work
-- [Transactions](transactions.md) — several statements as one atomic commit, under snapshot isolation, from every surface
-- [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
-- [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
-- [Property value types](types.md) — date/time, duration and binary representations and limits
-- [Rules](rules.md) — all six predicate kinds with examples
-- [API reference](api.md) — which page covers which surface
-- [HTTP API](http.md) — every route `mushroomdb serve` answers
-- [Python guide](python.md) — the binding, with worked examples
-- [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
-- [Arrow, pandas and polars](arrow.md) — the whole graph as two Arrow tables, and how to read them in pandas or polars
-- [Install](install.md) — one row per way in, and what each leaves out
-- [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
-- [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
-- [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
-- [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
-- [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
-- [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
-- [Known limits](limits.md) — what it does not do, and what was measured
-- [Benchmarks](benchmarks.md) — its own numbers, each with the file it comes from
-- [Architecture](architecture.md) — the crates, the storage format, and the roadmap
+- [Get started](get-started.md): pick a language: [Rust](get-started-rust.md), [Python](get-started-python.md), [TypeScript](get-started-typescript.md), [Docker](get-started-docker.md), or [an existing Cypher app over Bolt](get-started-bolt.md)
+- [Drivers and Bolt](drivers-bolt.md): connect the official graph-database drivers over Bolt, and which of their features work
+- [Transactions](transactions.md): several statements as one atomic commit, under snapshot isolation, from every surface
+- [Quickstart](quickstart.md): a store, an assistant wired to it, and the four questions with one worked call each
+- [Concepts](concepts.md): how it works: stores, nodes, rules, explain, time, access, memory
+- [Property value types](types.md): date/time, duration and binary representations and limits
+- [Rules](rules.md): all six predicate kinds with examples
+- [API reference](api.md): which page covers which surface
+- [HTTP API](http.md): every route `mushroomdb serve` answers
+- [Python guide](python.md): the binding, with worked examples
+- [`ingest-git` as a data source](ingest-git.md): what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
+- [Arrow, pandas and polars](arrow.md): the whole graph as two Arrow tables, and how to read them in pandas or polars
+- [Install](install.md): one row per way in, and what each leaves out
+- [Install, plugin and hooks](skill.md): the two install routes, what each writes, and `doctor`
+- [MCP tools](mcp.md): the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
+- [The association benchmark](association-bench.md): one world in three forms, the twenty questions, and the gate
+- [Concurrency](concurrency.md): many readers, one writer; the write lock, `Busy`, and `refresh`
+- [Node masks and access control](masks.md): role tokens, client masks, restricted-stub mode
+- [Running it as a service](service.md): the volume, the snapshot interval, backup, restore, and what a restart costs
+- [Panic policy](panic-policy.md): which conditions panic vs. return a typed error
+- [Known limits](limits.md): what it does not do, and what was measured
+- [Benchmarks](benchmarks.md): its own numbers, each with the file it comes from
+- [Architecture](architecture.md): the crates, the storage format, and the roadmap
 
 Reference:
 
 - [CLI reference](cli.md)
-- [MCP tools](mcp-tools.md) — every tool with its arguments, generated from the server's own listing
-- [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
-- [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
-- [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
-- [Upgrade from 0.9](upgrade-from-0.9.md) — what changes for a 0.9 caller, and what stays
+- [MCP tools](mcp-tools.md): every tool with its arguments, generated from the server's own listing
+- [Python API](python-api.md): every method of `GraphDb`, generated from the type stub
+- [Rust](rust.md): embedding the engine: the types you touch, with examples that are compiled
+- [TypeScript client](typescript.md): the HTTP client: its methods, and the routes it leaves to `fetch`
+- [Upgrade from 0.9](upgrade-from-0.9.md): what changes for a 0.9 caller, and what stays
 - [Cypher Query Reference](query.md)
-- [openCypher conformance](conformance.md) — the openCypher TCK pass, fail and skip counts
-- [Cypher function conformance](conformance-functions.md) — every Cypher function the TCK calls, and whether the engine passes it
-- [Bolt protocol](bolt.md) — the versions the server negotiates and the driver audit behind them
+- [openCypher conformance](conformance.md): the openCypher TCK pass, fail and skip counts
+- [Cypher function conformance](conformance-functions.md): every Cypher function the TCK calls, and whether the engine passes it
+- [Bolt protocol](bolt.md): the versions the server negotiates and the driver audit behind them
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
-- [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
+- [Vector search](vector.md): similarity rules, `find_similar`, exact and approximate, the index
 - [Property indexes](indexes.md)
-- [Unique constraints](constraints.md) — declare single-property uniqueness and understand write refusals
+- [Unique constraints](constraints.md): declare single-property uniqueness and understand write refusals
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
 - [Live Subscriptions](subscriptions.md)
 - [Rule Suggestion](suggest.md)
 - [Durability and crash recovery](durability.md)
-- [Data safety and evidence](data-safety.md) — recovery, compatibility, sync policy and backup checks
+- [Data safety and evidence](data-safety.md): recovery, compatibility, sync policy and backup checks
 - [Running several processes against one store](multiprocess.md)
 - [Self-hosting guide](self-host.md)
 - [Deployment](deployment.md)
@@ -119,7 +119,7 @@ Reference:
 
 ## Install for an AI agent
 
-The shortest way in is the Claude Code plugin — `claude plugin marketplace add
+The shortest way in is the Claude Code plugin: `claude plugin marketplace add
 MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
 `/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
 `/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
