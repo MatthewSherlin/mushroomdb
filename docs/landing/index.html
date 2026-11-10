@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>mushroomdb — the graph that stays true</title>
-<meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration — write a rule once, and every write derives, maintains and retracts the matching edges." />
+<title>mushroomdb: the graph that stays true</title>
+<meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration: write a rule once, and every write derives, maintains and retracts the matching edges." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap" />
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
 <meta property="og:type" content="website" />
-<meta property="og:title" content="mushroomdb — the graph that stays true" />
+<meta property="og:title" content="mushroomdb: the graph that stays true" />
 <meta property="og:description" content="An embedded Rust graph database in which a relationship is a schema declaration: write a rule once, and every write derives, maintains and retracts the matching edges." />
 <meta property="og:url" content="https://matthewsherlin.github.io/mushroomdb/" />
 <meta property="og:image" content="https://matthewsherlin.github.io/mushroomdb/assets/social-preview.png" />
@@ -199,7 +199,7 @@
 
   <header>
     <h1>mushroomdb</h1>
-    <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
+    <p class="tagline">The graph that stays true, and knows who's allowed to see it.</p>
     <p class="lede">
       mushroomdb is a Rust graph database you embed in your process or run as a server, with
       Cypher, the Bolt protocol, transactions and a queryable history. A relationship is a schema
@@ -207,7 +207,7 @@
       <strong>retracts</strong> the matching edges, each one carrying the rule, the score and the
       values that produced it.
     </p>
-    <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
+    <p class="alpha">Pre-1.0 alpha. APIs and formats may change between minor versions.</p>
     <div class="install"><pre><code id="install-cmd">pip install mushroomdb</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
     <p class="install-note">Also <code>cargo add mushroomdb</code>, <code>npm install mushroomdb-client</code>, the Docker image, and <code>npx mushroomdb install --db ./memory</code> to give Claude Code or Cursor a memory.</p>
     <p class="cta"><a class="primary" href="docs/quickstart.html">Quickstart</a><a href="docs/">Read the docs</a></p>
@@ -259,7 +259,7 @@
     <p>
       A Cypher <strong>SET</strong> in the built-in console changes a single property, the
       <code>founded_within</code> rule fires, and the new scored edges appear on the canvas.
-      There is no re-index step and no batch job to schedule — the derivation happens inside the
+      There is no re-index step and no batch job to schedule: the derivation happens inside the
       write that changed the property.
     </p>
     <figure>
@@ -274,14 +274,14 @@
         <h3>What it is</h3>
         <ul>
           <li>An embedded, single-binary graph database with a rule engine that maintains edges for you.</li>
-          <li>A 25-tool MCP server — twenty-three listed on every store, a store built by <code>ingest-git</code> included — plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
+          <li>A 25-tool MCP server (twenty-three listed on every store, a store built by <code>ingest-git</code> included), plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
           <li>Local-first: your data stays on disk, no cloud service, no model call anywhere: you bring your own embeddings.</li>
         </ul>
       </div>
       <div class="card">
         <h3>What it isn't</h3>
         <ul>
-          <li>Not a hosted service — you run it, embedded or from the image and the templates in <code>deploy/</code>.</li>
+          <li>Not a hosted service: you run it, embedded or from the image and the templates in <code>deploy/</code>.</li>
           <li>Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.</li>
           <li>Not a transactional relational database. Single writer, snapshot-isolated transactions, memory-first storage.</li>
         </ul>
