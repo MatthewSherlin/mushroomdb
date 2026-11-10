@@ -150,17 +150,17 @@ sends `Authorization: Bearer <token>`.
 Run a Cypher query (read or write). The server detects write statements and
 acquires the write lock automatically. Returns `{ columns: string[], rows: CellValue[][] }`.
 
-`opts.params` — bound parameters; values must be JSON scalars
+`opts.params`: bound parameters; values must be JSON scalars
 (`string | number | boolean | null`); `null` binds as a null.
 
-`opts.as_of` — time-travel: run the query on the graph as it was at this WAL
+`opts.as_of`: time-travel: run the query on the graph as it was at this WAL
 commit index (0 to `commit_seq − 1` inclusive, read-only). Obtain a commit
 index from the `commit` field of a `nodeHistory`/`edgeHistory` entry.
 
-`opts.mask` — node-key allow-list: restrict visible nodes to these keys.
+`opts.mask`: node-key allow-list: restrict visible nodes to these keys.
 Makes the query read-only.
 
-`opts.namespace` — restrict results to this namespace, intersecting with
+`opts.namespace`: restrict results to this namespace, intersecting with
 `mask` and any role. Makes the query read-only.
 
 ### `client.ingest(req) → Promise<IngestReport>`
@@ -211,9 +211,9 @@ Run a graph algorithm:
 
 | name | config type | result type |
 |------|-------------|-------------|
-| `"pagerank"` | `PageRankConfig` | `PageRankReport` — `{ scores: [key, score][], converged }` |
-| `"wcc"` | `WccConfig` | `WccReport` — `{ components: [key, component_id][], truncated }` |
-| `"degree"` | `DegreeConfig` | `DegreeReport` — `{ scores: [key, degree][], truncated }` |
+| `"pagerank"` | `PageRankConfig` | `PageRankReport`: `{ scores: [key, score][], converged }` |
+| `"wcc"` | `WccConfig` | `WccReport`: `{ components: [key, component_id][], truncated }` |
+| `"degree"` | `DegreeConfig` | `DegreeReport`: `{ scores: [key, degree][], truncated }` |
 
 All config fields are optional; server defaults apply.
 
@@ -228,8 +228,8 @@ only included when the client carries a valid full-access token.
 
 ### `client.metrics() → Promise<MetricsReport>`
 
-Wires `GET /metrics`. Returns live runtime counters — node/edge counts, WAL size, RSS,
-uptime — and a configurable slow-query log. Requires full-access auth.
+Wires `GET /metrics`. Returns live runtime counters (node/edge counts, WAL size, RSS,
+uptime) and a configurable slow-query log. Requires full-access auth.
 
 ### `client.findSimilar(opts) → Promise<FindSimilarResult>`
 
@@ -237,7 +237,7 @@ Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector p
 `opts.field` and `opts.vector` are required; `opts.k`, `opts.min`, `opts.label`, `opts.mask`,
 `opts.exact` are optional. Returns `{ hits: [key, score][] }`.
 
-`opts.where` — a `PropPredicate` applied after the search:
+`opts.where`: a `PropPredicate` applied after the search:
 ```ts
 // equality
 { field: 'status', eq: 'published' }
@@ -248,7 +248,7 @@ Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector p
 ### `client.createNode(label, key, props?, namespace?) → Promise<CreateNodeResult>`
 
 Wires `POST /nodes`. Inserts a node with the given label and key. This is an
-**insert**, not an upsert — a duplicate key throws `MushroomError`. Optional
+**insert**, not an upsert; a duplicate key throws `MushroomError`. Optional
 `props` map sets initial properties. Optional `namespace` scopes the node.
 Returns `{ ok, nodes, edges }`.
 
@@ -261,12 +261,12 @@ Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
 Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
 Throws `MushroomError` (404) when the key does not exist.
 
-`opts.mask` — node-key allow-list (non-empty string array; no key that is empty, has
+`opts.mask`: node-key allow-list (non-empty string array; no key that is empty, has
 surrounding whitespace or contains a comma). Only edges whose **other** endpoint is in the
 list are returned; `key` itself need not be. A list or key the server could not read as
 written throws `MushroomError`.
 
-`opts.stub_hidden` — when `true` **and** `mask` is set, edges to masked-out
+`opts.stub_hidden`: when `true` **and** `mask` is set, edges to masked-out
 endpoints are included; those endpoints appear as
 `{ key: string; restricted: true }` rather than a plain string. Without `mask`
 this option is silently ignored by the server.
@@ -283,7 +283,7 @@ was added or retracted.
 
 ### `client.wasLinked(a, b, edgeType, atCommit) → Promise<WasLinkedResult>`
 
-Wires `GET /history/was_linked`. Returns `{ a, b, edge_type, at_commit, linked }` — whether
+Wires `GET /history/was_linked`. Returns `{ a, b, edge_type, at_commit, linked }`: whether
 the named edge existed at the given commit index.
 
 `atCommit` accepts an integer commit index **or** an RFC 3339 date string
@@ -319,13 +319,13 @@ Returns `{ files, bytes, verified }`. Throws `MushroomError` when verification f
 ### `client.watch(opts, onEvent) → Promise<WatchHandle>`
 
 Open a `GET /watch` WebSocket and stream raw `MutationEvent`s. The server sends every
-committed mutation — node inserts/deletes, property changes, edge inserts/deletes, rule
-lifecycle and ingest events — as an externally-tagged JSON frame.
+committed mutation (node inserts/deletes, property changes, edge inserts/deletes, rule
+lifecycle and ingest events) as an externally-tagged JSON frame.
 
 Returns a handle with `close(): Promise<void>`. A server older than 0.8 does not answer a
 close on `/watch`, so `close()` resolves within 3 s whether or not the handshake completes.
 
-`opts.onClose` — called once when the WebSocket closes, whether via `handle.close()` or
+`opts.onClose`: called once when the WebSocket closes, whether via `handle.close()` or
 because the server dropped the connection. Use it as a signal to reconnect.
 
 Against a server older than 0.8, the `ws` package's socket is force-closed when the 3 s

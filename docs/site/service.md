@@ -1,7 +1,7 @@
 # Running it as a service
 
 `mushroomdb serve` is a single process holding one store directory. The graph is
-in RAM and on that directory, and nowhere else — there is no replica, no
+in RAM and on that directory, and nowhere else; there is no replica, no
 external log, and nothing reconstructs it from somewhere else. So the operator's
 job is small and entirely mechanical: mount the directory, bound the replay,
 copy it somewhere, and be able to put it back.
@@ -23,9 +23,9 @@ A store is a directory. Mount it; everything below follows from that.
 | `wal.genesis` | the marker that lets `asof` replay into the archives | `asof` reach below the last snapshot |
 | `roles.json` | role tokens and their masks | every configured role |
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
-| `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a store without it cannot resolve a date to a commit until new commits build a fresh one |
-| `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent, which is its usual state — content that names the snapshot and the WAL on disk marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot; any other content is left over and is emptied at the next write |
-| `keys.json` | access-key hashes, created private (mode 0600); never tokens | every access key — reissue them. `mushroomdb backup` and `POST /backup` do not copy it; the continuous S3 backup does |
+| `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`): a store without it cannot resolve a date to a commit until new commits build a fresh one |
+| `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent (its usual state); content that names the snapshot and the WAL on disk marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot; any other content is left over and is emptied at the next write |
+| `keys.json` | access-key hashes, created private (mode 0600); never tokens | every access key; reissue them. `mushroomdb backup` and `POST /backup` do not copy it; the continuous S3 backup does |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -35,7 +35,7 @@ past and no roles.
 path that appends to the write-ahead log takes the advisory lock first, and a
 writer that cannot take it within `WRITE_LOCK_WAIT` gets `GraphError::Busy`
 rather than corrupting anything (CHANGELOG v0.6.0, **Multi-process safety**).
-Readers are unaffected — many of them can share the directory. Two `serve`
+Readers are unaffected; many of them can share the directory. Two `serve`
 processes on one volume is not a supported configuration; one serves, the rest
 read. See [Concurrency](concurrency.md).
 
@@ -54,8 +54,8 @@ mushroomdb serve /data --snapshot-every 300
 bounds one thing: how
 much WAL a **hard** crash leaves to replay on the next open. Without it, a store
 that has never snapshotted replays from genesis, which re-derives every rule's
-edges and rebuilds the ANN index for any `VectorSimilar` rule — minutes on a
-large store. See [Durability and crash recovery](durability.md).
+edges and rebuilds the ANN index for any `VectorSimilar` rule (minutes on a
+large store). See [Durability and crash recovery](durability.md).
 
 Three properties worth knowing:
 
@@ -74,7 +74,7 @@ Three properties worth knowing:
   had WAL to fold, indefinitely. `mushroomdb stats <db-dir>` prints a `history:`
   line saying where the retained history starts, so growth is never a surprise,
   and `mushroomdb snapshot <db-dir> --retention N` is how to bound it once that
-  trade is worth making. Pruning advances the history horizon — see
+  trade is worth making. Pruning advances the history horizon; see
   [How far back history reaches](timetravel.md#how-far-back-history-reaches) for
   exactly what stops answering.
 
@@ -105,7 +105,7 @@ map. History addressed by commit index is unaffected.
 > HTTP endpoint.
 
 For a running server, `POST /backup` is the correct path. It holds the read lock
-for the full duration — copies plus verification — so writers block for that
+for the full duration (copies plus verification), so writers block for that
 window and the copy is consistent. It is full-token only; role tokens get 403.
 See [POST /backup](http.md#post-backup).
 
@@ -124,11 +124,11 @@ mushroomdb serve /data --restore-from /backups
 `--restore-from <dir>` seeds an **empty** store directory before the server
 opens it:
 
-- If `<dir>` itself holds a store — a `snapshot.bin`, or a non-empty `wal.bin`
-  for a store that has never snapshotted — that is the backup.
+- If `<dir>` itself holds a store (a `snapshot.bin`, or a non-empty `wal.bin`
+  for a store that has never snapshotted), that is the backup.
 - Otherwise `<dir>` is a directory *of* backups. An immediate subdirectory named
-  `latest` holding a store wins outright — so a symlink or a rolling copy can
-  name itself — and failing that, the newest by mtime wins.
+  `latest` holding a store wins outright (so a symlink or a rolling copy can
+  name itself), and failing that, the newest by mtime wins.
 - The chosen backup's files are copied into a staging directory inside the store
   directory and opened there, which runs the same CRC and replay checks any open
   runs. Only a copy that opened is moved into place. A copy that does not open is
@@ -143,31 +143,31 @@ restored from /backups/latest: 4 files, 2097152 bytes
 
 Four rules make it safe to leave in a container command line forever:
 
-1. **It never overwrites a store.** If the directory already holds a store — by
-   the same `snapshot.bin`-or-non-empty-`wal.bin` test — it does nothing and says
+1. **It never overwrites a store.** If the directory already holds a store (by
+   the same `snapshot.bin`-or-non-empty-`wal.bin` test) it does nothing and says
    `restore-from: <db-dir> already holds a store; not restoring` on stderr. This
-   is boot-time seeding for a fresh volume, not a rollback command — to roll
+   is boot-time seeding for a fresh volume, not a rollback command; to roll
    back deliberately, move the store directory aside first.
 2. **An empty vault is a warning, not an error.** A first boot against a backup
    volume with nothing in it yet prints `restore-from: no backup found under
    <path>` and starts empty, which is the only sensible behaviour for day one.
 3. **A failed restore changes nothing.** Because the copy is staged and only
    moved in once it has opened, a corrupt or truncated backup leaves the store
-   directory exactly as it was — empty. Fix the backup, or point at a different
+   directory exactly as it was: empty. Fix the backup, or point at a different
    one, and the next boot restores; there is no half-written store to clear out
    first, and no run that silently reports a store is already present. That
    guarantee covers errors the restore itself detects; a crash between the two
    renames that install the staged files (not a returned error, but the
    process dying mid-restore) can still leave the directory holding one file
    but not the other. The next boot sees that partial store as already
-   present and reports it rather than restoring over it — clear the directory
+   present and reports it rather than restoring over it; clear the directory
    and restore again.
 4. **It runs before `--demo-if-empty`.** A restored store is never overwritten
    by the demo seed, whichever order the flags appear in.
 
 The manual equivalent is exactly what the flag automates: with the server
 stopped, copy the backup directory's files into the store directory and start
-it. Nothing else is required — no import step, no rebuild.
+it. Nothing else is required: no import step, no rebuild.
 
 ---
 
@@ -178,7 +178,7 @@ Everything.
 Nodes, edges, every rule-derived edge, the rules themselves, the WAL, every
 archive, and all history. A container that writes its store to the container
 filesystem starts from zero on every restart, every redeploy and every
-reschedule, and nothing anywhere reports that as an error — the new store is a
+reschedule, and nothing anywhere reports that as an error; the new store is a
 perfectly valid empty one.
 
 There is no second copy. The graph lives in RAM and on that directory. If the
@@ -209,8 +209,8 @@ record a timestamp beside it.
 request already in flight finish, closes live `/watch` and `/subscribe`
 subscribers, and only then takes the shutdown snapshot. Before v0.6.12 it was
 aborted outright, which severed in-flight responses and subscriptions
-mid-stream. Nothing was ever lost — the WAL holds every commit and the next
-open replays it — but a rolling restart cut off work it did not need to.
+mid-stream. Nothing was ever lost (the WAL holds every commit and the next
+open replays it), but a rolling restart cut off work it did not need to.
 
 The drain is bounded (25 s at the default timeout; a stuck request or an open
 subscriber is cut off then, over plain HTTP and TLS alike), then comes the shutdown snapshot, then, with
@@ -234,8 +234,8 @@ makes a server log unreadable, so the level follows what happened:
 Twenty successful requests write nothing. A single 404 writes one line. The
 effect is that anything in the log is there because it is worth reading.
 
-Every response carries `x-request-id` — echoed from the caller's header when it
-sent one, generated otherwise — so an error someone reports can be found in the
+Every response carries `x-request-id` (echoed from the caller's header when it
+sent one, generated otherwise), so an error someone reports can be found in the
 log:
 
 ```
@@ -272,18 +272,18 @@ The image's `ENTRYPOINT` is the `mushroomdb` binary, so everything after the
 image name replaces the default `CMD` (which is
 `serve /data --addr 0.0.0.0:8080 --demo-if-empty`). What each piece is doing:
 
-- `-v …:/data` — the store directory on a volume that outlives the container.
+- `-v …:/data`: the store directory on a volume that outlives the container.
   This is the line §5 is about.
-- `-v …:/backups` — the vault `--restore-from` reads and `backup` writes. A
+- `-v …:/backups`: the vault `--restore-from` reads and `backup` writes. A
   separate volume on purpose: a restore is only useful if it survives losing the
   first one.
-- `MUSHROOMDB_TOKEN` — required, because `--addr 0.0.0.0:8080` is not loopback.
+- `MUSHROOMDB_TOKEN`: required, because `--addr 0.0.0.0:8080` is not loopback.
   `serve` refuses to start on a non-loopback bind without a token. Passing it in
   the environment keeps it out of the process's argument list. Terminate TLS at
   a reverse proxy in front of this, or build with `--features tls` and pass
-  `--tls-cert`/`--tls-key` — see [Deployment](deployment.md).
-- `--snapshot-every 300` — caps crash replay at five minutes of WAL.
-- `--restore-from /backups` — a no-op on every boot where `/data` survived, and
+  `--tls-cert`/`--tls-key`; see [Deployment](deployment.md).
+- `--snapshot-every 300`: caps crash replay at five minutes of WAL.
+- `--restore-from /backups`: a no-op on every boot where `/data` survived, and
   the thing that saves the deployment on the boot where it did not.
 
 Take the backups themselves from outside the container against the running
@@ -303,8 +303,8 @@ a backup nobody has.
 
 ## See also
 
-- [Durability and crash recovery](durability.md) — what recovery replays, what a
+- [Durability and crash recovery](durability.md): what recovery replays, what a
   snapshot archives, and what retention costs
-- [Concurrency](concurrency.md) — many readers, one writer, and `Busy`
-- [Deployment](deployment.md) — TLS, reverse proxies, and the loopback default
-- [Time travel](timetravel.md) — `asof`, the horizon, and archive reachability
+- [Concurrency](concurrency.md): many readers, one writer, and `Busy`
+- [Deployment](deployment.md): TLS, reverse proxies, and the loopback default
+- [Time travel](timetravel.md): `asof`, the horizon, and archive reachability

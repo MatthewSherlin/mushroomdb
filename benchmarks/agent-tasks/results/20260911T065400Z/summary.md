@@ -7,7 +7,7 @@
 - model: sonnet, max-turns 30, cell timeout 900s
 - arm P (files + grep): the world as `entities/*.json`, `changes.jsonl`, `roles.json` and a README describing the rules; no MCP server; plain prompt
 - arm Q (sqlite): the same world as `world.sqlite` (`sqlite3` on PATH) with the same README and its schema; no MCP server; plain prompt
-- arm R (graph): the same world as a mushroomdb store — `install --delivery mcp --db ./world.mushroomdb` into a directory holding nothing else, so the store is the only data path; plain prompt
+- arm R (graph): the same world as a mushroomdb store: `install --delivery mcp --db ./world.mushroomdb` into a directory holding nothing else, so the store is the only data path; plain prompt
 - allowed tools, every arm: `Read,Grep,Glob,Bash,Edit,Write` (+ `mcp__mushroomdb` for R)
 - every cell runs in a fresh copy of its arm's subject directory; nothing is carried from one cell to the next.
 - a cell that timed out or errored carries no cost, turns or duration; it is excluded from those means and from their paired differences, never counted as zero. Each section says how many cells it dropped.
@@ -243,7 +243,7 @@ arm P: 60 cells; arm Q: 60 cells; arm R: 60 cells; timeouts 0; errors 0; cells w
 
 ## Deltas vs arm Q
 
-Paired by task: one difference per task, arm mean minus arm Q mean. The interval is a 95% percentile bootstrap over those differences (2000 resamples, seeded). An interval that does not contain 0 is the only kind worth quoting. `tasks` is how many tasks contributed a difference — a task where either side recorded nothing contributes none.
+Paired by task: one difference per task, arm mean minus arm Q mean. The interval is a 95% percentile bootstrap over those differences (2000 resamples, seeded). An interval that does not contain 0 is the only kind worth quoting. `tasks` is how many tasks contributed a difference; a task where either side recorded nothing contributes none.
 
 | arm | metric | arm mean | arm Q mean | delta | 95% CI | tasks |
 |---|---|---|---|---|---|---|

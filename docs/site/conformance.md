@@ -54,7 +54,7 @@ A scenario that expects an error passes on any error, so the pass rate counts tw
 | `expressions/boolean` | 40 | 110 | 0 | 26.7% |
 | `expressions/comparison` | 39 | 33 | 0 | 54.2% |
 | `expressions/conditional` | 1 | 12 | 0 | 7.7% |
-| `expressions/existentialSubqueries` | 0 | 0 | 10 | — |
+| `expressions/existentialSubqueries` | 0 | 0 | 10 | |
 | `expressions/graph` | 38 | 10 | 13 | 79.2% |
 | `expressions/list` | 146 | 31 | 8 | 82.5% |
 | `expressions/literals` | 83 | 48 | 0 | 63.4% |

@@ -1,7 +1,7 @@
-# Fragmentation probe — pre-registration (spec §8.2)
+# Fragmentation probe: pre-registration (spec §8.2)
 
 Written 2026-09-30 and committed before the first run. An amendment is dated,
-says why, and is made before a run — never after one.
+says why, and is made before a run, never after one.
 
 Corrected 2026-10-01, before any run: one unit test that could not fail was
 replaced by one that does (`test_probe.py`). No threshold, axis or procedure
@@ -16,10 +16,10 @@ node.
 
 ## The world
 
-The association world, day 0: `association/build.py` `world(20260910, 2000)` —
-1,400 Talent, 400 Company, 200 Job. The rules are `build.task_rules()` — the
+The association world, day 0: `association/build.py` `world(20260910, 2000)`:
+1,400 Talent, 400 Company, 200 Job. The rules are `build.task_rules()`: the
 world's nine single-predicate rules; the semantic rule is excluded because
-truth.py does not evaluate `VectorSimilar` — plus two conjunctions this probe
+truth.py does not evaluate `VectorSimilar`, plus two conjunctions this probe
 adds:
 
 | rule | from → to | predicate | edge |
@@ -49,15 +49,15 @@ nine cells.
 
 ## Scoring
 
-Truth is `association/truth.py` `derived_edges` over the unfragmented world —
+Truth is `association/truth.py` `derived_edges` over the unfragmented world:
 the engine's predicates transcribed, with a committed cross-check of zero
 disagreements. Each cell is scored twice, as recall and precision against truth
 after mapping each alias key to its entity:
 
-1. **canonical — the primary score.** Only edges whose source is the canonical
+1. **canonical: the primary score.** Only edges whose source is the canonical
    alias count: what a reader that resolves an entity to its canonical node, and
    does not follow `SAME_AS`, sees.
-2. **any-alias — the secondary score.** An edge counts when any alias of its
+2. **any-alias: the secondary score.** An edge counts when any alias of its
    source holds it: what a reader following `SAME_AS` sees.
 
 Each is reported over every rule, over the leaf rules, and over the two
@@ -65,7 +65,7 @@ conjunctions.
 
 **What each score can show.** A leaf rule's field lands on the canonical alias
 with probability 1/k, so canonical recall on leaf rules is close to
-1 − fraction × (k−1)/k by construction — about 0.83 at the reference cell. The
+1 − fraction × (k−1)/k by construction, about 0.83 at the reference cell. The
 canonical score is primary by decision, not because it carries the most
 information; the conjunction rows and the any-alias column are where the cost
 §3.3 describes shows up, and the summary prints them beside it.
@@ -83,7 +83,7 @@ k = 3**. Loss = 1 − that recall.
 0.05 is five times the margin that decided 0.6.12's association gate (1.000
 against 0.990).
 
-## Pilots run before this was written — disclosed
+## Pilots run before this was written: disclosed
 
 - **Research pilot, 2026-09-30**, leaf rules only, 25% of Talent split, scale
   2,000, lists not split: canonical recall 0.8801 / 0.8346 / 0.8025 at

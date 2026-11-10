@@ -1,9 +1,9 @@
-# v0.1.1 release regression — mushroomdb
+# v0.1.1 release regression: mushroomdb
 
 ## Machine / date
 
 - **Date:** 2026-08-24
-- **Host:** mac.lan
+- **Host:** Apple M4 Pro laptop
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -20,7 +20,7 @@
 | `cargo fmt --check` | **clean** |
 | `benchmarks/test_harness.py` | not re-run (competitor engines offline; mushroomdb-only paths covered by cargo test) |
 
-## 10k suite — mushroomdb (v0.1.1)
+## 10k suite: mushroomdb (v0.1.1)
 
 Single-pass cold measurements at 10,000 nodes (seed=20260819, 70/20/10 Talent/Company/Job split).
 Baselines from `regression-v0.1-20260821.md` (run A column).
@@ -87,7 +87,7 @@ All rules improve by 20–46%. No rule engine code changed (confirmed via `git d
 | Big-3 full-graph (n=50) | p50=3.3 µs p95=9.9 µs | p50=7.1 µs p95=15.5 µs | Intersection still 0 (1M cap/70k×20k = 0.07% coverage); latency measurement noise at µs scale |
 | Big-3 slice 500T×500C | p50=772.5 µs p95=1.19 ms | p50=727.5 µs p95=942.2 µs | Stable; all 3 rules fire |
 | Explain (n=100) | p50=59.9 µs p95=222.1 µs | p50=118.2 µs p95=530.5 µs | Higher; no explain code changed; attributed to memory layout differences (larger RSS footprint during this phase in v0.1.1 run order) |
-| Per-query IVF recall | mean=0.991 | mean=0.991 | Unchanged — IVF quality unaffected by V6 format change |
+| Per-query IVF recall | mean=0.991 | mean=0.991 | Unchanged: IVF quality unaffected by V6 format change |
 
 ## Publish dry-run chain
 
@@ -95,17 +95,17 @@ Dependency order for publish: mushroomdb-storage → mushroomdb-rules → mushro
 
 | Crate | Package name | dry-run result | Note |
 |---|---|---|---|
-| crates/core-storage | mushroomdb-storage | **PASS** — packages cleanly, upload aborted (dry-run) | Root crate; no internal workspace deps |
-| crates/core-rules | mushroomdb-rules | **FAIL** — `no matching package named mushroomdb-storage found in crates.io index` | Expected: upstream not yet published to registry |
-| crates/core-query | mushroomdb-query | **FAIL** — `no matching package named mushroomdb-storage found in crates.io index` | Expected: upstream not yet published |
-| crates/arrow-bridge | mushroomdb-arrow | **FAIL** — `no matching package named mushroomdb-query found in crates.io index` | Expected: upstream not yet published |
-| crates/core-api | mushroomdb | **FAIL** — `no matching package named mushroomdb-query found in crates.io index` | Expected: upstream not yet published |
-| crates/server | mushroomdb-server | **FAIL** — `no matching package named mushroomdb-arrow found in crates.io index` | Expected: upstream not yet published |
-| crates/cli | mushroomdb-cli | **FAIL** — `no matching package named mushroomdb not found in crates.io index` | Expected: upstream not yet published |
+| crates/core-storage | mushroomdb-storage | **PASS**: packages cleanly, upload aborted (dry-run) | Root crate; no internal workspace deps |
+| crates/core-rules | mushroomdb-rules | **FAIL**: `no matching package named mushroomdb-storage found in crates.io index` | Expected: upstream not yet published to registry |
+| crates/core-query | mushroomdb-query | **FAIL**: `no matching package named mushroomdb-storage found in crates.io index` | Expected: upstream not yet published |
+| crates/arrow-bridge | mushroomdb-arrow | **FAIL**: `no matching package named mushroomdb-query found in crates.io index` | Expected: upstream not yet published |
+| crates/core-api | mushroomdb | **FAIL**: `no matching package named mushroomdb-query found in crates.io index` | Expected: upstream not yet published |
+| crates/server | mushroomdb-server | **FAIL**: `no matching package named mushroomdb-arrow found in crates.io index` | Expected: upstream not yet published |
+| crates/cli | mushroomdb-cli | **FAIL**: `no matching package named mushroomdb not found in crates.io index` | Expected: upstream not yet published |
 
 crates/core-bench and crates/sim-harness have `publish = false` and are excluded from the chain.
 
-**Assessment:** Only the root leaf (mushroomdb-storage) can pass dry-run before the chain is published in dependency order. The cascade of failures is the expected and correct behavior — crates.io validates that all resolved dependencies are present in the registry. The actual publish sequence must be executed in dependency order with indexing delays (~30–60 s) between each step. The registry credentials and publish workflow are release-triggered (see `.github/workflows/`); dry-run confirmed the package manifests and source tree are valid for mushroomdb-storage.
+**Assessment:** Only the root leaf (mushroomdb-storage) can pass dry-run before the chain is published in dependency order. The cascade of failures is the expected and correct behavior: crates.io validates that all resolved dependencies are present in the registry. The actual publish sequence must be executed in dependency order with indexing delays (~30–60 s) between each step. The registry credentials and publish workflow are release-triggered (see `.github/workflows/`); dry-run confirmed the package manifests and source tree are valid for mushroomdb-storage.
 
 ## Coverage table audit (docs/site/query.md)
 
@@ -127,7 +127,7 @@ Table date updated from 2026-08-21 to 2026-08-24. Supported row count: 42. Named
 | File | Change |
 |---|---|
 | `dogfood/results/scale-100k.md` | Replaced with v0.1.1 V6 numbers; corrected "V5 snapshot" template text to "V6 snapshot"; added snapshot file size (1.1 GiB) |
-| `benchmarks/results/regression-v0.1.1-20260824.md` | New file — this document |
+| `benchmarks/results/regression-v0.1.1-20260824.md` | New file (this document) |
 | `CHANGELOG.md` | Updated snapshot section: replaced "100k-node numbers will be re-published" promise with measured V6 numbers |
 | `docs/site/query.md` | Date updated 2026-08-21 → 2026-08-24 |
 | `README.md` | Updated cold-start benchmark table: V5→V6 snapshot open/write/size |
@@ -136,9 +136,9 @@ Table date updated from 2026-08-21 to 2026-08-24. Supported row count: 42. Named
 
 - All benchmark cells are from executed runs on the machine described. No estimates.
 - Delta investigations are complete for all cells showing >10%: backfill −29% (single-pass; no code change; environmental factors suspected, magnitude unconfirmed), subscription latencies (noise floor), scan-filter −29% (single-pass; no code change; environmental factors suspected, magnitude unconfirmed).
-- The backfill delta is the largest unexplained improvement. No rule engine code changed. Cause not confirmed — additional runs needed to establish spread.
+- The backfill delta is the largest unexplained improvement. No rule engine code changed. Cause not confirmed; additional runs needed to establish spread.
 - Snapshot V6 numbers are correctly attributed to the V6 format change in T2.
-- Publish dry-run: only the root leaf passes. This is correct and expected behavior — documented honestly.
+- Publish dry-run: only the root leaf passes. This is correct and expected behavior, documented honestly.
 - 100k WAL reopen −1% and snapshot open +2%: both within noise; no investigation required (< 10% threshold).
 - CHANGELOG v0.1.1 section is coherent; no duplicate headers; no stale promises.
 

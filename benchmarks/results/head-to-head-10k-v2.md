@@ -1,4 +1,4 @@
-# Head-to-head benchmark v2 — mushroomdb vs. system A / system B / system C
+# Head-to-head benchmark v2: mushroomdb vs. system A / system B / system C
 
 > **Supersedes** `benchmarks/results/head-to-head-10k.md` (v1, 2026-08-20).
 > v1 had: mushroomdb two-hop ERROR (pull executor not yet landed), system C
@@ -8,7 +8,7 @@
 ## Machine / date / versions
 
 - **Date:** 2026-08-20
-- **Host:** mac.lan (Apple M4 Pro, 12 cores, arm64)
+- **Host:** Apple M4 Pro laptop (12 cores, arm64)
 - **OS:** macOS 15.7.3
 - **RAM:** 24 GiB
 - **Python:** 3.12.12
@@ -26,9 +26,9 @@
 ## Honesty notes
 
 - **mushroomdb** numbers are **embedded Rust** (no network RTT, no serialization overhead).
-  system B is also embedded — its numbers are directly comparable to mushroomdb's.
+  system B is also embedded; its numbers are directly comparable to mushroomdb's.
   system A and system C numbers go over bolt/localhost (~0.1–1 ms round-trip per query).
-- **rule_derive** is mushroomdb-only — competitors have no auto-derivation equivalent.
+- **rule_derive** is mushroomdb-only; competitors have no auto-derivation equivalent.
   It is excluded from the cross-engine table. See `benchmarks/README.md`.
 - **Sequential runs required** (contamination guard): system A and system C both default to
   `bolt://localhost:7687`. They were run strictly sequentially:
@@ -42,22 +42,22 @@
   fields (key + props). `cypher_scan_filter` now correctly returns 1,400 rows (same as
   system A/mushroomdb) instead of 0. `bulk_ingest` time increased from 46 ms to 19.9 s
   because full property serialization now occurs.
-- **cypher_two_hop (I1 fix — fair comparison):** mushroomdb derives INDUSTRY_ALIGNMENT edges
+- **cypher_two_hop (I1 fix, fair comparison):** mushroomdb derives INDUSTRY_ALIGNMENT edges
   automatically via the `bench_industry_tc` rule (FieldEqual on `industry`). For a fair
   comparison, the 1,000,000 derived edges were exported and bulk-loaded into each competitor
   engine as ordinary edges (pre-materialization). All four engines then ran the same query:
   `MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
-  RETURN t.key, c.key, t2.key LIMIT 200` — all return **200 rows**.
+  RETURN t.key, c.key, t2.key LIMIT 200`; all return **200 rows**.
   **Edge pre-materialization times (one-time cost):** system A 10.8 s, system B 0.17 s (COPY FROM CSV),
   system C 8.0 s. mushroomdb derives the edges in 0.924 s automatically on rule declaration.
   Competitors required manual ETL; mushroomdb's rule engine replaces this step entirely.
 - **system B cypher_scan_filter (I2 fix):** system B adapter updated to store `size_bucket INT64`
-  (full props). Scan-filter now uses `WHERE n.size_bucket = 3` — returns 1,400 rows
+  (full props). Scan-filter now uses `WHERE n.size_bucket = 3`; returns 1,400 rows
   (identical to system A/mushroomdb/system C). Previous workaround (`STARTS WITH 'talent'`,
   7,000 rows) is retired.
 - **cold_start asymmetry:** mushroomdb `cold_start` measures `GraphDb::open()` + first
   `node_edges()` call (full process cost). system A / system C `cold_start` measures
-  connect+first query with the server **already running** — their server boot cost is
+  connect+first query with the server **already running**: their server boot cost is
   reported separately as `boot_to_ready`. system B (embedded) measures database open + query,
   directly comparable to mushroomdb.
 
@@ -74,31 +74,31 @@
 | cypher scan-filter-project (1.4k rows) | 2.20 ms | 87.36 ms | 0.37 ms ‡ | 12.56 ms |
 | cypher two-hop join (200 rows) | **0.198 ms** | 5.68 ms ★ | 1.58 ms ★ | 2.17 ms ★ |
 | cold_start (WAL-only / connect) | 3.24 s | 18.54 ms ▲ | 23.41 ms | 0.42 ms ▲ |
-| cold_start (snapshot V4) | **1.01 s** | — | — | — |
+| cold_start (snapshot V4) | **1.01 s** | n/a | n/a | n/a |
 | server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
 † system C `bulk_ingest`: v2 fix stores full props (`SET n = row`); time reflects real
-  property serialization. v1 was 46 ms (key only — semantically incomplete).
+  property serialization. v1 was 46 ms (key only, semantically incomplete).
 
-‡ system B `cypher_scan_filter`: I2 fix — adapter now stores `size_bucket INT64`; uses
+‡ system B `cypher_scan_filter`: I2 fix: adapter now stores `size_bucket INT64`; uses
   `WHERE n.size_bucket = 3` returning 1,400 rows (was `STARTS WITH 'talent'` → 7,000 rows).
   0.37 ms is best-of-5; same predicate semantics as system A/mushroomdb/system C.
 
 ★ system A / system B / system C `cypher_two_hop` (I1 fix): all return **200 rows** after
   1,000,000 INDUSTRY_ALIGNMENT edges were bulk-loaded as ordinary edges (pre-materialization).
   One-time pre-mat cost: system A 10.8 s, system B 0.17 s (COPY FROM CSV), system C 8.0 s.
-  mushroomdb derives the same edges automatically in 0.924 s on rule declaration — no manual
+  mushroomdb derives the same edges automatically in 0.924 s on rule declaration; no manual
   ETL required. v1 entries showed 0 rows (empty scan); those have been superseded by this run.
   mushroomdb v1 row was ERROR; fixed by the pull executor with LIMIT pushdown.
 
 ▲ system A / system C `cold_start`: server already running; measures connect + first query
   only. `boot-to-ready` row reports the actual container-start-to-first-query-answered time
-  (system A: 6.6 s, system C: 4.3 s). mushroomdb and system B are embedded — there is no server;
+  (system A: 6.6 s, system C: 4.3 s). mushroomdb and system B are embedded; there is no server;
   `cold_start` IS the full startup cost.
 
 ---
 
-## mushroomdb — rule_derive (ours-only, excluded from cross-engine table)
+## mushroomdb: rule_derive (ours-only, excluded from cross-engine table)
 
 > **Auto-derivation has no competitor equivalent.**
 > Edges are derived automatically when rules are declared and on every subsequent
@@ -110,11 +110,11 @@
   - `bench_industry_tc` (INDUSTRY_ALIGNMENT): 0.924 s
   - `bench_specialty_tc` (SPECIALTY_MATCH): 2.152 s
 
-(v1: 20.728 s total — earlier streaming backfill reduced this ~7×)
+(v1: 20.728 s total; earlier streaming backfill reduced this ~7×)
 
 ---
 
-## 100k cold-start — WAL-only vs. Snapshot V4
+## 100k cold-start: WAL-only vs. Snapshot V4
 
 > Measured from a freshly rebuilt 100k-node dogfood database
 > (`dogfood/results/scale-100000-db`, rebuilt 2026-08-20 via `dogfood/scale_run.py`).
@@ -129,7 +129,7 @@
 | system B open+query (10k) | 23.41 ms | Embedded; no rules to replay |
 | system C connect-only (10k scale) | 0.42 ms | Server already running; boot-to-ready = 4.3 s |
 
-**Key finding:** V4 snapshot  reduces 100k cold-start from 8.86 min to 11 s —
+**Key finding:** V4 snapshot  reduces 100k cold-start from 8.86 min to 11 s:
 a 47.7× improvement. The honest embedded-vs-server comparison:
 - mushroomdb (embedded): 11 s from V4 snapshot, or 8.86 min from WAL-only
 - system A (server): 6.6 s to boot the process; connect+query adds 18.5 ms after boot
@@ -156,7 +156,7 @@ and removed before system C start. No cross-contamination in v2 runs.
 
 ---
 
-## v2.1 — Regression run (2026-08-21)
+## v2.1: Regression run (2026-08-21)
 
 > **The 2026-08-21 release cycle** added: Cypher write support, `delete_edge` API,
 > `batch_edges` API (batch WAL frame for inserts + deletes), and a rule-engine
@@ -166,11 +166,11 @@ and removed before system C start. No cross-contamination in v2 runs.
 > Benchmark config change: `max_edges` removed from `run.py` rule dicts so
 > rules use the global-budget path (`max_edges=None` → 1M global cap), matching
 > v2 semantics.  Passing `max_edges=1_000_000` would have triggered per-source
-> top-1M semantics (effectively uncapped at 10k scale, 2.8M+ edges) — that
+> top-1M semantics (effectively uncapped at 10k scale, 2.8M+ edges), that
 > would not be a regression but a larger workload; documented in investigation
 > notes below.
 
-### mushroomdb — 10k comparison (v2 vs v2.1)
+### mushroomdb: 10k comparison (v2 vs v2.1)
 
 | workload | v2 | v2.1 | delta |
 |---|---|---|---|
@@ -179,7 +179,7 @@ and removed before system C start. No cross-contamination in v2 runs.
 | neighborhood_depth1 (p95) | 2.2 µs | 1.1 µs | −50% (faster) |
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% |
 | cypher scan-filter (1.4k rows) | 2.20 ms | 1.53 ms | **−30% (query engine improvements)** |
-| cypher two-hop (200 rows) | 0.198 ms | 307 µs | +55% (109 µs abs — timing noise) |
+| cypher two-hop (200 rows) | 0.198 ms | 307 µs | +55% (109 µs abs, timing noise) |
 | rule_derive (bench_industry_tc) | 0.924 s | 872 ms | −5.6% (slightly faster) |
 | rule_derive (bench_specialty_tc) | 2.152 s | 1.976 s | −8.2% (slightly faster) |
 | rule_derive total | 3.076 s | 2.849 s | −7.4% (slightly faster) |
@@ -190,18 +190,18 @@ All mushroomdb deltas are within ±10% noise or improvements.  No regressions.
 on a single-sample sub-ms query.  The edge count is identical (1M INDUSTRY_ALIGNMENT
 edges, global budget tripped at the same point as v2).  This is timing noise.
 
-### mushroomdb — 100k cold-start (v2 vs v2.1)
+### mushroomdb: 100k cold-start (v2 vs v2.1)
 
 | path | v2 | v2.1 | delta |
 |---|---|---|---|
 | snapshot V4 | 11.15 s | 10.4 s | −7% (faster) |
-| WAL-only | 8.86 min | not re-measured * | — |
+| WAL-only | 8.86 min | not re-measured * | n/a |
 
 *WAL-only cannot be re-measured without a 100k rebuild (WAL was truncated when
 the v2 snapshot was taken). The 2026-08-21 release cycle added batch WAL frames; WAL replay semantics
 for node/edge records are unchanged, so the v2 WAL-only number remains indicative.
 
-### Cross-engine — 10k (v2.1)
+### Cross-engine: 10k (v2.1)
 
 | workload | mushroomdb | system A | system B | system C |
 |---|---|---|---|---|
@@ -211,9 +211,9 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 | cypher scan-filter (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | cypher two-hop (200 rows) | **261.6 µs** ★ | **3.99 ms** ★ | **1.59 ms** ★ | **1.96 ms** ★ |
 | cold_start (WAL-only / connect) | 3.24 s ⊕ | 18.54 ms ⊕ | 23.41 ms ⊕ | 0.42 ms ⊕ |
-| cold_start (snapshot V4) | 1.01 s ⊕ | — | — | — |
+| cold_start (snapshot V4) | 1.01 s ⊕ | n/a | n/a | n/a |
 
-★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed — system C cell was
+★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed: system C cell was
   system A on a warm container; system A and system B v2.1 values also unreliable (warmup/ordering artifacts from
   single-pass run). **Current row = v2.2 corrected four-engine benchmark** (same dataset, same warmup policy):
   5,810,000 INDUSTRY_ALIGNMENT edges, fresh process/container, 3 warmup + median of 10 measured runs.
@@ -246,17 +246,17 @@ See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 
 **Three strategies measured** (10,000 nodes, 1,000 property updates, SPECIALTY_MATCH Overlap(0.15)):
 
-> **(a) per-op (expert-written)** — individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
+> **(a) per-op (expert-written)**: individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
 > Correctly retracts stale edges; retraction logic written with expert API knowledge.
 > `batch_edges` is new in this release.
 >
-> **(b) batched (expert-written)** — uses `batch_edges` (new API in this release), one WAL frame per update.
+> **(b) batched (expert-written)**: uses `batch_edges` (new API in this release), one WAL frame per update.
 > Expert knowledge of batching contract required; not available on competitor engines.
 >
-> **(c) Rule engine** — `create_rule` + `set_prop`. Derivation and retraction are automatic and atomic in Rust.
+> **(c) Rule engine**: `create_rule` + `set_prop`. Derivation and retraction are automatic and atomic in Rust.
 >
 > **Add-only pattern (NOT benchmarked):** omits `delete_edge`; stale edges accumulate on every update.
-> Not a correct implementation — described in correctness section, not measured as a variant.
+> Not a correct implementation; described in correctness section, not measured as a variant.
 
 | Phase | (a) per-op | (b) batched | (c) rule engine |
 |---|---|---|---|
@@ -265,7 +265,7 @@ See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 | Updates (1000 × set_prop) | **64.93 min** | 5.0 s | 5.1 s |
 | **Total wall (spec only)** | **64.93 min** | **24.98 s** | **17.58 s** |
 | SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 | 5,165,384 |
-| Drift (vs rule engine) | **0** | **0** | — |
+| Drift (vs rule engine) | **0** | **0** | n/a |
 
 Rule engine is **1.42× faster** than batched hand-rolled; **221.6× faster** than per-op.
 
@@ -275,15 +275,15 @@ not of the hand-rolled approach in general. Real application code routinely miss
 entirely (add-only), (2) retracting only the field written (not all affected predicates), (3) top-k
 backfill after eviction, (4) weight_prop staleness. The rule engine handles all of these automatically.
 
-**SEMANTIC_MATCH sub-run** (2,000 nodes — exact VectorSimilar scales O(n²)):
+**SEMANTIC_MATCH sub-run** (2,000 nodes, exact VectorSimilar scales O(n²)):
 
 | metric | hand-rolled | rule engine |
 |---|---|---|
 | SEMANTIC_MATCH edges | 17,789 | 17,789 |
-| Drift | 0 | — |
+| Drift | 0 | n/a |
 | Semantic match time | 1.5 s total ingest | 2.9 s (exact cosine backfill only) |
 
-### Contamination guard — v2.1 run
+### Contamination guard: v2.1 run
 
 | engine | container | port | state before run |
 |---|---|---|---|
@@ -296,13 +296,13 @@ backfill after eviction, (4) weight_prop staleness. The rule engine handles all 
 runs them sequentially; system C connects after system A has finished). All engines
 report correct results. dai-system A was restored after the run.
 
-### Contamination finding — v2.1 system C result was bench-system A (found during the v2.2 correction pass)
+### Contamination finding: v2.1 system C result was bench-system A (found during the v2.2 correction pass)
 
 **Post-v2.1 investigation found contamination in the system C two-hop result.**
 
 `bench-system C` was never started in the v2.1 single-pass run. The system C adapter
 tried to import `a named system` (ImportError), then fell back to the system A Python driver at
-`bolt://localhost:7687` — which connected to `bench-system A` (still running from the earlier
+`bolt://localhost:7687`, which connected to `bench-system A` (still running from the earlier
 system A pass). The v2.1 "system C" two-hop value of **2.57 ms** is actually a system A result.
 
 This also explains the system A v2→v2.1 improvement (5.68 ms → 2.88 ms): system A was measured
@@ -321,13 +321,13 @@ See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
 
 ⚠ v2.1 system A = warm second measurement; v2.1 "system C" = system A under different label.
 
-**Why the isolated rerun numbers differ from v2 baseline — two confounds:**
+**Why the isolated rerun numbers differ from v2 baseline; two confounds:**
 
 1. **Dataset growth (1M → 5.81M edges):** v2 used `max_edges=None` → global budget
    capped INDUSTRY_ALIGNMENT at 1,000,000. Since the 2026-08-21 semantics change, `max_edges=Some(k)` switches to
    per-source top-k semantics; with 2,000 company candidates per talent the FieldEqual rule
    produces **5,810,000 edges** (all matching pairs, effectively uncapped). Comparing the
-   two-hop on 1M-edge v2 data vs 5.81M-edge current data is apples-to-oranges — denser
+   two-hop on 1M-edge v2 data vs 5.81M-edge current data is apples-to-oranges; denser
    graphs take longer to traverse.
 
 2. **Cold-start vs warm container:** v2 two-hop queries ran on a container that had
@@ -340,7 +340,7 @@ See the four-engine table below.
 
 Full isolation log (single-shot cold runs, superseded by v2.2): `benchmarks/results/isolated-twohop-20260821-041719.md`.
 
-### Four-engine two-hop — v2.2 corrected (same dataset, warmup policy)
+### Four-engine two-hop: v2.2 corrected (same dataset, warmup policy)
 
 **Date:** 2026-08-21T04:41:00  
 **Dataset:** 5,810,000 INDUSTRY_ALIGNMENT edges (FieldEqual on `industry`, uncapped per-source)  
@@ -360,7 +360,7 @@ Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
 
 ---
 
-## v2.3 — Post-table-stakes regression run (2026-08-21)
+## v2.3: Post-table-stakes regression run (2026-08-21)
 
 > **The table-stakes release** (Plan 14) added: Cypher write support (`query_write`,
 > `query_with_params`), `WITH` pipeline, `UNWIND`, `OPTIONAL MATCH`, `$params`,
@@ -372,7 +372,7 @@ Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
 > Competitor containers were not re-run for non-two-hop workloads. Two-hop values
 > remain the v2.2 corrected benchmark.
 
-### mushroomdb — 10k comparison (v2.1 vs v2.3)
+### mushroomdb: 10k comparison (v2.1 vs v2.3)
 
 | workload | v2.1 | v2.3 | delta | note |
 |---|---|---|---|---|
@@ -389,12 +389,12 @@ Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
 All mushroomdb deltas are within ±10% noise or improvements. **No regressions.**
 
 **scan-filter cold-start note (single-shot policy):** Both 1.53 ms (v2.1) and 3.35 ms (v2.3) are
-single-shot measurements — one call in a fresh process. They are policy-matched and directly
+single-shot measurements; one call in a fresh process. They are policy-matched and directly
 comparable. The +119% single-shot delta is a cold-start artifact: the first call warms the memory
 allocator and OS page cache; the elevated number does not reflect steady-state throughput.
 
 Warm steady-state p50 for scan-filter is **0.77 ms** (10-run median after 3 warmup), measured
-by `investigate_scan.py`. This is a 50% improvement vs v2.1 single-shot (1.53 ms) — but
+by `investigate_scan.py`. This is a 50% improvement vs v2.1 single-shot (1.53 ms), but
 comparing a warm p50 to a single-shot baseline crosses measurement policies. A warm-to-warm
 comparison against v2.1 was not run. The correct conclusion: no cold-start regression (single-shot
 3.35 ms is explained by allocator warmup, not code regression); warm throughput improved (pull
@@ -402,24 +402,24 @@ executor optimizations in the table-stakes release).
 
 **sub-µs timings note:** depth-1 and depth-2 latencies are in the 0.2–1.3 µs range.
 ±0.1–0.2 µs swings reflect scheduling jitter, not code changes. Values are p50 of 20
-samples — increase sample count for stable sub-µs comparisons.
+samples; increase sample count for stable sub-µs comparisons.
 
 ### 100k cold-start (v2.3 re-measurement)
 
 | path | v2 | v2.1 | v2.3 | delta vs v2.1 |
 |---|---|---|---|---|
 | mushroomdb snapshot V4 (100k) | 11.15 s | 10.4 s | **10.508 s** | +1.0% (noise) |
-| mushroomdb WAL-only (100k) | 8.86 min | not re-measured | not re-measured * | — |
+| mushroomdb WAL-only (100k) | 8.86 min | not re-measured | not re-measured * | n/a |
 
 *WAL-only cannot be re-measured: WAL is 0 bytes (truncated when the v2 snapshot was
 taken). The WAL replay code changed in the table-stakes release (Batch frames are now
 a valid replay record type, and delete ops added). However, the 100k dogfood WAL was
-built before batch frame support and contains no Batch records — the replay path for
+built before batch frame support and contains no Batch records; the replay path for
 node/edge inserts is unchanged. The v2 WAL-only number (8.86 min) remains indicative.
 V4 snapshot load bypasses WAL replay entirely; the measured 10.508 s is the authoritative
 v2.3 number.
 
-### Contamination guard — v2.3 run
+### Contamination guard: v2.3 run
 
 mushroomdb workloads are embedded and unaffected by bolt servers. Run.py was not invoked
 for competitor engines (numbers unchanged from v2.2). The v2.3 mushroomdb-only run was
@@ -429,11 +429,11 @@ executed with:
 
 ---
 
-## v2.4 — Post-unlocks regression run (2026-08-21)
+## v2.4: Post-unlocks regression run (2026-08-21)
 
 > **The unlocks release** (Plan 15) added: live subscriptions (`subscribe_rule`,
 > `subscribe_all_rules`, `subscribe_writes`, WS `GET /subscribe`), as-of time travel
-> (`open_at`), materialized property views (`create_view`, `ViewStore`, snapshot V4→V5 —
+> (`open_at`), materialized property views (`create_view`, `ViewStore`, snapshot V4→V5;
 > V4 snapshots are unreadable with V5 binary), and rule suggestion (`suggest_rules`,
 > `GET /suggest`, CLI `suggest`). This section confirms no regressions and records any
 > performance changes from the new features.
@@ -441,7 +441,7 @@ executed with:
 > **Competitor numbers are unchanged from v2.2.** No competitor code changed; two-hop
 > row = v2.2 corrected four-engine benchmark.
 
-### mushroomdb — 10k comparison (v2.3 vs v2.4)
+### mushroomdb: 10k comparison (v2.3 vs v2.4)
 
 | workload | v2.3 | v2.4 | delta | note |
 |---|---|---|---|---|
@@ -457,7 +457,7 @@ executed with:
 
 *Final numbers: N=5 median, release build, 2026-08-21. Two-stage fix applied (see below). Pre-fix v2.4: industry=1.551 s (+77%), specialty=2.610 s (+29%), total=4.161 s (+44%).*
 
-**rule_derive regression — root cause and two-stage fix:**
+**rule_derive regression: root cause and two-stage fix:**
 
 Initial v2.4 measurement showed +44% regression from Plan-15 view-maintenance infrastructure.
 Two separate overhead sources identified and fixed in this session:
@@ -471,7 +471,7 @@ sites guarded by `if !self.view_store.is_empty()`. Recovery: −14.9% (4.161 s �
 during backfill even with no subscribers and no views. Fix: `emit_deltas: bool` added to
 `RuleEngine`; `ProvSets::insert/remove` skip the push when `emit: false`. Flag set `true` by
 `subscribe_*` / `create_view`, cleared when last subscriber drops and no views remain.
-Safety: events are fire-and-forget live streams — late subscribers never receive past events
+Safety: events are fire-and-forget live streams; late subscribers never receive past events
 by design; views call `backfill_view` from `topo` directly at creation (confirmed at
 `views.rs::create_view`), not from pending deltas. Recovery: further −11.8% (3.542 s → 3.149 s).
 
@@ -479,13 +479,13 @@ by design; views call `backfill_view` from `topo` directly at creation (confirme
 (`init_node_views` per InsertNode, engine index updates). All individual regressions are <11%.
 
 **scan-filter note:** Both 3.35 ms (v2.3) and 1.22 ms (v2.4) are single-shot cold-start
-measurements — policy-matched. The v2.3 scan-filter note documented the cold-start artifact;
+measurements, policy-matched. The v2.3 scan-filter note documented the cold-start artifact;
 v2.4 shows a lower cold-start value (run order, allocator state). No regression.
 
 **sub-µs timings note:** depth-1 (p95) went from 1.3 µs to 2.2 µs (+0.9 µs absolute).
 Sub-µs p95 swings of ±1 µs are within normal scheduling jitter on 20 samples. Not a regression.
 
-### 100k cold-start (v2.4 — V5 snapshot)
+### 100k cold-start (v2.4: V5 snapshot)
 
 > The V4 snapshot format is rejected by V5 binary ("V4 snapshot is no longer supported;
 > re-snapshot with a V5 binary"). The previous 100k db (snapshot.bin V4, wal.bin 0 bytes)
@@ -501,7 +501,7 @@ per-source top-k semantics. For dogfood rules with only 3 industries and high fa
 the per-source cap of 1M is never hit, creating all 283.5M+ edges and causing OOM.
 Fix: reset `_rule()` default to `max_edges=None` (global budget) in `dogfood/rules.py`.
 
-**APPROXIMATE_SEMANTIC_RULE compatibility fix (same root cause):** `APPROXIMATE_SEMANTIC_RULE` also used `max_edges=MATCHER_MAX_EDGES=1_000_000`. At 100k scale, IVF with the global 1M cap (V4) queried only ~6k Talent nodes before hitting the cap. With V5 per-source cap of 1M and ~160 qualifying Companies per Talent (cosine ≥ 0.85), all 70k Talent nodes must be queried, materializing ~11M edges — ~11× more than V4. This causes semantic_approx to take 90+ min instead of ~8.4 min, and WAL reopen to take another 90+ min. Fix: set `max_edges=None` in `APPROXIMATE_SEMANTIC_RULE` (preserves V4 global-budget semantics).
+**APPROXIMATE_SEMANTIC_RULE compatibility fix (same root cause):** `APPROXIMATE_SEMANTIC_RULE` also used `max_edges=MATCHER_MAX_EDGES=1_000_000`. At 100k scale, IVF with the global 1M cap (V4) queried only ~6k Talent nodes before hitting the cap. With V5 per-source cap of 1M and ~160 qualifying Companies per Talent (cosine ≥ 0.85), all 70k Talent nodes must be queried, materializing ~11M edges, ~11× more than V4. This causes semantic_approx to take 90+ min instead of ~8.4 min, and WAL reopen to take another 90+ min. Fix: set `max_edges=None` in `APPROXIMATE_SEMANTIC_RULE` (preserves V4 global-budget semantics).
 
 **V5 backfill timing** (with global-budget max_edges=None fix):
 
@@ -518,7 +518,7 @@ Fix: reset `_rule()` default to `max_edges=None` (global budget) in `dogfood/rul
 | similar_size_strict_tc | 1.653 s | 2.628 s | +59.0% | 1M edges, tripped |
 | **backfill total** | **21.228 s** | **28.650 s** | **+35.0% ‡** | same to_vec() root cause as 10k |
 
-‡ 100k backfill numbers measured pre-fix (PID 50395, 2026-08-21T15:42). **Both** perf fixes postdate this run: Stage 1 (`is_empty()` guard, commit 2c38199) and Stage 2 (`emit_deltas` engine gate, commit d4d312c). Applying both recovery rates from the 10k re-measurement (Stage 1 −14.9%, Stage 2 −11.8%, combined ~−25%) gives an estimated post-fix 100k backfill of **~21.5 s** (~parity with V4's 21.228 s). **Estimate, not measured** — 100k re-run not attempted (20+ min rebuild).
+‡ 100k backfill numbers measured pre-fix (PID 50395, 2026-08-21T15:42). **Both** perf fixes postdate this run: Stage 1 (`is_empty()` guard, commit 2c38199) and Stage 2 (`emit_deltas` engine gate, commit d4d312c). Applying both recovery rates from the 10k re-measurement (Stage 1 −14.9%, Stage 2 −11.8%, combined ~−25%) gives an estimated post-fix 100k backfill of **~21.5 s** (~parity with V4's 21.228 s). **Estimate, not measured**: 100k re-run not attempted (20+ min rebuild).
 
 **Cold-start open times (WAL-only and V5 snapshot):**
 
@@ -533,7 +533,7 @@ Fix: reset `_rule()` default to `max_edges=None` (global budget) in `dogfood/rul
 ### NEW: Subscription end-to-end latency
 
 > Commit-to-event-received p50/p95 over 1,000 events. Methodology: t_post = Instant::now()
-> after insert_node() returns (commit is synchronous — WAL fsync + apply + event push all
+> after insert_node() returns (commit is synchronous: WAL fsync + apply + event push all
 > complete inside the call); event received via recv_timeout() / WS frame; latency = t_recv
 > − t_post. Clock: std::time::Instant (monotonic, ~ns resolution, Apple M4 Pro). Warmup:
 > 50 events discarded. Release build (`cargo test --release`). Measured 2026-08-21.
@@ -555,7 +555,7 @@ loaded M4 Pro.
 
 Source: `crates/server/tests/sub_latency.rs` (added in this release).
 
-### Cross-engine — 10k (v2.4)
+### Cross-engine: 10k (v2.4)
 
 Competitor workloads not re-run; numbers unchanged from v2.2 corrected benchmark.
 mushroomdb non-two-hop numbers updated to v2.4 single-shot values.
@@ -573,14 +573,14 @@ mushroomdb non-two-hop numbers updated to v2.4 single-shot values.
 ⊕ v2 values; competitor servers unchanged.
 ▽ mushroomdb cold-start is 100k-node snapshot open (not a 10k connect latency); V5 `open_with` from snapshot 8.710 s measured 2026-08-21; write cost 25.094 s. V4 baseline was 10.508 s (−17.1%).
 
-### Contamination guard — v2.4 run
+### Contamination guard: v2.4 run
 
 mushroomdb workloads are embedded and unaffected by bolt servers.
 Competitor engines not re-run (numbers unchanged from v2.2). The v2.4 run:
 - `docker ps | grep bench-` → no bench-* containers before start (verified)
 - `dai-system A` present on port 7687 with non-standard auth; system A adapter failed
   connectivity check (`_AUTH = ("system A", "system A")` rejected by production container)
-  and was skipped — no contamination of mushroomdb results
+  and was skipped; no contamination of mushroomdb results
 - mushroomdb is embedded; bolt port state is irrelevant
 
 ---
@@ -588,7 +588,7 @@ Competitor engines not re-run (numbers unchanged from v2.2). The v2.4 run:
 ## v2.5 / v0.1.0 regression (2026-08-21)
 
 **Plans covered:** Plan 15 (algorithms, full-text-lite, TypeScript client) + Plan 16 (docs, release).
-**Binary:** release build — `maturin develop --release` for Python bindings; `cargo --release` for latency.
+**Binary:** release build: `maturin develop --release` for Python bindings; `cargo --release` for latency.
 **Full report:** `benchmarks/results/regression-v0.1-20260821.md`.
 
 ### Latency correction note (v2.4 numbers above)
@@ -599,13 +599,13 @@ The v2.4 subscription latency numbers in this document (`0.04 µs / 0.21 µs` in
 | Channel | v2.4 (above) | v0.1.0 corrected | Reason |
 |---|---|---|---|
 | In-process p50 | 0.04 µs | **0.17 µs** | 0.04 µs (40 ns) is below `Instant::now()` granularity on Darwin (~10 ns resolution); two v0.1.0 runs agree at 0.17 µs. |
-| In-process p95 | 0.21 µs | **0.42 µs** | Same — v2.4 was a quiet-machine (02:19 AM) single run. |
+| In-process p95 | 0.21 µs | **0.42 µs** | Same: v2.4 was a quiet-machine (02:19 AM) single run. |
 | WS p50 | 61 µs | **86 µs** | Single-run at 02:19 AM vs two consistent v0.1.0 runs at 20:09. |
 | WS p95 | 88 µs | **226 µs** | Same quiet-machine effect. Tests still pass (p50 < 1 ms, p95 < 5 ms assertions). |
 
 These numbers are documented as corrected; the v2.4 entries above are historical record only.
 
-### 10k mushroomdb — v0.1.0 (two runs for variance)
+### 10k mushroomdb: v0.1.0 (two runs for variance)
 
 Competitor workloads not re-run (no contamination risk; embedded mushroomdb unaffected by bolt state).
 
@@ -615,15 +615,15 @@ Competitor workloads not re-run (no contamination risk; embedded mushroomdb unaf
 | neighborhood_depth1 (p50) | 0.4 µs | 0.4 µs | 0.3 µs | 0% | No change |
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0.2 µs | 0% | No change |
 | cypher scan-filter (1.4k rows) | 1.53 ms | 2.04 ms | 2.12 ms | +33% | Cold single-pass artifact; warmup-median (20 runs) = **0.9 ms** (faster than v2.4). Criterion bench +7.2%. T15-16 did not change scan executor. |
-| cypher two-hop (200 rows) | 307 µs† | 207 µs | 326 µs | — | 57% run-to-run variance; canonical is four-engine benchmark (261.6 µs warmup-median). |
+| cypher two-hop (200 rows) | 307 µs† | 207 µs | 326 µs | n/a | 57% run-to-run variance; canonical is four-engine benchmark (261.6 µs warmup-median). |
 | rule_derive (two rules) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | See rule_derive note below. |
 
 † v2.4 307 µs: single-pass after ingest with variable warmup state. Canonical: four-engine warmup-median 261.6 µs.
 ‡ v2.4 3.149 s was a single run; the same binary measured 2.849 s in another run on the same day.
 
-### rule_derive — v0.1.0 detailed
+### rule_derive: v0.1.0 detailed
 
-v0.1.0 runs A and B give 3.493 s and 3.514 s (0.6% intrarun variance) — **a stable +11% above the v2.4 3.149 s baseline**.
+v0.1.0 runs A and B give 3.493 s and 3.514 s (0.6% intrarun variance), **a stable +11% above the v2.4 3.149 s baseline**.
 
 This cross-version delta is real, not noise. Investigation: Plans 15-16 added `FulltextIndex` as a field
 in `GraphDb` (T2) and graph algorithms (T1). Neither touches the rule engine's streaming backfill path.
@@ -636,7 +636,7 @@ negligible overhead (~10 ns × 10k nodes = 0.1 ms).
 added `FulltextIndex` struct (GraphDb grew), or CPU frequency/thermal variation between the 02:19 AM v2.4
 run and 20:09 v0.1 runs. Tracked.
 
-### Subscription latency — v0.1.0 re-run
+### Subscription latency: v0.1.0 re-run
 
 `cargo test -p server --test sub_latency --release -- --nocapture`
 1,000 events, 50 warmup, t_recv − t_post (post-commit-to-receive), `std::time::Instant`.
@@ -657,6 +657,6 @@ shared column. Fixed in `crates/core-storage/src/fulltext.rs` (new `field_indexe
 and `crates/core-api/src/db.rs` (DisableFulltext apply removes A-node postings before calling disable).
 Deterministic regression test added: `crates/core-api/tests/fulltext.rs::disable_shared_field_removes_only_disabled_label_postings`.
 
-### Contamination guard — v0.1.0 run
+### Contamination guard: v0.1.0 run
 
 Competitor workloads not re-run. mushroomdb is embedded; bolt port state is irrelevant to these results.

@@ -1,8 +1,8 @@
 # The association benchmark
 
-The association suite asks the question a graph is supposed to be best at —
+The association suite asks the question a graph is supposed to be best at,
 *why are these two things related, and what did that look like on some other
-day* — and measures the graph against the two things a developer would otherwise
+day*, and measures the graph against the two things a developer would otherwise
 reach for: a directory of JSON files, and a single relational database file.
 
 It lives in `benchmarks/agent-tasks/`, where the retired code suite ran, and
@@ -22,8 +22,8 @@ python3 benchmarks/agent-tasks/run.py --suite association --reps 3
 ## One world, three forms
 
 There is exactly one generator and three writers that must not disagree about a
-single fact. `association/build.py` synthesizes a world — talents, companies,
-jobs — and writes it three ways under the build directory:
+single fact. `association/build.py` synthesizes a world (talents, companies,
+jobs) and writes it three ways under the build directory:
 
 | Directory | Arm | What the agent gets |
 |---|---|---|
@@ -34,8 +34,8 @@ jobs — and writes it three ways under the build directory:
 `equivalent()` loads all three back and asserts they agree. Every arm is allowed
 `Read,Grep,Glob,Bash,Edit,Write`; arm R also gets `mcp__mushroomdb`.
 
-**What only the graph form has** is the ten rules loaded as real linking rules —
-so the store holds derived edges and their history — and the 1,536-dimension
+**What only the graph form has** is the ten rules loaded as real linking rules,
+so the store holds derived edges and their history, and the 1,536-dimension
 `embedding` the semantic rule needs. That vector is the one generated field the
 flat forms leave out: writing 1,536 floats per entity into a JSON file an agent
 is meant to grep would be tens of megabytes of noise. The README names it as the
@@ -43,7 +43,7 @@ one field only the store has, and no task may ask about a rule that reads it.
 
 **Time in the store is a WAL commit index**, not a wall clock. `days.json` is the
 bridge: for each day it records the commit index of that day's last mutation,
-which is what an as-of query wants. The store is never snapshotted — a snapshot
+which is what an as-of query wants. The store is never snapshotted; a snapshot
 would truncate the very history the suite exists to ask about.
 
 The world is deterministic in its seed and scale (`20260910` / `2000`, a 90-day
@@ -55,7 +55,7 @@ against, so a result names the world it measured.
 ## The questions
 
 Twenty tasks, five kinds, four each. Each is graded against executable truth
-computed from the world by `association/truth.py` — an answer key, not a rubric —
+computed from the world by `association/truth.py` (an answer key, not a rubric),
 and most are set checks with an explicit `forbid` list, so naming a near-miss
 costs score rather than being ignored.
 
@@ -68,7 +68,7 @@ costs score rather than being ignored.
 | `visibility` | What one role may see |
 
 The truth is brute-forced from the generated world independently of the engine,
-and then cross-checked *against* the engine — 200 `explain` probes, 20
+and then cross-checked *against* the engine: 200 `explain` probes, 20
 `was_linked` probes and 20 `node_history` probes, 0 disagreements
 (`association/cross-check.md`). A task the baseline arm finishes in fewer than
 the pilot floor of turns is *replaced* rather than dropped, so the set stays at
@@ -84,7 +84,7 @@ python3 benchmarks/agent-tasks/run.py --suite association --setup-only
 
 Builds all three forms once, under the harness scratch directory, and installs
 the graph subject. It takes five to six minutes and is skipped when a complete
-build is already there — an incomplete one is removed and rebuilt.
+build is already there; an incomplete one is removed and rebuilt.
 
 ```sh
 python3 benchmarks/agent-tasks/run.py --suite association --setup-only --reprovision
@@ -94,7 +94,7 @@ python3 benchmarks/agent-tasks/run.py --suite association --setup-only --reprovi
 writes it again with the current binary, skill, brief and `alwaysLoad` setting.
 Use it whenever the binary has moved: without it, `install_association_graph` is
 a no-op once `.mcp.json` is there, and the run would measure an old skill under
-the new version's name. **The world itself is never touched** — the six-minute
+the new version's name. **The world itself is never touched**: the six-minute
 build and the digest `tasks.json` was written against both survive, because the
 artifacts `--reprovision` removes are the install's, not the store's.
 
@@ -107,7 +107,7 @@ before anything measured against the old one can be compared.
 ## The gate
 
 Pre-registered, computed by the harness rather than by hand, with **arm Q as the
-baseline** — the graph has to beat one relational file, not a straw man. Arm P is a
+baseline**: the graph has to beat one relational file, not a straw man. Arm P is a
 second baseline, not a contender: a verdict of "passed, best arm P" would read
 as a pass for a run in which files won, so only arm R is under the gate.
 
@@ -121,7 +121,7 @@ An arm passes when all of these hold:
 5. no max-turns failure on a task arm Q finished.
 
 Correctness carries no interval requirement, because arm Q saturated it in the
-pilot — 1.00 on every task — which is what makes **cost the discriminator**.
+pilot, 1.00 on every task, which is what makes **cost the discriminator**.
 Adoption is recorded but not gated: in arm R the store is the agent's only data
 path, so adoption is 100% by construction and says nothing.
 
@@ -141,7 +141,7 @@ The run after those fixes is committed at
 [`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
 It still **failed**, on two of the five legs: correctness −0.007 vs arm Q, and the cost
 interval [−0.0581, +0.0115] not entirely below zero. The graph arm moved from 0.795 to 0.967
-on correctness and from $0.5089 to $0.0923 on cost — a tie with the relational baseline on
+on correctness and from $0.5089 to $0.0923 on cost, a tie with the relational baseline on
 correctness and cheaper in mean cost, turns and wall time, but not the gate.
 
 The next run is committed at
@@ -177,12 +177,12 @@ CI [−0.0353, −0.0124] lies entirely below zero. The gate fails on correctnes
 **What that key was.** A date-resolution defect in the engine, found on 2026-09-28 and fixed in
 0.6.12: the commit-times sidecar recorded a commit counter rather than a WAL frame index, and the
 two diverge by one frame per rule-firing commit. On this world that is 588 frames against 311
-stamps, so `2026-07-14` resolved to frame 167 — the state 23 simulated days earlier — and the task
+stamps, so `2026-07-14` resolved to frame 167, the state 23 simulated days earlier, and the task
 lost the one key whose edge is derived inside that window. Probed at the day's real frame the
 engine returns all eight keys, so the derivation was never wrong; only the date-to-frame step was.
 The run above was produced by a binary carrying that defect.
 
-## The run on the fix — 20260928T195302Z — PASSED
+## The run on the fix (20260928T195302Z): PASSED
 
 Committed at
 [`benchmarks/agent-tasks/results/20260928T195302Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
@@ -206,20 +206,20 @@ Arm R against arm Q, paired by task:
 | cache hit ratio | 0.964 | 0.953 | +0.0112 | [−0.0054, 0.0225] | 20 |
 
 180 cells, 0 dropped, 0 timeouts, 0 errors. **Arm R scored 1.000 on every task and every one of
-its 60 cells** — the first run in which it did. All four time-travel tasks answer in a single MCP
+its 60 cells** (the first run in which it did). All four time-travel tasks answer in a single MCP
 call at ~77.6k tokens, against 4–9 tool calls and 131k–308k tokens for the baselines.
 
 Two things are worth stating precisely, because they are easy to overclaim:
 
 - **The correctness leg was amended on 2026-09-11** to pass on a tie, on the grounds that arm Q had
-  saturated at 1.00 and the original wording — correctness must exceed both baselines with its
-  interval excluding zero — could not be passed by any arm. This run passes the **original**
+  saturated at 1.00 and the original wording (correctness must exceed both baselines with its
+  interval excluding zero) could not be passed by any arm. This run passes the **original**
   wording: +0.0101 against arm Q with `[0.0005, 0.0229]` excluding zero, and above arm P's 0.983.
 - **Absolute costs are higher than the 25 Sep run in every arm** (R $0.0614 vs $0.0357, Q $0.1127
   vs $0.0608). Same model, same max-turns, same world; a different day. The gate measures the
   paired difference, which is what the interval above reports.
 
-Six cells scored below 1.0 and **all six belong to a baseline** — five arm Q, one arm P. Every key
+Six cells scored below 1.0 and **all six belong to a baseline**: five arm Q, one arm P. Every key
 they missed was named correctly by arm R in the same rep, so none is a grader fault, and arm R lost
 no cell to classify. Per-cell evidence:
 [`classification.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
@@ -238,4 +238,4 @@ that did not score 1.0, with a hand-filled classification: `tool`, `model`, or
 
 The sub-1.0 table is the one that has to be filled in by hand, by reading each
 cell's stream file. It is where a claim about *why* an arm lost is allowed to
-come from — not from the aggregate.
+come from, not from the aggregate.

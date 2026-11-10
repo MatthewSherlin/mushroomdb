@@ -121,11 +121,11 @@ jobs:
       # last in this job on purpose: a failure here must not strand the
       # multiprocess suite above, which has no other coverage.
       - run: cargo test -p mushroomdb-cli --test first_run
-      # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/
-      # edge_props_section access_unchecked seams). These seams have no proptest
-      # hostile-bytes coverage; Miri is the appropriate defence against corrupt
-      # relative-pointer UB. Blocked on Miri's limited mmap support — track as
-      # a separate job once mmap stubs land in the Miri tree.
+      # Not yet covered: a Miri job for crates/core-storage (the
+      # MappedBase::topology/columns/edge_props_section access_unchecked seams),
+      # which have no proptest hostile-bytes coverage. Miri is the right defence
+      # against corrupt relative-pointer UB, but it cannot run them until its
+      # mmap support lands; add the job then.
 
   # Correctness gates that are #[ignore]'d out of `cargo test --workspace`
   # because they are slow, but are NOT timing-sensitive (they assert a recall

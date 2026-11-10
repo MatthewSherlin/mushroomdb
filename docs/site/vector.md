@@ -66,8 +66,8 @@ What the rule does:
   means no limit for a source node.
 - A rule between a label and itself links in both directions: `a` to `b`, and `b` to `a`.
 - Two vectors of different lengths, a list with something in it that is not a number, and a
-  vector of all zeros produce no edge. They produce no error either — at most one line on
-  standard error the first time — so a field written with the wrong dimension is easy to miss:
+  vector of all zeros produce no edge. They produce no error either (at most one line on
+  standard error the first time), so a field written with the wrong dimension is easy to miss:
   check a node you expect to be linked.
 
 ## Searching
@@ -126,8 +126,8 @@ The index is an HNSW graph, built in the engine with no outside dependency.
 
 Every vector rule has one, approximate or not: it is how a rule finds candidates without
 comparing every pair of nodes. A rule that is not approximate searches its index more widely,
-and falls back to comparing every pair when that is not enough. So what follows — the
-parameters, the build, the memory — applies to any store with a vector rule. What
+and falls back to comparing every pair when that is not enough. So what follows (the
+parameters, the build, the memory) applies to any store with a vector rule. What
 `approximate: true` adds is a rule that may miss neighbours, and searches that may use its index.
 
 | Parameter | Default |

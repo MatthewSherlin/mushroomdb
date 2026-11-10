@@ -18,7 +18,7 @@ db = mushroomdb.GraphDb.open("/path/to/db")
 reader = mushroomdb.GraphDb.open("/path/to/db", read_only=True)
 ```
 
-`GraphDb.open` creates the database directory if it does not already exist — no
+`GraphDb.open` creates the database directory if it does not already exist; no
 manual `mkdir` is required.
 
 A read-write handle takes the store's cross-process write lock and raises
@@ -27,7 +27,7 @@ lock. See [Concurrency](#concurrency) below.
 
 ## Insert nodes
 
-`insert_node(label, key, props, namespace=None)` — same argument order as Rust.
+`insert_node(label, key, props, namespace=None)`: same argument order as Rust.
 Raises if the key is already live.
 
 ```python
@@ -36,7 +36,7 @@ db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
 db.insert_node("Doc", "a1", {"title": "t"}, namespace="tenant-a")
 ```
 
-`namespace` (v0.6.6) is the namespace the node is created in — set at insert and
+`namespace` (v0.6.6) is the namespace the node is created in; set at insert and
 immutable, so `set_prop(key, "ns", …)` afterwards raises. Omitted (or `"default"`)
 means the `default` namespace and stores nothing. An invalid name raises `ValueError`;
 a `props["ns"]` disagreeing with the argument raises too.
@@ -52,7 +52,7 @@ db.upsert_node("Person", "alice", {"team": "blue"})  # "updated"
 
 On update it writes only the fields present in `props` whose value differs from
 the stored one. Fields you do not pass are left untouched, and an unchanged
-field produces no WAL record — so rules do not re-fire needlessly. An existing
+field produces no WAL record; rules do not re-fire needlessly. An existing
 key under a different label raises `ValueError`: relabelling a node is not an
 upsert.
 
@@ -120,7 +120,7 @@ name is already registered:
 db.create_rule(rule, if_not_exists=True)   # True first time, False after
 ```
 
-A `"namespace"` key (v0.6.6) scopes the rule to one namespace — it sees only that
+A `"namespace"` key (v0.6.6) scopes the rule to one namespace; it sees only that
 namespace's nodes, so every edge it derives stays inside. Omitted is a global rule.
 
 **Predicate shape.** The canonical form is the snake_case one that `explain`
@@ -128,7 +128,7 @@ emits, so an explanation round-trips straight back into a new rule:
 
 | `kind` | extra keys |
 |---|---|
-| `key_match`, `field_equal` | — |
+| `key_match`, `field_equal` | |
 | `overlap`, `vector_similar` | `min` |
 | `numeric_within` | `tolerance` |
 | `geo_radius` | `km` |
@@ -146,13 +146,13 @@ db.create_rule(clone)
 
 **`max_edges` semantics:** a missing key fills the predicate default (32 for
 scored predicates, 512 for KeyMatch), the same as HTTP `null`. Python `None`
-(JSON null) is passed through and leaves `max_edges` as `None` — the Rust
+(JSON null) is passed through and leaves `max_edges` as `None`: the Rust
 global-budget hatch (1,000,000 per source). Use HTTP `null` or omit the key
 if you want the capped default; pass `None` explicitly only if you intend the
 uncapped budget.
 
 **Symmetric predicates:** when `src_label == dst_label` (e.g., Person-to-Person
-similarity), the rule fires in **both directions** — a property change on any
+similarity), the rule fires in **both directions**: a property change on any
 node triggers candidate scanning from that node as both source and destination.
 An undirected Cypher pattern like `MATCH (a)-[:SIMILAR]-(b)` double-counts rows
 because both `a→b` and `b→a` edges exist. Use directed patterns
@@ -181,7 +181,7 @@ for row in result:
 ```
 
 `params` accepts a `dict`, a list of `(str, value)` tuples, or `None`. Values
-are passed as Cypher parameters — they are never interpolated into the Cypher
+are passed as Cypher parameters; they are never interpolated into the Cypher
 string, so string values are safe against injection regardless of content.
 
 `query_with_params(cypher, params)` is a retained back-compat alias for
@@ -195,8 +195,8 @@ mine = db.query("MATCH (n) RETURN n", role="a-reader", namespace="tenant-a")
 
 `role` answers as one of the store's `roles.json` roles and `namespace` from one
 namespace; together they **intersect**, so a role bound to `tenant-a` asked for
-`tenant-b` returns `[]` rather than the union. Either argument makes the call a read —
-a write statement raises — and an invalid namespace name raises `ValueError`.
+`tenant-b` returns `[]` rather than the union. Either argument makes the call a read
+(a write statement raises), and an invalid namespace name raises `ValueError`.
 
 `query_write(cypher, params=None)` takes the same three param shapes:
 
@@ -211,7 +211,7 @@ db.query_write(
 `key(n)` / `id(n)` always return the id-map key. `key(n)` is available in both
 read queries and write-statement `RETURN` projections. See [query.md](query.md).
 
-The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
+The dict keys in each row are the **RETURN aliases** from the query: `p`, `o`,
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
 n.age AS age` yields `{"age": ...}`.
 
@@ -232,7 +232,7 @@ neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 returns the `k` nearest nodes to `vector` by cosine similarity on `field`.
 
 Scores are cosine similarity in `[-1, 1]`. The engine keeps `score >= min`
-(inclusive). A distance of `1 - sim` is the caller's conversion — the engine
+(inclusive). A distance of `1 - sim` is the caller's conversion; the engine
 does not speak distance. Convert after the call if you need a strict distance
 cut (`keep if 1 - sim < T`); do not bake `T` into `min`.
 
@@ -246,14 +246,14 @@ hits = db.find_similar("embedding", query_vec, k=10, min=0.0)
 
 **Exact vs approximate.** When no approximate `VectorSimilar` rule covers
 `field`, brute `find_similar` is an exact GEMM. HNSW is still the approximate
-path — used when such a rule covers the field and `exact` is false.
+path, used when such a rule covers the field and `exact` is false.
 
 Two arguments make the call exact, and one does not:
 
 | Argument | Kernel | Exact? |
 |---|---|---|
 | `exact=True` | GEMM over the candidate set | **Yes** |
-| `where={…}` | GEMM over the candidate set | **Yes** — a predicate implies exact |
+| `where={…}` | GEMM over the candidate set | **Yes**: a predicate implies exact |
 | `mask=[…]` alone | HNSW, with the beam widened | **No** |
 | a `scoped()` handle alone | HNSW, with the beam widened | **No** |
 
@@ -265,7 +265,7 @@ rule uses (`EF_MAX` = 4,096) does it fall back to an exhaustive masked scan. So
 a masked call does not return fewer than `k` while more visible hits exist, and
 it is still not guaranteed to have found the true top `k`.
 
-If you need an exhaustive answer over the visible set, say so — pass
+If you need an exhaustive answer over the visible set, say so: pass
 `exact=True`, or a `where=` predicate. Both keep the mask and the scope; they
 change only the kernel.
 
@@ -315,9 +315,9 @@ look up. Both conditions must hold for the index path:
 1. `label=` is set on the call, **and**
 2. `enable_index(label, where["field"])` has been called on the store.
 
-With both, `eq` / `in` resolve through the property index. With either missing —
-a predicate and no label, or a label whose `(label, field)` index was never
-enabled — the call scans the labelled set, or the whole live set when there is
+With both, `eq` / `in` resolve through the property index. With either missing
+(a predicate and no label, or a label whose `(label, field)` index was never
+enabled) the call scans the labelled set, or the whole live set when there is
 no label. **That scan is correct, just slower**; the answer is identical either
 way, so nothing tells you at runtime which path you took. If a `where=` search
 is slower than you expected, this is the first thing to check.
@@ -334,7 +334,7 @@ hits = db.find_similar(                      # correct, but a full live scan
 )
 ```
 
-`where` is a predicate on the **data**, not on the caller — see
+`where` is a predicate on the **data**, not on the caller; see
 [masks.md](masks.md#scoped-one-front-door-for-visibility) for the difference,
 and [masks.md](masks.md#narrowing-a-role-by-a-property) for the role-side
 predicate, `visible_where`.
@@ -356,7 +356,7 @@ vectors are omitted as both query and candidate. Duplicate keys collapse to
 first-seen order. Empty `keys` returns `[]`. More than 8192 unique resolved
 keys raises. `min` is the same unit and inequality as `find_similar`: cosine
 similarity in `[-1, 1]`, kept when `score >= min`. A distance of `1 - sim` is
-the caller's conversion here too — the engine does not speak distance on this
+the caller's conversion here too; the engine does not speak distance on this
 surface any more than on `find_similar`. Convert after the call if you need a
 distance cut (`keep if 1 - sim < T`); do not bake `T` into `min`.
 
@@ -375,7 +375,7 @@ ranked = db.degrees(label="Person", direction="both", limit=500)
 `direction` is `"out"`, `"in"`, or `"both"`. `"both"` is the sum of unique
 out-neighbours and unique in-neighbours (a reciprocal pair counts 2 at each
 endpoint), not the size of the undirected neighbour set.
-`neighbors(..., direction="both")` still raises `ValueError` — that API is one
+`neighbors(..., direction="both")` still raises `ValueError`; that API is one
 directed hop.
 
 `degree(key)` raises for an unknown key. `degrees` omits unknown keys;
@@ -425,7 +425,7 @@ s = db.stats()
 ```
 
 `namespaces` (v0.6.6) lists every namespace with at least one live node, in name
-order, always including `default` — one entry on a store that has never named one.
+order, always including `default` (one entry on a store that has never named one).
 
 ## Transactions
 
@@ -441,7 +441,7 @@ with db.transaction() as tx:
 
 The block commits when it ends cleanly and rolls back, re-raising, when it
 raises. `tx.execute(cypher, params=None)` takes what `query_write` takes and
-returns what it returns. Nothing reaches the store — or any other handle —
+returns what it returns. Nothing reaches the store (or any other handle)
 until the commit, which is one commit in the history. Without a `with`, use
 `tx = db.begin_transaction()` and finish it yourself with `tx.commit()`, which
 returns the commit number, or `tx.rollback()`; a transaction dropped unfinished
@@ -489,7 +489,7 @@ except MushroomBusy:
 
 **Readers see every commit, after `refresh()`.** A handle does not poll the
 store, so another process's commits stay invisible until you ask for them.
-`refresh()` applies them in place and returns how many arrived — rules fire and
+`refresh()` applies them in place and returns how many arrived; rules fire and
 derived edges appear exactly as on a fresh open, and no `close()` and reopen is
 needed:
 
@@ -532,7 +532,7 @@ db.snapshot()  # write V8 (mmap rkyv) snapshot and truncate WAL
 
 `snapshot()` writes the current state as a V8 mmap snapshot (12 rkyv sections,
 zero-copy open) and then truncates the WAL to a minimal baseline. Faster cold
-starts, but as-of history (`open_at`) restarts from that point — commits before
+starts, but as-of history (`open_at`) restarts from that point; commits before
 the snapshot are no longer reachable via time travel.
 
 **Keep WAL (Rust API):**
@@ -544,7 +544,7 @@ db.snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })?;
 
 `keep_wal: true` writes the V8 snapshot but leaves the WAL intact. `open_at`
 can still reach pre-snapshot commits. The WAL replay over the snapshot is
-idempotent — no manual recovery is needed. The WAL grows until an explicit
+idempotent; no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
 **V9 snapshot format:** mmap-able rkyv sections (14, one more for the full-text index when a pair is declared, one more when the snapshot kept its WAL); zero-copy open via
@@ -566,7 +566,7 @@ object model. Use `ingest_batch` (node + edge inserts in one frame) or
 `batch_edges` (mixed insert/delete edges in one frame) for atomic Python
 writes. Both use the same `WalRecord::Batch` frame and one-fsync guarantee.
 
-The Rust forms — `write_batch`, and the compare-and-set `write_batch_cas` — are on the
+The Rust forms (`write_batch`, and the compare-and-set `write_batch_cas`) are on the
 [Rust](rust.md#several-writes-as-one) page.
 
 Not yet exposed: `ingest_json` (use `ingest_batch`), auto-FK inference

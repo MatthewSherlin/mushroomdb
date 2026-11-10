@@ -22,7 +22,7 @@ two such paths and they take it at different granularities.
 **A plain handle holds it for its lifetime.** `GraphDb::open` locks the store
 and keeps it locked until the handle drops. One-shot commands are shaped this
 way, so they serialise against everything else naturally. Opening a second
-read-write handle — in this process or any other — waits up to
+read-write handle (in this process or any other) waits up to
 `WRITE_LOCK_WAIT` for the first one to let go, then fails with
 `GraphError::Busy`.
 
@@ -55,8 +55,8 @@ not stop an unrelated program from editing the files.
 
 ## `Busy`
 
-A writer that cannot get the lock within its wait budget — two seconds by
-default, `WRITE_LOCK_WAIT` — gets `GraphError::Busy` (`MushroomBusy` in Python).
+A writer that cannot get the lock within its wait budget (two seconds by
+default, `WRITE_LOCK_WAIT`) gets `GraphError::Busy` (`MushroomBusy` in Python).
 
 Nothing was written and no in-memory state changed, so retrying later is always
 safe. `Busy` means another process is writing right now, not that anything is
@@ -79,7 +79,7 @@ Two cases are worth naming.
 **A partial trailing frame is a wait, not a corruption.** When another process
 is midway through appending, the last bytes in the file are not yet a whole
 frame. They are left alone. `refresh()` returns the count of complete frames it
-applied — possibly zero — and the handle stays stale until that frame lands.
+applied (possibly zero) and the handle stays stale until that frame lands.
 
 **A peer's snapshot triggers a reload.** A snapshot replaces the store's base
 image and usually truncates the WAL, so the tail no longer continues the
@@ -102,14 +102,14 @@ metadata lookups and reads no file contents.
 
 `SharedDb::read()` calls this for you on every read. A server handle therefore
 stays current without reopening, and a read started after a peer's commit
-completed always sees that commit — the visibility does not depend on how fast
+completed always sees that commit; the visibility does not depend on how fast
 the peer was. The price is up to two metadata lookups per read, never a file
 read.
 
 That guarantee is only as good as the filesystem underneath it: it assumes a
 `stat` after a peer's write and fsync reports the new length. Local filesystems
-do. A network or overlay mount that caches attributes — NFS, SMB, some
-container layers — can report the old length for as long as its attribute
+do. A network or overlay mount that caches attributes (NFS, SMB, some
+container layers) can report the old length for as long as its attribute
 timeout, and a read in that window will not see the commit. Keep a store that
 several processes write on a local disk.
 
@@ -119,7 +119,7 @@ several processes write on a local disk.
 
 - never takes the lock, so it opens immediately even while a writer holds it,
   and never makes a writer wait;
-- writes nothing at open — no WAL repair write-back, no snapshot migration;
+- writes nothing at open: no WAL repair write-back, no snapshot migration;
 - returns `GraphError::ReadOnly` from every mutation;
 - still refreshes, so it can follow a writer's commits.
 
@@ -150,7 +150,7 @@ a live `mushroomdb serve`: 20 HTTP writers released at once, and 20 separate
 `mushroomdb mcp` processes each writing while the server holds the store. Every
 write must land, and `mushroomdb verify` must pass on the result.
 
-`mushroomdb doctor` reports the lock's current state as one of its checks —
+`mushroomdb doctor` reports the lock's current state as one of its checks:
 `free`, or a `warn` naming the fact that another process is writing right now.
 
 ## What this does not give you
@@ -160,7 +160,7 @@ cross-process transactions and no isolation levels. A reader mid-refresh can
 observe a commit boundary but not a half-applied commit.
 
 **Subscriptions do not fire for another process's writes.** Commits absorbed by
-`refresh` replay exactly as they would at open, and open notifies nobody — so a
+`refresh` replay exactly as they would at open, and open notifies nobody; so a
 mutation subscriber, and the `/watch` and `/subscribe` endpoints built on it,
 see only writes made through this process. The data is there on the next read;
 the notification is not. Poll if you need to react to a hook's writes.

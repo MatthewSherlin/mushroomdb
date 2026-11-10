@@ -51,7 +51,7 @@ tests and is not in the results table; the open-time figures the README quotes c
 ## Hand-rolled maintenance versus rules
 
 `run_handrolled.py` and `adapters/handrolled.py` compare the rule engine with edge maintenance
-written by hand against the same store — per operation, and batched. It is a comparison of two
+written by hand against the same store, per operation and batched. It is a comparison of two
 ways to use mushroomdb, and its result is `benchmarks/results/handrolled-vs-rules.md`.
 
 ## A/B against another build

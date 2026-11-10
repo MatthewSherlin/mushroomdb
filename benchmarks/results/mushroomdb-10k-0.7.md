@@ -1,4 +1,4 @@
-# Benchmark — mushroomdb
+# Benchmark: mushroomdb
 
 ## Machine / date
 
@@ -28,24 +28,24 @@ for the workloads and how to reproduce it.
 | cypher scan-filter-project | 1.02 ms |
 | cypher two-hop join | 421.0 µs |
 
-## mushroomdb — bulk ingest throughput
+## mushroomdb: bulk ingest throughput
 
 - **Nodes ingested:** 10,000
 - **Wall time:** 1.076 s
 - **Throughput:** 9.3k nodes/s
 - **Chunk size:** 2k nodes / ingest_batch call (5 sequential chunks at 10k scale)
 
-## mushroomdb — neighbourhood latencies
+## mushroomdb: neighbourhood latencies
 
 - **depth-1 (node_edges):** p50=0.4 µs p95=2.4 µs (n=20)
 - **depth-2 (node_edges + neighbors + second-hop):** p50=0.2 µs p95=0.8 µs (n=20)
 
-## mushroomdb — Cypher workloads
+## mushroomdb: Cypher workloads
 
 - **scan-filter-project** (`MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key`): rows=1400 wall=1.02 ms
 - **two-hop join** (`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): rows=200 wall=421.0 µs
 
-## mushroomdb — rule_derive (ours-only)
+## mushroomdb: rule_derive (ours-only)
 
 Edges are derived when a rule is declared and on every later write that changes
 what it reads. This is the cost of declaring the rules over the loaded graph.

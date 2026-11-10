@@ -2,8 +2,8 @@
 
 ## Before you start
 
-Read `README.md` — the [Architecture](docs/site/architecture.md) page is the
-architecture as built — and the wire discipline below. `docs/design.md` is the
+Read `README.md` (the [Architecture](docs/site/architecture.md) page is the
+architecture as built) and the wire discipline below. `docs/design.md` is the
 original design, kept as a historical record: it no longer describes the code,
 but its generality guarantee still applies to all of it.
 
@@ -21,7 +21,7 @@ Python bindings gate.
 
 ---
 
-## Gates — run these before every commit
+## Gates: run these before every commit
 
 ### Rust gate (all commits touching `crates/` or `cli/`)
 
@@ -37,13 +37,13 @@ All five commands must exit 0. The bench step is compile-only (timing gates are
 too noisy on CI runners).
 
 `crates/code-extract` (package `mushroomdb-extract`, lib `code_extract`) is part
-of the workspace and covered by the same gate. It is a pure library — bytes in,
-facts out — and owns every tree-sitter dependency in the tree: it opens no file,
+of the workspace and covered by the same gate. It is a pure library (bytes in,
+facts out) and owns every tree-sitter dependency in the tree: it opens no file,
 walks no directory and touches no database, so everything it knows about the
 surrounding tree arrives through caller-supplied closures. Keep it that way; the
 filesystem side lives in `crates/cli/src/structure.rs`.
 
-### Code-graph gate — retired in 0.7
+### Code-graph gate: retired in 0.7
 
 The code-graph door and its acceptance script went in 0.7. The one leg of that
 script that was not about code graphs, twenty concurrent writers against a live
@@ -65,13 +65,13 @@ hand-edited: every one is rendered by `scripts/render-plugin.sh` from the five
 templates in `scripts/plugin-templates/` and from the CLI's real
 `crates/cli/skills/mushroom/SKILL.md`, with `{{VERSION}}`, `{{BIN}}` and
 `{{DB_PATH}}` substituted, and the skill's `<!-- cli -->…<!-- /cli -->` blocks
-dropped — the plugin ships an MCP server, so its copy is the `mcp` variant of
+dropped; the plugin ships an MCP server, so its copy is the `mcp` variant of
 the same source (`install --delivery` picks the variant at install time; see
 `render_template`). The version comes from `crates/cli/Cargo.toml`, so a
 version bump is a re-render. The `plugin-validate` CI job runs both the strict
 validate and the drift check.
 
-Three reference pages are generated — `docs/site/cli.md`, `mcp-tools.md` and `python-api.md` —
+Three reference pages are generated (`docs/site/cli.md`, `mcp-tools.md` and `python-api.md`),
 and CI fails when one is stale. After changing the CLI's usage, an MCP tool's description or
 schema, or the Python stub, regenerate and commit:
 
@@ -124,7 +124,7 @@ cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
 simulation tests and the oracle equivalence property tests. It takes a few
 minutes on a laptop. To iterate on one area, scope it: `cargo test -p
 mushroomdb-cli`, `cargo test -p mushroomdb-server`, or a single test by name
-(`cargo test --workspace edge_history`). Run the full gate before you push —
+(`cargo test --workspace edge_history`). Run the full gate before you push;
 CI mirrors it exactly.
 
 ---
@@ -134,7 +134,7 @@ CI mirrors it exactly.
 The user-facing install paths live in `README.md`. The paths below are for
 contributors building or publishing the artifacts themselves.
 
-Every `v*` tag from `v0.4.1` onward is published — the current release is listed on the
+Every `v*` tag from `v0.4.1` onward is published: the current release is listed on the
 [releases page](https://github.com/MatthewSherlin/mushroomdb/releases), and `npx mushroomdb`,
 the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today. (This line
 named a fixed list through v0.5.2 and went stale the moment 0.6.0 shipped; it now names none.)
@@ -228,9 +228,9 @@ See [`clients/typescript/README.md`](clients/typescript/README.md) for the full 
 over stdio using the official `@modelcontextprotocol/sdk` client, rather than a
 hand-rolled JSON-RPC probe, so a break in the wire protocol, the tool list, or the
 reported `serverInfo` fails the same way it would for a real assistant host. It has
-two modes — spawn a binary directly (`--command <bin> --db <dir>`), or read the
+two modes (spawn a binary directly (`--command <bin> --db <dir>`), or read the
 command and args for one server out of an `.mcp.json`-shaped file
-(`--config <file> --server <name>`) — plus optional assertions (`--expect-version`,
+(`--config <file> --server <name>`)), plus optional assertions (`--expect-version`,
 `--expect-tools`) and an optional extra tool call (`--call <tool> <json-args>`) whose
 text output it prints. Run it locally:
 
@@ -247,13 +247,13 @@ brand-new user.
 
 ---
 
-## Testing philosophy — DST and oracle equivalence
+## Testing philosophy: DST and oracle equivalence
 
 ### Deterministic simulation testing
 
 The `sim-harness` crate replaces real disk IO with a fault-injecting
-`SimFs` that runs under a virtual clock. Every crash scenario — torn WAL
-write, fsync lie, corrupt snapshot tail — is a seeded, byte-for-byte
+`SimFs` that runs under a virtual clock. Every crash scenario (torn WAL
+write, fsync lie, corrupt snapshot tail) is a seeded, byte-for-byte
 reproducible run. New storage or WAL code must be exercised under the
 simulator: write failing sim tests first, then make them pass.
 
@@ -270,7 +270,7 @@ addition must extend the oracle path first.
 
 A new query feature adds a case to `crates/core-api/tests/query.rs` and a row to the coverage
 table in `docs/site/query.md`. Known gaps (no LIMIT pushdown in join materialization) are
-documented in `docs/site/limits.md` and may not be silently introduced — surface new limitations
+documented in `docs/site/limits.md` and may not be silently introduced; surface new limitations
 explicitly.
 
 ---

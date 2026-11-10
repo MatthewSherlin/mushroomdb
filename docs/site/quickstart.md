@@ -12,8 +12,8 @@ as `npx mushroomdb …`; [Install](install.md) has the other ways to get it.
 
 ## 1. A store
 
-`demo` fills a fresh directory with a small worked graph — 10 Orgs, 20 Projects,
-30 People, 334 edges derived by 7 rules — which is enough to run every call on
+`demo` fills a fresh directory with a small worked graph (10 Orgs, 20 Projects,
+30 People, 334 edges derived by 7 rules), which is enough to run every call on
 this page:
 
 ```text
@@ -39,7 +39,7 @@ mushroomdb install --db ./memory --delivery mcp
 surface, and pinning is also what marks the entry `alwaysLoad`, so those tools
 are in context before the session's first question rather than deferred.
 
-Restart the assistant afterwards — MCP servers and hooks are read at startup —
+Restart the assistant afterwards (MCP servers and hooks are read at startup),
 then `mushroomdb doctor` verifies the install end to end, including a real
 handshake with the configured MCP command.
 
@@ -53,7 +53,7 @@ detail](#install-in-detail) below and [`skill.md`](skill.md).
 One named call each, on the store's own keys. Every output below is a real call
 against the `demo` store from step 1.
 
-### Why are these two related — `explain_association`
+### Why are these two related: `explain_association`
 
 ```json
 // tool: explain_association
@@ -67,11 +67,11 @@ mushroomdb explain — person-01 ↔ proj-01: 2 relationship(s)
   FIT via rule skill_fit (score 1.00) — overlap on skills >= 0.5 [skills: s01, s02, s03]
 ```
 
-The bracketed clause is the evidence — the values the two actually share — so
+The bracketed clause is the evidence, the values the two actually share, so
 the answer is quotable rather than asserted, and there is no second call to
 fetch both property lists and diff them by hand.
 
-### What did that look like then — `edges_at`
+### What did that look like then: `edges_at`
 
 ```json
 // tool: edges_at
@@ -89,17 +89,17 @@ PROJECT (1)
   → proj-01  rule auto_fk_person_project_id
 ```
 
-`at` is a date — `2026-10-01`, or a full RFC 3339 instant — and resolves to the last commit at
+`at` is a date, `2026-10-01` or a full RFC 3339 instant, and resolves to the last commit at
 or before it; a bare date covers that whole day, in UTC. The reply above was captured on
 2026-10-01, the day that store was built, with `"at": "2026-10-01"`: pass the UTC date on which
 you ran `demo`, or any later one. A date before the store's first
-commit is refused — `no commit time is recorded that early; the oldest is commit 0 at … ms` —
+commit is refused, `no commit time is recorded that early; the oldest is commit 0 at … ms`,
 not answered with a guess. A 0-based commit index works too, but do not hunt for one: the date
 is the question. A store that records no commit times says so by name rather than guessing.
 `edges_at` takes `node_edges`' `edge_type` / `all_of` / `label` / `direction` filters, so "who
 was linked by all three of these, back then" is still one call.
 
-### What would this change do — `what_if`
+### What would this change do: `what_if`
 
 ```json
 // tool: what_if
@@ -118,7 +118,7 @@ PROJECT (1, rule auto_fk_person_project_id): proj-02
 Nothing is written: the rule engine runs the same re-derivation a real `set_prop`
 would, against a clone. The live graph answers identically before and after.
 
-### Who may see it — `query` with a `role`
+### Who may see it: `query` with a `role`
 
 A role is a named label/key selector in the store's `roles.json`, written by
 `mushroomdb schema apply`:
@@ -152,7 +152,7 @@ Without the `role`, the same Cypher returns them:
 ```
 
 Writes are rejected while a `role` or a `mask` is set, and you pass one or the
-other, never both. The MCP server has no auth and both are cooperative — a
+other, never both. The MCP server has no auth and both are cooperative, a
 convenience for asking *what would this role see*, never a security boundary.
 Real enforcement is the HTTP server's role tokens (`serve --role-token`):
 [`masks.md`](masks.md).
@@ -234,7 +234,7 @@ listening on http://127.0.0.1:8080
 ## Using the explorer
 
 - The empty-state "Load demo neighborhood" button fetches one node
-  (`MATCH (n) RETURN n LIMIT 1` — resolves to `org-01`). Query
+  (`MATCH (n) RETURN n LIMIT 1`: resolves to `org-01`). Query
   `person-01` explicitly to see the scored FIT neighborhood.
 - Click any edge to open the why panel, which shows which rule fired,
   the predicate values, and the computed score.
@@ -270,7 +270,7 @@ claude plugin marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 
-Then type `/mushroom:mushroom` — Claude Code namespaces plugin-provided skills
+Then type `/mushroom:mushroom`; Claude Code namespaces plugin-provided skills
 as `/<plugin>:<skill>`. The MCP server starts through `npx -y mushroomdb@<version>`;
 the hooks go through the plugin's `hooks/run.sh`, which resolves that package to
 its native binary once and caches the path, so a session start or a prompt
@@ -289,8 +289,8 @@ With no flags it detects the assistant (Claude Code, Cursor, or both), picks
 project scope inside a git checkout and user scope anywhere else, and prints
 which it chose. Project scope writes the MCP entry to `.mcp.json`, the
 `/mushroom` skill to `.claude/skills/mushroom/`, two hooks to
-`.claude/settings.json` — `SessionStart` (the brief) and `UserPromptSubmit`
-(recall) — and an ignore line for the store. It writes no git hooks, and an
+`.claude/settings.json`, `SessionStart` (the brief) and `UserPromptSubmit`
+(recall), and an ignore line for the store. It writes no git hooks, and an
 install over a 0.6 one removes the `sync` git hook blocks and the settings hooks
 0.7 no longer ships.
 
@@ -300,7 +300,7 @@ get committed, so a path would follow a `git worktree add` across and point the
 new checkout's hooks at the old checkout's graph. With `--auto` each working
 tree gets its own `mushroom-memory`. Outside a checkout there is no working
 tree root to resolve against, so the store is pinned to the project directory,
-and `--db <path>` pins one anywhere — which is the form step 2 above uses, and
+and `--db <path>` pins one anywhere, which is the form step 2 above uses, and
 the form an entity store wants.
 
 A Cursor or Codex install pins the path too. Only Claude Code sets
@@ -309,8 +309,8 @@ happens to start the server; if that were wrong, the assistant would read an
 empty store under your home directory with nothing reporting an error.
 
 The MCP entry runs the published package, so the assistant needs nothing
-installed globally. `install` locates it once — `--print-binary`, falling back
-to `--print-launcher` — and writes that absolute path, so no hook ever spawns
+installed globally. `install` locates it once, `--print-binary` falling back
+to `--print-launcher`, and writes that absolute path, so no hook ever spawns
 `npx`. If neither resolves it warns and falls back to
 `npx -y mushroomdb@<version>`, which still works. To point it at a local build
 instead:
@@ -334,7 +334,7 @@ server is registered).
 ### Turning it off
 
 `mushroomdb disable` turns mushroomdb off in a project without uninstalling
-it — the MCP entry, the hooks and any git hook block a 0.6 install wrote come
+it; the MCP entry, the hooks and any git hook block a 0.6 install wrote come
 out; the skill,
 the store and the `.gitignore` line stay. `mushroomdb enable` turns it back
 on, re-resolving the command rather than replaying whatever `disable` took
@@ -401,8 +401,8 @@ rules: 7
 
 ## Deployment and TLS
 
-To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
-`--features tls` rustls path — see [deployment.md](deployment.md).
+To serve over HTTPS, via a reverse proxy (nginx, Caddy) or the built-in
+`--features tls` rustls path, see [deployment.md](deployment.md).
 
 ---
 
@@ -430,11 +430,11 @@ mushroomdb ingest-git ./mushroom-memory . --prs --ensure-gitignore
 mushroomdb brief ./mushroom-memory
 ```
 
-The first walks the git history and the working tree — authors, commits, files,
+The first walks the git history and the working tree; authors, commits, files,
 symbols, imports, calls and merged pull requests become nodes, and
 `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` / `MENTIONS` edges are derived by
 rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
-second prints the store's schema — its labels, its edge types and one worked
+second prints the store's schema: its labels, its edge types and one worked
 call per question kind.
 
 A store built this way is an ordinary memory store: it lists the same twenty-three

@@ -1,6 +1,6 @@
 # llama-index-graph-stores-mushroomdb
 
-LlamaIndex `PropertyGraphStore` backed by **mushroomdb** — an embedded Rust graph database with a Python binding via PyO3.
+LlamaIndex `PropertyGraphStore` backed by **mushroomdb**: an embedded Rust graph database with a Python binding via PyO3.
 
 Built against **llama-index-core 0.14.24**.
 
@@ -158,5 +158,5 @@ overwritten** if present in user-supplied `EntityNode.properties` or
 - **Relation properties not persisted**: the mushroomdb 0.1.2 binding has no edge-property API (`insert_edge` accepts only type/src/dst; `SET r.field` is rejected by the Cypher planner). `Relation.properties` passed to `upsert_relations` are silently dropped; `get_triplets` and `get_rel_map` always return relations with `properties={}`. This is a binding gap queued alongside ANN.
 - **No native ANN / `find_similar`**: `vector_query` scans all embeddings in Python. Suitable for knowledge-graph sizes (thousands of nodes); not for million-scale vector workloads.
 - **Cypher subset**: mushroomdb implements a subset of openCypher. `MERGE`, `id()`, double-quoted string literals, and `id` as a parameter name are not available.
-- **Single-process**: mushroomdb is an embedded store — one process per database path at a time.
+- **Single-process**: mushroomdb is an embedded store: one process per database path at a time.
 - **Label updates**: when a node's label changes (e.g. placeholder `"entity"` → `"Person"`), the store deletes and reinserts the node, restoring user-owned edges. Rule-derived edges are re-derived by the engine automatically.

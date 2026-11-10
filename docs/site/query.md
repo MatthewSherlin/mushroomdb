@@ -7,10 +7,10 @@ variable-length paths and `shortestPath`.
 
 ---
 
-## Key idiom — how to filter and read node keys
+## Key idiom: how to filter and read node keys
 
 The node's key lives in the id map, not as a stored property. These spellings
-read it (and the label) anywhere a scalar does — `WHERE`, `ORDER BY`, `RETURN`,
+read it (and the label) anywhere a scalar does: `WHERE`, `ORDER BY`, `RETURN`,
 an inline pattern filter, and after a grouping `WITH`:
 
 | Spelling | Gives |
@@ -98,9 +98,9 @@ LIMIT 10
 (var:Label {key: 'value'})
 ```
 
-- `var` — optional binding name
-- `:Label` — optional label filter
-- `{key: 'value'}` — zero or more property equality filters. `{id: 'alice'}` is
+- `var`: optional binding name
+- `:Label`: optional label filter
+- `{key: 'value'}`: zero or more property equality filters. `{id: 'alice'}` is
   a key lookup (`ScanKey`). The names `key` and `label` fall back to the node's
   own key and label when no stored property of that name exists (see Key idiom
   above)
@@ -120,7 +120,7 @@ and `-[]-` respectively.
 ### Multiple patterns in one MATCH
 
 Patterns separated by commas inside a single `MATCH` are equivalent to the same
-patterns as consecutive `MATCH` clauses — they plan and execute identically.
+patterns as consecutive `MATCH` clauses; they plan and execute identically.
 Sharing a variable between them is a join; sharing none is a cartesian product,
 which is the openCypher meaning.
 
@@ -178,8 +178,8 @@ zero-length variable-length paths are not supported; minimum hop count is 1
 
 ### Semantics
 
-- **BFS expansion** — each hop expands all neighbours of the current frontier.
-- **Relationship uniqueness** — within one `MATCH` clause no relationship is
+- **BFS expansion**: each hop expands all neighbours of the current frontier.
+- **Relationship uniqueness**: within one `MATCH` clause no relationship is
   bound twice (Cypher relationship isomorphism): not twice in one walk, not by
   two hops of a pattern, fixed or variable-length, and not by two
   comma-separated parts of the clause. So a named path never lists a
@@ -195,12 +195,12 @@ zero-length variable-length paths are not supported; minimum hop count is 1
   match (`MATCH … SET`, `MATCH … DETACH DELETE`) sees the same rows. An
   undirected self-loop is one relationship, walked once. This guarantees
   termination on cyclic graphs.
-- **The end node is filtered, the nodes in between are not** — the
+- **The end node is filtered, the nodes in between are not**: the
   destination's label and inline properties (`(b:Person {active: true})`,
   `{id: $id}`) apply to the node each path ends at.  A path may pass through
   nodes that fail them.  This holds in every hop form, for a hop in the middle
   of a pattern, in `OPTIONAL MATCH`, and with a named path.
-- **Intermediate-row budget** — if the output row count reaches 1,000,000 the
+- **Intermediate-row budget**: if the output row count reaches 1,000,000 the
   query is aborted with an error naming the limit.  Use tighter ranges or a
   `WHERE` filter to stay within budget on dense graphs.
 
@@ -361,7 +361,7 @@ RETURN city, cnt
 ORDER BY cnt DESC
 ```
 
-The `WHERE` clause after an aggregating `WITH` acts as a HAVING filter —
+The `WHERE` clause after an aggregating `WITH` acts as a HAVING filter,
 evaluated against the group result, not the raw matched rows.
 
 A grouping key that is a **bare variable** stays a node through the group, so
@@ -416,7 +416,7 @@ RETURN p2.name AS name, city
 ```
 
 Each `WITH` stage produces a new working set.  A subsequent `MATCH` clause
-joins against that set — use `WHERE` to correlate.
+joins against that set; use `WHERE` to correlate.
 
 ---
 
@@ -584,7 +584,7 @@ expression is not allowed with DISTINCT/aggregation`.
 ## Write statements
 
 mushroomdb supports a Cypher write subset.  Every write statement flows through
-the same mutation path as the Rust API — the rule engine fires incrementally and
+the same mutation path as the Rust API; the rule engine fires incrementally and
 the WAL commits with a single fsync before the response is returned.
 
 Write results are always one row with four columns:
@@ -1255,9 +1255,9 @@ any statement, a call included, for a role with no write scope, as it refuses
 `SHOW`; such a role reads through `query_masked` (HTTP `/query` routes a call
 there).
 
-**What is refused.** `CALL` inside a larger query — after `MATCH`, `WITH` or
+**What is refused.** `CALL` inside a larger query, after `MATCH`, `WITH` or
 `UNWIND`, or followed by any clause other than `WHERE` and `RETURN` (a second
-`MATCH`, `UNION`) — is the error `not supported in mushroomdb 0.10: CALL inside
+`MATCH`, `UNION`), is the error `not supported in mushroomdb 0.10: CALL inside
 a larger query`. A `CALL { … }` subquery is `not supported in mushroomdb 0.10:
 CALL subquery`.
 
@@ -1339,7 +1339,7 @@ prefix, the regular-expression operator `lex:`).
 | `REMOVE n:Label` | `not supported in mushroomdb 0.10: REMOVE n:Label (label removal)` |
 | `SET n:Label` | `not supported in mushroomdb 0.10: SET n:Label (label assignment)` |
 | `(n:A:B)`, `(n:A\|B)`, `WHERE n:A:B` | `not supported in mushroomdb 0.10: more than one label (n:A:B, n:A\|B); a node has one label` |
-| `WHERE (n)-[:K]->()`, `NOT (n)-->()`, `exists((n)-->())`, `size((n)-->())` | `not supported in mushroomdb 0.10: pattern predicate (a relationship pattern used as an expression)` — test the pattern with `OPTIONAL MATCH (n)-[:K]->(m) WITH n, count(m) AS c WHERE c > 0` |
+| `WHERE (n)-[:K]->()`, `NOT (n)-->()`, `exists((n)-->())`, `size((n)-->())` | `not supported in mushroomdb 0.10: pattern predicate (a relationship pattern used as an expression)`. Test the pattern with `OPTIONAL MATCH (n)-[:K]->(m) WITH n, count(m) AS c WHERE c > 0` |
 | `[(n)-->(m) \| m.name]` | `not supported in mushroomdb 0.10: pattern comprehension [(n)-->(m) \| …]` |
 | `RETURN n {.name, .age}` | `not supported in mushroomdb 0.10: map projection (n {.key, …})` |
 | `n.name =~ 'a.*'` | `not supported in mushroomdb 0.10: regular-expression match (=~)` |
@@ -1364,7 +1364,7 @@ OPTIONAL MATCH (a)-[:KNOWS]->(b)
 RETURN a, COUNT(b)
 ```
 
-Edgeless nodes return `COUNT(b) = 0` — the outer row is never dropped.
+Edgeless nodes return `COUNT(b) = 0`; the outer row is never dropped.
 
 ### A leading OPTIONAL MATCH
 
@@ -1489,7 +1489,7 @@ missing parameter `name`
 
 Scalar functions are available in `WHERE` expressions and `RETURN` / `WITH`
 projections.  **Null propagation:** if any argument is `null`, the result is
-`null` — except `coalesce`, which skips nulls.
+`null`, except `coalesce`, which skips nulls.
 
 | Function | Input | Output | Notes |
 |---|---|---|---|
@@ -1719,7 +1719,7 @@ MATCH (a)-[r]->(b) WHERE NOT r:BLOCKS RETURN b.id
 - It is never turned into an index lookup; the label in the pattern
   (`MATCH (n:Person)`) is what selects nodes by label.
 - Where it errors in this build: on a list comprehension's own variable
-  (`[x IN nodes WHERE x:A]` — the element is a value; a node variable from
+  (`[x IN nodes WHERE x:A]`, where the element is a value; a node variable from
   outside the comprehension works), and in a value of a per-row write (the
   `UNWIND … ` and `MATCH … CREATE/MERGE` statements: `SET n.f = m:L`, a
   `CREATE` or `MERGE` property) when the variable is a node the statement itself
@@ -1777,27 +1777,27 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 |---|---|
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
-| `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
-| `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)` — null in gives null, a wrong type is an error naming the function |
-| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
-| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
-| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range → null; a non-list base or a non-integer index is a type error |
+| `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)`; `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
+| `elementId(n)` / `elementId(r)` / `startNode(r)` / `endNode(r)` / `nodes(p)` / `relationships(p)` / `length(p)` | `MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN nodes(p), relationships(p), length(p)`; `MATCH (a)-[r:KNOWS]->(b) RETURN elementId(r), startNode(r), endNode(r)`, null in gives null, a wrong type is an error naming the function |
+| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)`, the same rows as consecutive `MATCH` clauses, except that the parts of one `MATCH` never bind one relationship twice; no shared variable is a product |
+| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'`, missing property is null (never a match, under `NOT` too), not an error |
+| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]`, out of range → null; a non-list base or a non-integer index is a type error |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
-| `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
-| Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d` — projects with or without a HAVING clause |
+| `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x`, the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
+| Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d`, projects with or without a HAVING clause |
 | `MATCH (n)-[r:TYPE]->(m)` directed edge | `MATCH (a)-[:KNOWS]->(b) RETURN a` |
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
 | `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
 | `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List`; a list element is compared whole (`n.tags IN [[1, 2]]`), see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
-| `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
+| `RETURN DISTINCT` | `RETURN DISTINCT n.city`, hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
 | `WHERE AND / OR / XOR` | `WHERE n.a = 1 AND n.b = 2`, `WHERE n.a XOR n.b` |
-| Comparisons and boolean operators as values | `RETURN n.age >= 18 AS adult`, `[x IN l \| x > 1]`, `SET n.flag = n.score > 10`, `coalesce(n.a IS NULL, false)`, `CASE WHEN … THEN n.a > 1 END` — every expression position; three-valued (`RETURN null > 1` is null, `NOT null` is null, `null IS NULL` is true); see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
+| Comparisons and boolean operators as values | `RETURN n.age >= 18 AS adult`, `[x IN l \| x > 1]`, `SET n.flag = n.score > 10`, `coalesce(n.a IS NULL, false)`, `CASE WHEN … THEN n.a > 1 END`, every expression position; three-valued (`RETURN null > 1` is null, `NOT null` is null, `null IS NULL` is true); see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
 | `ORDER BY prop ASC / DESC` | `ORDER BY n.name DESC` |
 | `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
 | `$param` in WHERE | `WHERE n.age > $min` |
 | `$param` in SET | `SET n.score = $val` |
-| `$param.field` (a map parameter's entry) | `WHERE n.id = $p.id`, `CREATE (:P {id: $p.id})` — `$p['id']` too; an absent key is null |
+| `$param.field` (a map parameter's entry) | `WHERE n.id = $p.id`, `CREATE (:P {id: $p.id})`, `$p['id']` too; an absent key is null |
 | `COUNT(*)`, `COUNT(var)`, `SUM`, `AVG`, `MIN`, `MAX` (single) | `RETURN COUNT(*), SUM(n.score)` |
 | Grouped aggregation (single or multiple keys, multiple aggs) | `RETURN n.city, COUNT(*) AS c ORDER BY c DESC` |
 | `WITH` projection + aliasing | `WITH n.name AS nm RETURN nm` |
@@ -1811,59 +1811,59 @@ rejected with a clear, actionable message; **Absent** = not implemented.
 | `UNWIND … WHERE` (filter after UNWIND) | `UNWIND [1,2,3] AS x WHERE x > 1 RETURN x` |
 | `UNWIND … MATCH` / `OPTIONAL MATCH` / `WITH` (clauses after `UNWIND`) | `UNWIND $ids AS id MATCH (n:Person {id: id}) RETURN n.name` |
 | `r.field` on a map element | `UNWIND $rows AS r RETURN r.id, r.name` |
-| `UNWIND … CREATE` (bulk load) | `UNWIND $rows AS r CREATE (:Person {id: r.id, name: r.name})` — one batch, atomic |
-| `UNWIND … MERGE` | `UNWIND $rows AS r MERGE (n:Person {id: r.id}) ON CREATE SET n.at = r.at` — a row sees the rows before it; node and relationship forms |
+| `UNWIND … CREATE` (bulk load) | `UNWIND $rows AS r CREATE (:Person {id: r.id, name: r.name})`, one batch, atomic |
+| `UNWIND … MERGE` | `UNWIND $rows AS r MERGE (n:Person {id: r.id}) ON CREATE SET n.at = r.at`, a row sees the rows before it; node and relationship forms |
 | `UNWIND … MATCH … SET` / `SET n += r` / `REMOVE` / `DELETE` / `DETACH DELETE` | `UNWIND $rows AS r MATCH (n {id: r.id}) SET n += r` |
 | `OPTIONAL MATCH` (left-outer-join) | `MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, b` |
-| A leading `OPTIONAL MATCH` | `OPTIONAL MATCH (n:Person {id: 'x'}) RETURN n` — one row of nulls when nothing matches |
-| `RETURN *` / `WITH *` | `MATCH (p:Person)-[r:KNOWS]->(q) RETURN *` — the node, path and value names in scope, in byte order of name (here `p`, `q`); see [RETURN * and WITH *](#return--and-with-) |
-| Label predicates `n:Label`, `r:TYPE` | `MATCH (n) WHERE n:Person OR n:Company RETURN n.id, n:Person AS person` — see [Label predicates](#label-predicates) |
-| `MATCH … CREATE` / `MATCH … MERGE` | `MATCH (a {id: 'x'}), (b {id: 'y'}) CREATE (a)-[:K]->(b)`, `MATCH (a), (b) MERGE (a)-[:K]->(b)` — once per matched row; see [MATCH … CREATE / MATCH … MERGE](#match--create--match--merge) |
+| A leading `OPTIONAL MATCH` | `OPTIONAL MATCH (n:Person {id: 'x'}) RETURN n`, one row of nulls when nothing matches |
+| `RETURN *` / `WITH *` | `MATCH (p:Person)-[r:KNOWS]->(q) RETURN *`, the node, path and value names in scope, in byte order of name (here `p`, `q`); see [RETURN * and WITH *](#return--and-with-) |
+| Label predicates `n:Label`, `r:TYPE` | `MATCH (n) WHERE n:Person OR n:Company RETURN n.id, n:Person AS person`; see [Label predicates](#label-predicates) |
+| `MATCH … CREATE` / `MATCH … MERGE` | `MATCH (a {id: 'x'}), (b {id: 'y'}) CREATE (a)-[:K]->(b)`, `MATCH (a), (b) MERGE (a)-[:K]->(b)`, once per matched row; see [MATCH … CREATE / MATCH … MERGE](#match--create--match--merge) |
 | `OPTIONAL MATCH … WHERE` (filter in optional scope) | `OPTIONAL MATCH (a)-[r]->(b) WHERE b.score > 5` |
 | Multiple chained `OPTIONAL MATCH` | `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (a)-[:S]->(c)` |
 | `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
 | Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
-| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` — a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
-| `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props` — evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
+| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})`, a value may be any expression (`{flag: 1 > 0, n: 2 + 3}`); a `MERGE` matches against the evaluated value (`MERGE (n:L {id: 'a' + 'b'})`). A literal-only value that evaluates to null is a named error |
+| `$param` in `CREATE` / `MERGE` property maps | `CREATE (:Person {id: $id, name: $p.name})`, `CREATE (n:Person $props)`, `MERGE (n:Person {id: $id}) ON CREATE SET n += $props`, evaluated against the parameters (the per-row form over one row); a null parameter value is left out, a null `MERGE` key is an error |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
-| `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
-| `MATCH … SET n += {…}` / `SET n = {…}` | `MATCH (n) WHERE n.id = 'x' SET n += {score: 2, old: null}` — merge (null removes) or replace; `id`, `ns` and view-owned properties are never removed |
-| `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname` — a missing property is a no-op; `RETURN` projects the post-write state |
+| `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x`, write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
+| `MATCH … SET n += {…}` / `SET n = {…}` | `MATCH (n) WHERE n.id = 'x' SET n += {score: 2, old: null}`, merge (null removes) or replace; `id`, `ns` and view-owned properties are never removed |
+| `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname`, a missing property is a no-op; `RETURN` projects the post-write state |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
 | `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
-| `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` | `MERGE (a:Person {id: 'alice'})-[:KNOWS]->(b:Person {id: 'bob'})` — find-or-create both nodes and the edge; idempotent; `ON CREATE SET` / `ON MATCH SET` may name `a` or `b` |
-| `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n` — returns node whether created or matched |
-| `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key` — single-statement create + projection |
-| `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
-| Boolean literals `true` / `false` (any case) | `WHERE n.active = true`, `WHERE n.active <> false`, `MATCH (n {active: true})`, `SET n.active = false`, `RETURN true AS t` — a node with no such property matches neither `= …` nor `<> …`. `true` and `false` are reserved: naming a variable or an alias either one is a parse error. A property or a map key may still be called that (`n.true`) |
-| `null` literal (any case) | `RETURN null AS v`, `WHERE null IS NULL` — evaluates to null; `null = null` is null, so a WHERE drops the row. `null` is reserved like `true` / `false`; `n.null` and a backtick-quoted `` `null` `` key are still names |
-| List and map literals | `RETURN [1, n.x, 'a'] AS l, {a: 1, b: [2, 3]} AS m` — elements and values are any expression; `` {`c d`: 1} `` quotes a key. A map's keys come back sorted, not in written order: `keys({b: 1, a: 2})` is `['a', 'b']` |
-| Null inside a list or map | `RETURN [1, null] AS l`, `[n.x, n.missing]`, `{a: null}` — the element stays null in every output (Rust `Value::Null`, JSON `null`, Python `None`, TS `null`, Arrow text `[1, null]`). `size([null]) = 1`, `head([null, 1])` is null, `keys({a: null})` is `['a']`. Equality is three-valued: `[1, null] = [1, null]` is null (the row is dropped), `[1, null] = [2, null]` is false. A stored property cannot hold one (see Named-error) |
-| List comprehensions | `RETURN [x IN n.tags WHERE x <> 'old' \| x] AS active`, `[x IN [1, 2, 3] \| x * 10]`, `[x IN n.scores WHERE x > 0]` — `WHERE` and `\| expr` are each optional (no `\| expr` keeps the element). Usable in `WHERE`, `RETURN`, `ORDER BY`, `UNWIND` and as a function argument, and they nest. The variable exists only inside the comprehension and shadows an outer variable of the same name there. A null list (or a non-list) gives null; a null element is a real element, so it passes through `\| expr`, and a `WHERE` that is null drops it. Not supported in the `RETURN` of a write statement (see Named-error) |
-| List predicates | `WHERE all(x IN n.scores WHERE x > 0)`, `RETURN any(t IN n.tags WHERE t = 'new') AS fresh`, `none(…)`, `single(…)` — `all|any|none|single(x IN list WHERE predicate)`, the `WHERE` required. Usable anywhere an expression is, and they nest with each other and with comprehensions. The variable exists only inside the predicate and shadows an outer variable of the same name there. Three-valued, over the predicate's answer for each element: `all` is false if any answer is false, else null if any is null, else true (true on an empty list); `any` is true if any answer is true, else null if any is null, else false; `none` is false if any answer is true, else null if any is null, else true; `single` is false if more than one answer is true, else null if any is null, else true exactly when one answer is true (false on an empty list). A null list (or a non-list) gives null. In a `WHERE`, a null answer drops the row. Not supported in the `RETURN` of a write statement (see Named-error) |
-| `reduce()` | `RETURN reduce(total = 0, x IN n.scores \| total + x) AS sum`, `reduce(s = '', w IN n.words \| s + w)` — `reduce(acc = init, x IN list \| expr)`. `init` and `list` are read in the enclosing scope; `acc` and `x` exist only inside `expr` and shadow outer names there. An empty list gives `init`; a null list (or a non-list) gives null; a null `expr` value makes the accumulator null for the next step. Usable anywhere an expression is, and it nests with itself and with list comprehensions. Not supported in the `RETURN` of a write statement (see Named-error) |
-| Query without `MATCH` | `RETURN 1 + 1 AS x`, `UNWIND [1, 2, 3] AS x RETURN x`, `WITH 1 AS a RETURN a` — reads no graph and runs against one empty row; `UNWIND [] AS x` gives no rows |
-| Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
+| `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` | `MERGE (a:Person {id: 'alice'})-[:KNOWS]->(b:Person {id: 'bob'})`, find-or-create both nodes and the edge; idempotent; `ON CREATE SET` / `ON MATCH SET` may name `a` or `b` |
+| `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n`, returns node whether created or matched |
+| `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key`, single-statement create + projection |
+| `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL`, null-check predicate; composes with AND/OR |
+| Boolean literals `true` / `false` (any case) | `WHERE n.active = true`, `WHERE n.active <> false`, `MATCH (n {active: true})`, `SET n.active = false`, `RETURN true AS t`, a node with no such property matches neither `= …` nor `<> …`. `true` and `false` are reserved: naming a variable or an alias either one is a parse error. A property or a map key may still be called that (`n.true`) |
+| `null` literal (any case) | `RETURN null AS v`, `WHERE null IS NULL`, evaluates to null; `null = null` is null, so a WHERE drops the row. `null` is reserved like `true` / `false`; `n.null` and a backtick-quoted `` `null` `` key are still names |
+| List and map literals | `RETURN [1, n.x, 'a'] AS l, {a: 1, b: [2, 3]} AS m`, elements and values are any expression; `` {`c d`: 1} `` quotes a key. A map's keys come back sorted, not in written order: `keys({b: 1, a: 2})` is `['a', 'b']` |
+| Null inside a list or map | `RETURN [1, null] AS l`, `[n.x, n.missing]`, `{a: null}`, the element stays null in every output (Rust `Value::Null`, JSON `null`, Python `None`, TS `null`, Arrow text `[1, null]`). `size([null]) = 1`, `head([null, 1])` is null, `keys({a: null})` is `['a']`. Equality is three-valued: `[1, null] = [1, null]` is null (the row is dropped), `[1, null] = [2, null]` is false. A stored property cannot hold one (see Named-error) |
+| List comprehensions | `RETURN [x IN n.tags WHERE x <> 'old' \| x] AS active`, `[x IN [1, 2, 3] \| x * 10]`, `[x IN n.scores WHERE x > 0]`; `WHERE` and `\| expr` are each optional (no `\| expr` keeps the element). Usable in `WHERE`, `RETURN`, `ORDER BY`, `UNWIND` and as a function argument, and they nest. The variable exists only inside the comprehension and shadows an outer variable of the same name there. A null list (or a non-list) gives null; a null element is a real element, so it passes through `\| expr`, and a `WHERE` that is null drops it. Not supported in the `RETURN` of a write statement (see Named-error) |
+| List predicates | `WHERE all(x IN n.scores WHERE x > 0)`, `RETURN any(t IN n.tags WHERE t = 'new') AS fresh`, `none(…)`, `single(…)`: `all|any|none|single(x IN list WHERE predicate)`, the `WHERE` required. Usable anywhere an expression is, and they nest with each other and with comprehensions. The variable exists only inside the predicate and shadows an outer variable of the same name there. Three-valued, over the predicate's answer for each element: `all` is false if any answer is false, else null if any is null, else true (true on an empty list); `any` is true if any answer is true, else null if any is null, else false; `none` is false if any answer is true, else null if any is null, else true; `single` is false if more than one answer is true, else null if any is null, else true exactly when one answer is true (false on an empty list). A null list (or a non-list) gives null. In a `WHERE`, a null answer drops the row. Not supported in the `RETURN` of a write statement (see Named-error) |
+| `reduce()` | `RETURN reduce(total = 0, x IN n.scores \| total + x) AS sum`, `reduce(s = '', w IN n.words \| s + w)`: `reduce(acc = init, x IN list \| expr)`. `init` and `list` are read in the enclosing scope; `acc` and `x` exist only inside `expr` and shadow outer names there. An empty list gives `init`; a null list (or a non-list) gives null; a null `expr` value makes the accumulator null for the next step. Usable anywhere an expression is, and it nests with itself and with list comprehensions. Not supported in the `RETURN` of a write statement (see Named-error) |
+| Query without `MATCH` | `RETURN 1 + 1 AS x`, `UNWIND [1, 2, 3] AS x RETURN x`, `WITH 1 AS a RETURN a`, reads no graph and runs against one empty row; `UNWIND [] AS x` gives no rows |
+| Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1`, with precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
-| Temporal constructors and namespaced temporal functions | `RETURN date({year: 1984, week: 10, dayOfWeek: 3}) AS d`, `datetime({date: d, hour: 12, timezone: '+01:00'})`, `date.truncate('month', n.at)`, `duration.between(a.since, b.since)`, `datetime.fromepochmillis(n.ms)` — see [Temporal values](#temporal-values); a bad input is an error, never null |
+| Temporal constructors and namespaced temporal functions | `RETURN date({year: 1984, week: 10, dayOfWeek: 3}) AS d`, `datetime({date: d, hour: 12, timezone: '+01:00'})`, `date.truncate('month', n.at)`, `duration.between(a.since, b.since)`, `datetime.fromepochmillis(n.ms)`; see [Temporal values](#temporal-values); a bad input is an error, never null |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
 | `stDev` / `stDevP` / `percentileCont` / `percentileDisc` | `MATCH (n:Reading) RETURN n.sensor, stDev(n.value) AS spread, percentileDisc(n.value, 0.95) AS p95` |
-| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
+| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band`, also in `MATCH … SET … RETURN` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
-| View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
-| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)` — a range index; unnamed is `idx_<L>_<p>`; `WHERE` ranges, `STARTS WITH` and `ORDER BY … LIMIT` on it read the index; see [Schema statements](#schema-statements-ddl) |
+| View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name`, where `pop` is a degree view maintained incrementally; reads like a stored prop |
+| `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p)` / `DROP INDEX name [IF EXISTS]` | `CREATE INDEX idx_age FOR (n:Person) ON (n.age)`, a range index; unnamed is `idx_<L>_<p>`; `WHERE` ranges, `STARTS WITH` and `ORDER BY … LIMIT` on it read the index; see [Schema statements](#schema-statements-ddl) |
 | `CREATE CONSTRAINT name [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` / `DROP CONSTRAINT name [IF EXISTS]` | `CREATE CONSTRAINT uniq_email FOR (u:User) REQUIRE u.email IS UNIQUE` |
-| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES` — a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
-| `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok` — a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
-| `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
+| `SHOW INDEXES` / `SHOW CONSTRAINTS` | `SHOW INDEXES`, a read; columns `name`, `type`, `label`, `property`, `state`; a scoped read lists only labels it can see |
+| `CALL ns.name(args) [YIELD …] [WHERE …] [RETURN …]` | `CALL db.ping() YIELD success AS ok RETURN ok`, a read statement of its own, on every read entry point; see [Procedures](#procedures-call) |
+| `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key`, correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Compile-time checks
 
@@ -1933,14 +1933,14 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | A temporal constructor or function given a bad input (`date({year: 2024, month: 13})`, `date('nope')`, `date(42)`) | ``date(): `month` 13 is outside 1..=12``, `date(): cannot read 'nope' as a Date`, `date() expects a string, a map or a temporal value, got an integer` |
 | A named time zone (`datetime({year: 2024, timezone: 'Europe/Paris'})`) | `not supported in mushroomdb 0.10: named time zones` |
 | A label test on a value (`UNWIND [1] AS x RETURN x:L`) | ``x:L: `x` is not a node or a relationship`` |
-| Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
-| List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
-| List predicate in the `RETURN` of a write statement | `a list predicate is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and test it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
-| `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
+| Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null``, raised by `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
+| List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards`; refused before anything is written. In a `SET` value or a `WHERE` it works |
+| List predicate in the `RETURN` of a write statement | `a list predicate is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and test it afterwards`; refused before anything is written. In a `SET` value or a `WHERE` it works |
+| `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards`; refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | ``parse: UnknownFunction: unknown function `…`; supported: toLower, toUpper, size, coalesce, …`` — refused at compile time (see [Compile-time checks](#compile-time-checks)); the message lists every scalar function |
+| Unknown function name | ``parse: UnknownFunction: unknown function `…`; supported: toLower, toUpper, size, coalesce, …``; refused at compile time (see [Compile-time checks](#compile-time-checks)); the message lists every scalar function |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
-| `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
+| `count(DISTINCT *)` | named parse error: `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
@@ -1954,11 +1954,11 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `DROP INDEX` of a listed name two indexes share | `'eq_A_b_c' names more than one index: equality (A, b_c), equality (A_b, c); drop the one you mean with disable_index(label, field) or disable_fulltext(label, field)` |
 | A composite index or constraint, or a constraint other than `IS UNIQUE` | `an index covers one property; composite indexes are not supported`, `only IS UNIQUE constraints are supported` |
 | An unknown procedure, or `YIELD` of a column it does not return | `execute: unknown procedure: <ns>.<name>`, ``execute: YIELD `<field>`: <ns>.<name> returns no such column; it returns: …`` |
-| `FOREACH`, `EXISTS { }` / `COUNT { }` / `COLLECT { }` and `CALL { }` subqueries, `CALL` inside a larger query, `SET n:Label`, more than one label, pattern predicates and comprehensions, map projections, `=~`, `LOAD CSV`, `USE`, `allShortestPaths` | `not supported in mushroomdb 0.10: <feature>` — the full list is under [Unsupported features](#unsupported-features) |
+| `FOREACH`, `EXISTS { }` / `COUNT { }` / `COLLECT { }` and `CALL { }` subqueries, `CALL` inside a larger query, `SET n:Label`, more than one label, pattern predicates and comprehensions, map projections, `=~`, `LOAD CSV`, `USE`, `allShortestPaths` | `not supported in mushroomdb 0.10: <feature>`, the full list is under [Unsupported features](#unsupported-features) |
 
 ### Absent
 
-Forms not implemented and not tested. Behavior is not guaranteed — these may produce an
+Forms not implemented and not tested. Behavior is not guaranteed; these may produce an
 unexpected-token parse error or other unspecified result.
 
 | Form |
@@ -1976,18 +1976,18 @@ unexpected-token parse error or other unspecified result.
 
 | Feature | Status |
 |---|---|
-| Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; every write statement runs inside a transaction with the results and counts it gives auto-commit (`MATCH … CREATE` / `MERGE`, `UNWIND … <write>`, the `SET` map forms and `SET` / `REMOVE … RETURN` included), under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; schema statements are refused there |
-| Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
+| Multi-statement transactions | Supported: BEGIN … COMMIT through `SharedDb::begin_transaction` (and Bolt `BEGIN` / `COMMIT` / `ROLLBACK`, see [Bolt](bolt.md)); snapshot isolation, one atomic commit; every write statement runs inside a transaction with the results and counts it gives auto-commit (`MATCH … CREATE` / `MERGE`, `UNWIND … <write>`, the `SET` map forms and `SET` / `REMOVE … RETURN` included), under HTTP `/tx` and Bolt `BEGIN` alike, so also in driver-managed write transactions; schema statements are refused there |
+| Combined MATCH … SET … RETURN | Supported: write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, arithmetic expressions (`n.x + 1`, `n.score * 1.5`) and predicates (`n.score > 10`, `NOT n.done`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
-| MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
-| Bare DELETE on node with edges | Error — use DETACH DELETE |
+| MATCH … DETACH DELETE (node) | Supported: removes node + all edges |
+| Bare DELETE on node with edges | Error: use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
-| WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
-| Multiple patterns in one MATCH | Supported, comma-separated — as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. `CREATE` takes several patterns too |
-| `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
-| UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
-| UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
+| WITH pipeline stages | Supported: projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
+| Multiple patterns in one MATCH | Supported, comma-separated: as consecutive MATCH clauses, except that the parts of one MATCH never bind one relationship twice. `CREATE` takes several patterns too |
+| `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold; they still scan the label |
+| UNWIND | Supported: any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
+| UNWIND with write clauses | Supported: `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
 | Declaring a unique constraint | Scans the label's existing nodes, so it blocks writers for a time proportional to the label's node count (about 1 to 3 seconds at a million nodes); readers are unaffected. Refused, listing the first 100 conflicting nodes and the total, when two already hold equal values |
 | A store whose WAL declares a unique constraint after data that breaks it | Opens normally: replay never checks a record, and a snapshot, a reader's refresh and `open_at` all load it the same way. The duplicates stay as they are. The constraint is in force for new writes: only a value a write changes is judged, so a write that leaves a duplicate's value as it is (another property, or the same value written again) is allowed, and one that gives a node a value another live node holds is refused. To clean up, give all but one holder of each shared value a new value, or delete them; the constraint then holds for the whole label. Only a store written by a build without the create-time scan can be in this state |
 | Variable-length paths: max hops | Capped at 10 |

@@ -17,7 +17,7 @@
   `RETURN n` was a Node. They now arrive as they do from a read. HTTP and CLI
   output are unchanged. Present in released 0.10.5 (ledger row 174).
 
-## v0.10.5 — graph values over Bolt, relationship-property events and imports
+## v0.10.5: graph values over Bolt, relationship-property events and imports
 
 ### Fixed
 
@@ -54,7 +54,7 @@
   arm. The JSON of every existing event is unchanged, and `MutationEvent` and
   `ExportEdge` are unchanged.
 
-## v0.10.4 — aggregates take expressions, and a role's transaction can write
+## v0.10.4: aggregates take expressions, and a role's transaction can write
 
 ### Fixed
 
@@ -78,7 +78,7 @@
   terminal shows it dimmed, and `NO_COLOR` or `TERM=dumb` shows it plain. Piped output
   is unchanged.
 
-## v0.10.3 — a replaced WAL is seen on Windows
+## v0.10.3: a replaced WAL is seen on Windows
 
 ### Fixed
 
@@ -93,7 +93,7 @@
   that are neither Unix nor Windows still have no file identity. Present in
   released 0.9.x and 0.10.x (ledger row 122).
 
-## v0.10.2 — a revoked key stops working on an open connection, and the Linux binaries run on older systems
+## v0.10.2: a revoked key stops working on an open connection, and the Linux binaries run on older systems
 
 ### Fixed
 
@@ -101,7 +101,7 @@
 - **A snapshot replaced between the snapshot read and the WAL read in `load_from_disk` no longer
   leaves the handle with mixed state.** Previously, `load_from_disk` captured `snapshot_ident`
   after WAL replay. A peer that completed a WAL-replacing snapshot in between left the handle
-  holding the old snapshot's data under the new snapshot's identity, invisibly — no staleness
+  holding the old snapshot's data under the new snapshot's identity, invisibly; no staleness
   check or refresh could tell. The fix captures the identity before any read, rechecks it after
   the replay, and resets and retries (up to three attempts) on a mismatch. Present in released
   0.9.x and 0.10.x (row 121).
@@ -111,7 +111,7 @@
   `BEGIN`, and `COMMIT` re-checks the credential against the current key table. A removed key fails
   with `Neo.ClientError.Security.Unauthorized` and its open transaction is rolled back. Any identity
   change while a transaction is open (tier or role change) is refused with `Forbidden` and the
-  transaction is rolled back — this prevents a changed role's view from leaking into a transaction
+  transaction is rolled back; this prevents a changed role's view from leaking into a transaction
   that was opened under a different role. Outside a transaction a tier or role change takes effect
   silently on the next statement. Static `--token` and no-auth modes are unaffected. (ledger row 142)
 
@@ -119,7 +119,7 @@
 
 - **`mushroomdb.__version__`** in Python, matching the package metadata.
 
-## v0.10.1 — aggregates and mixed-type ordering are right, and commits cost less on Linux
+## v0.10.1: aggregates and mixed-type ordering are right, and commits cost less on Linux
 
 ### Performance
 
@@ -135,7 +135,7 @@
 
 - **`ORDER BY` and `min` / `max` now follow openCypher's cross-type order.** Values of different types now sort in openCypher's ascending order: map < list < Date < LocalDateTime < DateTime < Duration < binary < string < boolean < number < null. Previously, numbers sorted first. `MATCH (a) RETURN a.m AS m ORDER BY m` over `m` = 1, `'a'`, `true` used to return `1, 'a', true`; it now returns `'a', true, 1`. `min` over a mixed column returns the string; `max` returns the number. Comparisons with `<`, `>`, `<=`, `>=` between two values of different types still return nothing (unchanged). Affected: any `ORDER BY`, `min`, or `max` over a property or expression whose values span more than one type, in 0.10.0 and earlier, on every surface that runs Cypher (row 170).
 
-## v0.10.0 — Cypher, Bolt, and a store you host yourself
+## v0.10.0: Cypher, Bolt, and a store you host yourself
 
 
 A store that never uses a 0.10 feature opens under 0.9.x, and 0.9.x opens under
@@ -181,7 +181,7 @@ Ledger rows closed in 0.10, beyond the ones already closed in an earlier release
 - **A JSON object `{"$date": …}`, `{"$ldt": …}`, `{"$dt": …}`, `{"$dur": …}` or `{"$binary": …}` is now a typed value, stored once the store is V11.** Through 0.9.x such an object was stored as a map. It now parses to a Date, LocalDateTime, DateTime, Duration or Binary value (ISO 8601 text, base64 for binary), and a query that takes one as a parameter returns it in the same form. V11 is opt-in and sticky: the first write that would store one of these values first moves the store to the V11 snapshot format, then stores the value, and the store stays V11 from then on. A store that never stores one keeps the format 0.9.x reads. 0.9.x cannot open a V11 store: it stops with `snapshot: unsupported version 11`. A bare string is still a string, and a tagged object whose text does not parse is still a map. A store that already holds such a map exports it in that form, which now re-imports as the typed value. Role predicates (`visible_where`) refuse the new types.
 - **Rust: `Value` has five new variants** (`Date`, `LocalDateTime`, `DateTime`, `Duration`, `Binary`), so an exhaustive `match` on it needs new arms. `tagged_text` and `tagged_json` give their wire forms.
 
-## v0.9.4 — aggregates over variables, integer sums, boolean comparisons and rule weights are right
+## v0.9.4: aggregates over variables, integer sums, boolean comparisons and rule weights are right
 
 No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot opens under 0.9.3: no byte layout in the snapshot or the WAL changed. The edge-property section of a snapshot is written the same way 0.9.3 writes it in every case a 0.9.x write path can reach, row 154's included.
 
@@ -194,11 +194,11 @@ No format version change. A 0.9.3 store opens under 0.9.4, and a 0.9.4 snapshot 
 - **Booleans compare: `false < true`.** `<`, `<=`, `>` and `>=` between two booleans were false, so `WHERE n.flag > false` dropped every row (in a read, in a fused scan with LIMIT, and in a write statement's WHERE), and `min` / `max` of a boolean property returned null. openCypher orders `false` before `true`, as `ORDER BY` already did. A boolean and a value of another type still do not order: `WHERE n.flag > 0` matches nothing. Affected: an ordering comparison or `min` / `max` over booleans (row 160).
 - **A rule's weight stays gone after another rule takes the edge.** Two weighted rules over one edge type, a snapshot, then a change that makes the first rule let the edge go while the second rule claims it: the edge showed the first rule's weight beside the second's, and lost it at the next snapshot. It now shows only the second rule's weight, live, after a snapshot and after a reopen. A snapshot now writes each edge's properties as a live read shows them. Affected: stores with two `weight_prop` rules over one edge type that were snapshotted while one of them owned an edge the other later took (row 154).
 
-## v0.9.3 — a filtered scan with LIMIT sees every node a snapshot holds
+## v0.9.3: a filtered scan with LIMIT sees every node a snapshot holds
 
 No format version change. A 0.9.2 store opens under 0.9.3, and a 0.9.3 snapshot opens under 0.9.2: the fix is in how a query reads, and no byte a snapshot or the WAL writes has changed.
 
-**Upgrade if you run a filtered query with LIMIT on a store that has ever been snapshotted.** A query whose WHERE is one comparison of a scanned node's property with a literal — `n.prop <op> value`, `<op>` any of `=`, `<>`, `<`, `<=`, `>`, `>=` — with a LIMIT (with or without SKIP) and no ORDER BY returned, for that node, only the nodes whose property was written since the last snapshot, and said nothing. `MATCH (n:L) WHERE n.val <> 3 … LIMIT 10` is the common case. `=` was affected only when the filtered node is not the first one the MATCH scans, as in `MATCH (m:M), (n:L) WHERE n.val = 3 … LIMIT 10` or `MATCH (m:M) MATCH (n:L) WHERE n.val = 3 … LIMIT 10`; on the first node it runs as a lookup and was right. Every 0.2.0–0.9.2 release has it, on every surface that runs Cypher: the CLI, the MCP `query` tool, HTTP, Python, TypeScript and the Rust library, live, after a reopen, through readers, `open_at` and role or namespace scopes (row 139).
+**Upgrade if you run a filtered query with LIMIT on a store that has ever been snapshotted.** A query whose WHERE is one comparison of a scanned node's property with a literal (`n.prop <op> value`, `<op>` any of `=`, `<>`, `<`, `<=`, `>`, `>=`) with a LIMIT (with or without SKIP) and no ORDER BY returned, for that node, only the nodes whose property was written since the last snapshot, and said nothing. `MATCH (n:L) WHERE n.val <> 3 … LIMIT 10` is the common case. `=` was affected only when the filtered node is not the first one the MATCH scans, as in `MATCH (m:M), (n:L) WHERE n.val = 3 … LIMIT 10` or `MATCH (m:M) MATCH (n:L) WHERE n.val = 3 … LIMIT 10`; on the first node it runs as a lookup and was right. Every 0.2.0–0.9.2 release has it, on every surface that runs Cypher: the CLI, the MCP `query` tool, HTTP, Python, TypeScript and the Rust library, live, after a reopen, through readers, `open_at` and role or namespace scopes (row 139).
 
 ### Fixed
 
@@ -208,11 +208,11 @@ No format version change. A 0.9.2 store opens under 0.9.3, and a 0.9.3 snapshot 
 
 - **`mushroomdb-storage`: `ColumnsView::column`.** It reads post-snapshot values only, which is how the scan above went wrong; the engine no longer calls it. `ColumnsView::view_column` reads the snapshot too. `column` keeps its signature in 0.9.x.
 
-## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
+## v0.9.2: the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
 
-**Upgrade if a store was written by 0.8.0 with a top-k rule beside another rule over the same edge type.** 0.9.1 left a top-k edge that 0.8.0 removed while no rule counted it missing until its source changed; it now comes back at the first write after open (row 113). A snapshot also records that the repair has run, so a store with top-k rules — every agent-memory store — does not pay for it at every open (row 116). Four smaller corrections follow (rows 50, 84, 112, 115).
+**Upgrade if a store was written by 0.8.0 with a top-k rule beside another rule over the same edge type.** 0.9.1 left a top-k edge that 0.8.0 removed while no rule counted it missing until its source changed; it now comes back at the first write after open (row 113). A snapshot also records that the repair has run, so a store with top-k rules (every agent-memory store) does not pay for it at every open (row 116). Four smaller corrections follow (rows 50, 84, 112, 115).
 
 ### Fixed
 
@@ -220,10 +220,10 @@ No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot 
 - **`rebuild_rule` no longer drops an edge another rule still desires.** When a rule was explicitly rebuilt (or rebuilt after index drift), `apply_streaming_rebuild` and `apply_via_rebuild` retracted stale edges but did not push them to the reclaim queue, so a competing rule never got the chance to take them. The fix adds the push; the second-pass reclaim now fires for rebuild the same way it already did for incremental writes (row 84).
 - **An `open_at` handle on a store snapshotted while two rules both owned the same edge now shows one owner, not two.** The row 107 dedup ran on the first write (via `ensure_provenance_loaded_mut`) but not when the provenance was decoded for an as-of handle via `from_persist`. The fix calls `dedup_provenance` inside `from_persist` (row 112).
 - **`forget` of a property no longer misreports the derived-edge count on a store row 111 repaired.** Before the fix, the snapshot's provenance was decoded into the as-of handle but not reconciled, so the derived-edge count it saw could differ from the live count. The fix runs row 111's repair before computing the report (row 115).
-- **A snapshot records that the repair of 0.8.0's lost edges has run, so an open does not repeat it.** The repair re-evaluates every top-k source short of its cap, which on a store with such rules — every agent-memory store — cost each open about 40 %. A snapshot whose state has had the repair now carries an optional section 16, and an open of it skips the repair; a snapshot written before this release is repaired at each open until the next snapshot. 0.9.1 ignores the section (row 116).
+- **A snapshot records that the repair of 0.8.0's lost edges has run, so an open does not repeat it.** The repair re-evaluates every top-k source short of its cap, which on a store with such rules (every agent-memory store) cost each open about 40 %. A snapshot whose state has had the repair now carries an optional section 16, and an open of it skips the repair; a snapshot written before this release is repaired at each open until the next snapshot. 0.9.1 ignores the section (row 116).
 - **`delete_node` counts the correct number of derived edges when the deleted node is only a via-hop.** `provenance_touching` found edges where the node is src or dst, but missed edges where the node is the via hop. The fix counts the edges the apply's own deltas retracted instead (row 50).
 
-## v0.9.1 — stores 0.8.0 had damaged get their edges back
+## v0.9.1: stores 0.8.0 had damaged get their edges back
 
 No format version change. A 0.9.0 store opens under 0.9.1, and a 0.9.1 snapshot opens under 0.9.0.
 
@@ -235,7 +235,7 @@ No format version change. A 0.9.0 store opens under 0.9.1, and a 0.9.1 snapshot 
 - **`stats().edges` no longer reads low after a rule lets go of an edge the graph did not hold.** Each such retraction counted as a removed edge until the next snapshot (row 109).
 - **The first write after opening a snapshotted store sees which rule owns an edge.** On that write, `insert_edge` of an edge a rule derived answered `Ok(false)` instead of refusing it as rule-owned, in a batch as well, and `delete_node` reported the deleted node's rule-derived edges as manual (rows 108, 110). On a store where 0.8.0 lost edges, `delete_node` no longer counts the lost ones (row 111).
 
-## v0.9.0 — the Rust library is `mushroomdb`
+## v0.9.0: the Rust library is `mushroomdb`
 
 No format version change, and nothing changes for the CLI, the MCP server, HTTP, Python or TypeScript: a 0.8.2 store opens under 0.9.0 and the other way round. The minor version moves because one thing breaks for an embedded Rust user, below.
 
@@ -249,7 +249,7 @@ No format version change, and nothing changes for the CLI, the MCP server, HTTP,
 
   Nothing changes for the CLI, the MCP server, HTTP, Python or TypeScript, and the on-disk format is identical: no store, WAL, snapshot or response carries the library's name.
 
-## v0.8.2 — two more rule engine corrections, and a repair for stores 0.8.0 damaged
+## v0.8.2: two more rule engine corrections, and a repair for stores 0.8.0 damaged
 
 No format version change. A 0.8.1 store opens under 0.8.2, and a 0.8.2 snapshot opens under 0.8.1 and 0.8.0.
 
@@ -272,9 +272,9 @@ No format version change. A 0.8.1 store opens under 0.8.2, and a 0.8.2 snapshot 
   the edge was already lost before this release (the losing write ran on 0.8.0 or 0.8.1) are not
   repaired; delete and recreate both rules to restore those edges (row 111 will reconcile at the
   first write automatically) (row 107).
-- **A via-hop top-k rule keeps its next-best edge when its best match was another rule's.** The fix 0.8.1 made for plain top-k rules, now for a via-hop one: when its best match was an edge another rule owned and that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule` (row 83).
+- **A via-hop top-k rule keeps its next-best edge when its best match was another rule's.** The fix 0.8.1 made for plain top-k rules, now for a via-hop one: when its best match was an edge another rule owned and that match went away (a changed property or the destination deleted) the next-best edge stayed missing until `rebuild_rule` (row 83).
 
-## v0.8.1 — six rule engine corrections
+## v0.8.1: six rule engine corrections
 
 No format version change. A 0.8.0 store opens under 0.8.1, and a 0.8.1 store opens under 0.8.0.
 
@@ -289,18 +289,18 @@ Also here: the skill an assistant reads names the store's path once and fits its
 
 ### Fixed
 
-- **A top-k rule keeps its next-best edge when its best match was another rule's.** Two rules over the same labels and edge type, one of them top-k: when the top-k rule's best match for a source was an edge the other rule already owned, it recorded nothing and dropped its own next-best edge, and when that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule`. Not yet for a via-hop top-k rule (row 83, in part).
-- **Derived edges are where the rule counts say after a snapshot.** On a store opened from a snapshot, a rule that desired an edge another rule over the same edge type had derived before the snapshot recorded it as its own too; the edge was counted twice, and when that second rule let go of it the edge went from the graph while the first rule went on counting it — `stats` reported edges `neighbors` did not return. The same happened to an edge you had written yourself before the snapshot: a rule that desired it took it as its own, and deleted it when it stopped desiring it. A store `main` snapshotted while two rules owned an edge is not repaired by this release, and its `stats` edge count can stay too high (rows 103 and 107).
+- **A top-k rule keeps its next-best edge when its best match was another rule's.** Two rules over the same labels and edge type, one of them top-k: when the top-k rule's best match for a source was an edge the other rule already owned, it recorded nothing and dropped its own next-best edge, and when that match went away (a changed property or the destination deleted) the next-best edge stayed missing until `rebuild_rule`. Not yet for a via-hop top-k rule (row 83, in part).
+- **Derived edges are where the rule counts say after a snapshot.** On a store opened from a snapshot, a rule that desired an edge another rule over the same edge type had derived before the snapshot recorded it as its own too; the edge was counted twice, and when that second rule let go of it the edge went from the graph while the first rule went on counting it; `stats` reported edges `neighbors` did not return. The same happened to an edge you had written yourself before the snapshot: a rule that desired it took it as its own, and deleted it when it stopped desiring it. A store `main` snapshotted while two rules owned an edge is not repaired by this release, and its `stats` edge count can stay too high (rows 103 and 107).
 - **Deleting a top-k rule's best match promotes the next one.** A KeyMatch top-k rule whose source named the deleted node chose it again: the rule's edge count included an edge the graph did not have, and the next-best match was not taken (row 106).
 - **Deleting a via node removes the edges derived through it.** A via-hop rule's edge stayed after the node it hopped through was deleted (row 104).
 - **A via-hop rule that links a label to itself derives the edge into a new node.** Inserting nodes in one order derived the edge and in the other did not (row 105).
 - **A via-hop rule takes back an edge another rule gave up.** When a plain rule stopped deriving an edge that a via-hop rule over the same edge type also derives, the edge was removed and not added back; the via-hop rule is now re-evaluated for that source (row 84, in part).
 
-## v0.8.0 — faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed
+## v0.8.0: faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed
 
 No format version change. A 0.7.2 store opens under 0.8.0, and a 0.8.0 snapshot opens under 0.7.2, which ignores the full-text index the snapshot now carries and builds its own.
 
-**Upgrade if you snapshot a store with no full-text pair, property index or multiplicity declared.** In 0.7.2 and earlier, an archiving snapshot taken with nothing written since the last one — `mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, a graceful shutdown just after a snapshot — wrote an empty file over the previous WAL archive: its history was lost, and reads by date could answer an old commit with a later state. A store created by `mushroomdb mcp` or `serve` since 0.7 declares the memory schema and was not exposed. What was lost is not recoverable (row 100).
+**Upgrade if you snapshot a store with no full-text pair, property index or multiplicity declared.** In 0.7.2 and earlier, an archiving snapshot taken with nothing written since the last one (`mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, a graceful shutdown just after a snapshot) wrote an empty file over the previous WAL archive: its history was lost, and reads by date could answer an old commit with a later state. A store created by `mushroomdb mcp` or `serve` since 0.7 declares the memory schema and was not exposed. What was lost is not recoverable (row 100).
 
 The rest of what is here:
 
@@ -326,14 +326,14 @@ Each engine change was given to an independent reviewer that ran the same writes
 ### Fixed
 
 - **An insert that names a property twice indexes the value that is stored.** `insert_node` with the same field twice, or a Cypher `CREATE` with a repeated key, stores the last value and used to index both: the first value's words stayed searchable until the store was next opened.
-- **A read sees a view's value as of the commit it reads at.** The lock-free reader — `reader()` in the Rust API, and what the HTTP server answers a request with a role token from (`/query`, a node, its edges, its neighbourhood) — returned a view's property as it stood at the reader's last fold, which happens every 64 commits. Until then a node read back with no value for a view created since, an old count or sum after an edge or a neighbour's property changed, and a deleted view's property still on it. A read through the handle itself, which is every other read, was always current. The writer now hands each commit's view values to the reader with the commit (row 97).
-- **A snapshot of a store with nothing new no longer destroys its history.** Two archiving snapshots with no write between them — `mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, a graceful shutdown just after one — wrote an empty file over the previous WAL archive. `node_history`, `was_linked` and reads by date lost everything that archive held, and because the commit numbers were then handed out again, `asof` and `query … as_of` could answer an old commit with a later state while `stats` reported complete history. It affected a store with no full-text pair, property index or multiplicity declared, so not a store created by `mushroomdb mcp` or `serve` since 0.7, which declare the memory schema; a store from `demo`, the Rust API or Python with no declaration was exposed. Such a snapshot now leaves the WAL and the archives as they are. What was overwritten is not recoverable (row 100).
-- **A store's first archiving snapshot can be interrupted without costing its reads by date.** The marker that lets `asof`, `open_at` and `query … as_of` read commits out of the archives was written last, and a snapshot killed before it — `mushroomdb snapshot`, a `serve --snapshot-every` tick or a shutdown — left a store that never got one: every commit in an archive was `out of range` from then on, with `stats` reporting complete history and nothing else wrong. It is written first now. A store this has already happened to is not repaired: nothing in it distinguishes it from one whose history was cut by a truncating snapshot, and reading such a store's archives as if they were whole would answer wrongly. Its history reads (`node_history`, `was_linked`) are unaffected (row 98).
-- **`/watch` answers a client that closes.** The server only wrote to a `/watch` socket and never read it, so a client's close frame went unanswered: the client waited out its own timeout, and the server kept the connection's task and its place in the event channel until a later commit gave it something to write and the write failed — on a store nobody was writing to, until the server stopped. The socket is read now, which also answers a ping. `/subscribe` was not affected (row 99).
-- **A store's first snapshot failing no longer loses edge properties.** When the first snapshot of a store failed at its write — a full disk — the handle went on with no edge properties: a rule's weights read as absent, and the next snapshot that worked made that permanent (row 96).
+- **A read sees a view's value as of the commit it reads at.** The lock-free reader (`reader()` in the Rust API, and what the HTTP server answers a role-token request from: `/query`, a node, its edges, its neighbourhood) returned a view's property as it stood at the reader's last fold, which happens every 64 commits. Until then a node read back with no value for a view created since, an old count or sum after an edge or a neighbour's property changed, and a deleted view's property still on it. A read through the handle itself, which is every other read, was always current. The writer now hands each commit's view values to the reader with the commit (row 97).
+- **A snapshot of a store with nothing new no longer destroys its history.** Two archiving snapshots with no write between them (`mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, a graceful shutdown just after one) wrote an empty file over the previous WAL archive. `node_history`, `was_linked` and reads by date lost everything that archive held, and because the commit numbers were then handed out again, `asof` and `query … as_of` could answer an old commit with a later state while `stats` reported complete history. It affected a store with no full-text pair, property index or multiplicity declared, so not a store created by `mushroomdb mcp` or `serve` since 0.7, which declare the memory schema; a store from `demo`, the Rust API or Python with no declaration was exposed. Such a snapshot now leaves the WAL and the archives as they are. What was overwritten is not recoverable (row 100).
+- **A store's first archiving snapshot can be interrupted without costing its reads by date.** The marker that lets `asof`, `open_at` and `query … as_of` read commits out of the archives was written last, and a snapshot killed before it (`mushroomdb snapshot`, a `serve --snapshot-every` tick or a shutdown) left a store that never got one: every commit in an archive was `out of range` from then on, with `stats` reporting complete history and nothing else wrong. It is written first now. A store this has already happened to is not repaired: nothing in it distinguishes it from one whose history was cut by a truncating snapshot, and reading such a store's archives as if they were whole would answer wrongly. Its history reads (`node_history`, `was_linked`) are unaffected (row 98).
+- **`/watch` answers a client that closes.** The server only wrote to a `/watch` socket and never read it, so a client's close frame went unanswered: the client waited out its own timeout, and the server kept the connection's task and its place in the event channel until a later commit gave it something to write and the write failed, on a store nobody was writing to, until the server stopped. The socket is read now, which also answers a ping. `/subscribe` was not affected (row 99).
+- **A store's first snapshot failing no longer loses edge properties.** When the first snapshot of a store failed at its write (a full disk) the handle went on with no edge properties: a rule's weights read as absent, and the next snapshot that worked made that permanent (row 96).
 - **A snapshot interrupted before its WAL is replaced leaves a store that opens.** A truncating or archiving snapshot writes `snapshot.bin` and then replaces `wal.bin`. A crash between the two left the new snapshot beside the WAL it was made from, and the next open replayed that WAL over it: after a rename the open failed with `corrupt data: wal replay RenameNode`, and the store did not open again. Such a snapshot now writes a small file, `snapshot.intent`, before it starts and empties it when it has finished, and an open that finds it does not apply the old WAL a second time. A backup carries the file. This was 0.7.2's known limit (row 92).
 
-## v0.7.2 — corrections, five of them for a store that would not open or answered wrongly
+## v0.7.2: corrections, five of them for a store that would not open or answered wrongly
 
 No format version change. A 0.7.1 store opens under 0.7.2, and a 0.7.2 snapshot opens under 0.7.1, which ignores the two optional sections this release adds.
 
@@ -362,17 +362,17 @@ Several inputs that 0.7.1 accepted are refused; each is under Changed.
 - **An `/algo` request with a field the config does not have is 400.** `POST /algo/pagerank`, `/algo/wcc` and `/algo/degree` dropped such a field without a word: `{"weight": "score"}` answered 200 with unweighted scores, and `max_iter` for `max_iters` ran with the default. The message names the field and the ones the route accepts. `{}` is still every default. **A caller that sends a stray field gets 400 where 0.7.1 answered** (row 87).
 - **PageRank refuses a damping that is not a number from 0 to 1.** Python raises `ValueError` and HTTP answers 400. A NaN used to come back as a NaN score for every node (row 75).
 - **Over MCP, `find_similar` refuses a `min`, `k` or `limit` that is not a number.** It used to take the default and echo it, so a caller who sent `"0.5"` got results filtered at 0.8. Absent or null still takes the default (row 74).
-- **`remember` refuses a key, predicate or label made only of invisible characters** — a zero-width space, an ASCII control character, a byte-order mark — as it already refused an empty one, before it writes anything (row 78).
-- **A provisional stub with a long key is linked by its whole key alone.** A stub's aliases are its key and each word of it. A key that implies more than 32 — a sentence, a URL with a slug and a query string — used to get them all, past the cap an entity is held to; it now carries the one (row 53).
+- **`remember` refuses a key, predicate or label made only of invisible characters** (a zero-width space, an ASCII control character, a byte-order mark) as it already refused an empty one, before it writes anything (row 78).
+- **A provisional stub with a long key is linked by its whole key alone.** A stub's aliases are its key and each word of it. A key that implies more than 32 (a sentence, a URL with a slug and a query string) used to get them all, past the cap an entity is held to; it now carries the one (row 53).
 
 ### Fixed
 
-- **Deleting a node after a snapshot removes its edges.** On a store that had taken a snapshot — which `serve --snapshot-every`, `mushroomdb snapshot` and Python's `snapshot()` all do — `delete_node` removed the node and left every edge the snapshot held for it. Reading the neighbours of a node that had been linked to it failed with `corrupt data: topology id N has no key`; a pattern match returned a row with one end missing; `stats` and degree views went on counting the edges; and the next snapshot kept them. It is in 0.7.1 and earlier. **A store already left that way is repaired when 0.7.2 opens it**: the leftover edges are dropped, and the next snapshot no longer carries them. `mushroomdb verify` checks checksums and cannot see such edges; it reports a store in that state as intact (row 95).
+- **Deleting a node after a snapshot removes its edges.** On a store that had taken a snapshot (which `serve --snapshot-every`, `mushroomdb snapshot` and Python's `snapshot()` all do) `delete_node` removed the node and left every edge the snapshot held for it. Reading the neighbours of a node that had been linked to it failed with `corrupt data: topology id N has no key`; a pattern match returned a row with one end missing; `stats` and degree views went on counting the edges; and the next snapshot kept them. It is in 0.7.1 and earlier. **A store already left that way is repaired when 0.7.2 opens it**: the leftover edges are dropped, and the next snapshot no longer carries them. `mushroomdb verify` checks checksums and cannot see such edges; it reports a store in that state as intact (row 95).
 - **Three more writes after a snapshot now act on what the snapshot holds.** Deleting a view removes its property from every node, where the snapshot's values stayed readable. A rule deleted, snapshotted and created again derives its edges after a reopen, where the old snapshot's ownership records came back in their place. And an aggregate view created after a snapshot counts the neighbours the snapshot holds, where it started from zero. An average, minimum or maximum with nothing left to aggregate is absent, where it kept the snapshot's number; and a view over an edge type a rule derives is right after a reopen that replays writes, where it kept the snapshot's counts (row 95).
 - **A view cannot take the name of a property nodes already carry, and a refused view leaves nothing behind.** On a store with a snapshot the name check missed properties the snapshot held. And the refusal came after the record was written to the WAL, so the store that had just refused the view failed its next open (row 95).
 - **A store that renamed a node and then took a snapshot keeping its WAL opens again.** `mushroomdb snapshot --keep-wal`, `snapshot_with(keep_wal: true)`, the snapshot `enable_multiplicity` takes and an auto-migration all leave the WAL whole, and the next open replayed all of it over the snapshot. After a `rename_node` that open failed with `corrupt data: wal replay RenameNode n→m: duplicate node key: m` and the store did not open again; after a key was deleted and inserted again the store opened holding an older value, with no error. Such a snapshot now records how much of the WAL it holds, and the open does not apply those writes a second time. It is in 0.7.1 and earlier (row 91).
 
-  **A store already in that state is not repaired by upgrading**, because its snapshot carries no such record. If the store has never taken a truncating or an archiving snapshot — its directory holds no `wal.<N>.archive`, and it was never snapshotted with `--truncate` — move `snapshot.bin` aside and keep it: the store opens from the WAL alone, and the next snapshot is a good one. **Do not do this on a store that has archives**: `mushroomdb snapshot` and `serve --snapshot-every` archive by default, and without its snapshot such a store opens holding only what was written since the last archive, with no error.
+  **A store already in that state is not repaired by upgrading**, because its snapshot carries no such record. If the store has never taken a truncating or an archiving snapshot (its directory holds no `wal.<N>.archive`, and it was never snapshotted with `--truncate`) move `snapshot.bin` aside and keep it: the store opens from the WAL alone, and the next snapshot is a good one. **Do not do this on a store that has archives**: `mushroomdb snapshot` and `serve --snapshot-every` archive by default, and without its snapshot such a store opens holding only what was written since the last archive, with no error.
 
   **The same state can still follow a crash** between a truncating snapshot and the replacement of its WAL, a window two filesystem calls wide. That is not fixed here (row 92). A store left that way opens once `wal.bin` is moved aside: the snapshot holds every node, edge and rule, and the full-text pairs and equality indexes have to be declared again, as may the multiplicity opt-in.
 
@@ -384,17 +384,17 @@ Several inputs that 0.7.1 accepted are refused; each is under Changed.
 - **`remember`'s `matched` counts a fact endpoint that already exists**, each key once (row 48).
 - **`remember` no longer declares full-text on an entity label it did not use.** An `entities` entry whose key is already stored under another label is matched as stored; its own label used to be declared anyway, one pair against the cap for a label with no node. The report still does not say the label went unused (row 64).
 - **The MCP `create_rule` schema lists `approximate`**, which the tool accepts and `suggest_rules` can hand back (row 52).
-- **A truncating snapshot no longer hands discarded commit numbers to the commits that follow.** `GraphDb::snapshot()`, Python's `snapshot()`, `mushroomdb snapshot --truncate` and `mushroomdb migrate` discard the WAL. They left the store's floor where it was, so the replacement WAL was numbered over the old one: `stats` went on reporting `history: complete (nothing pruned)`, and `asof --commit 3`, `open_at(3)`, `edges_at` and `was_linked` answered a commit number taken before the snapshot with whatever commit now sat at that position — a different graph, with no error. The floor now moves to where the discarded history ended, as it already did when `--retention` pruned an archive. `stats` reports `history: reaches back to commit N`, and a read at a discarded commit is refused as out of range, naming the floor (row 80).
+- **A truncating snapshot no longer hands discarded commit numbers to the commits that follow.** `GraphDb::snapshot()`, Python's `snapshot()`, `mushroomdb snapshot --truncate` and `mushroomdb migrate` discard the WAL. They left the store's floor where it was, so the replacement WAL was numbered over the old one: `stats` went on reporting `history: complete (nothing pruned)`, and `asof --commit 3`, `open_at(3)`, `edges_at` and `was_linked` answered a commit number taken before the snapshot with whatever commit now sat at that position: a different graph, with no error. The floor now moves to where the discarded history ended, as it already did when `--retention` pruned an archive. `stats` reports `history: reaches back to commit N`, and a read at a discarded commit is refused as out of range, naming the floor (row 80).
 
   **This changes commit numbers after a truncating snapshot.** What is written next is numbered above the old total, where it used to be numbered from 0, and `wal_total_commits()` no longer drops. A caller that relied on "commit 0 is my first write after `snapshot()`" must read `history_floor` and count up from it; the first write is not always at the floor, because a store with full-text fields or indexes re-records each declaration first. Archives taken before a truncating snapshot are removed by it: they are below the new floor.
 
   **A store truncated by 0.7.1 or earlier is not repaired.** It keeps reporting its history as complete, because nothing on disk records how many commits were discarded. Its next truncating snapshot stops numbers being reused from then on; a number held from before an older truncation can still be answered with the wrong commit.
 
 - **A handle that has not refreshed no longer answers a history read from the wrong commits.** `was_linked`, `edges_at`, `node_history`, `edge_history` and `wal_total_commits` read the WAL fresh from disk and numbered its frames from the floor the handle had in memory. A reader left open across another process's pruning or truncating snapshot therefore answered `was_linked(a, b, KNOWS, 2)` from a different commit 2. The floor is now read from disk with the frames. A Python reader process, which refreshes only when asked, was the caller most exposed (row 81).
-- **An edge two rules both derive survives when one of them stops.** Two rules may share a source label, a destination label and an edge type. When both wanted the same edge it had one owner, the rule that added it, and when that rule's predicate stopped holding the edge was removed — although the other rule still wanted it. It stayed gone until that rule was rebuilt or one of its own fields was written. Now, in the same write, every rule over that edge type is re-evaluated for the node that lost the edge, and a rule that still wants it takes it, at its own score. While both hold, the edge still carries one rule's score and `explain` names that rule only. It predates 0.7 (row 37).
+- **An edge two rules both derive survives when one of them stops.** Two rules may share a source label, a destination label and an edge type. When both wanted the same edge it had one owner, the rule that added it, and when that rule's predicate stopped holding the edge was removed: although the other rule still wanted it. It stayed gone until that rule was rebuilt or one of its own fields was written. Now, in the same write, every rule over that edge type is re-evaluated for the node that lost the edge, and a rule that still wants it takes it, at its own score. While both hold, the edge still carries one rule's score and `explain` names that rule only. It predates 0.7 (row 37).
 - **A past-commit read whose base no longer exists is refused.** After a truncating or archiving snapshot the live WAL starts above the store's first commit, on that snapshot as its base. A later `keep_wal` snapshot overwrote the base with the state at the head, and `open_at`, `asof` and `query_at` then replayed the WAL over nothing: a graph missing everything older than the WAL, with no error. Such a read now answers `CommitOutOfRange`. Reads of a store whose WAL does reach its first commit are unchanged (row 82).
 
-## v0.7.1 — four corrections
+## v0.7.1: four corrections
 
 No new feature and nothing removed. A 0.7.0 store opens unchanged.
 
@@ -405,7 +405,7 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   a rename left it at the old key: `WHERE n.id = '<new key>'` found nothing
   and `RETURN n.id` printed the old key, with no error. The rename now
   rewrites an `id` that equals the old key, in the same commit, on every
-  surface — the MCP tool, Python's `rename_node`, HTTP
+  surface: the MCP tool, Python's `rename_node`, HTTP
   `POST /nodes/{key}/rename` and a batch. An `id` holding anything else is
   the caller's and is left alone; a node that stores none gains none. The
   rename is still one WAL frame, and a read as of a commit before it still
@@ -427,7 +427,7 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   skill teaches that form, but the tool's `inputSchema` said `integer`: a
   client that checks arguments against the schema refused the taught call,
   and one that does not accepted it. `at_commit` is now typed as `edges_at`'s
-  `at` is — a string or a non-negative integer — and the description leads
+  `at` is (a string or a non-negative integer) and the description leads
   with the date. Nothing about the handler changed (row 71).
 - **A store without the memory defaults keeps saying so after its first
   `remember`.** `remember` declares `Note.text` as it writes, so "this store
@@ -441,8 +441,8 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   indexes them. The check is bounded: it looks at the first 1,000 nodes of
   each memory label, so a field only a later node carries is not named.
   Nothing is declared for you: an existing store is still upgraded only by
-  that command. A store with no node under a memory label — one with its own
-  schema — is told nothing, and so is the prompt hook's digest, which fires
+  that command. A store with no node under a memory label (one with its own
+  schema) is told nothing, and so is the prompt hook's digest, which fires
   every turn. Python's `recall` rows are unchanged; `fulltext_pairs()` is how
   a Python caller sees what is declared. The tool's older "no text index"
   answer now replaces each control character in the store path it prints
@@ -467,7 +467,7 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
 
 - **A batch that renames a node cannot see that node's stored properties in
   the ops after the rename.** Only a batch built in Rust can put a rename
-  beside another op — `BatchBuilder` or `SharedDb::submit_batch`; MCP, HTTP,
+  beside another op: `BatchBuilder` or `SharedDb::submit_batch`; MCP, HTTP,
   Python and the CLI each send a rename alone. In such a batch, an
   `insert_edge` from the renamed node is checked as if the node were in the
   default namespace, so an edge across namespaces that a plain `insert_edge`
@@ -479,12 +479,12 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
 ### Not in this release
 
 At 0.7.0 the defect ledger deferred fifteen rows to 0.7.1. This release
-closes three of them — 71, 72 and 73 — and row 61, which was deferred to 0.8.
+closes three of them (71, 72 and 73) and row 61, which was deferred to 0.8.
 The other twelve move to 0.7.2 unchanged: rows 47, 48, 50, 51, 52, 53, 57,
 64, 65, 74, 75 and 78. The known limits under 0.7.0 below say so where they
 name one. Row 79 is new, and is the known limit above.
 
-## v0.7.0 — memory that fills itself
+## v0.7.0: memory that fills itself
 
 0.7 is the release in which `remember` followed by `recall` works on a new
 store. The memory write path is what it is for; the code-graph door is what it
@@ -509,7 +509,7 @@ updated.
 > mode already used 0.8. In the **Python binding** and on **HTTP
 > `POST /find_similar`** it was `0.0`: a call that never named `min` returned
 > every hit scoring 0.0 or above, up to `k`, and now returns only those
-> scoring 0.8 or above — which can be none. No error, no warning, fewer
+> scoring 0.8 or above, which can be none. No error, no warning, fewer
 > results.
 >
 > **To keep the old behaviour, name it: `min=0.0` in Python, `"min": 0.0` in
@@ -534,14 +534,14 @@ not look like a code identifier.
   search says so, with the command that fixes it, instead of answering as if
   the topic were unknown.
 - **`remember` takes what a sentence names.** Beside `text` and `about` it
-  accepts `entities` — each a key, a label, properties and aliases, created or
-  described in the same commit — and `facts`, relationships among them. The
+  accepts `entities` (each a key, a label, properties and aliases, created or
+  described in the same commit) and `facts`, relationships among them. The
   reply says what it created, what it matched, and what it could only stub.
 - **An unknown subject is stubbed, not refused.** `remember {about:
   ["matthew"]}` on a store that has never heard of `matthew` used to fail. It
   now creates a provisional `Entity`, marked as one, that the `schema` tool
   counts and lists the first ten of. A provisional node never expires;
-  describing it — `upsert_entity`, or `remember`'s `entities` — clears the
+  describing it (`upsert_entity`, or `remember`'s `entities`) clears the
   mark, and `forget` removes it. A fact's subject and object get the same
   treatment. At most 20 are stubbed per call; any past that are named in the
   reply as **not** created, and the rest of the call still commits.
@@ -574,8 +574,8 @@ not look like a code identifier.
   `remember` still declares what it writes, on any store: `Note.text`, and the
   `name` of a label `entities` names. So `recall`'s "no text index" answer and
   the session brief's line appear only while the store has no text field at
-  all. After the first `remember` — and on a 0.6 store that has already
-  remembered a note — `recall` answers from the fields the store has and says
+  all. After the first `remember` (and on a 0.6 store that has already
+  remembered a note) `recall` answers from the fields the store has and says
   nothing about the rest: an entity written before, or by another path, is
   not found by its name until the defaults are applied (see the known limits).
 - **A topic is at most 24 search terms.** A pasted paragraph is cut to its
@@ -587,7 +587,7 @@ not look like a code identifier.
   `suggest_rules`, `create_rule` with the proposal's own arguments, then
   `explain_association`.
 
-### Removed — the code-graph door
+### Removed: the code-graph door
 
 - **Seven MCP tools**: `explore`, `map`, `context`, `impact`, `owners`, `why`,
   `sync`. There is now one tool surface: every store advertises the same
@@ -610,7 +610,7 @@ not look like a code identifier.
   were hook bodies, and a hook a 0.6 install wrote keeps calling them until
   it is removed, so they are still accepted, unlisted: each does nothing,
   exits 0 and prints one line on stderr saying how to remove the hook.
-- **The `UserPromptSubmit` hook's dirty-tree nudge** — what the changed files
+- **The `UserPromptSubmit` hook's dirty-tree nudge**: what the changed files
   reach, who owns them, which learned concept just went stale. It read
   `CO_CHANGED`, `IMPORTS` and `DESCRIBED_IN` edges only `ingest-git` writes.
 - **The code-graph benchmark suite.** It measured the door this release
@@ -624,13 +624,13 @@ After upgrading, run `mushroomdb install` once to remove the retired hooks; `mus
 To keep any of it: pin `mushroomdb@0.6.x`.
 
 Every retired hook, in a settings file or a git hook, is recognised as ours
-only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
+only when its program is mushroomdb: `npx … mushroomdb@…`, a path ending
 `/mushroomdb`, or `node …/mushroomdb.js`. A hook of your own is never touched.
 
 ### Kept, and changed
 
 - **`ingest-git` stays**, positioned as a data source. Its store is now an
-  ordinary memory store — the same twenty-three tools, the same brief — and it
+  ordinary memory store (the same twenty-three tools, the same brief) and it
   declares its schema through `apply_schema`, so re-ingesting is idempotent.
   Into an existing store it declares its own missing rules and full-text pairs,
   as 0.6 did, and never the memory defaults.
@@ -647,7 +647,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   visible in the CLI.
 - **The prompt hook answers ordinary language.** It used to say nothing unless
   the prompt named a path, a `mod::name`, a snake_case word or something in
-  backticks — so on a memory store it was silent on every prompt. The MCP
+  backticks; so on a memory store it was silent on every prompt. The MCP
   `recall` tool's fix is the first section above; this is the automatic
   path. It prepends the untrusted-content framing line to what it prints.
 - **On a store built by `ingest-git`, the prompt hook now answers every
@@ -656,7 +656,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **The prompt hook is silent on a store with no text index.** `mushroomdb
   brief` says so instead, once per session, with the
   `schema apply … --memory-defaults` command that fixes it.
-- **`recall` says how much of the topic each hit matched** — `(2/3 terms)` —
+- **`recall` says how much of the topic each hit matched** (`(2/3 terms)`)
   and ranks by it, and no longer drops a hit for covering exactly half. The
   entity a two-word question is about holds one of the two words, which is all
   an entity node ever holds, and it was being dropped from the answer to it.
@@ -665,8 +665,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **`recall` sanitizes what it prints.** Keys, summaries and the store label
   now have their control characters stripped. Before this the MCP `recall`
   tool printed stored text raw, control characters included.
-- **Each command that sets a store up declares a schema on it.** Four do —
-  `mcp`, `serve`, `demo` and `ingest-git` — and `ingest-git` was the one
+- **Each command that sets a store up declares a schema on it.** Four do
+  (`mcp`, `serve`, `demo` and `ingest-git`) and `ingest-git` was the one
   without a schema. `install` creates no store; it now prints a line when its
   target store does not exist yet, naming the commands that will create it
   with the memory schema. A general-purpose command such as `query` still
@@ -719,13 +719,13 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   marketplace add MatthewSherlin/mushroomdb`, then `claude plugin install
   mushroom@mushroomdb`; seven files printed the first without the word
   `plugin`, and a claims rule now refuses that form.
-- **`docs/site` no longer publishes two internal notes** — they moved to
-  `docs/roadmap/` — and `docs/design.md` is headed as the historical record it
+- **`docs/site` no longer publishes two internal notes** (they moved to
+  `docs/roadmap/`) and `docs/design.md` is headed as the historical record it
   is: the design the project started from, not a description of what exists.
 - **Six gates the release process did not have.** The version check sees the
   Python binding's manifest, its pins and both lockfiles, and a bump whose
   lockfile refresh fails now fails; the defect ledger runs in CI and refuses a
-  deferral to a release that has shipped; and four are new — the names gate, a
+  deferral to a release that has shipped; and four are new: the names gate, a
   link-and-anchor gate over the hand-written docs (`scripts/check-links.py`),
   a check that `llms-full.txt` is what its generator writes and that the
   generator accounts for every page under `docs/site`
@@ -735,15 +735,15 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   CI; the rehearsal is run by hand before a tag. A claims rule also refuses a
   sentence that names a release as the current one.
 
-### Added — identity, and four tools for the store as a whole
+### Added: identity, and four tools for the store as a whole
 
 - **`schema`** answers "what's in here": labels with their fields, edge types
   and what derives them, every rule with its predicate, the full-text fields
   `recall` searches, the equality indexes, and the provisional nodes
   `remember` created. A host with no session hook had no way to learn a
   store's shape but guessing Cypher.
-- **`forget`** tombstones a node, removes one property — the first way to
-  remove a property over MCP — or retracts one fact. It refuses an edge a rule
+- **`forget`** tombstones a node, removes one property (the first way to
+  remove a property over MCP) or retracts one fact. It refuses an edge a rule
   derived and names the rule, reports the derived edges a property removal
   retracts because a rule read that property, lists the notes that still state
   what was forgotten, and says plainly that history keeps it until the log is
@@ -756,7 +756,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **`analyze`** ranks and groups: `central`, `degree`, `components`,
   `clusters` and `identities`, over the whole store, at most 50 rows, the same
   answer every time.
-- **Every entity carries a normalised `aliases` list** — its key, its name in
+- **Every entity carries a normalised `aliases` list**: its key, its name in
   lowercase with punctuation folded, and that name's words. Nothing else goes
   in. It is recomputed from the key and the current name on each write that
   describes the entity, not accumulated: a renamed entity stops matching its
@@ -767,7 +767,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   `alias_keys` (below), not in `aliases`. A value an older store already holds
   in `aliases` is its owner's data and is kept: on the next describing write
   to that entity, or when the identity preset's backfill runs, every item the
-  key and the name do not imply moves to `alias_keys` as written — trimmed,
+  key and the name do not imply moves to `alias_keys` as written: trimmed,
   not normalised. Only a blank item is let go. A list the store itself
   derived from an earlier name is not such a value: it is replaced, and
   nothing moves (see the known limits). Any value that is not a string
@@ -783,7 +783,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   overlap from it. A declared alias links only through an explicit claim on a
   stub's key.
 - **Aliases are normalised to Unicode NFC.** A name typed with combining
-  marks — `E` followed by U+0301 — yields the same aliases as its precomposed
+  marks (`E` followed by U+0301) yields the same aliases as its precomposed
   form, `É`, so the two link. The stored `name` is left as written. This adds
   one dependency to the core crate, `unicode-normalization` 0.1.
 - **`mushroomdb schema apply <db> --memory-identity`** adds the identity
@@ -796,7 +796,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **An explicit alias claim links a stub.** An entity that declares an alias
   equal to a provisional stub's key links that stub, at 1.00:
   `remember {about: ["matt"]}` and an entity written with `aliases: ["matt"]`
-  are linked, in either order. Jaccard could not do this — the stub holds one
+  are linked, in either order. Jaccard could not do this; the stub holds one
   alias, `matt`, and the entity's four hold no `matt`: its key, its name and
   the name's two words. A declared alias equal to an unrelated
   stub's key links them at 1.00 too: declaring it is the caller's explicit
@@ -823,8 +823,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   names.
 - **`alias_keys` is a second store-maintained list**: the aliases a caller
   declared, trimmed and otherwise as written, which is what the claim rules
-  read. Derived name words do not go in — an entity merely named "Alex" does
-  not claim a stub keyed `alex` — with one exception, after `rename_node`,
+  read. Derived name words do not go in (an entity merely named "Alex" does
+  not claim a stub keyed `alex`) with one exception, after `rename_node`,
   described in the known limits. It is the only place a declared alias is
   kept. It accumulates, where `aliases` does not; holds at most 32; is refused
   as a key inside `props`; is never proposed by `suggest_rules`; and is
@@ -841,11 +841,11 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
   25% of Talent split into 3 aliases, recall of the edges the canonical alias
   holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered
-  0.05 — so, as pre-registered, the canonical node is 0.8's headline
+  0.05; so, as pre-registered, the canonical node is 0.8's headline
   (`benchmarks/fragmentation/results/20261001T060009Z/summary.md`).
 - **The `SAME_AS` quality gate (spec §8.3) PASSED**: 9 true positives, 1 false
-  positive, 9 false negatives — precision 0.900, exactly the floor, and recall
-  0.500 — for both the pairwise links and the resolved identities
+  positive, 9 false negatives (precision 0.900, exactly the floor, and recall
+  0.500) for both the pairwise links and the resolved identities
   (`benchmarks/identity/results/20261001T061131Z/summary.md`). A second run
   after the claim rules and NFC were added, pre-registered as expecting no
   change, gave the same numbers
@@ -856,14 +856,14 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   pre-registered as expecting no pair to change side, gave the same numbers
   again (`benchmarks/identity/results/20261001T161603Z/summary.md`).
 
-### Added — the Python binding reaches the memory surface
+### Added: the Python binding reaches the memory surface
 
 Twenty methods, each with a signature and a docstring in
 `bindings/python/mushroomdb.pyi`.
 
 - **Graph algorithms**: `pagerank`, `connected_components`,
   `degree_centrality` and `communities`. `degree()` and `degrees()` are
-  unchanged and are a different thing — the degree of the keys you name.
+  unchanged and are a different thing: the degree of the keys you name.
   `budget_ms` defaults to `0`, no time limit, so the same store gives the same
   answer.
 - **Full-text**: `enable_fulltext` (with `if_not_exists=`),
@@ -884,7 +884,7 @@ Twenty methods, each with a signature and a docstring in
   to what is stored is not written, so an identical repeat writes nothing at
   all. Rules fire inside the commit. `wal_total_commits()` moves by no frame
   when nothing changed, by one when something did, and by two when a rule
-  also derived or retracted an edge — never by the number of nodes. It is a
+  also derived or retracted an edge: never by the number of nodes. It is a
   raw property write, like `set_prop`: it accepts `name`,
   `aliases` and `alias_keys` on an entity and does not maintain the alias
   lists (see the known limits).
@@ -964,17 +964,17 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
   refuse the store's own fields is not decided (row 66, deferred to 0.8).
 - **The store recognises its own `aliases` list by its shape**: the node's
   lowercased key, one name and that name's words, sorted. Two things follow.
-  A list an owner wrote before 0.7 that has exactly that shape — key `bob`,
-  `aliases: ["bob", "bobby"]` — is read as the store's, and `bobby` is
+  A list an owner wrote before 0.7 that has exactly that shape (key `bob`,
+  `aliases: ["bob", "bobby"]`) is read as the store's, and `bobby` is
   dropped rather than kept in `alias_keys`. And after `rename_node` the list
   was derived from another key, so it does not have the shape: the next
   describing write moves into `alias_keys` every item the new key and the
   stored name do not imply. That is the former key, lowercased, unless the new
-  key or the name already implies it — `alex`, named Alex Stone and renamed to
-  `alex-stone`, leaves nothing — and once kept it links a provisional stub
+  key or the name already implies it (`alex`, named Alex Stone and renamed to
+  `alex-stone`, leaves nothing) and once kept it links a provisional stub
   keyed exactly so. If the name was also changed
-  by a raw write at any point since the last describing write — before the
-  rename or after it — it is the old name and each of its words as well, and
+  by a raw write at any point since the last describing write (before the
+  rename or after it) it is the old name and each of its words as well, and
   each of those then claims a stub keyed so: the one case in which derived
   name words become declared aliases.
   `forget {key, prop: "alias_keys"}` clears what was kept.
@@ -999,7 +999,7 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
 - **Two strangers with one full name of two or more words link.**
   `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
-  explainable with `explain_association`, but it is wrong — the gate's one
+  explainable with `explain_association`, but it is wrong: the gate's one
   false positive, and why its precision has no margin.
 - **Identity is global.** The preset's rules carry no namespace, so
   same-named entities in different namespaces link, and `remember`'s `same as`
@@ -1026,7 +1026,7 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
 - **`query` reads its statement only as a shell argument.** There is no stdin
   and no file form, so a fact written from a shell depends on the quoting rule
   above; an apostrophe inside a Cypher string is written `\'`, and a literal
-  backslash cannot be written at all — the lexer refuses it with `invalid
+  backslash cannot be written at all; the lexer refuses it with `invalid
   escape` rather than store something else (row 70, deferred to 0.8).
 - **The installed skill can exceed its 6,000-byte budget.** The budget is
   tested on a render with a 17-byte store path and `install` writes the
@@ -1045,7 +1045,7 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
   the `schema` tool lists the fields `recall` searches.
 - **A store the Python binding creates has no memory schema.** `remember`
   declares the text fields it needs as it goes. The identity preset is applied
-  from the command line — `mushroomdb schema apply <db> --memory-identity` —
+  from the command line (`mushroomdb schema apply <db> --memory-identity`)
   with the Python handle closed (row 55, deferred to 0.8).
 - **A hand-written edge can be undeletable while a rule matches its
   endpoints.** The engine refuses to delete an edge when a rule with the same
@@ -1088,7 +1088,7 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
   at the median and 640 ms at worst, against the hook's 5,000 ms timeout
   (`benchmarks/hook-latency/results/20261001T192739Z.md`). The conditions: a
   release build, a warm file cache, 20 runs per prompt, and a machine that was
-  not quiet — its 1-minute load average read 18.94 — so these are not
+  not quiet (its 1-minute load average read 18.94) so these are not
   quiet-machine timings. What was timed is `mushroomdb recall <db>`, not the
   plugin's `run.sh recall --auto` wrapper. `stats`, which opens the store and
   does almost nothing else, took the same 585 ms: the cost is the full-text
@@ -1099,14 +1099,14 @@ Row numbers are rows of the defect ledger, `docs/internal/defect-ledger.md`.
   numbers were measured on 0.6.12 and earlier, against a default listing of
   19 tools; 0.7 lists 23.
 
-## v0.6.12 — a date that lands where it says, and a server you can run
+## v0.6.12: a date that lands where it says, and a server you can run
 
 **v0.6.11 was never published.** It was merged, and the release was stopped when
 its headline feature turned out to resolve every date to an ever-earlier graph
 on exactly the stores this engine exists for. The defect never reached a
 release, a registry or a user: the last published version is 0.6.10, and this is
 the next one. The `v0.6.11` section below stays as the record of what landed and
-what it claimed — including a retraction it earned — and everything in it ships
+what it claimed (including a retraction it earned) and everything in it ships
 here.
 
 Upgrading from 0.6.10 therefore brings both releases at once.
@@ -1117,13 +1117,13 @@ written. Run
 [`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
 same 2,000-entity world digest as the two before it: the graph arm scores
 **1.000 on all twenty tasks and all sixty cells** against the relational baseline's
-0.990, at **$0.0614 against $0.1127** — cost **-45.6%** with its 95% interval
+0.990, at **$0.0614 against $0.1127**: cost **-45.6%** with its 95% interval
 `[-0.06875, -0.03147]`, tokens **-26.5%**, turns **-44.3%**, every interval
 excluding zero. 180 cells, 0 timeouts, 0 errors, 0 dropped.
 
 Correctness had been amended on 2026-09-11 to pass on a tie, because the relational
-arm saturated at 1.00 and the original wording — exceed both baselines with the
-interval excluding zero — was judged unpassable by any arm. **This run passes
+arm saturated at 1.00 and the original wording (exceed both baselines with the
+interval excluding zero) was judged unpassable by any arm. **This run passes
 the original wording**: +0.0101 against arm Q with `[0.0005, 0.0229]`, and above
 arm P's 0.983.
 
@@ -1132,7 +1132,7 @@ Sep run lost one key on one task, reproducibly across three reps; that key was a
 date resolving 23 simulated days early. All four time-travel tasks now answer
 correctly in every rep, each in a single MCP call. Every one of this run's six
 sub-1.0 cells belongs to a baseline, and each key they missed was named
-correctly by the graph arm in the same rep —
+correctly by the graph arm in the same rep:
 [`classification.md`](benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
 
 ### Security
@@ -1141,14 +1141,14 @@ correctly by the graph arm in the same rep —
   running it, which dropped in-flight responses and live `/watch` and
   `/subscribe` subscribers mid-stream. It now stops accepting, lets what is
   already running finish, and then takes the shutdown snapshot. Nothing was
-  ever lost — the WAL holds every commit — but a rolling restart cut off work
+  ever lost (the WAL holds every commit) but a rolling restart cut off work
   it did not need to. A TLS server gets 30 seconds of grace before closing
   regardless, so one stuck request cannot hold a restart open.
 
-  Five new entry points carry the signal — `serve_with_shutdown`,
+  Five new entry points carry the signal: `serve_with_shutdown`,
   `serve_with_role_tokens_and_shutdown`,
   `serve_with_ui_and_role_tokens_and_shutdown`,
-  `serve_with_embedded_ui_and_shutdown` and `serve_tls_with_shutdown` — each
+  `serve_with_embedded_ui_and_shutdown` and `serve_tls_with_shutdown`: each
   taking a `oneshot::Receiver<()>` that shuts the server down when it fires
   **or is dropped**. **The existing entry points are unchanged**, in signature
   and in behaviour, so nothing embedding this crate has to move. The cost is
@@ -1159,7 +1159,7 @@ correctly by the graph arm in the same rep —
   could not be tied to the request that caused it.
 
   A line per request at one level is what makes a server log unreadable, so the
-  level follows the outcome — `error` for 5xx, `warn` for anything slower than
+  level follows the outcome: `error` for 5xx, `warn` for anything slower than
   5s, `info` for 4xx, `debug` for everything else, which is off by default.
   Measured on the built binary: twenty successful requests write nothing, one
   404 writes one line. Every response carries `x-request-id`, echoed from the
@@ -1174,7 +1174,7 @@ correctly by the graph arm in the same rep —
 - **`GET /health` no longer hands the graph's shape to an uncredentialed
   caller.** It returned `nodes_live`, `edges` and the bind address to anyone,
   while `/stats` and `/metrics` refused the same counters to an *authenticated*
-  role-bound token because "counters leak graph size" — one disclosure, two
+  role-bound token because "counters leak graph size": one disclosure, two
   opposite policies, and the unauthenticated side was the generous one.
 
   It stays reachable without a credential, because a load balancer has none, and
@@ -1191,7 +1191,7 @@ correctly by the graph arm in the same rep —
 
   It sheds rather than queues on purpose: an unbounded queue in front of a
   single-writer engine turns overload into latency that never recovers. The
-  WebSocket routes are exempt — a timeout applied to `/watch` or `/subscribe`
+  WebSocket routes are exempt: a timeout applied to `/watch` or `/subscribe`
   would sever a healthy subscription at the deadline, and a subscription is
   meant to outlive any request.
 
@@ -1207,8 +1207,8 @@ correctly by the graph arm in the same rep —
   readers and before `stats`.
 
   They were always *served*; they were never *listed*, and a host builds its tool
-  set from `tools/list`. So the skill's first instruction on an empty store —
-  offer to fill it, with `ingest_json` for a batch or `upsert_entity` for one —
+  set from `tools/list`. So the skill's first instruction on an empty store
+  (offer to fill it, with `ingest_json` for a batch or `upsert_entity` for one)
   named two tools the model could not call, and the README's own minimal
   workflow, `upsert_entity → create_rule → find_similar → explain_association`,
   had two of its four steps unreachable. A new install opens on an empty store,
@@ -1237,7 +1237,7 @@ correctly by the graph arm in the same rep —
   ```
 
   A commit is not a frame. A commit whose rules fire appends a **second** WAL
-  frame — the derived-edge history marker — and the sidecar recorded
+  frame (the derived-edge history marker) and the sidecar recorded
   `commit_seq - 1`, which counts commits. The two agree until the first rule
   fires and then diverge by one frame per rule-firing commit, cumulatively, so
   the error grew with history and always resolved backwards. A store with no
@@ -1248,12 +1248,12 @@ correctly by the graph arm in the same rep —
   so a date reaches that commit's derived edges as well as its record. Affected
   surfaces were `edges_at`, `was_linked`, `node_history`, `edge_history`,
   `mushroomdb asof --at`, HTTP `at_commit`, the Python binding and the MCP tools.
-  **No history was ever stored wrongly** — every commit index addressed exactly
+  **No history was ever stored wrongly**: every commit index addressed exactly
   what it always did, and still does.
 
 - **`commit_times.bin` is now v2, and v1 files are discarded on open.** v1
   entries mean something this build cannot use, and the drift depends on which
-  commits fired rules — which the file does not record — so it cannot be
+  commits fired rules (which the file does not record) so it cannot be
   repaired in place. A v1 map is dropped rather than reinterpreted, and the store
   answers `no_recorded_time` until its next commit starts a usable one. That is
   recognised as *superseded*, not reported as damage: nothing about the store is
@@ -1261,7 +1261,7 @@ correctly by the graph arm in the same rep —
 
 - **A peer's commit times survive `refresh()`.** The incremental refresh branch
   raised the frame cursor to include another process's commits without reloading
-  the sidecar, so a handle answered dates from a prefix of the store's history —
+  the sidecar, so a handle answered dates from a prefix of the store's history:
   and, while its own map was still empty, its next commit rewrote the whole file
   with a single entry and destroyed the peer's. Refresh now reloads the map with
   the frames.
@@ -1270,7 +1270,7 @@ correctly by the graph arm in the same rep —
   are gone.** `snapshot()` without `keep_wal` replaces the WAL with a baseline
   and renumbers from the floor; the map kept its old entries, which then named
   unrelated records, and stamps written afterwards landed beyond the store's own
-  frame count — so the date surface refused queries the index path served
+  frame count; so the date surface refused queries the index path served
   perfectly well. The map is now cleared with the history it described, and the
   store says `no_recorded_time`. A date and a commit index still refuse in
   exactly the same places.
@@ -1286,18 +1286,18 @@ correctly by the graph arm in the same rep —
   unchanged; the new answer is the accurate one, because the map is genuinely
   empty rather than pointing past the end.
 
-## v0.6.11 — time in the graph (merged, never published — shipped in 0.6.12)
+## v0.6.11: time in the graph (merged, never published, shipped in 0.6.12)
 
 > This version was never tagged. Its date surface resolved to the wrong WAL
 > frame whenever a commit fired a rule, which is the defect 0.6.12 opens with;
 > the release was stopped rather than published. Everything described below is
-> in 0.6.12, with that defect fixed. Kept in full because the claims it made —
-> and the one it retracted — are part of the record.
+> in 0.6.12, with that defect fixed. Kept in full because the claims it made
+> (and the one it retracted) are part of the record.
 
 
 A date becomes a first-class way to address history. `edges_at(key, "2026-06-19")`
 answers what a node's relationships looked like on that day, and so do
-`was_linked`, the two history readouts and `mushroomdb asof --at` — each resolving
+`was_linked`, the two history readouts and `mushroomdb asof --at`, each resolving
 to the last commit at or before the instant. Until now the engine recorded **no
 wall-clock time at all**: every history surface took a 0-based commit index, and
 `docs/site/mcp.md` told callers outright that "commits carry no dates: take `at`
@@ -1311,8 +1311,8 @@ run they took 6-10 MCP calls and 450,000-640,000 tokens each, carrying ~67% of
 the graph arm's cost and all of its variance. They now take **one call and about
 50,000 tokens**. Against the relational baseline, paired over 20 tasks with every
 interval excluding zero: **cost -41.2%**, tokens **-26.8%**, turns **-25.6%**.
-The 95% cost interval — the leg the pre-registered gate calls the discriminator,
-and the leg that failed before — is now `[-0.0353, -0.0124]`, **entirely below
+The 95% cost interval (the leg the pre-registered gate calls the discriminator,
+and the leg that failed before) is now `[-0.0353, -0.0124]`, **entirely below
 zero**.
 
 **The gate still reports FAILED**, on correctness, by **one key on one task**
@@ -1324,12 +1324,12 @@ positives, reproducibly across three reps.
 > derivation, not a date-resolution defect", and stated that "the resolved commit
 > is the correct one for the date". **Both halves were wrong.** It was a
 > date-resolution defect in this release, and the resolved commit was 150 frames
-> — 23 simulated days — before the day the task asked about. The engine and the
+> (23 simulated days) before the day the task asked about. The engine and the
 > generator agree at every frame probed; the derivation was never in question.
 > See v0.6.12 below. The explanation was written from the run summary three days
 > after the run, without re-opening the store; the numbers above are unaffected.
 
-180 cells, 0 dropped, 0 timeouts, 0 errors —
+180 cells, 0 dropped, 0 timeouts, 0 errors:
 [`results/20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
 
 Alongside that: opening a store with full-text enabled costs half what it did, a
@@ -1337,26 +1337,26 @@ scale gate that had never been able to report itself now reports, and a corrupt
 store answers one HTTP status instead of two.
 
 Nothing an existing caller does changes behaviour. **No WAL record is added, no
-WAL discriminant is consumed, and no snapshot version moves** — a store written by
+WAL discriminant is consumed, and no snapshot version moves**: a store written by
 0.6.10 opens and reads exactly as it did, and one written by this release opens
 unchanged under 0.6.10.
 
 #### Added
 
 - **A date wherever a commit index went.** `edges_at`, `was_linked`, `asof` and
-  the Python binding accept an RFC 3339 string — `"2026-06-19"`,
+  the Python binding accept an RFC 3339 string: `"2026-06-19"`,
   `"2026-06-19T12:00:00Z"`, offsets applied, fractional seconds truncated to
-  milliseconds — or the 0-based frame index they always took. `resolve_date()`
+  milliseconds: or the 0-based frame index they always took. `resolve_date()`
   exposes the resolution on its own and `commit_time_ms(frame)` reads a frame's
   recorded time back. **No MCP tool was added**: `at` and `at_commit` simply take
   a string now, so the association surface stays at sixteen tools.
 - **Resolution is defined on commit order, not on time order.** The map is scanned
   ascending by frame, and the answer is the last frame whose recorded time is at or
-  before the target. A clock that steps backwards — an NTP correction, a restored
-  VM — therefore cannot make a date ambiguous, and a sample lower than its
+  before the target. A clock that steps backwards (an NTP correction, a restored
+  VM) therefore cannot make a date ambiguous, and a sample lower than its
   predecessor is stored as observed rather than rejected or reordered.
 - **A store that cannot answer says which kind of "cannot".** `NoRecordedTime`
-  when the store records none — every store written before this release —
+  when the store records none (every store written before this release)
   `TimeBeforeFloor` carrying the oldest frame and time it does have, and
   `CommitOutOfRange` when a resolved frame falls below the WAL horizon and so
   cannot be replayed. Both new classes are `MushroomError` subclasses with stable
@@ -1365,27 +1365,27 @@ unchanged under 0.6.10.
 - **Times live in a `commit_times.bin` sidecar that is part of neither format.**
   The precedent is `roles.json`: written atomically beside the store, loaded at
   open, and never in the WAL or the snapshot. A release that does not know the file
-  does not read it. That choice is not stylistic — a new WAL discriminant is
+  does not read it. That choice is not stylistic: a new WAL discriminant is
   permitted by `docs/format-stability.md:120`, but `decode_all` treats any frame it
   cannot deserialise as a corrupt tail and `repair_wal` defaults to `true`, so an
   older binary would **persist that truncation**; `format-stability.md:140` records
   exactly that outcome for discriminant 23. An unknown file has none of that
   failure mode, and it keeps this release to zero format changes.
-- **`record_commits_at(unix_ms)` — backfilled history addressable by its own
+- **`record_commits_at(unix_ms)`: backfilled history addressable by its own
   dates.** The engine records when a commit *happened*, which is right for a live
   store and useless for an import: a mirror replaying a year of rows stamps all of
   them "now", so the data is there and no date reaches it. This says "record
   subsequent commits at this instant" instead. Sticky until changed or cleared,
   because a day of backfilled rows genuinely shares one instant. **Import in
-  chronological order** — an instant earlier than anything already recorded raises
+  chronological order**: an instant earlier than anything already recorded raises
   `CommitTimeNotMonotonic` carrying both, because resolution walks commit order
   and a later commit holding an earlier time would silently widen every answer
   after it. Equal instants are allowed. The live clock is never held to this, so an
   NTP step backwards still commits. Deliberately **not** exposed over HTTP or MCP:
   asserting when a commit happened rewrites the store's apparent history, which is
   not something a role token models.
-- **Stamping is O(1) per commit.** The sidecar's header carries no entry count —
-  the count is the file length — so a commit appends its own 16 bytes rather than
+- **Stamping is O(1) per commit.** The sidecar's header carries no entry count
+  (the count is the file length) so a commit appends its own 16 bytes rather than
   rewriting the map. A torn append leaves a partial trailing entry, which is
   refused as `Corrupt` rather than silently dropped: a half-written time would
   resolve dates to the wrong frame forever.
@@ -1397,14 +1397,14 @@ unchanged under 0.6.10.
   3.8 ms for the identical store with no pair enabled. Replaying an
   `EnableFulltext` record backfills its pair with a full `0..ids.len()`
   tokenise-and-stem scan, and every snapshot re-emits one such record per enabled
-  pair — then `load_from_disk` calls `rebuild_all`, which clears every posting and
+  pair: then `load_from_disk` calls `rebuild_all`, which clears every posting and
   does the whole thing again. The backfill is now skipped **on the open path only**.
   `refresh()` also replays frames but is followed by a fold rather than a rebuild,
   so its backfill is the only thing that indexes a peer's frames and is untouched.
   The 40 tests in `core-api/tests/fulltext.rs` pass unchanged.
 - **The MVCC fold shares the overlay instead of copying it.** `FrozenOverlay`'s
   eight fields are `Arc`, so a fold is eight refcount bumps where it used to
-  deep-clone `ids`, `syms`, `fulltext` and the accrued overlay — `IdMap` alone is a
+  deep-clone `ids`, `syms`, `fulltext` and the accrued overlay: `IdMap` alone is a
   `HashMap<String, u32>` plus a `Vec<String>`, so every node key was copied twice,
   at every open, after every snapshot, every 64 commits on the write path, and on
   every `refresh()` that applied a peer commit. Mutation goes through
@@ -1413,7 +1413,7 @@ unchanged under 0.6.10.
   measurable**: at 10k–30k nodes the copy is about a megabyte, the write-path fold
   amortises over 64 commits, and two harnesses over three runs each put before and
   after inside each other's spread (`examples/fold_bench.rs`,
-  `examples/refresh_bench.rs`). The change is asymptotic — O(nodes) to O(1) — and
+  `examples/refresh_bench.rs`). The change is asymptotic (O(nodes) to O(1)) and
   it bites at the 10M-node design target, not at 30,000. A reader applying deltas
   did improve for free: `materialize()` now copies only the structures those deltas
   touch rather than all eight.
@@ -1427,21 +1427,21 @@ unchanged under 0.6.10.
   and fell through a catch-all to 400 while `role_mask_err` answered 500, so the
   same damaged store answered one or the other depending on whether the role-mask
   memo was warm. 500, because a corrupt store is a server-side condition and 400
-  tells a caller to change an input that cannot help. The body is unchanged — only
-  the status moved — and of 370 server tests exactly one assertion needed editing:
+  tells a caller to change an input that cannot help. The body is unchanged (only
+  the status moved) and of 370 server tests exactly one assertion needed editing:
   the one that had pinned the old value, whose own comment already called it
   provisional. Closes the last row deferred from the 0.6.10 ledger.
 - **A bare date denotes its whole day.** `edges_at(key, "2026-07-14")` resolved to
   the *midnight that starts* the day, so asking for a date excluded everything that
-  happened on it — an edge written at 09:00 on the 14th was invisible to a caller
+  happened on it: an edge written at 09:00 on the 14th was invisible to a caller
   asking for the 14th. A date is a day; a named instant still means exactly itself.
 - **`resolve_date` refuses an index it cannot hand back.** It checked the retention
-  floor but not the ceiling, so after a truncating snapshot — which folds the WAL
-  and discards it — it returned a commit the caller's next call would reject. One
+  floor but not the ceiling, so after a truncating snapshot (which folds the WAL
+  and discards it) it returned a commit the caller's next call would reject. One
   refusal is better than two, and `resolve_date` is public.
 - **Three scale assertions are red, not two, and the third had never executed.**
   All six assertions in `hnsw_insert_cost_is_sublinear_per_vector` shared one test,
-  and an assertion that fails ends its test — so the 2k→10k build-growth failure
+  and an assertion that fails ends its test; so the 2k→10k build-growth failure
   panicked first and the 50,000-second wall clock **and both update assertions
   never ran at all**. `benchmarks/results/hnsw-scale-0.6.6.md` had counted red
   assertions by reading the printed table and reported two. The test is now six
@@ -1454,12 +1454,12 @@ unchanged under 0.6.10.
 
 - **The three scale gates stay red.** Closing them means cutting the
   distance-evaluation count, and the distance kernel is already at the hardware
-  ceiling — 116.6 ns/eval cache-resident, ~26 GFLOP/s, about 3.3 four-wide FMA
+  ceiling: 116.6 ns/eval cache-resident, ~26 GFLOP/s, about 3.3 four-wide FMA
   issues per cycle. The remaining lever is touching fewer bytes, and int8 rows were
   spiked for this release and **cut**: recall is payable (the clustered gate needs
   an 8×K full-precision rerank; at 4×K it misses the mean floor by 0.0025), but the
   speedup is not there. Best int8 result against the shipped f32 slab, both
-  streaming one contiguous allocation, was **0.92× — slower**, because an
+  streaming one contiguous allocation, was **0.92×: slower**, because an
   i8-to-f32 widening per element costs about what the saved bandwidth buys. A real
   SQ8 kernel needs integer SIMD, which scalar source will not autovectorise into.
   `crates/core-rules/examples/sq8_spike.rs` is the committed measurement.
@@ -1473,19 +1473,19 @@ unchanged under 0.6.10.
   and is deliberately not in this release. Ledger row 36 stays open with the
   measurement recorded.
 - **A commit time is not covered by WAL CRC or snapshot integrity.** The sidecar is
-  neither, so a torn or deleted `commit_times.bin` degrades the date surface —
-  `Corrupt` when it will not decode, `NoRecordedTime` when it is gone — and damages
+  neither, so a torn or deleted `commit_times.bin` degrades the date surface
+  (`Corrupt` when it will not decode, `NoRecordedTime` when it is gone) and damages
   nothing else. That is the intended failure direction; the two are deliberately
   distinguished, because a damaged map must not read as "this store never had
   times".
 - **A date and a frame index are mutually exclusive**, and passing both raises
   rather than taking one. A precedence rule between them is how a caller ends up
   believing it asked for one and got the other.
-- **`find_similar`'s `min` still defaults differently by surface** — 0.8 on MCP,
+- **`find_similar`'s `min` still defaults differently by surface**: 0.8 on MCP,
   0.0 in Python and HTTP. Still proposed for 0.7, where a breaking note is
   affordable. Pass `min` explicitly.
 
-## v0.6.10 — scoped reads and stable errors
+## v0.6.10: scoped reads and stable errors
 
 A scope stops being an argument you have to remember on every call and becomes a
 property of the handle. `db.scoped(role=…, namespace=…, keys=[…])` returns a
@@ -1496,25 +1496,25 @@ that: every engine failure is a stable Python class that still subclasses
 `RuntimeError`, a mirror can be rebuilt onto a store that already has content,
 and insert-count multiplicity is available to the stores that ask for it. Nothing
 an existing caller does changes behaviour, and stores stay V9 and upgrade in
-place — unless you call `enable_multiplicity()`, which is the one opt-in step
+place: unless you call `enable_multiplicity()`, which is the one opt-in step
 with a one-way consequence, described under **Added** and again under **Known
 limits**.
 
 #### Added
 
-- **`db.scoped(role=…, namespace=…, keys=[…])` — a scope is a property of the
+- **`db.scoped(role=…, namespace=…, keys=[…])`: a scope is a property of the
   handle.** It returns a `GraphDb`-shaped child sharing this handle's store and
   mutex: not a second open, no second lock, one small allocation, and `close()`
   on either name closes both. At least one leg is required (none raises
   `ValueError`); legs intersect, so `scoped()` on a scoped handle narrows further
   and never widens, and `keys=[]` narrows to nothing. An unknown role raises at
-  `scoped()`, not on the first read. Every mutation raises `ReadOnly` —
-  `snapshot`, `create_rule`, `enable_index` and `ingest_batch` included —
+  `scoped()`, not on the first read. Every mutation raises `ReadOnly`
+  (`snapshot`, `create_rule`, `enable_index` and `ingest_batch` included)
   while `refresh()` is permitted because it writes nothing.
 - **Every read on a scoped handle applies the scope, under one contract.** The
   subject is checked first, so *a key outside the scope is indistinguishable from
-  a key that does not exist*; then every other node the answer would mention —
-  neighbour, endpoint, candidate, evidence — is filtered to the scope. Which
+  a key that does not exist*; then every other node the answer would mention
+  (neighbour, endpoint, candidate, evidence) is filtered to the scope. Which
   answer "absent" is stays a per-method fact, so each surface answers what it
   already answers for an unknown key: `node_info` → `None`; `node_edges`,
   `neighbors`, `explain`, `degree`, `what_if_set_prop` → `KeyNotFound`;
@@ -1538,8 +1538,8 @@ limits**.
   so the ranks are the ranks of the visible corpus and `k` is honoured.
   `explain` omits an explanation whose evidence path crosses a hidden node
   entirely rather than redacting it.
-- **Masked engine entry points for the four surfaces that had none** —
-  `pairwise_similar`, `search_hybrid`, `explain`, `degree`/`degrees` — plus
+- **Masked engine entry points for the four surfaces that had none**
+  (`pairwise_similar`, `search_hybrid`, `explain`, `degree`/`degrees`) plus
   `_scoped` wrappers that add the subject check, each with a `ReaderSnapshot`
   twin so the HTTP role paths keep reading one coherent lock-free epoch.
   `pairwise_similar` measures its size caps (Gram ≤ 4,096, gemv ≤ 8,192 unique
@@ -1547,7 +1547,7 @@ limits**.
   it. `node_edges_masked` keeps its looser, documented subject contract for the
   full-token path; the new wrapper is what tightens it for role-scoped callers.
 - **A stable exception class per engine error.** `MushroomError(RuntimeError)`
-  is the base and eighteen subclasses hang off it — `KeyNotFound`,
+  is the base and eighteen subclasses hang off it: `KeyNotFound`,
   `DuplicateKey`, `IoError`, `Corrupt`, `RuleInvalid`, `RuleOwned`,
   `RuleNotFound`, `QueryError`, `IngestError`, `ReadOnly`, `CommitOutOfRange`,
   `ViewPropReadOnly`, `CasConflict`, `MaskedReadOnly`, `RoleWriteDenied`,
@@ -1567,12 +1567,12 @@ limits**.
   directory and without one duplicate key rejecting a 100,000-row frame.
   `"error"` is the default and is the previous behaviour exactly. `"skip"` leaves
   the stored node untouched. `"replace"` makes its properties exactly the supplied
-  props — fields absent from them are removed — while a label that differs from
+  props (fields absent from them are removed) while a label that differs from
   the stored one and an `ns` that would move the node are **row errors**, not
   silent rewrites. Two properties sit outside "exactly" because neither is the
   caller's to supply: `ns`, which is immutable, and any property a view owns,
   which is kept rather than removed and counted in `kept_view_owned`. The frame
-  stays atomic — only the definition of "valid" changes — and the report gains
+  stays atomic (only the definition of "valid" changes) and the report gains
   `skipped`, `replaced` and `kept_view_owned` beside `inserted` and
   `edges_inserted`.
 - **`db.roles()`** returns what `roles.json` defines (`name`, `labels`, `keys`,
@@ -1593,34 +1593,34 @@ limits**.
   `degree(..., multiplicity=True)` and `degrees(..., multiplicity=True)` sum it.
   Both default to `False`, so every existing caller keeps unique-neighbour
   semantics, and `multiplicity=True` on a store that never opted in answers the
-  unique count rather than erroring — the argument is a readout preference, not a
+  unique count rather than erroring; the argument is a readout preference, not a
   demand the store cannot meet. A duplicate insert increments the count and
   leaves unique degree alone; `insert_edge` still returns `Ok(false)`, because its
   contract is "was this pair new". `delete_edge` clears the count with the pair.
   CSR stays a set: no multi-edges. On a scoped handle a multiplicity count sums
   visible pairs only. Duplicates whose endpoints and edge type are created in the
-  same frame count too — that is how a mirror rebuild writes — because the count
+  same frame count too (that is how a mirror rebuild writes) because the count
   is resolved in the one pass that knows the frame's own ids.
 - **Snapshot `VERSION_10`, written only by a store that opted in.** The count is
   carried by a new WAL record (discriminant **23**, appended as
   `docs/format-stability.md` permits), and a pre-0.6.10 decoder cannot read one.
   Left alone that would be worse than a refusal: an older binary treats the first
   unreadable record as a corrupt WAL tail, replays only the commits before it,
-  and — `repair_wal` being the default — **persists that truncation**. So opting
+  and (`repair_wal` being the default) **persists that truncation**. So opting
   in also stamps the snapshot at a version older binaries do not know, and writes
   that snapshot **before** the declaration record. The snapshot is read before the
   WAL, so an older binary stops at `snapshot: unsupported version 10` with the
   WAL byte-unchanged. **It refuses the store by name instead of silently
   discarding commits**, which is what the version stamp bought. V10 is V9's
-  container with a different stamp — no new section, no new field — and the
+  container with a different stamp (no new section, no new field) and the
   snapshot keeps the WAL, so every commit `open_at` could reach before the call it
   can still reach after it. **A store that never calls `enable_multiplicity()`
-  writes V9, carries no discriminant-23 record, and stays readable by 0.6.9 —
-  and by every release back to 0.6.5, where V9 itself landed — indefinitely.**
+  writes V9, carries no discriminant-23 record, and stays readable by 0.6.9
+  (and by every release back to 0.6.5, where V9 itself landed) indefinitely.**
 - **`docs/site/multiprocess.md`**, in the docs bundle: the deployment shapes that
-  are supported — one writer with N refreshing readers, and N writers serialised
+  are supported (one writer with N refreshing readers, and N writers serialised
   by the advisory lock, where `Busy` after a 2 s wait means nothing was written
-  and a retry is safe — and the ones that are not. Nothing disables the lock, so
+  and a retry is safe) and the ones that are not. Nothing disables the lock, so
   the page says that plainly rather than implying a configuration; what is
   genuinely reachable is a non-mushroomdb process editing the store directory, and
   two paths to the same directory, where the lock is held per inode. A store
@@ -1630,11 +1630,11 @@ limits**.
 
 - **`NodeMask` picks its representation by density.** A visible set becomes a
   bitset when `len * 64 >= span` (`span` being one past the largest visible id)
-  and stays a `HashSet` otherwise — read as memory rather than density, the
+  and stays a `HashSet` otherwise: read as memory rather than density, the
   bitset is chosen precisely when it is no larger than the set it replaces, so a
   role seeing ten nodes at the top of a ten-million-id store stays sparse by four
   orders of magnitude. The representation is decided at construction and fixed
-  for the set's life — no later call re-shapes a set, and `intersect` returns a
+  for the set's life; no later call re-shapes a set, and `intersect` returns a
   new one. The rule's *outcome* is the distinct count's: the first evaluation
   uses a count that still includes duplicates, which can only rule a bitset out,
   and when it passes, the bitset does the deduplication and the rule is re-checked
@@ -1645,15 +1645,15 @@ limits**.
 
   | 200,000 nodes | 2,000 visible (stays sparse) | 50,000 visible (becomes dense) |
   |---|---|---|
-  | `query_masked` | 1396.8 → 1374.9 µs | 7983.9 → 5685.5 µs — **−28.8%** |
-  | masked `find_similar` | 1415.7 → 1416.3 µs | 10272.0 → 7967.0 µs — **−22.4%** |
-  | `neighborhood_masked` | 2469.5 → 2474.8 µs | 2401.1 → 2392.4 µs — −0.4% |
+  | `query_masked` | 1396.8 → 1374.9 µs | 7983.9 → 5685.5 µs: **−28.8%** |
+  | masked `find_similar` | 1415.7 → 1416.3 µs | 10272.0 → 7967.0 µs: **−22.4%** |
+  | `neighborhood_masked` | 2469.5 → 2474.8 µs | 2401.1 → 2392.4 µs: −0.4% |
 
   The 2,000-id column is the control: the rule leaves that mask a `HashSet`, and
   it is flat, which is what says the enum around the set costs nothing.
   `neighborhood_masked` is flat at both sizes because the probe is about 1% of a
   BFS that spends its time expanding edges and building rows. The win is where
-  the probe is the work. Hits, ordering and every existing answer are unchanged —
+  the probe is the work. Hits, ordering and every existing answer are unchanged:
   `contains_id` is a set-membership predicate, and set membership did not move.
 - **A role-token read of a store whose reader overlay will not fold now answers
   400 naming the corruption**, where it previously answered `404 node key not
@@ -1667,29 +1667,29 @@ limits**.
   digest string fell through six `matches!` arms a plain byte can never hit. Over
   ~400 KB of representative digest text, median of five runs of
   `crates/core-api/examples/sanitize_bench.rs`, the committed harness: the 0.6.9
-  form ran about 27% slower than the 0.6.8 predicate it replaced — 775 µs against
+  form ran about 27% slower than the 0.6.8 predicate it replaced: 775 µs against
   612. The fast path brings it to 585 µs, which **returns the cost to 0.6.8's**;
   the remainder is inside the run-to-run spread and is not claimed as a gain.
-  Output is identical on every input — the harness asserts that over all 1.1M code
+  Output is identical on every input; the harness asserts that over all 1.1M code
   points before it times anything. Absolute microseconds are machine-specific;
   re-run it rather than trusting these, and expect the ordering to hold while the
   magnitudes move.
 - **The `.pyi` stub says what the Rust doc comments say, and a check keeps it
   that way.** Forty-two of the stub's docstrings were one-liners while the
-  compiled `__doc__` documented the contract — an IDE hover and a type-checker
-  read the stub. `scripts/check-pyi.sh` — run by CI beside
-  `scripts/check-claims.sh` — now fails when a stub method's docstring is a
+  compiled `__doc__` documented the contract: an IDE hover and a type-checker
+  read the stub. `scripts/check-pyi.sh` (run by CI beside
+  `scripts/check-claims.sh`) now fails when a stub method's docstring is a
   single line while the Rust doc comment it stands for runs to more than three,
   so the drift cannot silently return.
-- **`find_similar`'s exactness rule is stated where callers read it** —
+- **`find_similar`'s exactness rule is stated where callers read it**:
   `docs/site/api.md`, `docs/site/mcp.md` and the Python README each say that
   **`mask=` alone, and a `scoped()` handle, are the approximate path**, and name
   the two exact ones (`exact=True`, or a `where=` predicate). A scope deliberately
   does *not* imply `exact`: that would silently turn a fast ANN call into an O(n)
   GEMM for every existing masked caller. The same three places now state that a
   `where=` predicate uses the property index only when a `label` accompanies it
-  and `(label, field)` is index-enabled — without a label it is a
-  correct-but-slower scan — and `distance = 1 - sim` is stated on the
+  and `(label, field)` is index-enabled (without a label it is a
+  correct-but-slower scan) and `distance = 1 - sim` is stated on the
   `pairwise_similar` entry, which had been missing it.
 - **`docs/site/masks.md` names `scoped()` as the one scoping front door**, with
   the "hidden is absent" contract quoted where it is defined.
@@ -1698,7 +1698,7 @@ limits**.
 
 - **`insert_node` accepted a property a view owns.** Every path that *removed* a
   view-owned property refused; creation consulted the view store nowhere, on
-  three separate paths — `GraphDb::insert_node`, `BatchOp::InsertNode`, and the
+  three separate paths: `GraphDb::insert_node`, `BatchOp::InsertNode`, and the
   no-conflict arm of the new `on_conflict` insert. The store served the caller's
   number until something touched that node and answered the view's after a
   reopen: a `Doc` inserted with a degree view's own `deg` of `777` read `777` for
@@ -1714,7 +1714,7 @@ limits**.
 - **The Python binding builds its exception after releasing the store lock.**
   The new error classes are constructed with the interpreter attached; doing that
   under the store mutex made `find_similar`, `pairwise_similar`, `degree` and
-  `degrees` take mutex-then-GIL while every other method took GIL-then-mutex — an
+  `degrees` take mutex-then-GIL while every other method took GIL-then-mutex: an
   ABBA inversion on the one `Arc` every `scoped()` child shares, reachable from
   any threaded caller and invisible to a single-threaded test. The three locking
   helpers now bind the result, drop the guard, and map afterwards; a subprocess
@@ -1726,25 +1726,25 @@ limits**.
 
 #### Known limits
 
-- **The scale benchmark's growth assertions stay red — and there are three of
+- **The scale benchmark's growth assertions stay red, and there are three of
   them, not two.** The build grows 15.48× from 2,000 to 10,000 vectors against a
   ceiling of 8×; 50,000 vectors take 1,018.05 s against a ceiling of 300 s; and
   one re-embed at 50,000 costs **5.92×** what it costs at 2,000, against a
   ceiling of 3×. That third one had never been reported: all six assertions sat
   in a single test, the build-growth one panicked first, and an assertion that
-  fails ends its test — so the other two red ones never executed, and the count
+  fails ends its test; so the other two red ones never executed, and the count
   was taken from the printed table instead. It is also the tightest of the three
   and measures what a production store does most, since a changed embedding is a
   remove plus an insert. Those are the figures committed in
   [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md),
-  and a re-run after the split confirms them within machine noise — 16.19×,
-  1,017.14 s and 5.85× — so nothing regressed and nothing was fixed: the third
+  and a re-run after the split confirms them within machine noise (16.19×,
+  1,017.14 s and 5.85×) so nothing regressed and nothing was fixed: the third
   failure was always there and nothing could report it. Closing any of them
   means cutting the distance-evaluation count itself.
 - **`enable_multiplicity()` is not atomic, and an exception does not undo it.**
   The declaration record can already be in the log with only its fsync having
   failed, and the V10 snapshot alone can be enough for the next open to finish the
-  job — so a call that raises may leave the store opted in, immediately or on the
+  job; so a call that raises may leave the store opted in, immediately or on the
   next open. The failure direction is the safe one, because the V10 stamp precedes
   the record on every path and an older binary therefore refuses such a store by
   name rather than truncating it. But the exception means *outcome unknown*, not
@@ -1752,7 +1752,7 @@ limits**.
   where the store stands. There is no call that opts a store back out.
 - **Opting in and archiving in different sessions forfeits the archive genesis
   chain.** `enable_multiplicity()` writes a snapshot, and a store decides at its
-  **first** archive whether `open_at` may reach into archives — saying no whenever
+  **first** archive whether `open_at` may reach into archives: saying no whenever
   a snapshot it cannot vouch for already exists. A snapshot the same handle took,
   keeping the WAL, it can vouch for, so opting in and taking that first archive in
   one session keeps the reach. Across sessions it does not, which is the answer
@@ -1760,7 +1760,7 @@ limits**.
 - **Counting costs a property lookup per neighbour.** Over 20,000 nodes at fanout
   4 with every pair inserted twice, snapshotted and reopened,
   `degrees(multiplicity=True)` takes 14.11 ms against 2.18 ms for the unique
-  reading — about 6.5×. Hoisting the per-row view rebuild out of the loop removed
+  reading: about 6.5×. Hoisting the per-row view rebuild out of the loop removed
   2.57 ms of that; the remaining ~12 ms is inherent, being 80,000 edge-property
   reads the unique path does not do at all. It is paid only by callers who pass
   `multiplicity=True`, which defaults to `False` everywhere.
@@ -1785,11 +1785,11 @@ limits**.
   all, so its vector leg is the approximate one whenever an HNSW rule covers the
   field.
 - **A scoped handle is read-only, and a scope is a key list or a field
-  predicate — not a query.** Scoped writes would mean routing through the
+  predicate, not a query.** Scoped writes would mean routing through the
   `RoleWriteDenied` decision table, which is a larger surface than this patch;
   dual-write through the unscoped handle instead. And a scope whose membership is
-  computed by a traversal inside the engine — the thing that would let an embedder
-  stop computing its readable set in another database — is deliberately deferred:
+  computed by a traversal inside the engine (the thing that would let an embedder
+  stop computing its readable set in another database) is deliberately deferred:
   a `keys=` handle scope collapses N per-call round trips into one readable-set
   query per request and removes the leak, but it does **not** remove that query.
 - **`scoped()` and `mask=` are cooperative, not an access boundary.** They are
@@ -1797,7 +1797,7 @@ limits**.
   enforcement is the HTTP server's role tokens, which is exactly why this release
   moved their read contract into the engine.
 
-## v0.6.9 — engine polish
+## v0.6.9: engine polish
 
 Surfaces that told the truth about themselves, mostly. Cypher's identity fields
 resolve and plan as point lookups instead of label scans; a write statement's
@@ -1830,7 +1830,7 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
   re-offering every vector. The open-time scan and the sliced build both skip
   ids the index already accounts for. `complete` is still the blob's last field,
   so the completeness check reads it without decoding. **A 0.6.8 binary meeting a
-  v4 blob fails its version check and falls back to the exhaustive scan —
+  v4 blob fails its version check and falls back to the exhaustive scan:
   slower, never wrong**, the same contract v3 already had. Snapshot `VERSION`
   is unchanged at 9.
 - **`ingest-git` reports `evicted` beside `deleted`.** A node dropped because
@@ -1884,7 +1884,7 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
   Topology stores a set, so a duplicate insert does not raise the count, and
   unresolved NULL targets stay outside the readout. A persisted per-pair insert
   count needs a write-ahead-log record that does not exist yet, and adding one
-  would make a store written here unreadable by 0.6.8 — too much for a polish
+  would make a store written here unreadable by 0.6.8: too much for a polish
   patch, so it moves to the next one.
 - **HNSW search is still approximate unless you ask otherwise.** `exact=True`
   or a `where=` predicate force the exact GEMM path; `mask=` alone rides the
@@ -1894,7 +1894,7 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
   access boundary. Real enforcement is the HTTP server's role tokens, where
   `GET /stats` is closed to them outright.
 
-## v0.6.8 — sidecar exact reads
+## v0.6.8: sidecar exact reads
 
 #### Added
 
@@ -1938,7 +1938,7 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
 - **MCP listing is unchanged.** `ASSOCIATION_TOOLS` is still the same fifteen
   tools in the same order. No `pairwise_similar` tool, no HTTP `find_similar`.
 
-## v0.6.7 — the hardening patch
+## v0.6.7: the hardening patch
 
 #### Fixed
 
@@ -1952,8 +1952,8 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
   left to `pump_index_build`. Pinned by `an_interrupted_build_resumes_on_reopen`
   and `a_search_after_a_mid_build_reopen_is_exact`.
 - **`upsert_entity` refuses the whole update or applies all of it.** The update
-  path used to set one property at a time, so a write refused partway — a
-  different `ns`, a reserved name — left the properties ahead of the refusal
+  path used to set one property at a time, so a write refused partway (a
+  different `ns`, a reserved name) left the properties ahead of the refusal
   committed. Every per-property check now runs first and the sets land in one
   WAL commit. The v0.6.6 known limit is closed. Pinned by
   `upsert_entity_update_is_all_or_nothing`.
@@ -2004,7 +2004,7 @@ every open. No snapshot-format change: stores stay V9 and upgrade in place.
   count, are in
   [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
 
-## v0.6.6 — the scale release
+## v0.6.6: the scale release
 
 The vector index was the ceiling. Opening a store rebuilt the HNSW graph it had just loaded, a
 changed embedding cost a walk of the whole graph, `create_rule` over a large corpus held its commit
@@ -2020,23 +2020,23 @@ rather than comparisons with 0.6.5, are in
 
 - **A store written by 0.6.6 cannot be opened by 0.6.5.** `RuleDef` gains an appended `namespace`
   field. A rule persisted by 0.6.5 still decodes here, as a global rule; the reverse does not
-  hold — 0.6.5's decoder knows only the older shapes and rejects trailing bytes, so it fails with
+  hold: 0.6.5's decoder knows only the older shapes and rejects trailing bytes, so it fails with
   `rule_def deserialize` and the open is refused rather than degraded. Every rule 0.6.6 snapshots
   is re-encoded this way, including rules 0.6.5 itself created. **Roll back only from a snapshot
   taken before the upgrade.** Pinned by `a_0_6_5_decoder_cannot_read_a_0_6_6_rule`.
 - **The persisted vector index is blob version 3 (`MHNS`), and the upgrade is one way.** A 0.6.6
   binary reads version 1, 2 and 3 blobs and writes version 3. A 0.6.5 binary meeting a version-3
-  blob refuses *the blob* and falls back to a full scan — correct and slower — but it will not get
+  blob refuses *the blob* and falls back to a full scan (correct and slower) but it will not get
   that far on a real store, because the `RuleDef` line above refuses the open first. The snapshot
   format itself is untouched; see "Not in this release".
 - **`create_rule` on a large vector corpus returns before its edges exist.** A rule whose vector
   index does not fit in one build slice is installed, reports its progress through `stats`
   (`building: {indexed, total}`) and `POST /rules` (**202 Accepted**), and derives its edges in a
-  second commit once the index is whole — never a partial set, and no search answers from the
+  second commit once the index is whole: never a partial set, and no search answers from the
   partial index either (see Fixed). A write advances the build, `mushroomdb serve` advances a build
   its handle has registered once a second, and `mushroomdb build-index <db>` drives it to
   completion. **After a restart the first write or `mushroomdb build-index` is what registers an
-  outstanding build** — a freshly opened `serve` has nothing to advance until then. A corpus at or
+  outstanding build**: a freshly opened `serve` has nothing to advance until then. A corpus at or
   below the slice size behaves exactly as it did before, and this applies to a `VectorSimilar` rule
   in **either** mode, not only an approximate one: the slice threshold is the vector index, which
   both build.
@@ -2048,11 +2048,11 @@ rather than comparisons with 0.6.5, are in
   truth at 5,000 vectors, and measures 1.0. `MUSHROOMDB_VECTOR_SCAN=1` restores the full scan and
   the guarantee it carries, at O(n²).
 - **`roles.json` version 4** is written when any role carries `namespaces`. An older binary refuses
-  a version-4 file and denies every role, which is the safe direction but is a hard stop — roll
+  a version-4 file and denies every role, which is the safe direction but is a hard stop: roll
   roles forward only once every reader is on 0.6.6.
 - **`ns` is a reserved property, and it is write-once.** A node's namespace is fixed at insert: a
   later write naming a different `ns`, and a property delete that would strip it, are both refused.
-  A single write may name `ns` at most once — with two entries the write path and the authorization
+  A single write may name `ns` at most once: with two entries the write path and the authorization
   path could read different namespaces from the same list. Absent means the default namespace, so
   a store with no `ns` property anywhere is one namespace and nothing is rewritten. **A store that
   already used `ns` as an ordinary string property is not**: those values become namespace names on
@@ -2060,7 +2060,7 @@ rather than comparisons with 0.6.5, are in
   them, and a value that is not a legal namespace name can end up listed by `stats` where no
   surface can pass it back. Rename the property before upgrading if it meant something else.
 - **`MERGE` cannot create into a namespace, for any caller.** A MERGE pattern carries only its
-  identifying property, so its create arm always lands in the default namespace — which means a
+  identifying property, so its create arm always lands in the default namespace, which means a
   role bound to namespaces cannot MERGE-create at all. Use `CREATE`, `insert_node` or `ingest`,
   which take `ns` like any other property.
 - **An embedding whose dimension differs from the ones an index already holds is no longer
@@ -2077,13 +2077,13 @@ rather than comparisons with 0.6.5, are in
 - **Namespaces.** A node carries a reserved `ns` property, set at insert and immutable afterwards;
   absent means the default namespace, so an existing store is one namespace and nothing is
   rewritten. A role may be bound to namespaces (`"namespaces": ["tenant-a"]`) and then sees only
-  those — intersected with its labels, its keys and its `visible_where`. A rule is scoped
+  those: intersected with its labels, its keys and its `visible_where`. A rule is scoped
   (`"namespace": "tenant-a"`) or global; a scoped rule's edges never cross, and a user-written edge
   across a boundary is refused. `query`, `/query`, the CLI and Python take a `namespace`; `stats`
   reports per-namespace node counts; `as_of` composes with all of it.
-- **`mushroomdb build-index <db-dir> [--rule <name>]`** — finish a deferred vector-index build
+- **`mushroomdb build-index <db-dir> [--rule <name>]`**: finish a deferred vector-index build
   before traffic arrives.
-- **`MUSHROOMDB_HNSW_PARAMS`** — `m,m0,ef_construction,ef_search[,prune]`, read once per process,
+- **`MUSHROOMDB_HNSW_PARAMS`**: `m,m0,ef_construction,ef_search[,prune]`, read once per process,
   for an operator who has measured their own corpus. The shipped defaults and the measurements that
   chose them are in [`docs/site/rules.md`](docs/site/rules.md).
 
@@ -2097,7 +2097,7 @@ rather than comparisons with 0.6.5, are in
   Measured within this release, before and after the kernel alone, a 1,536-dimension build takes
   8.5 s at 2,000 vectors and 132 s at 10,000 against 49.6 s and 731 s, and 50,000 vectors build in
   1,018 s where that size was never run at the earlier cost. The index holds 6,663 bytes per vector
-  instead of 12,807 — 48 % less — and the persisted blob halves with it. Recall is unchanged on all
+  instead of 12,807 (48 % less) and the persisted blob halves with it. Recall is unchanged on all
   six gates. The store's own `f64` copy of every vector is untouched; only the index's copy is
   narrowed, and every similarity a caller is shown is still computed from the `f64` properties.
   Every figure here, and which comparison each one is,
@@ -2112,29 +2112,29 @@ rather than comparisons with 0.6.5, are in
   the graph to strip back-references; a reverse-adjacency map makes it O(in-degree), which
   `remove_is_not_a_full_scan` asserts as an operation count rather than a wall clock. At the
   shipped kernel one re-embed costs 2.4 ms at 2,000 vectors, 6.6 ms at 10,000 and 14.3 ms at
-  50,000 — that is the cost after both this fix and the kernel, not a measurement of either alone.
+  50,000; that is the cost after both this fix and the kernel, not a measurement of either alone.
 - **A diverse-neighbour prune replaces the nearest-M one**, which is what the raised `M₀` was
   standing in for. It is a **first-rejection short-cut** of the HNSW paper's §3.5 algorithm, not
   that algorithm: it keeps the untested far tail where the paper backfills with the nearest
-  rejects, which is both faster and — on a corpus whose clusters are wider than `M₀` — measurably
+  rejects, which is both faster and (on a corpus whose clusters are wider than `M₀`) measurably
   better. `docs/site/rules.md` carries the comparison, and anyone "correcting" it toward the paper
   should read that table first. Parameters are now `HnswParams` with documented defaults and a
   `MUSHROOMDB_HNSW_PARAMS` override; the three recall gates already in CI pass unchanged, and four
-  more join them. It costs build time at a fixed corpus size — 5,000 × 1,536 dimensions takes
-  43.3 s with it against 9.6 s with the nearest-M prune — and the cheaper prune misses the 0.90
+  more join them. It costs build time at a fixed corpus size (5,000 × 1,536 dimensions takes
+  43.3 s with it against 9.6 s with the nearest-M prune) and the cheaper prune misses the 0.90
   recall floor on a clustered corpus at 0.8581, which is why the diverse one is the default and the
   other is an opt-out with its cost recorded beside it.
 - **A search during a deferred build is answered exactly, not from the part of the index that
   exists.** The sliced build made `find_similar` and `hybrid_search` able to be *wrong* rather than
   slow for the first time: after `create_rule` returned 202 the graph held one slice, looked
-  perfectly answerable, and was used — so a query whose true nearest neighbour sat outside that
+  perfectly answerable, and was used; so a query whose true nearest neighbour sat outside that
   slice got the nearest of the slice instead, with nothing in the result saying so. On a quiescent
   embedded store that was permanent. Both paths now decline: a live handle skips a rule with a
   build outstanding, and a snapshot taken mid-build records the fact in its index blob so that a
   reader opening it declines too. Either way the caller gets the exhaustive answer, and the fast
   path returns when the build finishes.
 - **`mushroomdb doctor`'s handshake waits as long as the store took to open.** The check spawns
-  the MCP server, which has to open the same store `doctor` just opened — and a WAL-only store
+  the MCP server, which has to open the same store `doctor` just opened, and a WAL-only store
   replays its vector rules' index builds every time, which can take longer than the fixed 10-second
   deadline the handshake used. `doctor` therefore reported a healthy server as unreachable,
   moments after its own open had taken longer than that without complaint. The deadline is now at
@@ -2160,7 +2160,7 @@ rather than comparisons with 0.6.5, are in
   and `a_parked_vector_survives_a_reopen` pin at store level. A mixed-dimension index upgraded from
   a 0.6.5 or pre-kernel blob counts its padded positions as refusals for the same reason.
 - **`upsert_entity`'s update path is not atomic.** It sets one property at a time, so a write that
-  is refused partway — naming a different `ns` on an existing node, for instance — leaves the
+  is refused partway (naming a different `ns` on an existing node, for instance) leaves the
   properties ahead of the refusal committed and returns an error. Send a single-property update, or
   use `POST /query` with a Cypher `SET`, when that matters.
 - **A masked approximate search can return fewer than `k`.** `find_similar` under a role bound to
@@ -2189,7 +2189,7 @@ rather than comparisons with 0.6.5, are in
 No snapshot format change: V9 stays V9, and the `format-compat` contract (V5…V9 open, migrate and
 preserve data) is untouched. The vector index rides the opaque section it already rode, with its
 own magic and version inside it, so a 0.6.5 binary meeting a 0.6.6 index blob would fall back to a
-full scan rather than read it wrongly — though on a real store it refuses the open first, for the
+full scan rather than read it wrongly, though on a real store it refuses the open first, for the
 `RuleDef` reason under BREAKING.
 
 The scale benchmark's two growth assertions stay red, deliberately and unedited: the build is
@@ -2202,34 +2202,34 @@ evaluation-count gate that watches the same thing as a machine-independent count
 
 A build in progress is paid for by writers: every durable write does one slice of it, which at
 2,048 vectors of 1,536 dimensions is roughly 9–27 seconds under the write lock. A reopen mid-build
-does not resume the slicing at all — the open-time scan finishes the whole remaining index in one
+does not resume the slicing at all; the open-time scan finishes the whole remaining index in one
 pass, and only the edge backfill is left to the slice loop. Run `mushroomdb build-index` before
 traffic arrives rather than discovering either through latency.
 
-## v0.6.5 — the knowledge-base release
+## v0.6.5: the knowledge-base release
 
 A team running mushroomdb as a sidecar graph beside a document knowledge base wrote down what
 stopped it becoming the primary store, and this release is that list, fixed. History expired
-silently — automatic snapshots kept the newest eight WAL archives, and past that horizon a history
+silently; automatic snapshots kept the newest eight WAL archives, and past that horizon a history
 read answered as if nothing had happened. A snapshot cost roughly nine times the data it held,
 because every string column carried its own copy of the string table. The two things the product
-sells — time travel and per-caller visibility — refused to compose. Durability was self-managed,
+sells (time travel and per-caller visibility) refused to compose. Durability was self-managed,
 with no page telling an operator what to mount or how to restore. And the 0.5.x data-loss bug
-class — via-hop rules retracting all their edges after a snapshot — was still covered by
+class (via-hop rules retracting all their edges after a snapshot) was still covered by
 dogfooding rather than by a test. Each item is small, each has its own test, and every number
 below comes from a test this release commits. There is no benchmark gate: nothing here is a claim
 about agent performance.
 
 #### BREAKING
 
-- **Snapshot format V9 — one shared string table.** A snapshot carries the string table once, in a
+- **Snapshot format V9: one shared string table.** A snapshot carries the string table once, in a
   new section, instead of a full copy inside every string column. Measured by
   `snapshot_size_is_near_the_property_payload` (12,000 nodes × 8 string fields, 3.7 MB of property
   bytes): **36.8 MB → 5.2 MB** on disk, 9.82× the payload down to 1.39× (the 36.8 MB / 9.82× "before"
   figure is a pre-change measurement recorded beside the test, taken against the old per-column
   layout the V8 encoder wrote; the 5.2 MB / 1.39× "after" figure is what the committed test asserts,
   as `size < payload * 2`). Upgrading is automatic and
-  in place — the first read-write open of a V5–V8 store rewrites its snapshot at V9 and keeps the
+  in place; the first read-write open of a V5–V8 store rewrites its snapshot at V9 and keeps the
   old one as `snapshot.bin.bak` until the next clean open. **A store snapshotted by 0.6.5 cannot be
   opened by 0.6.4 or earlier**: an older binary refuses it with `snapshot: unsupported version 9`
   rather than reading it wrongly. The `.bak` is the only way back, so take a backup before
@@ -2240,7 +2240,7 @@ about agent performance.
   zero. Rust callers matching the variant exhaustively add `floor` or `..`.
 - **`GraphDb::node_history` returns `HistoryResult`**, matching `edge_history`:
   `{ items, total_commits, horizon }` instead of a bare `Vec`. `edge_history`'s result gains
-  `horizon` in the same shape. Python's `db.node_history(key)` likewise returns a dict — migrate
+  `horizon` in the same shape. Python's `db.node_history(key)` likewise returns a dict: migrate
   with `db.node_history(k)["history"]`.
 - **Automatic snapshots keep every archive by default.** The eight-archive bound is gone: retention
   is something you configure (`mushroomdb snapshot <db> --retention N`), never something that
@@ -2248,7 +2248,7 @@ about agent performance.
   it**; `mushroomdb stats` and `mushroomdb doctor` both print where history starts.
 - **`roles.json` version 3** is written when any role carries `visible_where`. An older binary
   refuses a version-3 file and **denies every role**, which is the safe direction but is a hard
-  stop — roll roles forward only once every reader is on 0.6.5.
+  stop: roll roles forward only once every reader is on 0.6.5.
 - **`as_of` together with `stub_hidden` is refused** on `POST /query` and on the MCP `query` tool
   (400 / tool error, `as_of (time-travel) does not compose with stub_hidden`). The combination was
   previously accepted with the flag silently inert.
@@ -2268,7 +2268,7 @@ about agent performance.
   and a client allow-list intersect at the commit being read and neither can widen the other. Three
   semantics are worth knowing: the **graph is historical but the role definition is current**,
   because `roles.json` is a sidecar with no past version, so narrowing a role today changes the
-  answer to yesterday's question; **deletion is not retroactive** — a role reads a now-deleted node,
+  answer to yesterday's question; **deletion is not retroactive**: a role reads a now-deleted node,
   and its edges, at any retained commit where it was live, so revoking history means pruning
   archives or narrowing the role, not `DELETE`; and **keys resolve by string at the commit being
   read**, so a key reused after a rename names whichever node held it then.
@@ -2282,13 +2282,13 @@ about agent performance.
   memo rather than clearing the old one.
 - **`mushroomdb serve --restore-from <dir>`** seeds an empty store directory from the newest backup
   under `<dir>` (an immediate `latest/` subdirectory wins outright, otherwise newest by mtime), and
-  does nothing when the directory already holds a store — safe to leave in a container command line
+  does nothing when the directory already holds a store: safe to leave in a container command line
   forever. The copy is staged inside the target directory and opened before anything is installed,
   so **a failed restore changes nothing**: a corrupt backup leaves the store directory exactly as it
   was found, and the next boot restores rather than reporting a half-written store. New page:
-  [Running it as a service](docs/site/service.md) — what to mount, how often to snapshot, how to
+  [Running it as a service](docs/site/service.md): what to mount, how often to snapshot, how to
   back up, how to restore, and what a restart without a volume costs.
-- **A snapshot round trip per rule kind** — ten cases covering every predicate (`KeyMatch`,
+- **A snapshot round trip per rule kind**: ten cases covering every predicate (`KeyMatch`,
   `FieldEqual`, `Overlap`, `NumericWithin`, `GeoRadius`, `VectorSimilar`, `All`, `Any`) plus the
   via-hop and two-rule-chain shapes, each asserting that derived edges survive a reopen *and* that a
   write after the reopen retracts exactly the right subset and no more. This is the class of bug
@@ -2299,7 +2299,7 @@ about agent performance.
 - **Every history read reports the horizon.** `node_history` and `edge_history` carry `horizon`, the
   oldest commit still retained, on the Rust, HTTP, MCP and Python surfaces; `was_linked`, `edges_at`,
   `asof` and `query_at` name the valid range in their error. `Stats` gains `history_floor`, and
-  `mushroomdb stats` prints a `history:` line — `complete (nothing pruned)` or `reaches back to
+  `mushroomdb stats` prints a `history:` line: `complete (nothing pruned)` or `reaches back to
   commit N`. No read answers "nothing happened" when the answer is "that is no longer retained".
 - **`mushroomdb asof` reported the wrong total** on any store with WAL archives; it counted only
   live `wal.bin` frames, so an eleven-commit store printed `of 1`. It now prints the real total and
@@ -2325,7 +2325,7 @@ about agent performance.
 
 - **Role-token `as_of` replays the WAL under the store's read guard.** `query_at_scoped` reopens
   from disk on every call, exactly as `query_at` already did, but the surface is now reachable by a
-  role token — so a role-token client can drive repeated replays. There is no rate limit.
+  role token; so a role-token client can drive repeated replays. There is no rate limit.
 - **`docs/site/masks.md` is not in the LLM bundle.** `scripts/gen-llms-full.sh` links the masks page
   rather than concatenating it, so the predicate-mask and as-of-composition sections do not reach
   `llms-full.txt`. The same statements do reach it through `api.md` and `timetravel.md`.
@@ -2333,12 +2333,12 @@ about agent performance.
   node of every allowed label and reads one property each; no property index is consulted. The memo
   hides this between writes, so a write-heavy store with a large label set pays it once per commit.
 
-## v0.6.4 — the data-layer release
+## v0.6.4: the data-layer release
 
 No engine change, no tool added or removed, no format change. This release is the product saying
-what it is: the data layer for agents that reason over entities — rules that derive and retract
+what it is: the data layer for agents that reason over entities: rules that derive and retract
 relationships, `explain_association` with the evidence, `edges_at` for the graph as it was,
-`what_if` for a change not yet made, and `query` by `role` — served over MCP or embedded. The
+`what_if` for a change not yet made, and `query` by `role`: served over MCP or embedded. The
 code-graph door is deprecated: it still works, it is still tested, it is off the front door, and
 0.7 removes it.
 
@@ -2350,15 +2350,15 @@ cells): the invoked arm scored 0.924 against stock's 0.927 (`-0.0035 [-0.0112, 0
 $0.2713 against $0.2267 (`+0.04463 [+0.01312, +0.07471]`), and the two installed-but-not-invoked
 arms made **0 graph calls across 120 sessions**. The association suite measures the engine instead:
 the graph arm moved from 0.795 / $0.5089 to 0.967 / $0.0923 against the relational baseline's 0.974
-/ $0.1158 — a correctness tie at a lower mean cost — and files + grep remain the cheapest way to
+/ $0.1158 (a correctness tie at a lower mean cost) and files + grep remain the cheapest way to
 answer those twenty questions on a 2,000-entity world
 ([`results/20260911T065400Z`](benchmarks/agent-tasks/results/20260911T065400Z/summary.md)).
 
 #### Changed
 
 - `README.md` and `docs/site/index.md` lead with the entity data layer. `ingest-git` is documented
-  as a **data source** — commits, pull requests, files and authors as entities with rule-derived
-  relationships — rather than as the product.
+  as a **data source** (commits, pull requests, files and authors as entities with rule-derived
+  relationships) rather than as the product.
 - The `/mushroom` skill and the Cursor rules file answer one named call per question kind on an
   entity store. The rows telling an agent to call the graph before a search are gone.
 - The Claude Code plugin's description leads with graph memory.
@@ -2366,12 +2366,12 @@ answer those twenty questions on a 2,000-entity world
   `llms-full.txt` and the plugin description, and `scripts/check-claims.sh` keeps them out in CI.
 - The publish smoke expects the entity surface.
 
-#### Deprecated — still working, still tested, removed in 0.7
+#### Deprecated: still working, still tested, removed in 0.7
 
 - **The code task tools** `explore`, `map`, `context`, `impact`, `owners`, `why`, `sync`. Listings
   are unchanged: three on a store built by `ingest-git`, fifteen on any other, 27 served either way
   and all of them through `mushroomdb mcp <db> --all-tools`. If you call them, pin
-  `mushroomdb@0.6.x` — nothing on the entity surface replaces them.
+  `mushroomdb@0.6.x`; nothing on the entity surface replaces them.
 - **The three experimental hooks** `--intercept-grep`, `--impact-before-edit`, `--enrich-grep`.
   `install` now prints `deprecated  <flag> — the code-graph hooks are deprecated and are removed in
   0.7` for each. Re-run `install` without the flag to take one back out.
@@ -2382,12 +2382,12 @@ answer those twenty questions on a 2,000-entity world
 Nothing in this release removes anything. The `code-graph` CI acceptance job still runs, because a
 deprecated feature that still ships is one that still has to work.
 
-## v0.6.3 — the association release
+## v0.6.3: the association release
 
 A release about the question the graph is supposed to be best at: *why are these two things
-related, and what did that look like on some other day.* A new benchmark suite asks it — one
+related, and what did that look like on some other day.* A new benchmark suite asks it (one
 generated world written three ways, twenty relationship questions, graded against executable
-truth — and the first run of it **failed its gate**, badly. Everything below is what that run
+truth) and the first run of it **failed its gate**, badly. Everything below is what that run
 exposed, fixed: an `explain_association` that names the values two nodes actually share, a
 `node_edges` that answers "why" in the call that lists the edges, two new tools (`edges_at`,
 `what_if`) that answer a whole question in one call instead of twenty, and the Cypher spellings
@@ -2397,20 +2397,20 @@ here as it came out. No format change.
 #### Measured on the association suite (before the fixes)
 
 The suite is `benchmarks/agent-tasks/` run with `--suite association`: one deterministic world
-(seed `20260910`, scale 2000, a 90-day window and 300 changes) written three ways — `files/` as
-`entities/*.json` + `changes.jsonl`, `sqlite/` as `world.sqlite`, `graph/` as a mushroomdb store —
+(seed `20260910`, scale 2000, a 90-day window and 300 changes) written three ways (`files/` as
+`entities/*.json` + `changes.jsonl`, `sqlite/` as `world.sqlite`, `graph/` as a mushroomdb store)
 and 20 questions over five kinds (why, multihop, retraction, timetravel, visibility), four each.
 The arms are **P** (files + grep), **Q** (the relational file, and the baseline), **R** (the store,
 reached only through the MCP server). Every arm gets `Read,Grep,Glob,Bash,Edit,Write`; R also gets
 `mcp__mushroomdb`. The §1 gate: correctness at or above arm Q paired by task, at or above every
 other arm's paired mean, cost at or below arm Q, the 95% interval of the paired cost difference
-against Q lying entirely below zero, and no max-turns failure on a task Q finished. Correctness carries no interval requirement —
-Q saturated it in the pilot — so cost is the discriminator. Adoption is recorded, not gated: in
+against Q lying entirely below zero, and no max-turns failure on a task Q finished. Correctness carries no interval requirement
+(Q saturated it in the pilot) so cost is the discriminator. Adoption is recorded, not gated: in
 arm R the store is the only data path.
 
 The verdict of the "before" run,
-[`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)
-— arms P, Q, R × 3 reps × 20 tasks, 180 cells, world digest `f2b689ba52c80241`:
+[`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md):
+arms P, Q, R × 3 reps × 20 tasks, 180 cells, world digest `f2b689ba52c80241`:
 
 | | |
 |---|---|
@@ -2442,12 +2442,12 @@ seeded), arm R against arm Q: score `-0.1914 [-0.3420, -0.0699]`, cost `0.38314 
 0.52528]`, total tokens `709065.6 [498965.9, 914119.2]`, turns `18.033 [11.483, 25.667]`. Read
 plainly: the graph arm was **worse and four times more expensive** than a single relational file,
 and five tasks ran out of turns that Q finished. Adoption was 100% by construction, so nothing here
-is a question of whether the agent reached for the graph — it reached for it 1,178 times and still
+is a question of whether the agent reached for the graph; it reached for it 1,178 times and still
 lost. The tool calls that dominated were `query` ×612 and `edge_history` ×222: an agent
 replaying history event by event because no call answered the question whole.
 
-The **code-door arms L, J and H** — arm B's install plus `--impact-before-edit`, plus
-`--enrich-grep`, plus `--always-load` respectively — are wired into the harness in this release
+The **code-door arms L, J and H**: arm B's install plus `--impact-before-edit`, plus
+`--enrich-grep`, plus `--always-load` respectively: are wired into the harness in this release
 but **carry no measurement**: no run of them is committed, so nothing here claims anything about
 what those three hooks are worth.
 
@@ -2488,24 +2488,24 @@ against arm Q: score `0.0264 [0.0040, 0.0639]`, cost `-0.02094 [-0.02861, -0.012
 
 The run measured commit `bbaa919`. The commits after it up to the release commit are docs, the
 version bump, the gate wording, the brief's hard byte cap and its as-of note, `count(DISTINCT r)`,
-and the `listed`/`label`/`neighborhood`/unknown-type fixes — none of them changes a tool this run
+and the `listed`/`label`/`neighborhood`/unknown-type fixes: none of them changes a tool this run
 exercised, except the brief's as-of note. Against the "before" run the graph arm moved from score
 0.795 to 0.967, cost $0.509 to $0.092, turns 25.6 to 5.1, max-turns cells 8 to 0, and errors 8 to 0.
 Read plainly: the graph arm now ties the relational baseline on correctness and is cheaper in mean
-cost, turns and wall time — but the pre-registered gate is still not met, because two rep-1
+cost, turns and wall time: but the pre-registered gate is still not met, because two rep-1
 time-travel cells scored 0 (the agent chose a wrong commit for the date; see
 [`classification.md`](benchmarks/agent-tasks/results/20260911T065400Z/classification.md)) and the
 cost interval's upper end sits just above zero. The files + grep arm remains the cheapest and most
 correct way to answer these twenty questions on this 2,000-node world.
 
-#### The association surface — fifteen tools on a memory store
+#### The association surface: fifteen tools on a memory store
 
 - **A store that was not built by `ingest-git` now lists the association surface.** Fifteen tools:
   `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`,
   `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`,
   `remember`, `recall`, `stats`. A code-graph store still lists three (`explore`, `query`,
-  `stats`). All **27** stay served on either surface — the listing decides what a session can
-  call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set
+  `stats`). All **27** stay served on either surface (the listing decides what a session can
+  call, not what the server answers) and `mushroomdb mcp <db> --all-tools` lists the whole set
   with schemas. The server decides once, at startup, from the store it opened, so one `.mcp.json`
   serves both kinds.
 - **`query` takes a `role`.** Pass `role: "<name>"` to answer as one role from the store's
@@ -2515,18 +2515,18 @@ correct way to answer these twenty questions on this 2,000-node world.
 #### `explain_association` answers with the evidence
 
 - **The reply is text first, and it names the values the two nodes share.** Each relationship is
-  one line — edge type, rule, score, the predicate it matched — followed by a bracketed clause
+  one line (edge type, rule, score, the predicate it matched) followed by a bracketed clause
   carrying the evidence: `overlap` prints the shared list items, `field_equal` the equal value,
   `key_match` the destination key the field named, `geo_radius` both coordinates and the distance,
   `numeric_within` the two numbers, `vector_similar` the cosine the rule scored. A composed
   `all`/`any` prints one clause per branch. On the real association store the whole reply is 562
-  bytes, and the values only one node holds never appear in it — which is the point: the old reply
+  bytes, and the values only one node holds never appear in it, which is the point: the old reply
   named a predicate and left the agent to fetch both property lists and diff them by hand.
 - **Each predicate's own threshold is applied before anything is reported.** `overlap` must clear
   its `min` as a Jaccard ratio, `numeric_within` its tolerance, `geo_radius` its radius, and
   `key_match` only reports when the source field actually names the destination. Under `any`, only
   the satisfied branches print.
-- **`json: true` gains an `evidence` object per relationship** — `{field, shared:[…]}`,
+- **`json: true` gains an `evidence` object per relationship**: `{field, shared:[…]}`,
   `{field, value}`, `{field, a, b, km}`, `{field, a, b}`, `{field, similarity}` or `{parts:[…]}`.
   Every other field of the array is byte-identical to before.
 - Two deliberate silences: a via-hop rule reports no evidence (its predicate was evaluated between
@@ -2534,7 +2534,7 @@ correct way to answer these twenty questions on this 2,000-node world.
   nested inside `all`/`any` reports no similarity, because a branch's own score is not recoverable
   from a min or a max.
 
-#### Relationships in one call — `node_edges` and `neighborhood`
+#### Relationships in one call: `node_edges` and `neighborhood`
 
 - **Both are text first, grouped by edge type with a count, each listed edge carrying its
   direction, the rule that derived it, its score and the predicate it matched.** "Why is this
@@ -2546,7 +2546,7 @@ correct way to answer these twenty questions on this 2,000-node world.
   pairwise probes. `json: true` → `{key, all_of, partners, listed, total}`.
 - **`edge_type: T` gives one type's partner keys with the rule named once** rather than repeated
   per line; `json: true` → `{key, edge_type, rule, edges, partners, listed, total}`.
-- **`label: L` narrows the partners** — and the counts, not only the listings — in every form, so
+- **`label: L` narrows the partners** (and the counts, not only the listings) in every form, so
   "which *companies*" is one call rather than a key-prefix filter afterwards.
 - **`direction: out | in | any`** (default `any`; `both` is a synonym) filters the edges the
   grouped view groups and the intersection is taken over. It was previously parsed and ignored by
@@ -2555,18 +2555,18 @@ correct way to answer these twenty questions on this 2,000-node world.
   `edge_type`/`all_of` (max 2,000); the remainder is always stated as `… and N more`. The grouped
   listings still stop at 40 lines, and now say so: `… listing capped at 40 lines; pass edge_type
   or all_of for the whole set`.
-- `all_of` together with `edge_type` is a tool error — `pass one of all_of or edge_type, not
-  both` — rather than one of them silently winning.
+- `all_of` together with `edge_type` is a tool error (`pass one of all_of or edge_type, not
+  both`) rather than one of them silently winning.
 - **An edge type that is nowhere in the store is a tool error naming it and the types the store
   does have**, capped at twenty names, rather than the "0 edges" / "0 partners" a misspelling used
-  to answer — which reads as a fact about the graph and is indistinguishable from the right answer
+  to answer, which reads as a fact about the graph and is indistinguishable from the right answer
   for a type this node genuinely has none of. The census only runs when the answer came back empty.
 - **`neighborhood` takes `label` too**, and applies it: at depth 1 it narrows the partners and the
   counts exactly as `node_edges` does, and past one hop it keeps the traversal rows of that label.
-  It used to be accepted and silently ignored. The walk itself is never narrowed — a hop through
+  It used to be accepted and silently ignored. The walk itself is never narrowed: a hop through
   another label is how a two-hop question reaches the label it asked about.
-- **The grouped `json: true` report carries a top-level `listed`** — the edges actually in the
-  document, the sum of the per-type counts — and echoes the `label` it was narrowed by, which the
+- **The grouped `json: true` report carries a top-level `listed`** (the edges actually in the
+  document, the sum of the per-type counts) and echoes the `label` it was narrowed by, which the
   other shapes of the reply already did.
 
 #### New: `edges_at` and `what_if`
@@ -2589,22 +2589,22 @@ correct way to answer these twenty questions on this 2,000-node world.
 - **Python**: `edges_at(key, commit)`, `what_if_set_prop(key, field, value)`, `edge_history(a, b)`
   and `wal_total_commits()`.
 
-#### Cypher — the spellings an agent assumes exist
+#### Cypher: the spellings an agent assumes exist
 
 Every one of these used to be a parse error or a silent `null`, which is most of what the
 benchmark's multihop cells burned their turns on.
 
 - **`n.key` and `n.label` read as properties**, and `labels(n)` returns a one-element list. A
   stored property of either name still wins; this is only the fallback. They work in `WHERE`, in
-  `ORDER BY`, in an inline pattern filter (`MATCH (c {key: 'c3'})`) and after a grouping `WITH` —
+  `ORDER BY`, in an inline pattern filter (`MATCH (c {key: 'c3'})`) and after a grouping `WITH`:
   the last of which was the deeper bug: `WITH c, count(*) AS n` used to flatten `c` to a scalar, so
   `c.key` read null and `key(c)` failed outright.
 - **`STARTS WITH` / `ENDS WITH` / `CONTAINS`** as infix operators, desugaring to the scalar
   functions of the same meaning, so null and non-string handling is shared with the call spelling.
-- **List subscripts** — `n.location[0]`, `[-1]` counting from the end. Out of range, a non-list
+- **List subscripts**: `n.location[0]`, `[-1]` counting from the end. Out of range, a non-list
   base and a non-integer index are all `null`, never an error. Two unaliased subscripts of one list
   are now two named columns (`t.location[0]`, `t.location[1]`) instead of a duplicate-column error.
-- **Comma-separated patterns in one `MATCH`** — `MATCH (t)-[:A]->(c), (t)-[:B]->(c)` — producing
+- **Comma-separated patterns in one `MATCH`** (`MATCH (t)-[:A]->(c), (t)-[:B]->(c)`) producing
   exactly what a run of separate `MATCH` clauses produces, so both spellings plan and execute
   identically. Patterns sharing no variable are a cartesian product, as openCypher says.
 - **`count(DISTINCT …)` and `collect(DISTINCT …)`.** This is what makes an intersection correct:
@@ -2613,48 +2613,48 @@ benchmark's multihop cells burned their turns on.
   named `distinct` still parses. On a **relationship** variable `count(DISTINCT r)` counts distinct
   edges, keyed on `(edge type, source, destination)`; it used to answer `0` on a graph full of them.
 - **A non-aggregate `WITH … WHERE <alias>` resolves the alias.** `WITH t, t.x AS x WHERE x > 11`
-  was a planner-only false rejection — the plan it refused to build would have run correctly.
+  was a planner-only false rejection: the plan it refused to build would have run correctly.
 - **An aggregate `WITH` with no `WHERE` now projects its `RETURN`.** `WITH c, count(t) AS n RETURN
   key(c), n` used to come back with columns named `c` and `n`, and a computed projection like
   `RETURN n * 2` was silently dropped.
-- **An unknown function names itself** — the error quotes the name it did not know and lists the
+- **An unknown function names itself**: the error quotes the name it did not know and lists the
   functions it does, instead of failing anonymously.
 
-#### A memory store opens with its schema — `SessionStart`
+#### A memory store opens with its schema: `SessionStart`
 
 - **`mushroomdb brief <db>` on a memory store prints the store's shape**: each label with its
   property names and node count, each edge type with the rule behind it, its source and
-  destination labels and its count, the roles, the total commit count — and then one worked call
+  destination labels and its count, the roles, the total commit count: and then one worked call
   per question kind, built from that store's own labels and edge types, so the calls are runnable
   as printed. The 4,000 bytes is a ceiling and not a line count: schema entries drop first, then
   every name is cut to 60 characters, and only then do the worked calls come off from the end
   under a final `(brief truncated at 4,000 bytes)` line. It is byte-stable between runs; a store too large to read
   inside the 3-second budget renders **partially** rather than late. The `embedding` field is
-  hidden from the schema listing — 1,536 floats is not a property worth naming.
+  hidden from the schema listing: 1,536 floats is not a property worth naming.
 - **The recipes teach the one-call forms.** `why` names `explain_association` and says the reply
   carries the shared values; `relationships` and `as of` render the `all_of:` / `label:` form of
   `node_edges` and `edges_at` over edge types that actually run between the two busiest labels;
   `what if` appends the `edge_type:` narrowing; and a `linked by all of` recipe renders the
   comma-pattern, `count(DISTINCT …)` Cypher for the intersection question. The `as of` note says
-  where its `at` comes from — no commit carries a date, so a date is turned into a commit number
+  where its `at` comes from; no commit carries a date, so a date is turned into a commit number
   through `node_history` / `edge_history`, never guessed from the end of the WAL.
 - **The skill carries a recipe per question kind**, and the `--delivery cli` variant names the CLI
   equivalent of each.
 
-#### `install` — three more experiments, and always-load by default
+#### `install`: three more experiments, and always-load by default
 
 - **`--impact-before-edit`** (off by default) adds a `PreToolUse` hook matched to
   `Edit|Write|MultiEdit`: before an edit lands it prints at most 600 bytes of the file's blast
-  radius — importers, co-change partners, covering tests. It never blocks; exit 0 always.
+  radius: importers, co-change partners, covering tests. It never blocks; exit 0 always.
 - **`--enrich-grep`** (off by default) adds a `PostToolUse` hook matched to `Grep`: after a search
   returns it prints at most 800 bytes about the first five identifiers that name exactly one symbol
-  the graph holds — definition site, caller count, the file's owner. Nothing resolving is nothing
+  the graph holds: definition site, caller count, the file's owner. Nothing resolving is nothing
   printed.
 - **Both emit `hookSpecificOutput.additionalContext`** rather than bare stdout, which is the shape
   Claude Code adds to the model's context instead of showing to the user.
 - **`--always-load` / `--no-always-load`.** `alwaysLoad: true` on the `mcpServers.mushroomdb`
-  entry is now the **default for an entity-store install** — `--delivery mcp` or `both` with an
-  explicit `--db` — because a session that cannot see the tools spends turns finding them. It is
+  entry is now the **default for an entity-store install** (`--delivery mcp` or `both` with an
+  explicit `--db`) because a session that cannot see the tools spends turns finding them. It is
   Claude Code's `.mcp.json` only, and it was verified honoured for a stdio server by Claude Code
   2.1.258. `--no-always-load` opts out; an install that named no store is unchanged.
 - **`doctor` reports all of them**, and the install manifest records which are on, so `disable`,
@@ -2662,7 +2662,7 @@ benchmark's multihop cells burned their turns on.
 
 #### The benchmark harness
 
-- **`--suite association`** — the world builder (`association/build.py`, one generator and three
+- **`--suite association`**: the world builder (`association/build.py`, one generator and three
   writers that `equivalent()` checks agree), the truth module, 20 tasks over five kinds, arms P/Q/R,
   a paired percentile bootstrap, and a gate variant that requires the cost interval to exclude
   zero and does not gate on adoption.
@@ -2672,7 +2672,7 @@ benchmark's multihop cells burned their turns on.
   or the digest `tasks.json` was written against.
 - **Code-door arms L, J and H** (arm B's install plus `--impact-before-edit`, plus `--enrich-grep`,
   plus `--always-load`) and a real **`--disallowedTools`** switch, which removes a tool from what
-  the model is offered — unlike `--allowedTools`, which only grants permission and leaves the tool
+  the model is offered: unlike `--allowedTools`, which only grants permission and leaves the tool
   in the list.
 
 #### Fixed
@@ -2699,7 +2699,7 @@ benchmark's multihop cells burned their turns on.
   (`{key, edge_type, rule, edges, partners, listed, total}`). Drop `edge_type` to keep the grouped
   shape. The HTTP `/node/{key}/edges` endpoint is untouched.
 - **`edges_at {json: true}` lists at most `limit` edges per edge type** (default 10, max 100 in
-  that form) and carries `listed` and `total` alongside `edges`, where it used to dump everything —
+  that form) and carries `listed` and `total` alongside `edges`, where it used to dump everything:
   114,092 bytes on the measured hub call against 7,266 now. Pass `edge_type` or `all_of` with a
   limit up to 2,000 for the whole set.
 - **`what_if {json: true}` respects `limit`** (default 10) and gains `lost_total` / `gained_total`,
@@ -2707,8 +2707,8 @@ benchmark's multihop cells burned their turns on.
 - **The grouped `edges_at` view honours `direction`.** `out`, `in` and `any` were parsed and then
   ignored on that path, so every caller got the undirected answer; a call that passed a direction
   now gets the edges it asked for, and the counts in the header narrow with them.
-- **`all_of` together with `edge_type` is a tool error** — `pass one of all_of or edge_type, not
-  both` — on `node_edges` and `edges_at`, where one of the two used to win silently.
+- **`all_of` together with `edge_type` is a tool error** (`pass one of all_of or edge_type, not
+  both`) on `node_edges` and `edges_at`, where one of the two used to win silently.
 - **`alwaysLoad: true` is the default for an entity-store MCP install.** `install --delivery mcp`
   or `both` with an explicit `--db` writes it on the `mcpServers.mushroomdb` entry, so a re-run of
   `install` rewrites an existing `.mcp.json` that did not have it. `--no-always-load` opts out; an
@@ -2717,9 +2717,9 @@ benchmark's multihop cells burned their turns on.
   was reading the columns named `c` and `n` out of that shape, or relying on a dropped computed
   projection, sees the projected names and values instead.
 
-## v0.6.2 — the proof release
+## v0.6.2: the proof release
 
-The delivery changes in this release were measured on a rebuilt agent benchmark before it shipped —
+The delivery changes in this release were measured on a rebuilt agent benchmark before it shipped:
 but *together*, not one at a time: one four-arm run of 240 cells, plus a one-rep probe of the two
 `--intercept-grep` arms. No change here carries a number of its own, because the per-change
 baseline run was cancelled. The pre-registered gate is reported as it came out. **The gate was not
@@ -2727,16 +2727,16 @@ passed.** Nothing here is a claim the numbers do not carry. No format change.
 
 #### The gate
 
-The benchmark is `benchmarks/agent-tasks/` (harness v2): 20 tasks over two repositories — this one
-and a pinned third-party Python repository — graded against executable truth (a test command for
+The benchmark is `benchmarks/agent-tasks/` (harness v2): 20 tasks over two repositories (this one
+and a pinned third-party Python repository) graded against executable truth (a test command for
 each change task, an exact answer key for the rest), one worktree per cell, cost and token counts
 read from the session stream, and a `gate_verdict` computed by the harness rather than by hand.
 The pre-registered §1 gate is: correctness >= stock (paired by task), cost <= stock, adoption
 >= 80%, and no max-turns failure on a task stock finished.
 
 The verdict is the Gate section of the full run,
-[`benchmarks/agent-tasks/results/20260910T000418Z/summary.md`](benchmarks/agent-tasks/results/20260910T000418Z/summary.md)
-— arms A, B, C, D × 3 reps × 20 tasks, 240 cells:
+[`benchmarks/agent-tasks/results/20260910T000418Z/summary.md`](benchmarks/agent-tasks/results/20260910T000418Z/summary.md):
+arms A, B, C, D × 3 reps × 20 tasks, 240 cells:
 
 | | |
 |---|---|
@@ -2761,11 +2761,11 @@ skill teaches the binary, no MCP server).
 | adoption | 0.00 | 0.00 | 0.43 | 0.00 |
 
 Paired by task, with a 95% percentile bootstrap over the per-task differences, **no correctness
-interval excludes 0** — B `0.0142 [-0.0083, 0.0508]`, C `-0.0035 [-0.0112, 0.0017]`, D
+interval excludes 0**: B `0.0142 [-0.0083, 0.0508]`, C `-0.0035 [-0.0112, 0.0017]`, D
 `-0.0067 [-0.0138, 0.0000]`. The one cost interval that excludes 0 is C's: `0.04463
 [0.01312, 0.07471]`. Read plainly: on these tasks the graph changed nothing measurable about
 whether the agent got the answer right, invoking it deliberately cost about 20% more, and nothing
-but a deliberate invocation made an agent reach for it at all — 26 of 60 arm-C sessions made at
+but a deliberate invocation made an agent reach for it at all: 26 of 60 arm-C sessions made at
 least one call (`query` ×45, `explore` ×43), and 0 of 60 in every other arm.
 
 Two smaller runs are committed beside it, and neither is a gate:
@@ -2788,19 +2788,19 @@ Two smaller runs are committed beside it, and neither is a gate:
   | turns | 16.00 | 13.20 | 12.85 |
   | adoption | 0.00 | 0.25 | 0.10 |
 
-  Gate FAILED (F: adoption 10% < 80%). **One rep — direction only, not a result.** The smoke above
+  Gate FAILED (F: adoption 10% < 80%). **One rep: direction only, not a result.** The smoke above
   showed the same size of cost drop and three reps erased it.
 
-#### A session opens with a brief — `SessionStart`
+#### A session opens with a brief: `SessionStart`
 
 - **`mushroomdb brief <db>` and a third Claude Code hook.** The brief is the repository's shape read
   from the graph alone: file, symbol and edge counts, the sha of the last sync, the 25 most central
   files with their role, the 25 most called symbols with their signatures, and one line naming the
   door this install wired, under the same untrusted-data marker every digest rendered out of a
-  store opens with — a brief is repository text placed in a session's context before its first
+  store opens with: a brief is repository text placed in a session's context before its first
   turn, and the marker's bytes come out of the cap, not on top of it. Measured on this
   repository's store: **3,916 bytes** of a 4,000-byte cap, median **228 ms**. It reads no clock
-  and no working tree, so two sessions started an hour apart get byte-identical output — a host
+  and no working tree, so two sessions started an hour apart get byte-identical output: a host
   that caches it is never wrong.
 - **Key files are ranked by centrality and then filtered to files something imports or calls.**
   PageRank over the file graph alone put six `.woff2` font files and an `OFL.txt` in this
@@ -2809,7 +2809,7 @@ Two smaller runs are committed beside it, and neither is a gate:
   starts with `map`'s key files. When the byte cap drops lines, the brief says `… and N more`
   rather than ending mid-list, and the reach line always survives the cap.
 
-#### `explore` — one tool to find, and a listing that follows the store
+#### `explore`: one tool to find, and a listing that follows the store
 
 - **New tool and subcommand `explore <target> [--depth context|impact|history|all] [--full]`.** It
   composes `context`, `impact` and `owners` behind one depth rather than adding a fourth report:
@@ -2818,17 +2818,17 @@ Two smaller runs are committed beside it, and neither is a gate:
   file changes with; `all` is all three. `budget` (MCP, in tokens; default 1,200 ≈ 4,800 bytes,
   minimum 200) caps the reply, and the header line naming the target survives any budget. Measured
   on this repository's store, replies run **2,070–3,488 bytes** across the four depths and three
-  targets — the widest is 73% of the default budget — and `--depth all` has a median latency of
+  targets (the widest is 73% of the default budget) and `--depth all` has a median latency of
   **196 ms**, cheaper than `map`.
-- **The MCP tool listing follows the store.** A store built by `ingest-git` advertises three tools —
-  `explore`, `query`, `stats` — and any other store advertises eleven. The server decides once, at
+- **The MCP tool listing follows the store.** A store built by `ingest-git` advertises three tools
+  (`explore`, `query`, `stats`) and any other store advertises eleven. The server decides once, at
   startup, from the store it opened, so one `.mcp.json` serves both and neither has to be configured
   for. Measured on this repository's store, the listing a coding session pays for before its first
-  turn drops from **5,622 bytes to 1,593** — 72%, on top of the 12,238 → 5,622 cut in v0.6.1. All 25
-  tools stay served on either surface — the listing decides what a session can call, not what the
-  server answers — and `mushroomdb mcp <db> --all-tools` lists them all (14,419 bytes).
+  turn drops from **5,622 bytes to 1,593**: 72%, on top of the 12,238 → 5,622 cut in v0.6.1. All 25
+  tools stay served on either surface (the listing decides what a session can call, not what the
+  server answers) and `mushroomdb mcp <db> --all-tools` lists them all (14,419 bytes).
 - **`doctor`'s handshake accepts either front door.** It required `map` in `tools/list`, which is
-  exactly the tool a code-graph store no longer lists — `doctor` failed on the stores this feature
+  exactly the tool a code-graph store no longer lists: `doctor` failed on the stores this feature
   exists for. It now accepts `explore` or `map` and names the one it found.
 
 #### `context` answers with pointers; bodies are opt-in
@@ -2837,16 +2837,16 @@ Two smaller runs are committed beside it, and neither is a gate:
   (`path:start-end`), the signature and the doc, and `full: true` (`--full` on the CLI) adds the
   body read from the working tree. Measured on this repository's store: a symbol target **2,072
   bytes** against 3,853 with the body, a file target **1,640** against 4,044. The body is the
-  expensive half of the answer and rarely the half that decides anything — and a file target now
+  expensive half of the answer and rarely the half that decides anything: and a file target now
   answers from the graph alone, reading nothing off disk.
 
 #### The prompt hook fires on identifiers, and answers with pointers
 
-- **`recall` is silent unless the prompt names an identifier** — a path, a `mod::name`, a snake_case
+- **`recall` is silent unless the prompt names an identifier**: a path, a `mod::name`, a snake_case
   or dotted name, an inner-capitalised word, or anything in backticks. `is it done`, `ok thanks` and
   `fix this` print nothing at all: no framing line, no header, dirty tree or not. The stopword list
   and relevance floor from v0.6.1 still apply on top of the gate.
-- **The digest is pointers, not excerpts.** One line per hit — `path:line symbol — first doc line` —
+- **The digest is pointers, not excerpts.** One line per hit (`path:line symbol — first doc line`)
   which is what a follow-up `explore` call takes as its target. The per-hit edge lines and the
   closing hint are gone, and the output budget drops from 1,800 to 1,200 bytes.
 - **On a dirty tree the diff nudge replaces the digest** rather than printing beside it: a change in
@@ -2859,12 +2859,12 @@ Two smaller runs are committed beside it, and neither is a gate:
   reaches the graph through `Bash`: `mushroomdb explore <store> <target>`. `mcp` is the server
   alone; `both` (the default) writes the entry and a skill that also teaches the shell form.
   Switching an existing install to `cli` removes the entry it registered and prunes the manifest
-  key. Claude Code only — a Cursor or Codex install is always the server, and `install` prints a
+  key. Claude Code only: a Cursor or Codex install is always the server, and `install` prints a
   note saying so rather than dropping the flag silently.
 - **`doctor`, `enable` and `disable` follow the manifest.** A new `skip` status (never a failure)
   reports the `config` and `handshake` checks as `skip … delivery: cli`, per platform, while
   `store`, `lock`, `hooks`, `git-hooks` and `scope` still run against the store recovered from the
-  recorded `SessionStart` hook. `enable` rebuilds the install that was disabled, server and all — or
+  recorded `SessionStart` hook. `enable` rebuilds the install that was disabled, server and all: or
   no server, as recorded.
 
 #### `install --intercept-grep` (experimental, off by default)
@@ -2897,7 +2897,7 @@ Two smaller runs are committed beside it, and neither is a gate:
   An install that predates this release gains it on the next `install`; `uninstall`, `disable` and
   `enable` handle it like the other two.
 
-## v0.6.1 — 2026-09-09
+## v0.6.1: 2026-09-09
 
 Dogfooding v0.6.0 on this repository turned up three code-graph defects, a token bill worth
 trimming, and a worktree bug in `install`. All fixed here. No format change.
@@ -2914,37 +2914,37 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   `Symbol.call_lines` already recorded one entry per call site; the renderer read only the first and
   then truncated the list. Callers are now grouped by file and ranked by call-site count, with a
   `callers_not_shown` count when a very widely called symbol still needs cutting. Calls written
-  inside a macro's arguments (`format!("… {}", sanitize(x))`) were never extracted at all — they are
+  inside a macro's arguments (`format!("… {}", sanitize(x))`) were never extracted at all: they are
   now. On this repository's own store: `CALLS` edges 8,778 → 9,857 from the extraction fix, and a
   caller list that was missing two whole crates (`crates/cli/src/recall.rs`,
   `crates/server/src/mcp_tasks.rs`) now names every one grep finds.
 - **Call resolution got four narrower rules, cutting false edges 86% (10.5% → 1.2% of `CALLS`
   measured as non-test source calling into a test symbol):** a call written in method position
-  (`x.name(`) no longer resolves through the guess-by-uniqueness tier — only same-file, same-
+  (`x.name(`) no longer resolves through the guess-by-uniqueness tier: only same-file, same-
   directory, imported, or a repository-wide match that still carries its receiver type
   (`Store.flush`); a path call whose leading segment names nothing in the tree (`std::mem::take`,
   `serde_json::from_str`) resolves to nothing instead of guessing; the name-search tiers now require
   the definition to be in the same language as the call site (TypeScript/TSX/JS count as one
-  family); and a Rust method call now gets incoming callers from receiver syntax at all — `0` such
+  family); and a Rust method call now gets incoming callers from receiver syntax at all: `0` such
   methods had a caller before this release, `222` do now, gated by a receiver check that requires
   `self`/`this`/`cls` or a variable named after its type, because the plain "type mentioned
   anywhere in this file" tie-break the brief specified produced ~2,700 wrong edges on this
   repository (`ResultSet.len`, `ColumnsView.get`) and was dropped rather than shipped.
 - **`impact` and `why` name partners by shared-commit count, not only by the `CO_CHANGED` rule's
   similarity floor.** The floor (jaccard ≥ 0.25) is correct for the graph edge and stays unchanged,
-  but it hides a file that changes with this one often and also changes a lot on its own —
+  but it hides a file that changes with this one often and also changes a lot on its own:
   `crates/cli/src/lib.rs` shares 6 of `install.rs`'s commits and never cleared any floor worth
   setting. `impact` now fills remaining room with the most frequent partners at `≥ 3` shared
   commits, rendered `(N shared commits)` rather than a score so it can't be misread as one; `why`
   reports the same count whenever there is no direct edge.
 
-#### Token diet — smaller replies, a smaller skill
+#### Token diet: smaller replies, a smaller skill
 
 - **Task tools reply with text only by default.** The `structuredContent` copy of every reply is
   gone. **Breaking for a programmatic caller:** pass the new `json: true` argument to get the report
   back as structured text instead of parsing `structuredContent`.
-- **`tools/list` defaults to eleven tools** — the eight task tools plus `query`, `ingest_json` and
-  `stats` — down from all twenty-four. Listing is the only thing that narrows: all twenty-four stay
+- **`tools/list` defaults to eleven tools** (the eight task tools plus `query`, `ingest_json` and
+  `stats`) down from all twenty-four. Listing is the only thing that narrows: all twenty-four stay
   callable by name whichever listing is in force, and the skill names the thirteen unlisted ones so
   an agent can call one without seeing it in a list. `mushroomdb mcp --all-tools` lists the full set
   instead, including the sixteen `Advanced:`-prefixed graph tools from v0.6.0. The plugin's own MCP
@@ -2953,7 +2953,7 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   table moved to `docs/site/code-graph.md`; what's left is the first minute, the task rules, the
   learn pass and one paragraph pointing at `--all-tools`, masks, and `no auth`.
 - **`recall`'s prompt-submit nudge is silent on a generic prompt.** A stopword list (146 function
-  words plus six code-generic ones — `code`, `file`, `line`, and the like) drops glue words from the
+  words plus six code-generic ones: `code`, `file`, `line`, and the like) drops glue words from the
   search, and a relevance floor on the best hit means a prompt that resolves to nothing specific
   prints nothing rather than a low-value digest.
 - **`impact` caps the `unknown:` paths it names at three**, then `…and N more unknown`, so an
@@ -2969,12 +2969,12 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   restoring an explicit `--command` pin verbatim if the binary still exists. `doctor` reports a
   disabled install with one line and exits clean.
 
-#### The store resolves at run time — worktrees get their own
+#### The store resolves at run time: worktrees get their own
 
 - **A project install writes `--auto` instead of an absolute store path** when it can prove `--auto`
   resolves to the same directory (a git checkout, no explicit `--db`). `--auto` now walks up to the
   nearest working-tree root rather than checking only the current directory, so a linked
-  `git worktree` — which keeps its own `.git` file — resolves to its own `mushroom-memory` instead
+  `git worktree` (which keeps its own `.git` file) resolves to its own `mushroom-memory` instead
   of inheriting the original checkout's. A 0.6.0 install with the absolute path still baked in is
   rewritten to `--auto` by the next `install`. Cursor and Codex don't set the environment variable
   Claude Code does to make this provable, so they still pin the absolute path; `--db` always pins.
@@ -2998,8 +2998,8 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
 
 #### Snapshots, and a narrower `touch`
 
-- **`ingest-git` and `sync` snapshot automatically** — after a full ingest, and again once the live
-  WAL has grown past 4 MiB — so a store opens against a small WAL instead of replaying everything
+- **`ingest-git` and `sync` snapshot automatically** (after a full ingest, and again once the live
+  WAL has grown past 4 MiB) so a store opens against a small WAL instead of replaying everything
   since the last manual `snapshot`. Measured on this repository: store open 288 ms → 173 ms. `touch`
   never triggers one. Every automatic snapshot (this path, `serve`'s periodic tick, graceful
   shutdown, and a bare `mushroomdb snapshot` with no flags) archives the WAL it replaces rather than
@@ -3009,7 +3009,7 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   rather than deleting it, so a store that snapshots on every sync would otherwise leave one more
   `wal.<N>.archive` behind per 4 MiB of churn and never reclaim any of them. The bound applies only
   to the snapshots mushroomdb takes on its own; `mushroomdb snapshot <db>` still keeps every
-  archive, and `--retention N` sets the number. Pruning advances the history horizon — the reads
+  archive, and `--retention N` sets the number. Pruning advances the history horizon: the reads
   above stop reaching commits below it, and `open_at` answers for commits after the last snapshot
   once the first prune has broken the `wal.genesis` chain. See `docs/site/durability.md`.
 - **`touch` narrows its structure pass to the files it was actually given** instead of scanning
@@ -3028,16 +3028,16 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
 #### Known
 
 - **`snapshot.bin` is much larger than the data it holds.** Every string-typed column carries its
-  own full copy of the store's string table, so an interned string is written once per column —
+  own full copy of the store's string table, so an interned string is written once per column:
   37 MB for a store whose logical properties are under 4 MB on this repository. It costs more from
   this release on, because `ingest-git` and `sync` now snapshot on their own. The fix needs no
   format change and is the next release's first storage item.
 
-## v0.6.0 — 2026-09-04
+## v0.6.0: 2026-09-04
 
 ### The live code graph (format-stable)
 
-No format change — snapshot VERSION stays V8 and WAL discriminants stay `0`–`22`. One new file
+No format change: snapshot VERSION stays V8 and WAL discriminants stay `0`–`22`. One new file
 appears in a store directory: `LOCK`, always empty, carrying the advisory cross-process write
 lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
@@ -3045,7 +3045,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 - **Via-hop rules could retract all their edges after a snapshot.** The rule engine read topology
   from the write overlay only, so a via rule evaluated on a snapshot-opened store saw no via edges
-  and retracted the ones already derived — `KNOWS` on this repository's own store went from 20
+  and retracted the ones already derived: `KNOWS` on this repository's own store went from 20
   edges to 1 after a snapshot followed by an incremental `ingest-git`. Fixed at the root; the
   graph produced through the snapshot path is now byte-identical to the graph produced without
   one.
@@ -3059,7 +3059,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
   it first. `GraphDb::open` holds it for the handle's lifetime; `SharedDb` (the server) takes it
   per write scope and per group commit, so it never shuts other processes out between writes.
   `snapshot()` refuses without it.
-- **`GraphError::Busy`** — the new error a writer gets when it cannot take the lock within
+- **`GraphError::Busy`**: the new error a writer gets when it cannot take the lock within
   `WRITE_LOCK_WAIT` (2 s). Nothing was written and no in-memory state changed, so a retry is
   always safe. CLI write commands exit **3** with `another mushroomdb process is writing; retry`.
 - **`refresh()`** applies another process's committed WAL frames through the same code path the
@@ -3078,7 +3078,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 #### The repository graph
 
-- **New crate `mushroomdb-extract`** (`crates/code-extract`) — tree-sitter symbol, import and call
+- **New crate `mushroomdb-extract`** (`crates/code-extract`): tree-sitter symbol, import and call
   extraction for Rust, Python, TypeScript, TSX and JavaScript, plus Markdown headings and
   mentions. Bytes in, facts out: it opens no file and touches no database.
 - **`ingest-git` graphs structure, not just history.** The working-tree pass adds `Symbol` nodes
@@ -3098,31 +3098,31 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 #### New commands
 
-- **`mushroomdb map <dir> [--json]`** — the repository in one screen: size, last sync, file
+- **`mushroomdb map <dir> [--json]`**: the repository in one screen: size, last sync, file
   clusters with cohesion, most-depended-on files, owners, recently-hot files, and three questions
   worth asking. 17 lines on this repository.
-- **`mushroomdb context <dir> <target>`** — one file or symbol from every side: signature, doc,
+- **`mushroomdb context <dir> <target>`**: one file or symbol from every side: signature, doc,
   source read from the working tree, owner, callers, callees, importers, co-change partners,
   recent commits, notes and concepts. `<target>` is a path, a symbol key (`path#name`), or a bare
   symbol name; an ambiguous bare name returns the candidates.
-- **`mushroomdb impact <dir> <file>...`** — co-change partners with scores and whether each is
+- **`mushroomdb impact <dir> <file>...`**: co-change partners with scores and whether each is
   itself modified, importers, the symbols other files call, and the owner. With no files it reads
   the working tree's diff against `HEAD` plus untracked files.
-- **`mushroomdb owners <dir> <path>`** — top author and share, who else knows the file, the last
+- **`mushroomdb owners <dir> <path>`**: top author and share, who else knows the file, the last
   commit to touch it, and the split by quarter.
-- **`mushroomdb why <dir> <a> <b>`** — every rule edge between two nodes with the evidence that
+- **`mushroomdb why <dir> <a> <b>`**: every rule edge between two nodes with the evidence that
   produced it (the shared commits, the importing line and its line number, the calling line), or
   the shortest path between them when there is no direct link.
-- **`mushroomdb sync <dir> [--json]`** — replays the commits since the last sync, then re-extracts
+- **`mushroomdb sync <dir> [--json]`**: replays the commits since the last sync, then re-extracts
   the files that differ from `HEAD`. Takes no repository argument: it reads it off the graph.
-- **`mushroomdb touch <dir>|--auto [<file>...]`** — re-extracts just these files. With no file
+- **`mushroomdb touch <dir>|--auto [<file>...]`**: re-extracts just these files. With no file
   argument it reads them from a `PostToolUse` payload on stdin.
-- **`mushroomdb doctor [--project|--user] [--platform …]`** — verifies an install end to end and
+- **`mushroomdb doctor [--project|--user] [--platform …]`**: verifies an install end to end and
   prints one line per check: config entry, `npx` reachability, store open and staleness, the write
   lock, the two settings hooks, the three git hooks, a real `initialize` + `tools/list` handshake
   with the configured command, and a duplicate server in the other scope. Exit 1 on any `fail`.
 - **`mushroomdb algo communities <dir> [--edge-type T]... [--weight-prop P] [--min-weight X]
-  [--top N]`** — Louvain community detection with per-community cohesion and overall modularity.
+  [--top N]`**: Louvain community detection with per-community cohesion and overall modularity.
   Deterministic, and honours `budget_ms` by returning the partition so far with `(truncated)`.
 - **`mushroomdb mcp --auto`** and **`recall --auto`** / **`touch --auto`** resolve the store as
   `$CLAUDE_PROJECT_DIR/mushroom-memory`, falling back to `./mushroom-memory`.
@@ -3130,15 +3130,15 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 #### MCP server
 
-- **Eight task tools** — `map`, `context`, `impact`, `owners`, `why`, `recall`, `remember`,
-  `sync` — answer a repository question in one call. Each returns the rendered digest as text
+- **Eight task tools** (`map`, `context`, `impact`, `owners`, `why`, `recall`, `remember`,
+  `sync`) answer a repository question in one call. Each returns the rendered digest as text
   *and* the structured report as `structuredContent`, so a host that ignores structured output
   still shows something readable.
 - **The sixteen graph tools now carry an `Advanced:` prefix** in `tools/list` and are listed after
   the task tools, so an assistant can tell which surface is the front door. The tool names,
   arguments and result shapes are unchanged.
-  > **Superseded in v0.6.1** — task tools reply with text only by default (`structuredContent` was
-  > removed, a breaking change for a programmatic caller — pass `json: true` for the structured
+  > **Superseded in v0.6.1**: task tools reply with text only by default (`structuredContent` was
+  > removed, a breaking change for a programmatic caller; pass `json: true` for the structured
   > report), and the default `tools/list` shrank to eleven tools (the eight task tools plus
   > `query`, `ingest_json` and `stats`); `--all-tools` still lists all twenty-four. See the v0.6.1
   > entry below.
@@ -3151,7 +3151,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 - **The `UserPromptSubmit` hook is diff-aware.** With a dirty working tree it names the co-change
   partners and importers your change reaches that you have *not* modified, the owner of the
-  change, and how many concepts your edits made stale — at most eight lines. A clean tree falls
+  change, and how many concepts your edits made stale: at most eight lines. A clean tree falls
   back to the topic digest. Silent on any failure, and read-only.
 - **A `PostToolUse` hook** matched to `Edit|Write|MultiEdit` runs `touch` asynchronously, so a
   symbol you just renamed is in the graph by the next question. It prints nothing and exits 0
@@ -3164,16 +3164,16 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 - **The MCP entry runs `npx -y mushroomdb@<version>` by default**, pinned to the version that
   wrote it. The bare `mushroomdb` name is written only when the `PATH` hit canonicalizes to the
-  running executable. **Nothing is copied into `~/.mushroomdb/bin` any more** — the absolute path
+  running executable. **Nothing is copied into `~/.mushroomdb/bin` any more**: the absolute path
   a 0.5.x install wrote is re-pinned in place on the next `install`.
-  > **Superseded in v0.6.1** — a Claude Code project install resolves the store at `--auto` instead
+  > **Superseded in v0.6.1**: a Claude Code project install resolves the store at `--auto` instead
   > of writing an absolute path (so a `git worktree` gets its own store), and every hook and MCP
   > entry `install` writes now runs the resolved native binary directly instead of spawning `npx`.
   > `--no-prewarm` also skips that resolution. See the v0.6.1 entry below.
 - **`--command <path>`** invokes a specific binary instead. A relative `--command` or `--db` is
   anchored to the current directory before anything is written; a bare name is a `PATH` lookup and
   is written as given.
-- **Scope is inferred** — project inside a git checkout, user anywhere else — and printed in the
+- **Scope is inferred** (project inside a git checkout, user anywhere else) and printed in the
   summary. An install in the other scope is reported with the `uninstall` that removes it, never
   edited.
 - **Codex is opt-in** (`--platform codex`), because registering with it runs another program.
@@ -3183,7 +3183,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
   for the same store is replaced rather than added beside, so a 0.5.x upgrade does not leave two
   recall digests running per prompt.
 - **A `.gitignore` line** for the store directory when the store is inside the repository, removed
-  on uninstall — and only deleted along with the file if stripping our line leaves it empty.
+  on uninstall: and only deleted along with the file if stripping our line leaves it empty.
 
 #### Claude Code plugin
 
@@ -3199,7 +3199,7 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 
 #### Export and algorithms
 
-- **GraphML export** — `mushroomdb export <dir> <dest> --format graphml` writes nodes and edges as
+- **GraphML export**: `mushroomdb export <dir> <dest> --format graphml` writes nodes and edges as
   a single `.graphml` file for generic graph viewers, byte-identical between runs. `Value::Int`
   declares `attr.type="long"` (GraphML's informal convention reads `"int"` as 32-bit), and a
   property whose type is inconsistent across nodes declares `attr.type="string"` for every node.
@@ -3215,14 +3215,14 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
 #### Rules
 
 - **`KeyMatch`'s default `max_edges` is now 512, was 1.** A list-valued foreign key fires once per
-  element, up to `MAX_KEYMATCH_LIST` = 512 elements in stored order, so one node can point at many
-  — which is what `imports`, `calls_to` and `mentions` need. Rules already stored keep the
+  element, up to `MAX_KEYMATCH_LIST` = 512 elements in stored order, so one node can point at many,
+  which is what `imports`, `calls_to` and `mentions` need. Rules already stored keep the
   `max_edges` they were written with, so a rule saved with `max_edges: 1` still keeps a single
   destination per source.
 
 #### Python bindings
 
-- **`GraphDb.open(path, read_only=False)`** — a read-only handle never takes the lock, raises
+- **`GraphDb.open(path, read_only=False)`**: a read-only handle never takes the lock, raises
   `RuntimeError` from every mutation, and still refreshes.
 - **`refresh()`** returns the number of peer commits applied.
 - **`MushroomBusy`** is raised when another process holds the write lock.
@@ -3247,22 +3247,22 @@ and appends 10 WAL commits instead of 66.
 
 #### Release engineering
 
-- **`scripts/acceptance-0.6.sh`** — a seven-step release acceptance run in a throwaway worktree:
+- **`scripts/acceptance-0.6.sh`**: a seven-step release acceptance run in a throwaway worktree:
   ingest floors read back with Cypher, `map` under 40 lines, two independent ingests exporting
   identical JSONL, an added import producing a direct `IMPORTS` edge with its line number and a
   reverted import retracting it, the dirty-tree nudge, 20 concurrent `touch` processes against a
   live MCP server followed by `verify`, and the timing table. Runs in CI as the `code-graph` job.
-- **`scripts/bench-code-graph.sh`** — the measured table on this repository and any tree named in
+- **`scripts/bench-code-graph.sh`**: the measured table on this repository and any tree named in
   `BENCH_REPOS`, including the determinism column.
 - **`scripts/render-plugin.sh [--check]`** renders the plugin from the CLI's real skill and the
   templates; CI fails on drift and runs `claude plugin validate --strict`.
 - **An SDK-level MCP handshake test** in CI, plus a post-publish `npx` smoke test.
 
-## v0.5.2 — 2026-09-03
+## v0.5.2: 2026-09-03
 
 ### Python binding parity (format-stable)
 
-No format change — snapshot VERSION stays V8 and WAL discriminants are untouched; every item
+No format change: snapshot VERSION stays V8 and WAL discriminants are untouched; every item
 below is binding surface, one new read-only Cypher scalar, and docs. Upgrade in place from any
 0.4.x or 0.5.x store.
 
@@ -3273,7 +3273,7 @@ The gaps a real integrator hit using the Python binding, closed:
   derived; an unknown key raises `KeyNotFound` as it does in Rust.
 - **`key(n)` Cypher scalar.** A node's key is not a property, so `n.key` never resolved and there
   was no way to project or filter on the key from Cypher. `key(n)` is now in both scalar registries
-  — read queries and the `MATCH … SET … RETURN` mirror — and returns the key string. A non-node
+  (read queries and the `MATCH … SET … RETURN` mirror) and returns the key string. A non-node
   argument (property expression, relationship variable, wrong arity) is a named error, not a silent
   null. `node_info` already carried `"key"`; the binding README and `docs/site/query.md` now say so.
 - **`upsert_node(label, key, props)`** returning `"inserted"` or `"updated"`. Writes only the
@@ -3298,26 +3298,26 @@ The gaps a real integrator hit using the Python binding, closed:
   so `help(mushroomdb.GraphDb)` is useful at the REPL.
 - **Concurrency documented (docs only; no lock in this release).** One writer process per store;
   a handle sees only the commits made through it; there is no cross-process lock yet, and no
-  `reopen()` — close and `open` again to pick up another process's writes.
+  `reopen()`: close and `open` again to pick up another process's writes.
 - **Fix: MCP `initialize` now returns `serverInfo.version`.** Claude Code rejected the handshake
   without it, so the server never connected in Claude Code before this release.
 
-## v0.5.1 — 2026-09-03
+## v0.5.1: 2026-09-03
 
 - **Fix: `npx mushroomdb install` wrote a bare `mushroomdb` command** because npm's shim on PATH
   looked like the binary; install now writes the bare name only when the PATH entry is this
   executable, otherwise copies the binary to `~/.mushroomdb/bin`. `npx` prepends
   `~/.npm/_npx/<hash>/node_modules/.bin` to PATH and the `mushroomdb` there is npm's Node entry
-  point, so the bare name resolved inside the npx shell and nowhere else — the MCP server and the
+  point, so the bare name resolved inside the npx shell and nowhere else: the MCP server and the
   recall hook failed with ENOENT after install. `npm i -g mushroomdb` installs the same shim and
   now copies too. Classification compares canonicalized paths, so a symlink to the real binary
   (`cargo install`, Homebrew) still gets the upgrade-safe bare name.
 
-## v0.5.0 — 2026-09-03
+## v0.5.0: 2026-09-03
 
 ### The memory release (format-stable)
 
-No format change — upgrade in place from any 0.4.x store. Snapshot VERSION stays V8; WAL
+No format change: upgrade in place from any 0.4.x store. Snapshot VERSION stays V8; WAL
 discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchanged.
 
 #### Front door
@@ -3358,8 +3358,8 @@ discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchan
   touch of each file, and a full re-ingest repairs it at once. The `File.alive` prop, which was
   only ever written as `true`, is gone.
 - **`File.n_commits` is the true total.** It was written as the length of the capped `commits`
-  list, so a file past `--max-commits-per-file` (default 200) reported a history frozen at the cap
-  — contradicting the documented "counts every commit that ever touched the file". It now carries
+  list, so a file past `--max-commits-per-file` (default 200) reported a history frozen at the cap,
+  contradicting the documented "counts every commit that ever touched the file". It now carries
   the real count, which is also what `author_counts` sums to.
 
 #### Engine
@@ -3402,11 +3402,11 @@ discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchan
   accounting in `ingest-git`; `create_rule` via backfill and `rebuild` remain separate
   implementations.
 
-## v0.4.5 — 2026-09-03
+## v0.4.5: 2026-09-03
 
 ### `install` writes an MCP command that actually resolves (format-stable)
 
-No format change — upgrade in place from any 0.4.x store. Patch release for
+No format change: upgrade in place from any 0.4.x store. Patch release for
 the `mushroomdb install` front door; no engine or storage changes.
 
 - **Fix: `mushroomdb install` produced a server that never connected when the
@@ -3425,11 +3425,11 @@ the `mushroomdb install` front door; no engine or storage changes.
   same path is rewritten in place. `install` also prints the resolved command and
   a reminder to restart the assistant.
 
-## v0.4.4 — 2026-09-02
+## v0.4.4: 2026-09-02
 
 ### The front door (format-stable)
 
-No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+No format change: upgrade in place from any 0.4.x store. The WAL discriminants,
 snapshot section IDs, and `VERSION` constant remain at V8.
 
 - **`mushroomdb install` / `mushroomdb uninstall` subcommands.** One-command setup
@@ -3460,11 +3460,11 @@ snapshot section IDs, and `VERSION` constant remain at V8.
   migration. This release is purely additive (CLI subcommands, skill content,
   documentation).
 
-## v0.4.3 — 2026-09-02
+## v0.4.3: 2026-09-02
 
 ### Query completeness + observability (format-stable, final 0.4.x patch)
 
-No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+No format change: upgrade in place from any 0.4.x store. The WAL discriminants,
 snapshot section IDs, and `VERSION` constant remain at V8. T1–T4 are
 planner/executor/runtime changes only; all query results are byte-identical to
 unindexed execution (equivalence-tested in every task).
@@ -3483,9 +3483,9 @@ unindexed execution (equivalence-tested in every task).
   byte-identical to the unoptimized path in all cases, including the fallback.
 
 - **Compound AND-of-equalities via index intersection (T2).** Queries with two or
-  more equality predicates on the same scanned variable — whether from inline
-  patterns (`MATCH (n:Doc {namespace: 'a', status: 'live'})`) or `WHERE` clauses
-  (`WHERE n.namespace = $ns AND n.status = 'live'`) — now emit a new
+  more equality predicates on the same scanned variable (from inline patterns
+  such as `MATCH (n:Doc {namespace: 'a', status: 'live'})`, or `WHERE` clauses such as
+  `WHERE n.namespace = $ns AND n.status = 'live'`) now emit a new
   `IndexIntersect` plan operator. The executor resolves each `(field, operand)` pair
   via `nodes_with_prop`, two-pointer-intersects the resulting sorted id-lists
   (smallest first for efficiency), then applies any unindexed fields as per-node
@@ -3505,7 +3505,7 @@ unindexed execution (equivalence-tested in every task).
   any plan that includes `Expand` (edge traversal) clears the skip flag and always
   re-executes. A skipped re-execution is provably unable to change the result set.
   Subscriptions over traversal queries (`MATCH (a)-[:E]->(b) ...`) retain
-  `scan_label = None` and never skip — the honest v0.4.3 boundary, documented.
+  `scan_label = None` and never skip: the honest v0.4.3 boundary, documented.
 
 - **`GET /metrics` endpoint + slow-query log (T4).** A new `GET /metrics` route
   (same auth middleware as `GET /stats`) returns a JSON object with:
@@ -3524,14 +3524,14 @@ unindexed execution (equivalence-tested in every task).
 
 - **`#[doc(hidden)]` on test-instrumentation helpers.** `query_sub_exec_count()`
   and `reset_query_sub_exec_count()` in `mushroomdb` (core-api) are now tagged
-  `#[doc(hidden)]` — no behavior change; the functions remain `pub` for integration
+  `#[doc(hidden)]`; no behavior change; the functions remain `pub` for integration
   tests.
 
-## v0.4.2 — 2026-09-01
+## v0.4.2: 2026-09-01
 
 ### Hardening patch (format-stable)
 
-No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+No format change: upgrade in place from any 0.4.x store. The WAL discriminants,
 snapshot section IDs, and `VERSION` constant remain at V8. (The `encode_v7` header
 fix in this release touches a test-only encoder for the historical V7 format; the
 current-format code path is unchanged.)
@@ -3539,7 +3539,7 @@ current-format code path is unchanged.)
 - **Shutdown missed-wakeup fix (macOS hang).** `WriteQueue::signal_shutdown` now holds
   the queue mutex while setting the shutdown flag and calling `notify_all`. Without the
   lock the drain thread could observe the flag, release the mutex, and enter
-  `Condvar::wait` after the notify fired — a missed wakeup that left `DrainHandle::drop`
+  `Condvar::wait` after the notify fired: a missed wakeup that left `DrainHandle::drop`
   blocked forever. macOS thread-startup timing entered this window reliably; Ubuntu
   rarely did. Fixed by taking the lock before the store+notify so the wakeup cannot be
   lost. A 200-iteration stress test (`shared_db_drop_never_hangs`) guards against
@@ -3567,7 +3567,7 @@ current-format code path is unchanged.)
   `docs/site/durability.md` gains a format-compatibility matrix (V5→0.1.0 through
   V8→0.2.0+) with the patch-stability promise documented.
 
-- **HNSW recall fix — layer-0 link budget and candidate floor (behavior change,
+- **HNSW recall fix: layer-0 link budget and candidate floor (behavior change,
   disclosed).** The v0.4.1 changelog noted "IVF-Flat recall ≈0.55 at 5k×1536-D" as a
   known issue. That was a misdiagnosis: the actual recall path is HNSW, not IVF. IVF
   probe/cluster knobs had zero effect because `VectorSimilar approximate: true` routes
@@ -3581,10 +3581,10 @@ current-format code path is unchanged.)
   test is now gated in CI (previously excluded with a stale "IVF recall gap" note).
   Costs disclosed: layer-0 index memory doubles (~256 B → ~512 B/node; ~256 MB at the
   500k-node ceiling); approximate-rule backfill on dense fixtures is ~5× slower (44.8 s
-  → 227.6 s at 5k — the price of correct results). Known limitation: the density ceiling
+  → 227.6 s at 5k: the price of correct results). Known limitation: the density ceiling
   moved to ~128-node clusters; the structural fix (HNSW §3.5 diverse-neighbor selection)
   is tracked for 0.4.3+. **Behavior change:** derived edges from ANN-based association
-  rules may differ after a store rebuild — they are now more complete. Stores opened
+  rules may differ after a store rebuild: they are now more complete. Stores opened
   without a rebuild continue to serve queries normally; the change takes effect when the
   rule engine re-derives edges (on rebuild or new writes that trigger the rule).
 
@@ -3593,11 +3593,11 @@ current-format code path is unchanged.)
   description was stale). `CHANGELOG.md` v0.4.1 case-count corrected ("1280 cases
   total: 768 WAL-replay + 512 HTTP-body").
 
-## v0.4.1 — 2026-09-01
+## v0.4.1: 2026-09-01
 
 ### Foundations (format-stable patch)
 
-No format change — upgrade in place from any 0.4.0 store.
+No format change: upgrade in place from any 0.4.0 store.
 
 - **Backfill scale regression guards.** The streaming backfill introduced in
   v0.4.0 (which fixed the cross-product wall) is now locked in by peak-memory
@@ -3606,7 +3606,7 @@ No format change — upgrade in place from any 0.4.0 store.
 - **CI recall gates.** HNSW + approximate-recall floor tests (previously
   `#[ignore]`d) now run in a dedicated CI job on every merge.
 - **Known issue:** `approximate_recall_5k_timing` reveals IVF-Flat recall
-  ≈0.55 at 5k×1536-D vs the 0.90 floor — a pre-existing gap discovered by
+  ≈0.55 at 5k×1536-D vs the 0.90 floor: a pre-existing gap discovered by
   this release's gating work. The test is excluded from the CI gate until
   fixed; tracked for a 0.4.x follow-up.
 - **Benchmark baselines re-pinned.** Baselines regenerated from a canonical
@@ -3618,18 +3618,18 @@ No format change — upgrade in place from any 0.4.0 store.
 - **Fuzz targets.** WAL-replay and HTTP-body never-panic proptests (1280
   cases total: 768 WAL-replay + 512 HTTP-body).
 
-## v0.4.0 — 2026-08-31
+## v0.4.0: 2026-08-31
 
 ### Temporal / moat
 
 - Time-travel reads: `GraphDb::query_at(commit, cypher)`, `POST /query
   {"as_of": N}`, and Python `query_at` run a read-only query against the graph
-  as it existed at a past WAL commit — the agent-replay primitive. The live
+  as it existed at a past WAL commit: the agent-replay primitive. The live
   store is unaffected; writes and (for now) role/masked temporal queries are
   rejected.
 - `docs/site/roadmap-moat.md` specifies the two remaining category-defining
-  features — rule chaining (with a cycle-safe, replay-deterministic design) and
-  memory-native decay/consolidation/namespaces — ready to build with sign-off.
+  features, rule chaining (with a cycle-safe, replay-deterministic design) and
+  memory-native decay/consolidation/namespaces, ready to build with sign-off.
 
 ### Trust & hardening
 
@@ -3683,9 +3683,9 @@ between separately matched nodes does not yet create the edge.
   body cap; bounded neighborhood BFS depth.
 - CLI `algo degree`/`pagerank` gain `--dir out|in|both`.
 
-## v0.3.0 — 2026-08-30
+## v0.3.0: 2026-08-30
 
-Role-scoped writes and mask-aware vector search. Additive over v0.2.0 — no
+Role-scoped writes and mask-aware vector search. Additive over v0.2.0; no
 breaking changes; existing role tokens and stores behave exactly as before.
 
 ### RBAC write scopes (role-bounded mutations)
@@ -3707,7 +3707,7 @@ write a role performs can reveal or touch data outside its visibility.
   the Cypher `MATCH` phase of a role-scoped write reads through the role's
   mask; a role can read back a node it just created via `MERGE … RETURN`.
 - `create/update/delete_labels ⊆` the role's read labels, validated at
-  `apply_schema` — a role can never touch state it cannot observe.
+  `apply_schema`: a role can never touch state it cannot observe.
 - `/rules`, `/subscribe`, `/watch`, `/stats`, `/suggest`, `/explain`,
   `/algo/*`, `/backup`, and node rename remain admin-only for all role
   tokens. The full §6.2 adversarial checklist ships as executable tests.
@@ -3725,7 +3725,7 @@ write a role performs can reveal or touch data outside its visibility.
 - `MERGE … RETURN` under a role token now returns the just-created node
   instead of empty rows (the authz mask is re-resolved after the create).
 
-## v0.2.0 — 2026-08-29
+## v0.2.0: 2026-08-29
 
 The association-engine release: trust, physics, and agent-default memory.
 
@@ -3755,14 +3755,14 @@ The association-engine release: trust, physics, and agent-default memory.
 
 ### Temporal memory (time travel for agents)
 
-- `edge_history(a, b)` and `was_linked(a, b, type, at_commit)` — full edge
+- `edge_history(a, b)` and `was_linked(a, b, type, at_commit)`: full edge
   lifecycle over the WAL, including rule-derived edges with rule
   attribution (history markers written at true firing time).
 - Compare-and-set writes: `write_batch_cas` with per-node last-change
   preconditions and a typed `CasConflict` error; last-change map persists
   across snapshots (V8 LAST_CHANGE section).
 - History-preserving snapshots: `archive_wal` keeps WAL segments as
-  `wal.<n>.archive` with retention — unbounded time travel for
+  `wal.<n>.archive` with retention: unbounded time travel for
   `node_history` / `edge_history` / `open_at`, honest genesis-chain
   contract for pre-archive commits.
 - All history APIs over HTTP and MCP; horizons reported in every response.
@@ -3774,13 +3774,13 @@ The association-engine release: trust, physics, and agent-default memory.
   are read-only in v0.2; never-widen is the standing invariant.
 - Restricted-stub mask mode (opt-in): hidden nodes surface as
   `{key, restricted: true}` stubs on read surfaces instead of being
-  omitted — per-mask choice, never available to role tokens.
+  omitted: per-mask choice, never available to role tokens.
 
 ### Fulltext v2
 
 - BM25 ranking (k1=1.2, b=0.75), Snowball English stemming at index and
-  query time, `"phrase"` adjacency matching, `-term` negation, `prefix*`
-  — in `search`, `search_hybrid` (RRF text leg upgrades automatically),
+  query time, `"phrase"` adjacency matching, `-term` negation, `prefix*`:
+  in `search`, `search_hybrid` (RRF text leg upgrades automatically),
   and Cypher `textMatches`.
 
 ### Operations: backup + export
@@ -3794,9 +3794,9 @@ The association-engine release: trust, physics, and agent-default memory.
 
 ### Quality of life
 
-- `rename_node(old, new)` — key changes, identity and history follow.
+- `rename_node(old, new)`: key changes, identity and history follow.
 - Edge upsert with placeholder endpoints (`POST /edges/upsert`).
-- Python `query(cypher, params=...)` — parameterized queries (dict or
+- Python `query(cypher, params=...)`: parameterized queries (dict or
   tuple list); no more string interpolation.
 - `Value::Map`, hybrid RRF search, `apply_schema`, `node_history` (0.1.2
   interim releases, first tagged here).
@@ -3811,18 +3811,18 @@ The association-engine release: trust, physics, and agent-default memory.
   `serve_with_role_tokens` / `serve_with_ui_and_role_tokens`).
 - Snapshot format V8 (auto-migration from V5+ on open).
 
-## v0.1.1 — 2026-08-24
+## v0.1.1: 2026-08-24
 
 ### MCP agent-memory tools
 
-Three new MCP tools for agent workflows — available via `mushroomdb mcp <dir>`:
+Three new MCP tools for agent workflows: available via `mushroomdb mcp <dir>`:
 
-- **`upsert_entity`** — insert or update a node by key with no existence
+- **`upsert_entity`**: insert or update a node by key with no existence
   check required; creates the node if absent, updates properties if present.
-- **`find_similar`** — return neighbors connected by a given edge type
+- **`find_similar`**: return neighbors connected by a given edge type
   (default `SIMILAR`); designed for vector-rule recall in agent-memory
   workflows.
-- **`explain_association`** — explain rule-derived associations between two
+- **`explain_association`**: explain rule-derived associations between two
   node keys; returns rule name, edge type, and match score per link. Alias
   of `explain` with a semantically clearer name.
 
@@ -3845,20 +3845,20 @@ release build:
 | **Total** | **2.878 s** |
 
 Result: **within target**. Re-measured on v0.1.1: N=5 median 2.878 s vs 2.894 s
-baseline — no residual regression at this scale. No code change was required.
+baseline; no residual regression at this scale. No code change was required.
 
 ### Snapshots
 
-- **V6 snapshot format (compressed)** — `snapshot()` now writes a zstd-compressed
+- **V6 snapshot format (compressed)**: `snapshot()` now writes a zstd-compressed
   (level 3) V6 container. Wire format: `GDB1` magic + 2-byte version header
   (uncompressed); body is a zstd stream of the existing V5 payload (CRC32 + bincode).
   Measured at 5k nodes: 62 KiB on disk, 16 ms write, 2 ms open. At 100k nodes
   (9 rules, ~10.5M derived edges): **1.1 GiB on disk** (−50% vs V5 ~2.2 GiB),
   **22.563 s write**, **8.880 s open** (V5 baseline: 25.09 s write, 8.71 s open).
-  v0.1.0 V5 snapshots are read transparently — no migration required. Old binaries
+  v0.1.0 V5 snapshots are read transparently; no migration required. Old binaries
   cannot read V6 files (forward-breaking for the snapshot file only; WAL format and
   Python/HTTP API are unchanged).
-- **`snapshot_with(SnapshotOptions { keep_wal: bool })`** — new API that exposes
+- **`snapshot_with(SnapshotOptions { keep_wal: bool })`**: new API that exposes
   snapshot options. `keep_wal: true` writes the V6 snapshot but preserves the WAL,
   keeping pre-snapshot commits reachable via `open_at`. Crash-safe: snapshot write
   is atomic; if it crashes the full WAL is intact and replay over the snapshot is
@@ -3866,17 +3866,17 @@ baseline — no residual regression at this scale. No code change was required.
 
 ### Cypher
 
-- **`IS NULL` / `IS NOT NULL`** — postfix null-check predicate in `WHERE` and `WITH … WHERE`; composes with `AND`/`OR`/`NOT`; enables the anti-join idiom (`OPTIONAL MATCH … WHERE b IS NULL`).
-- **General arithmetic (`+`, `-`, `*`, `/`)** — arithmetic expressions in `RETURN`, `WHERE` comparisons, `SET` RHS, and function arguments; operator precedence (`*`/`/` over `+`/`-`); parentheses; null propagation; saturating integer arithmetic; named error on division by zero.
-- **`CREATE … RETURN`** and **`MERGE … RETURN`** — single-statement write-then-project; write commits to WAL before projection; returns created/matched node bindings and computed columns.
+- **`IS NULL` / `IS NOT NULL`**: postfix null-check predicate in `WHERE` and `WITH … WHERE`; composes with `AND`/`OR`/`NOT`; enables the anti-join idiom (`OPTIONAL MATCH … WHERE b IS NULL`).
+- **General arithmetic (`+`, `-`, `*`, `/`)**: arithmetic expressions in `RETURN`, `WHERE` comparisons, `SET` RHS, and function arguments; operator precedence (`*`/`/` over `+`/`-`); parentheses; null propagation; saturating integer arithmetic; named error on division by zero.
+- **`CREATE … RETURN`** and **`MERGE … RETURN`**: single-statement write-then-project; write commits to WAL before projection; returns created/matched node bindings and computed columns.
 
 ### Packaging
 
-- **Prebuilt Intel macOS (`x86_64-apple-darwin`) binaries dropped** — GitHub's hosted `macos-13` runners are chronically starved (the v0.1.0 build sat queued past the 24-hour cap). Releases now ship `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`; Intel macOS users build from source (`cargo build -p mushroomdb-cli --release`). The Homebrew formula is arm64-only on macOS.
+- **Prebuilt Intel macOS (`x86_64-apple-darwin`) binaries dropped**: GitHub's hosted `macos-13` runners are chronically starved (the v0.1.0 build sat queued past the 24-hour cap). Releases now ship `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`; Intel macOS users build from source (`cargo build -p mushroomdb-cli --release`). The Homebrew formula is arm64-only on macOS.
 
 ---
 
-## v0.1.0 — 2026-08-21
+## v0.1.0: 2026-08-21
 
 First tagged release.
 
@@ -3884,27 +3884,27 @@ First tagged release.
 
 ### Engine
 
-- **Incremental linking rules** — declare a predicate once; every subsequent write
+- **Incremental linking rules**: declare a predicate once; every subsequent write
   evaluates it and fires or retracts the matching edges automatically. Six predicate
   kinds: `KeyMatch`, `FieldEqual`, `Overlap` (Jaccard), `NumericWithin`, `GeoRadius`,
   `VectorSimilar` (cosine). Predicates compose via `All(...)` (AND, score = min) and
   `Any(...)` (OR, score = max), nestable to depth 4.
-- **Auto-FK detection** — fields ending in `_id` whose values match existing node keys
+- **Auto-FK detection**: fields ending in `_id` whose values match existing node keys
   get `KeyMatch` rules created automatically at ingest time.
-- **Top-k per source** — `max_edges: Some(k)` limits the engine to the k highest-scoring
+- **Top-k per source**: `max_edges: Some(k)` limits the engine to the k highest-scoring
   destinations per source node; eviction and backfill fire automatically on every mutation.
-- **Approximate vector mode** — `VectorSimilar` with `approximate: true` uses IVF-Flat
+- **Approximate vector mode**: `VectorSimilar` with `approximate: true` uses IVF-Flat
   candidate selection. Measured per-query recall ≥ 0.90 quiesced, ≥ 0.85 post-rebuild
   at 5k nodes / dim 1536. Exact backfill ~12 min, approximate ~17 s at that scale.
-- **Crash-atomic write batches** — `write_batch(|b| { … })` commits any number of mixed
+- **Crash-atomic write batches**: `write_batch(|b| { … })` commits any number of mixed
   ops in one WAL frame; on crash replay the frame is all-or-nothing.
-- **Materialized views** — `create_view` maintains per-node derived properties
+- **Materialized views**: `create_view` maintains per-node derived properties
   (degree counts, neighbor-aggregate sum/avg/min/max/count) incrementally on every edge
   change. Values persist through WAL and snapshots; rebuild in O(nodes × degree) on open.
-- **Rule suggestions** — `suggest_rules()` (and `GET /suggest`, `mushroomdb suggest`)
+- **Rule suggestions**: `suggest_rules()` (and `GET /suggest`, `mushroomdb suggest`)
   profiles the data and returns a ranked list of candidate rules with estimated edge
   counts, example pairs, and rationale. No rule is ever applied automatically.
-- **WAL + versioned snapshots** — CRC-checksummed WAL with per-commit fsync; versioned
+- **WAL + versioned snapshots**: CRC-checksummed WAL with per-commit fsync; versioned
   snapshots in a zero-copy archived format (V5). Open = snapshot + WAL replay. Derived
   edges are not WAL-logged; they are re-materialized from node data on open.
 
@@ -3917,7 +3917,7 @@ First tagged release.
 - `UNWIND` list expansion
 - `CREATE` (nodes and relationships), `MATCH … SET`, `MATCH … DELETE`,
   `MATCH … DETACH DELETE`, `MERGE` (single-key match-or-create)
-- Aggregations: `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` — single and grouped
+- Aggregations: `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX`: single and grouped
 - Variable-length paths: `-[r:TYPE*min..max]->` and `shortestPath`; max hops capped at 10
 - Query parameters: `$name` placeholders replaced at query time
 - Scalar functions: `toLower`, `toUpper`, `size`, `coalesce`, `type(r)`, `abs`, `round`
@@ -3935,28 +3935,28 @@ First tagged release.
 
 ### Unlocks
 
-- **Time travel** — `open_at(&dir, commit)` replays the WAL to any past commit, giving a
+- **Time travel**: `open_at(&dir, commit)` replays the WAL to any past commit, giving a
   read-only view of the graph at that point. Scope: commits in the current WAL since the
   last snapshot.
-- **Live subscriptions** — `subscribe_rule("name")` and `GET /subscribe` (WebSocket)
+- **Live subscriptions**: `subscribe_rule("name")` and `GET /subscribe` (WebSocket)
   stream `EdgeFired` / `EdgeRetracted` / `NodeInserted` / `NodeDeleted` events after each
   WAL fsync. Measured end-to-end latency: in-process p50 0.04 µs / p95 0.21 µs; over WS
   on localhost p50 61 µs / p95 88 µs.
-- **Full-text search** — `enable_fulltext(label, field)` builds and maintains an inverted
+- **Full-text search**: `enable_fulltext(label, field)` builds and maintains an inverted
   index. Queries support AND/OR boolean operators and prefix matching (`rust*`).
-- **Graph algorithms** — PageRank, weakly-connected components (WCC), and degree
+- **Graph algorithms**: PageRank, weakly-connected components (WCC), and degree
   centrality over the unified topology (manual + derived edges), accessible via the Rust
   API and the `mushroomdb algo` CLI subcommands.
 
 ### Clients
 
-- **TypeScript client** (`clients/typescript`) — wraps the HTTP + WebSocket API with full
+- **TypeScript client** (`clients/typescript`): wraps the HTTP + WebSocket API with full
   TypeScript types. Install from the repository; npm publish pending after the first tag.
-- **Python bindings** (`bindings/python`) — PyO3 thin wrapper over `core-api`. maturin
+- **Python bindings** (`bindings/python`): PyO3 thin wrapper over `core-api`. maturin
   build; PyPI publish pending after the first tag.
-- **Docker image** — `ghcr.io/matthewsherlin/mushroomdb` (registry publish pending after
+- **Docker image**: `ghcr.io/matthewsherlin/mushroomdb` (registry publish pending after
   the first tag). Local build: `docker build -t mushroomdb:local .`.
-- **MCP server** — `mushroomdb mcp <dir>` starts a stdio JSON-RPC server exposing graph
+- **MCP server**: `mushroomdb mcp <dir>` starts a stdio JSON-RPC server exposing graph
   operations as MCP tools.
 
 ### Known limitations in v0.1.0

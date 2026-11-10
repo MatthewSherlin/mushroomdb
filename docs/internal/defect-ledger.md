@@ -2,190 +2,190 @@
 
 Every defect found in mushroomdb, its severity, and the release it was fixed or
 deferred to. The ledger started at v0.6.10 with an adversarial review of
-committed work that was already green — passing tests are not evidence of an
+committed work that was already green: passing tests are not evidence of an
 absent leak.
 
 `scripts/check-defect-ledger.sh` parses the index between the
 `DEFECT-INDEX:BEGIN` / `DEFECT-INDEX:END` markers and gates releases: it exits
 non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 
-<!-- DEFECT-INDEX:BEGIN — the release gate parses ONLY between these markers. Mutation tables elsewhere in this file share the row shape and must never be counted as defects. -->
+<!-- DEFECT-INDEX:BEGIN: the release gate parses ONLY between these markers. Mutation tables elsewhere in this file share the row shape and must never be counted as defects. -->
 | # | Severity | Where | Status |
 |---|---|---|---|
 | 1 | High | `Scope::keys_cache` has no store identity | **CLOSED** |
 | 2 | Medium | `commit_seq` not monotonic across `refresh()` | **CLOSED** |
-| 3 | **High — live leak** | `explain_scoped` returns a hidden via node's weight | **CLOSED** |
-| 4 | **High — live leak** | `explanation_evidence_is_visible` ignores the rule namespace | **CLOSED** |
+| 3 | **High: live leak** | `explain_scoped` returns a hidden via node's weight | **CLOSED** |
+| 4 | **High: live leak** | `explanation_evidence_is_visible` ignores the rule namespace | **CLOSED** |
 | 5 | Low | HTTP role-branch error path not byte-identical | **CLOSED** |
 | 6 | Low | The exactness warning names parameters `search_hybrid` does not accept | **CLOSED** |
 | 7 | Medium | `Scope::intersect` is `pub`, load-bearing, and has **zero** tests | **CLOSED** |
-| 8 | **High — live leak** | `upsert_node` is an existence + label oracle on a scoped handle | **CLOSED** |
-| 9 | High | `on_conflict="replace"` deletes view-owned read-only properties | **CLOSED** — the guard is now at the choke-point, pinned over HTTP |
-| 10 | Medium | Spec §5.3's history row was deviated from — correctly — but never amended | **CLOSED** |
+| 8 | **High: live leak** | `upsert_node` is an existence + label oracle on a scoped handle | **CLOSED** |
+| 9 | High | `on_conflict="replace"` deletes view-owned read-only properties | **CLOSED**: the guard is now at the choke-point, pinned over HTTP |
+| 10 | Medium | Spec §5.3's history row was deviated from (correctly) but never amended | **CLOSED** |
 | 11 | Low | `StoreStamp`'s doc comment names two mint points; there are three | **CLOSED** |
-| 12 | Low | `graph_err` maps `Corrupt` to 400 while `role_mask_err` maps it to 500 | **CLOSED** — both answer 500 as of v0.6.11 |
+| 12 | Low | `graph_err` maps `Corrupt` to 400 while `role_mask_err` maps it to 500 | **CLOSED**: both answer 500 as of v0.6.11 |
 | 13 | Medium | `replace` is now impossible for any node a view has written to | **CLOSED** |
 | 14 | Medium | `push_unapplyable_delta_for_test` ships as public API in release builds | **CLOSED** |
-| 15 | Medium | A full-access token gets `200 OK` from a store a role token is told is corrupt | **CLOSED** — documented, not fixed: the store is not corrupt and the 200 is the correct answer |
-| 16 | Low | `_WRITES_BY_KEY` probes one key position per method | **CLOSED** — the rows are a `(method, key position)` cross-product |
-| 17 | **CRITICAL — deadlock** | `graph_err` takes the GIL while holding the store mutex | **CLOSED** — the guard is dropped before the map, pinned by a subprocess timeout test |
-| 18 | Medium | `replace` silently keeps view-owned props while three docs promise "exactly the supplied props" | **CLOSED** — `BatchOutcome::kept_view_owned`, and all three statements amended |
-| 19 | Medium | The choke-point thesis covers removal but not creation: `insert_node` never consults the view store | **CLOSED** — creation is guarded; it was a live divergence, not a redundancy |
-| 20 | Low — spec defect | Spec §5.9 and plan Task 9 require documenting a configuration that does not exist: "two processes writing with the lock disabled" | **CLOSED** — spec and plan amended with the evidence by `75de6f5` |
-| 21 | Low — plan defect | Plan Task 9's file list omits `crates/server/src/mcp.rs`, so Step 6 as scoped cannot state the `min` deviation where the spec requires it | **CLOSED** — `bab8f4e` applied the string |
-| 22 | Medium | `archive_wal` can silently opt a store back out: six fallible calls sit between the rename and the baseline that re-declares multiplicity | **CLOSED** — the baseline write moved to zero calls after the rename, and the V10 stamp recovers the declaration on open |
-| 23 | Medium | Opting in writes `snapshot.bin`, which permanently disqualifies the store from an archive genesis chain | **CLOSED** — the genesis proxy now defers to a known answer, and the same-session limit is documented |
-| 24 | Medium | A same-batch duplicate whose endpoints are created in the same frame is never counted — the primary ingest shape | **CLOSED** — the count is named in the dense rewrite, the one pass that knows the frame's own ids |
-| 25 | Low-med — doc defect | `f9d1033` falsified spec §5.13's "no snapshot-format change (V9 unchanged)" and the §7 D8 correction block, and amended neither | **CLOSED** — both amended by `75de6f5` |
-| 26 | Low | `GraphDb::format_version()`'s doc claims to name the version this binary writes; since V10 it writes 9 or 10 | **CLOSED** — reworded to name the floor, by `75de6f5` |
-| 27 | Low | A fourth hand-maintained mmap-container enumeration survives, in `snapshot::decode`'s match arm | **CLOSED** — a match guard calling `is_mmap_container`, by `75de6f5` |
-| 28 | Low | `roles()` refuses a scoped handle with `ValueError` and no doc names the class | **CLOSED** — `ValueError` kept deliberately; both docs now name it and say it is not a `MushroomError` |
-| 29 | Low — perf | `degrees_multiplicity` rebuilds both views once per row | **CLOSED** — confirmed and hoisted: 16.68ms to 14.11ms over 20k rows. The rebuild was only 18% of the gap; the rest is inherent, see the section |
-| 30 | Low | A rule whose `weight_prop` is `count` names the reserved edge property's slot | **CLOSED** — NOT REPRODUCIBLE: three barriers keep them apart, and a test now pins two of them |
-| 31 | Low — ledger defect | Row 21's status cell said the string was "not yet applied"; `bab8f4e` had applied it | **CLOSED** — row 21 corrected |
-| 32 | Medium — doc defect | `enable_multiplicity` promises a failure leaves the store opted *out*; the open-time recovery completes an opt-in that returned `Err` | **CLOSED** — behaviour kept (it is the safe direction); all four statements of the false promise corrected |
-| 33 | Medium — reasoning defect | The recovery's stated inference — "a V10 snapshot beside an archive proves the store was opted in when the archive was made" — is unsound, with a counterexample needing no failure at all | **CLOSED** — archive clause KEPT as a scope restriction, reasoning replaced in code and in row 22; the V10-only invariant pinned by test and mutation |
-| 34 | Medium — doc defect | The rollback was already unreliable on `f9d1033`: `log_then_apply` appends before it fsyncs, so a failed barrier leaves the declaration durable with no archive involved | **CLOSED** — no code change; the contract now says the call is not atomic, pinned by a test that needs no archive |
-| 35 | Low — CI gate defect | `acceptance-0.6`'s four latency budgets are four thresholds on one quantity: `--version` is 3 ms while `stats` is 371 ms, so ~95% of each reading is store open and 0-30 ms is the command. The touch budget (600 ms) sat inside the runner's own noise band — green runs read 359-588 ms on unchanged code — so it failed on runner load, not on a change | **CLOSED** — budgets set to ~2x the worst reading observed on unchanged code, and the comment now states what the numbers measure |
-| 36 | Medium — performance, pre-existing | Store open is ~371 ms for a 522-file graph on a warm local SSD, and it was ~95% of every code-graph command's wall clock. Since 0.7 every new store declares full-text (the memory schema's eight pairs, and up to 32 once `remember` self-declares), so every store that has text pays the rebuild on open, not only an `ingest-git` one; what an `ingest-git` store pays for the memory schema's pairs on top of its own has not been measured. Not introduced by 0.6.10 — CI shows the same block at 359 ms on 2026-09-11 — and not measured against 0.6.8, so its age is unknown | **CLOSED** in 0.8 — a snapshot carries the full-text index, and replaying a snapshot's declarations no longer builds the rule indexes: 252 ms → 30 ms on a code graph of this repository |
-| 37 | Medium — engine, pre-existing | On incremental retraction a rule removes an edge that another rule with the same `(src_label, dst_label, edge_type)` still desires, and the edge stays gone until a rebuild or a write to the other rule's watched fields. `crates/core-rules/src/engine.rs`: ownership is single and first-come in `apply_per_src_top_k` and `apply_desired`, retraction is unconditional, and firing is filtered by `watched_fields` | **CLOSED** — every rule over a retracted edge's type is re-evaluated for the source that lost it, in the same write; the ignored test now runs |
-| 38 | Low — unmeasured | The `UserPromptSubmit` hook's latency on a large store is unknown. ~0.24 s per prompt was measured once, on a store ingested from this repository; the hook's timeout is 5 s (`scripts/plugin-templates/hooks.json.tmpl:9`) and the CI job that timed store open was deleted with the code-graph door | **CLOSED** — measured, plan 4 Task 10: on 100,000 notes the slowest of 20 runs took 640 ms against the 5,000 ms timeout (`benchmarks/hook-latency/results/20261001T192739Z.md`) |
-| 39 | Low | On a `--delivery cli` install an empty store's brief names three MCP tools (`EMPTY_BRIEF`, `crates/core-api/src/memory/brief.rs:736`) that a CLI-only session cannot call; `reach_line` branches on delivery and `EMPTY_BRIEF` does not | **CLOSED** — plan 4 Task 9: a cli-only install's empty brief offers the shell form |
-| 40 | Low | `why` and `explain_association` cap their digest in lines only (`crates/core-api/src/explain_digest.rs:397`); one evidence line can run to kilobytes when two nodes share a long list, and `why` prints each direction | **CLOSED** — plan 4 Task 9: the bracketed evidence is cut at 240 characters; the json report is whole |
-| 41 | Low | `render_schema` (`crates/core-api/src/memory/schema.rs:129`) caps each section in lines and has no total byte cap, so a store with very long names renders an unbounded reply; the `json: true` report is uncapped by design | **CLOSED** — plan 4 Task 9: the text is capped at 12,000 bytes and says so; the json report is whole by design |
-| 42 | Low | `forget`'s refusal for a rule-derived fact names every rule with the same edge type and endpoint labels, not the rule that derived the edge (`rule_owned_refusal`, `crates/server/src/mcp_tasks.rs:2419`); at worst it names a rule too many | **CLOSED** — plan 4 Task 9: the refusal names the rule `explain` attributes the edge to |
-| 43 | Low | A key with leading or trailing whitespace gained a second, canonicalised alias on the first unrelated write after it was created | **CLOSED** — fixed by plan 3's second amendment (`0d959b5`): `aliases` is recomputed from the key and the name on each describing write, so nothing accumulates |
-| 44 | Low | Five retired hook bodies — `touch`, `intercept`, `impact-hook`, `enrich`, `sync` — still parse (`crates/cli/src/lib.rs:845-849`), exit 0 and print one stderr line, so a hook a 0.6 install wrote does not fail | **CLOSED** |
-| 45 | **High — silent wrong answer** | A rule created outside a batch logged a bare `CreateRule`, leaving every lock-free reader one symbol behind the writer for up to 63 commits: zero rows for the new rule's edges, then `mvcc delta intern mismatch` on every read | **CLOSED** — `60b3e57` (plan 3 Task 1), pinned by `crates/core-api/tests/rule_intern_reader.rs` |
-| 46 | Medium — gate defect | `scripts/ignored-test-census.sh` cannot fail a build (`:53`): 32 ignored tests, 9 named in a workflow, 23 executed nowhere, including every memory-ceiling and scale-growth assertion. It also matches `#[ignore` inside comments and reads a fixed three-line window | **CLOSED** in 0.8.1 |
-| 47 | Medium — unverified | `upsert_entity`'s create path moved from `ingest` to `insert_node` in plan 1 and nothing compares the two for type coercion, list handling or index maintenance (`docs/roadmap/v0.7-plan-1-handoff.md:290-294`) | **CLOSED** in 0.7.2 — compared, and they agree |
+| 15 | Medium | A full-access token gets `200 OK` from a store a role token is told is corrupt | **CLOSED**: documented, not fixed: the store is not corrupt and the 200 is the correct answer |
+| 16 | Low | `_WRITES_BY_KEY` probes one key position per method | **CLOSED**: the rows are a `(method, key position)` cross-product |
+| 17 | **CRITICAL: deadlock** | `graph_err` takes the GIL while holding the store mutex | **CLOSED**: the guard is dropped before the map, pinned by a subprocess timeout test |
+| 18 | Medium | `replace` silently keeps view-owned props while three docs promise "exactly the supplied props" | **CLOSED**: `BatchOutcome::kept_view_owned`, and all three statements amended |
+| 19 | Medium | The choke-point thesis covers removal but not creation: `insert_node` never consults the view store | **CLOSED**: creation is guarded; it was a live divergence, not a redundancy |
+| 20 | Low: spec defect | Spec §5.9 and plan Task 9 require documenting a configuration that does not exist: "two processes writing with the lock disabled" | **CLOSED**: spec and plan amended with the evidence by `75de6f5` |
+| 21 | Low: plan defect | Plan Task 9's file list omits `crates/server/src/mcp.rs`, so Step 6 as scoped cannot state the `min` deviation where the spec requires it | **CLOSED**: `bab8f4e` applied the string |
+| 22 | Medium | `archive_wal` can silently opt a store back out: six fallible calls sit between the rename and the baseline that re-declares multiplicity | **CLOSED**: the baseline write moved to zero calls after the rename, and the V10 stamp recovers the declaration on open |
+| 23 | Medium | Opting in writes `snapshot.bin`, which permanently disqualifies the store from an archive genesis chain | **CLOSED**: the genesis proxy now defers to a known answer, and the same-session limit is documented |
+| 24 | Medium | A same-batch duplicate whose endpoints are created in the same frame is never counted: the primary ingest shape | **CLOSED**: the count is named in the dense rewrite, the one pass that knows the frame's own ids |
+| 25 | Low-med: doc defect | `f9d1033` falsified spec §5.13's "no snapshot-format change (V9 unchanged)" and the §7 D8 correction block, and amended neither | **CLOSED**: both amended by `75de6f5` |
+| 26 | Low | `GraphDb::format_version()`'s doc claims to name the version this binary writes; since V10 it writes 9 or 10 | **CLOSED**: reworded to name the floor, by `75de6f5` |
+| 27 | Low | A fourth hand-maintained mmap-container enumeration survives, in `snapshot::decode`'s match arm | **CLOSED**: a match guard calling `is_mmap_container`, by `75de6f5` |
+| 28 | Low | `roles()` refuses a scoped handle with `ValueError` and no doc names the class | **CLOSED**: `ValueError` kept deliberately; both docs now name it and say it is not a `MushroomError` |
+| 29 | Low: perf | `degrees_multiplicity` rebuilds both views once per row | **CLOSED**: confirmed and hoisted: 16.68ms to 14.11ms over 20k rows. The rebuild was only 18% of the gap; the rest is inherent, see the section |
+| 30 | Low | A rule whose `weight_prop` is `count` names the reserved edge property's slot | **CLOSED**: NOT REPRODUCIBLE: three barriers keep them apart, and a test now pins two of them |
+| 31 | Low: ledger defect | Row 21's status cell said the string was "not yet applied"; `bab8f4e` had applied it | **CLOSED**: row 21 corrected |
+| 32 | Medium: doc defect | `enable_multiplicity` promises a failure leaves the store opted *out*; the open-time recovery completes an opt-in that returned `Err` | **CLOSED**: behaviour kept (it is the safe direction); all four statements of the false promise corrected |
+| 33 | Medium: reasoning defect | The recovery's stated inference: "a V10 snapshot beside an archive proves the store was opted in when the archive was made": is unsound, with a counterexample needing no failure at all | **CLOSED**: archive clause KEPT as a scope restriction, reasoning replaced in code and in row 22; the V10-only invariant pinned by test and mutation |
+| 34 | Medium: doc defect | The rollback was already unreliable on `f9d1033`: `log_then_apply` appends before it fsyncs, so a failed barrier leaves the declaration durable with no archive involved | **CLOSED**: no code change; the contract now says the call is not atomic, pinned by a test that needs no archive |
+| 35 | Low: CI gate defect | `acceptance-0.6`'s four latency budgets are four thresholds on one quantity: `--version` is 3 ms while `stats` is 371 ms, so ~95% of each reading is store open and 0-30 ms is the command. The touch budget (600 ms) sat inside the runner's own noise band: green runs read 359-588 ms on unchanged code: so it failed on runner load, not on a change | **CLOSED**: budgets set to ~2x the worst reading observed on unchanged code, and the comment now states what the numbers measure |
+| 36 | Medium: performance, pre-existing | Store open is ~371 ms for a 522-file graph on a warm local SSD, and it was ~95% of every code-graph command's wall clock. Since 0.7 every new store declares full-text (the memory schema's eight pairs, and up to 32 once `remember` self-declares), so every store that has text pays the rebuild on open, not only an `ingest-git` one; what an `ingest-git` store pays for the memory schema's pairs on top of its own has not been measured. Not introduced by 0.6.10: CI shows the same block at 359 ms on 2026-09-11: and not measured against 0.6.8, so its age is unknown | **CLOSED** in 0.8: a snapshot carries the full-text index, and replaying a snapshot's declarations no longer builds the rule indexes: 252 ms → 30 ms on a code graph of this repository |
+| 37 | Medium: engine, pre-existing | On incremental retraction a rule removes an edge that another rule with the same `(src_label, dst_label, edge_type)` still desires, and the edge stays gone until a rebuild or a write to the other rule's watched fields. `crates/core-rules/src/engine.rs`: ownership is single and first-come in `apply_per_src_top_k` and `apply_desired`, retraction is unconditional, and firing is filtered by `watched_fields` | **CLOSED**: every rule over a retracted edge's type is re-evaluated for the source that lost it, in the same write; the ignored test now runs |
+| 38 | Low: unmeasured | The `UserPromptSubmit` hook's latency on a large store is unknown. ~0.24 s per prompt was measured once, on a store ingested from this repository; the hook's timeout is 5 s (`scripts/plugin-templates/hooks.json.tmpl:9`) and the CI job that timed store open was deleted with the code-graph door | **CLOSED**: measured, plan 4 Task 10: on 100,000 notes the slowest of 20 runs took 640 ms against the 5,000 ms timeout (`benchmarks/hook-latency/results/20261001T192739Z.md`) |
+| 39 | Low | On a `--delivery cli` install an empty store's brief names three MCP tools (`EMPTY_BRIEF`, `crates/core-api/src/memory/brief.rs:736`) that a CLI-only session cannot call; `reach_line` branches on delivery and `EMPTY_BRIEF` does not | **CLOSED**: plan 4 Task 9: a cli-only install's empty brief offers the shell form |
+| 40 | Low | `why` and `explain_association` cap their digest in lines only (`crates/core-api/src/explain_digest.rs:397`); one evidence line can run to kilobytes when two nodes share a long list, and `why` prints each direction | **CLOSED**: plan 4 Task 9: the bracketed evidence is cut at 240 characters; the json report is whole |
+| 41 | Low | `render_schema` (`crates/core-api/src/memory/schema.rs:129`) caps each section in lines and has no total byte cap, so a store with very long names renders an unbounded reply; the `json: true` report is uncapped by design | **CLOSED**: plan 4 Task 9: the text is capped at 12,000 bytes and says so; the json report is whole by design |
+| 42 | Low | `forget`'s refusal for a rule-derived fact names every rule with the same edge type and endpoint labels, not the rule that derived the edge (`rule_owned_refusal`, `crates/server/src/mcp_tasks.rs:2419`); at worst it names a rule too many | **CLOSED**: plan 4 Task 9: the refusal names the rule `explain` attributes the edge to |
+| 43 | Low | A key with leading or trailing whitespace gained a second, canonicalised alias on the first unrelated write after it was created | **CLOSED**: fixed by plan 3's second amendment (`0d959b5`): `aliases` is recomputed from the key and the name on each describing write, so nothing accumulates |
+| 44 | Low | Five retired hook bodies (`touch`, `intercept`, `impact-hook`, `enrich`, `sync`) still parse (`crates/cli/src/lib.rs:845-849`), exit 0 and print one stderr line, so a hook a 0.6 install wrote does not fail | **CLOSED** |
+| 45 | **High: silent wrong answer** | A rule created outside a batch logged a bare `CreateRule`, leaving every lock-free reader one symbol behind the writer for up to 63 commits: zero rows for the new rule's edges, then `mvcc delta intern mismatch` on every read | **CLOSED**: `60b3e57` (plan 3 Task 1), pinned by `crates/core-api/tests/rule_intern_reader.rs` |
+| 46 | Medium: gate defect | `scripts/ignored-test-census.sh` cannot fail a build (`:53`): 32 ignored tests, 9 named in a workflow, 23 executed nowhere, including every memory-ceiling and scale-growth assertion. It also matches `#[ignore` inside comments and reads a fixed three-line window | **CLOSED** in 0.8.1 |
+| 47 | Medium: unverified | `upsert_entity`'s create path moved from `ingest` to `insert_node` in plan 1 and nothing compares the two for type coercion, list handling or index maintenance (`docs/roadmap/v0.7-plan-1-handoff.md:290-294`) | **CLOSED** in 0.7.2: compared, and they agree |
 | 48 | Low | `RememberReport.matched` undercounts when `facts` name an endpoint that already exists (`docs/roadmap/v0.7-plan-1-handoff.md:303-304`) | **CLOSED** in 0.7.2 |
-| 49 | Low — gate defect | `scripts/check-defect-ledger.sh` resolved the ledger relative to the working directory while resolving `Cargo.toml` from its own location, so it ran only from the repository root | **CLOSED** — plan 4 Task 1 |
+| 49 | Low: gate defect | `scripts/check-defect-ledger.sh` resolved the ledger relative to the working directory while resolving `Cargo.toml` from its own location, so it ran only from the repository root | **CLOSED**: plan 4 Task 1 |
 | 50 | Low | `forget` of a node under-reports retracted edges when the forgotten node is the via node of a via-hop rule | **CLOSED** in 0.9.2 |
-| 51 | Low | `same_as_pairs` treats every `node_edges` error as "no edges" (in `crates/core-api/src/memory/identity.rs`), so a real read failure reads as "no identity link" | **CLOSED** — v0.10 PS-11: `same_as_pairs` returns a `Result`; a key that does not exist is still skipped, any other read error is returned |
-| 52 | Low | `suggest_rules` can emit `approximate: true` in its `create_rule` arguments, a field `create_rule`'s advertised schema does not list | **CLOSED** in 0.7.2 — the schema was the wrong side |
-| 53 | Low | A provisional stub's aliases are never checked against the 32-alias cap that an entity's are | **CLOSED** in 0.7.2 — a stub past the cap is linked by its whole key alone |
-| 54 | Low — CI gap | `cargo clippy --all-features -D warnings` fails at `crates/server/src/http.rs:484` (`too_many_arguments`) and CI never runs all-features clippy, so every plan passes `-A clippy::too_many_arguments` by hand | **CLOSED** |
-| 55 | Medium — gate defect | The store-creation census (`crates/cli/tests/store_creation_schema.rs`) reads only `crates/cli/src/*.rs`, so it cannot see the Python binding or the HTTP server create a store, and a store the binding creates gets no schema | **CLOSED** in 0.8.1 |
-| 56 | Low — gate defect | `scripts/check-claims.sh` does not scan `bindings/`, does not skip `/* */` comment interiors, and has no pattern for a tool count written as a word, which is how `docs/site/api.md` kept "Seventeen tools" | **CLOSED** in 0.8.1 |
+| 51 | Low | `same_as_pairs` treats every `node_edges` error as "no edges" (in `crates/core-api/src/memory/identity.rs`), so a real read failure reads as "no identity link" | **CLOSED**: v0.10 PS-11: `same_as_pairs` returns a `Result`; a key that does not exist is still skipped, any other read error is returned |
+| 52 | Low | `suggest_rules` can emit `approximate: true` in its `create_rule` arguments, a field `create_rule`'s advertised schema does not list | **CLOSED** in 0.7.2: the schema was the wrong side |
+| 53 | Low | A provisional stub's aliases are never checked against the 32-alias cap that an entity's are | **CLOSED** in 0.7.2: a stub past the cap is linked by its whole key alone |
+| 54 | Low: CI gap | `cargo clippy --all-features -D warnings` fails at `crates/server/src/http.rs:484` (`too_many_arguments`) and CI never runs all-features clippy, so every plan passes `-A clippy::too_many_arguments` by hand | **CLOSED** |
+| 55 | Medium: gate defect | The store-creation census (`crates/cli/tests/store_creation_schema.rs`) reads only `crates/cli/src/*.rs`, so it cannot see the Python binding or the HTTP server create a store, and a store the binding creates gets no schema | **CLOSED** in 0.8.1 |
+| 56 | Low: gate defect | `scripts/check-claims.sh` does not scan `bindings/`, does not skip `/* */` comment interiors, and has no pattern for a tool count written as a word, which is how `docs/site/api.md` kept "Seventeen tools" | **CLOSED** in 0.8.1 |
 | 57 | Low | `benchmarks/agent-tasks/run.py`'s `load_tasks` still defaults to the retired `code` suite behind the guard that refuses it | **CLOSED** in 0.7.2 |
-| 58 | Medium — gate defect | `scripts/bump-version.sh --check` passes with `docs/site/index.md:57` naming the previous release and with a stale `bindings/python/Cargo.lock` (`:145` swallows a failed refresh); its header counts twenty-four sites and it sets twenty-eight | **CLOSED** — plan 4 Task 16: `--check` reads both lockfiles, a failed refresh fails the bump, and a release named in prose is a claim-gate failure |
-| 59 | Medium — release risk | Nothing packages the eight crates before the real `cargo publish`; a partial crates.io publish cannot be withdrawn | **CLOSED** — plan 4 Task 16: `scripts/publish-rehearsal.sh` packages the eight crates, the wheel and both npm packages in dry runs |
-| 60 | Medium — gate defect | `llms-full.txt` drift is unchecked (`scripts/gen-llms-full.sh` has no `--check` and runs in no workflow), a missing page in its list is skipped silently (`:81`), and nothing checks a relative link or anchor: `docs/site/api.md:1081` points at an anchor that does not exist | **CLOSED** — plan 4 Task 14: `scripts/check-links.py` and `gen-llms-full.sh --check` run in CI; a page the generator's list names and cannot find is an error, and so is a page under `docs/site` that it neither lists nor excludes |
-| 61 | Medium — release risk | `release.yml`'s `docker` job pushes `:latest` on any `v*` tag without waiting for the binaries or any test (`:149-170`) | **CLOSED** — 0.7.1 plan Task 4: `docker` has `needs: [github-release]`, so the image is pushed only after all three binaries built and the release was published; `release.yml` still runs no test of its own, so the tag still goes only on a commit whose CI is green |
-| 62 | Low — unmeasured | Four caps are reasoned first guesses with no telemetry (`MAX_QUERY_TERMS` 24, the half-coverage floor, `MAX_FULLTEXT_PAIRS` 32, `MAX_PROVISIONAL_PER_COMMIT` 20), and `analyze` is unmeasured above 100,000 nodes | **CLOSED** — v0.10 W5 PF-07: the cost of all four caps and the behaviour past each, and `analyze`, measured at 1,000,000 nodes on a loaded machine; no constant changed. Real demand on caps 3 and 4 is unmeasured (no telemetry; synthetic text) (`docs/site/limits.md`, `dogfood/results/caps-1m.md`) |
+| 58 | Medium: gate defect | `scripts/bump-version.sh --check` passes with `docs/site/index.md:57` naming the previous release and with a stale `bindings/python/Cargo.lock` (`:145` swallows a failed refresh); its header counts twenty-four sites and it sets twenty-eight | **CLOSED**: plan 4 Task 16: `--check` reads both lockfiles, a failed refresh fails the bump, and a release named in prose is a claim-gate failure |
+| 59 | Medium: release risk | Nothing packages the eight crates before the real `cargo publish`; a partial crates.io publish cannot be withdrawn | **CLOSED**: plan 4 Task 16: `scripts/publish-rehearsal.sh` packages the eight crates, the wheel and both npm packages in dry runs |
+| 60 | Medium: gate defect | `llms-full.txt` drift is unchecked (`scripts/gen-llms-full.sh` has no `--check` and runs in no workflow), a missing page in its list is skipped silently (`:81`), and nothing checks a relative link or anchor: `docs/site/api.md:1081` points at an anchor that does not exist | **CLOSED**: plan 4 Task 14: `scripts/check-links.py` and `gen-llms-full.sh --check` run in CI; a page the generator's list names and cannot find is an error, and so is a page under `docs/site` that it neither lists nor excludes |
+| 61 | Medium: release risk | `release.yml`'s `docker` job pushes `:latest` on any `v*` tag without waiting for the binaries or any test (`:149-170`) | **CLOSED**: 0.7.1 plan Task 4: `docker` has `needs: [github-release]`, so the image is pushed only after all three binaries built and the release was published; `release.yml` still runs no test of its own, so the tag still goes only on a commit whose CI is green |
+| 62 | Low: unmeasured | Four caps are reasoned first guesses with no telemetry (`MAX_QUERY_TERMS` 24, the half-coverage floor, `MAX_FULLTEXT_PAIRS` 32, `MAX_PROVISIONAL_PER_COMMIT` 20), and `analyze` is unmeasured above 100,000 nodes | **CLOSED**: v0.10 W5 PF-07: the cost of all four caps and the behaviour past each, and `analyze`, measured at 1,000,000 nodes on a loaded machine; no constant changed. Real demand on caps 3 and 4 is unmeasured (no telemetry; synthetic text) (`docs/site/limits.md`, `dogfood/results/caps-1m.md`) |
 | 63 | Low | Two items found surveying 0.7 and never scoped: the Cypher subset has no boolean literals (`docs/roadmap/cypher-boolean-literals.md`), and an older user-scope skill can shadow the one `install` writes with nothing detecting it (spec §12) | **CLOSED** |
-| 64 | Low | `remember` with an `entities[]` entry whose `label` disagrees with the stored node's silently matches the stored node and declares full-text on the label it did not use: the declare loop reads `entity.label` before any existence check (`crates/core-api/src/memory/remember.rs:461-477`) and an existing key takes the `set_prop` branch, which never reads the label (`:582-589`). `upsert_entity` refuses the same disagreement (`:313-333`). Both surfaces share it — the MCP tool (`crates/server/src/mcp_tasks.rs:1920`) and the Python binding (`bindings/python/src/lib.rs:2115`) call the one `core_api::memory::remember` | **CLOSED** |
-| 65 | Low | `set_props_many` holds the GIL for the whole batch: the comparison and the write run inside one `with_mut` with no `allow_threads` around it (`bindings/python/src/lib.rs:395`), so other Python threads wait for the frame and its fsync. It is not alone: `remember`, `upsert_entity`, `forget`, `recall` and `search` have no `allow_threads` either, as `upsert_node`, `set_prop` and the rule and full-text declarations do not; the algorithms, `suggest_rules`, `schema_report`, `identity_clusters`, `find_similar`, `pairwise_similar`, `degree` and `degrees` release it. Releasing it safely needs `upsert_node`'s read-then-write made atomic first — it reads under one lock acquisition (`:219`) and writes under another (`:238`), which is safe only while no write path releases the GIL | **CLOSED** |
-| 66 | Low — owner decision | A raw property write — `set_prop`, `upsert_node`, `set_props_many`, Cypher `SET`, `ingest_json` — can write `name`, `aliases`, `alias_keys` and `id` on an entity node without the alias maintenance `upsert_entity` and `remember` do (`describe_entity_with_aliases`, `crates/core-api/src/memory/remember.rs:247`): a raw `name` leaves `aliases` stale, and raw `aliases` can forge a `SAME_AS` link. The next describing write heals it. Whether the raw paths should refuse the store-maintained fields is not decided | **CLOSED** |
+| 64 | Low | `remember` with an `entities[]` entry whose `label` disagrees with the stored node's silently matches the stored node and declares full-text on the label it did not use: the declare loop reads `entity.label` before any existence check (`crates/core-api/src/memory/remember.rs:461-477`) and an existing key takes the `set_prop` branch, which never reads the label (`:582-589`). `upsert_entity` refuses the same disagreement (`:313-333`). Both surfaces share it: the MCP tool (`crates/server/src/mcp_tasks.rs:1920`) and the Python binding (`bindings/python/src/lib.rs:2115`) call the one `core_api::memory::remember` | **CLOSED** |
+| 65 | Low | `set_props_many` holds the GIL for the whole batch: the comparison and the write run inside one `with_mut` with no `allow_threads` around it (`bindings/python/src/lib.rs:395`), so other Python threads wait for the frame and its fsync. It is not alone: `remember`, `upsert_entity`, `forget`, `recall` and `search` have no `allow_threads` either, as `upsert_node`, `set_prop` and the rule and full-text declarations do not; the algorithms, `suggest_rules`, `schema_report`, `identity_clusters`, `find_similar`, `pairwise_similar`, `degree` and `degrees` release it. Releasing it safely needs `upsert_node`'s read-then-write made atomic first: it reads under one lock acquisition (`:219`) and writes under another (`:238`), which is safe only while no write path releases the GIL | **CLOSED** |
+| 66 | Low: owner decision | A raw property write: `set_prop`, `upsert_node`, `set_props_many`, Cypher `SET`, `ingest_json`: can write `name`, `aliases`, `alias_keys` and `id` on an entity node without the alias maintenance `upsert_entity` and `remember` do (`describe_entity_with_aliases`, `crates/core-api/src/memory/remember.rs:247`): a raw `name` leaves `aliases` stale, and raw `aliases` can forge a `SAME_AS` link. The next describing write heals it. Whether the raw paths should refuse the store-maintained fields is not decided | **CLOSED** |
 | 67 | Low | The engine's delete guard refuses an edge no rule would derive, and one that does not exist. `prepare_delete_edge` (`crates/core-api/src/db.rs:14561`) asks `would_derive` (`:14578`) before `has_edge` (`:14586`), so deleting an absent edge is `RuleOwned` when a rule matches the pair. `would_derive` (`:14596-14631`) checks the rule's edge type and endpoint labels (`:14610-14615`) and evaluates its predicate on the pair (`:14626`); it ignores `via_label`, `namespace` and `max_edges`, so a via-hop rule with no via node, a rule scoped to another namespace, or a rule whose per-source cap excludes the pair each block the delete of a hand-written edge. `forget` answers truthfully around it and carries a mirror of the private function (`guard_matches`, `crates/core-api/src/memory/forget.rs`), which can drift from the original | **CLOSED** in 0.10 |
-| 68 | Low — gate defect | The skill's 6,000-byte cap is measured on a render whose store path is `./mushroom-memory` (`every_delivery_variant_names_every_tool_and_fits_the_budget`, `crates/cli/tests/install.rs`), while `install` renders the store's absolute path into it (`install_claude_code`, `crates/cli/src/install.rs`). The template names the path six times, so the `both` variant — 5,963 bytes at that 17-byte path — is over the cap at any path of 24 bytes or more; a real `both` install at a long absolute path rendered 6,496 | **CLOSED** in 0.8.1 |
-| 69 | Low | `delivery_for_store` (`crates/cli/src/install.rs`) looks for an install manifest only beside the store's parent — `<parent>/.claude/skills/mushroom/.install-manifest.json`, then `<parent>/install-manifest.json` — and answers `both` when neither is there. A user-scope install keeps its manifest at `~/.mushroomdb/install-manifest.json`, so `install --user --delivery cli --db <path>` with the store anywhere else gets a session brief whose last line names the MCP tools, in a session with no server | **CLOSED** |
-| 70 | Low | `mushroomdb query` and `asof --query` take the statement only as a shell argument: there is no stdin and no file form. A fact written from a shell therefore depends on the reader following the skill's quoting rule, an apostrophe inside a Cypher string has to be written `\'`, and a literal backslash cannot be written at all — the lexer has no escape for it, and refuses with `invalid escape` rather than storing something else | **CLOSED** in 0.10 |
-| 71 | Medium | `was_linked`'s handler accepts an RFC 3339 date for `at_commit` (`crates/server/src/mcp.rs`, resolved through `resolve_date` as `edges_at` does) and the skill teaches that form (`crates/cli/skills/mushroom/SKILL.md`: "its `at_commit` takes a date too"), but the tool's `inputSchema` types `at_commit` as `integer`. A client that validates arguments against the schema refuses the call the skill teaches | **CLOSED** — 0.7.1 plan Task 2: `at_commit` is typed as `edges_at`'s `at` is, a string or a non-negative integer; the listing is 27,371 bytes by default and 28,172 for all 25; pinned by `was_linked_declares_the_date_it_accepts` in `crates/server/tests/mcp.rs` |
-| 72 | Medium — silent wrong answer, pre-existing | `rename_node` leaves a stored `id` property at the old key. `upsert_entity`'s create path (`crates/core-api/src/memory/remember.rs`, `upsert_entity`) and a Cypher `CREATE {id: …}` store the key as an `id` property; `remember`'s `entities` do not. After `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns no rows, `WHERE n.id = 'q1'` returns the renamed node and `RETURN n.id` prints `q1`, while `key(n)` and the inline pattern `{id: 'q2'}` answer for `q2`. `docs/site/query.md` writes `n.id` throughout. Reachable from the unlisted MCP `rename_node` tool, the Python binding and HTTP | **CLOSED** — 0.7.1 plan Task 1: a rename rewrites a stored `id` that equals the old key, in the same frame, from `GraphDb::rename_node` and from the batch arm HTTP reaches; pinned by `crates/core-api/tests/rename_upsert.rs`, `crates/server/tests/http.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_basic.py` |
-| 73 | Medium | After the first `remember` on a store that never took the memory defaults, nothing says they are missing. `remember` declares `Note.text` itself (`crates/core-api/src/memory/remember.rs`, the `enable_fulltext` call), so the store has one text pair; `recall`'s no-index answer and the brief's no-index line show only while a store has none (`recall_rows`, `crates/core-api/src/memory/recall.rs`). From then on `recall` answers from the pairs the store has and an entity already in it is not found by its name, with no notice, until `schema apply --memory-defaults`. A 0.6 store that has remembered a note is already in this state | **CLOSED** — 0.7.1 plan Task 3: the `recall` tool and the brief name each memory-default field the store has not declared and holds a value for, with the command that indexes them; nothing is declared unasked; pinned by `crates/core-api/tests/memory_recall.rs`, `crates/server/tests/mcp.rs`, `crates/cli/tests/prompt_hook.rs` and `crates/cli/tests/store_creation_schema.rs` |
+| 68 | Low: gate defect | The skill's 6,000-byte cap is measured on a render whose store path is `./mushroom-memory` (`every_delivery_variant_names_every_tool_and_fits_the_budget`, `crates/cli/tests/install.rs`), while `install` renders the store's absolute path into it (`install_claude_code`, `crates/cli/src/install.rs`). The template names the path six times, so the `both` variant: 5,963 bytes at that 17-byte path: is over the cap at any path of 24 bytes or more; a real `both` install at a long absolute path rendered 6,496 | **CLOSED** in 0.8.1 |
+| 69 | Low | `delivery_for_store` (`crates/cli/src/install.rs`) looks for an install manifest only beside the store's parent (`<parent>/.claude/skills/mushroom/.install-manifest.json`, then `<parent>/install-manifest.json`) and answers `both` when neither is there. A user-scope install keeps its manifest at `~/.mushroomdb/install-manifest.json`, so `install --user --delivery cli --db <path>` with the store anywhere else gets a session brief whose last line names the MCP tools, in a session with no server | **CLOSED** |
+| 70 | Low | `mushroomdb query` and `asof --query` take the statement only as a shell argument: there is no stdin and no file form. A fact written from a shell therefore depends on the reader following the skill's quoting rule, an apostrophe inside a Cypher string has to be written `\'`, and a literal backslash cannot be written at all: the lexer has no escape for it, and refuses with `invalid escape` rather than storing something else | **CLOSED** in 0.10 |
+| 71 | Medium | `was_linked`'s handler accepts an RFC 3339 date for `at_commit` (`crates/server/src/mcp.rs`, resolved through `resolve_date` as `edges_at` does) and the skill teaches that form (`crates/cli/skills/mushroom/SKILL.md`: "its `at_commit` takes a date too"), but the tool's `inputSchema` types `at_commit` as `integer`. A client that validates arguments against the schema refuses the call the skill teaches | **CLOSED**: 0.7.1 plan Task 2: `at_commit` is typed as `edges_at`'s `at` is, a string or a non-negative integer; the listing is 27,371 bytes by default and 28,172 for all 25; pinned by `was_linked_declares_the_date_it_accepts` in `crates/server/tests/mcp.rs` |
+| 72 | Medium: silent wrong answer, pre-existing | `rename_node` leaves a stored `id` property at the old key. `upsert_entity`'s create path (`crates/core-api/src/memory/remember.rs`, `upsert_entity`) and a Cypher `CREATE {id: …}` store the key as an `id` property; `remember`'s `entities` do not. After `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns no rows, `WHERE n.id = 'q1'` returns the renamed node and `RETURN n.id` prints `q1`, while `key(n)` and the inline pattern `{id: 'q2'}` answer for `q2`. `docs/site/query.md` writes `n.id` throughout. Reachable from the unlisted MCP `rename_node` tool, the Python binding and HTTP | **CLOSED**: 0.7.1 plan Task 1: a rename rewrites a stored `id` that equals the old key, in the same frame, from `GraphDb::rename_node` and from the batch arm HTTP reaches; pinned by `crates/core-api/tests/rename_upsert.rs`, `crates/server/tests/http.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_basic.py` |
+| 73 | Medium | After the first `remember` on a store that never took the memory defaults, nothing says they are missing. `remember` declares `Note.text` itself (`crates/core-api/src/memory/remember.rs`, the `enable_fulltext` call), so the store has one text pair; `recall`'s no-index answer and the brief's no-index line show only while a store has none (`recall_rows`, `crates/core-api/src/memory/recall.rs`). From then on `recall` answers from the pairs the store has and an entity already in it is not found by its name, with no notice, until `schema apply --memory-defaults`. A 0.6 store that has remembered a note is already in this state | **CLOSED**: 0.7.1 plan Task 3: the `recall` tool and the brief name each memory-default field the store has not declared and holds a value for, with the command that indexes them; nothing is declared unasked; pinned by `crates/core-api/tests/memory_recall.rs`, `crates/server/tests/mcp.rs`, `crates/cli/tests/prompt_hook.rs` and `crates/cli/tests/store_creation_schema.rs` |
 | 74 | Low | Over MCP a `min` for `find_similar` that is not a JSON number is silently replaced by the default: `args.get("min").and_then(Js::as_f64).unwrap_or(core_api::FIND_SIMILAR_DEFAULT_MIN)` (`crates/server/src/mcp.rs`, the vector branch of `tool_find_similar`), and the reply echoes `min: 0.8`. HTTP refuses the same value with `min must be a number` (`crates/server/src/http.rs`, `find_similar`). A caller that sends `"0.5"` as a string gets the 0.8 answer with no error. `k` has the same shape on MCP | **CLOSED** in 0.7.2 |
 | 75 | Low | The Python binding's `pagerank` accepts `damping=float("nan")` and returns a score of NaN for every node with `converged: False`: the argument goes into `PageRankConfig` unchecked (`bindings/python/src/lib.rs`, `pagerank`) and `crates/core-api/src/algo.rs` uses it as given. A damping outside 0 to 1 is not refused either | **CLOSED** in 0.7.2 |
-| 76 | Medium — silent junk write | `remember` accepts an empty string as a key. `""` in `about`, or as a fact's `subject` or `object`, is resolved like any unknown key: a provisional `Entity` whose key and `name` are the empty string is created and the `ABOUT` or fact edge is written to it. Neither surface refuses it: the MCP tool's `facts_arg` and `str_list_arg` take any string (`crates/server/src/mcp_tasks.rs`), the binding's `facts_from_py` likewise, and `crates/core-api/src/memory/remember.rs` has no empty-key check where it resolves endpoints. `forget`'s `fact` argument, by contrast, requires three non-empty strings over MCP | **CLOSED** — `8764869`: `remember` and `upsert_entity` refuse a key that is empty or only whitespace, in `core-api`, before anything is written; pinned by `crates/core-api/tests/memory_remember.rs`, `crates/core-api/tests/memory_upsert.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py` |
-| 77 | Medium — silent junk write | `remember` accepts an empty string as a fact's `predicate` and as an entity's `label`, and `upsert_entity` creates a node under an empty `label`. The predicate becomes an edge whose type is the empty string (`crates/core-api/src/memory/remember.rs`, the `insert_edge` over `facts`); the label becomes a node label and, in `remember`, a full-text pair on `("", name)` that spends one of the 32. Over MCP the edge cannot be retracted: `forget`'s `fact` refuses an empty predicate and Cypher has no way to name the type, so it goes only with an endpoint node | **CLOSED** — `d8522d7`: `remember` refuses a predicate or a label that is empty or only whitespace, and `upsert_entity` a create under one, in `core-api`, before anything is written; pinned by `crates/core-api/tests/memory_remember.rs`, `crates/core-api/tests/memory_upsert.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py` |
-| 78 | Low | A key made only of characters `str::trim` does not count as whitespace — a zero-width space, a control character, a byte-order mark — is not empty to row 76's refusal: `remember` stubs it as a provisional `Entity` like any unknown key. Unlike row 76's node it is removable through the tool that made it: the MCP `forget {key}` takes it | **CLOSED** in 0.7.2 |
-| 79 | Medium — a guard a batch can pass, pre-existing | A batch's preview cannot see the stored properties of a node that an earlier op in the same batch renamed. `MutPreview::note_rename_node` (`crates/core-api/src/db.rs`) records the new key as one the batch introduced, and for such a key `prop_value` and `has_prop` answer only from what the batch itself wrote, never from the store. `namespace_in_batch` therefore reads the renamed node as being in the default namespace: the batch `[rename a→b, insert_edge(b, d)]`, with `a` in namespace `tenant-a` and `d` in the default one, commits the edge that a plain `insert_edge(a, d)` refuses with `CrossNamespace`. `[rename a→b, remove_prop(b, "name")]` returns Ok and removes nothing. And a chain `[a→b, b→c]` on a node whose stored `id` is `b` leaves it `b`, where the same two renames as two commits write `c`. Reachable only from an embedded `BatchBuilder` or `SharedDb::submit_batch`: MCP, HTTP, the Python binding and the CLI each send a rename alone, and a role-scoped batch refuses one | **CLOSED** in 0.7.2 |
-| 80 | Medium — a commit number that changes meaning | A truncating snapshot — `GraphDb::snapshot()`, Python `snapshot()`, `mushroomdb snapshot --truncate`, `mushroomdb migrate` — replaced the WAL with its baseline and left `wal.floor` where it was (`crates/core-api/src/db.rs`, the `keep_wal=false` branch of `snapshot_with`). The replacement WAL was therefore numbered from the old floor: `stats` reported `history_floor: 0`, which the CLI prints as `history: complete (nothing pruned)`, and `open_at(n)`, `asof --commit n`, `edges_at` and `was_linked` answered a commit index taken before the snapshot with whatever frame now sat at that position. Found 2026-10-12 checking a docs page against a running store: on a `demo` store commit 3 holds 0 nodes; after `snapshot --truncate` commit 3 held 60 | **CLOSED** — the floor moves to where the discarded history ended, before the WAL is replaced; pinned in `crates/core-api/tests/snapshot.rs` and over the CLI |
-| 81 | Medium — a wrong answer with no error | The history reads paired the floor a handle held in memory with frames read fresh from disk: `was_linked`, `edges_at`, `node_history`, `edge_history` and `wal_total_commits` call `all_frames()` and number what it returns from `self.wal_horizon_floor` (`crates/core-api/src/db.rs`). A handle that had not refreshed since another process moved the floor — a retention sweep, or after row 80 a truncating snapshot — numbered the new WAL from its old floor. Found by the review of row 80: a read-only handle across a peer's truncating snapshot answered `was_linked(a, b, KNOWS, 2) = false` for a link made at commit 2 | **CLOSED** — the floor is read from disk with the frames; pinned by `a_reader_that_has_not_refreshed_does_not_answer_a_discarded_commit` |
-| 82 | Medium — a wrong graph with no error | `open_at_with` restores the snapshot as the base of a live-WAL replay only `if state.wal_truncated` (`crates/core-api/src/db.rs`). A `keep_wal` snapshot records `false`, correctly: it is the state at the head. But when the live WAL does not reach the store's first commit — the floor has moved, or archives sit in front of it — the snapshot it replaced was the WAL's base, and the prefix is then replayed over nothing. Found by the review of row 80: truncate, two writes, a `keep_wal` snapshot, and `open_at(floor)` answered 1 node where the graph held 2. Reachable through `enable_multiplicity`, which forces a `keep_wal` snapshot | **CLOSED** — refused as `CommitOutOfRange` when the base is gone; pinned by `open_at_after_a_keep_wal_snapshot_on_a_truncated_store_is_refused_or_right` |
-| 83 | Medium — engine, pre-existing | A top-k rule beside another rule over the same `(src_label, dst_label, edge_type)` loses its fallback edge. When the top-k rule's best match for a source is an edge the other rule owns, it records nothing for that source; affected sources are found through provenance (`crates/core-rules/src/engine.rs`, the `affected_srcs_for_n_dst` set in `on_node_changed_inner`), so when that match later stops the source is not recomputed and the rule's next-best edge is missing until `rebuild_rule`. Nothing is retracted on the shared edge, so row 37's second pass has nothing to see. Found by the review of row 37's fix; a differential fuzz with a top-k sibling still diverges in 20 of 60 seeds (55 of 60 before the fix) | **CLOSED** in 0.8.2 — plain top-k rules in 0.8.1, via-hop top-k rules in 0.8.2 |
-| 84 | Medium — engine, pre-existing | Row 37's second pass runs after a node change and after a user-edge change, and re-evaluates plain rules only. Still open: a plain rule retracts an edge a via-hop rule desires; `rebuild_rule` drops an edge another rule desires (`apply_streaming_rebuild` retracts without recording), and the same path runs unasked when an approximate rule's index drifts (`take_rebuild_needed`). `delete_rule` is not affected: it rebuilds the survivors | **CLOSED** in 0.9.2 |
+| 76 | Medium: silent junk write | `remember` accepts an empty string as a key. `""` in `about`, or as a fact's `subject` or `object`, is resolved like any unknown key: a provisional `Entity` whose key and `name` are the empty string is created and the `ABOUT` or fact edge is written to it. Neither surface refuses it: the MCP tool's `facts_arg` and `str_list_arg` take any string (`crates/server/src/mcp_tasks.rs`), the binding's `facts_from_py` likewise, and `crates/core-api/src/memory/remember.rs` has no empty-key check where it resolves endpoints. `forget`'s `fact` argument, by contrast, requires three non-empty strings over MCP | **CLOSED**: `8764869`: `remember` and `upsert_entity` refuse a key that is empty or only whitespace, in `core-api`, before anything is written; pinned by `crates/core-api/tests/memory_remember.rs`, `crates/core-api/tests/memory_upsert.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py` |
+| 77 | Medium: silent junk write | `remember` accepts an empty string as a fact's `predicate` and as an entity's `label`, and `upsert_entity` creates a node under an empty `label`. The predicate becomes an edge whose type is the empty string (`crates/core-api/src/memory/remember.rs`, the `insert_edge` over `facts`); the label becomes a node label and, in `remember`, a full-text pair on `("", name)` that spends one of the 32. Over MCP the edge cannot be retracted: `forget`'s `fact` refuses an empty predicate and Cypher has no way to name the type, so it goes only with an endpoint node | **CLOSED**: `d8522d7`: `remember` refuses a predicate or a label that is empty or only whitespace, and `upsert_entity` a create under one, in `core-api`, before anything is written; pinned by `crates/core-api/tests/memory_remember.rs`, `crates/core-api/tests/memory_upsert.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py` |
+| 78 | Low | A key made only of characters `str::trim` does not count as whitespace (a zero-width space, a control character, a byte-order mark) is not empty to row 76's refusal: `remember` stubs it as a provisional `Entity` like any unknown key. Unlike row 76's node it is removable through the tool that made it: the MCP `forget {key}` takes it | **CLOSED** in 0.7.2 |
+| 79 | Medium: a guard a batch can pass, pre-existing | A batch's preview cannot see the stored properties of a node that an earlier op in the same batch renamed. `MutPreview::note_rename_node` (`crates/core-api/src/db.rs`) records the new key as one the batch introduced, and for such a key `prop_value` and `has_prop` answer only from what the batch itself wrote, never from the store. `namespace_in_batch` therefore reads the renamed node as being in the default namespace: the batch `[rename a→b, insert_edge(b, d)]`, with `a` in namespace `tenant-a` and `d` in the default one, commits the edge that a plain `insert_edge(a, d)` refuses with `CrossNamespace`. `[rename a→b, remove_prop(b, "name")]` returns Ok and removes nothing. And a chain `[a→b, b→c]` on a node whose stored `id` is `b` leaves it `b`, where the same two renames as two commits write `c`. Reachable only from an embedded `BatchBuilder` or `SharedDb::submit_batch`: MCP, HTTP, the Python binding and the CLI each send a rename alone, and a role-scoped batch refuses one | **CLOSED** in 0.7.2 |
+| 80 | Medium: a commit number that changes meaning | A truncating snapshot: `GraphDb::snapshot()`, Python `snapshot()`, `mushroomdb snapshot --truncate`, `mushroomdb migrate`: replaced the WAL with its baseline and left `wal.floor` where it was (`crates/core-api/src/db.rs`, the `keep_wal=false` branch of `snapshot_with`). The replacement WAL was therefore numbered from the old floor: `stats` reported `history_floor: 0`, which the CLI prints as `history: complete (nothing pruned)`, and `open_at(n)`, `asof --commit n`, `edges_at` and `was_linked` answered a commit index taken before the snapshot with whatever frame now sat at that position. Found 2026-10-12 checking a docs page against a running store: on a `demo` store commit 3 holds 0 nodes; after `snapshot --truncate` commit 3 held 60 | **CLOSED**: the floor moves to where the discarded history ended, before the WAL is replaced; pinned in `crates/core-api/tests/snapshot.rs` and over the CLI |
+| 81 | Medium: a wrong answer with no error | The history reads paired the floor a handle held in memory with frames read fresh from disk: `was_linked`, `edges_at`, `node_history`, `edge_history` and `wal_total_commits` call `all_frames()` and number what it returns from `self.wal_horizon_floor` (`crates/core-api/src/db.rs`). A handle that had not refreshed since another process moved the floor: a retention sweep, or after row 80 a truncating snapshot: numbered the new WAL from its old floor. Found by the review of row 80: a read-only handle across a peer's truncating snapshot answered `was_linked(a, b, KNOWS, 2) = false` for a link made at commit 2 | **CLOSED**: the floor is read from disk with the frames; pinned by `a_reader_that_has_not_refreshed_does_not_answer_a_discarded_commit` |
+| 82 | Medium: a wrong graph with no error | `open_at_with` restores the snapshot as the base of a live-WAL replay only `if state.wal_truncated` (`crates/core-api/src/db.rs`). A `keep_wal` snapshot records `false`, correctly: it is the state at the head. But when the live WAL does not reach the store's first commit: the floor has moved, or archives sit in front of it: the snapshot it replaced was the WAL's base, and the prefix is then replayed over nothing. Found by the review of row 80: truncate, two writes, a `keep_wal` snapshot, and `open_at(floor)` answered 1 node where the graph held 2. Reachable through `enable_multiplicity`, which forces a `keep_wal` snapshot | **CLOSED**: refused as `CommitOutOfRange` when the base is gone; pinned by `open_at_after_a_keep_wal_snapshot_on_a_truncated_store_is_refused_or_right` |
+| 83 | Medium: engine, pre-existing | A top-k rule beside another rule over the same `(src_label, dst_label, edge_type)` loses its fallback edge. When the top-k rule's best match for a source is an edge the other rule owns, it records nothing for that source; affected sources are found through provenance (`crates/core-rules/src/engine.rs`, the `affected_srcs_for_n_dst` set in `on_node_changed_inner`), so when that match later stops the source is not recomputed and the rule's next-best edge is missing until `rebuild_rule`. Nothing is retracted on the shared edge, so row 37's second pass has nothing to see. Found by the review of row 37's fix; a differential fuzz with a top-k sibling still diverges in 20 of 60 seeds (55 of 60 before the fix) | **CLOSED** in 0.8.2: plain top-k rules in 0.8.1, via-hop top-k rules in 0.8.2 |
+| 84 | Medium: engine, pre-existing | Row 37's second pass runs after a node change and after a user-edge change, and re-evaluates plain rules only. Still open: a plain rule retracts an edge a via-hop rule desires; `rebuild_rule` drops an edge another rule desires (`apply_streaming_rebuild` retracts without recording), and the same path runs unasked when an approximate rule's index drifts (`take_rebuild_needed`). `delete_rule` is not affected: it rebuilds the survivors | **CLOSED** in 0.9.2 |
 | 85 | Low | `what_if_set_prop` reports an edge that changes owner as both lost and gained: its churn filter compares whole `EdgeAt` values, the rule included (`crates/core-api/src/db.rs`), where it should net on `(edge_type, src, dst)`. Visible since row 37's fix made a change of owner possible in one write | **CLOSED** in 0.10 |
-| 86 | Medium — a restored store that cannot answer a date | A backup did not carry `commit_times.bin`. `backup_to` (`crates/core-api/src/db.rs`) copied the WAL, the snapshot, the floor and the archives, and `RESTORE_FILES` (`crates/core-api/src/restore.rs`) named the same set; the commit-time map was in neither. A store restored from a backup had its history and not the map a read by date resolves through | **CLOSED** in 0.7.2 |
-| 87 | Low — a request answered as if it had been understood | `POST /algo/pagerank`, `/algo/wcc` and `/algo/degree` dropped a field the config does not have without a word: `{"weight": "score"}` on PageRank answered 200 with unweighted scores, and `max_iter` for `max_iters` ran with the default (`PageRankConfig`, `WccConfig`, `DegreeConfig` in `crates/core-api/src/algo.rs`, deserialised with `#[serde(default)]` alone) | **CLOSED** in 0.7.2 |
+| 86 | Medium: a restored store that cannot answer a date | A backup did not carry `commit_times.bin`. `backup_to` (`crates/core-api/src/db.rs`) copied the WAL, the snapshot, the floor and the archives, and `RESTORE_FILES` (`crates/core-api/src/restore.rs`) named the same set; the commit-time map was in neither. A store restored from a backup had its history and not the map a read by date resolves through | **CLOSED** in 0.7.2 |
+| 87 | Low: a request answered as if it had been understood | `POST /algo/pagerank`, `/algo/wcc` and `/algo/degree` dropped a field the config does not have without a word: `{"weight": "score"}` on PageRank answered 200 with unweighted scores, and `max_iter` for `max_iters` ran with the default (`PageRankConfig`, `WccConfig`, `DegreeConfig` in `crates/core-api/src/algo.rs`, deserialised with `#[serde(default)]` alone) | **CLOSED** in 0.7.2 |
 | 88 | Low | More MCP arguments are replaced by a default, or dropped, when they are not the type asked for: `find_similar` drops the elements of `vector` that are not numbers, so `[1, "x", 0]` searches as `[1, 0]`; other tools' `limit`, `k` and `min` parse as row 74's did (`crates/server/src/mcp.rs`). And `create_rule`'s advertised schema omits `via_label`, `via_edge` and `via_dir`, which the tool accepts | **CLOSED** |
-| 89 | Medium — a write that lands on the wrong node, pre-existing | A key a batch frees and then uses again resolved to the node the store still held it on. The rewrite of a batch to dense ids (`rewrite_wal_dense_inner`, `crates/core-api/src/db.rs`) asked the store for a key before it asked what the frame itself had done, and nothing is applied until the whole frame is rewritten. `[delete_node a, insert_node a, set_prop(a, …)]` lost the property; `[rename a→b, insert_node a, insert_edge(a, c)]` put the edge on `b`; `[rename d→b, rename a→d]` sent the rename's own `id` rewrite to the wrong node. The handle and a reopen agreed with each other, so it was a consistent wrong write, not a torn one. Reachable only from a batch built in Rust | **CLOSED** in 0.7.2 |
+| 89 | Medium: a write that lands on the wrong node, pre-existing | A key a batch frees and then uses again resolved to the node the store still held it on. The rewrite of a batch to dense ids (`rewrite_wal_dense_inner`, `crates/core-api/src/db.rs`) asked the store for a key before it asked what the frame itself had done, and nothing is applied until the whole frame is rewritten. `[delete_node a, insert_node a, set_prop(a, …)]` lost the property; `[rename a→b, insert_node a, insert_edge(a, c)]` put the edge on `b`; `[rename d→b, rename a→d]` sent the rename's own `id` rewrite to the wrong node. The handle and a reopen agreed with each other, so it was a consistent wrong write, not a torn one. Reachable only from a batch built in Rust | **CLOSED** in 0.7.2 |
 | 90 | Low | Left by the review of the 0.7.2 branch, each observed: the batch preview's `label_of` answers a reused key with the label of the node the store held it on, so `would_derive` can refuse for the wrong label; a batch refuses `[set_prop(a, g, 2), delete_edge(SAME, a, c)]` as rule-owned where two commits succeed, because a rule's retraction is not visible inside the batch that causes it; `count(true)` is an unbound variable and `n.flag > false` matches nothing without an error; `/algo/*` reads a JSON array as a config by position; the TypeScript client's `algo("wcc")` accepts a PageRank-typed config that the route now refuses; the invisible-character refusal does not cover U+00AD, U+2060, U+FE0F or the C1 controls | **DEFERRED** to 0.11 |
-| 91 | High — a store that does not open, pre-existing | An open replayed the whole WAL over a snapshot that had kept it (`snapshot_with(keep_wal: true)`, `mushroomdb snapshot --keep-wal`, the snapshot `enable_multiplicity` and an auto-migration take), and applying a write to the state it produced is not always a no-op. After `rename_node(n, m)` the replayed insert of `n` made a second node, the replayed rename met its own result, and the open failed: `corrupt data: wal replay RenameNode n→m: duplicate node key: m`. After a delete and a reinsert of one key, the later writes were replayed onto the retired node and the store reopened with an older value, with no error. Reproduced on the released 0.7.1 | **CLOSED** in 0.7.2 for a snapshot 0.7.2 writes; one written earlier is recovered by hand |
-| 92 | High — the same failure after a crash, pre-existing | A truncating or archiving snapshot writes `snapshot.bin` and then replaces `wal.bin`. A crash between the two leaves the new snapshot beside the old WAL, and the next open replays that WAL over the snapshot exactly as row 91's did: a rename, or a delete and reinsert, before the snapshot makes the store unopenable or wrong. Row 91's mark cannot be used here as it stands: the replacement WAL that normally follows can begin with the same bytes as the one it replaced, and frames skipped then would be writes lost | **CLOSED** in 0.8 — an intent file written before the snapshot and emptied after the WAL is replaced |
-| 93 | Medium — a read that never returns, pre-existing | A history read on a node renamed away and back again did not return. `build_key_alias_intervals` (`crates/core-api/src/db.rs`) follows a key back through the renames that led to it and kept one rename for each key, the last. After `a → b` and `b → a` each key was the other's predecessor and the walk went round for ever: `was_linked`, `node_history`, `edge_history` and `edges_at` on such a node, from any surface, the MCP `was_linked` tool included | **CLOSED** in 0.7.2 |
-| 94 | High — a store that does not open, pre-existing | A node renamed onto a key that a deleted node once held made the next snapshot unreadable: `insert a`, `insert b`, `delete b`, `rename a→b`, any snapshot, and every open after it failed with `corrupt data: v8: labels section has 2 entries but id table has 1 total slots`. The snapshot was right. Its reader (`archived_to_idmap`, `crates/core-storage/src/v8/encode.rs`) rebuilt the key table by inserting each slot's key in order, and a retired slot whose key a lower, live slot now carried found the key present, allocated nothing, and retired the live node instead | **CLOSED** in 0.7.2 — and a truncating or archiving snapshot already written this way opens again |
-| 95 | High — wrong answers on any store that has snapshotted, pre-existing | Four writes acted on what was written since the last snapshot and not on what the snapshot holds. Deleting a node left the edges the snapshot held for it: `neighbors` of a survivor answered `corrupt data: topology id N has no key`, a pattern match returned a row with a missing end, `stats().edges` and degree views stayed high, and the next snapshot wrote the edges into its own base. Deleting a view left its property readable. A snapshot taken when no rule owned an edge carried the previous snapshot's provenance forward. An aggregate view created after a snapshot summed nothing for neighbours the snapshot held. In 0.7.1 and before | **CLOSED** in 0.7.2 — and a store left with a deleted node's edges drops them at open |
-| 96 | Medium — lost edge properties, pre-existing | A store's first snapshot moved the edge properties out of the handle to encode them, before the write that could fail (`snapshot_with`, the path with no earlier snapshot, `crates/core-api/src/db.rs`). When that write failed — a full disk — the handle went on with none: a rule's weight read as absent, and the next snapshot that worked wrote the loss down. A store that already had a snapshot was not affected | **CLOSED** in 0.8 |
-| 97 | Medium — a reader that answers without a view's value, pre-existing | A view's property read through `reader()` — the lock-free reader, which the HTTP server answers a role token's `/query`, node, edges and neighbourhood reads from — was the value as of the last fold, not as of the commit the reader was taken at. A reader is the fold plus the commits since, replayed from their WAL records, and a view's value is in no record: the writer computes it. So for up to `FOLD_EVERY_K - 1` (63) commits a reader returned a node with no view property at all where the view was newer than the fold, an old count where it was not, and a deleted view's property where the fold still held it. Every other property in the same answer was current | **CLOSED** in 0.8 |
-| 98 | Medium — reads by commit lost for good, nothing else, pre-existing | A store's first archiving snapshot wrote `wal.genesis` — the marker that lets a read by commit or date replay the archives — last, after `snapshot.bin`, the WAL's rename to its archive and the replacement WAL, and only when no snapshot had existed beforehand. A snapshot killed anywhere before that left a store on which every later snapshot found a `snapshot.bin`, could not tell it from a truncating one's, and never wrote the marker. From then on `asof`, `open_at` and `query … as_of` answered `out of range` for every commit in an archive, while `stats` printed `history: complete`, `verify` passed and nothing else was wrong. Reproduced by `kill -9` during `mushroomdb snapshot` and during the snapshot `mushroomdb mcp` takes at open: 4 of 45 kills | **CLOSED** in 0.8 |
-| 99 | Low — a held connection, pre-existing | `GET /watch` wrote events to its WebSocket and never read from it (`write_events`, `crates/server/src/ws.rs`). A client's close frame was not answered, so the closing handshake did not complete and the client waited out its own timeout; the server held the connection's task and broadcast receiver until the next commit's write to the dead socket failed, which on an idle store is never. A ping went unanswered for the same reason | **CLOSED** in 0.8 |
-| 100 | High — history destroyed and a read by commit answering wrongly, pre-existing | An archiving snapshot of a store that had nothing written to it since its last one archived the WAL anyway. An archive is named for the commit it ends at (`last archive + live frames`, `snapshot_with`, `crates/core-api/src/db.rs`), so with no frames the name was the last archive's and the rename put an empty file over it. `wal.genesis` stayed and the floor stayed 0, so the commit numbers were handed out again: after three inserts, two snapshots and one more insert, `asof --commit 0` answered a count of 4 for a commit at which the store held one node, `stats` said `history: complete`, and `verify` passed. Only a store with no full-text pair, property index or multiplicity declared: a declaration is re-emitted into the new WAL, which is then never empty. `mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, and a graceful shutdown after one all did it | **CLOSED** in 0.8 |
+| 91 | High: a store that does not open, pre-existing | An open replayed the whole WAL over a snapshot that had kept it (`snapshot_with(keep_wal: true)`, `mushroomdb snapshot --keep-wal`, the snapshot `enable_multiplicity` and an auto-migration take), and applying a write to the state it produced is not always a no-op. After `rename_node(n, m)` the replayed insert of `n` made a second node, the replayed rename met its own result, and the open failed: `corrupt data: wal replay RenameNode n→m: duplicate node key: m`. After a delete and a reinsert of one key, the later writes were replayed onto the retired node and the store reopened with an older value, with no error. Reproduced on the released 0.7.1 | **CLOSED** in 0.7.2 for a snapshot 0.7.2 writes; one written earlier is recovered by hand |
+| 92 | High: the same failure after a crash, pre-existing | A truncating or archiving snapshot writes `snapshot.bin` and then replaces `wal.bin`. A crash between the two leaves the new snapshot beside the old WAL, and the next open replays that WAL over the snapshot exactly as row 91's did: a rename, or a delete and reinsert, before the snapshot makes the store unopenable or wrong. Row 91's mark cannot be used here as it stands: the replacement WAL that normally follows can begin with the same bytes as the one it replaced, and frames skipped then would be writes lost | **CLOSED** in 0.8: an intent file written before the snapshot and emptied after the WAL is replaced |
+| 93 | Medium: a read that never returns, pre-existing | A history read on a node renamed away and back again did not return. `build_key_alias_intervals` (`crates/core-api/src/db.rs`) follows a key back through the renames that led to it and kept one rename for each key, the last. After `a → b` and `b → a` each key was the other's predecessor and the walk went round for ever: `was_linked`, `node_history`, `edge_history` and `edges_at` on such a node, from any surface, the MCP `was_linked` tool included | **CLOSED** in 0.7.2 |
+| 94 | High: a store that does not open, pre-existing | A node renamed onto a key that a deleted node once held made the next snapshot unreadable: `insert a`, `insert b`, `delete b`, `rename a→b`, any snapshot, and every open after it failed with `corrupt data: v8: labels section has 2 entries but id table has 1 total slots`. The snapshot was right. Its reader (`archived_to_idmap`, `crates/core-storage/src/v8/encode.rs`) rebuilt the key table by inserting each slot's key in order, and a retired slot whose key a lower, live slot now carried found the key present, allocated nothing, and retired the live node instead | **CLOSED** in 0.7.2: and a truncating or archiving snapshot already written this way opens again |
+| 95 | High: wrong answers on any store that has snapshotted, pre-existing | Four writes acted on what was written since the last snapshot and not on what the snapshot holds. Deleting a node left the edges the snapshot held for it: `neighbors` of a survivor answered `corrupt data: topology id N has no key`, a pattern match returned a row with a missing end, `stats().edges` and degree views stayed high, and the next snapshot wrote the edges into its own base. Deleting a view left its property readable. A snapshot taken when no rule owned an edge carried the previous snapshot's provenance forward. An aggregate view created after a snapshot summed nothing for neighbours the snapshot held. In 0.7.1 and before | **CLOSED** in 0.7.2: and a store left with a deleted node's edges drops them at open |
+| 96 | Medium: lost edge properties, pre-existing | A store's first snapshot moved the edge properties out of the handle to encode them, before the write that could fail (`snapshot_with`, the path with no earlier snapshot, `crates/core-api/src/db.rs`). When that write failed: a full disk: the handle went on with none: a rule's weight read as absent, and the next snapshot that worked wrote the loss down. A store that already had a snapshot was not affected | **CLOSED** in 0.8 |
+| 97 | Medium: a reader that answers without a view's value, pre-existing | A view's property read through `reader()`: the lock-free reader, which the HTTP server answers a role token's `/query`, node, edges and neighbourhood reads from: was the value as of the last fold, not as of the commit the reader was taken at. A reader is the fold plus the commits since, replayed from their WAL records, and a view's value is in no record: the writer computes it. So for up to `FOLD_EVERY_K - 1` (63) commits a reader returned a node with no view property at all where the view was newer than the fold, an old count where it was not, and a deleted view's property where the fold still held it. Every other property in the same answer was current | **CLOSED** in 0.8 |
+| 98 | Medium: reads by commit lost for good, nothing else, pre-existing | A store's first archiving snapshot wrote `wal.genesis`: the marker that lets a read by commit or date replay the archives: last, after `snapshot.bin`, the WAL's rename to its archive and the replacement WAL, and only when no snapshot had existed beforehand. A snapshot killed anywhere before that left a store on which every later snapshot found a `snapshot.bin`, could not tell it from a truncating one's, and never wrote the marker. From then on `asof`, `open_at` and `query … as_of` answered `out of range` for every commit in an archive, while `stats` printed `history: complete`, `verify` passed and nothing else was wrong. Reproduced by `kill -9` during `mushroomdb snapshot` and during the snapshot `mushroomdb mcp` takes at open: 4 of 45 kills | **CLOSED** in 0.8 |
+| 99 | Low: a held connection, pre-existing | `GET /watch` wrote events to its WebSocket and never read from it (`write_events`, `crates/server/src/ws.rs`). A client's close frame was not answered, so the closing handshake did not complete and the client waited out its own timeout; the server held the connection's task and broadcast receiver until the next commit's write to the dead socket failed, which on an idle store is never. A ping went unanswered for the same reason | **CLOSED** in 0.8 |
+| 100 | High: history destroyed and a read by commit answering wrongly, pre-existing | An archiving snapshot of a store that had nothing written to it since its last one archived the WAL anyway. An archive is named for the commit it ends at (`last archive + live frames`, `snapshot_with`, `crates/core-api/src/db.rs`), so with no frames the name was the last archive's and the rename put an empty file over it. `wal.genesis` stayed and the floor stayed 0, so the commit numbers were handed out again: after three inserts, two snapshots and one more insert, `asof --commit 0` answered a count of 4 for a commit at which the store held one node, `stats` said `history: complete`, and `verify` passed. Only a store with no full-text pair, property index or multiplicity declared: a declaration is re-emitted into the new WAL, which is then never empty. `mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, and a graceful shutdown after one all did it | **CLOSED** in 0.8 |
 | 101 | Low | Left by the review of rows 98 and 100, each observed and each a refusal, never a wrong answer: after an archiving snapshot is interrupted, `open_at` refuses the commits written since until a snapshot completes, though the interrupted one is a valid base; a snapshot with `keep_wal` and `archive_wal` both set records `wal_truncated=false`, so live-WAL commits are refused until the next archive; the empty-store snapshot failure is fixed by row 119; a refused read by commit reports a range that contains the commit, and `stats` says `history: complete` for a store whose archives cannot be read by commit; a kill between an archive's rename and the replacement WAL leaves a `wal.bin.tmp` | **DEFERRED** to 0.11 |
-| 102 | Low — measured, not investigated | A one-hop Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst`, took 18.7 ms at 100,000 nodes, 80.3 ms at 300,000 and 281.6 ms at 1,000,000 (`dogfood/results/scale-memory-1m.md`), past the slow-query log's 250 ms. It grows with the label's size, so the key filter looks to be applied after a scan of the label rather than as a lookup. The answer was right | **CLOSED** in 0.10 |
-| 103 | High — derived edges a read does not return, pre-existing | After a snapshot and a reopen, a rule's derived edges can be counted and not returned: `stats` says `edges=2` and the rule `e=2`, and `neighbors` returns neither. Two repros from the review of row 83's fix, both needing a snapshot and a reopen in the middle: two top-k rules over one edge type (`topk1` A→A overlap 0.3 `k=1`, `topk2` overlap 0.5 `k=2`; insert three nodes, snapshot and reopen, delete one, snapshot and reopen, change a tag); and a plain, a via-hop and a top-k rule over one edge type. The same on `main`; not with a plain reopen. The first repro does not happen with one top-k rule; the second has one. | **CLOSED** in 0.8.1 |
-| 104 | Medium — an edge left behind, pre-existing | Deleting a via-hop rule's via node leaves the edge the rule derived through it: one via-hop rule `P→T` via `O`, insert `o`, `p`, `t`, `WORKS_AT p→o`, `delete_node(o)`, and `p->t` stays where a fresh build has none. Plain and top-k via rules alike. Possibly what row 50 counts | **CLOSED** in 0.8.1 |
-| 105 | Medium — an edge never derived, pre-existing | A via-hop rule that links a label to itself misses edges on insert: with only that rule, insert `P n0`, `O n2`, `WORKS_AT n0→n2`, then `P n5`, and `n0->n5` is not derived until `rebuild_rule`. Evaluating the new node as a source retracted the edge into it that another source had just derived, so the result depended on the order nodes were evaluated in. 48 of 80 fuzz runs diverged, on `main` too | **CLOSED** in 0.8.1 |
-| 106 | High — an edge counted and not there, pre-existing | Deleting the node a KeyMatch top-k rule's source names re-picked that node: rule `A→A` KeyMatch on a list field, `k = 1`, `s` names `[n7, n0]`; `delete_node(n0)` left `neighbors(s)` empty while `stats` counted the rule's edge, where `n7` should have been promoted. The backfill read its candidates by key, and the node being deleted still answers to its key during the delete; the edge was re-added with provenance and then swept from the graph | **CLOSED** in 0.8.1 |
-| 107 | High — stores already damaged by row 103, pre-existing | A store snapshotted while two rules owned one edge (row 103) keeps both owners and a wrong edge count: the snapshot's `edge_count` is carried forward arithmetically and never recounted, a write can still remove an edge one of the rules counts, and neither `rebuild_rule` nor a snapshot repairs it. The review of row 103's fix found the stats count off from the edges present in 66, 139 and 51 of 200 fuzz runs on `main` | **CLOSED** in 0.8.2 |
-| 108 | Low | After a snapshot, `insert_edge` of an edge a rule owns answers `Ok(false)` — already there — where a store with no snapshot answers the `RuleOwned` error that tells the caller a rule holds it. Found by the review of row 103's fix; the same before it | **CLOSED** in 0.9.1 |
+| 102 | Low: measured, not investigated | A one-hop Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst`, took 18.7 ms at 100,000 nodes, 80.3 ms at 300,000 and 281.6 ms at 1,000,000 (`dogfood/results/scale-memory-1m.md`), past the slow-query log's 250 ms. It grows with the label's size, so the key filter looks to be applied after a scan of the label rather than as a lookup. The answer was right | **CLOSED** in 0.10 |
+| 103 | High: derived edges a read does not return, pre-existing | After a snapshot and a reopen, a rule's derived edges can be counted and not returned: `stats` says `edges=2` and the rule `e=2`, and `neighbors` returns neither. Two repros from the review of row 83's fix, both needing a snapshot and a reopen in the middle: two top-k rules over one edge type (`topk1` A→A overlap 0.3 `k=1`, `topk2` overlap 0.5 `k=2`; insert three nodes, snapshot and reopen, delete one, snapshot and reopen, change a tag); and a plain, a via-hop and a top-k rule over one edge type. The same on `main`; not with a plain reopen. The first repro does not happen with one top-k rule; the second has one. | **CLOSED** in 0.8.1 |
+| 104 | Medium: an edge left behind, pre-existing | Deleting a via-hop rule's via node leaves the edge the rule derived through it: one via-hop rule `P→T` via `O`, insert `o`, `p`, `t`, `WORKS_AT p→o`, `delete_node(o)`, and `p->t` stays where a fresh build has none. Plain and top-k via rules alike. Possibly what row 50 counts | **CLOSED** in 0.8.1 |
+| 105 | Medium: an edge never derived, pre-existing | A via-hop rule that links a label to itself misses edges on insert: with only that rule, insert `P n0`, `O n2`, `WORKS_AT n0→n2`, then `P n5`, and `n0->n5` is not derived until `rebuild_rule`. Evaluating the new node as a source retracted the edge into it that another source had just derived, so the result depended on the order nodes were evaluated in. 48 of 80 fuzz runs diverged, on `main` too | **CLOSED** in 0.8.1 |
+| 106 | High: an edge counted and not there, pre-existing | Deleting the node a KeyMatch top-k rule's source names re-picked that node: rule `A→A` KeyMatch on a list field, `k = 1`, `s` names `[n7, n0]`; `delete_node(n0)` left `neighbors(s)` empty while `stats` counted the rule's edge, where `n7` should have been promoted. The backfill read its candidates by key, and the node being deleted still answers to its key during the delete; the edge was re-added with provenance and then swept from the graph | **CLOSED** in 0.8.1 |
+| 107 | High: stores already damaged by row 103, pre-existing | A store snapshotted while two rules owned one edge (row 103) keeps both owners and a wrong edge count: the snapshot's `edge_count` is carried forward arithmetically and never recounted, a write can still remove an edge one of the rules counts, and neither `rebuild_rule` nor a snapshot repairs it. The review of row 103's fix found the stats count off from the edges present in 66, 139 and 51 of 200 fuzz runs on `main` | **CLOSED** in 0.8.2 |
+| 108 | Low | After a snapshot, `insert_edge` of an edge a rule owns answers `Ok(false)` (already there) where a store with no snapshot answers the `RuleOwned` error that tells the caller a rule holds it. Found by the review of row 103's fix; the same before it | **CLOSED** in 0.9.1 |
 | 109 | Low | A tombstone over an edge the snapshot does not hold under-counts the live edge count: `corrected_edge_count` (row 107) computes the base's rows minus tombstones plus the overlay, and a rule's retraction of an edge absent from the base still records a tombstone, so `stats().edges` reads one low per such tombstone until the next snapshot recounts. Probe: `stats.edges` = 0 with 1 edge present; 2 of 60 `full-topk` cross-version fuzz runs ended one low. Fix: do not record a tombstone when the base does not hold the edge (`!base_has_out_edge`). Found by the review of row 107's fix | **CLOSED** in 0.9.1 |
 | 110 | Low | `delete_node`, as the first write after a clean open of a snapshotted store, reports the wrong counts: two rule-derived edges come back as `DeleteReport { manual_edges: 2, derived_edges: 0 }`, the same on 0.8.1. The commit itself goes through `log_then_apply_with`, which loads the snapshot's sections and provenance first, so row 107's dedup does run; it is the report, computed before that, that reads unloaded provenance. Found by the review of row 107's fix | **CLOSED** in 0.9.1 |
-| 111 | Low | A store where 0.8.0 already lost the edge (the losing write ran before 0.8.2) is not repaired by row 107's fix: provenance still names a rule as the triple's owner — the rule counts the edge — but the graph no longer holds it, and the dedup pass, which only removes second owners, has nothing to correct. Deferred fix: at the first write after open, drop provenance triples whose `(etype, src, dst)` is absent from the current topology and re-evaluate their source nodes against all rules. Found by the review of row 107's fix | **CLOSED** in 0.9.1 |
+| 111 | Low | A store where 0.8.0 already lost the edge (the losing write ran before 0.8.2) is not repaired by row 107's fix: provenance still names a rule as the triple's owner (the rule counts the edge) but the graph no longer holds it, and the dedup pass, which only removes second owners, has nothing to correct. Deferred fix: at the first write after open, drop provenance triples whose `(etype, src, dst)` is absent from the current topology and re-evaluate their source nodes against all rules. Found by the review of row 107's fix | **CLOSED** in 0.9.1 |
 | 112 | Low | `open_at` on a store snapshotted while two rules owned one edge (row 107) does not deduplicate provenance: an as-of handle decodes the snapshot whole, not through the path that runs row 107's repair, so after `delete_rule` of one owner it shows neither rule's edge while the live handle keeps the other's. Found by the review of row 111's fix; the same on 0.9.0 | **CLOSED** in 0.9.2 |
 | 113 | Low | A top-k rule's edge that 0.8.0 removed while no rule's provenance named it is not re-derived until its source changes; `rebuild_rule` repairs it. Row 111's repair finds only edges a rule still counts. 6 of 420 stores in the review's cross-version fuzz | **CLOSED** in 0.9.2 |
 | 114 | Low | `db.reader().node_edges` reports `derived: false` for every rule-derived edge, on a store with no snapshot too. Found by the review of row 111's fix; the same on 0.9.0 | **CLOSED** |
 | 115 | Low | `forget` of a property, as the first write after opening a store where 0.8.0 lost edges (row 111), reports `derived_edges: 0` where a fresh build reports 2: it compares the node's derived edges before and after the write, and the before is read ahead of the commit's repair. Found by the review of row 111's fix | **CLOSED** in 0.9.2 |
-| 116 | Medium — performance, unreleased | Row 113's repair ran at every open of a store with a top-k rule whose sources hold fewer edges than its cap — every agent-memory store — building every rule index during WAL replay: open +24 ms (+36 %) at 60k nodes, +75 ms (+44 %) at 150k, on `main` after #72. Found by measuring before the 0.9.2 tag | **CLOSED** in 0.9.2 |
+| 116 | Medium: performance, unreleased | Row 113's repair ran at every open of a store with a top-k rule whose sources hold fewer edges than its cap: every agent-memory store: building every rule index during WAL replay: open +24 ms (+36 %) at 60k nodes, +75 ms (+44 %) at 150k, on `main` after #72. Found by measuring before the 0.9.2 tag | **CLOSED** in 0.9.2 |
 | 117 | Low | The lock-free reader (HTTP read routes) can miss a derived edge that one batch retracts and re-derives, until the next reload. Present in released 0.9.x | **CLOSED** |
-| 118 | Medium — performance, present in released 0.9.2 | `ingest` and `write_batch` are quadratic in the batch size: validating each node insert walked every entry the batch had already recorded (`MutPreview::note_insert_node`, `retain` over the whole overlay), and `note_delete_node` and the rename migration did the same. 100,000 nodes in 50,000-row batches took 41 s (2.4k nodes/s); 200,000 nodes at `--batch-size` 500/2,000/10,000 took 7.6/4.6/12.9 s. Found by the first throughput run of `mushroomdb import` | **CLOSED** in 0.10 |
+| 118 | Medium: performance, present in released 0.9.2 | `ingest` and `write_batch` are quadratic in the batch size: validating each node insert walked every entry the batch had already recorded (`MutPreview::note_insert_node`, `retain` over the whole overlay), and `note_delete_node` and the rename migration did the same. 100,000 nodes in 50,000-row batches took 41 s (2.4k nodes/s); 200,000 nodes at `--batch-size` 500/2,000/10,000 took 7.6/4.6/12.9 s. Found by the first throughput run of `mushroomdb import` | **CLOSED** in 0.10 |
 | 119 | Low, present in released 0.9.x | A snapshot of a store that has never committed fails: `snapshot_with` with `archive_wal` (the default of `mushroomdb snapshot` and of every automatic snapshot) renamed a `wal.bin` that does not exist, after writing `snapshot.intent`, so `mushroomdb snapshot <fresh-dir>` exits "No such file or directory" and leaves the intent behind | **CLOSED** in 0.10 |
-| 120 | Low | CSV import: relationship property columns are not supported. Edges carry no user properties in the engine, so `mushroomdb import` refuses a relationships file with a property column rather than dropping the values. The engine half is done in 0.10: QL-RP gives edges user properties in the write path and the WAL (`SetEdgePropId` / `RemoveEdgePropId`, V11 records 28 and 29, written by Cypher `CREATE`/`MERGE` maps and `SET`/`REMOVE r.p`). The import still refuses the columns: mapping them onto those records, and carrying them in the JSONL export, is what remains | **CLOSED** in 0.10.5 — `mushroomdb import` takes typed property columns on a relationships file, and the JSONL and CSV exports carry them back |
+| 120 | Low | CSV import: relationship property columns are not supported. Edges carry no user properties in the engine, so `mushroomdb import` refuses a relationships file with a property column rather than dropping the values. The engine half is done in 0.10: QL-RP gives edges user properties in the write path and the WAL (`SetEdgePropId` / `RemoveEdgePropId`, V11 records 28 and 29, written by Cypher `CREATE`/`MERGE` maps and `SET`/`REMOVE r.p`). The import still refuses the columns: mapping them onto those records, and carrying them in the JSONL export, is what remains | **CLOSED** in 0.10.5: `mushroomdb import` takes typed property columns on a relationships file, and the JSONL and CSV exports carry them back |
 | 121 | Medium, present in released 0.9.x | `load_from_disk` reads `snapshot.bin` first but takes `snapshot_ident` only after the WAL replay (db.rs, after `wal_frames_written` is set). A peer that completes both renames of a WAL-replacing snapshot in between leaves the handle with the old snapshot's state plus the new snapshot's baseline WAL, recorded under the new identities, and no later staleness check or refresh can tell. The 0.10 WAL-file identity check (HO-07) does not close it, since that identity is also taken after the rename. Found by the second re-review of HO-07. Owner: engine follow-up | **CLOSED** in 0.10.2 |
 | 122 | Medium, present in released 0.9.x, non-Unix only | On Windows and other non-Unix platforms there is no WAL-file identity: `file_ident` returns `None` (core-storage/src/fs.rs), so `refresh_checking(true)` in `enter_write_scope` compares `None` with `None`. A peer that replaces `wal.bin` with a file of exactly this handle's cursor length, with the snapshot unchanged, is invisible to the length checks; the handle's next write appends frames encoded against the old file, and the store then fails to open (`Corrupt`). Unix is covered by the HO-07 inode check. Found by the fourth re-review of HO-07. Owner: engine follow-up; fix is a platform identity (Windows file index via `GetFileInformationByHandle`) | **CLOSED** in 0.10.3 (Windows); gap remains on other non-Unix platforms (e.g. wasm) |
 | 123 | Medium | An equality index (`enable_index`) over a property a view owns answers from stale postings until the next open: a view writes its property inside `apply` without passing `prop_index`, so with a Degree view `deg` on `User`, `MATCH (n:User) WHERE n.deg = 1` returns 0 rows live and 1 after a reopen. A range index over a view property is refused both ways (0.10 TY-8), and so is a unique constraint (TY-5); the equality index was not. Found by TY-8 | **CLOSED** in 0.10 (TY-5b) |
 | 124 | Medium, present in released 0.9.x | The lock-free reader answers a weighted rule's edge score as `null` for every score written since its last fold: a rule writes `weight_prop` straight into the edge-property overlay with no WAL record, and `CommitDelta` carried no edge properties. Reached through role-token `POST /query` and the public `SharedDb::reader()` / `ReaderSnapshot::query`. Found by TX-5's e2e run | **CLOSED** in 0.10 |
 | 125 | Medium | The equality index keyed values by variant, so `= 2` through the index found the `Int` 2 and missed the `Float` 2.0 (and `0` missed `-0.0`) that a scan's `values_equal` finds: declaring an index changed a query's answer. Pre-0.10; made reachable through range indexes by TY-8. Found by the TY-8 review | **CLOSED** in 0.10 (TY-8) |
-| 126 | Low — performance, present in released 0.9.2 | The first write after a fold copies store structures (the index, the column store) under the write lock: a one-off cost per fold that scales with the store, not per commit. TX-1b reduced it by no longer sharing the full-text index. | **CLOSED** in 0.10 (TX-7) |
+| 126 | Low: performance, present in released 0.9.2 | The first write after a fold copies store structures (the index, the column store) under the write lock: a one-off cost per fold that scales with the store, not per commit. TX-1b reduced it by no longer sharing the full-text index. | **CLOSED** in 0.10 (TX-7) |
 | 127 | Medium, present in released 0.9.x | `serve` on a data directory the process cannot write reported `store is busy: write lock held by another process`. `SharedDb::write()` turned the I/O error from creating `LOCK` into "lock denied" with `unwrap_or(false)`, so the first write answered `Busy` and an operator went looking for a second process that did not exist. Found while writing the deploy templates (HO-12) | **CLOSED** by HO-12b in 0.10 |
 | 128 | Low, present in released 0.9.x | `SET n.id` changes the id property without renaming the node key, so the two diverge: a node keyed `alice` can carry `id = 'mallory'`, and `rename_node` only moves `id` along when it still equals the key. Closed by QL-06: on a node whose `id` equals its key, the engine refuses, on every write path (Cypher, `set_prop`, `set_props`, batches, CAS, upsert, HTTP, Python), setting `id` to another value and removing `id`; writing the key is accepted. A node whose `id` differs from its key, or that has none, is not covered | **CLOSED** |
 | 129 | Medium, present in released 0.9.x | Plain `MATCH … SET n.f = expr` evaluates every SET value once, against the state before the statement, so it reads stale values within a row (`SET n.v = 10, n.w = n.v + 0` sets `w` to the old `v`) and across rows (`MATCH (n:C), (m:D) SET n.count = n.count + 1` adds 1, not one per row): updates are lost with no error. Closed by QL-09b: each value that reads a node property is evaluated as its row is written, against the statement's own writes, in `SET n.f = expr` and `SET n += / = {…}`. A value that reads both a node and a relationship variable keeps the old column path | **CLOSED** |
-| 130 | Low — performance | A single statement (or batch) that both creates nodes and edges and deletes nodes commits superlinearly: 815 ms at 20k rows, 711 ms of it in `commit_batch`. Pure create or pure delete batches are linear. | **CLOSED** in 0.10 (TX-7) |
+| 130 | Low: performance | A single statement (or batch) that both creates nodes and edges and deletes nodes commits superlinearly: 815 ms at 20k rows, 711 ms of it in `commit_batch`. Pure create or pure delete batches are linear. | **CLOSED** in 0.10 (TX-7) |
 | 131 | Medium, present in released 0.9.x | `RETURN DISTINCT`, `count(DISTINCT …)` and grouping built their key with a function that returned the null key for every list and map, so all lists (and all maps) in a column were one value: `RETURN DISTINCT n.tags` over 1000 different lists returned 1 row, and `RETURN n.tags, count(*)` made 1 group. Closed by QL-07: a list or map key is encoded recursively with the scan's equality (`[2]` = `[2.0]`, `[0]` = `[-0.0]`, `Int`s past 2^53 stay apart, two `DateTime`s at one instant are equal, nulls group together), and a number used directly as a key now follows the same rule (`0` and `-0.0` are one value; `Int`s past 2^53 no longer merge) | **CLOSED** |
-| 132 | High — wrong rows, present in released 0.9.x | A variable-length hop ignored its destination's label and inline properties: `MATCH (a)-[*1..3]->(b:Person {active: true})` returned every node reachable within three hops, of any label and any `active` value, with no error. The same held for a `shortestPath` destination's pattern label and properties. Writes driven by such a MATCH landed on the same wrong nodes: `MATCH … SET` changed every reachable node, and `…-[*1..3]->(b:Person {active: false}) DETACH DELETE b` deleted every reachable node (data loss). Confirmed on v0.9.2. Found by QL-07. Closed by QL-VL: the end node of every variable-length hop is checked against its label and properties (nodes in between are not), in every hop form, mid-pattern, in `OPTIONAL MATCH` (which also failed with "unsupported op" before) and with a named path | **CLOSED** in 0.10 (QL-VL) |
+| 132 | High: wrong rows, present in released 0.9.x | A variable-length hop ignored its destination's label and inline properties: `MATCH (a)-[*1..3]->(b:Person {active: true})` returned every node reachable within three hops, of any label and any `active` value, with no error. The same held for a `shortestPath` destination's pattern label and properties. Writes driven by such a MATCH landed on the same wrong nodes: `MATCH … SET` changed every reachable node, and `…-[*1..3]->(b:Person {active: false}) DETACH DELETE b` deleted every reachable node (data loss). Confirmed on v0.9.2. Found by QL-07. Closed by QL-VL: the end node of every variable-length hop is checked against its label and properties (nodes in between are not), in every hop form, mid-pattern, in `OPTIONAL MATCH` (which also failed with "unsupported op" before) and with a named path | **CLOSED** in 0.10 (QL-VL) |
 | 133 | Medium, present in released 0.9.x | WHERE evaluated NOT two-valued: `NOT (null)` kept the row. A comparison with a null side read as false, and `NOT` turned that into true, so `WHERE NOT n.x = 1` returned the nodes with no `x`, and `NOT (a AND null)` kept a row whose `a` was true. Closed by QL-BX: WHERE, `CASE WHEN` and a list comprehension's `WHERE` evaluate every predicate three-valued, as a projection does, and keep a row only when it is true | **CLOSED** |
-| 134 | High — wrong rows and wrong writes, present in released 0.9.x | Relationship uniqueness did not span a MATCH clause. A variable-length hop checked its edges only against its own walk, so `MATCH (a)<-[*1..1]-(b)-[:X]->(c)` over the single edge `n3 -X-> n1` returned a row that used that edge twice (the fixed-hop form returned nothing), and a named path over such a pattern listed one relationship twice. A fixed hop checked against every relationship already in the row, earlier clauses included, so `MATCH (a)-[r]->(b) MATCH (c)-[s]->(d)` over one edge returned nothing where openCypher returns one row, and `OPTIONAL MATCH` could not rebind an edge an earlier `MATCH` bound. Writes driven by such a MATCH landed on the wrong nodes: over `a -> b -> c -> d`, `MATCH (s {id: 'b'})<-[*1..2]-(x)-[:R]->(y) DETACH DELETE y` deleted `b`. Confirmed on v0.9.2. Found by the QL-VL review. Closed by QL-RU: every hop (fixed, variable-length, shortest path) skips the edges the earlier hops of its own MATCH clause bound, comma-separated parts included, and nothing from other clauses | **CLOSED** in 0.10 (QL-RU) |
+| 134 | High: wrong rows and wrong writes, present in released 0.9.x | Relationship uniqueness did not span a MATCH clause. A variable-length hop checked its edges only against its own walk, so `MATCH (a)<-[*1..1]-(b)-[:X]->(c)` over the single edge `n3 -X-> n1` returned a row that used that edge twice (the fixed-hop form returned nothing), and a named path over such a pattern listed one relationship twice. A fixed hop checked against every relationship already in the row, earlier clauses included, so `MATCH (a)-[r]->(b) MATCH (c)-[s]->(d)` over one edge returned nothing where openCypher returns one row, and `OPTIONAL MATCH` could not rebind an edge an earlier `MATCH` bound. Writes driven by such a MATCH landed on the wrong nodes: over `a -> b -> c -> d`, `MATCH (s {id: 'b'})<-[*1..2]-(x)-[:R]->(y) DETACH DELETE y` deleted `b`. Confirmed on v0.9.2. Found by the QL-VL review. Closed by QL-RU: every hop (fixed, variable-length, shortest path) skips the edges the earlier hops of its own MATCH clause bound, comma-separated parts included, and nothing from other clauses | **CLOSED** in 0.10 (QL-RU) |
 | 135 | Medium, present in released 0.9.x | IN flattened list-valued elements: an element of the right-hand list that was itself a list counted its own elements, so `n.x IN [$l]` with `$l = [1, 2]` matched `x = 1`, and `n.tags IN [$t]` never matched a node whose `tags` equals `$t`. `IN $l` and `IN [$l]` built the same tree. Closed by QL-BX: the right-hand side of IN is one list-valued expression (an additive expression, as in openCypher) and its elements are compared whole | **CLOSED** |
-| 136 | Low, present in released 0.9.x | Index declarations can be lost in an archive crash window on non-V11 stores. A history-preserving snapshot renames the WAL to an archive and then writes the baseline WAL that re-declares the store's indexes; a crash between those two filesystem calls leaves a store whose snapshot does not carry its equality index declarations, so the reopened store has lost them. Row 22 removed every fallible call from that window, and the V10 stamp recovers the multiplicity opt-in, but nothing recovers an index declaration. V9 bytes must stay byte-identical to 0.9.2, so the fix applies only to V11 stores: TY-12's section 18 carries the declarations there | **DEFERRED** — closed on V11 stores by TY-12; V9/V10 stores keep the window |
-| 137 | Low — performance, present in released 0.9.2 | The first commit after a fold that writes an edge (an edge insert or delete, or a rule deriving one) copies the whole topology overlay under the write lock: about 77 ms on a 1M-node store with 2M edges and no snapshot. Row 126 removed the copy from commits that write no edge. | **DEFERRED** to 0.11 |
-| 138 | High — 0.10 release blocker, introduced in 0.10 (HO-07), never released | The backup chain had no store identity. Manifests named no lineage and were keyed by `commit_seq` alone, and resume reused archives on a matching number and length. A different or rewound store on a reused prefix therefore lost its backup: retention deleted its lower-sorting manifest and the objects only that manifest named, and `LATEST` was left dangling while health said OK. It also overwrote the other store's manifests at equal `commit_seq`. Worse, it built a restore point that listed another store's same-sized archive and still verified. HO-08's lease polling made this an automatic path. Found by the HO-08 review | **CLOSED** in 0.10 (HO-10): both restore paths give the restored store a new lineage; tests in `crates/backup/tests/boot.rs` and `restore_on_boot_empty_dir` (see below) |
-| 139 | High — silent wrong rows, present in released 0.9.x (since 0.2.0) | A filtered scan with LIMIT and no ORDER BY (`MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k`, with or without SKIP, `<op>` any of `=`, `<>`, `<`, `<=`, `>`, `>=`; on 0.9.x `=` only when the filtered node is not the first the MATCH scans, as in `MATCH (m:M), (n:L) WHERE n.f = 3 … LIMIT k`) runs the fused scan-and-filter, whose column handle read the overlay and never the snapshot base, so it dropped every node whose value a snapshot held: two nodes, `snapshot()`, a third, and `WHERE n.val <> 3 … LIMIT 5` returned only the third. Confirmed on v0.9.2. Found by TY-10. Closed by QL-FS in 0.10, and in 0.9.3 by the backport (`ColumnsView::view_column`): the column handle reads what a property read reads — the layer (0.10), the overlay, the tombstones, then the base | **CLOSED** in 0.9.3 and 0.10 (QL-FS) |
-| 140 | Low, introduced in 0.10 (TX-4), present in released 0.10.x | A transaction begun by a role token or a `read`-tier key cannot write. `Transaction` has no authz-aware commit, so an HTTP `/tx` transaction (and, by the same engine, a Bolt `BEGIN`) for such an identity reads through the role's mask on its begin snapshot and refuses any write with 403. `/query` lets a role with a write scope write; a transaction does not. Fail-closed and documented, never wider than the role | **CLOSED** in 0.10.4 — a role token with a write scope writes in a transaction exactly as `/query` lets it; a `read` key and a role with no write scope stay read-only |
-| 141 | High — 0.10 regression, introduced in 0.10 (HO-07 × HO-01), never released | `serve --tls-cert/--tls-key` panicked building the TLS config: two rustls crypto providers compiled, none installed. HO-01's image builds the CLI with `--features tls`, whose axum-server brings rustls's aws-lc-rs provider; HO-07's backup client (object_store, reqwest) brings ring. With both compiled in rustls has no default provider, and `RustlsConfig::from_pem_file` (`ServerConfig::builder()`) panicked in the HTTP task, so the image could not serve native TLS. 0.9.2 had only aws-lc-rs in the CLI's graph and shipped no TLS build. Found in TX-16. Closed by TX-16: HTTP and Bolt build their config with `server::load_server_config`, which uses the installed provider, else aws-lc-rs; tests that install no provider pin it, and CI now builds the TLS binary | **CLOSED** in 0.10 (TX-16) |
+| 136 | Low, present in released 0.9.x | Index declarations can be lost in an archive crash window on non-V11 stores. A history-preserving snapshot renames the WAL to an archive and then writes the baseline WAL that re-declares the store's indexes; a crash between those two filesystem calls leaves a store whose snapshot does not carry its equality index declarations, so the reopened store has lost them. Row 22 removed every fallible call from that window, and the V10 stamp recovers the multiplicity opt-in, but nothing recovers an index declaration. V9 bytes must stay byte-identical to 0.9.2, so the fix applies only to V11 stores: TY-12's section 18 carries the declarations there | **DEFERRED**: closed on V11 stores by TY-12; V9/V10 stores keep the window |
+| 137 | Low: performance, present in released 0.9.2 | The first commit after a fold that writes an edge (an edge insert or delete, or a rule deriving one) copies the whole topology overlay under the write lock: about 77 ms on a 1M-node store with 2M edges and no snapshot. Row 126 removed the copy from commits that write no edge. | **DEFERRED** to 0.11 |
+| 138 | High: 0.10 release blocker, introduced in 0.10 (HO-07), never released | The backup chain had no store identity. Manifests named no lineage and were keyed by `commit_seq` alone, and resume reused archives on a matching number and length. A different or rewound store on a reused prefix therefore lost its backup: retention deleted its lower-sorting manifest and the objects only that manifest named, and `LATEST` was left dangling while health said OK. It also overwrote the other store's manifests at equal `commit_seq`. Worse, it built a restore point that listed another store's same-sized archive and still verified. HO-08's lease polling made this an automatic path. Found by the HO-08 review | **CLOSED** in 0.10 (HO-10): both restore paths give the restored store a new lineage; tests in `crates/backup/tests/boot.rs` and `restore_on_boot_empty_dir` (see below) |
+| 139 | High: silent wrong rows, present in released 0.9.x (since 0.2.0) | A filtered scan with LIMIT and no ORDER BY (`MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k`, with or without SKIP, `<op>` any of `=`, `<>`, `<`, `<=`, `>`, `>=`; on 0.9.x `=` only when the filtered node is not the first the MATCH scans, as in `MATCH (m:M), (n:L) WHERE n.f = 3 … LIMIT k`) runs the fused scan-and-filter, whose column handle read the overlay and never the snapshot base, so it dropped every node whose value a snapshot held: two nodes, `snapshot()`, a third, and `WHERE n.val <> 3 … LIMIT 5` returned only the third. Confirmed on v0.9.2. Found by TY-10. Closed by QL-FS in 0.10, and in 0.9.3 by the backport (`ColumnsView::view_column`): the column handle reads what a property read reads: the layer (0.10), the overlay, the tombstones, then the base | **CLOSED** in 0.9.3 and 0.10 (QL-FS) |
+| 140 | Low, introduced in 0.10 (TX-4), present in released 0.10.x | A transaction begun by a role token or a `read`-tier key cannot write. `Transaction` has no authz-aware commit, so an HTTP `/tx` transaction (and, by the same engine, a Bolt `BEGIN`) for such an identity reads through the role's mask on its begin snapshot and refuses any write with 403. `/query` lets a role with a write scope write; a transaction does not. Fail-closed and documented, never wider than the role | **CLOSED** in 0.10.4: a role token with a write scope writes in a transaction exactly as `/query` lets it; a `read` key and a role with no write scope stay read-only |
+| 141 | High: 0.10 regression, introduced in 0.10 (HO-07 × HO-01), never released | `serve --tls-cert/--tls-key` panicked building the TLS config: two rustls crypto providers compiled, none installed. HO-01's image builds the CLI with `--features tls`, whose axum-server brings rustls's aws-lc-rs provider; HO-07's backup client (object_store, reqwest) brings ring. With both compiled in rustls has no default provider, and `RustlsConfig::from_pem_file` (`ServerConfig::builder()`) panicked in the HTTP task, so the image could not serve native TLS. 0.9.2 had only aws-lc-rs in the CLI's graph and shipped no TLS build. Found in TX-16. Closed by TX-16: HTTP and Bolt build their config with `server::load_server_config`, which uses the installed provider, else aws-lc-rs; tests that install no provider pin it, and CI now builds the TLS binary | **CLOSED** in 0.10 (TX-16) |
 | 142 | Low, introduced in 0.10 (HO-04 × TX-16), never released | A key revoked by a `keys.json` reload (`SIGHUP`) keeps working on an already-open Bolt connection until it closes. A Bolt connection authenticates once, at `HELLO`, and keeps the identity it resolved then; HTTP resolves the key on every request and refuses it on the next one. Documented in `docs/site/bolt.md` (Scoped access, "Revoking a credential") | **CLOSED** in 0.10 |
-| 143 | Low — missing counter, introduced in 0.10 (QL-09b), never released | No write result counted the relationships a statement created. `UNWIND … MATCH (a), (b) CREATE (a)-[:K]->(b)` created the edge and reported `created = 0`, and a `MERGE` that created only a relationship reported nothing. That count is correct under the documented meaning of `created` (nodes inserted, as on 0.9.x), but there was no relationship counter beside it. On v0.9.2 (checked with `git show v0.9.2:crates/core-api/src/db.rs`, `exec_create`) neither `UNWIND` writes nor relationship `MERGE` existed. Its one edge-creating path, `CREATE (a:L {…})-[:K]->(b:L {…})`, reported `created = 2` with nothing for the edge. Found by the QL-12 review. Closed by QL-CX: the write row gains a fourth column, `relationships_created` (after `created`, `properties_set` and `deleted`, which keep their positions and meanings), filled on every create path: `CREATE`, `MERGE`, `UNWIND … CREATE/MERGE`, `MATCH … CREATE/MERGE`, and `CREATE` and `MERGE` inside a transaction (the `UNWIND` and `MATCH … CREATE/MERGE` forms are refused inside a transaction in this build). Tests: `row_143_every_create_path_counts_its_relationships` and `row_143_a_transaction_counts_its_relationships_too` in `crates/core-api/tests/ql_cx.rs`, plus `relationships_created` assertions beside the `created` ones in `cypher_merge_edge.rs`, `cypher_writes.rs` and `ql_09b.rs` | **CLOSED** in 0.10 (QL-CX) |
-| 144 | Medium — refused statement, introduced in 0.10 (TX-1, QL-09b, QL-CX), never released | Inside a transaction (Rust `begin_transaction`, HTTP `/tx`, Bolt `BEGIN`, so every driver's managed write transaction) the per-row write forms were refused with `not supported in mushroomdb 0.10 inside a transaction: …`: `MATCH … CREATE` / `MATCH … MERGE` and `UNWIND … <write>` (the transaction refused `WriteStatement::UnwindWrite`, because the per-row executor read `GraphDb`, not the transaction's layered view), and also `MATCH … SET n = {…}` / `SET n += {…}`, `MATCH … SET … RETURN` and `MATCH … REMOVE … RETURN`. So "find two nodes, connect them" — `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)` — failed over Bolt `BEGIN`; only auto-commit `RUN` ran it. Transactions are new in 0.10, so no release had it. Found by the QL-CX review. Closed by TX-MW: the per-row executor and the `MATCH … SET` / `REMOVE` executors compute their ops over a `RowSource` (the store, or the transaction's base snapshot with its buffer laid over it), and the transaction buffers those ops instead of committing them, so every form runs with auto-commit's results and counts. Tests: `crates/core-api/tests/tx_mw.rs` (a randomized differential of the same statements auto-commit vs inside one transaction, read-your-write, rollback, conflict on the same pair, constraint at commit), `crates/server/tests/http_tx.rs::match_then_create_connects_two_nodes_inside_a_transaction`, `crates/bolt/tests/tx.rs::begin_match_create_commit_connects_two_nodes` | **CLOSED** in 0.10 (TX-MW) |
-| 145 | Medium — wrong values, introduced in 0.10 (TX-1), never released | Inside a transaction, `MATCH … SET` evaluated every value against the state before the statement, not against the statement's own earlier rows and items as auto-commit does. Over four rows matching one node, `MATCH (n {id: 'a'}), (m:Person) SET n.v = n.v + 1` added 1, not 4; `SET n.v = 10, n.w = n.v + 0` set `w` from the old `v`. The transaction's own `stage_match_set` projected each value in the MATCH query. Found by TX-MW's differential. Closed by TX-MW: the transaction computes `MATCH … SET` through the auto-commit executor (`match_set_ops` over the transaction's `RowSource`). Test: `match_set_reads_its_own_earlier_rows_inside_a_transaction` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
-| 146 | Low — wrong counter, introduced in 0.10 (TX-1), never released | Inside a transaction, `MATCH … DETACH DELETE` counted an edge between two nodes the statement deleted twice in `deleted` (once from each end); auto-commit deletes the nodes in turn and counts it once. Data correct. Found by TX-MW's differential. Closed by TX-MW: `stage_match_delete_node` counts an incident edge only when neither end was deleted earlier in the statement. Test: `row_146_an_edge_between_two_deleted_nodes_is_counted_once_in_a_transaction` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
-| 147 | Low — wrong counter, present in released 0.9.x (checked against v0.9.2) | `DETACH DELETE` of a node with a self-loop counted the loop as two deleted relationships: `delete_node` summed the node's Out and In neighbour lists, and a self-loop is in both, so `DeleteReport.manual_edges`, the `deleted` column of `MATCH … DETACH DELETE`, Python `delete_node` / `forget` (`manual_edges`) and the MCP task report were one too high per self-loop. Present since self-loops existed (v0.9.2 `delete_node` computes the same sum); counter only, data correct. Found by the TX-MW review. Closed by TX-MW: the In list skips the node itself, so a self-loop is counted once on every delete path (auto-commit, `delete_node`, and inside a transaction). Test: `row_147_a_self_loop_is_deleted_once` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
-| 148 | Medium — wrong wire type, introduced in 0.10 (TX-3, TX-6), never released | Over Bolt, a bare node variable came back as its key string and a bare relationship variable was refused (`cannot return relationship variable 'r' bare`), so the official drivers got no Node, Relationship or Path structure (W3 §3.3): `record["n"]["name"]` and `record["r"].type` failed, and TX-18's `streaming` scenario failed in both drivers. Found by TX-18. Closed by TX-NS: a result column that is a bare node, relationship or path variable carries its kind (`ResultSet::column_kind`), and a query run inside `with_entity_detail` (as every Bolt statement is) carries the element behind each cell, read from the view the statement ran on, so a role's mask and a transaction's own writes apply; Bolt sends Node `0x4E`, Relationship `0x52` and Path `0x50` in the 5.0 or 4.4 shape, with element ids `n:<key>` and `r:<type>\|<start>\|<end>`. A fixed relationship variable may now be returned bare, carried by `WITH` and listed by `RETURN *`; it renders on HTTP and in Python as the `{type, start, end}` map a path's relationship is, and `RETURN n` is still the key string there. Tests: `crates/core-query/src/cypher/tests/tx_ns.rs`, `crates/core-api/tests/tx_ns.rs`, `crates/bolt/tests/structures.rs`; TX-18's driver scripts pass 12/12 with both drivers | **CLOSED** in 0.10 (TX-NS) |
-| 149 | Low — missing summary, introduced in 0.10 (TX-3), never released | A write's closing Bolt `SUCCESS` carried no `stats`, so a driver's `summary.counters` read zero for every write (`contains_updates` false), and the engine counted nothing finer than the write row: `deleted` mixed nodes and relationships, and a `CREATE` or `MERGE` counted no properties. Found by TX-18. Closed by TX-NS: every write path (auto-commit and inside a transaction, `RETURN` or not, DDL included) records `WriteStats` on its result: nodes and relationships created and deleted apart, properties set (including those a new node is written with), labels added, indexes and constraints added and removed; Bolt sends the counters that moved under the names drivers read. The write row keeps its columns and meanings. Tests: `every_write_statement_reports_exact_stats` and `a_transaction_reports_the_same_stats_as_auto_commit` in `crates/core-api/tests/tx_ns.rs`, `a_write_success_carries_its_counters` in `crates/bolt/tests/structures.rs` | **CLOSED** in 0.10 (TX-NS) |
-| 150 | Low — wrong counter, present in released 0.9.x (checked against v0.9.2) | A plain `MERGE … ON CREATE SET …` / `ON MATCH SET …`, node or relationship form, reported `properties_set = 0` in its write row though it set properties; `UNWIND … MERGE` counted them. On v0.9.2 (`git show v0.9.2:crates/core-api/src/db.rs`, `exec_merge`) the row is built with a literal 0 in that column. Counter only, data correct. Found by QL-PM. Closed by TX-NS: `exec_merge`, `exec_merge_edge` and the transaction's `stage_merge` / `stage_merge_edge` count the `ON CREATE` or `ON MATCH` items they apply, so every path agrees with `UNWIND … MERGE`. Test: `row_150_merge_set_items_are_counted_in_properties_set` in `crates/core-api/tests/tx_ns.rs` (auto-commit and inside a transaction) | **CLOSED** in 0.10 (TX-NS) |
-| 151 | Low — reported inconsistency, not reproduced; introduced in 0.10 (QL-06, QL-PM) if at all, never released | Reported by the QL-PM review: `SET n += $props` / `SET n = $props` (plain, `ON CREATE` / `ON MATCH`, `UNWIND` form) with an `id` key on a name-keyed node writes an `id` that differs from the key, while `SET n.id` is refused (the id≡key rule, row 128). Checked by QL-RP on the 0.10 branch (base `2bc2498`), auto-commit and inside a transaction: every map form gives the answer `SET n.id` gives. On a node whose `id` equals its key, every form — `SET n.id`, `SET n += $m`, `SET n = $m`, `MERGE … ON MATCH SET n += $m`, `MERGE … ON CREATE SET n += $m`, the `UNWIND` form — refuses a diverging `id` (`cannot change the key property `id` …; renaming a node is rename_node`) and writes nothing. On a name-keyed node (`MERGE (:P {name: 'x'})`, no `id` equal to its key) `SET n.id` and the map forms alike store `id` as an ordinary property, which is the documented rule (row 128, `query.md`): a node whose `id` differs from its key, or that has none, treats `id` as an ordinary property. v0.9.2 has neither the map forms nor the id≡key rule (`git show v0.9.2:crates/core-query/src/cypher/ast.rs` has no `MatchSetMapStmt`; `git show v0.9.2:crates/core-api/src/db.rs` has no `id_mirrors_key`), so no release had it. No code change; the parity is pinned. Test: `row_151_map_forms_and_set_id_give_the_same_answer` in `crates/core-api/tests/ql_rp.rs` | **CLOSED** in 0.10 (QL-RP) — not a defect, pinned |
+| 143 | Low: missing counter, introduced in 0.10 (QL-09b), never released | No write result counted the relationships a statement created. `UNWIND … MATCH (a), (b) CREATE (a)-[:K]->(b)` created the edge and reported `created = 0`, and a `MERGE` that created only a relationship reported nothing. That count is correct under the documented meaning of `created` (nodes inserted, as on 0.9.x), but there was no relationship counter beside it. On v0.9.2 (checked with `git show v0.9.2:crates/core-api/src/db.rs`, `exec_create`) neither `UNWIND` writes nor relationship `MERGE` existed. Its one edge-creating path, `CREATE (a:L {…})-[:K]->(b:L {…})`, reported `created = 2` with nothing for the edge. Found by the QL-12 review. Closed by QL-CX: the write row gains a fourth column, `relationships_created` (after `created`, `properties_set` and `deleted`, which keep their positions and meanings), filled on every create path: `CREATE`, `MERGE`, `UNWIND … CREATE/MERGE`, `MATCH … CREATE/MERGE`, and `CREATE` and `MERGE` inside a transaction (the `UNWIND` and `MATCH … CREATE/MERGE` forms are refused inside a transaction in this build). Tests: `row_143_every_create_path_counts_its_relationships` and `row_143_a_transaction_counts_its_relationships_too` in `crates/core-api/tests/ql_cx.rs`, plus `relationships_created` assertions beside the `created` ones in `cypher_merge_edge.rs`, `cypher_writes.rs` and `ql_09b.rs` | **CLOSED** in 0.10 (QL-CX) |
+| 144 | Medium: refused statement, introduced in 0.10 (TX-1, QL-09b, QL-CX), never released | Inside a transaction (Rust `begin_transaction`, HTTP `/tx`, Bolt `BEGIN`, so every driver's managed write transaction) the per-row write forms were refused with `not supported in mushroomdb 0.10 inside a transaction: …`: `MATCH … CREATE` / `MATCH … MERGE` and `UNWIND … <write>` (the transaction refused `WriteStatement::UnwindWrite`, because the per-row executor read `GraphDb`, not the transaction's layered view), and also `MATCH … SET n = {…}` / `SET n += {…}`, `MATCH … SET … RETURN` and `MATCH … REMOVE … RETURN`. So "find two nodes, connect them": `MATCH (a {id: $a}), (b {id: $b}) CREATE (a)-[:K]->(b)`: failed over Bolt `BEGIN`; only auto-commit `RUN` ran it. Transactions are new in 0.10, so no release had it. Found by the QL-CX review. Closed by TX-MW: the per-row executor and the `MATCH … SET` / `REMOVE` executors compute their ops over a `RowSource` (the store, or the transaction's base snapshot with its buffer laid over it), and the transaction buffers those ops instead of committing them, so every form runs with auto-commit's results and counts. Tests: `crates/core-api/tests/tx_mw.rs` (a randomized differential of the same statements auto-commit vs inside one transaction, read-your-write, rollback, conflict on the same pair, constraint at commit), `crates/server/tests/http_tx.rs::match_then_create_connects_two_nodes_inside_a_transaction`, `crates/bolt/tests/tx.rs::begin_match_create_commit_connects_two_nodes` | **CLOSED** in 0.10 (TX-MW) |
+| 145 | Medium: wrong values, introduced in 0.10 (TX-1), never released | Inside a transaction, `MATCH … SET` evaluated every value against the state before the statement, not against the statement's own earlier rows and items as auto-commit does. Over four rows matching one node, `MATCH (n {id: 'a'}), (m:Person) SET n.v = n.v + 1` added 1, not 4; `SET n.v = 10, n.w = n.v + 0` set `w` from the old `v`. The transaction's own `stage_match_set` projected each value in the MATCH query. Found by TX-MW's differential. Closed by TX-MW: the transaction computes `MATCH … SET` through the auto-commit executor (`match_set_ops` over the transaction's `RowSource`). Test: `match_set_reads_its_own_earlier_rows_inside_a_transaction` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
+| 146 | Low: wrong counter, introduced in 0.10 (TX-1), never released | Inside a transaction, `MATCH … DETACH DELETE` counted an edge between two nodes the statement deleted twice in `deleted` (once from each end); auto-commit deletes the nodes in turn and counts it once. Data correct. Found by TX-MW's differential. Closed by TX-MW: `stage_match_delete_node` counts an incident edge only when neither end was deleted earlier in the statement. Test: `row_146_an_edge_between_two_deleted_nodes_is_counted_once_in_a_transaction` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
+| 147 | Low: wrong counter, present in released 0.9.x (checked against v0.9.2) | `DETACH DELETE` of a node with a self-loop counted the loop as two deleted relationships: `delete_node` summed the node's Out and In neighbour lists, and a self-loop is in both, so `DeleteReport.manual_edges`, the `deleted` column of `MATCH … DETACH DELETE`, Python `delete_node` / `forget` (`manual_edges`) and the MCP task report were one too high per self-loop. Present since self-loops existed (v0.9.2 `delete_node` computes the same sum); counter only, data correct. Found by the TX-MW review. Closed by TX-MW: the In list skips the node itself, so a self-loop is counted once on every delete path (auto-commit, `delete_node`, and inside a transaction). Test: `row_147_a_self_loop_is_deleted_once` in `crates/core-api/tests/tx_mw.rs` | **CLOSED** in 0.10 (TX-MW) |
+| 148 | Medium: wrong wire type, introduced in 0.10 (TX-3, TX-6), never released | Over Bolt, a bare node variable came back as its key string and a bare relationship variable was refused (`cannot return relationship variable 'r' bare`), so the official drivers got no Node, Relationship or Path structure (W3 §3.3): `record["n"]["name"]` and `record["r"].type` failed, and TX-18's `streaming` scenario failed in both drivers. Found by TX-18. Closed by TX-NS: a result column that is a bare node, relationship or path variable carries its kind (`ResultSet::column_kind`), and a query run inside `with_entity_detail` (as every Bolt statement is) carries the element behind each cell, read from the view the statement ran on, so a role's mask and a transaction's own writes apply; Bolt sends Node `0x4E`, Relationship `0x52` and Path `0x50` in the 5.0 or 4.4 shape, with element ids `n:<key>` and `r:<type>\|<start>\|<end>`. A fixed relationship variable may now be returned bare, carried by `WITH` and listed by `RETURN *`; it renders on HTTP and in Python as the `{type, start, end}` map a path's relationship is, and `RETURN n` is still the key string there. Tests: `crates/core-query/src/cypher/tests/tx_ns.rs`, `crates/core-api/tests/tx_ns.rs`, `crates/bolt/tests/structures.rs`; TX-18's driver scripts pass 12/12 with both drivers | **CLOSED** in 0.10 (TX-NS) |
+| 149 | Low: missing summary, introduced in 0.10 (TX-3), never released | A write's closing Bolt `SUCCESS` carried no `stats`, so a driver's `summary.counters` read zero for every write (`contains_updates` false), and the engine counted nothing finer than the write row: `deleted` mixed nodes and relationships, and a `CREATE` or `MERGE` counted no properties. Found by TX-18. Closed by TX-NS: every write path (auto-commit and inside a transaction, `RETURN` or not, DDL included) records `WriteStats` on its result: nodes and relationships created and deleted apart, properties set (including those a new node is written with), labels added, indexes and constraints added and removed; Bolt sends the counters that moved under the names drivers read. The write row keeps its columns and meanings. Tests: `every_write_statement_reports_exact_stats` and `a_transaction_reports_the_same_stats_as_auto_commit` in `crates/core-api/tests/tx_ns.rs`, `a_write_success_carries_its_counters` in `crates/bolt/tests/structures.rs` | **CLOSED** in 0.10 (TX-NS) |
+| 150 | Low: wrong counter, present in released 0.9.x (checked against v0.9.2) | A plain `MERGE … ON CREATE SET …` / `ON MATCH SET …`, node or relationship form, reported `properties_set = 0` in its write row though it set properties; `UNWIND … MERGE` counted them. On v0.9.2 (`git show v0.9.2:crates/core-api/src/db.rs`, `exec_merge`) the row is built with a literal 0 in that column. Counter only, data correct. Found by QL-PM. Closed by TX-NS: `exec_merge`, `exec_merge_edge` and the transaction's `stage_merge` / `stage_merge_edge` count the `ON CREATE` or `ON MATCH` items they apply, so every path agrees with `UNWIND … MERGE`. Test: `row_150_merge_set_items_are_counted_in_properties_set` in `crates/core-api/tests/tx_ns.rs` (auto-commit and inside a transaction) | **CLOSED** in 0.10 (TX-NS) |
+| 151 | Low: reported inconsistency, not reproduced; introduced in 0.10 (QL-06, QL-PM) if at all, never released | Reported by the QL-PM review: `SET n += $props` / `SET n = $props` (plain, `ON CREATE` / `ON MATCH`, `UNWIND` form) with an `id` key on a name-keyed node writes an `id` that differs from the key, while `SET n.id` is refused (the id≡key rule, row 128). Checked by QL-RP on the 0.10 branch (base `2bc2498`), auto-commit and inside a transaction: every map form gives the answer `SET n.id` gives. On a node whose `id` equals its key, every form: `SET n.id`, `SET n += $m`, `SET n = $m`, `MERGE … ON MATCH SET n += $m`, `MERGE … ON CREATE SET n += $m`, the `UNWIND` form: refuses a diverging `id` (`cannot change the key property `id` …; renaming a node is rename_node`) and writes nothing. On a name-keyed node (`MERGE (:P {name: 'x'})`, no `id` equal to its key) `SET n.id` and the map forms alike store `id` as an ordinary property, which is the documented rule (row 128, `query.md`): a node whose `id` differs from its key, or that has none, treats `id` as an ordinary property. v0.9.2 has neither the map forms nor the id≡key rule (`git show v0.9.2:crates/core-query/src/cypher/ast.rs` has no `MatchSetMapStmt`; `git show v0.9.2:crates/core-api/src/db.rs` has no `id_mirrors_key`), so no release had it. No code change; the parity is pinned. Test: `row_151_map_forms_and_set_id_give_the_same_answer` in `crates/core-api/tests/ql_rp.rs` | **CLOSED** in 0.10 (QL-RP): not a defect, pinned |
 | 152 | Low, introduced in 0.10 (TX-NS), present in released 0.10.x | Over Bolt, a node or relationship nested anywhere but a bare column or a one-kind list arrives as its key or `{type, start, end}` map, not as a graph structure: inside a map built in the query (`RETURN {who: n}`), in a list that mixes kinds or values (`[n, r]`, `[n, 1]`), in a list of lists (`collect([a, b])`), or through a computed value (`head(collect(n))`, `coalesce(n, m)`, `CASE … THEN n`). The column kind is worked out from the plan, and these positions have no single element kind to name. Bare columns, `collect(n/r/p)`, `[a, b]` of one kind and `p.nodes` / `p.relationships` are structures (TX-NS). Documented in `docs/site/bolt.md` (Nodes, relationships and paths, "Lists") | **CLOSED** in 0.10.5 |
-| 154 | Low — wrong values, present in released 0.9.x (by code identity with v0.9.2) | A retracted rule's saved edge weight came back live, then vanished at the next snapshot. With two weighted rules over one edge type — `ra` (weight `wa`) owning an edge, `rb` (weight `wb`) also matching it — a snapshot archives `wa`; when `ra` retracts and `rb` claims the edge, `ra`'s `remove_edge` tombstones the key and `rb`'s `EdgeProps::set` cleared the tombstone, so the live read showed `wa = 1.0` beside `wb`, for a rule that no longer owned the edge. The next snapshot's merge emitted the overlay entry alone, so the same read then gave `wa = null`: the answer changed across a snapshot. The mechanism is the same in v0.9.2 (`git show v0.9.2:crates/core-storage/src/edge_props.rs`, `set` removes the tombstone; `v8/seam.rs` `EdgePropsView::get` falls through to the base after the tombstone check; `edge_props_merge_to_data` is byte-identical to 2bc2498's; the retract-then-claim path is in `core-rules/src/engine.rs`), reproduced on 0.10 base `2bc2498` by the QL-RP review; not run on a v0.9.2 binary. Found by the QL-RP review. Closed by QL-RP: `EdgeProps::set` keeps a tombstone (the entry is then the edge's whole map), and the snapshot merge lays an untombstoned overlay entry over the archived one field by field, as every read does. Test: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen) | **CLOSED** in 0.10 (QL-RP) |
-| 155 | Low — missing event, introduced in 0.10 (QL-RP), present in released 0.10.x | A relationship-property write from Cypher (`CREATE`/`MERGE` with a relationship map, `SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`) emits no mutation or subscription event, so `/watch` and `/subscribe` consumers do not see it: the engine applies `SetEdgePropId` / `RemoveEdgePropId` without a `MutationEvent` or `DbEvent` variant to carry them. The write itself is durable and visible to every read. Found by the QL-RP review (M4) | **CLOSED** in 0.10.5 — a relationship-property write emits `edge_prop_set` / `edge_prop_removed` on `/watch` and `/subscribe`; adding them to `DbEvent` is a breaking change, noted in the changelog |
-| 156 | Low — refused query, introduced in 0.10 (QL-03e), present in released 0.10.x | `elementId()` accepts only a bare node or relationship variable: `elementId(startNode(r))` and `elementId(nodes(p)[0])` are refused, so a node reached through a function or a list index has no element id in Cypher. `elementId(n)` / `elementId(r)` on a variable work and match the Bolt structures' `element_id`. Loud, not wrong results | **CLOSED** in 0.10.5 |
-| 157 | High — silent wrong results, present in released 0.9.x (checked against v0.9.2) | `sum`, `avg`, `min` and `max` over a bare variable (`UNWIND [1,2] AS x RETURN max(x)`, or a variable carried through `WITH`) returned null: the accumulator had an arm for a property argument and none for a variable, so every row fell to the catch-all arm and contributed nothing. `count`, `collect`, `stDev` and the percentiles already read a variable. `min` / `max` also skipped every non-number, so they returned null over strings even for a property. Found by QL-10's TCK run (Aggregation2). Closed by QL-AG: the four read a scalar variable as they read a property, `min` / `max` order any non-null value, and a node, relationship or path argument is a named error | **CLOSED** in 0.10 (QL-AG) |
-| 158 | Medium — wrong result type, present in released 0.9.x (checked against v0.9.2) | `sum` of integers returned a float (`sum` over `10`, `20` gave `30.0`): the accumulator was one `f64`, so an all-integer sum had the wrong type and lost exactness above 2^53. openCypher returns an integer for all-integer input and a float once any input is a float. Closed by QL-AG: integers add exactly as `i64`, an overflow is the error `sum(): integer overflow`, and a float anywhere makes the result a float; `avg`, `stDev` and the percentiles stay float, as openCypher has them | **CLOSED** in 0.10 (QL-AG) |
-| 159 | Low — refused query, present in released 0.9.x (checked against v0.9.2) | An aggregate's argument must be a variable, `var.field` or `*`: `max(x + 1)`, `max(1)` and `max($p)` are parse errors (`expected variable or '*' in aggregate argument`). Loud, not wrong results. Needs expression arguments in `AggArg` and in every site that reads one (`distinct_value`, `stat_input`, variable interning, column naming) | **CLOSED** in 0.10.4 — an aggregate takes any expression; a nested aggregate and `rand()` inside one are refused by name |
-| 160 | Medium — wrong results, present in released 0.9.x (checked against v0.9.2) | Comparing two booleans with `<`, `<=`, `>` or `>=` gave null: `RETURN false < true` was null, `WHERE n.flag > false` dropped every row, and `min` / `max` over a boolean property gave null. openCypher orders `false` before `true`, and `ORDER BY` already did. `filter::is_orderable_pair` had no `(Bool, Bool)` arm, and the `min` / `max` accumulators took numbers only. On v0.9.2 (`git show v0.9.2:crates/core-query/src/filter.rs`) `is_orderable_pair` is numbers and strings only and `eval_cmp` returns false for any other pair, so a `WHERE` dropped the row; `git show v0.9.2:crates/core-query/src/cypher/exec.rs` keeps `min` / `max` to `numeric_val`. Found by QL-10 (the TCK's Quantifier7 [3]). Closed by QL-VE: `is_orderable_pair` orders two booleans, the range index orders a `Bool` bound the same way (`OrderClass::Bool`), and `min` / `max` order booleans (QL-AG's `fold_extreme`, kept at the bundle-19 merge in place of QL-VE's property-only change, orders any non-null value). Tests: `row_160_booleans_order_false_before_true` in `crates/core-query/src/cypher/tests/ql_ve.rs`; `filter::tests::int_float_eq_and_numeric_str_ordering`; `a_range_matches_its_class_as_the_scan_does` in `crates/core-storage/src/range_index.rs`; `index_matches_scan` (the index and the scan agree on boolean bounds); TCK Quantifier7 [3] (5 scenarios) passes | **CLOSED** in 0.10 (QL-VE) |
-| 161 | Low — wrong values, introduced in 0.10 (QL-TF), never released | `date.statement()` / `date.transaction()` (and the `localdatetime.` and `datetime.` forms) read the clock on every call instead of holding one instant per statement or transaction, so two calls in one statement can differ and `statement()` can differ from `transaction()`. Two TCK Temporal10 scenarios fail on it, and flip on clock timing. `realtime()` reading the clock on every call is right | **CLOSED** in 0.10 (QL-CL) |
-| 162 | None on 0.10; the symptoms are rows 114, 117 and 124, present in released 0.9.x (run on v0.9.3) | Reported by the v0.9.4 review: `db.reader()` answered rule-derived edges and their weights differently from the live handle (2559 of 5345 checks with null weights, 487 missing derived edges). A seeded differential probe on 0.10 finds no difference; on v0.9.3 it reproduces as rows 114, 117 and 124, which 0.10 closed | **CLOSED** — not a defect on 0.10; present in 0.9.x as rows 114, 117 and 124 |
-| 164 | Low — lease lifecycle, introduced in unreleased 0.10 (HO-07), release blocker | Shutdown canceled an initial lease acquisition after its remote PUT but before capability probes returned a handle. The own LEASE remained after clean exit, and no final manifest was published. HO-LC retains the pending attempt, shares its completion and flush under one grace deadline, then performs one bounded ownership-checked release | **CLOSED** in 0.10 (HO-LC) |
-| 166 | Low — semantic deviation, present in released 0.9.x and 0.10.0 | `sum` over no values returns null; openCypher returns 0. `MATCH (n) RETURN sum(n.missing)` and a group whose rows all lack the property both give null. Pinned as intended by `sum_numeric_prop_ignores_null_and_non_numeric` in `crates/core-query/src/cypher/exec.rs`. Found by hardening H-2. Changing it changes a result a caller can see, so it waits for an owner ruling. | **CLOSED** in 0.10.4 — `sum` over no values is 0 (owner ruling: follow openCypher) |
-| 167 | Medium — performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. **CLOSED for the publish allocation part only** (see row 172 for the remaining Linux gap to the 1.15× target). Fix: `EffectiveCell`+`AtomicBool` bundled into one `Arc<CacheCell>`, kept separate from `Arc<IndexCell>` so `Arc::try_unwrap` succeeds on the sole-holder seed path (O(1) move restored); static read-context (`SlowQuerySink` + WAL path) cached as `Arc<ReadContextStatic>` in the handle. Net: 2 allocs/commit (was 5). After fix: macOS 1.04× paused / 0.98× under readers; Linux arm64 container (3 CPUs) 1.20–1.21× paused / 1.17–1.20× under readers. Gate tightened: 1.40× → 1.35× (paused), 1.65× → 1.40× (under readers). | **CLOSED** in 0.10.1 |
-| 168 | High — silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
-| 169 | Medium — wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Closed in 0.10.1: the planner's single-aggregate path returned before emitting `Skip` / `Limit`, on the reasoning that the aggregate makes one row; it now emits them and both aggregate executors apply them to that row. Tests: `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`; `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op` in `crates/core-query/src/cypher/exec.rs` | **CLOSED** in 0.10.1 |
-| 170 | Low — semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **CLOSED** in 0.10.1 |
-| 171 | Low — doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
-| 172 | Low — performance gap, present in released 0.10.0 and 0.10.1 | On Linux arm64 (3-CPU container), a plain commit paused is 1.20× v0.9.2 after the row 167 allocation fix, vs the 1.15× target. The remaining gap tracks WAL syscall overhead: `strace` shows ~0.3 extra `mprotect` and 0.17 `futex` per commit on glibc vs macOS even with all per-commit heap allocs removed; macOS (M4) reaches 1.04×. `scripts/check-defect-ledger.sh` exit 0 because the gate bound is 1.35×, not the target. Evidence: Linux arm64 container (3 CPUs, `--cpus 3`), paused probe vs v0.9.2 after row 167 fix: 1.20–1.21× (target 1.15×, bound 1.35×) | **DEFERRED** to 0.11 |
-| 173 | Low — wrong value shape over Bolt, present in released 0.10.5 | A `UNION` dropped the row 152 structures: `MATCH (n:A) RETURN {node: n} AS v UNION MATCH (m:B) RETURN {node: m} AS v` sent `node` as the key, because the deduplicating combine built a fresh result without the value kind trees and only the flat column kinds were restored. `UNION ALL` kept the first part's trees for every row, so a later part's string equal to a node key was sent as that Node. Found by the review of PR #154. | **CLOSED** in 0.10.6 — trees merged across parts like the flat kinds |
-| 174 | Low — wrong value shape over Bolt, present in released 0.10.5 | A `MATCH … SET/REMOVE … RETURN` built its result without row 152's value kind trees: `MATCH (n {id: 'ada'}) SET n.seen = true RETURN {who: n}`, `[n, 1]` and `coalesce(n, n)` sent the node as its key; only a bare variable column was a structure. Found by the review of the row 173 fix. | **CLOSED** in 0.10.6 — the write `RETURN` sets its trees from the `MATCH`'s variable kinds |
+| 154 | Low: wrong values, present in released 0.9.x (by code identity with v0.9.2) | A retracted rule's saved edge weight came back live, then vanished at the next snapshot. With two weighted rules over one edge type: `ra` (weight `wa`) owning an edge, `rb` (weight `wb`) also matching it: a snapshot archives `wa`; when `ra` retracts and `rb` claims the edge, `ra`'s `remove_edge` tombstones the key and `rb`'s `EdgeProps::set` cleared the tombstone, so the live read showed `wa = 1.0` beside `wb`, for a rule that no longer owned the edge. The next snapshot's merge emitted the overlay entry alone, so the same read then gave `wa = null`: the answer changed across a snapshot. The mechanism is the same in v0.9.2 (`git show v0.9.2:crates/core-storage/src/edge_props.rs`, `set` removes the tombstone; `v8/seam.rs` `EdgePropsView::get` falls through to the base after the tombstone check; `edge_props_merge_to_data` is byte-identical to 2bc2498's; the retract-then-claim path is in `core-rules/src/engine.rs`), reproduced on 0.10 base `2bc2498` by the QL-RP review; not run on a v0.9.2 binary. Found by the QL-RP review. Closed by QL-RP: `EdgeProps::set` keeps a tombstone (the entry is then the edge's whole map), and the snapshot merge lays an untombstoned overlay entry over the archived one field by field, as every read does. Test: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen) | **CLOSED** in 0.10 (QL-RP) |
+| 155 | Low: missing event, introduced in 0.10 (QL-RP), present in released 0.10.x | A relationship-property write from Cypher (`CREATE`/`MERGE` with a relationship map, `SET r.p`, `SET r += …`, `SET r = …`, `REMOVE r.p`) emits no mutation or subscription event, so `/watch` and `/subscribe` consumers do not see it: the engine applies `SetEdgePropId` / `RemoveEdgePropId` without a `MutationEvent` or `DbEvent` variant to carry them. The write itself is durable and visible to every read. Found by the QL-RP review (M4) | **CLOSED** in 0.10.5: a relationship-property write emits `edge_prop_set` / `edge_prop_removed` on `/watch` and `/subscribe`; adding them to `DbEvent` is a breaking change, noted in the changelog |
+| 156 | Low: refused query, introduced in 0.10 (QL-03e), present in released 0.10.x | `elementId()` accepts only a bare node or relationship variable: `elementId(startNode(r))` and `elementId(nodes(p)[0])` are refused, so a node reached through a function or a list index has no element id in Cypher. `elementId(n)` / `elementId(r)` on a variable work and match the Bolt structures' `element_id`. Loud, not wrong results | **CLOSED** in 0.10.5 |
+| 157 | High: silent wrong results, present in released 0.9.x (checked against v0.9.2) | `sum`, `avg`, `min` and `max` over a bare variable (`UNWIND [1,2] AS x RETURN max(x)`, or a variable carried through `WITH`) returned null: the accumulator had an arm for a property argument and none for a variable, so every row fell to the catch-all arm and contributed nothing. `count`, `collect`, `stDev` and the percentiles already read a variable. `min` / `max` also skipped every non-number, so they returned null over strings even for a property. Found by QL-10's TCK run (Aggregation2). Closed by QL-AG: the four read a scalar variable as they read a property, `min` / `max` order any non-null value, and a node, relationship or path argument is a named error | **CLOSED** in 0.10 (QL-AG) |
+| 158 | Medium: wrong result type, present in released 0.9.x (checked against v0.9.2) | `sum` of integers returned a float (`sum` over `10`, `20` gave `30.0`): the accumulator was one `f64`, so an all-integer sum had the wrong type and lost exactness above 2^53. openCypher returns an integer for all-integer input and a float once any input is a float. Closed by QL-AG: integers add exactly as `i64`, an overflow is the error `sum(): integer overflow`, and a float anywhere makes the result a float; `avg`, `stDev` and the percentiles stay float, as openCypher has them | **CLOSED** in 0.10 (QL-AG) |
+| 159 | Low: refused query, present in released 0.9.x (checked against v0.9.2) | An aggregate's argument must be a variable, `var.field` or `*`: `max(x + 1)`, `max(1)` and `max($p)` are parse errors (`expected variable or '*' in aggregate argument`). Loud, not wrong results. Needs expression arguments in `AggArg` and in every site that reads one (`distinct_value`, `stat_input`, variable interning, column naming) | **CLOSED** in 0.10.4: an aggregate takes any expression; a nested aggregate and `rand()` inside one are refused by name |
+| 160 | Medium: wrong results, present in released 0.9.x (checked against v0.9.2) | Comparing two booleans with `<`, `<=`, `>` or `>=` gave null: `RETURN false < true` was null, `WHERE n.flag > false` dropped every row, and `min` / `max` over a boolean property gave null. openCypher orders `false` before `true`, and `ORDER BY` already did. `filter::is_orderable_pair` had no `(Bool, Bool)` arm, and the `min` / `max` accumulators took numbers only. On v0.9.2 (`git show v0.9.2:crates/core-query/src/filter.rs`) `is_orderable_pair` is numbers and strings only and `eval_cmp` returns false for any other pair, so a `WHERE` dropped the row; `git show v0.9.2:crates/core-query/src/cypher/exec.rs` keeps `min` / `max` to `numeric_val`. Found by QL-10 (the TCK's Quantifier7 [3]). Closed by QL-VE: `is_orderable_pair` orders two booleans, the range index orders a `Bool` bound the same way (`OrderClass::Bool`), and `min` / `max` order booleans (QL-AG's `fold_extreme`, kept at the bundle-19 merge in place of QL-VE's property-only change, orders any non-null value). Tests: `row_160_booleans_order_false_before_true` in `crates/core-query/src/cypher/tests/ql_ve.rs`; `filter::tests::int_float_eq_and_numeric_str_ordering`; `a_range_matches_its_class_as_the_scan_does` in `crates/core-storage/src/range_index.rs`; `index_matches_scan` (the index and the scan agree on boolean bounds); TCK Quantifier7 [3] (5 scenarios) passes | **CLOSED** in 0.10 (QL-VE) |
+| 161 | Low: wrong values, introduced in 0.10 (QL-TF), never released | `date.statement()` / `date.transaction()` (and the `localdatetime.` and `datetime.` forms) read the clock on every call instead of holding one instant per statement or transaction, so two calls in one statement can differ and `statement()` can differ from `transaction()`. Two TCK Temporal10 scenarios fail on it, and flip on clock timing. `realtime()` reading the clock on every call is right | **CLOSED** in 0.10 (QL-CL) |
+| 162 | None on 0.10; the symptoms are rows 114, 117 and 124, present in released 0.9.x (run on v0.9.3) | Reported by the v0.9.4 review: `db.reader()` answered rule-derived edges and their weights differently from the live handle (2559 of 5345 checks with null weights, 487 missing derived edges). A seeded differential probe on 0.10 finds no difference; on v0.9.3 it reproduces as rows 114, 117 and 124, which 0.10 closed | **CLOSED**: not a defect on 0.10; present in 0.9.x as rows 114, 117 and 124 |
+| 164 | Low: lease lifecycle, introduced in unreleased 0.10 (HO-07), release blocker | Shutdown canceled an initial lease acquisition after its remote PUT but before capability probes returned a handle. The own LEASE remained after clean exit, and no final manifest was published. HO-LC retains the pending attempt, shares its completion and flush under one grace deadline, then performs one bounded ownership-checked release | **CLOSED** in 0.10 (HO-LC) |
+| 166 | Low: semantic deviation, present in released 0.9.x and 0.10.0 | `sum` over no values returns null; openCypher returns 0. `MATCH (n) RETURN sum(n.missing)` and a group whose rows all lack the property both give null. Pinned as intended by `sum_numeric_prop_ignores_null_and_non_numeric` in `crates/core-query/src/cypher/exec.rs`. Found by hardening H-2. Changing it changes a result a caller can see, so it waits for an owner ruling. | **CLOSED** in 0.10.4: `sum` over no values is 0 (owner ruling: follow openCypher) |
+| 167 | Medium: performance, CI gate red on `main`, present in released 0.10.0 | On Linux a plain commit costs 1.18–1.34× v0.9.2 with no readers (bound 1.15×) and 1.44–1.58× under readers once core sharing is taken out (bound 1.25×); on macOS 1.01× and 1.16–1.21×, where the owner accepted it. Reproduced in a Linux container; the cost is the writer publishing a reader snapshot each commit (TX-5), not the background builder. **CLOSED for the publish allocation part only** (see row 172 for the remaining Linux gap to the 1.15× target). Fix: `EffectiveCell`+`AtomicBool` bundled into one `Arc<CacheCell>`, kept separate from `Arc<IndexCell>` so `Arc::try_unwrap` succeeds on the sole-holder seed path (O(1) move restored); static read-context (`SlowQuerySink` + WAL path) cached as `Arc<ReadContextStatic>` in the handle. Net: 2 allocs/commit (was 5). After fix: macOS 1.04× paused / 0.98× under readers; Linux arm64 container (3 CPUs) 1.20–1.21× paused / 1.17–1.20× under readers. Gate tightened: 1.40× → 1.35× (paused), 1.65× → 1.40× (under readers). | **CLOSED** in 0.10.1 |
+| 168 | High: silent wrong results, present in released 0.10.0 (on v0.9.3 the same shape is refused with an error) | A `RETURN` with an aggregate straight after an aggregating `WITH` (no `WHERE` between them) is dropped: the query returns the `WITH`'s columns and rows. `MATCH (a) WITH a.s AS w0, count(*) AS w1 RETURN count(*) AS c0` over `s` = a, a, b returns columns `w0, w1` and rows `[a, 2]`, `[b, 1]`; openCypher returns `c0` = 2. With a `WHERE` after the `WITH` the `RETURN` runs. Found by hardening H-3. Closed in 0.10.1: the plan was right, but the executor sent a plan with nothing but a second `GroupAggregate` after the first down the streaming group path, which keeps only `ORDER BY` / `SKIP` / `LIMIT` after the aggregate; any other op after a `GroupAggregate` now takes the staged path. Tests: `finding_an_aggregating_return_after_an_aggregating_with_runs` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs` | **CLOSED** in 0.10.1 |
+| 169 | Medium: wrong row count, present in 0.10.0 (verified on `main`) | `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: `MATCH (a) RETURN count(*) AS c SKIP 1` and `… LIMIT 0` over one node return the row `[1]`; openCypher returns no rows. Found by hardening H-3. Closed in 0.10.1: the planner's single-aggregate path returned before emitting `Skip` / `Limit`, on the reasoning that the aggregate makes one row; it now emits them and both aggregate executors apply them to that row. Tests: `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`; `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op` in `crates/core-query/src/cypher/exec.rs` | **CLOSED** in 0.10.1 |
+| 170 | Low: semantic deviation, present in 0.10.0 (verified on `main`) | Values of different types order numbers, strings, booleans, lists, null in `ORDER BY`, and `min` / `max` follow that order; openCypher orders lists, strings, booleans, numbers, null. Over `m` = 1, `'a'`, `true`, `ORDER BY m` gives `1, 'a', true` (openCypher `'a', true, 1`) and `min` / `max` give `1` / `true` (openCypher `'a'` / `1`). query.md says only that null sorts last. Owner: adopt the openCypher order. Found by hardening H-3. Pinned by `finding_values_of_different_types_order_as_opencypher_orders_them` in `crates/sim-harness/tests/reference_evaluator.rs` | **CLOSED** in 0.10.1 |
+| 171 | Low: doc/engine mismatch, present in 0.10.0 (verified on `main`) | query.md (Relationship patterns) says omitting the brackets (`-->`) is accepted, but the parser refuses `(a)-->(b)`, `(a)--(b)` and `(a)<--(b)` with `expected '[' in a relationship pattern (found Dash)`. `-[]->` works. Loud, not wrong results. Found by hardening H-3, whose generator renders `-[]->` instead. Closed in 0.10.1: `rel()` in `crates/core-query/src/cypher/parser.rs` now accepts a second `Dash` in place of `[…]` and synthesises an empty `RelPat` (no variable, no types, no hop range); the bare forms are equivalent to `-[]->`, `<-[]-`, `-[]-` everywhere they were already accepted in bracketed form. No lexer change was needed: `--` is not a comment in this dialect and the existing unary-minus gate (`arith_unary` only folds `-` into a number literal) prevents arithmetic ambiguity. H-3 now randomly renders untyped hops as either `-->` or `-[]->`. TCK rate rose from 0.7268 to 0.7419 (bare-arrow scenarios now pass). Tests: `crates/core-query/src/cypher/tests/ql_ba.rs` (parse and execution) | **CLOSED** in 0.10.1 |
+| 172 | Low: performance gap, present in released 0.10.0 and 0.10.1 | On Linux arm64 (3-CPU container), a plain commit paused is 1.20× v0.9.2 after the row 167 allocation fix, vs the 1.15× target. The remaining gap tracks WAL syscall overhead: `strace` shows ~0.3 extra `mprotect` and 0.17 `futex` per commit on glibc vs macOS even with all per-commit heap allocs removed; macOS (M4) reaches 1.04×. `scripts/check-defect-ledger.sh` exit 0 because the gate bound is 1.35×, not the target. Evidence: Linux arm64 container (3 CPUs, `--cpus 3`), paused probe vs v0.9.2 after row 167 fix: 1.20–1.21× (target 1.15×, bound 1.35×) | **DEFERRED** to 0.11 |
+| 173 | Low: wrong value shape over Bolt, present in released 0.10.5 | A `UNION` dropped the row 152 structures: `MATCH (n:A) RETURN {node: n} AS v UNION MATCH (m:B) RETURN {node: m} AS v` sent `node` as the key, because the deduplicating combine built a fresh result without the value kind trees and only the flat column kinds were restored. `UNION ALL` kept the first part's trees for every row, so a later part's string equal to a node key was sent as that Node. Found by the review of PR #154. | **CLOSED** in 0.10.6: trees merged across parts like the flat kinds |
+| 174 | Low: wrong value shape over Bolt, present in released 0.10.5 | A `MATCH … SET/REMOVE … RETURN` built its result without row 152's value kind trees: `MATCH (n {id: 'ada'}) SET n.seen = true RETURN {who: n}`, `[n, 1]` and `coalesce(n, n)` sent the node as its key; only a bare variable column was a structure. Found by the review of the row 173 fix. | **CLOSED** in 0.10.6: the write `RETURN` sets its trees from the `MATCH`'s variable kinds |
 <!-- DEFECT-INDEX:END -->
 
-## 20. Spec §5.9 asks for a shape the code cannot be put into — CLOSED
+## 20. Spec §5.9 asks for a shape the code cannot be put into: CLOSED
 
 Found writing `docs/site/multiprocess.md` (Task 9, Step 1), which the plan
 required be checked against the code rather than written from the spec.
@@ -205,14 +205,14 @@ cross-process lock:
   (`bindings/python/src/lib.rs`). No other argument exists.
 - `GraphDb::open_unlocked` is `pub(crate)`, and its only two callers are in
   `crates/core-api/src/shared.rs`. `SharedDb` uses it to take the lock **per
-  write** instead of per handle — a change of granularity, not an opt-out. Every
+  write** instead of per handle: a change of granularity, not an opt-out. Every
   `SharedDb` write still goes through `poll_cross_process_lock`.
 - No CLI flag and no environment variable: `grep -rniE 'no.?lock|skip.?lock|
   disable.*lock|MUSHROOM_[A-Z_]*LOCK'` over `crates`, `bindings` and `docs/site`
   returns nothing that configures one.
 
 **Why it matters.** Writing "not supported: X" where X is unreachable teaches a
-reader that X is reachable, which is the opposite of the section's purpose —
+reader that X is reachable, which is the opposite of the section's purpose:
 and it leaves the *actually* reachable failure undocumented. The lock is
 **advisory**: what can really happen is (a) a non-mushroomdb process editing the
 store directory, and (b) two paths to the same directory, where the lock is held
@@ -220,8 +220,8 @@ per inode.
 
 **What shipped.** `docs/site/multiprocess.md` keeps the heading ("Not supported:
 two processes writing with the lock bypassed") because the reader's question is
-real, and answers it with the truth — that no API, flag or variable turns the
-lock off — then documents (a) and (b) as the reachable shapes. No behaviour
+real, and answers it with the truth (that no API, flag or variable turns the
+lock off) then documents (a) and (b) as the reachable shapes. No behaviour
 change; nothing to fix in code.
 
 **Fix:** amend spec §5.9's fourth bullet and plan Task 9's Step 1 so a later
@@ -230,12 +230,12 @@ release was exactly that failure mode in the other direction.
 
 **Applied by `75de6f5`**, which was the remaining half: the doc had shipped but
 the spec and the plan still asked for the shape that does not exist. Both are
-now amended with the evidence above — `OpenOptions`' three fields,
-`open_unlocked`'s visibility and its two `SharedDb` callers — rather than having
+now amended with the evidence above (`OpenOptions`' three fields,
+`open_unlocked`'s visibility and its two `SharedDb` callers) rather than having
 the bullet deleted, so a later reader sees why the question was asked. No
 behaviour to pin; this was always a documentation defect.
 
-## 21. Plan Task 9's file list cannot satisfy the spec's Step 6 — CLOSED
+## 21. Plan Task 9's file list cannot satisfy the spec's Step 6: CLOSED
 
 Spec §5.11 / plan Task 9 Step 6 require the `find_similar` `min` deviation
 (MCP `0.8`, Python `0.0`) stated "in both the MCP tool description and the
@@ -253,7 +253,7 @@ absent from Task 9's file list, which covers only `docs/site/*`, `scripts/*`,
 **What shipped.** The deviation is now stated on every surface Task 9 owns:
 `docs/site/mcp.md` (both the prose and the tool table), `docs/site/api.md`,
 `bindings/python/README.md` and the `.pyi` docstring for `find_similar`, each
-naming the other's value. `crates/server/src/mcp.rs` is untouched — it is a
+naming the other's value. `crates/server/src/mcp.rs` is untouched: it is a
 Rust file outside this task's scope, and the agent holding Rust files this
 release was not it.
 
@@ -264,7 +264,7 @@ schema-text assertion before editing.
 **Applied by `bab8f4e`**, which also confirmed there is no such assertion. This
 heading and the index row both said otherwise until defect #31 caught them.
 
-## 17. `graph_err` takes the GIL while holding the store mutex — CLOSED
+## 17. `graph_err` takes the GIL while holding the store mutex: CLOSED
 
 Introduced by `591650c` (Task 7). Confirmed independently.
 
@@ -277,7 +277,7 @@ Introduced by `591650c` (Task 7). Confirmed independently.
 
 The new `graph_err` opens with `Python::attach` (`bindings/python/src/lib.rs:1678`).
 It is called from `with_scope` (`:1544`, `:1547`) and `with_ref` (`:1525`) while
-the store `Mutex` guard is **still alive** — the guard drops at end of function,
+the store `Mutex` guard is **still alive**: the guard drops at end of function,
 after the `map_err`.
 
 Four methods call `with_scope` from inside `py.allow_threads`: `find_similar`
@@ -301,12 +301,12 @@ The **old** `graph_err` took no `Python` token: `PyRuntimeError::new_err` builds
 a lazy `PyErr` that touches no interpreter state, so normalization happened after
 `allow_threads` returned. Task 7 moved that work under the lock.
 
-Single-threaded it never bites — re-attaching on the same thread succeeds
-immediately — which is why all 283 tests pass. `serve`, or any threaded Python
+Single-threaded it never bites (re-attaching on the same thread succeeds
+immediately) which is why all 283 tests pass. `serve`, or any threaded Python
 caller, is where it appears.
 
 **Fix:** drop the guard before mapping. In `with_scope` / `with_ref`, bind the
-result, `drop(guard)`, then `map_err(graph_err)` — including the
+result, `drop(guard)`, then `map_err(graph_err)`: including the
 `scope.resolve` arm. Add a threaded regression test; a single-threaded one
 cannot fail.
 
@@ -319,7 +319,7 @@ a separate early return at all: resolution and the read share the single
 
 **The test could not be a threaded test in-process.** Once the cycle closes, the
 thread holding the GIL is blocked on the `Mutex` forever and nothing else in
-that interpreter runs again — the main thread's `Thread.join(timeout=…)`
+that interpreter runs again: the main thread's `Thread.join(timeout=…)`
 releases the GIL to wait and can never reacquire it. A `join(timeout=…)` +
 `assert not t.is_alive()` therefore hangs the runner rather than failing, which
 is worse than no test. The contending workload runs in a **subprocess** under
@@ -329,7 +329,7 @@ Verified in both directions on this fix: unfixed it fails on the timeout in
 60.02s, fixed it passes in 2.25s.
 
 `with_ref` and `with_mut_unscoped` are not reachable from inside
-`allow_threads` today, so no runtime test can defend them — mutating either one
+`allow_threads` today, so no runtime test can defend them: mutating either one
 back survived the whole suite. They are held to the rule by a source-reading
 test instead (`test_every_locking_helper_drops_the_guard_before_mapping_an
 _error`), which asserts every `map_err(graph_err)` in all three helpers sits
@@ -338,13 +338,13 @@ after the `drop(guard)`. That kills both mutants.
 **The `scope.resolve` arm is not reachable from Python.** `scoped()` resolves
 once eagerly and throws the mask away, so an unknown role is refused at
 construction, and `roles.json` is read at open with no role-mutation API in the
-binding — so a handle whose role resolves at `scoped()` time cannot stop
+binding: so a handle whose role resolves at `scoped()` time cannot stop
 resolving later. The arm is covered structurally, not by a test, and this is
 why.
 
 Pinned by `bindings/python/tests/test_concurrency.py`.
 
-## 18. `replace` keeps view-owned props while three documents promise otherwise — CLOSED
+## 18. `replace` keeps view-owned props while three documents promise otherwise: CLOSED
 
 `9f2f863` changed `plan_replace`'s stale set from a row error to a silent filter
 (`db.rs:13355`), which fixes defect #13. But nothing tells the caller: the row
@@ -352,7 +352,7 @@ counts as `replaced`, `row_errors` is empty, and `BatchOutcome` has no slot for
 "kept a field you did not supply".
 
 Three statements still promise the opposite, none amended:
-`db.rs:12796` (`OnConflict::Replace` — *"make the node's properties **exactly**
+`db.rs:12796` (`OnConflict::Replace`: *"make the node's properties **exactly**
 the supplied props"*, with the `ns` exception spelled out and the view exception
 not), `bindings/python/mushroomdb.pyi:437`, and `ingest_batch`'s docstring.
 
@@ -360,18 +360,18 @@ A mirror rebuild against a store with a view now reports success while the node
 retains properties the caller did not supply. The behaviour is defensible; the
 silence is not.
 
-**Fix:** amend the three contract statements, and surface the retained fields —
+**Fix:** amend the three contract statements, and surface the retained fields:
 a `kept_view_owned` count on `BatchOutcome`, or a `row_errors`-style note.
 
 ### What closed it
 
 `BatchOutcome::kept_view_owned` counts the view-owned fields a `Replace` row
-kept rather than removed — **fields, not rows**, so one row that keeps two
+kept rather than removed: **fields, not rows**, so one row that keeps two
 contributes two. `MutPreview::plan_replace` now returns a `ReplacePlan`
 (the writes, plus that count); the omitted set is partitioned into the stale
 half it removes and the view-owned half it keeps, instead of the view-owned half
 being dropped by a filter that left no trace. The row still counts in
-`replaced` and still raises no row error, because nothing went wrong — the count
+`replaced` and still raises no row error, because nothing went wrong: the count
 is the signal, not an error.
 
 All three statements now spell out the view exception beside the `ns` one:
@@ -382,11 +382,11 @@ gained the `kept_view_owned` key.
 Pinned by `replace_counts_the_view_owned_props_it_kept` and
 `replace_counts_nothing_when_no_view_owned_prop_was_kept`
 (`crates/core-api/tests/batch_on_conflict.rs`), and by two tests in
-`bindings/python/tests/test_ingest_batch.py` — one for the report key, one that
+`bindings/python/tests/test_ingest_batch.py`: one for the report key, one that
 reads the shipped `__init__.pyi` and the live docstring and fails if either
 promises "exactly" without stating the exception in prose.
 
-## 19. The choke-point covers removal but not creation — CLOSED
+## 19. The choke-point covers removal but not creation: CLOSED
 
 `GraphDb::insert_node` (`db.rs:6048`) calls only `check_insert_node`
 (`db.rs:13088`), which checks the key and nothing else; `BatchOp::InsertNode`
@@ -398,7 +398,7 @@ carrying a property a view owns.
 
 **Fix:** decide whether creation should refuse a view-owned field the way
 `SetProp` does, then either guard `check_insert_node` or record in the ledger
-why creation is deliberately exempt. Do not leave it unstated — "the guard is
+why creation is deliberately exempt. Do not leave it unstated: "the guard is
 present but not unavoidable" is the failure this release keeps repeating.
 
 ### The decision: guard it. Creation was a live divergence, not a redundancy
@@ -408,10 +408,10 @@ store with a degree view over `LINK`:
 
 | | `deg` |
 |---|---|
-| after `insert_node("Doc", "c", {"deg": 777})` | `777` — accepted and stored |
+| after `insert_node("Doc", "c", {"deg": 777})` | `777`: accepted and stored |
 | after any later view event for that node | recomputed, the value is replaced |
 | node with **no** later view event, same process | `777`, for the life of the handle |
-| the same node after a reopen | `0` — backfill overwrites it |
+| the same node after a reopen | `0`: backfill overwrites it |
 
 So the two do **not** disagree forever, and the view does **not** always
 overwrite. It is worse than either: the store serves the caller's number until
@@ -433,7 +433,7 @@ two-answers inconsistency, and the entry does not mention it.
 ### What closed it
 
 `MutPreview::check_insert_node` now takes the props and refuses a view-owned
-field before it checks the key — the same order as
+field before it checks the key: the same order as
 `MutPreview::prepare_remove_prop`, so the answer does not depend on whether the
 key exists. It is the one choke-point `GraphDb::insert_node`, `BatchOp::
 InsertNode` and the `InsertEdgeUpsert` placeholder path all pass through.
@@ -451,7 +451,7 @@ Pinned by `insert_node_refuses_a_view_owned_prop`,
 and `on_conflict_insert_refuses_a_view_owned_prop_on_a_fresh_key`
 (`crates/core-api/tests/batch_on_conflict.rs`).
 
-## 15. A corrupt store says so to only one of two callers — CLOSED, DOCUMENTED
+## 15. A corrupt store says so to only one of two callers: CLOSED, DOCUMENTED
 
 Found by the third review, in the tests `dc81587` added. The last assertion of
 `a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404`
@@ -467,7 +467,7 @@ corrupt, and the `200 OK` is the correct answer.** Sized before touching, as the
 row asked; here is the sizing.
 
 **What the fixture actually damages.** `push_unapplyable_delta_for_test` appends
-a record to `GraphDb::delta_tail` — the MVCC reader's *tail*, not the store.
+a record to `GraphDb::delta_tail`: the MVCC reader's *tail*, not the store.
 Its own doc says so: *"Only the tail is touched. This handle's own state is
 untouched and `commit_seq` does not move."* `fold_overlay + delta_tail` is a
 second representation of the same state, maintained so `reader()` can hand out
@@ -476,7 +476,7 @@ state. Nothing on disk changed and no committed write was lost.
 
 **Which path each caller takes.** In `node_edges` (`crates/server/src/http.rs`):
 the role branch calls `state.db.reader()`, and `ReaderSnapshot::effective`
-folds the tail — that is where `mvcc delta intern mismatch` comes from
+folds the tail: that is where `mvcc delta intern mismatch` comes from
 (`reader.rs`'s `apply_one`). The full-token branch calls `state.db.read()` and
 reads the live handle under a read lock, which is the authoritative state. It
 answers `200` because the answer is right.
@@ -495,8 +495,8 @@ genuinely corrupt store fails CRC verification at `open()` and is refused to
 **Why nothing was built.** The two candidate fixes both fail on their merits:
 
 - *Make the unscoped path read the delta tail.* It would have to take a reader
-  snapshot and fold it on every read — which is exactly the lock-free property
-  the unscoped path exists to have — in order to turn a correct answer into an
+  snapshot and fold it on every read (which is exactly the lock-free property
+  the unscoped path exists to have) in order to turn a correct answer into an
   error, for a condition a shipped binary cannot enter.
 - *Surface it through a channel both callers share.* A log line at fold failure
   would have to live in `core-api`, which depends on `core-storage`,
@@ -509,37 +509,37 @@ genuinely corrupt store fails CRC verification at `open()` and is refused to
 Manufacturing either to empty this row is what the row itself warned against.
 
 **No behaviour to pin, so no test was added.** The existing assertion is
-correct and is left unedited. Its message — *"the full-token path does not read
-the delta tail"* — is what this row was filed from: it reads as a deficiency and
+correct and is left unedited. Its message (*"the full-token path does not read
+the delta tail"*) is what this row was filed from: it reads as a deficiency and
 states a fact. A future reader should read it against this section.
 
-## 16. `_WRITES_BY_KEY` probes one key position per method — CLOSED
+## 16. `_WRITES_BY_KEY` probes one key position per method: CLOSED
 
 `bindings/python/tests/test_scope_leaks.py`. `insert_edge`, `delete_edge`,
 `insert_edge_upsert` and `batch_edges` hard-code `src="vis_a"` and probe only
 `dst`; `rename_node` probes only `old`.
 
-**No live gap today** — all five refuse at `with_mut` before the lock is taken,
+**No live gap today**: all five refuse at `with_mut` before the lock is taken,
 so neither argument is read. But the property the dict exists to enforce is *no
 key argument is read before the refusal*, and it currently tests that for one
-argument per method. If a future `insert_edge` grew an endpoint pre-check — the
-exact shape `upsert_node` had in defect #8 — a `src`-side leak would pass this
+argument per method. If a future `insert_edge` grew an endpoint pre-check (the
+exact shape `upsert_node` had in defect #8) a `src`-side leak would pass this
 suite unnoticed.
 
-**Fix — the parametrisation is now a `(method, key position)` cross-product.**
+**Fix: the parametrisation is now a `(method, key position)` cross-product.**
 Twelve rows became seventeen: `insert_edge`, `delete_edge`,
 `insert_edge_upsert` and `batch_edges` are each probed on `src` and on `dst`,
 and `rename_node` on `old` and on `new`. Every row still asserts that a hidden
 key and an absent key produce the same class and the same message.
 
 The `rename_node(new)` row moves `vis_a`, not the probed key, so the body gained
-one assertion — `db.node_info("vis_a") is not None` — without which that row
+one assertion (`db.node_info("vis_a") is not None`) without which that row
 would assert nothing about what the refusal prevented.
 
 **What pins it.** The mutation is in the table below as M1: an unscoped
 existence read on `insert_edge`'s `src` before the refusal, which is defect #8's
 shape on the argument this dict was not probing. It is killed by
-`[insert_edge-src]` while `[insert_edge-dst]` stays **green** — so the gap is
+`[insert_edge-src]` while `[insert_edge-dst]` stays **green**: so the gap is
 demonstrated, not argued.
 
 Also noted by the same review, not worth its own row: the no-write assertion
@@ -556,19 +556,19 @@ one exposed over the network:
 - `BatchOp::SetProp` (`db.rs:5826`) **has** the guard.
 - `BatchOp::RemoveProp` (`db.rs:5836`) delegates to `prepare_remove_prop`
   (`db.rs:13124`), which guards only `NS_PROP`. **No view guard.**
-- `DELETE /node/{key}/prop/{field}` (`http.rs:2269`, `:2277` — both the
+- `DELETE /node/{key}/prop/{field}` (`http.rs:2269`, `:2277`: both the
   role-token and full-token branches) submits `BatchOp::RemoveProp` directly.
 - So does `Batch::remove_prop` (`db.rs:13634`, public Rust API) and
   `crates/cli/src/structure.rs:799`.
 
 On the fixture the new test already builds: `DELETE /node/a/prop/deg` returns
-`200 {"ok":true}` and `deg` is gone — while the same test's own fixture asserts
+`200 {"ok":true}` and `deg` is gone: while the same test's own fixture asserts
 `db.remove_prop("a","deg")` is `Err(ViewPropReadOnly)`.
 
 The codebase already knew about this class on this op.
 `crates/server/tests/http.rs:4266` says it outright: *"The route reaches
 `BatchOp::RemoveProp`, which skips the dense-rewrite seam … so the refusal has
-to hold at the batch choke-point — and it has to hold over HTTP."* `ns` got its
+to hold at the batch choke-point: and it has to hold over HTTP."* `ns` got its
 choke-point refusal. View props did not.
 
 **Fix:** put `view_for_prop` in `prepare_remove_prop`, which covers
@@ -579,7 +579,7 @@ does not read CLOSED again until an **HTTP** test pins it.
 the defect described, not that it covered every path that reaches the same
 write. "The guard is present" is not "the guard is unavoidable."
 
-### #9 closed again — what makes it unavoidable this time
+### #9 closed again: what makes it unavoidable this time
 
 The refusal now lives in `MutPreview::prepare_remove_prop`
 (`crates/core-api/src/db.rs:13130`), ahead of `check_live_key` so the answer
@@ -603,7 +603,7 @@ token) and `::full_token_remove_view_owned_prop_refused`. A third,
 degenerating into "the route is broken". The engine-level pin is
 `crates/core-api/tests/batch_on_conflict.rs::batch_remove_prop_refuses_a_view_owned_prop`.
 
-**Every path that can remove a property, and its coverage** — the enumeration
+**Every path that can remove a property, and its coverage**: the enumeration
 missing the first time:
 
 | path | reaches | covered by |
@@ -614,21 +614,21 @@ missing the first time:
 | `DELETE /node/{key}/prop/{field}`, both branches (`http.rs:2269`, `:2277`) | `BatchOp::RemoveProp` | `http.rs` ×2 |
 | `cli/src/structure.rs:799` | `BatchOp::RemoveProp` | inherits the choke-point |
 | `Db.set_prop(value=None)` / `Db.remove_prop` (`bindings/python/src/lib.rs:276`, `:290`) | `GraphDb::remove_prop` | inherits the choke-point |
-| `plan_replace` stale set (`db.rs:5807`) | raw `WalRecord::RemoveProp` | view fields are **filtered out** — see #13 |
+| `plan_replace` stale set (`db.rs:5807`) | raw `WalRecord::RemoveProp` | view fields are **filtered out**: see #13 |
 | Cypher write (`exec_write_stmt`, `db.rs:9739`) | only ever `batch.set_prop`; no clause removes a property | `BatchOp::SetProp`'s guard (`db.rs:5836`) |
-| `GraphDb::delete_node` / `BatchOp::DeleteNode` (`db.rs:6171`) | `props.remove_all` | **not guarded, and correctly so** — the node itself goes, taking the view's row with it; a view owns a property *of a node*, not the node's existence |
-| `GraphDb::delete_view` (`db.rs:6581`) | drops the view's own values | **not guarded, and correctly so** — the owner tearing down its own property |
+| `GraphDb::delete_node` / `BatchOp::DeleteNode` (`db.rs:6171`) | `props.remove_all` | **not guarded, and correctly so**: the node itself goes, taking the view's row with it; a view owns a property *of a node*, not the node's existence |
+| `GraphDb::delete_view` (`db.rs:6581`) | drops the view's own values | **not guarded, and correctly so**: the owner tearing down its own property |
 | `rewrite_wal_dense`, snapshot/compaction replay | re-apply records already admitted | upstream of every guard by construction |
 | `write_scores` (`db.rs:7213`) | writes, does not remove | refuses a view prop with `RuleInvalid` |
 | `set_prop` / `set_props` / `what_if_set_prop` | write, do not remove | guarded at `db.rs:6084`, `:6109`, `:12127` |
 
-`WalRecord::RemoveProp` has exactly three emitters in non-test code —
+`WalRecord::RemoveProp` has exactly three emitters in non-test code:
 `db.rs:5807` (replace stale set, now view-filtered), `:5848`
 (`BatchOp::RemoveProp`, guarded) and `:6138` (`GraphDb::remove_prop`, guarded).
 The remaining matches (`db.rs:311`, `:3934`, `:5330`, `:11036`, `:11387`,
 `reader.rs:262`) are apply/replay/history readers, not emitters.
 
-## 13. `replace` is impossible for any node a view has written to — CLOSED
+## 13. `replace` is impossible for any node a view has written to: CLOSED
 
 `db.rs:13297` refuses a **supplied** view-owned field; `db.rs:13333` (added by
 the #9 fix) refuses an **omitted** one. There is no third option, so a node
@@ -649,13 +649,13 @@ out of it**."* Filtering emits no `RemoveProp`, leaks nothing, and keeps
 carries `&& self.db.view_store.view_for_prop(field).is_none()`. A view-owned
 field is not the caller's to supply, so omitting it is not a request to delete
 it and it is simply not part of what "exactly the supplied ones" ranges over.
-Supplying one is still a row error — `db.rs:13317` is untouched and
+Supplying one is still a row error: `db.rs:13317` is untouched and
 `replace_supplying_a_view_owned_prop_is_still_a_row_error` is green unedited.
 
 **Pinned by** `crates/core-api/tests/batch_on_conflict.rs::replace_leaves_a_view_owned_prop_in_place`.
 Before the fix that test read
 `[(0, "node a: property \"deg\" is owned by view \"links_out\" and is read-only; on_conflict=\"replace\" cannot remove it by omitting it")]`
-— i.e. the row refused, exactly as this entry describes. The test's node also
+i.e. the row refused, exactly as this entry describes. The test's node also
 carries an ordinary stale prop (`note`), so the fix cannot degenerate into
 "stop removing stale props".
 
@@ -666,7 +666,7 @@ declares wrong (`out.replaced == 0`, one row error). It is renamed to
 the only pre-existing test changed by this commit; it was added by the #9 fix
 three commits ago and is what #13 is about.
 
-## 14. `push_unapplyable_delta_for_test` ships as public API — CLOSED
+## 14. `push_unapplyable_delta_for_test` ships as public API: CLOSED
 
 `crates/core-api/src/db.rs:3307`:
 
@@ -680,7 +680,7 @@ from nothing else: it is compiled into every release build of `core-api` and
 semver-committed by accident. One call permanently corrupts every
 `ReaderSnapshot` taken from that handle.
 
-**Not reachable from Python, HTTP or MCP** — verified: not a `#[pyo3]` method,
+**Not reachable from Python, HTTP or MCP**: verified: not a `#[pyo3]` method,
 `Db` is not exposed, no route calls it, and it needs `&mut GraphDb`, which none
 of those surfaces hands out. It is reachable by any embedder of the published
 crate.
@@ -695,7 +695,7 @@ that corrupts a store must not be in the shipped surface.
 **Closed.** `db.rs:3315` is now `#[cfg(any(test, feature = "test-hooks"))]`;
 `crates/core-api/Cargo.toml` declares `test-hooks = []`; `crates/server`'s
 **dev-**dependencies add
-`core-api = { …, features = ["test-hooks"] }` — the same three-part shape
+`core-api = { …, features = ["test-hooks"] }`: the same three-part shape
 `crates/core-api/Cargo.toml` already uses to turn on `core-rules`' `test-hooks`
 for `tests/rules.rs`.
 
@@ -723,10 +723,10 @@ back clean.
 
 ---
 
-## 8. `upsert_node` is an existence + label oracle on a scoped handle — CLOSED
+## 8. `upsert_node` is an existence + label oracle on a scoped handle: CLOSED
 
-`bindings/python/src/lib.rs:206`. The existence read runs through `with_ref` —
-**no scope, no refusal** — before `with_mut`'s `refuse_if_scoped` is ever
+`bindings/python/src/lib.rs:206`. The existence read runs through `with_ref` (**no scope, no refusal**)
+before `with_mut`'s `refuse_if_scoped` is ever
 reached, and the error at `:211` returns the hidden node's label:
 
 ```rust
@@ -744,7 +744,7 @@ On a scoped handle `s = db.scoped(keys=["vis_a"])`, against a store holding
 | `s.upsert_node("__probe__", "absent", {})` | `RuntimeError: this handle is scoped…` | nothing |
 
 The exception **class** alone is a one-call existence oracle for any key; the
-message hands over the label. No write occurs — the chokepoint holds — so this
+message hands over the label. No write occurs (the chokepoint holds) so this
 is a read leak sitting *in front of* the chokepoint.
 
 **Why the suite misses it:** `test_scoped.py:190` probes a key that is both
@@ -758,14 +758,14 @@ missed the error. An error is an output.
 
 **Fix:** `self.refuse_if_scoped()?` as the first statement, exactly as
 `create_rule` does at `:725`. Add the `upsert_node` row to
-`test_scope_leaks.py` — every method that can be reached on a scoped handle
+`test_scope_leaks.py`: every method that can be reached on a scoped handle
 belongs in that file, whether or not it is a read.
 
-## 9. `on_conflict="replace"` deletes view-owned read-only properties — CLOSED
+## 9. `on_conflict="replace"` deletes view-owned read-only properties: CLOSED
 
 `crates/core-api/src/db.rs:13172`. `plan_replace` refuses a *supplied*
-view-owned field (`:13150`), but the **stale** set — everything the node carries
-that the supplied props omit — is filtered only on `field != NS_PROP` and
+view-owned field (`:13150`), but the **stale** set (everything the node carries
+that the supplied props omit) is filtered only on `field != NS_PROP` and
 `has_prop`. Each entry becomes a raw `WalRecord::RemoveProp`, bypassing
 `GraphDb::remove_prop`'s `ViewPropReadOnly` guard at `db.rs:6023`.
 
@@ -773,7 +773,7 @@ Input: a view owning prop `deg`, backfilled into the `ColumnStore` by
 `ViewStore::create_view`, so `props_view().field_names()` includes it; node `a`
 labelled `Doc` carrying `deg`. Then
 `ingest_batch([{key:"a", label:"Doc", props:{title:"b"}}], on_conflict="replace")`
-commits `RemoveProp{a, deg}` — the exact write `remove_prop("a","deg")` refuses.
+commits `RemoveProp{a, deg}`: the exact write `remove_prop("a","deg")` refuses.
 
 Spec §5.6: *"Reserved-property rules are unchanged and still refuse."* This one
 does not. Neither `batch_on_conflict.rs` nor `test_ingest_batch.py` has a view
@@ -782,34 +782,34 @@ fixture, which is why it is invisible.
 **Fix:** route the stale set through the same guard, or filter view-owned fields
 out of it. Add a view fixture, or the fix is unpinned.
 
-## 10. Spec §5.3's history row was deviated from, correctly, but never amended — CLOSED
+## 10. Spec §5.3's history row was deviated from, correctly, but never amended: CLOSED
 
 §5.3's table says the history surfaces answer `KeyNotFound` for a hidden
 subject. The implementation answers empty / `False` / `None`.
 
 **The implementation is right.** `node_history` / `edge_history` / `edges_at` /
 `was_linked` WAL-scan and do not raise for an *unknown* key, so raising for a
-*hidden* one would distinguish hidden from absent — the oracle §5.3's own first
+*hidden* one would distinguish hidden from absent: the oracle §5.3's own first
 sentence forbids. `test_scope_leaks.py`'s module docstring argues this.
 
 But the spec was never amended, no commit records the deviation, and **the
 release gate reads the spec**. A future reader reconciling the two will
 "fix" the code back into a leak.
 
-**Fix:** amend §5.3's table to state the rule — *a surface that does not raise
-for an absent key must not raise for a hidden one* — and cite the reasoning.
+**Fix:** amend §5.3's table to state the rule (*a surface that does not raise
+for an absent key must not raise for a hidden one*) and cite the reasoning.
 
-## 11. `StoreStamp`'s stated invariant is not true of the code — CLOSED
+## 11. `StoreStamp`'s stated invariant is not true of the code: CLOSED
 
 `crates/core-api/src/mask.rs`. The doc says the id is minted "at exactly the two
 points a fresh `RoleMaskCache` is installed." There are three. A comment that
-miscounts the thing it exists to pin is worse than none — #1 and #2 both existed
+miscounts the thing it exists to pin is worse than none: #1 and #2 both existed
 because nobody wrote the invariant down, and a wrong one invites the same
 mistake with more confidence.
 
 **Fix:** correct the count and name all three sites.
 
-## 12. `Corrupt` maps to 400 on one path and 500 on another — CLOSED
+## 12. `Corrupt` maps to 400 on one path and 500 on another: CLOSED
 
 `graph_err` has no `Corrupt` arm, so it falls through to `err_response` (400),
 while `role_mask_err` maps the same condition to 500. The same corrupt store
@@ -824,13 +824,13 @@ answering **500**, so both paths agree. 500 rather than 400 because a corrupt
 store is a server-side condition: 400 tells a caller to change an input, and no
 input they can send will help.
 
-The body is deliberately unchanged — the arm formats `corrupt.to_string()`,
-which is exactly what the 400 catch-all produced — so only the status moved.
+The body is deliberately unchanged (the arm formats `corrupt.to_string()`,
+which is exactly what the 400 catch-all produced) so only the status moved.
 
 `crates/server/tests/http.rs:2260`
 (`a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404`) is the pin. Its
 assertion was the one place in the suite that encoded the old status, and its
-doc comment had already flagged the value as provisional — *"400, not 5xx as the
+doc comment had already flagged the value as provisional: *"400, not 5xx as the
 ledger assumed."* It now asserts 500 and says why. **That one assertion is the
 only edit the fix required: the remaining 369 server tests pass unmodified**,
 which is what says no other route's response moved.
@@ -842,7 +842,7 @@ bodies this task promised to leave alone.
 
 **Not all rows were closed at the time.** #9 was reopened after a third review
 found its fix covered one of two doors; #13 and #14 came from the same pass.
-Ten rows were CLOSED, three were OPEN, and one was deferred — the three OPEN
+Ten rows were CLOSED, three were OPEN, and one was deferred: the three OPEN
 rows and the deferred row (#12) have since been closed; the index table above
 reflects the current state.
 
@@ -853,7 +853,7 @@ the fix.
 
 ---
 
-## 1. `Scope::keys_cache` has no store identity — CLOSED
+## 1. `Scope::keys_cache` has no store identity: CLOSED
 
 `crates/core-api/src/mask.rs`, `Scope::resolve_keys`. The cache entry is keyed
 on a bare `u64` commit seq:
@@ -877,8 +877,8 @@ notices it.
 seq, or move the cache into the `GraphDb` so it cannot outlive its store. Prefer
 whichever makes the cross-store case *impossible* rather than merely checked.
 
-**Fixed, with #2, by a store stamp.** `mask.rs` gains `StoreId` — a
-process-unique id from a never-reused counter — and `StoreStamp { store,
+**Fixed, with #2, by a store stamp.** `mask.rs` gains `StoreId` (a
+process-unique id from a never-reused counter) and `StoreStamp { store,
 commit_seq }`. `GraphDb` holds a `store_id`, minted in `new_empty` and again in
 `reset_for_reload`, at exactly the two points it installs a fresh
 `RoleMaskCache`. The cache entry carries a stamp and is served only when
@@ -887,7 +887,7 @@ commit_seq }`. `GraphDb` holds a `store_id`, minted in `new_empty` and again in
 Moving the memo into the `GraphDb` was the other candidate and was rejected: a
 `Scope`-keyed map on the store either hashes the whole key list per read (which
 is the cost the memo exists to avoid) or grows without bound as per-request
-scopes come and go. The stamp is not a check bolted onto the old design — the
+scopes come and go. The stamp is not a check bolted onto the old design: the
 identity is *owned and re-minted by the store*, which is the same ownership
 property that makes `RoleMaskCache` immune, carried into an entry the caller
 holds.
@@ -895,7 +895,7 @@ holds.
 Against the next person who adds a field: the validity test is a derived
 `PartialEq` on `StoreStamp`, and `StoreStamp::of` is the only constructor. A new
 field joins the comparison automatically and does not compile until `of` fills
-it in — there is no second place to forget.
+it in: there is no second place to forget.
 
 **What pins it:** `scope_keys_cache_never_crosses_stores` (`mask.rs`). Two
 stores of the same age (`commit_seq == 2` asserted equal), a scope naming a key
@@ -903,7 +903,7 @@ only store A has. Before the fix store B's mask admitted `secret`, B's own node
 holding the dense id A's `target` held. Mutation M1 (compare `commit_seq` only,
 i.e. the old code) and M3 (every store gets the same id) both die on it.
 
-## 2. `commit_seq` is not monotonic across a reload — CLOSED
+## 2. `commit_seq` is not monotonic across a reload: CLOSED
 
 `refresh()` (`db.rs:2460-2478`) calls `reset_for_reload()`, which zeroes
 `commit_seq` (`db.rs:2171`); `load_from_disk` reseeds it from
@@ -915,7 +915,7 @@ then serves its pre-reload mask: seq unchanged, nodes changed.
 `reset_for_reload` installs a **fresh** `RoleMaskCache` `Arc` precisely to close
 this hole, and its comment says so. `Scope` has no equivalent hook.
 
-Today this fails **closed** — every subject check re-resolves key→id, and dense
+Today this fails **closed**: every subject check re-resolves key→id, and dense
 ids are never recycled, so a stale entry reads a later key as absent rather than
 admitting it. That safety rests on an invariant stated nowhere near `Scope`.
 
@@ -926,7 +926,7 @@ the fix for #1 into this by making the cache entry carry a store+epoch stamp tha
 **Fixed** by the same stamp as #1: `reset_for_reload` mints a new `StoreId` on
 the line below the fresh `RoleMaskCache`, so a reload invalidates every entry a
 caller's `Scope` holds regardless of where `commit_seq` lands. The invariant is
-written out at `StoreStamp` in `mask.rs` — both axes, and why a
+written out at `StoreStamp` in `mask.rs`: both axes, and why a
 `GraphDb`-owned cache needs neither.
 
 **The reseed is constructible**, and the test constructs it rather than
@@ -939,11 +939,11 @@ M4 (reload keeps its id) dies on it.
 
 **It does still fail closed**, exactly as this entry said: the stale mask held a
 tombstoned dense id, and the test's "admits `filler`/`keep`" assertions did *not*
-fire — no live node inherited it. So the pre-fix leak is staleness, not
+fire: no live node inherited it. So the pre-fix leak is staleness, not
 disclosure. The fix does not rest on that: the stamp stops matching whether or
 not dense ids are ever recycled.
 
-## 3. `explain_scoped` returns a weight computed over hidden via nodes — CLOSED
+## 3. `explain_scoped` returns a weight computed over hidden via nodes: CLOSED
 
 **Confirmed independently.** `db.rs`, `explain`:
 
@@ -952,7 +952,7 @@ stored = rule_def.weight_prop.and_then(|p| edge_props_view().get(etype, src, dst
 ```
 
 returned unchanged by `explain_scoped`. For a via-hop rule the engine writes that
-property as the **max over every via node** — `core-rules/src/engine.rs:952`,
+property as the **max over every via node**: `core-rules/src/engine.rs:952`,
 `best = Some(match best { None => score, Some(prev) => prev.max(score) })`.
 `explanation_evidence_is_visible` asks only whether *some* visible via vouches,
 so when one does, the explanation ships carrying a score a **hidden** via set.
@@ -962,7 +962,7 @@ Reproduction: rule `weight_prop: Some("score")`, `via_label: "Org"`;
 scoring 0.9; mask hides `org_hidden`; `explain_scoped("alice", "proj", &mask)`
 returns `weight: Some(0.9)`.
 
-This is a hidden node influencing a score — the exact channel spec §5.4 closes
+This is a hidden node influencing a score: the exact channel spec §5.4 closes
 for `pairwise_similar` and leaves open here.
 
 **Fix:** recompute the weight over visible via nodes only, or omit the weight
@@ -977,23 +977,23 @@ recomputed score sanitises a number `explain` already returned and never adds a
 new one, so a scoped read never says more than the unscoped read it narrows.
 
 **What pins it:** `scoped_explain_reports_the_weight_of_the_visible_vias_only`
-(`crates/core-api/tests/scoped_reads.rs`), on the new `via_weighted` fixture —
+(`crates/core-api/tests/scoped_reads.rs`), on the new `via_weighted` fixture:
 `weight_prop: Some("score")` and two vias scoring 0.5 and 0.75, closing test gap
 7's first half. Before the fix it saw the leaked `weight: Some(0.75)`. The
 fixture's predicate is `All([KeyMatch, NumericWithin])`, deliberately
 **direction-sensitive**: a symmetric predicate cannot catch a `(dst, via)`
 evaluation, and the mutation pass found that one surviving.
 
-## 4. `explanation_evidence_is_visible` omits the rule's namespace — CLOSED
+## 4. `explanation_evidence_is_visible` omits the rule's namespace: CLOSED
 
 `db.rs:10155-10175` checks `mask.contains_id(via)`, the label sentinel, and
-`evaluate(predicate, via, dst)` — but **not** `rule_def.namespace`. The engine's
+`evaluate(predicate, via, dst)`: but **not** `rule_def.namespace`. The engine's
 via expansion filters with `rule_sees(def, v, g)`
 (`core-rules/src/engine.rs` ~855; `rule_sees_node` at `:22`).
 
 So a **visible, out-of-namespace** via with the right label and a satisfying
 predicate vouches for an explanation the engine actually derived through a
-**hidden, in-namespace** via — and the explanation is kept.
+**hidden, in-namespace** via: and the explanation is kept.
 
 Reproduction: rule `namespace: Some("t1")`; `org_hidden(ns=t1)` and
 `org_visible(ns=t2)`, both `Org`, both `industry=tech`, both `WORKS_AT` from
@@ -1009,7 +1009,7 @@ global rule sees everything) is written out in `db.rs` with a comment naming the
 engine function it mirrors.
 
 **What pins it:** `scoped_explain_rejects_an_out_of_namespace_via_as_evidence`,
-on the new `via_namespaced` fixture — `namespace: Some("t1")`, closing test gap
+on the new `via_namespaced` fixture: `namespace: Some("t1")`, closing test gap
 7's second half. Before the fix it saw the full `fit` explanation vouched for by
 `org_visible` (ns `t2`), with the real evidence `org_hidden` (ns `t1`) masked.
 
@@ -1017,11 +1017,11 @@ One thing the ledger's reproduction does not survive contact with the code: the
 hop edges **cannot be user-written**. `prepare_insert_edge` refuses a
 cross-namespace edge (`GraphError::CrossNamespace`, `db.rs:12901`), so
 `alice(t1) -WORKS_AT-> org_visible(t2)` is rejected at insert. The fixture gets
-there the only way the store allows — a **global** rule derives the hop edges,
+there the only way the store allows: a **global** rule derives the hop edges,
 which is the chaining case `Explanation::via_edge` documents. The defect is real
 and the leak reproduces; only the setup differs.
 
-## 5. HTTP role-branch error path is not byte-identical — CLOSED
+## 5. HTTP role-branch error path is not byte-identical: CLOSED
 
 `http.rs:1426` (`node_edges` role branch), `http.rs:1509` (`neighborhood` role
 branch), against `ReaderSnapshot::effective` (`reader.rs:509`).
@@ -1033,24 +1033,24 @@ through `resolve_key` / `neighborhood_masked`, which both swallow it with
 with `let state = self.effective()?;`, so the handler's `Err(e) => graph_err(e)`
 arm turns it into a **5xx `Corrupt`**.
 
-Same request, same store, different status and body — on `GET /node/{key}/edges`
+Same request, same store, different status and body: on `GET /node/{key}/edges`
 and `GET /node/{key}/neighborhood` with a role token, against a server whose
 reader snapshot has a corrupt WAL tail behind the frozen epoch.
 
 **Decision, taken deliberately: keep the new behaviour.** Reporting a corrupt
-store as "key not found" is the worse answer — it hides a real failure behind a
+store as "key not found" is the worse answer: it hides a real failure behind a
 routine one, and a caller retrying a 404 will never learn the store is damaged.
 The new response says what is actually wrong. This is the "good of the database"
 call rather than the letter of Task 2's byte-identity constraint.
 
 **Fix therefore is:** amend the plan's Task 2 constraint to record this as a
-deliberate exception, and add the route test neither behaviour has — no test in
+deliberate exception, and add the route test neither behaviour has: no test in
 `crates/server/tests/` exercises a corrupt-overlay reader on these two routes,
 which is why the change went unnoticed in the first place.
 
 **Closed both ways.** The plan's global byte-identity constraint now carries
 the exception, and Task 2 gains *"The one byte-identity exception: a store the
-reader cannot fold"* — the trade in full, so the next reader meets a decision
+reader cannot fold"*: the trade in full, so the next reader meets a decision
 rather than drift.
 
 **The corrupt overlay is constructible, but not by the write path.**
@@ -1059,7 +1059,7 @@ is applied to, and no sequence of public calls creates one: the tail is built
 from records the live overlay has just accepted, and `materialize` is
 deterministic, so a tail that folds once folds always.
 `GraphDb::push_unapplyable_delta_for_test` (`db.rs`, `#[doc(hidden)]`, beside
-`reader()`) appends the smallest such disagreement — an `Intern` record claiming
+`reader()`) appends the smallest such disagreement: an `Intern` record claiming
 `u32::MAX` for a symbol the frozen interner will not hand back. It touches only
 the tail, so `commit_seq` does not move and a memoised role mask stays valid,
 which turns out to be the whole reproduction.
@@ -1068,13 +1068,13 @@ which turns out to be the whole reproduction.
 
 1. **A cold role-mask memo never reaches the scoped read.** `mask_for_role`
    opens with `self.effective()?` too, so on the first role request against a
-   corrupt store the corruption surfaces there — **500 `roles misconfigured:
-   …`** — in the old branches and the new ones alike. The divergence this entry
+   corrupt store the corruption surfaces there (**500 `roles misconfigured:
+   …`**) in the old branches and the new ones alike. The divergence this entry
    describes needs the `(role, commit_seq)` memo already warm, which is the
    steady state of any served role token but is *not* what "same request, same
    store" implies.
 2. **The new status is 400, not "5xx Corrupt".** `graph_err` has no `Corrupt`
-   arm, so it falls through to `err_response` — `400` with the detail in the
+   arm, so it falls through to `err_response`: `400` with the detail in the
    body. The kept behaviour is still the right one (the body names the damage
    instead of blaming the key), but the status disagrees with `role_mask_err`'s
    500 for the same condition. Left as-is: fixing it means touching the shared
@@ -1082,24 +1082,24 @@ which turns out to be the whole reproduction.
    the next release's ledger, not this one's.**
 
 **What pins it:** two tests in `crates/server/tests/http.rs`, covering both
-routes each — `a_corrupt_overlay_is_reported_before_the_role_mask_resolves`
+routes each: `a_corrupt_overlay_is_reported_before_the_role_mask_resolves`
 (cold memo → 500, names the corruption, never "key not found") and
 `a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404` (warm memo → 400, same
 body test, plus a full-token read of the same store still answering 200).
 Against the pre-Task-2 branches (`68b1e4d^`'s `http.rs` restored verbatim) the
-warm test fails with `404 node key not found: pub1` — so it is a real
+warm test fails with `404 node key not found: pub1`: so it is a real
 discriminator, not a description of whatever the code happens to do. Mutations
 M8 (the injection hook made a no-op), M9 and M10 (`node_edges_scoped` /
 `neighborhood_scoped` swallowing `effective()` into `KeyNotFound`, i.e. the old
 behaviour moved into the engine) all die on it.
 
-## 6. The exactness warning names parameters `search_hybrid` cannot accept — CLOSED
+## 6. The exactness warning names parameters `search_hybrid` cannot accept: CLOSED
 
 `crates/core-api/src/db.rs`, `note_ambiguous_exactness`, reached from
 `search_hybrid_inner`'s vector leg via `find_similar_hnsw_masked`.
 
 The warning says *"pass exact=True or a where= predicate"*, but `search_hybrid`
-and `search_hybrid_scoped` take neither — their signatures are
+and `search_hybrid_scoped` take neither: their signatures are
 `(text_field, query_text, vector_field, query_vec, label, k[, mask])`. So a
 scoped hybrid search prints advice naming two arguments the caller cannot reach.
 
@@ -1112,7 +1112,7 @@ wording that names something the caller can actually do.
 
 **Related, not a defect:** the suppression set is a `Mutex<HashSet<..>>` on the
 `GraphDb` while the test counter is a `thread_local!`, so under a concurrent
-caller — `serve`, the deployment the warning exists for — the counter cannot be
+caller (`serve`, the deployment the warning exists for) the counter cannot be
 used to assert once-per-index. The current test only holds because it is
 single-threaded. Worth a comment so nobody later trusts the counter concurrently.
 
@@ -1120,13 +1120,13 @@ single-threaded. Worth a comment so nobody later trusts the counter concurrently
 alternative was the other candidate and was rejected: the approximation is just
 as real on the hybrid path, and a caller who read `mask=` as a promise of
 exhaustiveness is the reader this line was written for whichever door they came
-in by. Silencing it would leave them with no signal at all — the original
+in by. Silencing it would leave them with no signal at all: the original
 silent-wrong-answer, restored for one caller shape. What is broken is the
 remedy, so only the remedy changes.
 
-`ExactnessCaller` (`db.rs`, private) names the two shapes that reach the leg —
+`ExactnessCaller` (`db.rs`, private) names the two shapes that reach the leg:
 `Vector` (`find_similar*`, which do take `exact` and `where`) and `Hybrid`
-(`search_hybrid*`, which take neither) — and is threaded from
+(`search_hybrid*`, which take neither): and is threaded from
 `find_similar_vector_as` through `find_similar_hnsw_masked` to
 `note_ambiguous_exactness`. The public `find_similar_vector_filtered` signature
 is unchanged; it delegates with `Vector`. The hybrid line reads:
@@ -1134,41 +1134,41 @@ is unchanged; it delegates with `Vector`. The hybrid line reads:
 > the vector leg of a masked hybrid search on field `emb` (label `Item`) is
 > answering approximately … For an exact answer over the same visible candidate
 > set, run the vector leg on its own with `find_similar(field, vector, mask=…,
-> exact=True)` and fuse it with `search()` yourself — `search_hybrid` itself
+> exact=True)` and fuse it with `search()` yourself: `search_hybrid` itself
 > takes no exactness argument.
 
 The suppression key gains the caller shape (`(field, label, caller)`), because
 once-per-index across both shapes would let whichever call came first silence
-the other — leaving one caller reading advice written for a signature it does
+the other: leaving one caller reading advice written for a signature it does
 not have, which is the defect again in a new place.
 
 The counter's concurrency caveat is written out at
 [`ambiguous_exactness_warns`] in `db.rs`: the set is store-wide and the counter
 is per-thread, so it answers "once per index" only in a test that owns the
 store. A sibling hook, `ambiguous_exactness_last_warning`, records the line
-verbatim — the counter cannot witness *wording*, which is the entire defect.
+verbatim: the counter cannot witness *wording*, which is the entire defect.
 
 **What pins it:** `the_hybrid_path_advises_a_call_the_hybrid_caller_can_make`
 (`crates/core-api/tests/scoped_reads.rs`). It fails on the pre-fix code at the
-first assertion — the hybrid caller was reading "pass exact=True or a where=
+first assertion: the hybrid caller was reading "pass exact=True or a where=
 predicate" verbatim. Six mutations, all killed on the first pass: the hybrid
 call site reverted to `Vector` (M1) and the direct one switched to `Hybrid`
 (M6); the suppression key with the caller dropped (M2); the `advice` (M3) and
 `subject` (M4) hybrid arms replaced by the vector wording; and the rejected fix
-itself — an early return for `Hybrid` in `note_ambiguous_exactness` (M5), killed
+itself: an early return for `Hybrid` in `note_ambiguous_exactness` (M5), killed
 by the assertion that the warning still fires once on the hybrid path.
 
-## 7. `Scope::intersect` is `pub`, load-bearing, and untested — CLOSED
+## 7. `Scope::intersect` is `pub`, load-bearing, and untested: CLOSED
 
 Zero tests. It is the mechanism behind spec §5.2's *"`scoped()` on a scoped
 handle intersects further and never widens"*, Task 5 depends on it directly, and
-its `keys` match has four arms including `(None, b) => b.clone()` — none
+its `keys` match has four arms including `(None, b) => b.clone()`: none
 exercised. The highest-value test gap in the release.
 
 **Fix:** test every arm, including the asymmetric ones, and specifically that no
 combination can widen.
 
-**Fixed** — no production change was needed; `intersect` was correct, it was
+**Fixed**: no production change was needed; `intersect` was correct, it was
 unwitnessed. Five tests in `mask.rs`:
 
 | Test | Arm / property |
@@ -1179,7 +1179,7 @@ unwitnessed. Five tests in `mask.rs`:
 | `intersect_accumulates_role_and_namespace_legs` | role and namespace legs concatenate rather than replace |
 | `intersect_can_never_widen_either_side` | every pair from five scopes: the result sees nothing either side alone does not |
 
-**What pins it:** six mutations, all killed on the first pass — each key arm
+**What pins it:** six mutations, all killed on the first pass: each key arm
 replaced by `None`, `(None, None)` turned into an empty leg, the `(Some, Some)`
 intersection turned into a union, and the role/namespace concat reduced to
 `self`'s. A seventh (`intersect` starting the new scope with the left side's
@@ -1189,38 +1189,38 @@ is now witnessed.
 
 ---
 
-## Test gaps — not defects, but the reason defects 3 and 4 were invisible
+## Test gaps: not defects, but the reason defects 3 and 4 were invisible
 
 The review traced every Task 1–4 test against a reverted and a stubbed
 implementation: **none of them can pass vacuously.** The problem is not dishonest
 tests, it is missing ones. Close these alongside the defects above.
 
-1. ~~**`Scope::intersect` — zero tests.**~~ Promoted to defect #7, now **CLOSED**.
+1. ~~**`Scope::intersect`: zero tests.**~~ Promoted to defect #7, now **CLOSED**.
 2. **No test that the *role* leg re-resolves after a write.** Only the `keys` leg
    is pinned. The role leg's freshness rests entirely on `RoleMaskCache`'s
    pre-existing `commit_seq` keying, which no test here touches.
 3. **No test that `Scope::clone` carries its cache safely.** Correct today,
    unpinned.
-4. **`derived` is never asserted through `node_edges_scoped`** — the field Task 2
+4. **`derived` is never asserted through `node_edges_scoped`**: the field Task 2
    was most at risk of changing.
 5. **No HTTP-level assertion of the rewritten role branches.** The whole
    byte-identity claim rides on the pre-existing server test net. **Partly
    closed with defect #5**: the two corrupt-overlay tests are the first
    route-level assertions written *for* the rewritten branches, and they cover
    the error path on both routes. The success paths still ride the pre-existing
-   net — which does hold them, but was not written against them.
+   net: which does hold them, but was not written against them.
 6. **`degrees_scoped`'s `limit` and `where_` legs are untested under a scope**,
    though the doc comment makes a specific claim about `limit` counting visible
    rows.
 7. ~~**No via-hop rule with `weight_prop`, and none with a `namespace`.**~~
    **CLOSED** with defects #3 and #4: `via_weighted` and `via_namespaced` in
    `crates/core-api/tests/scoped_reads.rs`. Seven mutations were run against the
-   fix; six died on the first pass, and the seventh — swapping `evaluate`'s
-   `(via, dst)` arguments — **survived**, because every fixture predicate was
+   fix; six died on the first pass, and the seventh (swapping `evaluate`'s
+   `(via, dst)` arguments) **survived**, because every fixture predicate was
    symmetric. `via_weighted`'s predicate was changed to
    `All([KeyMatch, NumericWithin])` to kill it.
 
-## Constraints — verified clean at `9504bba`
+## Constraints: verified clean at `9504bba`
 
 | Constraint | Evidence |
 |---|---|
@@ -1235,7 +1235,7 @@ Re-verified after the #5/#6 fix commit: `Cargo.toml:17` still `0.6.9`, and
 release **and** for the working tree. That commit touches `crates/core-api` and
 `crates/server` only.
 
-## Mutation table — the #9 / #13 / #14 fix commit
+## Mutation table: the #9 / #13 / #14 fix commit
 
 Seven mutants, all killed on the first pass. Each was applied alone and reverted
 before the next.
@@ -1244,24 +1244,24 @@ before the next.
 |---|---|---|
 | 1 | Delete the `view_for_prop` guard from `prepare_remove_prop` | `batch_remove_prop_refuses_a_view_owned_prop`, `replace_leaves_a_view_owned_prop_in_place`, `scoped_remove_view_owned_prop_refused`, `full_token_remove_view_owned_prop_refused` |
 | 2 | That guard returns `Ok(false)` (silent no-op) instead of `Err` | the same four |
-| 3 | Drop `view_for_prop(field).is_none()` from the stale-set filter | `replace_leaves_a_view_owned_prop_in_place` — *"the view-owned property is neither removed nor rewritten"* |
+| 3 | Drop `view_for_prop(field).is_none()` from the stale-set filter | `replace_leaves_a_view_owned_prop_in_place`: *"the view-owned property is neither removed nor rewritten"* |
 | 4 | Invert that filter to `.is_some()` | `replace_leaves_a_view_owned_prop_in_place`, `replace_makes_props_exactly_the_supplied_props`, `replace_still_works_on_a_node_the_view_does_not_cover` |
 | 5 | `plan_replace`'s **supplied**-field guard `continue`s instead of erroring | `replace_supplying_a_view_owned_prop_is_still_a_row_error` |
 | 6 | Drop `features = ["test-hooks"]` from `crates/server`'s dev-dep | `cargo test -p mushroomdb-server --test http` → `E0599: no method named push_unapplyable_delta_for_test` ×2 |
 | 7 | Remove the `#[cfg(any(test, feature = "test-hooks"))]` gate | `strings target/release/libcore_api.rlib \| grep -c push_unapplyable_delta_for_test` → `1` (restored: `0`) |
 
 Mutants 3 and 4 are the pair that matters for #13: 3 proves the filter is doing
-work, 4 proves it is not doing *only* that work — the ordinary stale props still
+work, 4 proves it is not doing *only* that work: the ordinary stale props still
 have to go.
 
-## Mutation table — the #17 / #18 / #19 fix commit
+## Mutation table: the #17 / #18 / #19 fix commit
 
 Twelve mutants. Each was applied alone and reverted before the next. Ten died on
 the first pass; two survived and were killed by a test added for them.
 
 | # | Mutation | Killed by |
 |---|---|---|
-| 1 | `with_scope` maps the error under the guard again (the defect) | `test_error_raised_under_allow_threads_does_not_deadlock` — the child hangs, `subprocess.run` times it out |
+| 1 | `with_scope` maps the error under the guard again (the defect) | `test_error_raised_under_allow_threads_does_not_deadlock`: the child hangs, `subprocess.run` times it out |
 | 2 | `with_ref` maps the error under the guard again | **SURVIVED the whole suite** → `test_every_locking_helper_drops_the_guard_before_mapping_an_error` |
 | 3 | `with_mut_unscoped` maps the error under the guard again | **SURVIVED the whole suite** → the same new test |
 | 4 | Delete the `view_for_prop` loop from `check_insert_node` | `insert_node_refuses_a_view_owned_prop`, `batch_insert_node_refuses_a_view_owned_prop` |
@@ -1275,14 +1275,14 @@ the first pass; two survived and were killed by a test added for them.
 | 12 | The packaged stub drops the whole view-exception paragraph | `test_the_docs_state_the_view_exception_the_way_they_state_the_ns_one` |
 
 **Mutants 2 and 3 are the ones that matter.** Neither helper is reachable from
-inside `py.allow_threads` today, so no runtime test can make either deadlock —
+inside `py.allow_threads` today, so no runtime test can make either deadlock:
 reverting the drop in either one passes all 2379 workspace tests and all 300
 Python tests. They were killed by reading the source instead, holding all three
 locking helpers to the one rule so that the first method to wrap `with_ref` or
 `with_mut` in `allow_threads` does not silently reopen this.
 
 Mutant 12 was first written as a half-sentence deletion and **survived**; on
-inspection that was a weak mutant rather than a test gap — it garbled the prose
+inspection that was a weak mutant rather than a test gap: it garbled the prose
 but left the contract stated and `kept_view_owned` named. The assertion was
 strengthened anyway (it now requires the exception in prose, not just the
 identifier in the report shape) and the mutant re-aimed at the whole paragraph.
@@ -1291,12 +1291,12 @@ identifier in the report shape) and the mutant re-aimed at the whole paragraph.
 
 - **`cargo clippy --workspace --all-targets -- -D warnings` fails at
   `a1713df`**, on `crates/core-api/examples/sanitize_bench.rs:68`
-  (`clippy::manual_repeat_n` — `std::iter::repeat(line).take(4_000)` wants
+  (`clippy::manual_repeat_n`: `std::iter::repeat(line).take(4_000)` wants
   `repeat_n`). It is the only clippy error in the workspace under
   `--keep-going`; every other target is clean. Pre-existing and unrelated to
   #9/#13/#14, but it blocks the release gate and someone owns it.
 - **`7ca7741` (Task 5) has not been reviewed.** It is +1270 lines across the
-  whole Python read surface — the commit where a leak matters most. It needs the
+  whole Python read surface: the commit where a leak matters most. It needs the
   same adversarial pass that produced this list.
 - **Tasks 1-3 shipped without mutation testing.** Three of the four defects above
   are in those commits. Task 4 and Task 5 mutated deliberately and are cleaner.
@@ -1337,43 +1337,43 @@ is probed on both.
 `crates/server/src/mcp.rs:1443`'s `min` description now names the Python
 default alongside its own, so the MCP schema an agent reads states the
 deviation rather than only one half of it. Task 9 correctly declined to touch
-that file — it was outside the file list the plan gave it — and reported the
+that file (it was outside the file list the plan gave it) and reported the
 gap instead of silently widening its scope. Closed here, from outside that
 task, after checking `crates/server/tests/` for a schema-text assertion that
 would have pinned the old wording; there is none.
 
 Checked at the same time: `OpenOptions` carries exactly `auto_migrate`,
-`repair_wal`, `read_only` — no lock opt-out — and `open_unlocked` is
+`repair_wal`, `read_only` (no lock opt-out) and `open_unlocked` is
 `pub(crate)` with two callers, both in `SharedDb`, which locks per write. So
 #20 is confirmed: the spec asked for a configuration that does not exist.
 
 ---
 
-## 22. `archive_wal` can silently opt a store back out — CLOSED
+## 22. `archive_wal` can silently opt a store back out: CLOSED
 
 Found by the fifth review pass, on `f9d1033` (Task 10b).
 
 `snapshot_with(archive_wal: true)` renames the live WAL away with
-`self.fs.archive_wal(archive_n)?` and wrote its replacement — the baseline that
-re-emits `MULTIPLICITY_ENABLED` — **six fallible calls later**:
+`self.fs.archive_wal(archive_n)?` and wrote its replacement (the baseline that
+re-emits `MULTIPLICITY_ENABLED`) **six fallible calls later**:
 `write_genesis_marker`, `list_archives`, `read_archive`, `write_horizon_floor`,
-`delete_genesis_marker`, `delete_archive`. Any one returning `Err` — a transient
-`EIO`, an `ENOSPC` that clears, not only a crash — left the store with **no live
+`delete_genesis_marker`, `delete_archive`. Any one returning `Err` (a transient
+`EIO`, an `ENOSPC` that clears, not only a crash) left the store with **no live
 WAL at all** and so no declaration.
 
 Reopen then reported `multiplicity = false`. The store stopped counting, and its
-next snapshot wrote **V9** — while the archives still carried discriminant 23.
+next snapshot wrote **V9**: while the archives still carried discriminant 23.
 That is precisely the state V10 exists to prevent: a v0.6.9 binary reads those
 archives as a valid prefix followed by a corrupt tail.
 
 **Reproduction.** `crates/core-api/tests/multiplicity_declaration.rs`,
 `a_failed_archive_cannot_opt_the_store_back_out`. A `FailOnce` filesystem wraps
-`SimFs` and fails one named call exactly once, then behaves normally —
+`SimFs` and fails one named call exactly once, then behaves normally:
 deliberately not `SimFs::with_crash_after_ops`, which latches and so cannot tell
 a transient error from a power cut. Before the fix, both targets reopened opted
 *out* with the archive holding discriminant 23.
 
-**Fix — two halves, because one alone is not enough.**
+**Fix: two halves, because one alone is not enough.**
 
 1. **The baseline WAL write moved to immediately after the rename**, with zero
    fallible calls between them. This is what covers all three declarations:
@@ -1386,7 +1386,7 @@ a transient error from a power cut. Before the fix, both targets reopened opted
    `multiplicity = true` when the WAL declared nothing, the snapshot is
    `VERSION_10`, and at least one archive exists.
 
-Half 2 is what makes the bad state *unreachable* rather than merely unlikely —
+Half 2 is what makes the bad state *unreachable* rather than merely unlikely:
 ordering cannot close the crash window between two filesystem calls, and this
 does not try to.
 
@@ -1405,12 +1405,12 @@ does not try to.
 >
 > What actually carries the conclusion is the **V10 stamp alone**: it is written
 > from `self.multiplicity` before the WAL is touched, and it is also what makes
-> every older binary refuse the store by name — so opting in on the strength of
+> every older binary refuse the store by name: so opting in on the strength of
 > it costs such a reader nothing it was not already being told.
 >
 > The archive clause is kept, as a **scope restriction** rather than a proof.
 > Without it the recovery would also fire on a store that reached the V10
-> snapshot write and then failed with no archive present — a store that must
+> snapshot write and then failed with no archive present: a store that must
 > stay opted out, and can, because no WAL was renamed away, nothing carries
 > discriminant 23, and its next snapshot rewrites at V9. An archive is the
 > marker for the one state that is not recoverable that way.
@@ -1421,35 +1421,35 @@ does not try to.
 
 **Why it does not generalise to `EnableFulltext` / `EnableIndex`.** Those have no
 equivalent of the stamp: nothing in the snapshot records them, so there is no
-second copy of the evidence to recover from. Half 1 covers them — the wide
-window, where an ordinary `Err` was enough — and half 2 cannot. The asymmetry is
+second copy of the evidence to recover from. Half 1 covers them (the wide
+window, where an ordinary `Err` was enough) and half 2 cannot. The asymmetry is
 the right one: an index declaration lost to a crash costs an operator one
 `enable_fulltext` call and a rebuild, while a lost format declaration is not
 recoverable by any call.
 
 **What pins it.**
-- `a_failed_archive_cannot_opt_the_store_back_out` — both targets reopen opted
+- `a_failed_archive_cannot_opt_the_store_back_out`: both targets reopen opted
   in and keep writing V10; asserts that exactly one target reaches the
   lost-declaration state, so the test cannot pass on the reorder alone.
-- `a_failure_after_the_rename_keeps_the_index_declarations_too` — the ordering
+- `a_failure_after_the_rename_keeps_the_index_declarations_too`: the ordering
   half, stated for the two declarations the stamp does not cover.
-- `the_recovery_does_not_opt_a_store_in_by_itself` — a V9 snapshot next to an
+- `the_recovery_does_not_opt_a_store_in_by_itself`: a V9 snapshot next to an
   archive must not opt a store in.
 - `crates/sim-harness/tests/multiplicity_crash_window.rs`
-  (`no_crash_leaves_discriminant_23_unguarded`, unedited) — kills the mutant
+  (`no_crash_leaves_discriminant_23_unguarded`, unedited): kills the mutant
   that drops the archive clause from the recovery. It sweeps a workload with no
   archives at all, so a V10-implies-enabled rule that ignored archives would
   make a failed `enable_multiplicity` come back opted in, which that test
   refuses.
 
-## 23. Opting in permanently forfeits the archive genesis chain — CLOSED
+## 23. Opting in permanently forfeits the archive genesis chain: CLOSED
 
 `enable_multiplicity` writes `snapshot.bin` (`db.rs`, the forced `keep_wal`
 snapshot). The archive path samples `had_prior_snapshot` at the top of
 `snapshot_with` and gates `if is_first_archive && !had_prior_snapshot` on it, so
 a store that opted in **before** its first archive could never receive a genesis
 marker, and `open_at` could never replay archive-resident commits from empty
-state on it — permanently. Two docstrings promised the opposite in spirit
+state on it: permanently. Two docstrings promised the opposite in spirit
 (`enable_multiplicity`: "history reachable by `open_at` stays reachable"; the
 `.pyi`: "the snapshot keeps the WAL, so history stays reachable"). Both were true
 of the live WAL and false of the future archive chain.
@@ -1463,7 +1463,7 @@ truncated", and the proxy is only needed where the answer is unknown. New field
 `snapshot_preserved_history`: true when this handle opened a store with no
 `snapshot.bin` and has taken no truncating snapshot since. `had_prior_snapshot`
 now defers to it. A `keep_wal` snapshot this handle took, on a store that had
-none, provably left the WAL whole — so the chain really does start at genesis.
+none, provably left the WAL whole: so the chain really does start at genesis.
 
 **The limitation that is real, and is now documented.** Opting in, closing the
 store, and archiving in a *later* session still refuses genesis: once the handle
@@ -1475,20 +1475,20 @@ something `enable_multiplicity` causes. Both docstrings now say so and say what
 to do instead: take the first archive in the session that opted in.
 
 **What pins it.**
-- `opting_in_keeps_the_archive_genesis_chain` — the marker is written and
+- `opting_in_keeps_the_archive_genesis_chain`: the marker is written and
   `open_at(0)` reaches the archive-resident commit.
-- `a_prior_session_snapshot_still_refuses_genesis` — the documented limit.
-- `a_truncating_snapshot_in_this_session_still_refuses_genesis` — the case the
+- `a_prior_session_snapshot_still_refuses_genesis` (the documented limit.
+- `a_truncating_snapshot_in_this_session_still_refuses_genesis`) the case the
   conservative rule exists for, unrelaxed.
-- `crates/core-api/tests/wal_archives.rs` tests 13 and 14 (unedited) — both
+- `crates/core-api/tests/wal_archives.rs` tests 13 and 14 (unedited): both
   cross-session, both still refuse.
 
-## 24. A same-batch duplicate with same-batch endpoints is never counted — CLOSED
+## 24. A same-batch duplicate with same-batch endpoints is never counted: CLOSED
 
 `edge_count_record` returned `None` whenever `self.ids.get(src_key)` was `None`,
 which is every node created earlier in the same frame: interning happens later,
 in `rewrite_wal_dense`. Task 10 documented this as a known limit. It is not a
-corner — `ingest_batch` creating nodes and their edges in one frame is how a
+corner: `ingest_batch` creating nodes and their edges in one frame is how a
 mirror rebuild writes, which is the use case that motivated the feature. The
 edge *type* had the same problem through `self.syms.get`.
 
@@ -1496,16 +1496,16 @@ Degrading to "no count" rather than a wrong count was the right instinct, but a
 feature that silently does not count on its main path is not finished.
 
 **Reproduction.** `a_duplicate_counts_when_its_endpoints_are_created_in_the_same_frame`
-— three inserts of `E a→b` in a frame that also creates `a` and `b`; before the
+three inserts of `E a→b` in a frame that also creates `a` and `b`; before the
 fix `degree_multiplicity` answered 1 instead of 3. And
 `a_same_frame_duplicate_counts_under_a_brand_new_edge_type` for the `syms` half.
 
-**Fix — make it count, at the seam that can.** The count is no longer named in
+**Fix: make it count, at the seam that can.** The count is no longer named in
 the batch's validate pass. That pass queues a `PlannedRec::DuplicateCount`
 carrying the three *keys*, spliced back at the position the duplicate occupied;
 `rewrite_wal_dense_inner` resolves it. That pass is the only one that knows the
-frame's own ids — it holds the `pending` map of ids the frame's `InsertNodeId`
-records will allocate, and it is where `intern_wal` assigns the edge type — so a
+frame's own ids (it holds the `pending` map of ids the frame's `InsertNodeId`
+records will allocate, and it is where `intern_wal` assigns the edge type) so a
 count for a pair created by the same frame is nameable there and nowhere
 earlier.
 
@@ -1523,14 +1523,14 @@ single-`insert_edge` path, where `prepare_insert_edge` has already guaranteed
 both endpoints and the type resolve.
 
 **What pins it.**
-- `a_duplicate_counts_when_its_endpoints_are_created_in_the_same_frame` —
+- `a_duplicate_counts_when_its_endpoints_are_created_in_the_same_frame`:
   including the reopen, so the count is durable.
 - `a_same_frame_duplicate_counts_under_a_brand_new_edge_type`.
-- `a_deferred_count_stays_in_front_of_a_later_delete_in_the_same_frame` — the
+- `a_deferred_count_stays_in_front_of_a_later_delete_in_the_same_frame`: the
   splice position is load-bearing: appended counts would outlive a delete in the
   same frame and leave a `count` on an edge the store does not have.
-- `a_same_frame_duplicate_writes_no_record_without_the_opt_in` — the gate.
-- `batch_duplicate_insert_increments_count` (unedited) — the carry-forward
+- `a_same_frame_duplicate_writes_no_record_without_the_opt_in` (the gate.
+- `batch_duplicate_insert_increments_count` (unedited)) the carry-forward
   within a frame still reaches `committed + N`.
 
 ## Mutation table for #22-#24
@@ -1540,28 +1540,28 @@ full `cargo test --workspace` suite.
 
 | # | Mutation | Result |
 |---|---|---|
-| M1 | Drop the V10 recovery in `load_from_disk` entirely | KILLED — `a_failed_archive_cannot_opt_the_store_back_out` |
-| M2 | Key the recovery on `VERSION_9` instead of `VERSION_10` | KILLED — same, plus `the_recovery_does_not_opt_a_store_in_by_itself` |
-| M3 | Drop the `!list_archives()?.is_empty()` clause from the recovery | KILLED — `no_crash_leaves_discriminant_23_unguarded` |
-| M4 | Move the baseline WAL write back behind the genesis/prune steps | KILLED — `a_failed_archive_cannot_opt_the_store_back_out`, `a_failure_after_the_rename_keeps_the_index_declarations_too` |
-| M5 | `had_prior_snapshot` stops deferring to `snapshot_preserved_history` | KILLED — `opting_in_keeps_the_archive_genesis_chain` |
-| M6 | `snapshot_preserved_history = true` regardless of whether a snapshot existed at open | KILLED — `a_prior_session_snapshot_still_refuses_genesis` |
-| M7 | A truncating snapshot no longer clears `snapshot_preserved_history` | KILLED — `a_truncating_snapshot_in_this_session_still_refuses_genesis` |
-| M8 | Deferred counts stop carrying forward within the frame | KILLED — `batch_duplicate_insert_increments_count` |
-| M9 | Remove the `preview.db.multiplicity` gate on the batch path | KILLED — `a_same_frame_duplicate_writes_no_record_without_the_opt_in` |
-| M10 | Append deferred counts at the end instead of splicing in place | KILLED — `a_deferred_count_stays_in_front_of_a_later_delete_in_the_same_frame` |
-| M11 | The deferred count no longer increments (`+0`) | KILLED — `batch_duplicate_insert_increments_count` |
-| M12 | An **archiving** snapshot also clears `snapshot_preserved_history` | **SURVIVED** — see below |
-| M15 | The `DuplicateCount` arm stops emitting its `Intern` record | KILLED — `query_at_scoped_deletion_is_not_retroactive`, `query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit` |
-| M18 | Remove the opt-in gate from `edge_count_record` (single-edge path) | KILLED — `multiplicity_off_writes_no_new_record`, `multiplicity_disabled_reports_unique_degree` |
-| M21 | The archive baseline stops re-emitting `MULTIPLICITY_ENABLED` | KILLED — `a_failed_archive_cannot_opt_the_store_back_out` |
+| M1 | Drop the V10 recovery in `load_from_disk` entirely | KILLED: `a_failed_archive_cannot_opt_the_store_back_out` |
+| M2 | Key the recovery on `VERSION_9` instead of `VERSION_10` | KILLED: same, plus `the_recovery_does_not_opt_a_store_in_by_itself` |
+| M3 | Drop the `!list_archives()?.is_empty()` clause from the recovery | KILLED: `no_crash_leaves_discriminant_23_unguarded` |
+| M4 | Move the baseline WAL write back behind the genesis/prune steps | KILLED: `a_failed_archive_cannot_opt_the_store_back_out`, `a_failure_after_the_rename_keeps_the_index_declarations_too` |
+| M5 | `had_prior_snapshot` stops deferring to `snapshot_preserved_history` | KILLED: `opting_in_keeps_the_archive_genesis_chain` |
+| M6 | `snapshot_preserved_history = true` regardless of whether a snapshot existed at open | KILLED: `a_prior_session_snapshot_still_refuses_genesis` |
+| M7 | A truncating snapshot no longer clears `snapshot_preserved_history` | KILLED: `a_truncating_snapshot_in_this_session_still_refuses_genesis` |
+| M8 | Deferred counts stop carrying forward within the frame | KILLED: `batch_duplicate_insert_increments_count` |
+| M9 | Remove the `preview.db.multiplicity` gate on the batch path | KILLED: `a_same_frame_duplicate_writes_no_record_without_the_opt_in` |
+| M10 | Append deferred counts at the end instead of splicing in place | KILLED: `a_deferred_count_stays_in_front_of_a_later_delete_in_the_same_frame` |
+| M11 | The deferred count no longer increments (`+0`) | KILLED: `batch_duplicate_insert_increments_count` |
+| M12 | An **archiving** snapshot also clears `snapshot_preserved_history` | **SURVIVED**: see below |
+| M15 | The `DuplicateCount` arm stops emitting its `Intern` record | KILLED: `query_at_scoped_deletion_is_not_retroactive`, `query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit` |
+| M18 | Remove the opt-in gate from `edge_count_record` (single-edge path) | KILLED: `multiplicity_off_writes_no_new_record`, `multiplicity_disabled_reports_unique_degree` |
+| M21 | The archive baseline stops re-emitting `MULTIPLICITY_ENABLED` | KILLED: `a_failed_archive_cannot_opt_the_store_back_out` |
 
 **M12 is an equivalent mutant, and the argument is short enough to check.**
 `snapshot_preserved_history` is read at exactly one place: the
 `had_prior_snapshot` expression, which is consulted only under
 `is_first_archive`. `archive_wal` always adds an archive, retention pruning with
 `keep > 0` always leaves at least one, and nothing else in a session removes the
-last — so `existing_archives` is non-empty for every archiving snapshot after the
+last: so `existing_archives` is non-empty for every archiving snapshot after the
 first, and the flag's value from that point on is never read again. Leaving it
 `true` is the honest value (an archiving snapshot moves history, it does not
 truncate it); M12 makes it dishonest and unobservable. It is not killed because
@@ -1569,40 +1569,40 @@ there is nothing to observe, and no test was added for it: pinning an
 unobservable value would need a seam invented for the purpose.
 
 M21 is worth a second look for the opposite reason. It survives on the *archive*
-path's own merits — the V10 recovery would restore the declaration anyway — but
+path's own merits (the V10 recovery would restore the declaration anyway) but
 it is killed because the reordered baseline write now lands before the injected
 failure, so the reopened store finds the declaration in the live WAL rather than
 inferring it. The re-emission is still load-bearing on the `keep_wal=false`
 truncating path, where there are no archives and so no recovery.
 
-## 25. `f9d1033` falsified two spec statements and amended neither — CLOSED
+## 25. `f9d1033` falsified two spec statements and amended neither: CLOSED
 
 Found by the fifth review (F5). Two statements survived the V10 commit and were
 false after it:
 
-1. **§5.13's contract bullet** — *"CSR stays a set. No multi-edges, no
+1. **§5.13's contract bullet**: *"CSR stays a set. No multi-edges, no
    snapshot-format change (V9 unchanged)."* `f9d1033` adds V10 and makes an
    opted-in store write it. This is the sentence a later implementer would read
    to conclude the release takes no format step.
-2. **The §7 D8 `CORRECTION, 2026-09-18` block** — which described a 0.6.9 binary
+2. **The §7 D8 `CORRECTION, 2026-09-18` block**: which described a 0.6.9 binary
    *silently discarding every commit after the first discriminant-23 record*.
    `f9d1033` closes that hole: the V10 snapshot is read first and refused by
    name, so the truncation is unreachable. The block's guidance to Task 12
    ("the CHANGELOG must say this plainly") pointed at a false statement.
 
-This is defect #10's class exactly — a correct deviation from the spec that the
-spec was never told about — which #10 closed as a standing process rule.
+This is defect #10's class exactly (a correct deviation from the spec that the
+spec was never told about) which #10 closed as a standing process rule.
 
 **Fix.** `75de6f5` amended both, in `bca0856`'s style: the evidence is added
 rather than the old text deleted, so the next reader sees what was asked and
-what the answer turned out to be. No behaviour to pin — this is a documentation
+what the answer turned out to be. No behaviour to pin: this is a documentation
 closure, and the code it documents is pinned by `snapshot_v10.rs`.
 
 Everything else that stated the old behaviour was already correct at `f9d1033`:
 `mushroomdb.pyi`'s `enable_multiplicity`, the Rust binding docstring,
 `db.rs`'s `enable_multiplicity` doc, and `docs/format-stability.md`.
 
-## 26. `format_version()`'s doc outran the code — CLOSED
+## 26. `format_version()`'s doc outran the code: CLOSED
 
 Found by the fifth review (F6). `GraphDb::format_version()` returns
 `snapshot::VERSION` (= `VERSION_9`) and its doc read *"On-disk snapshot format
@@ -1612,8 +1612,8 @@ sentence was wrong on both halves. It is public API, reachable from the CLI
 (`cli/src/lib.rs` reads the re-exported `SNAPSHOT_VERSION` as `current`) and
 from any embedder.
 
-**Fix.** `75de6f5` reworded it to say what it is — the floor, the version a
-store that has opted in to nothing writes — and to point at
+**Fix.** `75de6f5` reworded it to say what it is (the floor, the version a
+store that has opted in to nothing writes) and to point at
 `snapshot::version_for` for the rest. The name was left alone deliberately:
 renaming a public function to fix a doc is a breaking change for a defect that
 is a sentence.
@@ -1622,7 +1622,7 @@ is a sentence.
 which is now a correct pin of a correctly-described value rather than a pin of
 stale semantics.
 
-## 27. A fourth mmap-container enumeration survived the unification — CLOSED
+## 27. A fourth mmap-container enumeration survived the unification: CLOSED
 
 Found by the fifth review (F8). `f9d1033`'s message said it unified three copies
 of the container-version list into `is_mmap_container`; it did, and the review
@@ -1630,19 +1630,19 @@ verified all three. A fourth survived in `snapshot::decode`'s match arm
 (`VERSION_8 | VERSION_9 | VERSION_10 =>`), because a match arm cannot call a
 function.
 
-No live gap — the arm was updated correctly for V10. The risk is forward: adding
+No live gap: the arm was updated correctly for V10. The risk is forward: adding
 V11 would have required editing three things no test ties together (the arm,
 `MMAP_CONTAINER_VERSIONS`, and its `[u16; 3]` length), and
 `every_version_the_encoder_writes_is_mmap_able` never exercises `decode`, so a
 V11 in `version_for` and the array but not the arm would produce a store this
 binary writes and then refuses to open, with the suite green.
 
-**Fix.** `75de6f5` made the arm a match guard — `v if is_mmap_container(v) =>`,
-which a guard *may* call — and made `MMAP_CONTAINER_VERSIONS` a slice so its
+**Fix.** `75de6f5` made the arm a match guard (`v if is_mmap_container(v) =>`,
+which a guard *may* call) and made `MMAP_CONTAINER_VERSIONS` a slice so its
 length is not a fourth thing to keep in step. `MMAP_CONTAINER_VERSIONS` is now
 the only place the set is written down.
 
-## 28. `roles()`'s scoped refusal is a `ValueError`, and no doc said so — CLOSED
+## 28. `roles()`'s scoped refusal is a `ValueError`, and no doc said so: CLOSED
 
 Found by the fifth review (F7). `bindings/python/src/lib.rs`'s `roles()` refuses
 a scoped handle with `PyValueError`. Every other scoped refusal in the binding
@@ -1653,12 +1653,12 @@ a `RuntimeError`. Neither the docstring nor the `.pyi` named the class.
 `ValueError`:
 
 - `ReadOnly` means *a scoped handle never writes*. `refuse_if_scoped` is reached
-  from exactly three places — `with_mut`, `upsert_node` and `create_rule` — and
+  from exactly three places (`with_mut`, `upsert_node` and `create_rule`) and
   all three are writes. `roles()` is a read, and the only read refused outright,
   so it has no `ReadOnly` precedent to be inconsistent with. Raising one here
   would make that class mean two different things.
 - `MushroomError`'s subclasses classify engine conditions. Calling `roles()` on
-  a scoped handle is caller misuse with no engine involvement — the same kind of
+  a scoped handle is caller misuse with no engine involvement: the same kind of
   thing as `scoped()`'s empty-scope refusal, which is already a `ValueError`.
 - `test_roles_is_refused_on_a_scoped_handle` has pinned `ValueError` since
   `9c21ef5`. Changing it is a breaking change to a shipped class for no gain.
@@ -1676,19 +1676,19 @@ empty-scope refusal; it names `ReadOnly` nowhere. So the docs were silent on the
 class, not wrong about it.
 
 **What pins it.**
-- `test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so` — asserts
+- `test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so`: asserts
   `type(err.value) is ValueError` and `not isinstance(err.value,
   MushroomError)`, then requires both the live `__doc__` and the **packaged**
   `__init__.pyi` to name `ValueError` and `MushroomError`. That is defect #18's
   shape: behaviour right, sentence absent.
 - `test_roles_is_refused_on_a_scoped_handle` (unedited) still pins the class.
 
-## 29. `degrees_multiplicity` rebuilt both views once per row — CLOSED
+## 29. `degrees_multiplicity` rebuilt both views once per row: CLOSED
 
 Found by the fifth review (F9), marked SUSPECTED and perf-only because the
 reviewer could not benchmark it. Benchmarked here: the rebuild costs real,
 measurable time and has been removed, but it is a minority of the gap the
-review pointed at — see "the finding is confirmed and its explanation is not",
+review pointed at: see "the finding is confirmed and its explanation is not",
 below.
 
 `multiplicity_directed_degree` opened with `self.topo_view()` and
@@ -1710,7 +1710,7 @@ mmap'd-base branch is the one taken, 5 reps, median (min in brackets):
 | ratio to the unique reading | 7.61x | 6.48x |
 
 **The finding is confirmed and its explanation is not.** The per-row rebuild is
-real and removing it is worth 2.57 ms — 15% of the multiplicity path, about
+real and removing it is worth 2.57 ms: 15% of the multiplicity path, about
 0.13 us per row. But it accounts for only 18% of the 14.5 ms gap. The rest is
 inherent to what the feature does: the count is a property lookup per
 *neighbour*, so this fixture does 80 000 `edge_props.get` calls the unique
@@ -1737,7 +1737,7 @@ which is what they did before.
 Correctness is untouched: `view()` is built from exactly `self.topo_view()` and
 `self.edge_props_view()`, so the two paths were already reading the same state.
 
-**What pins it.** Nothing new — this is a hoist with no behavioural surface, and
+**What pins it.** Nothing new: this is a hoist with no behavioural surface, and
 a test asserting "the view is built once" would be pinning an implementation
 detail through a seam invented for the purpose. The existing multiplicity
 degree tests (`degrees_multiplicity_sums_counts_per_row`, `counts_are_per_pair`,
@@ -1747,8 +1747,8 @@ degree tests (`degrees_multiplicity_sums_counts_per_row`, `counts_are_per_pair`,
 claim that matters: the answer did not move.
 
 `f9_bench.rs` is **kept and marked `#[ignore]`**. `75de6f5` committed it while
-its own header still said "TEMPORARY — Not committed", so it was running a
-20 000-node, 160 000-insert build — about thirteen minutes — inside every
+its own header still said "TEMPORARY: Not committed", so it was running a
+20 000-node, 160 000-insert build (about thirteen minutes) inside every
 `cargo test --workspace`, while asserting nothing about timing. A test that
 cannot fail should not be in the default run; a measurement that took this long
 to produce should not be thrown away. So it stays, with the header rewritten to
@@ -1762,7 +1762,7 @@ The workspace `passed` count is unchanged by the pair of changes: `f9_measure`
 leaves the default run and `a_rule_claiming_the_reserved_count_name_cannot_collide_with_it`
 (#30) joins it.
 
-## 30. A rule may name `count`, the reserved edge property — CLOSED, NOT REPRODUCIBLE
+## 30. A rule may name `count`, the reserved edge property: CLOSED, NOT REPRODUCIBLE
 
 Found by the fifth review (F10), marked SUSPECTED. The premise is right and the
 consequence is not.
@@ -1770,14 +1770,14 @@ consequence is not.
 **The premise holds.** `EDGE_COUNT_PROP` is `"count"`, and it is stored in the
 same `edge_props` map, keyed the same `(etype, src, dst, name)` way, that a
 rule's `weight_prop` writes into. `RuleDef::validate` constrains `weight_prop`
-in no way — it is not checked for emptiness, let alone against a reserved list —
+in no way (it is not checked for emptiness, let alone against a reserved list)
 and `MutPreview::check_create_rule` adds only a name-collision and a rule-chain
 cycle check. `f9273a6` refuses Cypher `SET r.count` by name and nothing else.
 `enable_multiplicity` does no pre-flight scan. All of that is as the review says.
 
 **The consequence does not.** The review predicted that *"the first duplicate
 `insert_edge` after opting in overwrites the rule's value with `weight + 1`"*.
-Constructed and run — three shapes, in a throwaway probe that is deliberately
+Constructed and run: three shapes, in a throwaway probe that is deliberately
 not in the tree; what it found is now asserted by the committed test named at
 the end of this section. It does not happen, because three independent
 properties keep the two apart.
@@ -1811,9 +1811,9 @@ Its docstring states plainly that it does **not** reach barrier 3: a `FieldEqual
 rule scores `1.0`, which a Float-accepting reader and the absent-means-one
 default would both report as 1, so that barrier is stated and not pinned.
 
-## 31. Row 21's status cell outlived its own fix — CLOSED
+## 31. Row 21's status cell outlived its own fix: CLOSED
 
-Found by the fifth review (F11), cosmetic. Row 21 read `**CLOSED** — one string,
+Found by the fifth review (F11), cosmetic. Row 21 read `**CLOSED**: one string,
 not yet applied`, and `bab8f4e` had applied that string to
 `crates/server/src/mcp.rs` two commits before the review ran. The status was
 right; the trailing clause was not. It matters only because
@@ -1825,8 +1825,8 @@ section's own heading still read `— OPEN`, and its body still described the
 string as a to-do, which the review had not spotted. Both are corrected. No
 behaviour to pin.
 
-The `## 20.` section had the same shape from the other direction — `75de6f5`
-closed it and the section still read as outstanding — so it is corrected too,
+The `## 20.` section had the same shape from the other direction (`75de6f5`
+closed it and the section still read as outstanding) so it is corrected too,
 under its own row rather than here.
 
 ## Mutation table for #16, #28, #29, #30
@@ -1836,16 +1836,16 @@ develop --release` between each.
 
 | # | Mutation | Result |
 |---|---|---|
-| M1 | An unscoped `node_info(src)` existence read in the binding's `insert_edge`, before the refusal — defect #8's shape on the `src` argument | KILLED — `test_a_keyed_write_refuses_identically_for_hidden_and_absent[insert_edge-src]`. **`[insert_edge-dst]` stayed green**, which is defect #16 demonstrated rather than argued: the old one-position parametrisation would have passed this mutant. |
-| M2 | Delete the exception-class paragraph from `mushroomdb.pyi`'s `roles` | KILLED — `test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so`, on the packaged `__init__.pyi` half |
-| M2b | Restore the pre-fix Rust docstring (`Refused on a scoped handle — see the note on scoped().`) | KILLED — same test, on the `__doc__` half |
-| M3 | `roles()` raises `ReadOnly::new_err` instead of `PyValueError` | KILLED — `test_roles_is_refused_on_a_scoped_handle` **and** the new class assertion |
-| M4 | Remove the `is_rule_owned` refusal from `prepare_insert_edge` (barrier 1) | KILLED — `a_rule_claiming_the_reserved_count_name_cannot_collide_with_it` |
-| M5 | Replace all six `already \|\| prov.contains(&triple)` weight guards in `core-rules`'s engine with `true` (barrier 2) | KILLED — same test, `left: Some(Float(1.0)), right: Some(Int(2))` — which is F10's predicted collision, visible only once the barrier is gone. `core-rules` was restored and verified at zero changed bytes afterwards. |
-| M5a | The same mutation applied to `apply_desired`'s guard **only** | **SURVIVED** — that is not the site `create_rule`'s backfill reaches. Recorded because it was run and reported before M5 widened it; it says the test is specific about which path it exercises, not that the guard is unpinned. |
-| M6 | `multiplicity_directed_degree` reads `self.topo_view()` per call again (#29 reverted) | **NOT RUN as a mutant** — #29 is a hoist with no behavioural surface, so no test can kill it. Its evidence is the benchmark, above. |
+| M1 | An unscoped `node_info(src)` existence read in the binding's `insert_edge`, before the refusal: defect #8's shape on the `src` argument | KILLED: `test_a_keyed_write_refuses_identically_for_hidden_and_absent[insert_edge-src]`. **`[insert_edge-dst]` stayed green**, which is defect #16 demonstrated rather than argued: the old one-position parametrisation would have passed this mutant. |
+| M2 | Delete the exception-class paragraph from `mushroomdb.pyi`'s `roles` | KILLED: `test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so`, on the packaged `__init__.pyi` half |
+| M2b | Restore the pre-fix Rust docstring (`Refused on a scoped handle: see the note on scoped().`) | KILLED: same test, on the `__doc__` half |
+| M3 | `roles()` raises `ReadOnly::new_err` instead of `PyValueError` | KILLED: `test_roles_is_refused_on_a_scoped_handle` **and** the new class assertion |
+| M4 | Remove the `is_rule_owned` refusal from `prepare_insert_edge` (barrier 1) | KILLED: `a_rule_claiming_the_reserved_count_name_cannot_collide_with_it` |
+| M5 | Replace all six `already \|\| prov.contains(&triple)` weight guards in `core-rules`'s engine with `true` (barrier 2) | KILLED (same test, `left: Some(Float(1.0)), right: Some(Int(2))`) which is F10's predicted collision, visible only once the barrier is gone. `core-rules` was restored and verified at zero changed bytes afterwards. |
+| M5a | The same mutation applied to `apply_desired`'s guard **only** | **SURVIVED**: that is not the site `create_rule`'s backfill reaches. Recorded because it was run and reported before M5 widened it; it says the test is specific about which path it exercises, not that the guard is unpinned. |
+| M6 | `multiplicity_directed_degree` reads `self.topo_view()` per call again (#29 reverted) | **NOT RUN as a mutant**: #29 is a hoist with no behavioural surface, so no test can kill it. Its evidence is the benchmark, above. |
 
-## 32. `enable_multiplicity`'s failure contract was false — CLOSED
+## 32. `enable_multiplicity`'s failure contract was false: CLOSED
 
 Found by the sixth review pass, on `781196f`.
 
@@ -1859,7 +1859,7 @@ store that already holds an archive.
 1. The store is opted out. `snapshot_with(archive_wal: true)` runs: **V9**
    snapshot, one archive, no declaration anywhere.
 2. `enable_multiplicity()` sets `self.multiplicity = true` and writes the
-   **V10** snapshot — deliberately first, because that ordering is the guard.
+   **V10** snapshot: deliberately first, because that ordering is the guard.
 3. The call then fails, in `snapshot_with`'s tail or in `log_then_apply`.
    `forced.is_err()`, so `self.multiplicity = false` and the call returns `Err`.
 4. On reopen: the WAL declares nothing, the snapshot is V10, an archive exists.
@@ -1879,21 +1879,21 @@ documentation is what changed.
 **Corrected in four places**, all of which carried some form of the promise or
 were silent where they should not have been:
 
-- `crates/core-api/src/db.rs` — `enable_multiplicity`'s doc gains a "This call
+- `crates/core-api/src/db.rs`: `enable_multiplicity`'s doc gains a "This call
   is not atomic, and an `Err` does not undo it" section naming both failure
   shapes, saying why they are safe, and directing the caller to reopen and ask
   `is_multiplicity_enabled()`. The `# Errors` list now points at it instead of
   promising a rollback. The `if forced.is_err()` comment inside the body said
   "Nothing was declared, so nothing is enabled"; it now says what the line
   actually does.
-- `docs/format-stability.md` — a new `##### enable_multiplicity() is not atomic`
+- `docs/format-stability.md`: a new `##### enable_multiplicity() is not atomic`
   subsection under the discriminant-23 heading. The surrounding text calls the
   V9-stays-readable property "the property the whole design rests on", which is
   still true and is left standing: it is about a store that never calls the
   method. What is added is that a store that *did* call it and got an exception
   cannot read the outcome off the return value.
-- `bindings/python/src/lib.rs` — the same correction in the binding docstring.
-- `bindings/python/mushroomdb.pyi` — and in the stub.
+- `bindings/python/src/lib.rs` (the same correction in the binding docstring.
+- `bindings/python/mushroomdb.pyi`) and in the stub.
 
 **What pins it.** `a_failed_opt_in_beside_an_archive_comes_back_opted_in`
 (`crates/core-api/tests/multiplicity_declaration.rs`). It archives at V9 while
@@ -1904,7 +1904,7 @@ record, and the reopen comes back **opted in**. It asserts what the code does;
 the old docstring predicted the opposite, which is the sense in which it was a
 failing test of the documented contract.
 
-## 33. The recovery's stated inference is unsound — CLOSED
+## 33. The recovery's stated inference is unsound: CLOSED
 
 Found by the sixth review pass, on `781196f`. The fix from #22 stands; its
 argument does not.
@@ -1923,7 +1923,7 @@ where it is wrong and the recovery fires anyway.
 
 **The V10 stamp alone is what carries the conclusion.** It is written from
 `self.multiplicity` before the WAL is touched, and it is also what makes every
-older binary refuse the store by name — so opting in on the strength of it costs
+older binary refuse the store by name: so opting in on the strength of it costs
 such a reader nothing it was not already being told.
 
 **Decision: the archive clause is KEPT**, restated as a *scope restriction*
@@ -1934,11 +1934,11 @@ rather than a proof. Two reasons, one empirical and one substantive.
   `no_crash_leaves_discriminant_23_unguarded` asserts
   `recovered.is_multiplicity_enabled() == has_discriminant_23(&wal)` across
   every crash point of an opt-in workload that takes no archive at all. The
-  clause-free rule opts those survivors in. Confirmed by mutation M1 below —
+  clause-free rule opts those survivors in. Confirmed by mutation M1 below:
   row 22 predicted this, and the prediction held.
 - It is the right line anyway. Without the clause, *every* failed
   `enable_multiplicity` would complete itself on the next open, including on a
-  store with no archive — a store that must stay opted out, and can: no WAL was
+  store with no archive: a store that must stay opted out, and can: no WAL was
   renamed away, nothing carries discriminant 23, and its next snapshot rewrites
   at V9, putting it back within reach of every older reader. An archive is the
   marker for the one state not recoverable that way.
@@ -1949,20 +1949,20 @@ reader, so opting it in would start writing discriminant 23 behind a stamp that
 does not guard it.
 
 **What pins it.**
-- `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` — an opted-out
+- `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10`: an opted-out
   store archives three times; every reopen must stay opted out, and the fixture
   asserts V9 and the growing archive count each round so the test cannot pass
   vacuously. Kills M2 and M3.
-- `the_recovery_does_not_opt_a_store_in_by_itself` (existing, unedited) — the
+- `the_recovery_does_not_opt_a_store_in_by_itself` (existing, unedited): the
   single-archive case; also kills M2 and M3.
-- `no_crash_leaves_discriminant_23_unguarded` (existing, unedited) — kills M1,
+- `no_crash_leaves_discriminant_23_unguarded` (existing, unedited): kills M1,
   the clause-free rule.
-- `a_failed_archive_cannot_opt_the_store_back_out` (existing, unedited) — kills
+- `a_failed_archive_cannot_opt_the_store_back_out` (existing, unedited): kills
   M4, the recovery removed entirely, so the clause is not dead code.
 
 Row 22's justification paragraph is struck and replaced in place, above.
 
-## 34. The rollback was already unreliable on `f9d1033` — CLOSED
+## 34. The rollback was already unreliable on `f9d1033`: CLOSED
 
 Found by the sixth review pass, on `781196f`. No code change; this is #32's
 contract defect reached by a second, older route.
@@ -1975,8 +1975,8 @@ record and the store is opted in.
 
 No archive is involved and the open-time recovery plays no part, so this route
 predates `44c8edb` entirely: the "left opted out" promise was false on `f9d1033`
-too, when it was first written. That matters for how #32 is read — the recovery
-did not introduce the hole, it widened an existing one — and it is why the
+too, when it was first written. That matters for how #32 is read (the recovery
+did not introduce the hole, it widened an existing one) and it is why the
 correction is stated as "this call is not atomic" rather than as a caveat about
 archives.
 
@@ -2000,20 +2000,20 @@ covered `mushroomdb`'s `multiplicity_declaration`, `snapshot_v10` and
 
 | # | Mutation | Result |
 |---|---|---|
-| M1 | Drop the archive clause: recover on `!multiplicity && snapshot_version == Some(VERSION_10)` — the alternative predicate the brief offered | KILLED — `no_crash_leaves_discriminant_23_unguarded` (sim-harness, unedited). This is why the clause is kept: the sweep reaches survivors with a V10 snapshot, no declaration and no archive, and the clause-free rule opts them in. |
-| M2 | Drop the version clause: recover on `!multiplicity && !list_archives()?.is_empty()`, letting the recovery fire on a **V9** snapshot | KILLED — `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` (new) **and** `the_recovery_does_not_opt_a_store_in_by_itself` (existing) |
-| M3 | Widen the version clause to `snapshot_version.is_some()` — the same V9 hole, reached by weakening rather than deleting | KILLED — the same two tests |
-| M4 | Remove the recovery entirely (`if false && …`) | KILLED — `a_failed_archive_cannot_opt_the_store_back_out` (existing) **and** `a_failed_opt_in_beside_an_archive_comes_back_opted_in` (new). The second is what shows the new test is not merely restating the old one. |
-| M5 | Replace the `!db.multiplicity` guard with `true` | **SURVIVED — equivalent mutant.** Setting `multiplicity = true` on a store where it is already `true` is a no-op; the guard is a short-circuit for `list_archives()`, not a behavioural condition. Recorded rather than papered over: no test should exist to kill it. |
+| M1 | Drop the archive clause: recover on `!multiplicity && snapshot_version == Some(VERSION_10)`: the alternative predicate the brief offered | KILLED: `no_crash_leaves_discriminant_23_unguarded` (sim-harness, unedited). This is why the clause is kept: the sweep reaches survivors with a V10 snapshot, no declaration and no archive, and the clause-free rule opts them in. |
+| M2 | Drop the version clause: recover on `!multiplicity && !list_archives()?.is_empty()`, letting the recovery fire on a **V9** snapshot | KILLED: `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` (new) **and** `the_recovery_does_not_opt_a_store_in_by_itself` (existing) |
+| M3 | Widen the version clause to `snapshot_version.is_some()`: the same V9 hole, reached by weakening rather than deleting | KILLED: the same two tests |
+| M4 | Remove the recovery entirely (`if false && …`) | KILLED: `a_failed_archive_cannot_opt_the_store_back_out` (existing) **and** `a_failed_opt_in_beside_an_archive_comes_back_opted_in` (new). The second is what shows the new test is not merely restating the old one. |
+| M5 | Replace the `!db.multiplicity` guard with `true` | **SURVIVED: equivalent mutant.** Setting `multiplicity = true` on a store where it is already `true` is a no-op; the guard is a short-circuit for `list_archives()`, not a behavioural condition. Recorded rather than papered over: no test should exist to kill it. |
 | M6 | Move `log_then_apply_with`'s fsync **before** its append, so the barrier can no longer strand a durable record | KILLED, but **discarded as too blunt to be evidence**: all 18 tests in the `multiplicity` target fail, so it says nothing about which test pins #34. Recorded because it was run. M7 is the discriminating version. |
-| M7 | Give the `forced.is_err()` arm a **real** rollback — capture `wal.bin` before the call and `write_atomic` it back on failure, the contract the old docstring described | KILLED — `a_failed_opt_in_whose_record_reached_the_wal_comes_back_opted_in`, **and nothing else in the four targets**. That is #34 pinned exactly: the test fails if and only if the rollback the docs promised actually exists. |
+| M7 | Give the `forced.is_err()` arm a **real** rollback: capture `wal.bin` before the call and `write_atomic` it back on failure, the contract the old docstring described | KILLED: `a_failed_opt_in_whose_record_reached_the_wal_comes_back_opted_in`, **and nothing else in the four targets**. That is #34 pinned exactly: the test fails if and only if the rollback the docs promised actually exists. |
 
-## 35. `acceptance-0.6`'s latency budgets threshold one quantity four times — CLOSED
+## 35. `acceptance-0.6`'s latency budgets threshold one quantity four times: CLOSED
 
 Found when `code-graph` failed on PR #25 at `touch latency (634 ms > 600 ms)`.
 
 The first three data points pointed at 0.6.9: 398 ms on `4896a895` (09-16, green),
-then 602 ms on `cab4070` — the v0.6.9 merge — and 616 ms on `c58ef66`. All four
+then 602 ms on `cab4070` (the v0.6.9 merge) and 616 ms on `c58ef66`. All four
 legs moved together by ~215 ms, which is the signature of a fixed cost, and the
 merge commit looked like where it landed.
 
@@ -2023,12 +2023,12 @@ underneath:
 | date | touch | map | brief | explore |
 |---|---|---|---|---|
 | 09-11 | 359 | 348 | 362 | 333 |
-| 09-13 | 487 | — | — | — |
-| 09-14 | 557 | — | — | — |
+| 09-13 | 487 |  |  |  |
+| 09-14 | 557 |  |  |  |
 | 09-15 | 588 | 571 | 597 | 556 |
 | 09-16 | 398 | 384 | 405 | 372 |
 
-09-15 reads 588 ms against a 600 ms budget — 98% of it, two days before v0.6.9
+09-15 reads 588 ms against a 600 ms budget: 98% of it, two days before v0.6.9
 merged. The spread is ~1.8x on code that did not change, so the budget was inside
 the runner's noise band and the crossing was a matter of when, not of what.
 
@@ -2046,7 +2046,7 @@ budgets are four thresholds on one shared quantity. That is also why they move
 as a block: they are the same measurement taken four times.
 
 This branch measured locally reads 379/373/389/364 against the pre-0.6.9 green
-CI of 398/384/405/372 — HEAD contains everything 0.6.9 added, so a 215 ms
+CI of 398/384/405/372: HEAD contains everything 0.6.9 added, so a 215 ms
 regression in that code would appear here. It does not.
 
 **Fixed:** budgets to 1400 ms, ~2x the worst reading observed on unchanged code,
@@ -2060,7 +2060,7 @@ with this variance. `scripts/bench-code-graph.sh` is where the product's real
 numbers come from, and this repository already keeps its throughput and p95 gates
 out of CI for the same reason.
 
-## 36. Store open is ~371 ms and dominates every code-graph command — CLOSED
+## 36. Store open is ~371 ms and dominates every code-graph command: CLOSED
 
 Measured while diagnosing #35, and recorded so the number is not lost.
 
@@ -2069,7 +2069,7 @@ against 3 ms for a command that opens nothing. Every code-graph command pays it:
 `touch`, `map`, `brief` and `explore` all land within ~30 ms of each other
 locally because the work each does is small beside the open.
 
-**Not introduced by 0.6.10**, and not by 0.6.9 — CI read the same block at
+**Not introduced by 0.6.10**, and not by 0.6.9: CI read the same block at
 359 ms on 09-11. Where in the stack the time goes was unknown when first recorded.
 
 **Picked up in 0.6.11.** Task 1 measured the open and located the cost in WAL replay
@@ -2083,10 +2083,10 @@ regression 0.6.10 introduced, and no caller's correctness depends on it.
 ### MEASURED, 2026-09-23 (v0.6.11 Task 1). The row reproduces, and the population that pays it is narrower than this row assumed.
 
 Machine: Apple M4 Pro, macOS 15.7.3, arm64. Binary: `mushroomdb 0.6.10`, release
-profile. Store: `ingest-git` of this repository — **1,000 commits, 524 files, 8,622
+profile. Store: `ingest-git` of this repository: **1,000 commits, 524 files, 8,622
 symbols**, i.e. the same shape the original reading used.
 
-**Total wall clock, `stats`, untraced, 7 runs:** 420, 370, 370, 360, 490, 380, 400 ms —
+**Total wall clock, `stats`, untraced, 7 runs:** 420, 370, 370, 360, 490, 380, 400 ms:
 **median 380 ms**, against a baseline of 0 ms for a command that opens nothing
 (`--version`). The row's 371 ms **reproduces**, one release later.
 
@@ -2102,8 +2102,8 @@ symbols**, i.e. the same shape the original reading used.
 | `open_with complete` | 524 ms |
 
 The mmap and every section decode together are **~2 ms, about 0.5 % of the open**. In
-particular `ensure_v8_base_sections_loaded` — the `to_vec()` of provenance, HNSW and IVF
-that `core-rules/src/engine.rs:2914` warns can reach 115 MiB — costs **under 100 µs
+particular `ensure_v8_base_sections_loaded` (the `to_vec()` of provenance, HNSW and IVF
+that `core-rules/src/engine.rs:2914` warns can reach 115 MiB) costs **under 100 µs
 here**. On this store that copy does not materialise, and it should not be attacked on
 the strength of the comment alone.
 
@@ -2112,7 +2112,7 @@ and the post-replay block (full-text `rebuild_all`, `prop_index.rebuild_all`,
 `rebuild_node_ns`, roles, `fold_now`). **The split between those two cannot be read off
 these numbers.** The instrumentation prints one line per `section_bytes` call and there
 are **39,654 of them per open**; a traced run takes ~540 ms against 380 ms untraced, so
-roughly 160 ms of the traced figure is the tracing itself — concentrated in exactly the
+roughly 160 ms of the traced figure is the tracing itself: concentrated in exactly the
 two phases under question, because those calls come from the replay backfill and from
 `rebuild_all`, in unknown proportion. Settling it needs a timer around `rebuild_all`
 specifically, which is a code change and therefore not this task.
@@ -2121,7 +2121,7 @@ specifically, which is a code change and therefore not this task.
 store.** A demo **entity** store opens in **~2 ms** and makes **zero** `section_bytes`
 calls, because nothing enabled full-text on it and `rebuild_all` early-returns
 (`fulltext.rs:705-707`). An `ingest-git` store enables **11–12** full-text pairs
-including `File.body` — the entire source text of every file — via
+including `File.body` (the entire source text of every file) via
 `cli/src/structure.rs:88-97` and `cli/src/ingest_git.rs:839`, `:1278`.
 
 That 2 ms figure carries its own caveat and must not be over-read: the demo store holds
@@ -2143,7 +2143,7 @@ fixture exists. Re-measure there:
 ### MEASURED AGAIN, 2026-09-25 (v0.6.11 Task 11). The first conclusion above was wrong: this is **not** code-graph-specific.
 
 The 2 ms entity figure came from a 60-node demo store, which bounds nothing. A controlled
-pair at the deployment's actual size — 30,000 entities, snapshotted, median of five opens,
+pair at the deployment's actual size: 30,000 entities, snapshotted, median of five opens,
 via `crates/core-api/examples/entity_open_bench.rs`:
 
 | 30,000-entity store | median open |
@@ -2157,14 +2157,14 @@ tracks indexed text volume, not store type. Any entity store using `hybrid_searc
 
 **FIXED in v0.6.11 (Task 8): 456 ms → 227 ms.** The redundant half was the *replay
 backfill*, not `rebuild_all`. `load_from_disk` replays frames and then calls `rebuild_all`
-unconditionally, which clears every posting and rewrites it — and every snapshot re-emits one
+unconditionally, which clears every posting and rewrites it: and every snapshot re-emits one
 `EnableFulltext` record per enabled pair, so the open does a full tokenise-and-stem scan per
 pair and discards all of it. `refresh()` also replays frames but is followed only by
 `fold_now`, so its backfill is load-bearing and is untouched. The guard is scoped to the open
 path alone.
 
 **Row 36 stays OPEN.** 227 ms is halved, not solved. What remains is the surviving
-`rebuild_all` pass, whose real fix is persisting the index as a snapshot section — a format
+`rebuild_all` pass, whose real fix is persisting the index as a snapshot section: a format
 change, deliberately out of this release (spec §3). The measurement and the 2x are the
 release's contribution.
 
@@ -2173,9 +2173,9 @@ release's contribution.
 ### CORRECTED, 2026-09-30. The index table briefly said CLOSED; that was wrong.
 
 `a7ede6e` (2026-09-29) flipped this row's status cell from `DEFERRED to 0.6.11` straight to
-`CLOSED`, on the instruction that a shipped-and-passed deferral target is itself a defect —
-true, but the fix it applied was the wrong one. The residual this row names — persisting the
-full-text index as a snapshot section, so open does not rebuild it from scratch — was never
+`CLOSED`, on the instruction that a shipped-and-passed deferral target is itself a defect (true, but the fix it applied was the wrong one. The residual this row names)
+persisting the
+full-text index as a snapshot section, so open does not rebuild it from scratch: was never
 done; only the redundant *duplicate* build was removed (Task 8, above). The 227 ms figure this
 row measures is still live and still cited as a real constraint in three places on this branch:
 `docs/roadmap/v0.7-memory-write-path-spec.md` §3.1 (why an existing store is never silently
@@ -2191,11 +2191,11 @@ again (already shipped) and not CLOSED. Corrected in the index table above.
 
 **Measured first.** A timer around each rebuild, which this row had asked for: on the 30,000-entity fixture (`entity_open_bench`, release, M4 Pro) the open is 183 ms, everything before the rebuilds is 3.4 to 4.1 ms, `fulltext.rebuild_all` is 179 ms and `prop_index.rebuild_all` is under 2 µs. The full-text rebuild was 98% of the open.
 
-**The index is in the snapshot.** `FulltextIndex::to_blob` / `from_blob` (`crates/core-storage/src/fulltext.rs`) write the enabled pairs, the postings and the document lengths as LEB128 varints with gap-coded node ids and positions, under the blob's own magic, version and CRC32. A snapshot of a store with a declared pair carries it as section 13 (`SECTION_FULLTEXT`); a store with none writes the bytes it always wrote. The container version does not change: a binary that does not know the id ignores the section — checked by opening a store written by this tree with a binary built from `main` at `9496b7d`, and with the released 0.7.1 wheel, which opened it and searched it — and its next snapshot drops it. On the fixture the blob is 2.24 MB beside a 6.24 MB snapshot, decodes in 17 ms, and the open is 21 ms.
+**The index is in the snapshot.** `FulltextIndex::to_blob` / `from_blob` (`crates/core-storage/src/fulltext.rs`) write the enabled pairs, the postings and the document lengths as LEB128 varints with gap-coded node ids and positions, under the blob's own magic, version and CRC32. A snapshot of a store with a declared pair carries it as section 13 (`SECTION_FULLTEXT`); a store with none writes the bytes it always wrote. The container version does not change: a binary that does not know the id ignores the section (checked by opening a store written by this tree with a binary built from `main` at `9496b7d`, and with the released 0.7.1 wheel, which opened it and searched it) and its next snapshot drops it. On the fixture the blob is 2.24 MB beside a 6.24 MB snapshot, decodes in 17 ms, and the open is 21 ms.
 
 **When the loaded index is kept.** The open reads the blob after mapping the base, if it reads back and was built over the same number of node ids, and applies the WAL to it record by record as a live write would. For a snapshot that kept its WAL (`keep_wal`) the blob is read when the snapshot also carries row 91's mark of how much WAL it holds, since those frames are then not applied again; without the mark the whole WAL replays over the snapshot, the blob is not read, and the index is built after the replay as it always was. A loaded index is kept unless the replay indexed a node that was already indexed under that field, which is what a crash between a snapshot and its WAL replacement produces; then, as for a missing or unreadable blob, the open builds the index from the stored values. `fulltext_rebuild_follows` is false when the index was loaded, so a pair declared after the snapshot is indexed by its own backfill. In a debug build an open that keeps a loaded index also rebuilds a copy and asserts the two are equal, which makes every test that reopens a snapshotted store a check of this. `open_at` and a reader snapshot's materialise still rebuild.
 
-**The second cost, found by tracing the first fix.** With the index loaded, the code-graph store still spent about 46 of 52 ms in `apply_frames`, on a 758-byte WAL holding nothing but the declarations its snapshot had re-emitted. `apply_frames` consumed the engine's retained state — a scan of every node to build the candidate indexes rules match through — before the first frame, whatever that frame was. A declaration writes no node and no edge; the scan now waits for the first record that does (`is_declaration`, `crates/core-api/src/db.rs`), which is what a store with no declaration, and so an empty baseline, always did.
+**The second cost, found by tracing the first fix.** With the index loaded, the code-graph store still spent about 46 of 52 ms in `apply_frames`, on a 758-byte WAL holding nothing but the declarations its snapshot had re-emitted. `apply_frames` consumed the engine's retained state (a scan of every node to build the candidate indexes rules match through) before the first frame, whatever that frame was. A declaration writes no node and no edge; the scan now waits for the first record that does (`is_declaration`, `crates/core-api/src/db.rs`), which is what a store with no declaration, and so an empty baseline, always did.
 
 **Result, on this row's own shape.** `ingest-git` of this repository: 11,197 nodes, 13 full-text pairs, 5 equality indexes. `mushroomdb stats`, release, median of 11: **252 ms** with a binary built from `main`, **30 ms** with this tree. `--version`, which opens nothing, is 3 ms.
 
@@ -2203,19 +2203,19 @@ Tests: ten in `crates/core-api/tests/fulltext.rs` (loaded and equal to never-clo
 
 **Reviewed, and three things the review found are fixed with it.** An insert that named a property twice indexed both values where the store kept the last; an open used to rebuild that away, and a snapshot would now have carried it, so both insert arms clear a node's entry before indexing it again (`unindex_before_reindexing`). A field whose values have no words left an empty postings column that a delete elsewhere removed, which made a correct loaded index unequal to a rebuilt one and tripped the debug-build comparison; `add_tokens` no longer creates the column. And reading the blob for a `keep_wal` snapshot doubled that store's open, 216 ms to 450 ms on a 30,000-entity fixture whose pairs were declared after its data, because every replayed insert tokenized before the rebuild did it again; the blob is now skipped for such a snapshot unless it carries row 91's mark and the marked WAL is the one on disk. Each has a test that failed first.
 
-**Reviewed again after 0.7.2 was merged under it.** One finding: a snapshot that kept its WAL had its index read whenever it carried a mark, before the WAL was looked at. When that WAL had lost its tail the mark did not match, the whole of what was left replayed over the snapshot, and the index went through that replay unrebuilt — a replayed insert relabelled a node and its posting under the old label's field stayed searchable (a debug build stopped at the equality check instead). The index is now set aside unless the marked WAL is the one on disk. `a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index` failed first.
+**Reviewed again after 0.7.2 was merged under it.** One finding: a snapshot that kept its WAL had its index read whenever it carried a mark, before the WAL was looked at. When that WAL had lost its tail the mark did not match, the whole of what was left replayed over the snapshot, and the index went through that replay unrebuilt: a replayed insert relabelled a node and its posting under the old label's field stayed searchable (a debug build stopped at the equality check instead). The index is now set aside unless the marked WAL is the one on disk. `a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index` failed first.
 
 **What is left, and not this row.** Writing a snapshot takes longer by the encode: 65 ms to 82 ms for the first on the fixture, as the reviewer measured. The equality index is still built twice at open, once by each `EnableIndex` backfill and once by `rebuild_all`; nothing measured makes it matter. The index is decoded at open even by a command that never searches, about 10 ms of the 30. A snapshot is larger by the index, about a third on the fixture.
 
-## 37. Incremental retraction removes an edge another rule still desires — CLOSED
+## 37. Incremental retraction removes an edge another rule still desires: CLOSED
 
 Found 2026-10-01, on `feat/v0.7-memory-write-path`, by the engine check plan 3's second
 amendment required before adding a seventeenth identity rule. Not introduced by 0.7: the code
 is as it was in 0.6.
 
 **The defect.** Two rules may share `(src_label, dst_label, edge_type)`, and nothing refuses
-it. When both desire the same directed edge, the engine gives the edge one owner — the rule
-that added it — and the other rule records nothing. When the owner's predicate stops holding,
+it. When both desire the same directed edge, the engine gives the edge one owner (the rule
+that added it) and the other rule records nothing. When the owner's predicate stops holding,
 it removes the edge from the topology without asking whether another rule still desires it.
 The other rule is not fired by that write unless a field it watches changed, so the edge stays
 gone until that rule is rebuilt (`rebuild_rule`) or one of its own watched fields is written.
@@ -2245,17 +2245,17 @@ equivalent.
    no `SAME_AS` edge is left.
 4. `rebuild_rule` on the claim rule: the edge is back, at 1.0.
 
-In the other order — the claim rule owning the edge, then `alias_keys` forgotten while the
-overlap still holds — the claim's direction is removed and only the overlap's reverse edge
+In the other order (the claim rule owning the edge, then `alias_keys` forgotten while the
+overlap still holds) the claim's direction is removed and only the overlap's reverse edge
 keeps the pair linked.
 
 **Pinned by** `engine::tests::an_edge_two_rules_desire_survives_the_owners_retraction` in
 `crates/core-rules/src/engine.rs`, `#[ignore]`d with this row named in its reason. It asserts
 what should be true and fails when run with `--ignored`.
 
-**Why it is deferred, not fixed.** The fix belongs in the engine — on incremental retraction,
+**Why it is deferred, not fixed.** The fix belongs in the engine: on incremental retraction,
 let another rule with the same edge type that still desires the pair take the edge, as
-`delete_rule` already does — and it changes behaviour for every rule, not only identity. No
+`delete_rule` already does: and it changes behaviour for every rule, not only identity. No
 rule set this release ships collides: the sixteen identity rules never share a directed triple
 (`Entity→X` and `X→Entity` are different directions, and the claim rules run only from the
 five entity labels to `Entity`). A caller who creates two such rules by hand can hit it.
@@ -2270,11 +2270,11 @@ without being rooted in one takes every node as its candidate set (`compute_desi
 incremental form of what `delete_rule` does.
 
 `apply_per_src_top_k` and `apply_desired` now record each edge they take out of the topology,
-with the rule that did it (`ProvSets::retracted`). When `on_node_changed_inner` — or
-`on_edge_changed_inner`, which is how a via-hop rule stops when its hop edge is deleted — has
+with the rule that did it (`ProvSets::retracted`). When `on_node_changed_inner` (or
+`on_edge_changed_inner`, which is how a via-hop rule stops when its hop edge is deleted) has
 run every rule for the change, the engine takes that list and calls `reclaim_retracted`: every
 *other* non-via rule over a retracted edge's type is re-evaluated for the source nodes that
-just lost an edge — the same desired set a fire for that node builds, applied the same way. A
+just lost an edge: the same desired set a fire for that node builds, applied the same way. A
 rule that still desires the pair finds the edge absent, adds it, and owns it at its own weight.
 A rule that does not, changes nothing.
 
@@ -2300,7 +2300,7 @@ retracted, so a store where no two rules share an edge type does no second-pass 
 | `an_edge_two_rules_desire_survives_the_owners_retraction` (was `#[ignore]`) | fails |
 | `the_surviving_rule_takes_the_edge_whichever_of_the_two_sorts_first` | fails |
 | `a_top_k_rule_takes_an_edge_its_sibling_retracted` | fails |
-| `an_edge_only_its_owner_desired_is_gone_after_the_retraction` | passes — it pins that a retraction nobody contests is still one |
+| `an_edge_only_its_owner_desired_is_gone_after_the_retraction` | passes: it pins that a retraction nobody contests is still one |
 
 In `crates/core-api/tests/shared_edge_rules.rs`, through `GraphDb`: the takeover with its
 owner, weight and stats compared across a WAL-only reopen and a snapshot reopen; a top-k
@@ -2317,11 +2317,11 @@ plain rules between two labels in 14 of 60 and none; a single rule never did.
   `explain` names that rule only. The fix is about the edge surviving, not about two rules
   being credited for it.
 - A top-k rule beside a sibling can still lose its fallback edge: **row 83**.
-- A via-hop rule is not re-evaluated by the second pass, and `rebuild_rule` — including the
-  rebuild an approximate rule's drift triggers by itself — retracts without it: **row 84**.
+- A via-hop rule is not re-evaluated by the second pass, and `rebuild_rule` (including the
+  rebuild an approximate rule's drift triggers by itself) retracts without it: **row 84**.
 - `what_if` shows a change of owner as a loss and a gain: **row 85**.
-- The owner's decision of 2026-10-01 that this row held up — letting a described ex-stub
-  claim a stub — is unblocked for plain rules. It is not taken here.
+- The owner's decision of 2026-10-01 that this row held up (letting a described ex-stub
+  claim a stub) is unblocked for plain rules. It is not taken here.
 
 ---
 
@@ -2331,7 +2331,7 @@ Entered 2026-10-01 by plan 4, Task 1. Until then these lived in session ledgers 
 the repository. Sources: plan 2's final review and fix report, plan 3's ledger and final review,
 `docs/roadmap/v0.7-plan-1-handoff.md`, and the research for plan 4.
 
-## 38. Hook latency on a large store is unmeasured — CLOSED
+## 38. Hook latency on a large store is unmeasured: CLOSED
 
 Plan 2's "Known costs" (`docs/roadmap/v0.7-code-graph-removal-plan.md:2154`): about 0.24 s per
 prompt on a store ingested from this repository, release build; "only a 10k-node store was
@@ -2347,29 +2347,29 @@ on an arm64 laptop with 12 cores.
 
 | What | median ms | p95 ms | max ms | digest bytes |
 |---|---|---|---|---|
-| `stats` — open the store, nothing else | 585 | 603 | 613 | — |
-| `recall` — a name the store holds: 'wlomipuka wlomipulo' | 586 | 604 | 640 | 948 |
-| `recall` — two common words: 'wkakakaka wlokakaka' | 585 | 608 | 612 | 846 |
-| `recall` — no match: 'zzqx vvkw' | 592 | 613 | 616 | 0 |
+| `stats`: open the store, nothing else | 585 | 603 | 613 |  |
+| `recall`: a name the store holds: 'wlomipuka wlomipulo' | 586 | 604 | 640 | 948 |
+| `recall`: two common words: 'wkakakaka wlokakaka' | 585 | 608 | 612 | 846 |
+| `recall`: no match: 'zzqx vvkw' | 592 | 613 | 616 | 0 |
 
 The slowest of the 80 runs took 640 ms, about an eighth of the 5,000 ms timeout. No run came
 near it, which is what closes the row.
 
 What the table also says: the hook's cost on this store is the open. `stats`, which opens the
-store and does almost nothing else, takes what `recall` takes, to within the run-to-run spread —
+store and does almost nothing else, takes what `recall` takes, to within the run-to-run spread:
 the search itself is not visible in the wall clock. That is row 36's cost, the full-text index
 rebuilt on every open, and it scales with the store; row 36 stays deferred and this row does
 not close it.
 
 Two conditions on the number. The machine's one-minute load average read 18.94 when the timer
-started — the release build had finished seconds before, and the laptop is shared — so these
+started (the release build had finished seconds before, and the laptop is shared) so these
 are not quiet-machine timings; the run was not repeated to get quieter ones. And the file cache
 was warm: a first prompt after a reboot is not measured.
 
 The store was byte-identical after the runs, and `stats` said the same of it: the hook wrote
 nothing.
 
-## 39. A CLI-only install's empty brief names tools it cannot call — CLOSED
+## 39. A CLI-only install's empty brief names tools it cannot call: CLOSED
 
 `EMPTY_BRIEF` offers `remember`, `upsert_entity` and `ingest_json`. A `--delivery cli` install
 registers no MCP server. `reach_line` already branches on delivery; the empty line does not.
@@ -2383,7 +2383,7 @@ the same key on every paste. The test fills both placeholders and runs the comma
 behind the locally built binary, on a store path with a space and a single quote in it.
 `EMPTY_BRIEF` is unchanged, so every other install's line is byte-identical.
 
-## 40. Evidence lines have no byte cap — CLOSED
+## 40. Evidence lines have no byte cap: CLOSED
 
 Plan 2 final review, M8: one evidence line printed fifty values, about 2 KB, and `why` prints
 each direction. `cap_lines` bounds the count of lines, not their length.
@@ -2392,7 +2392,7 @@ Closed by plan 4 Task 9. `render_explain` cuts the bracketed evidence at `MAX_EV
 (240 characters) and marks the cut with `…`; the rule, the score and the predicate are outside
 the bracket and survive. The `json: true` report is not cut.
 
-## 41. `render_schema` has no total byte cap — CLOSED
+## 41. `render_schema` has no total byte cap: CLOSED
 
 Plan 3 ledger, Task 4. Sections are capped at 20 lines, 12 properties per label and 10
 provisional keys, so only long names grow it. The `json: true` report is uncapped deliberately:
@@ -2403,7 +2403,7 @@ the cut is at the first line that does not fit: it and every line after it drop,
 heading left with no entry under it drops too, and a last line says `(schema truncated at 12000
 bytes; json: true returns the whole report)`. The json report is whole by design.
 
-## 42. `forget` names rules by edge type and labels, not by provenance — CLOSED
+## 42. `forget` names rules by edge type and labels, not by provenance: CLOSED
 
 Plan 3 ledger, Task 5. Two rules deriving the same edge type between the same labels are both
 named when one derived the edge. `GraphDb::explain` knows which.
@@ -2412,14 +2412,14 @@ Closed by plan 4 Task 9. `rule_owned_refusal` (`crates/core-api/src/memory/forge
 plan 4 Task 3) names the rules `explain` attributes the edge to, and says the edge "is derived
 by" them only then. A hand-written edge a rule matches is refused too and is in no provenance.
 For that one the refusal is a different sentence: the edge "was written by hand and no rule
-derived it". It names only the rules the engine's delete guard refused for — the same test, the
-predicate on the pair — and not every rule of that edge type and those labels. It says those
+derived it". It names only the rules the engine's delete guard refused for (the same test, the
+predicate on the pair) and not every rule of that edge type and those labels. It says those
 rules "would derive it again" only when each of them would: its namespace sees both nodes, its
 via hop holds, and its cap cannot exclude the pair. Otherwise it says they "match these two
 nodes' properties and may derive it again". A fact that is not in the store is never a refusal:
 it is the "nothing to retract" answer, though the engine's guard refuses it (row 67).
 
-## 43. A whitespace-padded key gained one canonicalised alias — CLOSED
+## 43. A whitespace-padded key gained one canonicalised alias: CLOSED
 
 Plan 3 ledger, final "parked" line. While `aliases` accumulated, the alias of a padded key was
 the key lowercased and not trimmed, so the next write folded it and added its canonical form
@@ -2427,18 +2427,18 @@ beside it, once. Plan 3's second amendment (`0d959b5`) made `aliases` a function
 key and name, recomputed on each describing write. Nothing accumulates, so there is no second
 copy to gain.
 
-## 44. Five retired hook subcommands still parse — CLOSED
+## 44. Five retired hook subcommands still parse: CLOSED
 
 Plan 2 final review, ruling I3. A machine that upgraded without re-running `install` still
 calls them from a hook; each prints how to remove it. Delete in 0.8.
 
 **Closed, 0.10.** The five names stay, as ONE inert shim (`Command::RetiredHook`, no per-name state): a machine upgraded from 0.6 without re-running `install` still calls them from assistant hooks and git hooks, and an `unknown command` exit 1 would show a hook error on every edit and commit. They parse with any arguments, open nothing, print nothing and exit 0 (the stderr advice line is gone: `doctor` carries it). The five separate match arms and the handler's advice text are removed. `mushroomdb doctor` warns for each retired hook still in a settings file or git hook and names `mushroomdb install` as the fix; `install` removes them. Pinned by `the_retired_hook_bodies_parse_as_inert` (`crates/cli/src/lib.rs`), `each_retired_hook_body_is_inert_exits_0_and_prints_nothing` (`crates/cli/tests/retired_hooks.rs`) and `doctor_reports_each_retired_hook_still_on_disk` (`crates/cli/tests/doctor.rs`).
 
-## 45. A rule created alone broke every lock-free reader — CLOSED
+## 45. A rule created alone broke every lock-free reader: CLOSED
 
 Plan 3, correction S8 and Task 1. `60b3e57`.
 
-## 46. The ignored-test census cannot fail — CLOSED
+## 46. The ignored-test census cannot fail: CLOSED
 
 `docs/roadmap/v0.7-plan-1-handoff.md:299-302`. 32 ignored, 9 named in a workflow, 23 never run
 (`bash scripts/ignored-test-census.sh` at `ae4d6c6`; run it again and write what it prints).
@@ -2455,54 +2455,54 @@ step is wired into the `plugin-validate` CI job, after `check-defect-ledger.sh`.
 the fix: 33 `#[ignore]`d tests, 9 named in a workflow, 24 in the allow-list, 0 never executed
 and not allowed.
 
-## 47. `ingest` and `insert_node` were never compared — CLOSED
+## 47. `ingest` and `insert_node` were never compared: CLOSED
 
 `docs/roadmap/v0.7-plan-1-handoff.md:290-294`: "Worth one explicit check before release." No
 later ledger records that check. Listed in plan 4 under "Owner decisions still open".
 
-**Closed, 0.7.2.** `crates/core-api/tests/upsert_vs_ingest.rs` puts one record — an integer, a float, a boolean, a string, an empty string, a list, an empty list, a mixed list and a nested map — through `ingest` and through `upsert_entity`'s create path on two stores with the memory schema and a rule over a list field, and compares what a reader can observe: every stored value and its type, the label, the full-text hit on the declared field, the derived edge in both directions with its explanation, and four property filters. They agree on all of it. The upsert stores one field more, the `aliases` it derives from the name, which is the design. No engine change.
+**Closed, 0.7.2.** `crates/core-api/tests/upsert_vs_ingest.rs` puts one record (an integer, a float, a boolean, a string, an empty string, a list, an empty list, a mixed list and a nested map) through `ingest` and through `upsert_entity`'s create path on two stores with the memory schema and a rule over a list field, and compares what a reader can observe: every stored value and its type, the label, the full-text hit on the declared field, the derived edge in both directions with its explanation, and four property filters. They agree on all of it. The upsert stores one field more, the `aliases` it derives from the name, which is the design. No engine change.
 
-## 48. `matched` undercounts existing fact endpoints — CLOSED
+## 48. `matched` undercounts existing fact endpoints: CLOSED
 
 `docs/roadmap/v0.7-plan-1-handoff.md:303-304`.
 
 **Closed, 0.7.2.** A fact endpoint that already exists is counted in `matched`, each key once and never one `about` or `entities` already counted; the MCP line `entities N created, M matched` follows. `a_fact_endpoint_that_already_exists_is_counted_as_matched` (`crates/core-api/tests/memory_remember.rs`) failed first with `matched: 0` against 2.
 
-## 49. The ledger gate ran only from the repository root — CLOSED
+## 49. The ledger gate ran only from the repository root: CLOSED
 
 `LEDGER` was a bare relative path. Shown failing from `/tmp`, then fixed, in plan 4 Task 1.
 
-## 50. `forget` under-reports edges through a via node — CLOSED
+## 50. `forget` under-reports edges through a via node: CLOSED
 
 Plan 3 final review, minor.
 
 **Closed, 0.9.2.** `delete_node` (`crates/core-api/src/db.rs`) now reads `self.last_apply_retraction_count`, a field updated by `log_then_apply_with` to capture exactly the retractions the apply's own deltas produced (not the preceding reconcile's restorations). `provenance_touching`, which found only edges where the node is src or dst, is no longer used for the derived-edge count. `deleting_a_via_node_counts_its_derived_edge_in_the_report` (`crates/core-api/tests/shared_edge_rules.rs`) failed first with `derived_edges: 0`.
 
-## 51. `same_as_pairs` swallows read errors — CLOSED
+## 51. `same_as_pairs` swallows read errors: CLOSED
 
 Plan 3 final review, minor. `let Ok(edges) = db.node_edges(key) else { continue }`.
 
 **Closed, v0.10 PS-11.** `same_as_pairs` now returns `Result<Vec<SameAsPair>, GraphError>`. A key that does not exist (`KeyNotFound`) is still skipped, since it has no claims; any other error from `node_edges` is returned. The callers that run before the write commits propagate it. The two that run after it (`upsert_entity`'s retracted-link read and `remember`'s report) cannot undo the commit, so they log the error to stderr and report no links. `same_as_pairs_returns_a_read_error_instead_of_no_links` and `same_as_pairs_skips_a_key_that_does_not_exist` (`crates/core-api/src/memory/identity.rs`) pin both halves.
 
-## 52. A suggestion can carry `approximate: true` — CLOSED
+## 52. A suggestion can carry `approximate: true`: CLOSED
 
 Plan 3 final review, minor. `create_rule` accepts it; its advertised schema does not list it.
 
 **Closed, 0.7.2.** `create_rule` over MCP does accept `approximate`, so the advertised schema was wrong and now lists it as a boolean. `create_rule_advertises_every_argument_a_suggestion_carries` (`crates/server/src/mcp.rs`) checks every argument `suggest_rules` hands back against the schema, and failed first on `approximate`. The schema still omits `via_label`, `via_edge` and `via_dir`, which no suggestion carries: row 88.
 
-## 53. A stub's aliases are not capped — CLOSED
+## 53. A stub's aliases are not capped: CLOSED
 
 Plan 3 final review, minor.
 
 **Closed, 0.7.2.** A stub whose key implies more than `MAX_ALIASES` aliases carries its whole key as its one alias (`stub_props`, `crates/core-api/src/memory/remember.rs`). It is still written. The first fix refused such a key outright, and the review of the branch showed what that cost: words are split on every character that is not a letter or a digit, so a news URL with a slug and a query string is 38 aliases and a 35-word sentence is 36, and each took the whole note down with it where 0.7.1 had written both. `a_stub_whose_key_implies_more_aliases_than_the_cap_carries_only_its_key` pins a 32-word key and such a URL. A stub written before this with more than 32 aliases is not migrated.
 
-## 54. All-features clippy is red and CI does not run it — CLOSED
+## 54. All-features clippy is red and CI does not run it: CLOSED
 
 Pre-existing. `crates/server/src/http.rs:484`.
 
 **Closed, 0.10.** Read at head, all-features clippy was already clean: the `too_many_arguments` sites in `crates/server/src/http.rs` carry an explicit `#[allow]`, so only the CI gap was left. The `embed` job (the one job that builds the UI `embed-ui` needs) now runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`. No `-A` flag remains anywhere. The wide `http.rs` serve functions keep their `#[allow]`; changing a published crate's public signatures to remove it was not part of this row.
 
-## 55. The store-creation census sees only the CLI — CLOSED
+## 55. The store-creation census sees only the CLI: CLOSED
 
 Plan 2 final review. A store created through the Python binding or by the HTTP server on a
 fresh path gets no schema, and the census that guards "every path that creates a store declares
@@ -2511,14 +2511,14 @@ a schema" cannot see either.
 **Closed, 0.8.1.** `crates/cli/tests/store_creation_schema.rs` now scans `crates/*/src/` and
 `bindings/*/src/` instead of `crates/cli/src/*.rs` only; file paths are reported workspace-relative
 so the allow-list and the error message name the owning crate. `"CoreDb::open"` is added to the
-OPENS list — the Python binding opens a store as `CoreDb::open_with_options`, through a `use
+OPENS list: the Python binding opens a store as `CoreDb::open_with_options`, through a `use
 core_api::GraphDb as CoreDb` alias. Two new allow-list entries cover `SharedDb::open` (the
 multi-reader handle whose callers hold the schema) and `open_with_test_sync` (a test-only
 constructor). The Python binding's `GraphDb.open` is the caller's responsibility for schema; the
 entry names ledger row 55 as the record of that decision. An existing assertion confirms that
 `crates/cli/src/install.rs` is still in the set and carries no bare open.
 
-## 56. Three blind spots in `check-claims.sh` — CLOSED
+## 56. Three blind spots in `check-claims.sh`: CLOSED
 
 Plan 2 ledger, Task 10, and the research for plan 4.
 
@@ -2527,46 +2527,46 @@ Plan 2 ledger, Task 10, and the research for plan 4.
 scanner strips `/* */` block comments with `perl -0777 -pe 's{/\*.*?\*/}{…}ges'` before
 pattern-matching (replacing each block with the same number of newlines to preserve line
 numbers), so a retired claim quoted inside a block comment does not trip the gate. (3) A new
-pattern catches spelled-out tool counts — `(eleven|twelve|…|thirty) (tools?|above)` — because
+pattern catches spelled-out tool counts (`(eleven|twelve|…|thirty) (tools?|above)`) because
 the skill and concept docs used word-form numbers that are just as stale as numerals when the
 tool list changes. Seven files held a matching phrase; five were updated in the same commit
 (`docs/site/concepts.md`, `docs/site/mcp.md`, `llms.txt`, `crates/cli/skills/mushroom/SKILL.md`,
 `crates/cli/skills/mushroom/cursor-rules.mdc`), `llms-full.txt` was regenerated, and
 `packaging/plugin/skills/mushroom/SKILL.md` was re-rendered via `scripts/render-plugin.sh`.
 
-## 57. `load_tasks` defaults to a retired suite — CLOSED
+## 57. `load_tasks` defaults to a retired suite: CLOSED
 
 Plan 2 ledger, Task 10. Unreachable behind the guard; wrong if the guard moves.
 
 **Closed, 0.7.2.** `load_tasks` defaults to `association`, the suite the runner itself defaults to. `test_load_tasks_defaults_to_the_suite_the_runner_defaults_to` failed first.
 
-## 58. The bump's own check cannot see two sites — CLOSED
+## 58. The bump's own check cannot see two sites: CLOSED
 
 The failure shape spec §7.1 was written to close, one layer out.
 
 **Closed, plan 4 Task 16.** `scripts/bump-version.sh --check` reads `Cargo.lock` and `bindings/python/Cargo.lock` and fails on an entry for one of this workspace's own packages that is not at the workspace version; shown passing with the binding's lockfile at `0.0.1` before the change and failing after. The binding's lockfile refresh no longer ends in `|| true`: a refresh that fails stops the bump. `scripts/check-claims.sh` has a pattern for a release named in prose as the current one, shown failing on a planted line. Neither the header nor the workflow comment above the `--check` step in `ci.yml` names a count. The pin rewrite leaves `scripts/` alone, so a bump no longer rewrites the script's own comment; the stale-pin scan in `check-claims.sh` exempts `scripts/` to match (at any depth, where the bump exempts the root `scripts/` only), because the first real bump tripped it on that comment. What it still cannot see: a third-party lockfile entry, and a release named in prose in any other wording.
 
-## 59. The first packaging of 0.7.0 is the irreversible one — CLOSED
+## 59. The first packaging of 0.7.0 is the irreversible one: CLOSED
 
 `git grep -- '--dry-run' -- .github scripts` finds nothing that runs one.
 
-**Closed, plan 4 Task 16.** `scripts/publish-rehearsal.sh` stops at a version site that disagrees, then runs `cargo publish --dry-run --workspace` over the eight published crates — on the pinned 1.92.0 toolchain each crate is built from its packaged tarball with its siblings resolved from the other tarballs, not from the index — builds the release wheel and checks it carries the stub and `py.typed`, and runs `npm pack --dry-run` on both npm packages. It has no path that uploads. Run on the 0.7.0 tree on 2026-10-01 in the verified form: eight crates packaged and verified, one abi3 wheel, both npm packages. It is run by hand before a tag and by no workflow; it runs on the machine it is run on, so a Linux-only packaging failure is still found by the real publish.
+**Closed, plan 4 Task 16.** `scripts/publish-rehearsal.sh` stops at a version site that disagrees, then runs `cargo publish --dry-run --workspace` over the eight published crates (on the pinned 1.92.0 toolchain each crate is built from its packaged tarball with its siblings resolved from the other tarballs, not from the index) builds the release wheel and checks it carries the stub and `py.typed`, and runs `npm pack --dry-run` on both npm packages. It has no path that uploads. Run on the 0.7.0 tree on 2026-10-01 in the verified form: eight crates packaged and verified, one abi3 wheel, both npm packages. It is run by hand before a tag and by no workflow; it runs on the machine it is run on, so a Linux-only packaging failure is still found by the real publish.
 
-## 60. Generated and linked docs can drift unseen — CLOSED
+## 60. Generated and linked docs can drift unseen: CLOSED
 
 `llms-full.txt` is regenerated only by a version bump. One broken anchor today.
 
 **Closed, plan 4 Task 14.** `scripts/check-links.py` checks every relative link and anchor in the hand-written docs against tracked files and real headings, and that every page under `docs/site/` is linked from its index; it fetches nothing. `scripts/gen-llms-full.sh --check` fails when `llms-full.txt` is not what the generator writes. The generator, in both modes, stops on a page its list names that is not on disk, and on a `docs/site/*.md` page that is in neither its list nor its exclusion list, naming the page; the file's header names what is excluded. Twenty-three of the twenty-four pages are in; `panic-policy.md` is excluded as a contributors' policy page. Both run in the `plugin-validate` CI job. The anchor in `docs/site/api.md` is fixed. The link gate reads the files it is told to: `docs/roadmap/`, `CHANGELOG.md` and the release notes are not among them.
 
-## 61. The image is pushed before anything is tested — CLOSED
+## 61. The image is pushed before anything is tested: CLOSED
 
 `release.yml`'s `docker` job has no `needs:`.
 
-Closed in 0.7.1: the job has `needs: [github-release]`. `github-release` needs `binaries`, so the moving `:latest` tag and the version tag are pushed only after the three targets compiled from the tagged commit and the GitHub Release was published with its assets; a tag whose build fails no longer moves `:latest`. What a tag publishes is unchanged — the same two image tags, the same release, the same dispatch of `publish.yml`, which still waits only for `github-release`.
+Closed in 0.7.1: the job has `needs: [github-release]`. `github-release` needs `binaries`, so the moving `:latest` tag and the version tag are pushed only after the three targets compiled from the tagged commit and the GitHub Release was published with its assets; a tag whose build fails no longer moves `:latest`. What a tag publishes is unchanged: the same two image tags, the same release, the same dispatch of `publish.yml`, which still waits only for `github-release`.
 
-What this does not do: `release.yml` runs no test. The image waits for a build and a release, not for a suite, so the rule the row's deferral stated still holds and the release checklist keeps it — tag only a commit whose CI on `main` is green. A workflow cannot be run from a working tree; the change was checked by parsing the file and printing each job's `needs`, and with `actionlint`. Its first real run is the `v0.7.1` tag, where `docker` should start after `github-release` finishes.
+What this does not do: `release.yml` runs no test. The image waits for a build and a release, not for a suite, so the rule the row's deferral stated still holds and the release checklist keeps it: tag only a commit whose CI on `main` is green. A workflow cannot be run from a working tree; the change was checked by parsing the file and printing each job's `needs`, and with `actionlint`. Its first real run is the `v0.7.1` tag, where `docker` should start after `github-release` finishes.
 
-## 62. Caps without telemetry — CLOSED
+## 62. Caps without telemetry: CLOSED
 
 Plan 2 "Known costs" (`:2151`); plan 3 "Known costs" (`analyze` at 1,000,000 nodes).
 
@@ -2580,7 +2580,7 @@ Plan 2 "Known costs" (`:2151`); plan 3 "Known costs" (`analyze` at 1,000,000 nod
 
 What stays unmeasured is the real-world demand on the caps: no caller telemetry exists, the stand-in prompts were documentation text, and the text is synthetic.
 
-## 63. Two items the survey found and nobody scoped — CLOSED
+## 63. Two items the survey found and nobody scoped: CLOSED
 
 Spec §12, and `docs/roadmap/v0.7-plan-1-handoff.md:160-163`, `:169-172`.
 
@@ -2588,39 +2588,39 @@ Spec §12, and `docs/roadmap/v0.7-plan-1-handoff.md:160-163`, `:169-172`.
 
 **Closed, 0.10.** `install` pushes a `warning: another copy of the skill exists at <path> ...; only one will be used` note when the other scope holds a `skills/mushroom/SKILL.md` that differs from the one just written (a project install checks the user scope and the reverse; worded neutrally, because which copy a host reads is its own rule). An identical copy earns nothing. Pinned by `project_install_warns_when_a_user_scope_skill_shadows_it` and `user_install_warns_of_a_differing_project_skill_and_not_an_identical_one` (`crates/cli/tests/install.rs`). The boolean literals were closed in 0.7.2 (above).
 
-## 64. `remember` accepts a label the store disagrees with — CLOSED
+## 64. `remember` accepts a label the store disagrees with: CLOSED
 
 Plan 4 Task 7's review; probed on the Task 8 wheel. With `ada` stored as `Person`, `remember(..., entities=[{"key": "ada", "label": "Org", "props": {"role": "founder"}}])` reports `matched: 1, created: 0, fulltext_declared: ["Org"]`; `ada` is still a `Person`, now with `role`, and the store declares full-text on `Org.name` with no `Org` node in it. `upsert_entity("ada", {...}, label="Org")` raises `IngestError` for the same input. The cost is one wasted full-text pair against `MAX_FULLTEXT_PAIRS` per disagreeing label, and a report that does not say the label was ignored.
 
-**Half closed, 0.7.2.** The declare loop skips an `entities[]` entry whose key the store holds under another label, so no full-text pair is spent on a label nothing was written under; a new key under that label in the same call still declares it. `a_label_the_store_disagrees_with_is_not_declared_full_text` (`crates/core-api/tests/memory_remember.rs`) failed first with `fulltext_declared: ["Guild"]`. The entry is still matched and its properties still written, because that is also how a provisional stub — stored as `Entity` — is described under the label the caller knows it by. What remains is the report: it does not say the label went unused.
+**Half closed, 0.7.2.** The declare loop skips an `entities[]` entry whose key the store holds under another label, so no full-text pair is spent on a label nothing was written under; a new key under that label in the same call still declares it. `a_label_the_store_disagrees_with_is_not_declared_full_text` (`crates/core-api/tests/memory_remember.rs`) failed first with `fulltext_declared: ["Guild"]`. The entry is still matched and its properties still written, because that is also how a provisional stub (stored as `Entity`) is described under the label the caller knows it by. What remains is the report: it does not say the label went unused.
 
 **Closed, 0.10.** The report says the label went unused: `RememberReport.labels_not_applied`, one `{key, requested, stored}` per distinct disagreement, a new field alongside the existing ones. The MCP json carries it as `labels_not_applied` and the text adds a `label` line; the Python dict carries it too. Pinned by `remember_reports_an_entity_label_that_disagrees_with_the_stored_one` (`crates/core-api/tests/memory_remember.rs`, failed first with `labels_not_applied: []`). The entry is still matched and its properties still written, as in 0.7.2.
 
-## 65. `set_props_many` and the memory calls hold the GIL — CLOSED
+## 65. `set_props_many` and the memory calls hold the GIL: CLOSED
 
 Plan 4 Task 8's review. Nothing is wrong today: every write path holds the GIL, which is what keeps `upsert_node`'s two lock acquisitions from interleaving with another writer. A batch of about 10,000 rows is one frame and one fsync with every other Python thread waiting on it.
 
 Widened by plan 4's final review: the row first named `set_props_many` alone. Read at head, `remember`, `upsert_entity`, `forget`, `recall` and `search` hold the GIL for their whole call too. For the three writes the reason above applies; `recall` and `search` are reads and could release it as `find_similar` does.
 
-**Closed, 0.10.** `upsert_node`'s existence read and write are one `with_mut` call, so no other writer can come between them. The GIL is then released inside the store-lock helpers themselves (`with_mut`, `with_mut_unscoped`, `with_ref`, `with_scope` in `bindings/python/src/lib.rs`) rather than at each method, so every write — `insert_node`, `upsert_node`, `set_prop`, `remove_prop`, `set_props_many`, the edge writes, `delete_node`, `remember`, `upsert_entity`, `forget`, the rule and index declarations — and every read through those helpers runs without the GIL, and the guard is dropped before `graph_err` retakes it (GIL, then store, never the reverse). Closures passed to the helpers are `Send`, so a Python object cannot be touched inside one; the compiler enforces it. A Python exception or `KeyboardInterrupt` can only arrive between calls, never inside the lock; the mutex still poisons on a Rust panic, which stays an error rather than serving a possibly half-applied store. Pinned by `bindings/python/tests/test_concurrent_write.py`: two writers lose nothing, four threads upserting the same keys get exactly one `inserted` per key and no `DuplicateKey`, and an interrupt mid-write leaves the handle usable.
+**Closed, 0.10.** `upsert_node`'s existence read and write are one `with_mut` call, so no other writer can come between them. The GIL is then released inside the store-lock helpers themselves (`with_mut`, `with_mut_unscoped`, `with_ref`, `with_scope` in `bindings/python/src/lib.rs`) rather than at each method, so every write (`insert_node`, `upsert_node`, `set_prop`, `remove_prop`, `set_props_many`, the edge writes, `delete_node`, `remember`, `upsert_entity`, `forget`, the rule and index declarations) and every read through those helpers runs without the GIL, and the guard is dropped before `graph_err` retakes it (GIL, then store, never the reverse). Closures passed to the helpers are `Send`, so a Python object cannot be touched inside one; the compiler enforces it. A Python exception or `KeyboardInterrupt` can only arrive between calls, never inside the lock; the mutex still poisons on a Rust panic, which stays an error rather than serving a possibly half-applied store. Pinned by `bindings/python/tests/test_concurrent_write.py`: two writers lose nothing, four threads upserting the same keys get exactly one `inserted` per key and no `DuplicateKey`, and an interrupt mid-write leaves the handle usable.
 
-## 66. Raw property writes bypass alias maintenance — CLOSED
+## 66. Raw property writes bypass alias maintenance: CLOSED
 
 Plan 4 Task 8's review, probed on the Task 8 wheel. Renaming an entity through `set_props_many` left `aliases` naming the old name and its `SAME_AS` claim standing; raw `aliases` forged a link at weight 1.0, and the next `upsert_entity` moved those strings into `alias_keys`. `set_prop` and `upsert_node` behave the same. Refusing the fields on one raw path and not the others would break parity, so the choice is the owner's and covers all five paths at once.
 
-**Closed, 0.10.0** — owner decision: option 3. Contract documented on `set_props_many` and in `docs/site/` (Agent memory & MCP). Raw writes do not maintain aliases; the memory API does. No refusal. Pinned by `test_it_is_a_raw_write_and_does_not_maintain_an_entitys_aliases`.
+**Closed, 0.10.0**: owner decision: option 3. Contract documented on `set_props_many` and in `docs/site/` (Agent memory & MCP). Raw writes do not maintain aliases; the memory API does. No refusal. Pinned by `test_it_is_a_raw_write_and_does_not_maintain_an_entitys_aliases`.
 
-## 67. The delete guard refuses for rules that would not derive the edge, and for edges that do not exist — CLOSED
+## 67. The delete guard refuses for rules that would not derive the edge, and for edges that do not exist: CLOSED
 
 Plan 4 Task 9's re-review, with a probe: two `Person` nodes sharing `team`, one rule with a `Team` hop over `MEMBER_OF`, no `Team` node and no edge in the store. Deleting `LINKED a → b` came back `RuleOwned`.
 
-Two things in `prepare_delete_edge` (`crates/core-api/src/db.rs:14561`). It calls `would_derive` (`:14578`) before `has_edge` (`:14586`), so an absent edge is refused rather than reported absent. And `would_derive` (`:14596-14631`) evaluates the rule's predicate directly on the pair (`:14626`) after matching edge type and labels (`:14610-14615`): it does not look at `via_label` — a via-hop rule evaluates its predicate between a via node and the destination — nor at `namespace`, nor at `max_edges`. So it refuses for a rule that would not put the edge back.
+Two things in `prepare_delete_edge` (`crates/core-api/src/db.rs:14561`). It calls `would_derive` (`:14578`) before `has_edge` (`:14586`), so an absent edge is refused rather than reported absent. And `would_derive` (`:14596-14631`) evaluates the rule's predicate directly on the pair (`:14626`) after matching edge type and labels (`:14610-14615`): it does not look at `via_label` (a via-hop rule evaluates its predicate between a via node and the destination) nor at `namespace`, nor at `max_edges`. So it refuses for a rule that would not put the edge back.
 
 `forget` does not change the guard. It answers "nothing to retract" for an absent edge, and for a hand-written one it says a rule "would derive it again" only when the rule's namespace, via hop and cap all allow it, and "matches these two nodes' properties and may derive it again" otherwise. The delete is still refused in both cases; only the engine can stop refusing. To name the rules the guard refused for, `crates/core-api/src/memory/forget.rs` mirrors the private `would_derive` as `guard_matches`; a comment at the engine function points at the mirror. The two can drift, which is the second reason to fix this in the engine: one public "would this rule derive this pair" would serve both.
 
 **Closed in 0.10.** `prepare_delete_edge` reports an edge the graph does not hold as absent (`Ok(false)`) before either rule check. `would_derive` now asks what `forget`'s copy asks: the node's label as this batch sees it, the rule's namespace, a real via hop when the rule has one, and whether the cap can bind. A cap that can bind does not refuse, which lets the delete through rather than block a pair the rule might not keep. Pinned by `delete_of_an_absent_edge_is_not_rule_owned_and_a_via_rule_with_no_hop_does_not_block` in `crates/core-api/tests/mutations.rs`, and by the three `does_not_keep_the_hand_written_fact` tests in `crates/core-api/tests/memory_forget.rs`. Still open, and still row 90: a retraction caused by an earlier op in the same batch is not yet visible to this guard.
 
-## 68. The skill's byte cap is measured on a short store path — CLOSED
+## 68. The skill's byte cap is measured on a short store path: CLOSED
 
 Plan 4 Task 13's review. The budget test renders the skill with the store at `./mushroom-memory` and the plugin's `npx` command; `install` writes the store's absolute path. The template carries the path placeholder six times, so each byte of path past the seventeenth costs six: 5,963 bytes at 17, 5,999 at 23, 6,005 at 24. A project install's store path is longer than that almost everywhere, so the skill a session re-reads every turn is usually over the figure the test holds it to. The reviewer's `both` install at a long absolute path came to 6,496 bytes. Either the test renders a path of realistic length, or the template names the path fewer times.
 
@@ -2628,17 +2628,17 @@ Plan 4 Task 13's review. The budget test renders the skill with the store at `./
 occurrences in the CLI command table are replaced with `'<db>'`, leaving one in the header line
 (`A live graph at {{DB_PATH}}`). This cuts the per-byte cost from 6× to 1×, so a 100-byte path
 costs 83 fewer bytes than before. The budget test (`every_delivery_variant_names_every_tool_and_fits_the_budget`,
-`crates/cli/tests/install.rs`) now renders a 102-byte path — one that looks like a real absolute
-project path — and the assertion holds at that length. The plugin skill was re-rendered. Both
+`crates/cli/tests/install.rs`) now renders a 102-byte path (one that looks like a real absolute
+project path) and the assertion holds at that length. The plugin skill was re-rendered. Both
 install variants pass the 6,000-byte cap at the new test path.
 
-## 69. A user-scope CLI install with a store elsewhere is briefed as if it had a server — CLOSED
+## 69. A user-scope CLI install with a store elsewhere is briefed as if it had a server: CLOSED
 
-Plan 4 Task 13's review. The brief is handed a store, not an install, and finds the install by looking beside the store's parent. That finds a Claude Code project install whose store is beside its `.claude` directory, and a user install whose store is the default `~/.mushroomdb/memory`. It does not find a user install made with `--db <path>`: the manifest is under `~/.mushroomdb/` and the store is not. No manifest reads as `both`, so the reach line names `explain_association` and `query` as MCP tools to a session that was given none. Nothing is lost — the shell form follows on the same line — but the first thing the session is told to call does not exist there.
+Plan 4 Task 13's review. The brief is handed a store, not an install, and finds the install by looking beside the store's parent. That finds a Claude Code project install whose store is beside its `.claude` directory, and a user install whose store is the default `~/.mushroomdb/memory`. It does not find a user install made with `--db <path>`: the manifest is under `~/.mushroomdb/` and the store is not. No manifest reads as `both`, so the reach line names `explain_association` and `query` as MCP tools to a session that was given none. Nothing is lost (the shell form follows on the same line) but the first thing the session is told to call does not exist there.
 
 **Closed, 0.10.** `delivery_for_store` takes `<home>/.mushroomdb/install-manifest.json` as its last candidate (`HOME`, then `USERPROFILE`); the signature is unchanged and the lookup is `delivery_for_store_with_home`. Pinned by `delivery_for_store_finds_user_scope_manifest_beside_home` and, through `HOME`, `delivery_for_store_reads_the_user_scope_manifest_through_home` (`crates/cli/tests/install.rs`; both fail with `Both` when the home candidate is removed). A user-scope `--delivery cli` install now sets the delivery for every store the lookup cannot place any other way.
 
-## 70. A shell Cypher statement cannot be passed on stdin or from a file — CLOSED in 0.10
+## 70. A shell Cypher statement cannot be passed on stdin or from a file: CLOSED in 0.10
 
 Plan 4 Task 13's review, probed on the Task 14 binary. `mushroomdb query <db> "CREATE (n:Note {id: 'note:a1', text: 'it\'s a fact'})"` writes `it's a fact`. The same statement with `C:\dir` in the text is refused with `lex: invalid escape '\d'`, and with a doubled backslash with `lex: invalid escape '\\'`: the lexer accepts no escape that yields a backslash. A statement piped on stdin is refused with `query requires a Cypher string`, and there is no `--file`. The MCP `remember` tool takes the text as a JSON string and has none of this; it is the shell door, which is the only door a `--delivery cli` install has, that cannot carry every string. A stdin or file form would remove the shell's quoting from the path; the backslash needs a lexer escape as well.
 
@@ -2650,21 +2650,21 @@ seven cases, including asof file/stdin and source refusals; the lexer suite pass
 including `backslash_escape_yields_one_backslash` and `double_quoted_strings_match_single_quoted`.
 No parser or CLI behavior changes in this reconciliation.
 
-## 71. `was_linked` takes a date its schema does not declare — CLOSED
+## 71. `was_linked` takes a date its schema does not declare: CLOSED
 
 Plan 4 Task 14 and its review, probed on the binary: `was_linked` with `"at_commit": "2026-10-01"` on a demo store built that day answered `{"at_commit":25,"linked":true}`. The handler has taken a date since `edges_at` did; the schema still reads `"at_commit": { "type": "integer", "minimum": 0 }` and the tool's description says "at commit C". The skill tells a session the date form works. A host that checks arguments against `inputSchema` before sending them will refuse it, and one that does not will succeed, so the same instruction works on some clients and fails on others.
 
-Not fixed with the docs because the fix is not a docs edit: the schema and description are part of the `tools/list` reply, whose size is published (27,067 and 27,868 bytes) and pinned. The change is `at_commit` typed as `edges_at`'s `at` is — a string or a non-negative integer — with the listing figures re-measured in the same commit.
+Not fixed with the docs because the fix is not a docs edit: the schema and description are part of the `tools/list` reply, whose size is published (27,067 and 27,868 bytes) and pinned. The change is `at_commit` typed as `edges_at`'s `at` is (a string or a non-negative integer) with the listing figures re-measured in the same commit.
 
 Closed in 0.7.1 by that change, in `crates/server/src/mcp.rs`: `at_commit` carries `anyOf: [{type: string, minLength: 1}, {type: integer, minimum: 0}]`, byte for byte what `edges_at`'s `at` carries, and no bare `type`; the tool's description now opens "Were A and B linked on DATE (or at commit C)". The handler is unchanged. `was_linked_declares_the_date_it_accepts` (`crates/server/tests/mcp.rs`) compares the two tools' schemas to each other and calls the tool with a date, an index, a string that is no date and a fraction. The listing moved from 27,067 to 27,371 bytes by default and from 27,868 to 28,172 for all 25 tools (`scripts/measure-tool-listing.py`, on the debug binary); `docs/site/mcp.md`, the README's tool table and the changelog carry the new figures and no longer describe the gap. The skill's sentence was already true and is unchanged, so its byte count is too.
 
-## 72. `rename_node` leaves the `id` property at the old key — CLOSED
+## 72. `rename_node` leaves the `id` property at the old key: CLOSED
 
 Plan 4 Task 15 saw it while reproducing the alias behaviour after a rename, and its review widened it, both on the binary. `upsert_entity {key: "q1", label: "Person"}`, then `rename_node q1 → q2`: `node_info q2` shows `"id":"q1"`; `MATCH (n:Person) WHERE n.id = 'q2' RETURN key(n), n.id` returns no rows; the same with `'q1'` returns `["q2","q1"]`; `MATCH (n:Person {id: 'q2'})` and `WHERE key(n) = 'q2'` both return the node, printing `n.id` as `q1`. A node created by `remember`'s `entities` stores no `id` property, and there `n.id` answers with the key, so the two lookup forms disagree only on nodes that carry the stored property.
 
 It predates 0.7. The reach is limited by `rename_node` being one of the two unlisted MCP tools, but the Python binding and HTTP have it too, and the query documentation filters on `n.id`. Either the rename rewrites a stored `id` that equals the old key, or `n.id` reads the key whatever is stored.
 
-Closed in 0.7.1 by the first of those. Reproduced first over MCP on the 0.7.0 binary, as above. The rewrite is in the `BatchOp::RenameNode` arm of `commit_logged_batch` (`crates/core-api/src/db.rs`): when the node's stored `id` is a string equal to the old key, a `SetProp` of `id` to the new key is queued behind the `RenameNode` record, in the same frame. `GraphDb::rename_node` — what the MCP tool, the Python binding and `ingest-git` call — sends a node with such an `id` through that arm and keeps its bare `RenameNode` frame for every other node; HTTP `POST /nodes/{key}/rename` and `BatchBuilder::rename_node` reach the arm directly. No WAL discriminant is new and a rename is still one commit.
+Closed in 0.7.1 by the first of those. Reproduced first over MCP on the 0.7.0 binary, as above. The rewrite is in the `BatchOp::RenameNode` arm of `commit_logged_batch` (`crates/core-api/src/db.rs`): when the node's stored `id` is a string equal to the old key, a `SetProp` of `id` to the new key is queued behind the `RenameNode` record, in the same frame. `GraphDb::rename_node` (what the MCP tool, the Python binding and `ingest-git` call) sends a node with such an `id` through that arm and keeps its bare `RenameNode` frame for every other node; HTTP `POST /nodes/{key}/rename` and `BatchBuilder::rename_node` reach the arm directly. No WAL discriminant is new and a rename is still one commit.
 
 What it leaves alone, each pinned: an `id` that holds anything but the old key (a raw write's, or a non-string) stays as written; a node that stores no `id` gains none, and there `n.id` still falls back to the key; a read as of a commit before the rename answers with the old key and the old `id`. The rewrite is an ordinary property write, so `node_history` shows a `PropSet` of `id` at the rename's commit and a rule that watches `id` re-evaluates the node. `aliases` and `alias_keys` are untouched: the former key still reaches `alias_keys` on the next describing write, as before. The second option was not taken because it would change what `n.id` returns for every node whose `id` was deliberately written as something else.
 
@@ -2672,11 +2672,11 @@ Nothing migrates a node an earlier build renamed. `mushroomdb query <db> "MATCH 
 
 Tests: `rename_moves_a_stored_id_that_equals_the_key`, `rename_leaves_an_id_that_was_not_the_key`, `rename_writes_no_id_on_a_node_that_stored_none`, `rename_with_its_id_is_one_commit_and_survives_reopen`, `rename_through_a_batch_moves_the_id_too`, `rename_through_the_group_commit_queue_moves_the_id_too` and `the_past_keeps_the_old_key_and_the_old_id` (`crates/core-api/tests/rename_upsert.rs`); `http_rename_node_moves_a_stored_id` (`crates/server/tests/http.rs`); `rename_node_moves_the_id_upsert_entity_stored` (`crates/server/tests/mcp.rs`); `test_rename_node_moves_a_stored_id` (`bindings/python/tests/test_basic.py`).
 
-## 73. After the first `remember`, nothing says the memory defaults are missing — CLOSED
+## 73. After the first `remember`, nothing says the memory defaults are missing: CLOSED
 
 Plan 4 Task 15's review, reproduced by the implementer on the binary. A store created by `mushroomdb query` with one `Person` named Pat Doe: `recall` answers "this store has no text index" and names the `schema apply … --memory-defaults` command. One `remember {text: "Pat Doe likes tea", about: ["p1"]}` later, `schema` lists `Note.text` under full-text, `recall "pat doe"` returns the note and not the person, and `brief` no longer prints its no-index line. After `schema apply --memory-defaults` the same `recall` returns both.
 
-The self-declare is deliberate — a store whose first write is a `remember` must be recallable — and the defaults are deliberately never applied unasked. What is missing is the notice in between: `recall` and the brief test for "no text pair at all", not for "the memory defaults are not all here". A 0.6 store that has remembered anything is already past the first test.
+The self-declare is deliberate (a store whose first write is a `remember` must be recallable) and the defaults are deliberately never applied unasked. What is missing is the notice in between: `recall` and the brief test for "no text pair at all", not for "the memory defaults are not all here". A 0.6 store that has remembered anything is already past the first test.
 
 Closed in 0.7.1 by the notice in between. `unindexed_memory_fields` (`crates/core-api/src/memory/recall.rs`) returns each `(label, field)` of `memory_defaults()` that the store has not declared while a live node under the label carries the field, in the defaults' order. The `recall` tool (`tool_recall`, `crates/server/src/mcp_tasks.rs`) ends its reply with `text index incomplete: recall does not search Person.name. Run …` when that list is not empty, after hits and after "nothing matches" alike; the session brief (`run_brief`, `crates/cli/src/lib.rs`) carries the same line above its reach line when the store has some text field, and its old "no text index" line when it has none. Both name `mushroomdb schema apply <db> --memory-defaults`. Nothing is declared: spec §3.1's rule that an existing store is never upgraded unasked stands, and its sentence "this store has no text index on that label" is what the line now says.
 
@@ -2684,60 +2684,60 @@ How the code tells a store that is missing the defaults from one that has a sche
 
 The check is bounded, because it runs on every `recall` tool call and every session brief. For each default pair the store has not declared, `GraphDb::first_nodes_carry_prop` (`crates/core-api/src/db.rs`) reads the first 1,000 live nodes of the label in id order (`UNINDEXED_SCAN_LIMIT`, `crates/core-api/src/memory/recall.rs`), through one props view, and stops at the first that carries the field: at most eight pairs of 1,000 property reads a call, whatever the store holds. A field carried only by a node past the first 1,000 of its label is not named; the notice is advice, and it stays silent rather than read a whole label to give it. The label column has no per-label index, so a label with fewer than 1,000 nodes costs one pass of integer compares over that column and no property read beyond its own nodes. The first form of the check read every node of a label that had no carrier, and measured 39 ms to 125 ms a call on a debug build over 100,000 such nodes; the bounded form is what shipped. With it, the `recall` tool's "no text index" answer sanitizes the store path it prints, as the new line beside it does.
 
-Not changed: the prompt hook prints no notice, as it prints none for a store with no index — it fires every turn; `recall` with `json: true` carries the line inside `digest` when there are hits and nowhere when there are none, as it carries nothing for a store with no index; the Python binding's `recall` rows are as they were. Neither line is charged to a byte cap: the brief's is inserted after `render` has applied the 4,000-byte cap, as the line it joins already was, so a brief already at the cap exceeds it by that one line; the tool's follows the digest and is outside its 1,200-byte budget, so no hit is dropped for it.
+Not changed: the prompt hook prints no notice, as it prints none for a store with no index: it fires every turn; `recall` with `json: true` carries the line inside `digest` when there are hits and nowhere when there are none, as it carries nothing for a store with no index; the Python binding's `recall` rows are as they were. Neither line is charged to a byte cap: the brief's is inserted after `render` has applied the 4,000-byte cap, as the line it joins already was, so a brief already at the cap exceeds it by that one line; the tool's follows the digest and is outside its 1,200-byte budget, so no hit is dropped for it.
 
 Tests: `a_store_past_its_first_note_names_the_entity_fields_recall_cannot_search` and `a_store_with_its_own_schema_and_no_memory_labels_is_not_told_to_apply_the_defaults`, `a_field_carried_only_beyond_the_scan_bound_is_not_named` and `a_field_carried_inside_the_scan_bound_is_named_however_many_nodes_lack_it` (`crates/core-api/tests/memory_recall.rs`); `recall_names_the_entity_fields_a_store_without_the_defaults_does_not_search`, `recall_s_no_index_answer_sanitizes_the_store_path` and `recall_s_incomplete_index_notice_sanitizes_the_store_path` (`crates/server/tests/mcp.rs`); `the_brief_of_a_store_past_its_first_note_names_the_fields_recall_cannot_search` and `the_prompt_hook_says_nothing_about_an_incomplete_index` (`crates/cli/tests/prompt_hook.rs`); `ingest_git_never_applies_the_memory_defaults_to_a_store_it_did_not_create` and `can_recall` (`crates/cli/tests/store_creation_schema.rs`).
 
-## 74. Over MCP a `min` that is not a number becomes the default — CLOSED
+## 74. Over MCP a `min` that is not a number becomes the default: CLOSED
 
 Parked at plan 4 Task 2's review, entered by the final fix wave. Confirmed by reading both parsers at head. It predates 0.7; what 0.7 changed is that the two surfaces now share the default, so the only difference left between them is that one refuses a string and the other ignores it. The fix is the HTTP parser's shape on the MCP side: absent or null takes the default, anything else that is not a number is an error.
 
 **Closed, 0.7.2.** Over MCP, `find_similar` answers `min must be a number`, `k must be a non-negative integer` or `limit must be a non-negative integer` for a value that is present and is not one; absent or null still takes the default. `test_find_similar_non_numeric_min_k_or_limit_is_error` (`crates/server/src/mcp.rs`) failed first on a string `min` answered with `min: 0.8` and results. The same shape in other tools' argument parsing is row 88.
 
-## 75. `pagerank` accepts a damping that is not a number — CLOSED
+## 75. `pagerank` accepts a damping that is not a number: CLOSED
 
 Parked at plan 4 Task 6's review, entered by the final fix wave. Reproduced on the 0.7.0 wheel: two `Person` nodes and one edge, `pagerank(damping=float("nan"))` returns `[('a', nan), ('b', nan)]` and `converged: False`, and raises nothing. The binding validates `direction` and nothing else. Whether the check belongs in the binding or in `PageRankConfig`'s consumer is the choice to make: the engine has no other caller that can pass a NaN.
 
 **Closed, 0.7.2.** `PageRankConfig::validate` (`crates/core-api/src/algo.rs`) refuses a `damping` that is not a number from 0 to 1, and the two surfaces that take a caller's config call it: Python raises `ValueError`, HTTP answers 400 `invalid pagerank config: damping must be a number from 0 to 1, got …`. Both ends of the range are accepted. `GraphDb::pagerank` still returns a report and not a `Result`, so an embedded caller validates for itself. `tol` is left alone: a NaN or negative one only means the run never reports convergence. Tests: `a_pagerank_damping_outside_zero_to_one_is_refused` (`crates/server/tests/http.rs`), two in `bindings/python/tests/test_algorithms.py`; each failed first.
 
-## 76. `remember` creates a node whose key is the empty string — CLOSED
+## 76. `remember` creates a node whose key is the empty string: CLOSED
 
 Found by the final fix wave while confirming a parked minor from plan 4 Task 7, which had recorded an empty fact endpoint as a late `KeyNotFound` with nothing written. That is not what head does. Reproduced on the 0.7.0 wheel: `remember("…", facts=[{"subject": "", "predicate": "KNOWS", "object": "b"}])` returns `provisional: ['']`; `node_info("")` then returns an `Entity` with `name: ''`, `provisional: True` and `aliases: []`; a second call with the empty string as `object` writes an edge into it; `remember("…", about=[""])` reports `matched: 1`. `forget(key="")` removes the node and its edges. The MCP tool reaches the same code with the same absence of a check. The fix is one refusal where `remember` resolves `about` and fact endpoints, before anything is written.
 
 Closed by `8764869`, before the tag. Reproduced first over MCP on the 0.7.0 binary: `remember {about: [""]}` answered `provisional  — named but not yet described`, a whitespace-only key and an empty fact subject were stubbed the same way, an `entities` entry keyed `""` was counted as matched and cleared the stub's provisional mark, and the MCP `forget {key: ""}` then refused with `key must be a non-empty string`, so the node could not be removed through the tool that made it.
 
-The refusal is `refuse_blank` (named `refuse_empty_key` until row 77's fix) in `crates/core-api/src/memory/remember.rs`, called from the three functions through which a caller's key reaches the memory write path: `remember` (every `about` entry, every `entities[].key`, each fact's `subject` and `object`), `upsert_entity` and `describe_entity_with_aliases`. A key that is empty after trimming whitespace is an `IngestError` naming the argument and its position — `remember: about[1] must not be empty or only whitespace, got ""` — and it is raised before the store is read, before full-text is declared and before the batch is built, so the call writes nothing: no note, no entity, no stub, no fact. The MCP tools and the Python binding call those functions and add no check of their own. A padded key with text in it is stored as given, as before.
+The refusal is `refuse_blank` (named `refuse_empty_key` until row 77's fix) in `crates/core-api/src/memory/remember.rs`, called from the three functions through which a caller's key reaches the memory write path: `remember` (every `about` entry, every `entities[].key`, each fact's `subject` and `object`), `upsert_entity` and `describe_entity_with_aliases`. A key that is empty after trimming whitespace is an `IngestError` naming the argument and its position (`remember: about[1] must not be empty or only whitespace, got ""`) and it is raised before the store is read, before full-text is declared and before the batch is built, so the call writes nothing: no note, no entity, no stub, no fact. The MCP tools and the Python binding call those functions and add no check of their own. A padded key with text in it is stored as given, as before.
 
-Two things it leaves alone. The position in the message counts `about` after the surface has dropped repeats, which both the MCP tool and the binding do before the call, so `about: ["a", "a", ""]` is reported as `about[1]`. And the raw paths — `upsert_node`, Cypher `CREATE`, `ingest_json`, `rename_node` — still take an empty key, and nothing migrates a node already stored under one: the store opens and `recall`, `schema` and `stats` answer with it present (`a_store_that_already_holds_an_empty_key_node_still_opens_and_answers`). `mushroomdb query <db> "MATCH (n) WHERE key(n) = '' DETACH DELETE n"` removes it, and so does the binding's `forget(key="")`; the MCP `forget` refuses an empty key.
+Two things it leaves alone. The position in the message counts `about` after the surface has dropped repeats, which both the MCP tool and the binding do before the call, so `about: ["a", "a", ""]` is reported as `about[1]`. And the raw paths (`upsert_node`, Cypher `CREATE`, `ingest_json`, `rename_node`) still take an empty key, and nothing migrates a node already stored under one: the store opens and `recall`, `schema` and `stats` answer with it present (`a_store_that_already_holds_an_empty_key_node_still_opens_and_answers`). `mushroomdb query <db> "MATCH (n) WHERE key(n) = '' DETACH DELETE n"` removes it, and so does the binding's `forget(key="")`; the MCP `forget` refuses an empty key.
 
 Tests: `an_empty_key_is_refused_wherever_remember_takes_one`, `a_whitespace_only_key_is_refused_the_same_way`, `a_padded_key_is_still_taken_as_given`, `describing_an_empty_key_is_refused` and the reopened-store test above (`crates/core-api/tests/memory_remember.rs`); `an_empty_or_whitespace_only_key_is_refused` (`memory_upsert.rs`); `an_empty_key_is_a_tool_error_and_writes_nothing` (`crates/server/tests/mcp.rs`); `test_an_empty_key_is_refused_and_nothing_is_written` and `test_a_store_that_already_holds_an_empty_key_node_still_answers` (`bindings/python/tests/test_memory.py`).
 
-## 77. `remember` writes an edge with no type and a node with no label — CLOSED
+## 77. `remember` writes an edge with no type and a node with no label: CLOSED
 
 Found by the review of row 76's fix, which asked what else the same absence of a check lets through. Reproduced over MCP on the binary at `06536df`. `remember {facts: [{subject: "ada", predicate: "", object: "bob"}]}` succeeds, and `node_edges ada` lists an edge with `"edge_type":""`; a predicate of two spaces writes a second edge typed `"  "`. `forget {fact: {…, predicate: ""}}` answers `fact.predicate must be a non-empty string`, and a Cypher delete has no way to name the type. `remember {entities: [{key: "widget", label: ""}]}` answers `entities  1 created` and `indexed   — full-text search enabled for the first time`: `node_info widget` shows `"label":""` and `schema` lists `.name` among the full-text fields. `upsert_entity {key: "gizmo", label: "", props: {…}}` answers `{"created":true,…,"label":""}`.
 
-Closed by `d8522d7`, before the tag. Row 76's helper, renamed `refuse_blank`, is called on two more arguments in `remember`'s validation loop — each `entities[].label` and each fact's `predicate` — and on the label in `describe_entity_with_aliases`, which is where `upsert_entity`'s create path and `describe_entity` put a label on a node. Those are the only places in `crates/core-api/src/memory/` where a caller's predicate becomes an edge type or a caller's label a node label; each is checked once. The refusal is an `IngestError` naming the argument and its position — `remember: facts[0].predicate must not be empty or only whitespace, got ""`, `remember: entities[1].label …`, `label must not be empty or only whitespace, got ""` — raised before the store is read and before full-text is declared, so a call that mixes a valid entity and a valid fact with one blank label or predicate writes nothing and declares nothing. On an update, `upsert_entity` with a blank `label` is the relabel refusal it already was, as for any label the node does not carry. `upsert_entity`'s own key check stays beside the one in `describe_entity_with_aliases`: it is not a pure duplicate, because without it an empty key with no label would be answered `label required when creating a new entity`.
+Closed by `d8522d7`, before the tag. Row 76's helper, renamed `refuse_blank`, is called on two more arguments in `remember`'s validation loop (each `entities[].label` and each fact's `predicate`) and on the label in `describe_entity_with_aliases`, which is where `upsert_entity`'s create path and `describe_entity` put a label on a node. Those are the only places in `crates/core-api/src/memory/` where a caller's predicate becomes an edge type or a caller's label a node label; each is checked once. The refusal is an `IngestError` naming the argument and its position (`remember: facts[0].predicate must not be empty or only whitespace, got ""`, `remember: entities[1].label …`, `label must not be empty or only whitespace, got ""`) raised before the store is read and before full-text is declared, so a call that mixes a valid entity and a valid fact with one blank label or predicate writes nothing and declares nothing. On an update, `upsert_entity` with a blank `label` is the relabel refusal it already was, as for any label the node does not carry. `upsert_entity`'s own key check stays beside the one in `describe_entity_with_aliases`: it is not a pure duplicate, because without it an empty key with no label would be answered `label required when creating a new entity`.
 
 Left alone, as row 76 left them: `forget`, the raw paths (`insert_node`, `insert_edge`, `upsert_node`, Cypher, `ingest_json`), and every tool schema. Nothing migrates what an earlier build wrote; the store opens and `recall`, `schema` and `stats` answer with an empty-type edge, an empty-label node and the `("", name)` pair present (`a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answers`). Removing them, each way verified:
 
 - A node under an empty label: `forget {key}` over MCP, or the binding's `forget(key=…)`.
 - An edge whose type is only whitespace: `forget {fact}` over MCP retracts it.
-- An edge whose type is the empty string: the binding's `forget(fact={"subject": …, "predicate": "", "object": …})` or `delete_edge("", subject, object)`; or, on a store being served, HTTP `DELETE /edges//<subject>/<object>` — the route `/edges/{etype}/{src}/{dst}` in `crates/server/src/http.rs` with an empty type segment, which row 77's review ran on a local `serve` and saw remove that edge alone. Over MCP there is no removal short of forgetting one of its endpoint nodes: `forget`'s `fact` refuses the empty predicate, and `MATCH (a)-[r]->(b) … DELETE r` does not parse without a type.
+- An edge whose type is the empty string: the binding's `forget(fact={"subject": …, "predicate": "", "object": …})` or `delete_edge("", subject, object)`; or, on a store being served, HTTP `DELETE /edges//<subject>/<object>`: the route `/edges/{etype}/{src}/{dst}` in `crates/server/src/http.rs` with an empty type segment, which row 77's review ran on a local `serve` and saw remove that edge alone. Over MCP there is no removal short of forgetting one of its endpoint nodes: `forget`'s `fact` refuses the empty predicate, and `MATCH (a)-[r]->(b) … DELETE r` does not parse without a type.
 - The full-text pair `remember` declared for an empty label: the binding's `disable_fulltext("", "name")`. No MCP tool or command drops one.
 
 Tests: `an_empty_predicate_or_label_is_refused_and_nothing_is_written`, `a_whitespace_only_predicate_or_label_is_refused_the_same_way`, `describing_under_an_empty_label_is_refused` and the reopened-store test above (`crates/core-api/tests/memory_remember.rs`); `an_empty_or_whitespace_only_label_is_refused` (`memory_upsert.rs`); `an_empty_predicate_or_label_is_a_tool_error_and_writes_nothing` (`crates/server/tests/mcp.rs`); `test_an_empty_predicate_or_label_is_refused_and_nothing_is_written` and `test_a_store_that_already_holds_an_empty_type_edge_and_label_still_answers` (`bindings/python/tests/test_memory.py`).
 
-## 78. A key of only zero-width or control characters is stubbed — CLOSED
+## 78. A key of only zero-width or control characters is stubbed: CLOSED
 
 Found by the review of row 76's fix, and reproduced over MCP on the binary at `d8522d7`: `remember {about: ["\u200b"]}` answers with a `provisional` line naming a key that prints as a space, and the review saw the same for `"\u0001"` and for a byte-order mark as a fact's subject. `forget {key: "\u200b"}` then removes the node, so nothing is stranded. Rows 76 and 77 refuse what `str::trim` empties, which is Unicode whitespace and nothing else. Whether a key should be refused for carrying no visible character at all, and by which definition, is the choice to make; the digest already replaces such characters with spaces when it prints a key.
 
-**Closed, 0.7.2.** The refusal row 76 added now also takes a value that is only invisible characters: one that `digest::sanitize` prints as nothing but spaces — ASCII controls, U+200B to U+200F, the bidi controls, U+FEFF. It is the shared helper, so a predicate or a label made only of them is refused too. A key with text beside an invisible character is taken as given. Not covered: U+2060, U+00AD and others `sanitize` does not map. Tests in `crates/core-api/tests/memory_remember.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py`; each failed first.
+**Closed, 0.7.2.** The refusal row 76 added now also takes a value that is only invisible characters: one that `digest::sanitize` prints as nothing but spaces: ASCII controls, U+200B to U+200F, the bidi controls, U+FEFF. It is the shared helper, so a predicate or a label made only of them is refused too. A key with text beside an invisible character is taken as given. Not covered: U+2060, U+00AD and others `sanitize` does not map. Tests in `crates/core-api/tests/memory_remember.rs`, `crates/server/tests/mcp.rs` and `bindings/python/tests/test_memory.py`; each failed first.
 
-## 79. A batch's preview cannot see a renamed node's stored properties — CLOSED
+## 79. A batch's preview cannot see a renamed node's stored properties: CLOSED
 
 Found by the review of row 72's fix (0.7.1 plan Task 1), which asked what else an in-batch rename hides, and reproduced again on the tree of the 0.7.1 release commit with a test that was not committed. It predates 0.7.1: the preview code is as it was at 0.7.0, and row 72's fix reads through it without changing it.
 
-A batch is checked against a preview of the store before anything is written. When the preview meets a rename, `MutPreview::note_rename_node` (`crates/core-api/src/db.rs`) marks the old key deleted and the new key as one the batch introduced, and carries over only the properties the batch itself has written. For a key the batch introduced, `prop_value` and `has_prop` deliberately do not read the store — that is how a delete followed by a re-insert of the same key is kept from seeing the old node's properties — so every property the renamed node already had is invisible to the ops that follow it in the batch. The commit itself is unaffected: the rename keeps the node and all its properties.
+A batch is checked against a preview of the store before anything is written. When the preview meets a rename, `MutPreview::note_rename_node` (`crates/core-api/src/db.rs`) marks the old key deleted and the new key as one the batch introduced, and carries over only the properties the batch itself has written. For a key the batch introduced, `prop_value` and `has_prop` deliberately do not read the store (that is how a delete followed by a re-insert of the same key is kept from seeing the old node's properties) so every property the renamed node already had is invisible to the ops that follow it in the batch. The commit itself is unaffected: the rename keeps the node and all its properties.
 
 Three consequences, each observed:
 
@@ -2747,13 +2747,13 @@ Three consequences, each observed:
 
 Reach. Only a caller that builds a batch in Rust can put a rename beside another op: `BatchBuilder` on an embedded `GraphDb`, or `SharedDb::submit_batch`. The MCP `rename_node` tool, the Python binding's `rename_node` and `ingest-git` call `GraphDb::rename_node`, HTTP `POST /nodes/{key}/rename` submits a batch of that one op, and a role-scoped batch refuses a rename. No served surface reaches it.
 
-The fix is in the preview: a key introduced by a rename has a store-resident node behind it, unlike one introduced by an insert, and the property reads have to tell the two apart — by remembering which store key a renamed key stands for and reading the store through it. Deferred to 0.7.2 rather than taken here because it changes what every batch check sees after a rename, and needs its own tests for each guard that reads a property.
+The fix is in the preview: a key introduced by a rename has a store-resident node behind it, unlike one introduced by an insert, and the property reads have to tell the two apart: by remembering which store key a renamed key stands for and reading the store through it. Deferred to 0.7.2 rather than taken here because it changes what every batch check sees after a rename, and needs its own tests for each guard that reads a property.
 
 **Closed, 0.7.2.** The overlay remembers, for a key a rename introduced, the store key its node is still under (`Overlay::renamed_from`, `MutPreview::store_key`), and `has_prop`, `prop_value`, `has_edge`, `is_rule_owned` and `label_of` read the store through it. A chain follows to the first key; a node inserted in the batch and then renamed has no stored node and reads only what the batch wrote. Edges the batch added or deleted before the rename, and a label it recorded, follow the node to its new key. All three consequences above are pinned in `crates/core-api/tests/rename_upsert.rs`, and so is a fourth this fix found: `[rename a→b, delete_edge(b, d)]` and `[rename a→b, insert_edge(b, d)]` on an edge a rule owns passed the `RuleOwned` guard, because the preview could not see the renamed node's label or its edges. Five of the eight tests fail without the fix.
 
-**Reviewed, and one regression of this fix closed with it.** `[rename a→b, delete_rule, insert_edge(b, c)]` on a pair that rule derived committed and dropped the edge: `note_delete_rule` recorded the rule's edges as gone under the store's key, and the renamed endpoint now read through to the store, where the edge still was. It records them under the key the batch knows the node by. The review's differential probe — one batch against the same ops as separate commits, and against a reopen — is kept as `crates/core-api/tests/batch_vs_commits.rs`. What it found beside this is row 89.
+**Reviewed, and one regression of this fix closed with it.** `[rename a→b, delete_rule, insert_edge(b, c)]` on a pair that rule derived committed and dropped the edge: `note_delete_rule` recorded the rule's edges as gone under the store's key, and the renamed endpoint now read through to the store, where the edge still was. It records them under the key the batch knows the node by. The review's differential probe (one batch against the same ops as separate commits, and against a reopen) is kept as `crates/core-api/tests/batch_vs_commits.rs`. What it found beside this is row 89.
 
-## 80. A truncating snapshot hands discarded commit numbers to later commits — CLOSED
+## 80. A truncating snapshot hands discarded commit numbers to later commits: CLOSED
 
 Found on 2026-10-12, checking the sentence "a read from before the floor is
 refused by name, never answered with a guess" on `docs/site/concepts.md`
@@ -2772,8 +2772,8 @@ as-of commit 3 of 13        c=60
 
 **Cause.** `snapshot_with`'s `keep_wal=false, archive_wal=false` branch wrote the
 baseline WAL and deleted the genesis marker, and never touched the horizon
-floor. The retention sweep in the archive branch does the right thing —
-`wal_horizon_floor += pruned_frames`, persisted before anything is deleted — and
+floor. The retention sweep in the archive branch does the right thing (`wal_horizon_floor += pruned_frames`, persisted before anything is deleted)
+and
 the truncating branch was simply not given the same line. Its own comment said
 the replacement WAL "renumbers from the floor", and two tests pinned that as
 intended: `default_snapshot_truncates_wal_history` annotated the first write
@@ -2784,8 +2784,8 @@ after the snapshot as "new commit 0", and
 It is the default snapshot of the Rust API and of the Python binding, so it is
 what an embedder's `db.snapshot()` did every time.
 
-**Fix.** Before the WAL is replaced the branch takes `wal_total_commits()` —
-floor, surviving archives and live WAL — writes it as the floor, and then
+**Fix.** Before the WAL is replaced the branch takes `wal_total_commits()` (floor, surviving archives and live WAL)
+writes it as the floor, and then
 replaces the WAL. Archives at or below the new floor are deleted in the same
 call: they are the history a truncating snapshot is asked to discard, and
 `cleanup_orphaned_archives` would remove them at the next open in any case. The
@@ -2824,8 +2824,8 @@ one declaration each time. Harmless: no number is reused.
 
 A crash between the floor write and the WAL replacement leaves the new floor
 over the old WAL. Every number from before the snapshot is refused, as it
-should be. But the old WAL's frames are then counted again above the floor —
-`node_history(a)` at `[0, 2, 3, 4]` reads `[5, 7, 8, 9]` — and the total is
+should be. But the old WAL's frames are then counted again above the floor (`node_history(a)` at `[0, 2, 3, 4]` reads `[5, 7, 8, 9]`)
+and the total is
 inflated by their count until the next truncating snapshot. Never a reused
 number; not the original ones either. Closing it needs the floor to be written
 with the snapshot in one atomic step, which means recording "covers through
@@ -2841,7 +2841,7 @@ snapshot stops numbers being reused from then on; a number held from before an
 older truncation can still sit above the new floor and be answered.
 `docs/site/timetravel.md` says so.
 
-## 81. A handle that has not refreshed reads fresh frames under its old floor — CLOSED
+## 81. A handle that has not refreshed reads fresh frames under its old floor: CLOSED
 
 Found 2026-10-12 by the review of row 80, and older than it: the same mismatch
 followed a retention sweep by another process.
@@ -2851,8 +2851,8 @@ archives and the live WAL from disk on every call (`all_frames`) and number the
 frames from `self.wal_horizon_floor`, which is whatever the floor was when this
 handle last loaded. Reproduced with a read-only handle held open while a second
 handle wrote, took a truncating snapshot and wrote again: `is_stale()` was true,
-the reader's floor was still 0, and `was_linked(a, b, KNOWS, 2)` — true before
-the snapshot — answered false, from the third frame of the new WAL.
+the reader's floor was still 0, and `was_linked(a, b, KNOWS, 2)` (true before
+the snapshot) answered false, from the third frame of the new WAL.
 
 The Python binding's handle is a plain `GraphDb` that refreshes only when
 `refresh()` is called, so a long-lived Python reader beside a writer process is
@@ -2872,26 +2872,26 @@ fail ("a stale reader answered that they were not").
 map it loaded. `resolve_date` then names a commit from the old map, and the
 history read refuses it or answers for the store as it now is.
 
-## 82. `open_at` replays a WAL that does not start at genesis over no base — CLOSED
+## 82. `open_at` replays a WAL that does not start at genesis over no base: CLOSED
 
 Found 2026-10-12 by the review of row 80. Not introduced by it.
 
 For a target commit in the live WAL, `open_at_with` loads the snapshot as the
 base only when the snapshot says `wal_truncated`. That flag is `!keep_wal` at
 the moment the snapshot is taken. So: a truncating snapshot (floor moves, WAL
-restarts on that snapshot), two writes, then a `keep_wal` snapshot — which is
+restarts on that snapshot), two writes, then a `keep_wal` snapshot: which is
 the state at the head and says `wal_truncated: false`. `open_at(floor)` then
 replays one frame over an empty store and answers with one node where the graph
 at that commit held two. `enable_multiplicity` forces exactly such a snapshot,
 and the "rolling checkpoints" row of `docs/site/timetravel.md` recommends the
 sequence.
 
-The state it would need — the store as it was when the live WAL began — was
+The state it would need (the store as it was when the live WAL began) was
 the truncating snapshot, and the `keep_wal` snapshot overwrote it.
 
 **Fix.** When the snapshot is not a base (`wal_truncated: false`) and the live
-WAL does not reach the store's first commit — the floor is above 0, or archives
-sit in front of it — the read is refused with `CommitOutOfRange`. When the WAL
+WAL does not reach the store's first commit (the floor is above 0, or archives
+sit in front of it) the read is refused with `CommitOutOfRange`. When the WAL
 does reach the first commit it is replayed from nothing, as before.
 
 **Test.** `open_at_after_a_keep_wal_snapshot_on_a_truncated_store_is_refused_or_right`
@@ -2904,7 +2904,7 @@ refused instead. And a store truncated by 0.7.1 or earlier has floor 0 and no
 archives, so it is indistinguishable from one whose WAL is whole: the wrong
 answer survives there.
 
-## 83. A top-k rule beside a sibling loses its fallback edge — CLOSED
+## 83. A top-k rule beside a sibling loses its fallback edge: CLOSED
 
 Found 2026-10-12 by the review of row 37's fix, with a differential fuzz. Older than the fix,
 and a different mechanism from the one it closes.
@@ -2924,7 +2924,7 @@ Pinned by `a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build` in
 **Half closed, 0.8.1.** The sources a destination change affects are now found through the edges
 into the destination as well as through the rule's provenance: every source with that edge,
 whatever owns it, is re-evaluated (`on_node_changed_inner`). The same was missing when the
-destination is deleted — the fuzz found it there after the first fix — and `on_node_removed_inner`
+destination is deleted (the fuzz found it there after the first fix) and `on_node_removed_inner`
 now gathers the same sources before the edges go. The cost is the destination's in-degree over
 the rule's edge type, for top-k rules only. The pinned test is no longer ignored: 7 of 20 seeds
 diverged before, 3 after the first half, 0 now; a wider run with a second top-k rule and two
@@ -2932,12 +2932,12 @@ labels, 200 seeds of 60 steps, diverged on none and replayed identically.
 
 **And the review of that.** It ran 1,180 runs of 50 steps a side, thirteen rule mixes, both rule-name
 orders, against `main`: plain top-k mixes went from 30–65 of 80 runs diverging to 0. It also
-found the change as first written made a write to a hub slow — a hub with 50,000 incoming edges
-that the top-k rule never matched went from 8.9 ms to 329 ms p50 — because every in-neighbour got
+found the change as first written made a write to a hub slow (a hub with 50,000 incoming edges
+that the top-k rule never matched went from 8.9 ms to 329 ms p50) because every in-neighbour got
 a full re-evaluation. An in-neighbour is now re-evaluated only if the rule's predicate held
 between it and the destination as the destination was before the change: one evaluation, no
 index probe (`pair_matched_before`). Measured on one release build, one machine, both sides at the same load, 30 writes each to a hub of 50,000 incoming edges owned by a plain rule, with a top-k rule beside it: 0.20 ms p50 on `main`, 21.9 ms here, where the unguarded change took 329 ms, when the top-k rule never matches the hub; 369 ms on `main` and 613 ms here when it matches every other write, which is the re-evaluation the fix is for. With no top-k rule, 0.19 ms on both. Deleting the hub: 133 ms and 159 ms. The review also showed what is left: a **via-hop** top-k rule
-takes neither addition, so it still loses its fallback the same way — `p->t1` owned by a plain
+takes neither addition, so it still loses its fallback the same way: `p->t1` owned by a plain
 rule, a via-hop top-k rule with `k = 1`, and changing or deleting `t1` never adds `p->t2` until a
 rebuild. The same on `main`. Deferred.
 
@@ -2954,7 +2954,7 @@ for a changed and a deleted destination, failed first. The review's fuzz (`rev58
 seeds × 2 rule-name orders × 50 steps a mix): all eleven mixes at 0 runs diverging from a fresh
 build.
 
-## 84. Retractions the second pass does not cover — CLOSED
+## 84. Retractions the second pass does not cover: CLOSED
 
 Found 2026-10-12 by the review of row 37's fix. Each is row 37's defect on a path the fix does
 not reach.
@@ -2981,16 +2981,16 @@ state stale enough for a rebuild to find an edge to retract, so there is no test
 
 The review of the change found its first form lost an edge: a via-hop rule that links a label to
 itself, re-evaluated for `s`, computed only `s`'s outgoing set against a retract set of every edge
-touching `s`, so `x->s` went — an edge `main` had right. It now adds the set anchored on `s` as a
+touching `s`, so `x->s` went: an edge `main` had right. It now adds the set anchored on `s` as a
 destination, as the plain branch does. `a_self_label_via_rule_reclaimed_for_a_source_keeps_the_edges_into_it`
 failed first, missing exactly `x->s`.
 
 **Closed, 0.9.2.** `apply_streaming_rebuild` and `apply_via_rebuild` (`crates/core-rules/src/engine.rs`) now push each retracted triple to `prov.retracted`, and `rebuild_inner` calls `reclaim_retracted` after the streaming pass, exactly as `on_node_changed` does. The stale-provenance state that triggers a retraction during rebuild cannot be created through the public API (the incremental path keeps provenance current), so the test is a unit test: `rebuild_retract_pushes_to_retracted_so_reclaim_fires` (`crates/core-rules/src/engine.rs`) sets props directly on the fixture without calling `on_node_changed`, creating a stale claim, then calls `rebuild` and verifies the competing rule reclaimed the edge. The integration regression guard is `competing_rule_reclaims_after_incremental_retraction` (`crates/core-api/tests/shared_edge_rules.rs`).
 
-## 85. `what_if` reports a change of owner as a loss and a gain — CLOSED
+## 85. `what_if` reports a change of owner as a loss and a gain: CLOSED
 
 Found 2026-10-12 by the review of row 37's fix. `what_if_set_prop` runs the change on a clone
-and diffs the derived edges before and after, comparing each as an `EdgeAt` — edge type,
+and diffs the derived edges before and after, comparing each as an `EdgeAt`: edge type,
 endpoints and the rule that derived it. An edge that survives the change under a different
 rule is therefore listed once as lost and once as gained. Before row 37's fix an edge could not
 change owner inside one write, so the comparison could not see this. The edge was there before
@@ -2999,7 +2999,7 @@ rule, or nothing.
 
 **Closed in 0.10.** The churn filter nets on `(edge_type, src, dst)`. An edge retracted and derived again in the same re-derivation, including one that changes owner, is in neither list. Pinned by `what_if_set_prop_nets_an_edge_that_changes_owner` in `crates/core-api/tests/what_if.rs`.
 
-## 86. A backup did not carry the commit-time map — CLOSED
+## 86. A backup did not carry the commit-time map: CLOSED
 
 Found on 2026-10-13 reading `backup_to` beside the files a store directory holds, after row 80's work on what a truncating snapshot keeps.
 
@@ -3007,27 +3007,27 @@ Found on 2026-10-13 reading `backup_to` beside the files a store directory holds
 
 **Closed, 0.7.2.** `backup_to` copies the file when it is there, and `RESTORE_FILES` names it, so `restore` and `serve --restore-from` put it back. `a_backup_can_still_answer_a_date` (`crates/core-api/tests/backup.rs`) failed first with a backup holding `wal.bin` alone. A backup taken by 0.7.1 or earlier does not hold the map and restores without it, as before. `docs/site/service.md` and `docs/site/http.md` list the file.
 
-## 87. An `/algo` request with a field the config does not have was answered — CLOSED
+## 87. An `/algo` request with a field the config does not have was answered: CLOSED
 
 Found writing `docs/site/http.md` (docs PR 3b), which had to say "a field the config does not have is ignored without a word" because it was true.
 
 **Closed, 0.7.2.** The three configs are `#[serde(default, deny_unknown_fields)]`. A field they do not have is 400, and the message names it and the ones accepted: ``invalid pagerank config: unknown field `max_iter`, expected one of `damping`, `max_iters`, …``. `{}` is still every default. Only HTTP builds these from a caller's JSON; MCP, the CLI and the Python binding fill the struct field by field and are unchanged, and the TypeScript client's types name only fields the routes accept. `an_algo_request_with_an_unknown_field_is_refused` (`crates/server/tests/http.rs`) failed first with a 200. **This refuses requests 0.7.1 answered**: a caller sending a stray field gets 400 where it got a result computed without it.
 
-## 88. More MCP arguments fall back to a default when they are the wrong type — CLOSED
+## 88. More MCP arguments fall back to a default when they are the wrong type: CLOSED
 
 Found fixing rows 74 and 52. `find_similar` builds its query vector with `filter_map(as_f64)`, so an element that is not a number is dropped and the search runs on a shorter vector. Other tools' numeric arguments parse as `find_similar`'s did before row 74. `create_rule`'s schema omits the three via-hop fields. None was probed beyond reading the code.
 
 **Closed, 0.10.** `find_similar` and `hybrid_search` refuse a `vector` with a non-number element (`vector elements must all be numbers`) or that is present and not an array (`vector must be an array of numbers`); `pairwise_similar` and `hybrid_search` refuse a present, wrongly typed `k` (`k must be a non-negative integer`) and `pairwise_similar` a wrongly typed `min` (`min must be a number`), where each took the default; absent or null keeps the default. `find_similar`'s own `k`, `min` and `limit` were closed with row 74. `create_rule`'s schema names `via_label`, `via_edge` and `via_dir` (`Out` or `In`). No shipped client sends these as strings. Pinned by `find_similar_drops_non_numeric_vector_elements_is_error` and `create_rule_schema_advertises_the_via_fields` (`crates/server/src/mcp.rs`, both failed first).
 
-## 89. A key reused inside a batch names the node the store still holds it on — CLOSED
+## 89. A key reused inside a batch names the node the store still holds it on: CLOSED
 
 Found by the review of row 79's fix, with a differential probe: one batch against the same ops committed one at a time. The same on `main` before that fix; row 79 made the preview right about these sequences, which is what showed that the apply side was not.
 
 A batch is rewritten from keys to dense ids in one pass before any of it is applied. For a key, the pass asked the store first and the frame's own allocations second. A key the frame had just renamed away from a node, or deleted, was still in the store on that node, so every later op naming the key was written against the old node.
 
-**Closed, 0.7.2.** The pass keeps the keys the frame has freed. A freed key names nothing until the frame inserts under it again, and then names the new node; the frame's own allocations are asked before the store. `a_key_reused_inside_a_batch_names_the_new_node` (`crates/core-api/tests/batch_vs_commits.rs`) runs nine such sequences and failed on all nine. The probe's random run — 14,000 sequences containing a rename, each compared with separate commits and with a reopen — reported 86 differences on `main`, 51 after row 79's fix and 1 after this, and that one is the in-batch retraction window in row 90.
+**Closed, 0.7.2.** The pass keeps the keys the frame has freed. A freed key names nothing until the frame inserts under it again, and then names the new node; the frame's own allocations are asked before the store. `a_key_reused_inside_a_batch_names_the_new_node` (`crates/core-api/tests/batch_vs_commits.rs`) runs nine such sequences and failed on all nine. The probe's random run (14,000 sequences containing a rename, each compared with separate commits and with a reopen) reported 86 differences on `main`, 51 after row 79's fix and 1 after this, and that one is the in-batch retraction window in row 90.
 
-## 90. What the 0.7.2 review left — DEFERRED to 0.11
+## 90. What the 0.7.2 review left: DEFERRED to 0.11
 
 Each was reproduced by the reviewer on the branch; none is new in 0.7.2 except the TypeScript typing, which follows from row 87.
 
@@ -3048,7 +3048,7 @@ Boolean literals are in the language (QL-BX); the two named queries from the
 original note were not re-run for this note. The row stays deferred for the
 in-batch retraction. 0.10 shipped with that remainder open. It is deferred to 0.11.
 
-## 91. A snapshot that kept its WAL was replayed over, and a rename made the store unopenable — CLOSED
+## 91. A snapshot that kept its WAL was replayed over, and a rename made the store unopenable: CLOSED
 
 Found on 2026-10-13 by the review of row 36's work, whose random probe compared a reopened store with one that never closed; two of its differences were on stores that had never used the new code path. Reproduced on the released 0.7.1 wheel with the CLI:
 
@@ -3062,37 +3062,37 @@ A `keep_wal` snapshot is the state at the end of the WAL, and the open replayed 
 
 **Closed, 0.7.2.** A snapshot that keeps its WAL records how much of the WAL it holds: `WalMark` (`crates/core-storage/src/v8/mod.rs`), the length and a checksum of every byte of it, as optional section 14. The open counts the frames inside that length, so commit numbers are what they were, and does not apply them (`apply_frames_over`, `crates/core-api/src/db.rs`). A declaration among them is still applied, because the pairs a store has declared are known from the WAL alone. What was written after the snapshot is replayed as before. A mark that does not read back, or does not match the WAL beside it, is ignored and the whole WAL replays. No container version change: a binary that does not know the section ignores it and behaves as 0.7.1 did. Tests in `crates/core-api/tests/snapshot.rs`: `a_rename_before_a_keep_wal_snapshot_does_not_stop_the_store_opening`, `a_reinserted_key_before_a_keep_wal_snapshot_reads_back_as_it_was_left` and `a_keep_wal_snapshot_still_replays_declarations_and_what_came_after`; each failed first.
 
-**Reviewed, and one regression of this fix closed with it.** The mark first checked the WAL's length and its first MiB only. A WAL larger than that which lost its tail — a torn frame repaired at open, an unsynced tail — and then grew past the marked length still matched, and the new writes lying inside the old length were skipped as held: acknowledged, on disk, and absent after the next open. The mark now checksums every byte it covers and has to end on a frame boundary. `a_wal_that_lost_its_tail_and_grew_back_is_not_taken_for_the_one_marked` failed first with three of six writes missing.
+**Reviewed, and one regression of this fix closed with it.** The mark first checked the WAL's length and its first MiB only. A WAL larger than that which lost its tail (a torn frame repaired at open, an unsynced tail) and then grew past the marked length still matched, and the new writes lying inside the old length were skipped as held: acknowledged, on disk, and absent after the next open. The mark now checksums every byte it covers and has to end on a frame boundary. `a_wal_that_lost_its_tail_and_grew_back_is_not_taken_for_the_one_marked` failed first with three of six writes missing.
 
-**A store already in this state is not repaired by upgrading.** Its snapshot has no mark, so 0.7.2 replays over it as 0.7.1 did. If its WAL reaches the store's first commit — no truncating snapshot was ever taken, and no archiving one either, so the directory holds no `wal.<N>.archive` — moving `snapshot.bin` aside lets the store open from the WAL alone, and the next snapshot is a good one; checked on the reproduction above. A history floor of 0 is not enough to know that: `mushroomdb snapshot` and `serve --snapshot-every` archive by default and leave the floor at 0, and such a store opened without its snapshot comes up holding only what was written since the last archive, with no error. Keep the file that was moved. If its WAL does not reach the first commit there is no such way out, and the snapshot is the only copy of what the WAL no longer holds.
+**A store already in this state is not repaired by upgrading.** Its snapshot has no mark, so 0.7.2 replays over it as 0.7.1 did. If its WAL reaches the store's first commit (no truncating snapshot was ever taken, and no archiving one either, so the directory holds no `wal.<N>.archive`) moving `snapshot.bin` aside lets the store open from the WAL alone, and the next snapshot is a good one; checked on the reproduction above. A history floor of 0 is not enough to know that: `mushroomdb snapshot` and `serve --snapshot-every` archive by default and leave the floor at 0, and such a store opened without its snapshot comes up holding only what was written since the last archive, with no error. Keep the file that was moved. If its WAL does not reach the first commit there is no such way out, and the snapshot is the only copy of what the WAL no longer holds.
 
-## 92. A crash between a snapshot and its WAL replacement leaves the same state — CLOSED
+## 92. A crash between a snapshot and its WAL replacement leaves the same state: CLOSED
 
-The reviewer's probe built this state by hand — the new snapshot beside a copy of the WAL from before it — and the open failed the same way whenever a rename preceded the snapshot. The window is two filesystem calls wide. Not fixed with row 91 because a truncating snapshot's replacement WAL can be byte-identical at its start to the WAL it replaced (two snapshots with the same writes repeated between them), and a mark that matched there would skip writes that were never folded in. Closing it needs the snapshot to carry its WAL position atomically with the WAL it describes.
+The reviewer's probe built this state by hand (the new snapshot beside a copy of the WAL from before it) and the open failed the same way whenever a rename preceded the snapshot. The window is two filesystem calls wide. Not fixed with row 91 because a truncating snapshot's replacement WAL can be byte-identical at its start to the WAL it replaced (two snapshots with the same writes repeated between them), and a mark that matched there would skip writes that were never folded in. Closing it needs the snapshot to carry its WAL position atomically with the WAL it describes.
 
-**Closed, 0.8.** A snapshot that replaces its WAL — a truncating one, or an archiving one — writes `snapshot.intent` before it writes `snapshot.bin`: the length and checksum of the snapshot it is about to write, and of the WAL that snapshot holds (`SnapshotIntent`, `crates/core-storage/src/v8/mod.rs`). When the WAL has been replaced it empties the file. An open that finds an intent naming the snapshot on disk, beside a WAL that begins with exactly the bytes it names, counts that WAL's frames and does not apply them, as row 91's mark has it do for a snapshot that kept its WAL; declarations among them are still applied. It is a file of its own because it has to stop being true: after the swap a WAL can begin with the very bytes the old one did, the same declarations and then the same writes made again, and a mark inside the snapshot would go on matching. An intent that does not name the snapshot on disk, or whose WAL is not there, is left over, and it is emptied before the handle that found it appends: at the append, under the write lock, and not at open, because a handle without the lock may be looking at a peer's snapshot half way through. A backup copies the file and `restore` names it, so a copy of a store in this state opens as the store does.
+**Closed, 0.8.** A snapshot that replaces its WAL (a truncating one, or an archiving one) writes `snapshot.intent` before it writes `snapshot.bin`: the length and checksum of the snapshot it is about to write, and of the WAL that snapshot holds (`SnapshotIntent`, `crates/core-storage/src/v8/mod.rs`). When the WAL has been replaced it empties the file. An open that finds an intent naming the snapshot on disk, beside a WAL that begins with exactly the bytes it names, counts that WAL's frames and does not apply them, as row 91's mark has it do for a snapshot that kept its WAL; declarations among them are still applied. It is a file of its own because it has to stop being true: after the swap a WAL can begin with the very bytes the old one did, the same declarations and then the same writes made again, and a mark inside the snapshot would go on matching. An intent that does not name the snapshot on disk, or whose WAL is not there, is left over, and it is emptied before the handle that found it appends: at the append, under the write lock, and not at open, because a handle without the lock may be looking at a peer's snapshot half way through. A backup copies the file and `restore` names it, so a copy of a store in this state opens as the store does.
 
-Tests in `crates/core-api/tests/snapshot.rs` stop a snapshot at four points — the intent written, the snapshot written, the floor advanced, the WAL replaced — for a truncating and an archiving snapshot, over a store with a rename, a delete and reinsert and an edge; a second covers a store whose WAL already began with re-emitted declarations, and a third a backup and a restore. `GraphDb::stop_next_snapshot` is the hook they use. With the open's use of the intent taken out they fail with `corrupt data: wal replay RenameNode n→m: duplicate node key: m`.
+Tests in `crates/core-api/tests/snapshot.rs` stop a snapshot at four points (the intent written, the snapshot written, the floor advanced, the WAL replaced) for a truncating and an archiving snapshot, over a store with a rename, a delete and reinsert and an edge; a second covers a store whose WAL already began with re-emitted declarations, and a third a backup and a restore. `GraphDb::stop_next_snapshot` is the hook they use. With the open's use of the intent taken out they fail with `corrupt data: wal replay RenameNode n→m: duplicate node key: m`.
 
 **Reviewed, and two things closed with it.** The left-over intent was first emptied only by a writer at open. A handle whose own snapshot failed at its last step and that went on writing, a served handle that reloaded after a peer's snapshot died there, and a writer opened without repair all kept it; the review made the same three writes again on such a handle, so the WAL began with the bytes the intent named, and the next open skipped them. `a_left_over_intent_does_not_skip_writes_made_after_it`. And `open_at` did not read the intent: on a store in this state it took the snapshot as the base of a prefix of the WAL and answered the first commits with nodes from the future, then failed. It now treats such a snapshot as a `keep_wal` one is treated, the state at the WAL's end: the prefix is replayed from nothing when the WAL reaches the first commit, and the read is refused otherwise. `a_past_commit_reads_right_on_a_store_with_an_interrupted_snapshot`. Both failed first.
 
-A third, from the review's fuzz: the snapshot after an interrupted one wrote its own intent over the standing one before its own `snapshot.bin` was down, and a failure in between — a full disk fails the large write, not the 32-byte one — left the first snapshot beside its WAL with nothing naming it, and the store did not open. The file now holds both until the new snapshot lands: the one standing and the one being attempted (`SnapshotIntent::decode_all`). `a_second_failed_snapshot_keeps_the_first_ones_intent` failed first.
+A third, from the review's fuzz: the snapshot after an interrupted one wrote its own intent over the standing one before its own `snapshot.bin` was down, and a failure in between (a full disk fails the large write, not the 32-byte one) left the first snapshot beside its WAL with nothing naming it, and the store did not open. The file now holds both until the new snapshot lands: the one standing and the one being attempted (`SnapshotIntent::decode_all`). `a_second_failed_snapshot_keeps_the_first_ones_intent` failed first.
 
 Not changed: in the state after the floor is advanced and before the WAL is replaced, the old WAL's frames are numbered again above the new floor until the next snapshot (row 80, "what is left"). A release that does not know the file opens a store in this state as 0.7.2 did.
 
 **Recovery, checked on the released 0.7.1.** In that state the snapshot holds everything the old WAL does. Moving `wal.bin` aside lets the store open on the snapshot alone, with every node, edge and rule. What is lost is what only the WAL records: the declared full-text pairs and equality indexes, which have to be declared again, and on a store with no archives the multiplicity opt-in, which has to be enabled again (that last from reading `load_from_disk`, not from a run).
 
-## 93. A history read on a node renamed away and back never returned — CLOSED
+## 93. A history read on a node renamed away and back never returned: CLOSED
 
 Found on 2026-10-13 by the review of row 91's fix, whose probe stopped on it: `insert a`, `insert x`, `rename a→b`, `rename b→a`, then `was_linked("x", "a", "E", 1)` had not returned after five seconds, on that commit and on the one before it.
 
 **Closed, 0.7.2.** The walk keeps every rename into a key and follows the latest one before the point it has reached, so each step goes strictly back in time and the walk ends. `a_history_read_on_a_node_renamed_away_and_back_returns` (`crates/core-api/tests/rename_upsert.rs`) runs the reads on another thread and failed first on its twenty-second timeout. Where a key was renamed into only once, which is every case that returned before, the walk gives the intervals it gave.
 
-**Reviewed, and the answer was then wrong.** With the walk ending, `was_linked` on a node renamed away and back answered, and answered "linked" for an edge deleted while the node carried its other name. That was a second defect behind the first, and not only on a cycle: the read kept the edges it had seen by the key strings in each WAL record, so a delete recorded under one of a node's names never removed an edge recorded under another — `a → b → c` with the delete under `b` did the same on 0.7.1, where it returned. It now keeps them by which of the two nodes they join and in which direction. `was_linked_sees_a_delete_made_under_another_of_the_nodes_names` checks the answer at every commit for five shapes; three failed first (`ffTTTTT` where `ffTTffT` is right). 
+**Reviewed, and the answer was then wrong.** With the walk ending, `was_linked` on a node renamed away and back answered, and answered "linked" for an edge deleted while the node carried its other name. That was a second defect behind the first, and not only on a cycle: the read kept the edges it had seen by the key strings in each WAL record, so a delete recorded under one of a node's names never removed an edge recorded under another: `a → b → c` with the delete under `b` did the same on 0.7.1, where it returned. It now keeps them by which of the two nodes they join and in which direction. `was_linked_sees_a_delete_made_under_another_of_the_nodes_names` checks the answer at every commit for five shapes; three failed first (`ffTTTTT` where `ffTTffT` is right). 
 
-**Reviewed again, and bounded to the node that has the key now.** The confirmation pass found the new bookkeeping answering "not linked" for a live derived edge: an earlier node had held the queried key and been deleted, the delete matched the key, and every edge between the pair was dropped. The same shape with a hand-written edge was already wrong on 0.7.1. `was_linked` now counts the queried key from the commit its present holder acquired it, follows a rename back only when that rename is how the occupancy began, and matches records that name their endpoints by dense id on the ids of the two live nodes. `was_linked_is_not_confused_by_an_earlier_node_that_held_the_key` failed first. Against the reviewer's oracle — `was_linked` at every commit beside what `neighbors` said at the time — 300 seeds of hand-written edges and 300 of derived ones have no wrong answer where the commit before had hundreds; with snapshots in the mix 3 seeds of 300 still differ, 12 answers, not traced. `node_history`, `edge_history` and `edges_at` are not bounded this way and still read a reused key back through its earlier holder.
+**Reviewed again, and bounded to the node that has the key now.** The confirmation pass found the new bookkeeping answering "not linked" for a live derived edge: an earlier node had held the queried key and been deleted, the delete matched the key, and every edge between the pair was dropped. The same shape with a hand-written edge was already wrong on 0.7.1. `was_linked` now counts the queried key from the commit its present holder acquired it, follows a rename back only when that rename is how the occupancy began, and matches records that name their endpoints by dense id on the ids of the two live nodes. `was_linked_is_not_confused_by_an_earlier_node_that_held_the_key` failed first. Against the reviewer's oracle (`was_linked` at every commit beside what `neighbors` said at the time) 300 seeds of hand-written edges and 300 of derived ones have no wrong answer where the commit before had hundreds; with snapshots in the mix 3 seeds of 300 still differ, 12 answers, not traced. `node_history`, `edge_history` and `edges_at` are not bounded this way and still read a reused key back through its earlier holder.
 
-## 94. A rename onto a retired key made the next snapshot unreadable — CLOSED
+## 94. A rename onto a retired key made the next snapshot unreadable: CLOSED
 
 Found on 2026-10-13 by the review of row 91's fix, with a matrix of twelve snapshot sequences on that commit and the one before it: all twelve failed to open.
 
@@ -3100,7 +3100,7 @@ A snapshot lists every key slot in dense-id order and which ids are retired. Aft
 
 **Closed, 0.7.2.** The key table is rebuilt slot for slot (`IdMap::from_slots`, `crates/core-storage/src/idmap.rs`): slot `i` is id `i` whatever its key, and the live keys are indexed from that. Nothing about what is written changed, so a store left unopenable by this after a truncating or an archiving snapshot opens again under 0.7.2 with nothing lost; checked with a store the previous code wrote. **Not after a snapshot that kept its WAL.** That snapshot carries no mark (row 91), so the whole WAL replays over it; the store now opens, where it refused before, and opens wrong: a second retired node, and `neighbors` failing with `topology id N has no key`. It takes writes and a snapshot in that state. Use row 91's recovery on such a store before opening it writable under 0.7.2. `a_node_renamed_onto_a_retired_key_survives_a_snapshot` (`crates/core-api/tests/snapshot.rs`) covers a truncating, a keep-WAL and an archiving snapshot and failed first on each; one unit test on the map.
 
-## 95. Writes after a snapshot that did not act on what the snapshot holds — CLOSED
+## 95. Writes after a snapshot that did not act on what the snapshot holds: CLOSED
 
 From the review of row 91's fix, whose probe ran the same random writes through a handle that snapshots and a reference that never does: they differed in 292 of 300 seeds, and a control with no snapshot differed in none. An investigation reduced it to four causes, each with a reproduction of a handful of writes. In every one the reference is right, and the snapshotting handle and its reopen are wrong. All four fail on `main` at `ca68e60` and on the `v0.7.1` tag.
 
@@ -3113,59 +3113,59 @@ A store opened from a snapshot, or one that has just taken one, holds the snapsh
 
 **Closed, 0.7.2.** Both sweeps go through the view of the base and the overlay together. `DeleteView` records a tombstone for each value the base holds. `snapshot_with` never hands the encoder the old provenance bytes. `create_view` gives the backfill the base's columns (`ViewStore::create_view_over`, `crates/core-rules/src/views.rs`). Nine tests in `crates/core-api/tests/after_snapshot.rs`, all nine failing first, and the probe at 300 seeds reports 0 where it reported 292.
 
-**A store already left with a deleted node's edges is repaired at open.** The edges are in its snapshot. `drop_edges_of_retired_nodes` removes every edge to or from a retired id after the base is mapped, with view maintenance, so the degree views come right as well; the next snapshot no longer carries them. An as-of open (`open_at`) does the same. The pass asks for the neighbours of every retired id under every edge type, and the review measured what that costs when run at every open: about 5 ms became 1.1 to 1.3 s on a store with 500,000 deleted nodes and 40 edge types and nothing to repair. So a snapshot written from 0.7.2 on carries a four-byte section, `EDGES_SWEPT`, saying its writer sweeps, and the pass runs only over a snapshot without it. An older binary that rewrites the snapshot drops the section, and the pass runs again, as it should. Tested against a snapshot written by the released 0.7.1 wheel in that state (`crates/core-api/tests/fixtures/dangling_edges_071.bin`): 0.7.1 reopens it reporting three edges and fails `neighbors`; this reports the one real edge and answers. The other three are not repaired: a rule's missing edges and an aggregate's wrong first value stay as they are until the rule or the view is made again, and a view property left behind on a store whose snapshots truncated has to be removed from those nodes with `remove_prop` before a view of that name can be made — the name is taken while a node reads a value under it.
+**A store already left with a deleted node's edges is repaired at open.** The edges are in its snapshot. `drop_edges_of_retired_nodes` removes every edge to or from a retired id after the base is mapped, with view maintenance, so the degree views come right as well; the next snapshot no longer carries them. An as-of open (`open_at`) does the same. The pass asks for the neighbours of every retired id under every edge type, and the review measured what that costs when run at every open: about 5 ms became 1.1 to 1.3 s on a store with 500,000 deleted nodes and 40 edge types and nothing to repair. So a snapshot written from 0.7.2 on carries a four-byte section, `EDGES_SWEPT`, saying its writer sweeps, and the pass runs only over a snapshot without it. An older binary that rewrites the snapshot drops the section, and the pass runs again, as it should. Tested against a snapshot written by the released 0.7.1 wheel in that state (`crates/core-api/tests/fixtures/dangling_edges_071.bin`): 0.7.1 reopens it reporting three edges and fails `neighbors`; this reports the one real edge and answers. The other three are not repaired: a rule's missing edges and an aggregate's wrong first value stay as they are until the rule or the view is made again, and a view property left behind on a store whose snapshots truncated has to be removed from those nodes with `remove_prop` before a view of that name can be made: the name is taken while a node reads a value under it.
 
 **Reviewed, and four more of the same kind closed with it.** The review ran each write on a snapshotting handle beside a reference that never snapshots, and found one thing this fix had made worse and three it had left.
-- *Made worse.* `create_view` checked a new view's property name against the properties written since the snapshot, so on a snapshotted store a view could take the name of a real property — and with `DeleteView` now hiding the snapshot's values, deleting that view deleted the property from every node. The check reads the snapshot's columns too.
+- *Made worse.* `create_view` checked a new view's property name against the properties written since the snapshot, so on a snapshotted store a view could take the name of a real property: and with `DeleteView` now hiding the snapshot's values, deleting that view deleted the property from every node. The check reads the snapshot's columns too.
 - *A refused view was already in the WAL.* That collision was refused inside `apply`, after the record was logged, so the store that had just refused the view failed its next open replaying it. `create_view` now refuses before the WAL write. `a_refused_view_does_not_stop_the_store_opening`.
 - *Avg, Min and Max kept the snapshot's value when the answer became "absent".* The three places a view clears its value removed it from the overlay only. They record a tombstone as well (`clear_view_value`, `crates/core-rules/src/views.rs`).
 - *A view over a rule-derived edge type was wrong after a reopen that replayed writes.* A live commit turns on the engine's report of the edges its rules add and retract; replay did not, and with a snapshot nothing recomputes the views afterwards. Replay turns it on while a view exists.
 
 Each has a test in `after_snapshot.rs` that failed first.
 
-**And a second round.** The name check was first put in the replay as well as before the WAL write, reading the snapshot in both. The re-check opened two stores a build of the `v0.7.1` tag had written — a view deleted and a snapshot that kept its WAL, with and without a real property since written under the freed name — and neither opened: the replayed `CreateView` met its own name in the snapshot. The replay's check is as narrow as it was in 0.7.1 again, and the two stores are fixtures (`fixtures/legacy_071`). The check before the WAL write looked for the column, and a snapshot keeps a deleted view's column with every value in it hidden, so deleting a view and making it again was refused until the next snapshot; it now looks for a node that reads a value. Deleting a hub became quadratic once its snapshotted edges were swept, because each swept edge recomputed the hub's own view from the snapshot: 47.9 s for 20,000 edges in the review's run, 21 ms now that the node being deleted is left out (`on_edge_changed_except`). Replaying with the engine's edge report on costs what it reports: the review measured a reopen of a store with 396,000 derived edges under a view at 0.79 s with the wrong count and 1.97 s with the right one.
+**And a second round.** The name check was first put in the replay as well as before the WAL write, reading the snapshot in both. The re-check opened two stores a build of the `v0.7.1` tag had written (a view deleted and a snapshot that kept its WAL, with and without a real property since written under the freed name) and neither opened: the replayed `CreateView` met its own name in the snapshot. The replay's check is as narrow as it was in 0.7.1 again, and the two stores are fixtures (`fixtures/legacy_071`). The check before the WAL write looked for the column, and a snapshot keeps a deleted view's column with every value in it hidden, so deleting a view and making it again was refused until the next snapshot; it now looks for a node that reads a value. Deleting a hub became quadratic once its snapshotted edges were swept, because each swept edge recomputed the hub's own view from the snapshot: 47.9 s for 20,000 edges in the review's run, 21 ms now that the node being deleted is left out (`on_edge_changed_except`). Replaying with the engine's edge report on costs what it reports: the review measured a reopen of a store with 396,000 derived edges under a view at 0.79 s with the wrong count and 1.97 s with the right one.
 
 Eighteen tests in the file now. Not changed: the reader's replay of the delta tail does not maintain view properties at all, so for up to 63 commits after a `delete_view`, or any view change, a reader can still show the value the fold had. That is how the reader has always treated views and is row 90's kind of item, not this row's.
 
-## 96. A failed first snapshot emptied the edge properties — CLOSED
+## 96. A failed first snapshot emptied the edge properties: CLOSED
 
 Found on 2026-10-13 by the fuzz in the review of row 92's fix (seed 330), then reduced: a rule with a `weight_prop`, two nodes it links, a first snapshot stopped before `snapshot.bin` is written. The weight read `Some(1.0)` before and `None` after, on the live handle; the next snapshot succeeded, and a reopen read `None`. The same for a truncating, a keep-WAL and an archiving snapshot. It predates that fix, which only added one more call that can fail inside the window.
 
 **Closed, 0.8.** The edge properties go back onto the handle as soon as they are encoded, before anything that can fail, and are released once the new snapshot is mapped. `a_failed_first_snapshot_keeps_edge_properties` (`crates/core-api/tests/snapshot.rs`) failed first, on the handle that failed.
 
-## 97. A reader did not see a view's value until the next fold — CLOSED
+## 97. A reader did not see a view's value until the next fold: CLOSED
 
 Noted at the end of row 95 as how the reader had always treated views, and deferred there. Looked at on 2026-10-13 it was worse than the note said. `db.reader()` builds a `ReaderSnapshot` from the last fold and the delta tail, and `apply_one` (`crates/core-api/src/reader.rs`) replays each commit's records over the fold. `CreateView` and `DeleteView` are no-ops there, and nothing in the replay runs view maintenance, so the reader held a view's property exactly as the fold had it. On a store with a degree view, three nodes and two edges, the handle read `deg = 2` and a reader taken at the same commit read no `deg` at all; after a snapshot and the removal of an only neighbour, the handle read no average and the reader read the snapshot's `3.0`; after `delete_view`, the reader went on returning the property. The fold happens every 64 commits, so the window closed by itself, which is why no test had met it: the existing reader tests either have no view or cross a fold.
 
-**Closed, 0.8.** The writer tells the reader what it computed. `ViewStore` records the nodes its incremental maintenance writes to (`touched`), and at the end of a commit `view_values_of_commit` (`crates/core-api/src/db.rs`) reads the view properties of those nodes — through the snapshot as well as what was written since — into the commit's `CommitDelta::view_values`. `ReaderSnapshot::materialize` applies them after the commit's records: a value is set, an absence is removed and tombstoned, as `clear_view_value` does on the writer. The reader computes nothing, so it cannot disagree with the handle about what a view's value is.
+**Closed, 0.8.** The writer tells the reader what it computed. `ViewStore` records the nodes its incremental maintenance writes to (`touched`), and at the end of a commit `view_values_of_commit` (`crates/core-api/src/db.rs`) reads the view properties of those nodes (through the snapshot as well as what was written since) into the commit's `CommitDelta::view_values`. `ReaderSnapshot::materialize` applies them after the commit's records: a value is set, an absence is removed and tombstoned, as `clear_view_value` does on the writer. The reader computes nothing, so it cannot disagree with the handle about what a view's value is.
 
 Two kinds of commit are folded instead of described, because a delta listing them would be held and replayed by every reader until the next fold: one that creates or deletes a view, which writes a property on every node of a label, and one that moves over a thousand more view values than its records account for, which a write to a hub does.
 
-**The first rule folded too much, and the review measured it.** It folded any commit that touched more than 1,024 nodes, and inserting a node touched it whether or not a view was on its label. A fold is eight `Arc` clones to take, but it shares the store's maps with the reader, so the commit after it copies them in full: on a release build, 100 batches of 1,100 inserts onto a 300,000-node store took 10.0 s where `main` took 0.48 s, with one view declared on a label that had no nodes. A commit is now folded only when its view values are out of proportion to its records — a budget of 1,024 plus one value for each record and view — so a bulk load is described, as the inserts it is made of already are. `a_bulk_load_of_a_label_no_view_is_on_does_not_fold_on_every_batch` and its pair for a label a view is on failed first.
+**The first rule folded too much, and the review measured it.** It folded any commit that touched more than 1,024 nodes, and inserting a node touched it whether or not a view was on its label. A fold is eight `Arc` clones to take, but it shares the store's maps with the reader, so the commit after it copies them in full: on a release build, 100 batches of 1,100 inserts onto a 300,000-node store took 10.0 s where `main` took 0.48 s, with one view declared on a label that had no nodes. A commit is now folded only when its view values are out of proportion to its records (a budget of 1,024 plus one value for each record and view) so a bulk load is described, as the inserts it is made of already are. `a_bulk_load_of_a_label_no_view_is_on_does_not_fold_on_every_batch` and its pair for a label a view is on failed first.
 
 `crates/core-api/tests/reader_view_values.rs`, fourteen tests. Nine failed first: a degree view after an edge is added and after one is removed, an aggregate following a neighbour's property, an average that becomes absent after a snapshot, a view created since the fold, a view deleted after a snapshot, a view over a rule's edges, a reader taken earlier keeping its own commit's value, and forty rounds of mixed writes across a snapshot with the reader compared to the handle after each. Three were added with the fix and passed: one batch that moves two views, a snapshotted neighbour deleted, and a hub of 1,500 spokes written and deleted, which takes the folded path.
 
-## 98. A first archiving snapshot that was interrupted cost the reads by commit — CLOSED
+## 98. A first archiving snapshot that was interrupted cost the reads by commit: CLOSED
 
-Found on 2026-10-13 by the review of the MCP server's automatic snapshot, which killed the process at random points during a store's first snapshot and reopened it: 45 kills, 4 stores on which `mushroomdb asof <dir> --commit 30` answered `commit 30 is out of range; valid range is 0..66`. Counts, `recall`, `node_history`, `was_linked` and new writes were all right; `touch wal.genesis` in the directory brought the reads back, which is what showed it was the marker and nothing else. The same windows reproduce with `mushroomdb snapshot`, so it predates that change — which would have widened it, since an MCP host is as likely to kill the server as to close its stdin.
+Found on 2026-10-13 by the review of the MCP server's automatic snapshot, which killed the process at random points during a store's first snapshot and reopened it: 45 kills, 4 stores on which `mushroomdb asof <dir> --commit 30` answered `commit 30 is out of range; valid range is 0..66`. Counts, `recall`, `node_history`, `was_linked` and new writes were all right; `touch wal.genesis` in the directory brought the reads back, which is what showed it was the marker and nothing else. The same windows reproduce with `mushroomdb snapshot`, so it predates that change: which would have widened it, since an MCP host is as likely to kill the server as to close its stdin.
 
 `snapshot_with` (`crates/core-api/src/db.rs`) wrote the marker as the last step of the archive path, under `is_first_archive && !had_prior_snapshot`. Three windows: after `snapshot.bin` and before the rename (the next snapshot sees a prior snapshot); after the rename and before the new WAL; after the new WAL and before the marker (an archive exists, so it is no longer the first).
 
-**Closed, 0.8.** The marker is written first, before the snapshot. What it says — that the store's archives and WAL together reach back to its first write — is as true with no archive yet as it is afterwards, under the same two conditions, and what makes it false already removes it: a truncating snapshot, and a retention sweep that prunes. A marker left by a snapshot that then fails is still true. `an_interrupted_first_archiving_snapshot_does_not_cost_the_reads_by_commit` (`crates/core-api/tests/snapshot.rs`) stops a first archiving snapshot at each of its four stops, reopens, takes two more, and reads the first two commits; it failed first.
+**Closed, 0.8.** The marker is written first, before the snapshot. What it says (that the store's archives and WAL together reach back to its first write) is as true with no archive yet as it is afterwards, under the same two conditions, and what makes it false already removes it: a truncating snapshot, and a retention sweep that prunes. A marker left by a snapshot that then fails is still true. `an_interrupted_first_archiving_snapshot_does_not_cost_the_reads_by_commit` (`crates/core-api/tests/snapshot.rs`) stops a first archiving snapshot at each of its four stops, reopens, takes two more, and reads the first two commits; it failed first.
 
-Not repaired: a store this already happened to. It has a snapshot, archives and no marker, which is also what a store whose history really was cut looks like, and nothing in the directory tells the two apart. Not changed: the refusal's message gives a range that contains the commit it refuses, and `stats` goes on saying `history: complete` for such a store; a `wal.bin.tmp` — empty, or a few hundred bytes of declarations — is left behind by a kill between the rename and the new WAL.
+Not repaired: a store this already happened to. It has a snapshot, archives and no marker, which is also what a store whose history really was cut looks like, and nothing in the directory tells the two apart. Not changed: the refusal's message gives a range that contains the commit it refuses, and `stats` goes on saying `history: complete` for such a store; a `wal.bin.tmp` (empty, or a few hundred bytes of declarations) is left behind by a kill between the rename and the new WAL.
 
-## 99. `/watch` did not answer a client that closed — CLOSED
+## 99. `/watch` did not answer a client that closed: CLOSED
 
 Found on 2026-10-13 writing the TypeScript client's `watch()`: its test's `close()` did not resolve until the WebSocket library's 30-second timeout. `write_events` looped on the event channel and sent; nothing polled the socket's read half, and it is the read that processes a close frame and queues the reply, and that answers a ping. `/subscribe` reads its socket for the subscription message and was not affected.
 
 **Closed, 0.8.** The loop selects over the event channel and `socket.recv()`. Whatever a client sends is ignored, a close frame included: the read after it sends the reply and reports the stream finished, and that ends the loop. Breaking on the close frame itself dropped the socket before the reply was written, and the client saw a reset. `watch_answers_a_client_that_closes_while_nothing_is_written` (`crates/server/tests/watch.rs`) failed first, then failed differently on that first attempt. The TypeScript client keeps a three-second bound on `close()` for servers older than this.
 
-## 100. An archiving snapshot with nothing new overwrote the last archive — CLOSED
+## 100. An archiving snapshot with nothing new overwrote the last archive: CLOSED
 
 Found on 2026-10-13 by the review of row 98's fix, whose oracle probe compared every read by commit against the state the store had actually been in, and reproduced by it on the commit before that fix. From the command line: three `mushroomdb query D "CREATE (n:P {id:'x'})"`, `mushroomdb snapshot D` (a `wal.3.archive` of 291 bytes; `asof --commit 0` counts 1), `mushroomdb snapshot D` again (`wal.3.archive` is 0 bytes; `asof --commit 0` is `out of range 0..0`), one more `CREATE`, and `asof --commit 0` counts 4.
 
-The archive's name is the name of the last archive plus the number of frames in the live WAL. That is right when there are frames. With none it is the last archive's own name, and `archive_wal` is a rename. A store that has declared a full-text pair, a property index or multiplicity is spared by accident: each snapshot re-emits its declarations into the replacement WAL, so its WAL is never empty — it instead made a new archive holding nothing but those declarations on every idle snapshot.
+The archive's name is the name of the last archive plus the number of frames in the live WAL. That is right when there are frames. With none it is the last archive's own name, and `archive_wal` is a rename. A store that has declared a full-text pair, a property index or multiplicity is spared by accident: each snapshot re-emits its declarations into the replacement WAL, so its WAL is never empty: it instead made a new archive holding nothing but those declarations on every idle snapshot.
 
 **Closed, 0.8.** The replacement WAL is built before the rename, and a live WAL whose records are exactly the replacement's has nothing in it to archive: it is left where it is, and rewritten in place only when it ends in bytes that are no record. That covers the empty WAL and the declarations-only one, so an idle store no longer grows an archive per snapshot either. Beyond that, the archive path refuses outright to rename over an archive that exists. `an_archiving_snapshot_with_nothing_new_leaves_the_last_archive_alone` (`crates/core-api/tests/snapshot.rs`) runs a store with and without a declaration through three snapshots with nothing between them, on one handle and across a reopen; it failed first on the size of the archive.
 
@@ -3173,7 +3173,7 @@ The archive's name is the name of the last archive plus the number of frames in 
 
 Not repaired: a store this happened to. The archive's content is gone.
 
-## 101. Refusals left by the review of rows 98 and 100 — DEFERRED to 0.11
+## 101. Refusals left by the review of rows 98 and 100: DEFERRED to 0.11
 
 Five behaviours the review of PR #53 observed on the commit before it as well as after. None answers wrongly and none loses anything; each refuses, or reports, more conservatively than the store's state requires. They are listed in the index row. The first is the one a user would meet: 40 of 40 archiving snapshots stopped at any of the four stops left the next write's commit unreadable by `open_at` until a snapshot completed.
 
@@ -3187,7 +3187,7 @@ The empty-store snapshot subcase is already closed by row 119 (`1faf1afa`, renum
 archive/truncate/keep, cleared intent, reopen/subsequent writes, declarations and retained history.
 No snapshot implementation changes here, and no other owed row is retargeted.
 
-## 102. A key-anchored one-hop query scans its label — CLOSED
+## 102. A key-anchored one-hop query scans its label: CLOSED
 
 Found on 2026-10-14 by the memory-shaped scale run (`dogfood/scale_memory.py`, seed 20261014,
 the 0.8.0 wheel). One query, timed once per scale on a store of 40 % `Person` nodes: 18.7 ms at
@@ -3208,15 +3208,15 @@ edge per node, after a snapshot and reopen: 100k nodes 40.6 ms to 0.006 ms; 1M n
 0.006 ms (the 281.6 ms of the first report had a different edge count). Plan-shape tests are in
 `mushroomdb-query`; result and differential tests in `crates/core-api/tests/cypher_key_traversal.rs`.
 
-## 103. Derived edges counted but not returned after a snapshot — CLOSED
+## 103. Derived edges counted but not returned after a snapshot: CLOSED
 
 Found on 2026-10-14 by the review of row 83's fix (`rev58_repro.rs`, `z1_double_snapshot_topk` and
 `y1_snapshot_desync_three_rules`), with a fuzz that reopens mid-stream. In `z1`: rules `topk1` and
 `topk2` over `A→A SAME`; insert `n0(x,y,w)`, `n5(x,y,z)`, `n6(x,y,z, fk=n5)`; snapshot and reopen;
 `delete_node(n6)`; snapshot and reopen; `set_prop(n5, tags, [x])`. A fresh build has `n0->n5` and
 `n5->n0`; the live store's `neighbors` returns neither while `stats` reports two edges. With one
-top-k rule, or with no snapshot, it does not happen. What disagrees after the restore — provenance
-and topology, or the read overlay — was not established. The first engine item for 0.8.1.
+top-k rule, or with no snapshot, it does not happen. What disagrees after the restore (provenance
+and topology, or the read overlay) was not established. The first engine item for 0.8.1.
 
 **Closed, 0.8.1.** Two rules owned one edge. Every derived-edge insert in the engine asked the
 post-snapshot overlay whether the edge was new (`Topology::add_edge`), and on a store opened from
@@ -3237,7 +3237,7 @@ instead, which the review measured as quadratic in a source's degree: one write 
 200,000 out-edges after a snapshot took 17.7 s, against 1.0 s before the fix and 1.03 s now.
 
 The same fix closes a loss of a user's edge the ledger had not recorded, found by the review: a
-user's `insert_edge`, a snapshot and a reopen, then a rule that desires the same edge — the rule
+user's `insert_edge`, a snapshot and a reopen, then a rule that desires the same edge: the rule
 recorded the user's edge as its own, and deleted it when it stopped desiring it.
 
 **Not repaired: a store snapshotted while two rules owned one edge.** A store whose double ownership
@@ -3246,7 +3246,7 @@ not: the review found that neither a write, a snapshot nor `rebuild_rule` repair
 still remove an edge a rule counts, and `stats.edges` stays wrong even after the rules are deleted
 and created again. That repair is row 107.
 
-## 104. Deleting a via node leaves the edge derived through it — CLOSED
+## 104. Deleting a via node leaves the edge derived through it: CLOSED
 
 Found on 2026-10-14 by the same review (`x2_via_node_delete_leaves_edge`). Five operations and one
 via-hop rule; `p->t` survives `delete_node(o)`. Row 50 is about the count `forget` reports when the
@@ -3254,8 +3254,8 @@ forgotten node is a via node, and may be this.
 
 **Closed, 0.8.1.** The delete retracted only edges touching the deleted node, and the via node is
 on neither end of the edge it carried. `on_node_removed_inner` now gathers, for every via-hop rule
-the node is a via node of, the sources that hop through it — while the hop edges are still in the
-graph — and evaluates them again with the node out of the hop. What that retracts goes through the
+the node is a via node of, the sources that hop through it (while the hop edges are still in the
+graph) and evaluates them again with the node out of the hop. What that retracts goes through the
 second pass, which a delete did not run before, so another rule over the same edge type that wants
 the edge takes it; nothing is reclaimed for or onto the node being deleted.
 `deleting_a_via_node_retracts_the_edges_derived_through_it`, for a plain and a top-k via rule,
@@ -3266,7 +3266,7 @@ destinations (29 ms on `main`, which leaves the edges), 374 ms for 50,000 source
 destinations (133 ms). Row 50 is now visible: the delete removes those edges and its report still
 says `derived_edges: 0`.
 
-## 105. A self-label via-hop rule misses edges into a new node — CLOSED
+## 105. A self-label via-hop rule misses edges into a new node: CLOSED
 
 Found on 2026-10-14 by the same review (`p2_self_label_via_alone_insert_dst`). The review of that row's fix
 pinned the cause: evaluating the new node as a source applies a desired set of its outgoing edges
@@ -3281,7 +3281,7 @@ done once per affected source, a `set_prop` on a via node that 10,000 sources ho
 where `main` took 60 ms. It now takes 27 ms. `a_self_label_via_rule_derives_the_edge_into_a_new_node`
 failed first; the review's self-label fuzz mix went from 46 of 80 runs diverging to 0.
 
-## 106. Deleting a top-k rule's best match re-picked it — CLOSED
+## 106. Deleting a top-k rule's best match re-picked it: CLOSED
 
 Found on 2026-10-14 by the second review of row 83's fix, with a fuzz built to break its guard.
 Same on `main`, with no snapshot. `max_edges = None` was not affected.
@@ -3295,7 +3295,7 @@ orders × 50 steps a mix): nine of its eleven mixes went to 0 runs diverging fro
 two left, 6 and 2 of 80, are row 103 (a snapshot and a reopen in each) and the via-hop top-k half
 of row 83.
 
-## 107. Stores damaged by row 103 are not repaired — CLOSED
+## 107. Stores damaged by row 103 are not repaired: CLOSED
 
 Found on 2026-10-15 by the review of row 103's fix, which wrote stores on `main` with `z1`'s prefix
 and opened them on the fixed build. A store with the double ownership still in its WAL replays
@@ -3333,7 +3333,7 @@ on 0.8.0 or 0.8.1) are not repaired: provenance still names an owner for an edge
 longer holds, and the dedup pass, which removes second owners only, has nothing to correct.  Row
 111 repairs those stores, in 0.9.1.
 
-## 108. A user edge over a rule's, after a snapshot, is not refused — CLOSED
+## 108. A user edge over a rule's, after a snapshot, is not refused: CLOSED
 
 Found on 2026-10-15 by the review of row 103's fix. The ownership check `insert_edge` makes reads
 what is written since the snapshot, so a rule's edge that lives in the snapshot is reported as
@@ -3348,10 +3348,10 @@ the check that a live rule would derive the edge again. Tests in
 `crates/core-api/tests/first_write_after_open.rs`; the single insert and the batch insert failed
 first.
 
-## 109. A tombstone over an absent base edge under-counts the live edge count — CLOSED
+## 109. A tombstone over an absent base edge under-counts the live edge count: CLOSED
 
 Found on 2026-10-15 by the review of row 107's fix. A rule that retracts an edge the snapshot's
-base does not hold — one that lived only in the overlay, or was never there — still records a
+base does not hold (one that lived only in the overlay, or was never there) still records a
 tombstone (`Topology::remove_edge` tombstones whatever it does not find in the overlay). Row 107's
 encoder fix counts a new snapshot's edges from its rows, so every snapshot's header is right; but
 the live count, `corrected_edge_count`, is base rows minus tombstones plus the overlay, and reads
@@ -3371,7 +3371,7 @@ depth, and no test fails without it; the unit test
 `remove_overlay_edge_records_no_tombstone_for_an_edge_the_overlay_lacks` covers only the topology
 half.
 
-## 110. A first-write `delete_node` on a snapshotted store misreports its counts — CLOSED
+## 110. A first-write `delete_node` on a snapshotted store misreports its counts: CLOSED
 
 Found on 2026-10-15 by the review of row 107's fix. On a store opened from a snapshot, a
 `delete_node` that is the first write reports the deleted node's rule-derived edges as manual:
@@ -3385,12 +3385,12 @@ report's derived count for a via node, and may share this.
 108's change). `deleting_a_node_first_after_open_counts_its_derived_edges_as_derived` failed first
 with the report above.
 
-## 111. Stores where the edge was already lost before 0.8.2 are not repaired — CLOSED
+## 111. Stores where the edge was already lost before 0.8.2 are not repaired: CLOSED
 
 Found on 2026-10-15 by the review of row 107's fix.  Row 107's repair works by deduplicating
 provenance at the first write: if two rules both claim a triple, the second (by byte order on rule
 name) loses its claim, so when it retracts the triple the first rule still owns it and the edge
-survives.  But if the losing write already ran on 0.8.0 or 0.8.1 — before 0.8.2 — the graph no
+survives.  But if the losing write already ran on 0.8.0 or 0.8.1 (before 0.8.2) the graph no
 longer holds the edge while provenance still names a rule as its owner: the rule counts an edge
 that is not there (`counted=2 present=0`). The dedup pass removes second owners only, so it has
 nothing to correct.
@@ -3425,7 +3425,7 @@ after open 1.188 s before and 1.208 s after (+20 ms, 1.7 %); later writes unchan
 The cross-version fuzz (420 stores the real 0.8.0 release wrote) went from 19 of 26 damaged stores
 still differing from a fresh build after the first write to 6; those 6 are row 113.
 
-## 112. `open_at` skips row 107's repair — CLOSED
+## 112. `open_at` skips row 107's repair: CLOSED
 
 Found on 2026-10-16 by the review of row 111's fix, with `DeleteRule` on the 0.8.0 stores
 `nat080`, `v080/snapshotted` and `w080`: 14 as-of reads differ from the live handle, before and
@@ -3433,7 +3433,7 @@ after that fix.
 
 **Closed, 0.9.2.** `from_persist` (`crates/core-rules/src/engine.rs`) now calls `dedup_provenance` on the provenance map before building `owned`, the same dedup `ensure_provenance_loaded_mut` runs for a regular open. `open_at_deduplicates_double_owned_provenance` (`crates/core-api/tests/shared_edge_rules.rs`) opens the `v080_snapshotted` fixture at a commit above the floor (added by a dummy insert so the WAL is non-empty) and verifies that `explain` shows one owner for the previously double-owned edge.
 
-## 113. A lost top-k edge no rule counts is not re-derived — CLOSED
+## 113. A lost top-k edge no rule counts is not re-derived: CLOSED
 
 Found on 2026-10-16 by the review of row 111's fix. Example: `two-topk`, reversed rule names, seed
 10, first write `AddLink(n4, n7)`: `SAME n7→n2` stays missing and `b_topk1` owns no edge. The
@@ -3441,7 +3441,7 @@ namespaced corpus has the same case (`full-topk-true-1`, `SAME n6→n0`).
 
 **Closed, 0.9.2.** `reconcile_lost_provenance` (`crates/core-api/src/db.rs`) no longer returns early when no provenance-named edges are missing from the graph: it always calls the new `fill_undertopk_sources` pass, which finds top-k rule sources whose provenance count is below cap and re-evaluates them. `undertopk_pass_restores_edge_absent_from_both_graph_and_provenance` (`crates/core-api/tests/shared_edge_rules.rs`, `test-hooks` feature) injects double ownership to produce the row-113 damage, then verifies the first write restores the edge.
 
-## 114. A reader's `node_edges` never says an edge is derived — CLOSED
+## 114. A reader's `node_edges` never says an edge is derived: CLOSED
 
 Found on 2026-10-16 by the review of row 111's fix. `ReaderSnapshot::node_edges` sets `derived`
 to `false` for every edge.
@@ -3478,7 +3478,7 @@ has no test of its own: a role-definition change refolds from the same journal a
 other fold, but `commit_roles` is crate-private. Its ignored `reader_derived_bench` is the timing
 probe.
 
-## 117. The lock-free reader can miss a derived edge a batch retracts and re-derives — CLOSED
+## 117. The lock-free reader can miss a derived edge a batch retracts and re-derives: CLOSED
 
 Found on 2026-10-20 by the review of row 114's fix. A commit's derived-edge changes reach the
 reader (`CommitDelta`) as a list of inserts and a list of retractions, and the order between them
@@ -3495,20 +3495,20 @@ triple and the order cannot matter. `a_batch_that_retracts_then_re_derives`,
 `a_batch_that_re_derives_then_retracts` and `a_batch_that_does_both_several_times`
 (`crates/core-api/tests/reader_derived.rs`) compare the reader with the live handle in the tail,
 after the next fold, after a snapshot and after a reopen; they fail on the previous netting.
-## 115. `forget` of a property misreports on a store row 111 repairs — CLOSED
+## 115. `forget` of a property misreports on a store row 111 repairs: CLOSED
 
 Found on 2026-10-16 by the review of row 111's fix. Fix: run row 111's repair before the report is
 computed, staging its deltas so the next commit carries them.
 
 **Closed, 0.9.2.** `ensure_reconcile_for_report` (`crates/core-api/src/db.rs`) loads provenance, runs `reconcile_lost_provenance`, and drains the engine's pending deltas; it is called from `forget` (`crates/core-api/src/memory/forget.rs`) for `ForgetTarget::Prop` before the before-snapshot is taken. `forgetting_a_prop_on_damaged_store_reports_derived_edges` (`crates/core-api/tests/shared_edge_rules.rs`) opens the `v080_lost_edge` fixture and verifies `report.derived_edges >= 1`.
 
-## 116. Row 113's repair cost every open — CLOSED
+## 116. Row 113's repair cost every open: CLOSED
 
 Found on 2026-10-19, after #72 merged and before the 0.9.2 tag, by timing open, first write and
 second write against v0.9.1 (median of five, release build, macOS). The independent review of
 #72 had reasoned that the top-k pass "finds nothing to do" on a healthy store; that holds only
 for sources at their cap. A source with fewer candidates than its cap is short of k on any store,
-so the pass built every index and re-evaluated those sources at the first commit of every open —
+so the pass built every index and re-evaluated those sources at the first commit of every open:
 in WAL replay, where an open pays it. All rules in the memory schema are top-k (caps 32 and 512)
 and real entities sit far below them.
 
@@ -3544,7 +3544,7 @@ First and second writes stayed at 4–6 ms in both builds. Tests in
 `an_open_of_a_marked_snapshot_skips_the_repair` and `injected_damage_withholds_the_mark` (the last
 two under `test-hooks`).
 
-## 118. Batch validation is quadratic in the batch size — CLOSED
+## 118. Batch validation is quadratic in the batch size: CLOSED
 
 Found on 2026-10-20 by the first throughput run of `mushroomdb import` (PF-03a), which had been
 expected to reach 100k nodes/s and ran at 1.8k. A profile put 6,727 of 6,754 samples in
@@ -3574,7 +3574,7 @@ at the last commit through `open_at`; at least 100 must be accepted so the overl
 2,500 randomized batches across 1,773 reopened, snapshotted and `open_at` states against base,
 byte-identical.
 
-## 119. A snapshot of a store with no commits fails — CLOSED
+## 119. A snapshot of a store with no commits fails: CLOSED
 
 Found on 2026-10-20 by the review of PF-03a: a header-only CSV imported nothing and then failed
 with "No such file or directory", and `mushroomdb snapshot <fresh-dir>` failed the same way. A
@@ -3591,7 +3591,7 @@ when it committed nothing. Tests in `crates/core-api/tests/snapshot_empty_store.
 `the_first_archive_after_an_empty_snapshot_still_holds_the_history`) and
 `csv_import_header_only_files_import_nothing_and_leave_no_intent` in `crates/cli/tests/csv_import.rs`.
 
-## 120. CSV import refuses relationship property columns — CLOSED in 0.10.5
+## 120. CSV import refuses relationship property columns: CLOSED in 0.10.5
 
 `mushroomdb import` (PF-03a) takes `:START_ID`, `:END_ID` and `:TYPE` from a relationships file
 and nothing else: the engine's edges carry no user properties, so a property column has nowhere to
@@ -3619,7 +3619,7 @@ is unchanged: the exporters read the properties through a new `ExportSource::for
 Evidence: the relationship-property tests in `crates/cli/tests/csv_import.rs` and
 `crates/cli/tests/export_round_trip.rs`.
 
-## 121. A reload can mix two snapshots' state under the newer identities — CLOSED
+## 121. A reload can mix two snapshots' state under the newer identities: CLOSED
 
 Found on 2026-10-20 by the second re-review of the 0.10 backup worker (HO-07). Present in
 released 0.9.x.
@@ -3638,7 +3638,7 @@ engine follow-up, outside the backup unit that found it. 0.10 shipped without it
 
 **Closed, 0.10.2.** `load_from_disk` now captures `snapshot_ident` before any read and rechecks
 it after the WAL replay (both via `fs.snapshot_ident()`). A mismatch resets in-memory state and
-retries — up to three attempts — using the same `reset_for_reload` path that `refresh` uses. The
+retries (up to three attempts) using the same `reset_for_reload` path that `refresh` uses. The
 bound fails closed: all attempts exhausted returns an `Io` error, not mixed state. Known limit: a
 store under continuous snapshot pressure (large store, aggressive snapshot schedule) can exhaust
 all attempts; a long-lived handle that hits this via `refresh` is then degraded until reopened.
@@ -3647,16 +3647,16 @@ performance gate passes. On non-Unix platforms `snapshot_ident` uses `(len, mtim
 than an inode, so an equal-length replacement within a mtime quantum would go undetected, the same
 limitation as the existing staleness check; this does not worsen row 122. Tests in
 `crates/core-api/tests/snapshot.rs`:
-`a_snapshot_replaced_during_load_is_detected_and_reloaded` — an `InterceptWalIdent` Fs wrapper
+`a_snapshot_replaced_during_load_is_detected_and_reloaded`: an `InterceptWalIdent` Fs wrapper
 fires on the first `wal_ident()` call, replacing both files via atomic rename; asserts both nodes
 visible after open and `refresh()` returns 0 new frames.
-`a_snapshot_replaced_on_every_load_attempt_returns_an_error` — the hook fires on every
+`a_snapshot_replaced_on_every_load_attempt_returns_an_error`: the hook fires on every
 `wal_ident()` call, exhausting all three attempts; asserts the `Io` error on open and that a fresh
 open then reads the correct (latest) state.
-`a_snapshot_replaced_on_every_reload_attempt_degrades_the_handle` — same exhaustion through
+`a_snapshot_replaced_on_every_reload_attempt_degrades_the_handle`: same exhaustion through
 `refresh`; asserts the handle is degraded and a fresh open then reads the correct state.
 
-## 122. On non-Unix platforms an equal-length WAL replacement followed by a write leaves a store that does not open — CLOSED (Windows); gap remains on other non-Unix platforms
+## 122. On non-Unix platforms an equal-length WAL replacement followed by a write leaves a store that does not open: CLOSED (Windows); gap remains on other non-Unix platforms
 
 Found on 2026-10-20 by the fourth re-review of the 0.10 backup worker (HO-07). Present in
 released 0.9.x. Affects Windows and other non-Unix platforms only. Windows x86_64 is a supported
@@ -3700,7 +3700,7 @@ Tests in `crates/core-api/tests/durable_wal.rs`, previously `#[cfg(unix)]`, now
 name). The suite does not otherwise run on Windows, so `ci.yml`'s `more-targets` Windows entry
 runs these five by exact name and fails if any name matches no test.
 
-## 123. An equality index over a view property goes stale — CLOSED
+## 123. An equality index over a view property goes stale: CLOSED
 
 Found on 2026-10-20 while implementing 0.10 TY-8. A view writes its property inside `apply`
 (`crates/core-rules/src/views.rs`), which does not pass the property index, so the postings for
@@ -3723,7 +3723,7 @@ next snapshot no longer re-emits the declaration. Tests: `an_equality_index_cann
 and `a_store_with_an_index_over_a_view_property_opens_and_answers_correctly`
 (`crates/core-api/tests/range_index.rs`, default build).
 
-## 124. The reader reads a weighted rule's recent scores as null — CLOSED
+## 124. The reader reads a weighted rule's recent scores as null: CLOSED
 
 Found on 2026-10-20 by TX-5, when moving full-token `POST /query` onto the lock-free reader made
 `crates/server/tests/e2e.rs::end_to_end_demo_http_watch_mcp` read `r.score` as `null`. The defect
@@ -3748,11 +3748,11 @@ the weighted-rule steps of `every_snapshot_matches_the_live_handle_and_keeps_its
 `each_kind_of_write_is_read_by_the_next_request` in `crates/server/tests/concurrent_reads.rs`.
 Disabling the restore fails the parity case in three store states and the chain test.
 
-## 125. The equality index treated `Int` 2 and `Float` 2.0 as different — CLOSED
+## 125. The equality index treated `Int` 2 and `Float` 2.0 as different: CLOSED
 
 Found on 2026-10-20 by the review of 0.10 TY-8. `PropertyIndex::lookup` probed the one
 `ValueKey` of the operand, and keys are by variant, so `MATCH (n:L {v: 2})` on an indexed pair
-found the `Int` 2 only, where the scan's `values_equal` — numeric across `Int` and `Float` — also
+found the `Int` 2 only, where the scan's `values_equal` (numeric across `Int` and `Float`) also
 finds the `Float` 2.0; `0` likewise missed `-0.0`. Declaring an index changed the answer. The
 defect predates 0.10; TY-8 made it reachable through range indexes, which also answer equality.
 
@@ -3766,7 +3766,7 @@ conversion equals it (one below 2^53, a run of neighbours above), the two zeros 
 (`crates/core-query/tests/index_matches_scan.rs`), which compares the index with `eval_cmp` over a
 scan.
 
-## 126. The first write after a fold copies store structures under the write lock — CLOSED
+## 126. The first write after a fold copies store structures under the write lock: CLOSED
 
 Found on 2026-10-21 by the review of TX-1b (the incremental reader and transaction overlay). After a
 fold, the write path's copy-on-write clones structures the new base shares, among them the property
@@ -3820,7 +3820,7 @@ copies the topology overlay whole: row 137). Its median rises from 51 ms to
 than the flat maps did. See the TX-7 report.
 
 
-## 127. `serve` on an unwritable data directory reported `store is busy: write lock held` — CLOSED by HO-12b
+## 127. `serve` on an unwritable data directory reported `store is busy: write lock held`: CLOSED by HO-12b
 
 Found on 2026-10-21 while writing the volume-ownership recipe for the deploy templates (HO-12).
 Present in released 0.9.x. The image runs as uid 65532 and Fly and Render mount a new volume
@@ -3839,7 +3839,7 @@ the effective uid, the directory's owner and mode, and what to change; `Busy` is
 another process holds. Tests: `crates/core-api/tests/unwritable_dir.rs`,
 `crates/cli/tests/serve_unwritable.rs`.
 
-## 128. `SET n.id` changes the `id` property without renaming the node key — CLOSED
+## 128. `SET n.id` changes the `id` property without renaming the node key: CLOSED
 
 Found on 2026-10-21 in the QL-06 review. Present in released 0.9.x.
 
@@ -3872,7 +3872,7 @@ move is a `SetProp` to the new key and passes. Tests: `crates/core-api/tests/key
 `http_prop_routes_refuse_an_id_that_is_not_the_key` in `crates/server/tests/http.rs`, and
 `bindings/python/tests/test_key_property.py`.
 
-## 129. A plain `MATCH … SET` reads pre-statement values, so updates are lost — CLOSED
+## 129. A plain `MATCH … SET` reads pre-statement values, so updates are lost: CLOSED
 
 Found on 2026-10-21 in the QL-09b review. Present in released 0.9.x.
 
@@ -3907,7 +3907,7 @@ node and a relationship variable also keeps the column path. Tests:
 `a_plain_match_set_item_reads_what_an_earlier_item_set` and
 `a_plain_match_set_counter_reads_per_row` in `crates/core-api/tests/ql_09b.rs`.
 
-## 130. A batch that creates edges and deletes nodes commits superlinearly — CLOSED
+## 130. A batch that creates edges and deletes nodes commits superlinearly: CLOSED
 
 Found on 2026-10-21 while timing QL-09b (clauses after UNWIND). A statement that creates nodes and edges and also
 deletes nodes in the same batch spent 711 of 815 ms in `commit_batch` at 20k rows, growing faster than the row count;
@@ -3933,13 +3933,13 @@ in `crates/core-api/tests/batch_vs_commits.rs` (300 edge-heavy batches against s
 | 20k rows | 586–666 ms | 179–201 ms |
 | 20k / 5k | 6.6–9.4× | 3.4–4.3× |
 
-## 131. DISTINCT and grouping keys treated every list and map as one value — CLOSED
+## 131. DISTINCT and grouping keys treated every list and map as one value: CLOSED
 
 Found on 2026-10-21 while building QL-07 (named paths, which render as maps). Present in released 0.9.x.
 
 `group_key_normalize` converts a value to the `ValueKey` that `RETURN DISTINCT`, `count(DISTINCT …)`,
 `GROUP BY`-style grouping and `UNION` dedup hash on. It numeric-unified `Int` and `Float` and handed every
-other value to `ValueKey::from_value`, which has no key for a list, map or duration and returns `None` — the same
+other value to `ValueKey::from_value`, which has no key for a list, map or duration and returns `None`: the same
 `None` a null gets. So every list in a column shared the null group, and so did every map.
 
 Evidence, one probe on the v0.9.2 tag (`d8637eb`) and on `v0.10/bundle-7` (`5268618`), 100 000 nodes
@@ -3965,7 +3965,7 @@ Residual: the scan's `=` is not transitive across `Int` and `Float` past 2^53 (`
 true while `Int(2^53 + 1) = Int(2^53)` is false), so no single key can match it in every case; the key follows the
 exact-representable rule above.
 
-## 132. A variable-length hop ignored its destination's label and properties — CLOSED
+## 132. A variable-length hop ignored its destination's label and properties: CLOSED
 
 Found on 2026-10-21 by QL-07 (named paths): `MATCH (a)-[:KNOWS*1..2]->(b:Person {id: 'dee'})` returned paths ending
 anywhere. The planner built `VarExpand` with no destination filter (its comment said so), and the planner kept
@@ -4019,7 +4019,7 @@ relationship-list variable, parameters, aggregates, a bound destination, `shorte
 randomized differential over 150 graphs against a brute-force walk) and `crates/core-api/tests/ql_vl.rs` (live, WAL
 replay, snapshotted, reopened, indexed, many commits).
 
-## 133. WHERE evaluated NOT two-valued: `NOT (null)` kept the row — CLOSED
+## 133. WHERE evaluated NOT two-valued: `NOT (null)` kept the row: CLOSED
 
 Found on 2026-10-21 in QL-BX, which made predicates values and so put a three-valued projection
 beside the WHERE evaluator. Present in released 0.9.x.
@@ -4060,7 +4060,7 @@ path did, so an element it does not need cannot raise an error. Tests:
 `crates/core-query/src/cypher/tests/ql_bx.rs`, and `a_write_where_drops_a_row_whose_not_is_null` in
 `crates/core-api/tests/cypher_bool_exprs.rs`.
 
-## 134. Relationship uniqueness did not span a MATCH clause — CLOSED
+## 134. Relationship uniqueness did not span a MATCH clause: CLOSED
 
 Found on 2026-10-21 by the QL-VL review's external differential: 4,673 of 30,000 random mid-pattern cases differed
 from openCypher. openCypher binds no relationship twice within one MATCH clause, across all its hops and all its
@@ -4111,7 +4111,7 @@ WAL replay, snapshotting, reopened, indexed and many commits; and a randomized d
 over every hop form, self-loops, comma-separated parts, separate clauses, `OPTIONAL MATCH`, named paths, parameters, an
 indexed store and the write path). At 2,500 graphs the differential runs 20,000 read cases and 7,543 writes: the base
 gives 1,757 wrong reads and 452 wrong writes, the fix gives none.
-## 135. IN flattened list-valued elements — CLOSED
+## 135. IN flattened list-valued elements: CLOSED
 
 Found on 2026-10-21 in the QL-BX review, by an independent openCypher evaluator run over the
 610 corpus queries QL-BX changed (6 of them came out wrong because of this). Present in released
@@ -4144,7 +4144,7 @@ element stays `Operand::ListLit` and is read lazily, element by element, each co
 (`predicate::in_list`); a constant list is borrowed. Tests: `in_does_not_flatten_list_valued_elements`
 and `in_reads_its_elements_lazily_as_where_always_did` in `crates/core-query/src/cypher/tests/ql_bx.rs`.
 
-## 136. Index declarations can be lost in an archive crash window on non-V11 stores — DEFERRED
+## 136. Index declarations can be lost in an archive crash window on non-V11 stores: DEFERRED
 
 Found on 2026-10-22 during TY-12. Present in released 0.9.x.
 
@@ -4166,7 +4166,7 @@ snapshot cannot carry them and those stores keep the window.
 
 **DEFERRED.** The fix for a non-V11 store is a format change, which a store takes by moving to V11.
 
-## 137. The first edge write after a fold copies the topology overlay — DEFERRED to 0.11
+## 137. The first edge write after a fold copies the topology overlay: DEFERRED to 0.11
 
 Found on 2026-10-22 by the review of TX-7 (ledger row 126). The topology overlay (`Topology`: per edge
 type, per node, its adjacency, plus tombstones) is shared with the reader's fold through an `Arc` like the
@@ -4180,7 +4180,7 @@ On a snapshotted store the overlay holds only what was written since the snapsho
 **DEFERRED to 0.11.** The fix is the same structural sharing as row 126: adjacency lists and tombstone
 maps in `cow` containers, so an edge write copies its node's list and the path to it.
 
-## 138. A different or rewound store on a reused backup prefix destroyed its own backup or built a mixed restore point — CLOSED (HO-10)
+## 138. A different or rewound store on a reused backup prefix destroyed its own backup or built a mixed restore point: CLOSED (HO-10)
 
 Found on 2026-10-22 by the HO-08 review. Introduced in 0.10 by HO-07 (continuous backup) and never
 released. HO-08 made it automatic: a waiting instance takes over a prefix once its lease expires.
@@ -4260,7 +4260,7 @@ on-disk bucket), and `s3_restore_latest_and_a_point_in_time` in `crates/backup/t
   verify, but the prefix's newer history from the other branch is not removed. Documented in
   `docs/site/deployment.md`.
 
-## 139. A filtered scan with LIMIT missed every node in the snapshot base — CLOSED
+## 139. A filtered scan with LIMIT missed every node in the snapshot base: CLOSED
 
 Found on 2026-10-22 by TY-10 (range planner), whose no-index differential disagreed with the scan on this shape alone.
 `MATCH (n:L) WHERE n.f <op> <literal> RETURN … LIMIT k` with no ORDER BY takes the pull path's fused scan-and-filter:
@@ -4309,7 +4309,7 @@ handle, keeps its 0.9.2 signature so a caller of the published `mushroomdb-stora
 the engine no longer calls it. Read side only: no byte a snapshot or the WAL writes changed. When 0.9.3 was merged into
 0.10, 0.10 kept its `column` (not deprecated) and gained `view_column` as the same handle under the 0.9.3 name.
 
-Tests: `crates/core-api/tests/fused_scan_base.rs` — every comparison operator against Int, Float, Str, Bool, List,
+Tests: `crates/core-api/tests/fused_scan_base.rs`: every comparison operator against Int, Float, Str, Bool, List,
 Map and null literals (and a second Int), each in four forms (`MATCH (n:L) … LIMIT`, the same with `SKIP 1`,
 `MATCH (m:M), (n:L)` and `MATCH (m:M) MATCH (n:L)`); typed and mixed base columns; nodes in the base, in the delta,
 overwritten, deleted and with the property removed after the snapshot; a second snapshot; live and reopened handles,
@@ -4317,7 +4317,7 @@ namespace and role masks, `open_at` and `query_at`, `SharedDb` readers unfolded 
 `=`-on-a-later-scan and SKIP shapes from the table above (`an_equality_on_a_later_scan_sees_the_snapshot_base`); and a
 randomized differential, fused against unfused in all four forms, over 16 seeds of 70 random insert / overwrite /
 remove / delete / snapshot / reopen steps, one of them a burst of `FOLD_EVERY_K + 1` writes so a reader folds inside
-the walk, through the handle and a reader — and `v8::seam::tests::the_column_handle_reads_what_get_reads` (typed
+the walk, through the handle and a reader: and `v8::seam::tests::the_column_handle_reads_what_get_reads` (typed
 columns, `Vector` among them, `Mixed`, and a layer). On 0.10 the seven QL-FS tests fail on the QL-FS base commit; the
 eighth fails with the base read disabled. On 0.9.3 all eight fail on `1200cdfe` (0.9's copy has no transaction and no
 list, map or `null` literal, which 0.9's WHERE does not parse). The review of 0.9.3 ran a wider differential,
@@ -4338,7 +4338,7 @@ a Str property, median of 21 runs):
 The no-snapshot path did not move beyond run-to-run noise; after a snapshot there is no correct "before" to compare
 with.
 
-## 140. A role-token or read-key transaction cannot write — CLOSED in 0.10.4
+## 140. A role-token or read-key transaction cannot write: CLOSED in 0.10.4
 
 Found on 2026-10-22 by the review of TX-4. `Transaction` (TX-1) buffers writes as `BatchOp`s and commits
 them through the compare-and-set path with no role in it; the role-scoped write path
@@ -4355,7 +4355,7 @@ scope and visibility of each buffered op under the same guard as the preconditio
 
 **Closed, 0.10.4.** A role token whose role has a write scope gets a transaction that writes (`TxBody::RoleOwned` over HTTP, `RoleOwnedTransaction` over Bolt). Every read in it, from MATCH, MERGE's existence lookup, key checks and RETURN, goes through the role's mask, over the snapshot and the transaction's own writes. Each statement's writes are checked against the scope and namespaces as it runs, and again at commit under the write lock with the preconditions (`submit_batch_cas_authz_with_seq`, the same `write_batch_authz_nosync` check `/query` uses). A `read` key and a role with no write scope keep the read-only transaction. An independent review found two read leaks in the first version (`MERGE … RETURN` and `MATCH … SET … RETURN` over a hidden node); both are closed, with regression tests over HTTP and Bolt in `crates/server/tests/tx_authz_parity.rs` that compare each response with `/query`'s. A delete of a derived edge is still refused only at commit.
 
-## 141. `serve --tls-cert/--tls-key` panicked building the TLS config: two rustls crypto providers compiled, none installed — CLOSED
+## 141. `serve --tls-cert/--tls-key` panicked building the TLS config: two rustls crypto providers compiled, none installed: CLOSED
 
 Found on 2026-10-22 by TX-16 (the Bolt listener, which serves the same certificate) and confirmed
 by its review. Introduced in the 0.10 cycle when HO-07 and HO-01 met; never released.
@@ -4388,7 +4388,7 @@ its own provider choice. Evidence:
 - CI (`.github/workflows/ci.yml`) builds the CLI with `--features tls` and runs both, plus the Bolt
   listener's TLS test.
 
-## 142. A key revoked by a `keys.json` reload keeps working on an open Bolt connection — CLOSED
+## 142. A key revoked by a `keys.json` reload keeps working on an open Bolt connection: CLOSED
 
 Found on 2026-10-22 when TX-17 documented Bolt's scoped access. Introduced in the 0.10 cycle where HO-04
 (`keys.json` with a `SIGHUP` reload) met TX-16 (the Bolt listener); never released.
@@ -4446,7 +4446,7 @@ Evidence: `row_142_a_revoked_key_is_refused_on_its_next_run`,
 in `crates/bolt/tests/keys.rs`.
 All eight were red on `main` before the fix and green after.
 
-## 143. No write result counted the relationships a statement created — CLOSED
+## 143. No write result counted the relationships a statement created: CLOSED
 
 Found on 2026-10-22 by the QL-12 review. Introduced in the 0.10 cycle by QL-09b (`UNWIND … CREATE/MERGE`
 and relationship `MERGE`); never released.
@@ -4470,7 +4470,7 @@ result columns). Evidence: `row_143_every_create_path_counts_its_relationships` 
 `relationships_created` assertions beside the `created` ones in `cypher_merge_edge.rs`,
 `cypher_writes.rs` and `ql_09b.rs`.
 
-## 144. MATCH-driven writes were refused inside a transaction — CLOSED
+## 144. MATCH-driven writes were refused inside a transaction: CLOSED
 
 Found on 2026-10-22 by the QL-CX review. Introduced in the 0.10 cycle (TX-1, QL-09b, QL-CX); never released.
 
@@ -4491,7 +4491,7 @@ read-your-write, rollback, conflict on the same pair, constraint at commit),
 `match_then_create_connects_two_nodes_inside_a_transaction` in `crates/server/tests/http_tx.rs`, and
 `begin_match_create_commit_connects_two_nodes` in `crates/bolt/tests/tx.rs`.
 
-## 145. Inside a transaction, MATCH … SET read the state before the statement — CLOSED
+## 145. Inside a transaction, MATCH … SET read the state before the statement: CLOSED
 
 Found by TX-MW's differential. Introduced in the 0.10 cycle (TX-1); never released.
 
@@ -4505,7 +4505,7 @@ Found by TX-MW's differential. Introduced in the 0.10 cycle (TX-1); never releas
 (`match_set_ops` over the transaction's `RowSource`). Evidence:
 `match_set_reads_its_own_earlier_rows_inside_a_transaction` in `crates/core-api/tests/tx_mw.rs`.
 
-## 146. Inside a transaction, DETACH DELETE counted a shared edge twice — CLOSED
+## 146. Inside a transaction, DETACH DELETE counted a shared edge twice: CLOSED
 
 Found by TX-MW's differential. Introduced in the 0.10 cycle (TX-1); never released.
 
@@ -4519,7 +4519,7 @@ earlier in the statement. Evidence:
 `row_146_an_edge_between_two_deleted_nodes_is_counted_once_in_a_transaction` in
 `crates/core-api/tests/tx_mw.rs`.
 
-## 147. DETACH DELETE counted a self-loop as two deleted relationships — CLOSED
+## 147. DETACH DELETE counted a self-loop as two deleted relationships: CLOSED
 
 Found by the TX-MW review. Present in released 0.9.x (checked against v0.9.2, whose `delete_node`
 computes the same sum).
@@ -4534,7 +4534,7 @@ computes the same sum).
 (auto-commit, `delete_node`, and inside a transaction). Evidence: `row_147_a_self_loop_is_deleted_once`
 in `crates/core-api/tests/tx_mw.rs`.
 
-## 148. Bolt sent a node as its key string and refused a bare relationship — CLOSED
+## 148. Bolt sent a node as its key string and refused a bare relationship: CLOSED
 
 Found by TX-18 (the official-driver gate). Introduced in the 0.10 cycle with the Bolt listener; never
 released.
@@ -4558,7 +4558,7 @@ as the `{type, start, end}` map. A node still renders as its key there. Evidence
 `crates/bolt/tests/structures.rs`, and TX-18's scripts (`python driver 6.4.1: 12/12`,
 `javascript driver 6.2.0: 12/12`).
 
-## 149. A Bolt write carried no counters — CLOSED
+## 149. A Bolt write carried no counters: CLOSED
 
 Found by TX-18. Introduced in the 0.10 cycle with the Bolt listener; never released.
 
@@ -4576,7 +4576,7 @@ unchanged. Evidence: `every_write_statement_reports_exact_stats` and
 `a_transaction_reports_the_same_stats_as_auto_commit` in `crates/core-api/tests/tx_ns.rs`,
 `a_write_success_carries_its_counters` in `crates/bolt/tests/structures.rs`.
 
-## 150. MERGE did not count its ON CREATE / ON MATCH SET items — CLOSED
+## 150. MERGE did not count its ON CREATE / ON MATCH SET items: CLOSED
 
 Found by QL-PM. Present in released 0.9.x (checked against v0.9.2, whose `exec_merge` builds the write
 row with a literal 0 for `properties_set`).
@@ -4591,7 +4591,7 @@ row with a literal 0 for `properties_set`).
 `stage_merge` / `stage_merge_edge`) count the `ON CREATE` or `ON MATCH` items they apply. Evidence:
 `row_150_merge_set_items_are_counted_in_properties_set` in `crates/core-api/tests/tx_ns.rs`.
 
-## 151. Map-form SET with an `id` key and `SET n.id` were reported to disagree — CLOSED (not a defect, pinned)
+## 151. Map-form SET with an `id` key and `SET n.id` were reported to disagree: CLOSED (not a defect, pinned)
 
 Reported by the QL-PM review. Introduced in the 0.10 cycle (QL-06, QL-PM) if at all; never released.
 
@@ -4609,7 +4609,7 @@ Reported by the QL-PM review. Introduced in the 0.10 cycle (QL-06, QL-PM) if at 
 **Closed (QL-RP), no code change:** the parity is pinned by
 `row_151_map_forms_and_set_id_give_the_same_answer` in `crates/core-api/tests/ql_rp.rs`.
 
-## 152. Over Bolt, a node inside a map, a mixed list or a computed value is its key — CLOSED in 0.10.5
+## 152. Over Bolt, a node inside a map, a mixed list or a computed value is its key: CLOSED in 0.10.5
 
 Found by the TX-NS review. Introduced in the 0.10 cycle with TX-NS's graph structures; never released.
 
@@ -4624,11 +4624,11 @@ read a string or a map there, not a Node.
 **Closed, 0.10.5.** Two new mechanisms work alongside the existing flat `EntityKind` tier (unchanged):
 
 - `ValueKindTag` (`pub(crate)`) in `crates/core-query/src/result.rs`: a plan-time tree describing how
-  graph elements nest inside a computed column — `Map(Vec<(String, ValueKindTag)>)` for map fields,
+  graph elements nest inside a computed column: `Map(Vec<(String, ValueKindTag)>)` for map fields,
   `MixedList(Vec<Option<ValueKindTag>>)` for per-element-tagged lists. `output_value_kind_trees`
   (entity.rs) walks the final `Project` op and fills one tag tree per column.
 - `ValueEntityTree` (`pub #[non_exhaustive]`) in the same file: the resolved graph element tree beside
-  a computed cell value — same variants, plus `Map`, which the existing `Entity` enum cannot carry
+  a computed cell value: same variants, plus `Map`, which the existing `Entity` enum cannot carry
   (pub without `#[non_exhaustive]`). `attach_entities` (entity.rs) now also fills value entity trees.
 - `pack_cell_with_entity_tree` in `crates/bolt/src/messages/graph.rs`: recursively packs a
   `ValueEntityTree` into Bolt structures, calling `pack_node` / `pack_relationship` / `pack_path` for
@@ -4644,7 +4644,7 @@ the flat mechanism picks them up without entering Tier 2 when they can.
 Tests: `nodes_and_relationships_inside_a_map_or_mixed_list_are_structures` and
 `computed_node_expressions_are_structures` in `crates/bolt/tests/structures.rs`.
 
-## 154. A retracted rule's saved edge weight came back live, then vanished at the next snapshot — CLOSED
+## 154. A retracted rule's saved edge weight came back live, then vanished at the next snapshot: CLOSED
 
 Found by the QL-RP review. Present in released 0.9.x by code identity with v0.9.2 (not run on a
 v0.9.2 binary).
@@ -4667,12 +4667,12 @@ snapshot merge lays an untombstoned overlay entry over the archived one field by
 does. Evidence: `row_154_a_retracted_rules_weight_does_not_reappear_across_a_snapshot` in
 `crates/core-api/tests/ql_rp.rs` (live, after a snapshot, after a reopen).
 
-## 155. Relationship-property writes emit no mutation or subscription event — CLOSED in 0.10.5
+## 155. Relationship-property writes emit no mutation or subscription event: CLOSED in 0.10.5
 
 Found by the QL-RP review (M4). Introduced in the 0.10 cycle with QL-RP; never released.
 
-- A relationship-property write from Cypher — a `CREATE` or `MERGE` relationship map, `SET r.p`,
-  `SET r += …`, `SET r = …`, `REMOVE r.p` — is applied as the V11 records `SetEdgePropId` (28) and
+- A relationship-property write from Cypher (a `CREATE` or `MERGE` relationship map, `SET r.p`,
+  `SET r += …`, `SET r = …`, `REMOVE r.p`) is applied as the V11 records `SetEdgePropId` (28) and
   `RemoveEdgePropId` (29). The engine's apply emits no `MutationEvent` and no `DbEvent` for them, since
   neither enum has a variant that names a relationship and a field.
 - So `/watch` and `/subscribe` (with `writes: true`) consumers do not see relationship-property
@@ -4697,7 +4697,7 @@ Both endpoints refuse role tokens, so no per-event filter is needed. Evidence: t
 in `crates/core-api/tests/events.rs`, `crates/server/tests/watch.rs` (including
 `watch_bridge_lag_emits_lagged_frame`) and the `/subscribe` test in `crates/server`.
 
-## 156. `elementId()` refuses anything but a bare node or relationship variable — CLOSED in 0.10.5
+## 156. `elementId()` refuses anything but a bare node or relationship variable: CLOSED in 0.10.5
 
 Allocated by the controller for bundle-18. Introduced in the 0.10 cycle with QL-03e; never released (0.9.x has no
 `elementId()`).
@@ -4727,7 +4727,7 @@ Non-entity arguments still produce the named error. Tests:
 `element_id_of_a_function_expression_is_the_bolt_element_id` and
 `element_id_of_non_entity_expression_is_still_an_error` in `crates/core-query/src/cypher/tests/ql_03e.rs`.
 
-## 157. Aggregates over a bare variable returned null — CLOSED
+## 157. Aggregates over a bare variable returned null: CLOSED
 
 Found on 2026-10-23 by QL-10's TCK run (Aggregation2 [1]–[12]). `UNWIND [1,2] AS x RETURN max(x)` returned null, as did
 `min`, `sum` and `avg`, and the same over a variable carried through `WITH`. `max(n.prop)` worked.
@@ -4751,7 +4751,7 @@ the TCK's Aggregation2 expects in lower case, so those scenarios still fail on t
 is still a variable or a property, so `max(x + 1)`, `max(1)` and `max($p)` are parse errors, not wrong results
 (row 159). The integer type of `sum` is row 158.
 
-## 158. `sum` of integers returned a float — CLOSED
+## 158. `sum` of integers returned a float: CLOSED
 
 Found in the QL-AG review (2026-10-23). `UNWIND [1,2,3] AS x RETURN sum(x)` and `MATCH (n:N) RETURN SUM(n.v)` over
 integer properties returned `6.0` / `30.0`. openCypher returns an integer for all-integer input, a float if any input is a
@@ -4765,7 +4765,7 @@ finishes as `Value::Float(val)`; the tag was not built. The existing unit tests 
 float, as openCypher has it, and so do `stDev`, `stDevP` and the percentiles (`percentileDisc` returns the input value).
 This changes the output type of `sum` over integers, so it is a `### Changed` changelog entry.
 
-## 159. Aggregate arguments that are expressions, literals or parameters are refused — CLOSED in 0.10.4
+## 159. Aggregate arguments that are expressions, literals or parameters are refused: CLOSED in 0.10.4
 
 `max(x + 1)`, `max(1)` and `max($p)` are parse errors: `AggArg` is `Star`, `Var`, `Prop` or `Distinct` of those. It is a
 refusal, not a wrong result. Not a small grammar change: every site that reads an `AggArg` (`distinct_value`,
@@ -4774,7 +4774,7 @@ evaluator over the row, and the unaliased column name for an expression is a rel
 
 **Closed, 0.10.4.** `AggArg::Expr` carries any expression; a variable and `var.field` keep their own arms. A nested aggregate (`max(count(x))`) is refused at check time as `NestedAggregation`, and `rand()` inside an aggregate as `NonConstantExpression` (TCK Return6 [15]). TCK 0.7419 → 0.7632, no scenario that passed before fails.
 
-## 160. Booleans did not compare: `false < true` was null — CLOSED
+## 160. Booleans did not compare: `false < true` was null: CLOSED
 
 Found by QL-10 (the openCypher TCK, Quantifier7 [3]). Present in released 0.9.x (checked against v0.9.2,
 whose `filter::is_orderable_pair` admits numbers and strings only, and whose `min` / `max` accumulators
@@ -4797,7 +4797,7 @@ not order (`true < 1` is null). Evidence: `row_160_booleans_order_false_before_t
 `crates/core-query/src/cypher/tests/ql_ve.rs` (`<`, `<=`, `>`, `>=`, `WHERE`, `ORDER BY`, `min`, `max`),
 the `index_matches_scan` differential, and the TCK's Quantifier7 [3], whose five scenarios now pass.
 
-## 161. `statement()` and `transaction()` read the clock on every call — CLOSED in 0.10 (QL-CL)
+## 161. `statement()` and `transaction()` read the clock on every call: CLOSED in 0.10 (QL-CL)
 
 Allocated by the controller for bundle-19. Introduced in the 0.10 cycle with QL-TF; never released (0.9.x has no
 namespaced temporal functions).
@@ -4834,7 +4834,7 @@ Commits: `52819fb7..ea5dd8f0` (`7c6dfbed`, `4d35cc30`, `ea5dd8f0`), merged in bu
 release-build and three debug-build TCK runs each gave 2416 passed (0.7268, strict 0.7208), and the function
 table no longer leaves `Temporal10.feature` out of its counts.
 
-## 162. A reader's derived edges and weights against the live handle — CLOSED, not a defect on 0.10
+## 162. A reader's derived edges and weights against the live handle: CLOSED, not a defect on 0.10
 
 Reported on 2026-10-22 by the v0.9.4 review as a side observation of its row 154 probe: `db.reader()`
 disagreed with the live handle on rule-derived edges. 2559 of 5345 reader checks had null weights
@@ -4879,7 +4879,7 @@ HTTP read routes. No engine code changed for this row. The probe is kept as a re
 fixed seeds of 60 steps: `row_162_a_reader_sees_the_live_handles_derived_edges_and_weights`
 (`crates/core-api/tests/reader_live_parity.rs`). It asserts zero differences for both readers.
 
-## 164. Shutdown canceled an acquisition after its own lease was written — CLOSED in 0.10 (HO-LC)
+## 164. Shutdown canceled an acquisition after its own lease was written: CLOSED in 0.10 (HO-LC)
 
 Introduced in unreleased 0.10's backup lease lifecycle; **Low**, allocated as a release blocker.
 Found by PR #113's S3 job at base `5c806ab7`: the existing
@@ -4908,7 +4908,7 @@ failed and unsupported capability checks, suspect-record watch retention, expire
 adoption. The existing CLI shutdown/final-manifest test is unchanged. The unit report records the
 final commit range from base `5c806ab7` and complete local/CI evidence before release.
 
-## 166. `sum` over no values is null, where openCypher gives 0 — CLOSED in 0.10.4
+## 166. `sum` over no values is null, where openCypher gives 0: CLOSED in 0.10.4
 
 Present in released 0.9.x and 0.10.0; **Low**. Found by the 0.10.x hardening test H-2
 (`crates/sim-harness/tests/query_rewrites.rs`) at 1,000 cases: a store whose nodes all lack `i`
@@ -4922,7 +4922,7 @@ is not changed without the owner. The H-2 test encodes the current behaviour in 
 
 **Closed, 0.10.4.** `sum` over no values, or over a group whose rows all lack the value, returns integer 0. `avg`, `min` and `max` over nothing stay null. `sum_numeric_prop_ignores_null_and_non_numeric` now pins 0.
 
-## 167. On Linux a plain commit costs 1.2–1.3× v0.9.2, and up to 1.4–1.6× under readers — CLOSED in 0.10.1 (alloc part; remaining Linux gap is row 172)
+## 167. On Linux a plain commit costs 1.2–1.3× v0.9.2, and up to 1.4–1.6× under readers: CLOSED in 0.10.1 (alloc part; remaining Linux gap is row 172)
 
 Present in released 0.10.0; **Medium** (performance; it turns `main` red). Found 2026-10-28 when
 `concurrency-gate` failed on `main` at `c6050eae` (a docs-only merge) and on four test-only pull
@@ -4967,7 +4967,7 @@ cost: each alloc pair triggers ~0.3 extra `mprotect` and 0.17 `futex` calls.
 
 **CLOSED in 0.10.1 for the publish allocation part.** The remaining Linux gap to the 1.15× target (paused 1.20× after this fix) is tracked as row 172. Two structural changes to `crates/core-api/src/reader.rs` and `db.rs`:
 
-1. **`CacheCell`** — bundles `EffectiveCell` and `AtomicBool` (background-build flag) into one
+1. **`CacheCell`**: bundles `EffectiveCell` and `AtomicBool` (background-build flag) into one
    `Arc<CacheCell>`, saving one heap allocation vs holding them separately. `IndexCell` is kept as
    its own `Arc<IndexCell>` so `Seeds` holds the layer and the index under **separate** reference
    counts. This restores the O(1) seed-move: `Arc::try_unwrap` on the sole remaining holder
@@ -4977,7 +4977,7 @@ cost: each alloc pair triggers ~0.3 extra `mprotect` and 0.17 `futex` calls.
    `crates/core-api/tests/reader_shared_effective.rs`; move count exported as
    `seed_layer_moves_this_thread()`.
 
-2. **`ReadContextStatic`** — the slow-query ring and WAL path (constant between commits) are
+2. **`ReadContextStatic`**: the slow-query ring and WAL path (constant between commits) are
    cached in `GraphDb` as `Arc<ReadContextStatic>` and Arc-cloned into every snapshot. The
    per-commit `counts` tuple is inlined directly in `ReaderSnapshot`. This saves two allocations
    per commit (the `PathBuf` and the `Arc<ReadContext>`).
@@ -4996,7 +4996,7 @@ under-readers ratio 1.65× → **1.40×**. The under-readers ratio on both platf
 is already below 1.0×). The Linux paused ratio (1.20×) does not reach the 1.15× target; the
 remaining gap is attributed to WAL syscall overhead and tracked as row 172.
 
-## 168. An aggregating `RETURN` after an aggregating `WITH` is dropped — CLOSED in 0.10.1
+## 168. An aggregating `RETURN` after an aggregating `WITH` is dropped: CLOSED in 0.10.1
 
 Present in released 0.9.x (seen on v0.9.3) and 0.10.0; **High** (silent wrong results). Found
 2026-10-29 by the 0.10.x hardening test H-3 (`crates/sim-harness/tests/reference_evaluator.rs`),
@@ -5032,7 +5032,7 @@ had the same drop and are fixed with it. Tests:
 `finding_an_aggregating_return_after_an_aggregating_with_runs` (un-ignored), the H-3 property
 without `hits_row_168`, and the `row_168_*` tests in `crates/core-query/src/cypher/tests/h3.rs`.
 
-## 169. `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key — CLOSED in 0.10.1
+## 169. `SKIP` and `LIMIT` are ignored on an aggregate with no grouping key: CLOSED in 0.10.1
 
 Present in 0.10.0, verified on `main`; **Medium** (wrong row count). Found 2026-10-29 by H-3.
 
@@ -5061,7 +5061,7 @@ row) is now `aggregate_limit_and_skip_apply_and_order_by_is_a_no_op`. Tests:
 `finding_skip_and_limit_apply_to_an_ungrouped_aggregate` (un-ignored), the H-3 property without
 `hits_row_169`, and the `row_169_*` tests in `crates/core-query/src/cypher/tests/h3.rs`.
 
-## 170. Values of different types sort numbers first, where openCypher sorts them last — CLOSED in 0.10.1
+## 170. Values of different types sort numbers first, where openCypher sorts them last: CLOSED in 0.10.1
 
 Present in 0.10.0, verified on `main`; **Low** (semantic deviation, undocumented). Found
 2026-10-29 by H-3.
@@ -5085,7 +5085,7 @@ they always participate). Tests: `finding_values_of_different_types_order_as_ope
 in `crates/sim-harness/tests/reference_evaluator.rs`; the `row_170_*` tests in
 `crates/core-query/src/cypher/tests/h3.rs`.
 
-## 171. query.md documents `-->`, but the parser refuses it — CLOSED in 0.10.1
+## 171. query.md documents `-->`, but the parser refuses it: CLOSED in 0.10.1
 
 Present in 0.10.0, verified on `main`; **Low** (doc/engine mismatch; loud, not wrong results).
 Found 2026-10-29 by H-3's generator. query.md (Relationship patterns) says "Omitting the brackets
@@ -5109,7 +5109,7 @@ sequence. `<-` in a less-than expression (`n.x < -1`) is not ambiguous because `
 the parser as separate tokens, and `<-` only starts a left relationship inside `rel()`, which is
 never called from an expression parser.
 
-**Tests:** `crates/core-query/src/cypher/tests/ql_ba.rs` — parse acceptance, execution (bare
+**Tests:** `crates/core-query/src/cypher/tests/ql_ba.rs`: parse acceptance, execution (bare
 equals bracketed on a small graph), ambiguity (arithmetic `a - -1`, `n.x < -1` still parse
 correctly), pattern-predicate refusal still fires for bare forms in WHERE expressions.
 
@@ -5117,11 +5117,11 @@ correctly), pattern-predicate refusal still fires for bare forms in WHERE expres
 `render_path` alternates between `-->` and `-[]->` accordingly. TCK rate rose from 0.7268 to
 0.7419 (bare-arrow scenarios now pass).
 
-## 172. Linux plain-commit paused ratio is 1.20× v0.9.2, above the 1.15× target — DEFERRED to 0.11
+## 172. Linux plain-commit paused ratio is 1.20× v0.9.2, above the 1.15× target: DEFERRED to 0.11
 
 Present in 0.10.0 and 0.10.1; **Low** (performance gap, gate not red). After the row 167
 allocation fix the per-commit overhead on a Linux arm64 container (3 CPUs) is 1.20–1.21× v0.9.2
-paused — below the 1.35× gate bound, but above the 1.15× original target.
+paused: below the 1.35× gate bound, but above the 1.15× original target.
 
 **Evidence (Linux arm64 container, `--cpus 3`, v0.9.2 baseline on the same machine):**
 
@@ -5142,7 +5142,7 @@ does not trigger the extra syscalls there (macOS paused ratio is 1.04× after th
 mimalloc) or deferring the WAL sync path, neither of which is scoped for 0.10.1. Deferred to
 0.11 for an owner decision on allocator strategy.
 
-## 173. A `UNION` drops the structures inside maps and mixed lists, or reads one part's value with another's shape — CLOSED in 0.10.6
+## 173. A `UNION` drops the structures inside maps and mixed lists, or reads one part's value with another's shape: CLOSED in 0.10.6
 
 Introduced in 0.10.5 with row 152; **Low** (a driver reads a value of the wrong shape; no data is
 changed). Found by the review of PR #154.
@@ -5160,7 +5160,7 @@ the combined result. A part that returns null for the column keeps the column fl
 does for a bare node column. Test: `a_union_keeps_nodes_inside_maps_only_when_every_part_agrees` in
 `crates/bolt/tests/structures.rs`.
 
-## 174. A write statement's `RETURN` sends a node inside a value as its key — CLOSED in 0.10.6
+## 174. A write statement's `RETURN` sends a node inside a value as its key: CLOSED in 0.10.6
 
 Introduced in 0.10.5 with row 152, which covered reads only; **Low**. Found by the review of the
 row 173 fix.

@@ -3,7 +3,7 @@
 Two suites share this harness. Each cell is one `claude -p` session captured as stream-json, so
 tool calls are counted and the final `result` event supplies usage, cost, turns and duration.
 
-## `--suite association` — the engine's benchmark
+## `--suite association`: the engine's benchmark
 
 One generated world written three ways, twenty relationship questions, graded against executable
 truth. This is the suite that measures what mushroomdb is for. Full description, the gate, and how
@@ -14,10 +14,10 @@ python3 benchmarks/agent-tasks/run.py --suite association --setup-only
 python3 benchmarks/agent-tasks/run.py --suite association --reps 3
 ```
 
-## `--suite code` — retired
+## `--suite code`: retired
 
 The code suite asked twenty repository questions of a stock session and of sessions carrying the
-code-graph door. **It is retired as of 0.6.4.** It still runs — nothing was deleted — but no
+code-graph door. **It is retired as of 0.6.4.** It still runs (nothing was deleted) but no
 further runs will be committed, because the question it asks has been answered:
 
 | run | what it measured | result |

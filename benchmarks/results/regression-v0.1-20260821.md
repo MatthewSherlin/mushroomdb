@@ -1,9 +1,9 @@
-# v0.1.0 release regression — mushroomdb
+# v0.1.0 release regression: mushroomdb
 
 ## Machine / date
 
 - **Date:** 2026-08-21
-- **Host:** mac.lan
+- **Host:** Apple M4 Pro laptop
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -20,7 +20,7 @@
 | `benchmarks/test_harness.py` | **20 passed / 2 skipped** (system A + system C not running; expected) |
 | Bug found and fixed | `engine_matches_oracle` proptest found fulltext `disable_fulltext` bug: when label A disabled but label B still indexes same field, stale postings from A remained. Fixed in `crates/core-storage/src/fulltext.rs` (new `field_indexed_by_other` method) + `crates/core-api/src/db.rs` (DisableFulltext apply). |
 
-## 10k suite — mushroomdb (v0.1.0)
+## 10k suite: mushroomdb (v0.1.0)
 
 Two runs (A and B) for variance assessment. Single-pass cold measurements (same methodology as all prior
 regressions). Baselines from `regression-post-plan13-final-20260821-021956.md`.
@@ -33,14 +33,14 @@ regressions). Baselines from `regression-post-plan13-final-20260821-021956.md`.
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0.2 µs | 0% | No change. |
 | cypher scan-filter-project | 1.53 ms | 2.04 ms | 2.12 ms | +33% | Cold first-call (single-pass). Warmup-median from 20-run direct measurement: **0.9 ms** (faster than baseline). Criterion bench on same code path shows +7.2% (within threshold). T15-16 did not change the Cypher scan executor. Single-pass cold measurement artifact. |
 | cypher two-hop join | 307.0 µs† | 206.7 µs | 325.6 µs | −33% / +6% | High variance (57% run-to-run). The canonical four-engine number (261.6 µs) is from a warmup-median methodology (3+10 runs). Single-pass measurement unreliable for this workload. Canonical 261.6 µs stands. |
-| rule_derive (total) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | **Real and stable** (0.6% intrarun variance). Cause not isolated — see rule_derive note below. |
+| rule_derive (total) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | **Real and stable** (0.6% intrarun variance). Cause not isolated; see rule_derive note below. |
 
 † v2.4 307 µs was on a pre-rule-derive in-process run (warmup state variable); canonical is the four-engine benchmark.  
-‡ v2.4 3.149 s: one measurement; the v2.4 binary also measured 2.849 s in a separate run. These are different code versions, not intrarun variance — the 2.849–3.149 s spread is cross-version drift, not a noise floor.
+‡ v2.4 3.149 s: one measurement; the v2.4 binary also measured 2.849 s in a separate run. These are different code versions, not intrarun variance; the 2.849–3.149 s spread is cross-version drift, not a noise floor.
 
-### rule_derive — +11% investigation
+### rule_derive: +11% investigation
 
-v0.1.0 runs A (3.493 s) and B (3.514 s) are 0.6% apart — the workload is stable within this binary.
+v0.1.0 runs A (3.493 s) and B (3.514 s) are 0.6% apart; the workload is stable within this binary.
 The +11% cross-version jump from v2.4 (3.149 s) is real.
 
 Plans 15-16 changes analyzed for per-backfill overhead:
@@ -50,9 +50,9 @@ Plans 15-16 changes analyzed for per-backfill overhead:
   apply (O(1) on empty BTreeSet), and `field_indexed(field)` per SetProp apply. However, `create_rule`
   timing in the benchmark starts AFTER `ingest_batch` completes, so per-node fulltext checks during
   ingest do not add to the rule_derive measurement. The rule engine's streaming backfill bypasses the
-  WAL apply path for individual edges — no fulltext check fires per derived edge.
+  WAL apply path for individual edges; no fulltext check fires per derived edge.
 - **view_store fast path (pre-v0.1, d4d312c):** The `if !self.view_store.is_empty()` guard skips
-  O(edge_count) delta accumulation when no views are declared. Benchmark declares no views — this path
+  O(edge_count) delta accumulation when no views are declared. Benchmark declares no views, so this path
   is O(1). No overhead here.
 
 **Cause not isolated.** The most plausible explanation is memory layout / cache behavior differences
@@ -89,7 +89,7 @@ From `dogfood/results/scale-100k.md` (date: 2026-08-21T15:42:11, V5 rebuild run)
 
 | Phase | Time |
 |---|---|
-| Backfill (9 rules, max_edges=1M each) | **28.65 s** (was "~21.5s estimate" — now closed) |
+| Backfill (9 rules, max_edges=1M each) | **28.65 s** (was "~21.5s estimate", now closed) |
 | V5 snapshot open (`open_with`) | **8.71 s** (deserialization; no rule re-fire) |
 | Snapshot write (`snapshot()`) | **25.09 s** |
 | WAL-only open | **8.25 min** (IVF-Flat re-derivation ~7.68 min) |
@@ -118,7 +118,7 @@ Attributing the delta to v2.4 measurement conditions, not a code regression.
 
 **`engine_matches_oracle` proptest failure (oracle_equivalence.rs)**
 
-Root cause: `FulltextIndex::disable(label, field)` when another label still indexes the same field —
+Root cause: `FulltextIndex::disable(label, field)` when another label still indexes the same field:
 the field's postings column was preserved (correct) but stale node_id entries for the just-disabled
 label remained (wrong). On next search, those entries appeared in results even though the label's
 index was disabled.
@@ -133,7 +133,7 @@ Files changed: `crates/core-storage/src/fulltext.rs` (new method), `crates/core-
 
 | Location | Before | After |
 |---|---|---|
-| README benchmarks table | `Cold-start (snapshot V5): **see note** ▽` | `8.71 s` (V5 open) / `8.25 min` (WAL-only) — two rows |
+| README benchmarks table | `Cold-start (snapshot V5): **see note** ▽` | `8.71 s` (V5 open) / `8.25 min` (WAL-only); two rows |
 | README ▽ footnote | "number being updated… V4 baseline was 10.5 s / 36.1 s" | Measured V5 numbers (WAL 8.25 min, snap 8.71 s, write 25.09 s, backfill 28.65 s) |
 | README limitations table | "V5 numbers update pending" | V5 measured 8.71 s open / 25.09 s write |
 | README subscription latency | "0.04 µs / 0.21 µs; 61 µs / 88 µs" | "0.17 µs / 0.42 µs; 86 µs / 226 µs" |

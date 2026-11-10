@@ -3,7 +3,7 @@
 Materialized property views are per-node derived properties maintained
 incrementally as the graph changes.  They behave exactly like user-written
 node properties in queries (scan, filter, project, group-by) but are computed
-automatically — no triggers, no manual refresh.
+automatically, with no triggers and no manual refresh.
 
 ## Concepts
 
@@ -126,7 +126,7 @@ View **definitions** are WAL-persisted as `CreateView` / `DeleteView`
 records (discriminants 10 / 11).  They also survive snapshots via a
 `view_defs` field in the snapshot state (format version 5).
 
-View **values** are NOT stored in snapshots — they are recomputed from
+View **values** are NOT stored in snapshots; they are recomputed from
 topo + props on every open.  This matches the rebuild-on-open pattern
 used by candidate indexes and keeps snapshot writes simple.
 

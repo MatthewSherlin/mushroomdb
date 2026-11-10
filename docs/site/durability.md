@@ -9,11 +9,11 @@ store with per-section CRCs.
 
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
-- **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
+- **With a snapshot**: the V9 image is memory-mapped (open-to-first-query in
   milliseconds even at 100k nodes; derived edges, HNSW vector indexes,
   provenance and the full-text index are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
-- **WAL-only, from genesis** — if the store has *never* been snapshotted, the
+- **WAL-only, from genesis**: if the store has *never* been snapshotted, the
   entire history replays from the beginning. Node/edge/property writes replay
   cheaply, but **rules re-derive their edges**, and for `VectorSimilar` rules
   that means rebuilding the ANN (HNSW/IVF) index from scratch. On a large,
@@ -28,8 +28,8 @@ The tooling already bounds WAL-only-from-genesis exposure:
   returns; a later `ingest-git` writes one when the store has no
   snapshot at all, or when the WAL has grown past 4 MiB since the last one.
   Measured on a 435-file repository, that is the difference between a 288 ms
-  open and a 173 ms one — paid on every hook, every MCP start and every CLI
-  call until something snapshots.
+  open and a 173 ms one (paid on every hook, every MCP start and every CLI
+  call until something snapshots).
 - **`mushroomdb mcp` snapshots a store whose WAL has grown.** When it opens a
   store whose WAL is past 4 MiB, and again when its session ends, it takes the
   same snapshot: the WAL is archived, not dropped, so history reads keep their
@@ -47,8 +47,8 @@ The tooling already bounds WAL-only-from-genesis exposure:
 (or snapshot on a schedule). The cost of a periodic snapshot is far smaller than
 a from-genesis rebuild, and it caps how much WAL a crash can leave to replay.
 
-For the operational side of all this — which directory to mount, how to back it
-up, and how `serve --restore-from` seeds a fresh volume on boot — see
+For the operational side of all this (which directory to mount, how to back it
+up, and how `serve --restore-from` seeds a fresh volume on boot), see
 [Running it as a service](service.md).
 
 ## A snapshot does not cost you the past
@@ -57,8 +57,8 @@ Folding the WAL into a snapshot is what makes the next open fast, but the WAL is
 also what `node_history`, `edge_history`, `was_linked` and `asof` read. Dropping
 it would leave a store that cannot say how any of its nodes came to be.
 
-So every snapshot mushroomdb takes **on its own** — the ingest's, a
-`--snapshot-every` tick, the shutdown one — and `mushroomdb snapshot <db>` with
+So every snapshot mushroomdb takes **on its own** (the ingest's, a
+`--snapshot-every` tick, the shutdown one), and `mushroomdb snapshot <db>` with
 no flags **archive** the WAL rather than dropping it. The frames are renamed to
 `wal.<N>.archive`, which the history reads still scan and the open path does
 not. You end up with a store that opens fast *and* remembers. An automatic
@@ -85,11 +85,11 @@ one leaves another `wal.<N>.archive` behind and nothing deletes it. On a
 repository that syncs on every commit that is one new archive per 4 MiB of WAL
 churn, indefinitely.
 
-So retention is opt-in, not automatic — nothing prunes unless a caller asks:
+So retention is opt-in, not automatic: nothing prunes unless a caller asks:
 
 | Snapshot | Archives kept |
 |---|---|
-| automatic — the ingest's, a `--snapshot-every` tick, shutdown | all of them |
+| automatic (the ingest's, a `--snapshot-every` tick, shutdown) | all of them |
 | `mushroomdb snapshot <db>` | all of them |
 | `mushroomdb snapshot <db> --retention N` | the newest N |
 
@@ -107,7 +107,7 @@ The other added cost is one `snapshot.bin`, which is rewritten in place rather
 than accumulated. A snapshot is an expanded image rather than a log, so it is
 sized by the data it holds and not by the WAL it replaces: a store of 3.7 MB of
 string properties spread over eight columns snapshots to 5.2 MB, 1.39× its
-property payload. A snapshot carries **one** string table, not one per column —
+property payload. A snapshot carries **one** string table, not one per column;
 before 0.6.5 the same store wrote eight copies of the table and came to 36.8 MB,
 9.82×. That change moves the format to V9; see **Recovery vs. refresh** below.
 
@@ -116,15 +116,15 @@ before 0.6.5 the same store wrote eight copies of the table and came to 36.8 MB,
 Two different things read the WAL tail, and they are easy to confuse.
 
 **Recovery** happens at open. The snapshot is loaded and the WAL is replayed
-on top of it — all of it, except the part a snapshot that kept its WAL
-already holds. A torn trailing frame — the signature of a crash mid-
-append — is dropped, and with `repair_wal` on (the default) the valid prefix is
+on top of it (all of it, except the part a snapshot that kept its WAL
+already holds). A torn trailing frame (the signature of a crash mid-
+append) is dropped, and with `repair_wal` on (the default) the valid prefix is
 written back over it. That truncation is correct crash recovery: the frame was
 never fsynced, so no caller was ever told it committed.
 
 Recovery is also where the snapshot format is upgraded, and that upgrade is
 one-way: a store snapshotted by 0.6.5 is format V9, and an earlier binary cannot
-open it — it refuses with `snapshot: unsupported version 9` rather than reading
+open it; it refuses with `snapshot: unsupported version 9` rather than reading
 it wrongly. The first read-write open of a V5–V8 store rewrites `snapshot.bin`
 at V9 and keeps the original beside it as `snapshot.bin.bak` until the next
 clean open, so the way back is to restore that file with the older binary.
@@ -152,7 +152,7 @@ frame that writer is about to make durable. That is why `repair_wal: false` and
 A store directory holds one extra file for cross-process coordination: `LOCK`,
 always empty. It exists only to carry an advisory OS lock that writers hold
 while they commit. It is created on the first write, never removed, and carries
-no data — deleting it while no process has the store open is harmless, and
+no data; deleting it while no process has the store open is harmless, and
 deleting it while one does defeats the coordination for handles opened
 afterwards.
 
@@ -164,7 +164,7 @@ its presence, and a store copied without it works normally.
 `mushroomdb verify <db>` validates a snapshot end to end: per-section CRC32
 **and** a structural (rkyv `bytecheck`) pass over the sections the hot read path
 otherwise reads unchecked. Run it before restoring a snapshot from an untrusted
-source — CRC32 alone cannot detect a maliciously crafted image (an attacker can
+source: CRC32 alone cannot detect a maliciously crafted image (an attacker can
 recompute the checksum), but the structural pass rejects out-of-bounds pointers.
 
 ## Format compatibility matrix
@@ -174,7 +174,7 @@ stamped in the 6-byte header (magic `GDB1` + 2-byte little-endian version).
 
 | Version | Introduced in | Status | Notes |
 |---------|--------------|--------|-------|
-| V5 | 0.1.0 | readable | uncompressed bincode + CRC32 header; **no encoder** — only the golden fixture pin covers this format |
+| V5 | 0.1.0 | readable | uncompressed bincode + CRC32 header; **no encoder**: only the golden fixture pin covers this format |
 | V6 | 0.1.1 | readable | zstd-compressed V5 payload in a container |
 | V7 | pre-0.2.0 (interim) | readable | zstd(CRC + packed CSR + packed columns + bincode meta) |
 | V8 | 0.2.0+ | readable | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
@@ -324,10 +324,10 @@ not open a V11 store.
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
 and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
 default). Parquet output is **not** byte-identical between parquet-rs library
-versions — use JSONL if you need a stable byte checksum.
+versions; use JSONL if you need a stable byte checksum.
 
-**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
-and edges only, since rules have no GraphML analogue — for import into generic
+**GraphML format** (`--format graphml`): writes a single GraphML file (nodes
+and edges only, since rules have no GraphML analogue) for import into generic
 graph viewers and analysis tools. If `<dest>` is an existing directory, the file
 is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
 elements carry a `label` attribute plus every property (lists and maps are
@@ -337,7 +337,7 @@ rule's declared `weight_prop`, read off the edge. GraphML output is
 byte-identical between two runs on the same store.
 
 **GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
-64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
+64-bit `i64`) declare `attr.type="long"`, not `"int"`; GraphML's informal
 convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
 for the full range. If nodes disagree on a property's type (one has an int
 under `score`, another a string), the key declares `attr.type="string"` for

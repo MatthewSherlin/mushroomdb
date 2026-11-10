@@ -1,4 +1,4 @@
-# A/B — mushroomdb v0.6.12 against the 0.7 branch, 10,000 nodes
+# A/B: mushroomdb v0.6.12 against the 0.7 branch, 10,000 nodes
 
 Written 2026-10-01 from an investigation run that day. It was started because the first 0.7 run
 (`mushroomdb-10k-0.7.md`) showed a rule backfill of 8.781 s where runs from 2026-08-21 and
@@ -6,7 +6,7 @@ Written 2026-10-01 from an investigation run that day. It was started because th
 
 **Conclusion: no 0.7 regression.** The released v0.6.12 and the 0.7 branch are indistinguishable on
 every workload below, with one exception: the first, cold execution of the two-hop query is about
-0.15 ms slower on the 0.7 branch (1.23× in the pooled table), and its cause was not established —
+0.15 ms slower on the 0.7 branch (1.23× in the pooled table), and its cause was not established;
 see "What was not established" at the end. The warm two-hop is flat. The backfill figure is real, is already in v0.6.12, and has been there since
 v0.2.0: the benchmark's rules have derived a different, complete edge set since then.
 
@@ -136,7 +136,7 @@ and `max_edges` omitted, as the harness is written:
 2,000,000 edges before, 8.645 s and 448,000 edges after.
 
 **Cause.** The benchmark's two rules omit `max_edges`. Before that commit an omitted `max_edges`
-meant a global budget, and the backfill stopped as soon as a rule owned 1,000,000 edges — an early
+meant a global budget, and the backfill stopped as soon as a rule owned 1,000,000 edges, an early
 exit after a fraction of the 7,000 sources. Since it, the Python binding fills an omitted
 `max_edges` with a per-source top-k of 32, so the backfill evaluates every candidate for all 7,000
 sources and keeps the best 32 each: 7,000 × 32 = 224,000 edges per rule.
@@ -153,8 +153,8 @@ This holds the derived set equal across versions: 2,000,000 edges everywhere.
 |---|---|---|---|---|---|---|---|
 | v0.1.1 | 5 | 2.973 s (2.973, 2.963, 2.801, 3.043, 3.042) | 0.887 | 2.082 | 0 MB | 100.8 µs | 6.29 3.58 2.78 3.67 2.85 |
 | `6e3136d` | 1 | 2.975 s | 0.885 | 2.090 | 0 MB | 107.3 µs | 2.86 |
-| `5fc65eb`, parent of `80babac` | 1 | 3.188 s | 0.917 | 2.271 | — | 107.4 µs | 4.20 |
-| `80babac` | 1 | 4.974 s | 1.977 | 2.997 | — | 110.0 µs | 4.25 |
+| `5fc65eb`, parent of `80babac` | 1 | 3.188 s | 0.917 | 2.271 | n/a | 107.4 µs | 4.20 |
+| `80babac` | 1 | 4.974 s | 1.977 | 2.997 | n/a | 110.0 µs | 4.25 |
 | v0.2.0 | 3 | 4.841 s (4.841, 5.009, 4.835) | 1.800 | 3.071 | 194.0 MB | 109.5 µs | 2.98 3.13 3.32 |
 | v0.6.12 (A) | 4 | 4.594 s (4.985, 4.565, 4.593, 4.596) | 1.721 | 2.910 | 194.0 MB | 106.5 µs | 3.60 2.93 2.73 4.13 |
 | 0.7 branch (B) | 4 | 4.795 s (4.826, 4.861, 4.560, 4.765) | 1.798 | 2.964 | 194.0 MB | 108.7 µs | 3.42 3.69 3.53 2.99 |
@@ -162,7 +162,7 @@ This holds the derived set equal across versions: 2,000,000 edges everywhere.
 On this control the 0.7 branch against v0.6.12 is 4.795 s against 4.594 s, with overlapping ranges
 (4.56–4.86 against 4.57–4.99).
 
-## Secondary finding — history markers in the WAL
+## Secondary finding: history markers in the WAL
 
 The control shows a second, smaller step, also before v0.2.0. **First commit with it: `80babac`**,
 2026-08-28, which added WAL markers for derived edges being added and retracted, with rule

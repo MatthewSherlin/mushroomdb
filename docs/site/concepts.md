@@ -94,8 +94,8 @@ x=proj-02  score=0.5
 x=proj-20  score=0.5
 ```
 
-A rule is evaluated when it is created, against everything already in the store — the
-**backfill** — and then on every insert and every property change, inside the write that made
+A rule is evaluated when it is created, against everything already in the store (the
+**backfill**), and then on every insert and every property change, inside the write that made
 the change. When a match stops holding, the rule **retracts** its edge in that same write.
 Nothing is re-indexed afterwards and no job runs later. [Rules](rules.md) has each predicate
 in full.
@@ -115,7 +115,7 @@ FIT via rule skill_fit (score 1.00) — overlap on skills >= 0.5 [skills: s01, s
 ```
 
 Each line is one edge: its type, the rule that derived it, the score, the predicate, and in
-brackets the **evidence** — the values the two nodes actually share. An assistant asked "why
+brackets the **evidence**: the values the two nodes actually share. An assistant asked "why
 are these two related?" can quote that instead of guessing.
 
 Now change the person's skills, and ask again:
@@ -136,7 +136,7 @@ it before the write returned.
 ## Time
 
 A write does not replace what was there. It is appended to the log as a **commit**, and commits
-are numbered from 0. So the store can be read as it was at any commit it still has — or on a
+are numbered from 0. So the store can be read as it was at any commit it still has, or on a
 date, which resolves to the last commit at or before it.
 
 The demo was 26 commits, 0 to 25. The `SET` above came after them, as two: the write itself,
@@ -171,7 +171,7 @@ One store can answer different callers differently.
 - A **namespace** is a tenancy boundary. A node is put in one when it is created and stays
   there; a node in none is in `default`. A hand-written edge cannot cross from one namespace to
   another.
-- A **role** names what a caller may see — by label, by key, by a property test — and
+- A **role** names what a caller may see, by label, by key, by a property test, and
   optionally what it may write. Roles are part of the store.
 - A **mask** is a list of keys, for one call: only these.
 - A **scope** binds a role, a namespace or a list of keys to a handle, so that every read
@@ -188,13 +188,13 @@ On top of the graph is a small surface for an assistant's memory, and it is how 
 meet mushroomdb.
 
 - **`remember`** writes a note, the entities it names, and facts among them, in one commit.
-  An entity it has never heard of is created as a **provisional** one — label `Entity`, marked
-  as provisional — rather than refused. The mark is cleared when something describes it.
+  An entity it has never heard of is created as a **provisional** one (label `Entity`, marked
+  as provisional) rather than refused. The mark is cleared when something describes it.
 - **`recall`** takes a question in ordinary words and returns what the store holds about it.
 - **`forget`** removes a node, a property or a hand-written fact from the graph. It does not
   erase history: that takes pruning.
 
-Entities are ordinary nodes — `Person`, `Org`, `Project`, `Concept`, `Event` — and notes are
+Entities are ordinary nodes (`Person`, `Org`, `Project`, `Concept`, `Event`) and notes are
 `Note` nodes linked to what they are about. So rules apply to memory as they do to anything
 else: when enough entities share a field, the store can propose a rule that links them, and
 once you accept it every later `remember` maintains those links. [Agent memory](mcp.md) walks through a session.

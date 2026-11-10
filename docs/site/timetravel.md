@@ -1,7 +1,7 @@
 # Temporal history: what was connected when, and why
 
-mushroomdb records every write — including when derived edges were created or
-retracted by rules — and lets you query that history at any granularity: per
+mushroomdb records every write, including when derived edges were created or
+retracted by rules, and lets you query that history at any granularity: per
 node, per edge pair, or as a point-in-time read-only snapshot of the whole
 graph. This is the temporal story: history APIs with rule attribution, as-of
 time travel, compare-and-set writes, and WAL archives.
@@ -14,7 +14,7 @@ Three read surfaces expose the recorded timeline. All three scan the on-disk
 WAL and include a `total_commits` horizon field so callers can always determine
 which portion of history is visible.
 
-### node_history — per-node change log
+### node_history: per-node change log
 
 Returns every WAL-visible change for a node since the last WAL-truncating
 snapshot.
@@ -39,10 +39,10 @@ snapshot.
 Change types: `NodeInserted`, `PropSet`, `PropRemoved`, `EdgeAdded`,
 `EdgeRemoved`, `NodeDeleted`.
 
-### edge_history — add/retract lifecycle with rule attribution
+### edge_history: add/retract lifecycle with rule attribution
 
 Returns the full add/retract history for all edges between two nodes. Includes
-**derived edges** — those created by rules — with the rule name attributed via
+**derived edges**, those created by rules, with the rule name attributed via
 `rule`. That is the point of the record: not just *what* was connected,
 but *why* (which rule fired) and *when* (at which commit).
 
@@ -50,7 +50,7 @@ but *why* (which rule fired) and *when* (at which commit).
 derived edge, a `DerivedEdgeAdded` (WAL discriminant 18) or
 `DerivedEdgeRetracted` (discriminant 19) HISTORY-MARKER record is appended in
 the same commit frame as the triggering mutation. These markers are pure
-history — they are state no-ops on replay (derived edges are re-derived from
+history; they are state no-ops on replay (derived edges are re-derived from
 rules deterministically). History scans read them as ground truth of when the
 edge was created or retracted and by which rule.
 
@@ -75,20 +75,20 @@ edge was created or retracted and by which rule.
 `event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived
 edges, `null` for manually written edges.
 
-### was_linked — point-in-time edge check
+### was_linked: point-in-time edge check
 
 Answers whether an edge of a given type was active between two nodes at a
 specific WAL commit.
 
 > **Index spaces:** `at_commit` is a **0-based frame index** (the same space
 > as `edge_history` event commits and `total_commits`). `last_changed()`
-> returns a **1-based commit sequence** from the CAS machinery — a different
+> returns a **1-based commit sequence** from the CAS machinery: a different
 > counter. Do not pass `last_changed(key)` directly as `at_commit`; to probe
 > "at the moment of the last change", use the commit values reported by
 > `edge_history`/`node_history` events instead.
 >
 > **Or pass a date and let the engine do it.** As of v0.6.11 `at_commit` also
-> takes an RFC 3339 string — `"2026-06-19"`, `"2026-06-19T12:00:00Z"` — and
+> takes an RFC 3339 string (`"2026-06-19"`, `"2026-06-19T12:00:00Z"`) and
 > resolves it to the last commit at or before that instant, in the 0-based space,
 > so the two counters cannot be confused. `resolve_date()` exposes the same
 > resolution on its own, and `commit_time_ms(frame)` reads a frame's recorded
@@ -99,7 +99,7 @@ specific WAL commit.
 > **Which frame a date lands on.** A commit whose rules fire writes two frames:
 > its own record, and a history marker carrying the rule attribution the edge
 > readouts report. A date resolves to the **last** frame the commit wrote, so it
-> sees that commit's derived edges as well as its record — asking for a date is
+> sees that commit's derived edges as well as its record; asking for a date is
 > asking for the graph as of that commit, complete.
 >
 > **Sidecars written before v0.6.12 are discarded on open.** Through v0.6.11 the
@@ -108,7 +108,7 @@ specific WAL commit.
 > thereafter, so those entries resolve dates to an ever-earlier graph. The drift
 > depends on which commits fired rules, which the file does not record, so it
 > cannot be repaired: the map is dropped and the store answers `no_recorded_time`
-> until its next commit starts a usable one. History itself is untouched — every
+> until its next commit starts a usable one. History itself is untouched; every
 > commit index keeps addressing exactly what it did.
 
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
@@ -131,7 +131,7 @@ body carries the range it will accept, and says so when older events are gone:
 
 All three history endpoints report the window they can answer over. Valid
 commit indices are `horizon..total_commits`: `total_commits` is the exclusive
-upper bound, and `horizon` is the oldest commit still retained — `0` when
+upper bound, and `horizon` is the oldest commit still retained, `0` when
 nothing has been pruned. `node_history` and `edge_history` carry both fields in
 their response; `was_linked`, `edges_at` and `open_at`/`query_at` name both in
 the `CommitOutOfRange` they return for a commit outside it. When the WAL is
@@ -150,7 +150,7 @@ Role tokens may call all three history endpoints. Masking follows the
 same-as-absent rule:
 
 - `node_history`: if the target key is outside the role's visibility mask, the
-  response is 404 — identical to querying an absent key (no existence oracle).
+  response is 404, identical to querying an absent key (no existence oracle).
 - `edge_history`: BOTH `a` AND `b` must be visible. If either is hidden, 404
   for that key.
 - `was_linked`: same two-key visibility requirement as `edge_history`.
@@ -168,17 +168,17 @@ the entire batch is rejected and no WAL frame is written.
 
 ### last_changed and commit_seq
 
-`db.last_changed(key)` returns `Some(commit_seq)` — the sequence number of the
-commit that last touched the node — or `None` if the node does not exist or has
+`db.last_changed(key)` returns `Some(commit_seq)`, the sequence number of the
+commit that last touched the node, or `None` if the node does not exist or has
 been deleted. The commit_seq is a monotonically increasing counter (1-based;
 every WAL frame advances it).
 
 **Touch definition:** a node's `last_changed` is updated when:
-- `InsertNode` — the newly-inserted node
-- `SetProp` / `RemoveProp` — the property-bearing node
-- `InsertEdge` / `DeleteEdge` — **both** src and dst endpoints (an edge change
+- `InsertNode`: the newly-inserted node
+- `SetProp` / `RemoveProp`: the property-bearing node
+- `InsertEdge` / `DeleteEdge`: **both** src and dst endpoints (an edge change
   touches both sides)
-- `DeleteNode` — node is tombstoned; `last_changed` then returns `None`
+- `DeleteNode`: node is tombstoned; `last_changed` then returns `None`
 
 History markers (`DerivedEdgeAdded` / `DerivedEdgeRetracted`) are state no-ops
 and do **not** update `last_changed`.
@@ -197,7 +197,7 @@ Precondition::NodeAbsent { key: "alice".into() }
 
 ### write_batch_cas (Rust API)
 
-`write_batch_cas` takes `Vec<Precondition>` and `Vec<BatchOp>` — not a closure.
+`write_batch_cas` takes `Vec<Precondition>` and `Vec<BatchOp>`, not a closure.
 See [rust.md § Several writes as one](rust.md#several-writes-as-one) for a
 compilable example using `BatchOp` directly.
 
@@ -246,15 +246,15 @@ query at `commit` under a restriction. `AsOfScope` says which one:
 |---|---|
 | `AsOfScope::Role("reader")` | everything that role may see |
 | `AsOfScope::Keys(&keys)` | an explicit node-key allow-list |
-| `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
+| `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list: a client list can only narrow a role, never widen it |
 
 Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
 with a client `mask`. Over MCP it is the `query` tool's `as_of` argument, which
-composes with `role` **or** with `mask` — that tool refuses the two together,
+composes with `role` **or** with `mask`; that tool refuses the two together,
 with or without `as_of`. Writes are refused at any commit.
 
 **The one semantic to get right:** the **graph** is historical, the **role
-definition** is current. `roles.json` is a sidecar — it is never written as a
+definition** is current. `roles.json` is a sidecar; it is never written as a
 WAL record, so it has no past version to read. What time-travels is which
 nodes the role's `keys` and `labels` resolve to: a role that may see the
 `Public` label sees exactly the `Public` nodes that existed at `commit`. If
@@ -265,7 +265,7 @@ today's label list against last week's graph.
 role's past: a role that may see `Public` reads a now-deleted `Public` node,
 and its edges, at any retained commit where it was live, and a role with
 `keys: ["k"]` reads `k` after `k` is gone. `DELETE` changes the present, not
-the WAL. To revoke history, prune the archives (below) or narrow the role —
+the WAL. To revoke history, prune the archives (below) or narrow the role;
 narrowing takes effect at every commit at once, because the role definition is
 always the current one.
 
@@ -287,7 +287,7 @@ is the state after the first WAL frame.
 `GraphDb::snapshot()` writes the current state to `snapshot.bin` and
 **truncates the WAL to empty** (Rust API default: `SnapshotOptions { keep_wal:
 false, archive_wal: false }`). The CLI command `mushroomdb snapshot` **archives**
-the WAL by default instead of discarding it — pass `--truncate` to get the
+the WAL by default instead of discarding it; pass `--truncate` to get the
 discard behaviour. After a truncating snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
@@ -315,7 +315,7 @@ including those before the snapshot.
 
 That holds while the WAL reaches the store's first commit. Once a truncating or
 archiving snapshot has been taken, the WAL starts above it, on that snapshot as
-its base — and a `keep_wal` snapshot replaces the base with the state at the
+its base, and a `keep_wal` snapshot replaces the base with the state at the
 head. The commits in the live WAL can then no longer be rebuilt, and `open_at`
 refuses them with `CommitOutOfRange` rather than replay them over nothing.
 History scans (`node_history`, `edge_history`, `was_linked`) are not affected:
@@ -330,7 +330,7 @@ Choose based on operational priorities:
 | Both: rolling checkpoints + eventual truncation | `keep_wal=true` for routine checkpoints; standard `snapshot()` when you decide to prune |
 
 **Torn WAL tail:** if the WAL has a partial frame (e.g., after a crash
-mid-write), `open_at` silently treats it as fewer commits — only complete,
+mid-write), `open_at` silently treats it as fewer commits: only complete,
 valid frames are counted. No error is returned; the valid prefix is replayed.
 
 ### Rust API
@@ -368,8 +368,8 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 mushroomdb asof ./db --commit 5 --namespace tenant-a --query "MATCH (n) RETURN n"
 ```
 
-`--namespace` restricts the read to one namespace. A namespace cannot change — it is
-set at insert and immutable — so that is simply the nodes which existed then and are in
+`--namespace` restricts the read to one namespace. A namespace cannot change (it is
+set at insert and immutable), so that is simply the nodes which existed then and are in
 it; a name no node uses answers with nothing, never with everything. The same
 composition is available through `AsOfScope::Namespace`, `POST /query` with
 `"namespace"`, and the MCP `query` tool, and it intersects a role there rather than
@@ -378,7 +378,7 @@ replacing it. See [masks.md](masks.md#namespaces-on-every-surface).
 ### Replay cost
 
 `open_at` replays rules incrementally, exactly as live writes do. On a database
-with many commits this can be slow — rule evaluation re-runs for every node
+with many commits this can be slow; rule evaluation re-runs for every node
 touched by every commit in the replay window. The replay is CPU-bound and does
 not involve disk I/O beyond the initial WAL read.
 
@@ -419,7 +419,7 @@ store's very first snapshot.  A `keep_wal=false` snapshot always writes
 new session sees `snapshot.bin` present and conservatively refuses the marker.
 Legacy stores (any prior `snapshot.bin`) are treated identically.
 
-### Archive reachability — stated plainly
+### Archive reachability: stated plainly
 
 Archives extend **two different guarantees** and they differ:
 
@@ -434,13 +434,13 @@ replays the WAL from scratch to reconstruct graph state at a point in time. It
 can only replay correctly if it has every frame from the very beginning. The
 genesis chain is intact when ALL of these are true:
 - `wal.genesis` marker is present (the first archive was also the store's
-  first-ever snapshot — no prior `snapshot.bin` existed, which rules out both
+  first-ever snapshot, meaning no prior `snapshot.bin` existed, which rules out both
   prior truncating snapshots and legacy stores)
 - `wal.floor` is 0 or absent (no archives have been pruned)
 
 When the genesis chain is NOT intact (pruned archives, or archiving started
 after a prior truncating snapshot), `open_at` for archive-resident commits
-returns `GraphError::CommitOutOfRange` — a clean refusal, never silently wrong
+returns `GraphError::CommitOutOfRange`, a clean refusal that is never silently wrong
 data. Live-WAL commits (commits in the current `wal.bin`) are always reachable.
 
 Summary:
@@ -451,7 +451,7 @@ Summary:
 | `was_linked` / `edges_at` | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 | `open_at` / `query_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 
-`node_history`/`edge_history` take no commit bound and scan whatever WAL/archives remain, so a pruned commit's events are not in the list — the `horizon` field in their response says so. `was_linked`, `edges_at`, and `open_at`/`query_at` check the horizon floor explicitly and refuse, naming the range they accept.
+`node_history`/`edge_history` take no commit bound and scan whatever WAL/archives remain, so a pruned commit's events are not in the list; the `horizon` field in their response says so. `was_linked`, `edges_at`, and `open_at`/`query_at` check the horizon floor explicitly and refuse, naming the range they accept.
 
 ### Retention and pruning
 
@@ -473,14 +473,14 @@ scans are unaffected.
 Automatic snapshots (`serve`, git ingest) keep **every** WAL archive by
 default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`, is `None`
 unless configured): nothing is pruned unless a caller asks for it. Retention
-is opt-in — `mushroomdb snapshot <db-dir> --retention N` is how to bound the
+is opt-in; `mushroomdb snapshot <db-dir> --retention N` is how to bound the
 archives, and every read says where the remaining history starts once that
 bound has pruned something. Below that horizon (`commit < wal_horizon_floor`):
 `was_linked`, `edges_at`, and `open_at`/`query_at` return
 `GraphError::CommitOutOfRange`, whose message names the range it will accept
 and says that events before the floor are not retained. `node_history` and
 `edge_history` take no commit bound, so they return the events that survive
-together with `horizon` — the oldest commit still retained; anything before
+together with `horizon`, the oldest commit still retained; anything before
 it was pruned.
 
 ---

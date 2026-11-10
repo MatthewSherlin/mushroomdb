@@ -4,8 +4,8 @@
 - subject HEAD: `c61ac91`
 - model: sonnet, max-turns 30, cell timeout 900s
 - arm A (stock): no MCP server, no project skill, no hooks; plain prompt
-- arm E (mushroomdb installed + grep redirect): `mushroomdb install --intercept-grep` — arm B's install plus the PreToolUse redirect from `Grep` to `explore`; plain prompt
-- arm F (mushroomdb cli delivery + grep redirect): `mushroomdb install --delivery cli --intercept-grep` — arm D's install plus that redirect; plain prompt
+- arm E (mushroomdb installed + grep redirect): `mushroomdb install --intercept-grep`: arm B's install plus the PreToolUse redirect from `Grep` to `explore`; plain prompt
+- arm F (mushroomdb cli delivery + grep redirect): `mushroomdb install --delivery cli --intercept-grep`: arm D's install plus that redirect; plain prompt
 - R2 subject: https://github.com/fastapi/fastapi at tag 0.141.1 (`95f8322ee1dc`), cloned per arm
 - allowed tools, every arm: `Read,Grep,Glob,Bash,Edit,Write` (+ `mcp__mushroomdb` for E)
 - DEVIATION from the original design: `Bash` is unqualified rather than the per-command `Bash(git:*)`, `Bash(rg:*)`, ... list. That list denies every pipeline, which made the co-change and most-imported tasks unanswerable in all arms. All arms carry the same deviation.
@@ -115,7 +115,7 @@ arm A: 20 cells; arm E: 20 cells; arm F: 20 cells; timeouts 0; errors 10; cells 
 
 ## Deltas vs stock
 
-Paired by task: one difference per task, arm mean minus arm A mean. The interval is a 95% percentile bootstrap over those differences (2000 resamples, seeded). An interval that does not contain 0 is the only kind worth quoting. `tasks` is how many tasks contributed a difference — a task where either side recorded nothing contributes none.
+Paired by task: one difference per task, arm mean minus arm A mean. The interval is a 95% percentile bootstrap over those differences (2000 resamples, seeded). An interval that does not contain 0 is the only kind worth quoting. `tasks` is how many tasks contributed a difference; a task where either side recorded nothing contributes none.
 
 | arm | metric | arm mean | stock mean | delta | 95% CI | tasks |
 |---|---|---|---|---|---|---|

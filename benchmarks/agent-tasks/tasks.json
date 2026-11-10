@@ -1,8 +1,8 @@
 {
-  "repo": "/private/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject",
+  "repo": "$TMPDIR/agent-bench/subject",
   "head": "c61ac919e365e43e62ee25698a5b2c1a11260f7f",
   "head_short": "c61ac91",
-  "repo2": "/private/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject2",
+  "repo2": "$TMPDIR/agent-bench/subject2",
   "head2": "95f8322ee1dcda7ceace7b1c4f6c9915b36d748f",
   "prefix": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.",
   "change_prefix": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.",

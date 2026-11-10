@@ -1,6 +1,6 @@
 ---
 name: mushroom
-description: Live graph memory for agents — query and create entities, derive relationships by rule, explain why two things are associated, read the graph at a past commit, ask what a change would do, and answer as one role. Trigger on: memory, remember, recall, relationship, entity, association, why are X and Y related, as of, what if, who may see.
+description: Live graph memory for agents: query and create entities, derive relationships by rule, explain why two things are associated, read the graph at a past commit, ask what a change would do, and answer as one role. Trigger on: memory, remember, recall, relationship, entity, association, why are X and Y related, as of, what if, who may see.
 ---
 
 # /mushroom
@@ -11,29 +11,29 @@ A live graph at `{{DB_PATH}}` (`'<db>'` below): entities, the edges rules derive
 
 ## First minute
 
-**1. If the store is empty, say so** — then offer to fill it: `ingest_json` for a batch of rows, `upsert_entity` for one.
+**1. If the store is empty, say so;** then offer to fill it: `ingest_json` for a batch of rows, `upsert_entity` for one.
 
-**2. Take your bearings from the `SessionStart` brief** already in your context — size, the schema, one worked call per question kind — not from a search.
+**2. Take your bearings from the `SessionStart` brief** already in your context (size, the schema, one worked call per question kind), not from a search.
 
-**3. Answer from the store, and quote what it prints.** One named call per question kind — the table below — against the store's own keys.
+**3. Answer from the store, and quote what it prints.** One named call per question kind (the table below) against the store's own keys.
 <!-- cli -->
 Every command runs through `Bash`, store first; the forms are below.
 <!-- /cli -->
 
 ## Task rules
 
-One call per question, on the store's own keys. The `SessionStart` brief printed one worked call per kind — copy those rather than probing Cypher for the schema.
+One call per question, on the store's own keys. The `SessionStart` brief printed one worked call per kind; copy those rather than probing Cypher for the schema.
 <!-- mcp -->
 
 | The question | The call |
 |---|---|
-| why are these two related | `explain_association a b` — the rule, the score and the values the two share |
-| what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
-| what did it look like then | `edges_at a <date>` — pass the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; it resolves to the last commit at or before it. A 0-based commit index also works. **Do not hunt for a commit**: not `node_history`, not `stats`, not a file on disk. A store that records no times says so by name |
-| what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
+| why are these two related | `explain_association a b`: the rule, the score and the values the two share |
+| what is it related to | `node_edges a`: grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
+| what did it look like then | `edges_at a <date>`: pass the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; it resolves to the last commit at or before it. A 0-based commit index also works. **Do not hunt for a commit**: not `node_history`, not `stats`, not a file on disk. A store that records no times says so by name |
+| what would this change do | `what_if a <field> <value>`: lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
-| a durable fact | `remember` — the `text` and the keys it is `about`; say the `note:` key back |
+| a durable fact | `remember`: the `text` and the keys it is `about`; say the `note:` key back |
 
 Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`; what's in here → `schema`; what matters, what clusters, which keys are one entity → `analyze`; forget it → `forget`.
 <!-- /mcp -->
@@ -41,29 +41,29 @@ Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` tak
 
 | The question | The command |
 |---|---|
-| why are these two related | `{{BIN}} why '<db>' <a> <b>` — what links two keys, with the evidence |
-| what did it look like then | `{{BIN}} asof '<db>' --at <date> --query "<cypher>"` — a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
-| anything else, including a durable fact | `{{BIN}} query '<db>' "<cypher>"` — any Cypher, read or write, here and in `--query`: single-quote Cypher strings; inside the double quotes backslash every dollar sign, double quote and backtick; a fact is a `CREATE (n:Note {id: 'note:<fresh-id>', text: '<the fact>'})`, and say the key back |
+| why are these two related | `{{BIN}} why '<db>' <a> <b>`: what links two keys, with the evidence |
+| what did it look like then | `{{BIN}} asof '<db>' --at <date> --query "<cypher>"`: a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
+| anything else, including a durable fact | `{{BIN}} query '<db>' "<cypher>"`: any Cypher, read or write, here and in `--query`: single-quote Cypher strings; inside the double quotes backslash every dollar sign, double quote and backtick; a fact is a `CREATE (n:Note {id: 'note:<fresh-id>', text: '<the fact>'})`, and say the key back |
 
 `explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, and there is no `remember` subcommand. The rest need `--delivery mcp`. Who may see → `query --role <name>`, a `role` from the store's `roles.json`.
 <!-- /cli -->
 
-A store built by `{{BIN}} ingest-git '<db>' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and answers to the same calls as any other store. Use the repository as a data source; do not reach for it ahead of a search.
+A store built by `{{BIN}} ingest-git '<db>' . --prs --ensure-gitignore` is a repository as entities (commits, pull requests, files, authors) and answers to the same calls as any other store. Use the repository as a data source; do not reach for it ahead of a search.
 
 ### What runs without you
 
-A `SessionStart` hook puts the store's brief in your context; a `UserPromptSubmit` hook prints a `recall` digest for the prompt — a question in ordinary words is enough — and nothing when the store has nothing to say. They add context; the tools answer.
+A `SessionStart` hook puts the store's brief in your context; a `UserPromptSubmit` hook prints a `recall` digest for the prompt (a question in ordinary words is enough) and nothing when the store has nothing to say. They add context; the tools answer.
 
 ## Learn
 
-The `learn` pass — `/mushroom learn <path>` — turns prose (docs, ADRs) into `Concept` nodes: ≤ 20 documents a run, ≤ 5 concepts each, one row apiece (`id` `concept:<kebab-case-name>`, `name`, `summary` ≤ 300 chars, `source_files` verified with `query` and sorted, `source_hashes` in that order, `extracted_by`, `extracted_at`), written with `ingest_json`.
+The `learn` pass (`/mushroom learn <path>`) turns prose (docs, ADRs) into `Concept` nodes: ≤ 20 documents a run, ≤ 5 concepts each, one row apiece (`id` `concept:<kebab-case-name>`, `name`, `summary` ≤ 300 chars, `source_files` verified with `query` and sorted, `source_hashes` in that order, `extracted_by`, `extracted_at`), written with `ingest_json`.
 
 The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`; when a source's hash stops matching the concept is stale. **Re-learn only those.**
 
 ## Advanced
 <!-- mcp -->
 
-`tools/list` shows the tools above on every store, one built by `ingest-git` included; `query` is Cypher, read or write. `{{BIN}} mcp <db> --all-tools` lists the other two with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive — `suggest_rules` drafts one — and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` shows the tools above on every store, one built by `ingest-git` included; `query` is Cypher, read or write. `{{BIN}} mcp <db> --all-tools` lists the other two with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive (`suggest_rules` drafts one) and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative, never a security boundary; real access control is `serve --role-token`.
 <!-- /mcp -->
 
 Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`{{BIN}} serve '<db>'`), and `doctor` checks the install.

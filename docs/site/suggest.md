@@ -1,15 +1,15 @@
 # Rule Suggestion
 
-mushroomdb can profile your data and propose linking rules — **the database that proposes its own schema**.
+mushroomdb can profile your data and propose linking rules: **the database that proposes its own schema**.
 
 ## Overview
 
 Call `db.suggest_rules()` to receive a list of `RuleSuggestion` objects. Each suggestion includes:
 
-- **`def`** — a complete `RuleDef` ready to pass to `db.create_rule()`.
-- **`est_edges`** — estimated number of edges if the rule were applied (extrapolated from a sample of source nodes, labeled as an estimate).
-- **`examples`** — up to 3 example `(src_key, dst_key, score)` pairs from the sample evaluation.
-- **`rationale`** — a human-readable explanation of why this rule was suggested.
+- **`def`**: a complete `RuleDef` ready to pass to `db.create_rule()`.
+- **`est_edges`**: estimated number of edges if the rule were applied (extrapolated from a sample of source nodes, labeled as an estimate).
+- **`examples`**: up to 3 example `(src_key, dst_key, score)` pairs from the sample evaluation.
+- **`rationale`**: a human-readable explanation of why this rule was suggested.
 
 No rule is created automatically. You must accept explicitly:
 
@@ -87,7 +87,7 @@ Sampling is seeded (default seed `0x4d75_7368_726f_6f6d`). The same database con
 
 ## Performance
 
-The profiling pass samples at most `max_sample_nodes` (default 10,000) nodes per label. Each candidate rule gets a preview budget of `budget_ms` (default 250 ms) enforced structurally — the function checks elapsed time between source nodes and bails early, retaining partial results. `suggest_rules` never hangs.
+The profiling pass samples at most `max_sample_nodes` (default 10,000) nodes per label. Each candidate rule gets a preview budget of `budget_ms` (default 250 ms) enforced structurally: the function checks elapsed time between source nodes and bails early, retaining partial results. `suggest_rules` never hangs.
 
 ## SuggestConfig
 

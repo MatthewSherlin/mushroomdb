@@ -1,6 +1,6 @@
-# mushroom — Claude Code plugin
+# mushroom: Claude Code plugin
 
-Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and two hooks: `SessionStart` (the session brief) and `UserPromptSubmit` (recall). Every store gives the session the twenty-three-tool association surface — query, explain, time travel, visibility — and a brief that prints the store's own schema with one worked call per question kind. Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
+Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and two hooks: `SessionStart` (the session brief) and `UserPromptSubmit` (recall). Every store gives the session the twenty-three-tool association surface (query, explain, time travel, visibility) and a brief that prints the store's own schema with one worked call per question kind. Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/`. Do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
 
 ## Install
 
@@ -9,26 +9,26 @@ claude plugin marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 
-Then open a repository and type `/mushroom:mushroom`. On the first turn the skill builds the store if it does not exist yet and prints a brief: the store's own schema, with one worked call per question kind — why are two entities related, what did the graph look like at a past commit, what would a change do, who may see it.
+Then open a repository and type `/mushroom:mushroom`. On the first turn the skill builds the store if it does not exist yet and prints a brief: the store's own schema, with one worked call per question kind: why are two entities related, what did the graph look like at a past commit, what would a change do, who may see it.
 
-After that it is task-first: one named call per question kind — `explain_association`, `node_edges`, `edges_at`, `what_if`, `query` with a `role`, `remember` and `recall` — copied from the worked calls the brief printed, against the store's own keys. What the engine guarantees and what it does not: [`docs/site/mcp.md`](../../docs/site/mcp.md).
+After that it is task-first: one named call per question kind (`explain_association`, `node_edges`, `edges_at`, `what_if`, `query` with a `role`, `remember` and `recall`), copied from the worked calls the brief printed, against the store's own keys. What the engine guarantees and what it does not: [`docs/site/mcp.md`](../../docs/site/mcp.md).
 
-(`mushroomdb install` — the npx path, not this plugin — writes the same skill into a project's or user's own `.claude/skills/mushroom/`, where Claude Code invokes it bare as `/mushroom`. The plugin and the npx install are two separate ways to get the same skill; a plugin-provided skill is always namespaced by Claude Code as `/<plugin-name>:<skill-name>`, which for this plugin is `/mushroom:mushroom`.)
+(`mushroomdb install`, the npx path rather than this plugin, writes the same skill into a project's or user's own `.claude/skills/mushroom/`, where Claude Code invokes it bare as `/mushroom`. The plugin and the npx install are two separate ways to get the same skill; a plugin-provided skill is always namespaced by Claude Code as `/<plugin-name>:<skill-name>`, which for this plugin is `/mushroom:mushroom`.)
 
 ## What it wires up
 
-- **MCP server** (`.mcp.json`) — runs `npx -y mushroomdb@<version> mcp --auto`, one process per project, talking to the graph over stdio.
+- **MCP server** (`.mcp.json`): runs `npx -y mushroomdb@<version> mcp --auto`, one process per project, talking to the graph over stdio.
 - **Skill** (`skills/mushroom/SKILL.md`, invoked as `/mushroom:mushroom`).
-- **`SessionStart` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh brief --auto` (5 s timeout) as a session opens. It prints the store's own schema in one block — the labels, the edge types and the rules that derive them — with one worked call per question kind against the store's own keys, a store built by `ingest-git` included. Byte-stable for a given store, so Claude Code caches it for the whole session.
-- **`UserPromptSubmit` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
+- **`SessionStart` hook**: runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh brief --auto` (5 s timeout) as a session opens. It prints the store's own schema in one block (the labels, the edge types and the rules that derive them), with one worked call per question kind against the store's own keys, a store built by `ingest-git` included. Byte-stable for a given store, so Claude Code caches it for the whole session.
+- **`UserPromptSubmit` hook**: runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
 
-The plugin writes **no git hooks** — a plugin has no business editing `.git/hooks`.
+The plugin writes **no git hooks**: a plugin has no business editing `.git/hooks`.
 
-## `hooks/run.sh` — why the hooks do not call `npx`
+## `hooks/run.sh`: why the hooks do not call `npx`
 
 `npx -y mushroomdb@<version> …` costs about half a second before it does any work: a cache check, a version resolve, and a Node process of its own. The MCP server pays that once per session, which is fine, and so does the `SessionStart` hook. The prompt hook fires on **every prompt**, which is not.
 
-So the hooks call `run.sh` instead. On its first run it asks the package where its native binary is — `npx -y mushroomdb@<version> --print-binary` — writes that one line to
+So the hooks call `run.sh` instead. On its first run it asks the package where its native binary is (`npx -y mushroomdb@<version> --print-binary`), writes that one line to
 
 ```
 ${CLAUDE_PLUGIN_DATA:-~/.mushroomdb}/binary-<version>
@@ -58,7 +58,7 @@ Several processes can share that store safely: the MCP server, both hooks and an
 
 ## Troubleshooting
 
-`mushroomdb doctor` is **not** the tool for a plugin-only install. It reads the files `mushroomdb install` writes — `.mcp.json` and `.claude/settings.json` — and Claude Code holds the plugin's configuration itself, so `doctor` reports `fail config` and exits 1 even when the plugin is working. Use `claude plugin list` for the plugin, and check the store directly:
+`mushroomdb doctor` is **not** the tool for a plugin-only install. It reads the files `mushroomdb install` writes (`.mcp.json` and `.claude/settings.json`), and Claude Code holds the plugin's configuration itself, so `doctor` reports `fail config` and exits 1 even when the plugin is working. Use `claude plugin list` for the plugin, and check the store directly:
 
 ```
 npx -y mushroomdb@<version> stats ./mushroom-memory   # node, edge and rule counts

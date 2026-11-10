@@ -15,12 +15,12 @@ runs under `SimFs`; none of them touch the filesystem.
 
 `SimFs` has two independent crash modes:
 
-**Byte mode** (`SimFs::with_crash_after(n)`) — fires inside `append` once the cumulative
+**Byte mode** (`SimFs::with_crash_after(n)`): fires inside `append` once the cumulative
 bytes-written counter crosses `n`. The torn `append` writes a prefix and sets a crash latch.
 Subsequent `append` and `sync` calls return `Err`; `read` and `write_atomic` are not
 affected (this models a power loss mid-WAL-write, not a full storage failure).
 
-**Op mode** (`SimFs::with_crash_after_ops(n)`) — fires on the n-th Fs call (append, sync,
+**Op mode** (`SimFs::with_crash_after_ops(n)`): fires on the n-th Fs call (append, sync,
 read, write\_atomic combined). A failed `write_atomic` leaves the old file content in place
 (rename-never-happened semantics). This closes the snapshot-write and WAL-truncation crash
 windows that byte mode does not reach.
@@ -88,7 +88,7 @@ Bug class caught: inverted index losing postings after a torn WAL write.
 
 All byte-sweep tests also run an op-mode sweep (`recovery_op_sweep_rules`) that injects
 crashes at every Fs-call boundary, covering snapshot `write_atomic` and WAL-truncation
-`write_atomic` — the two paths byte mode cannot reach.
+`write_atomic`: the two paths byte mode cannot reach.
 
 **Run the byte and op sweep tests:**
 
@@ -111,7 +111,7 @@ a from-scratch brute-force evaluation. This is checked continuously by a proptes
 
 ### Rules oracle: `engine_matches_oracle`
 
-`crates/sim-harness/tests/oracle_equivalence.rs` — proptest, 256 cases, sequences up
+`crates/sim-harness/tests/oracle_equivalence.rs`: proptest, 256 cases, sequences up
 to 80 ops drawn from: InsertNode, InsertEdge, SetProp, SetF, SetTags, CreateRule
 (9 templates: KeyMatch, FieldEqual, Overlap, All, Overlap-shared-etype, NumericWithin ×2,
 GeoRadius, VectorSimilar), DeleteRule, DeleteNode, DeleteEdge, RemoveProp, CreateView,
@@ -143,7 +143,7 @@ PROPTEST_CASES=1024 cargo test -p sim-harness --test oracle_equivalence engine_m
 
 ### Top-k oracle: `topk_dst_sweep`
 
-`crates/sim-harness/tests/top_k_oracle.rs` — proptest, verifies that at every quiescent
+`crates/sim-harness/tests/top_k_oracle.rs`: proptest, verifies that at every quiescent
 point the engine's per-source out-neighbor set under a top-k rule equals a scratch
 recompute of the k best candidates by score (and by key-order tiebreak for unscored rules).
 Three rules run concurrently: FieldEqual k=1, NumericWithin k=3, Any(FieldEqual,
@@ -154,10 +154,10 @@ insert-then-evict, backfill, or score change.
 
 **Fixed top-k tests:**
 
-- `topk_dst_insert_evict_and_backfill_sequence` — sequential insert/delete sequence that
+- `topk_dst_insert_evict_and_backfill_sequence`: sequential insert/delete sequence that
   exercises eviction and backfill
-- `topk_dst_numeric_k3_score_order` — verifies score ordering under NumericWithin
-- `topk_evicted_pair_has_no_explain_entry` — evicted edges must not appear in `explain()`
+- `topk_dst_numeric_k3_score_order`: verifies score ordering under NumericWithin
+- `topk_evicted_pair_has_no_explain_entry`: evicted edges must not appear in `explain()`
 
 **Run top-k tests:**
 
@@ -185,14 +185,14 @@ or node mutations.
 
 **Fixed fulltext test:**
 
-- `overlap_rule_equality_on_nonempty_derived_sets` (query\_equivalence.rs) — Cypher
+- `overlap_rule_equality_on_nonempty_derived_sets` (query\_equivalence.rs): Cypher
   MATCH result set matches the traversal API on a non-empty derived edge set
 
 ---
 
 ## Cypher ↔ traversal equivalence
 
-`crates/sim-harness/tests/query_equivalence.rs` — proptest. For random small graphs with
+`crates/sim-harness/tests/query_equivalence.rs`: proptest. For random small graphs with
 an Overlap rule:
 
 - `MATCH (a {k: $key})-[r:T]->(b) RETURN b` row set equals `neighbors` Out
@@ -208,7 +208,7 @@ cargo test -p sim-harness --test query_equivalence
 
 ## Torn-write tests (WAL unit layer)
 
-`crates/sim-harness/src/sim_fs.rs` — the torn-write unit tests above verify `SimFs`
+`crates/sim-harness/src/sim_fs.rs`: the torn-write unit tests above verify `SimFs`
 itself. The WAL layer is tested through the crash sweeps: every crash in the byte-mode
 sweep represents a potential torn WAL frame. The WAL uses CRC checksums per frame;
 `recovery_is_consistent_at_every_crash_offset` verifies that a torn frame is detected
@@ -254,11 +254,11 @@ APPROX_RECALL_FLOOR_RECOVERY = 0.85   # any crash-recovery or early HNSW build s
 
 Tests:
 
-- **`approximate_recall_above_floor_quiesced`** — 20 2-D unit vectors in 4 clusters;
+- **`approximate_recall_above_floor_quiesced`**: 20 2-D unit vectors in 4 clusters;
   asserts per-query recall ≥ 0.90 on a fully built index.
-- **`approximate_recall_above_floor_after_rebuild`** — same dataset, asserts recall
+- **`approximate_recall_above_floor_after_rebuild`**: same dataset, asserts recall
   ≥ 0.85 after an explicit `rebuild_rule`.
-- **`topk_approx_recall_floor`** — approximate rule inside the top-k oracle sweep;
+- **`topk_approx_recall_floor`**: approximate rule inside the top-k oracle sweep;
   asserts recall ≥ 0.90 at every quiescent point.
 - In `recovery_byte_sweep_rules`, every crash-recovery state with `vec_approx` live
   asserts recall ≥ `APPROX_RECALL_FLOOR_RECOVERY`.
@@ -302,14 +302,14 @@ cargo test -p sim-harness -- --nocapture 2>&1 | grep -E "crash points|recall|tes
 
 ## What is not yet covered
 
-- **Multi-statement transactions** — supported: BEGIN … COMMIT through
+- **Multi-statement transactions**: supported: BEGIN … COMMIT through
   `SharedDb::begin_transaction` and, over Bolt, `BEGIN` / `COMMIT` / `ROLLBACK`, with snapshot isolation and one atomic commit.
   Covered by `crates/core-api/tests/transaction_integration.rs`, `transaction_overlay.rs` and `tx_mw.rs` (the same random
   write statements run auto-commit and inside one transaction give the same results, counts and store), and for Bolt by
   `crates/bolt/tests/tx.rs`.
-- **Concurrent writer correctness** — the engine is single-writer by design (`RwLock`
+- **Concurrent writer correctness**: the engine is single-writer by design (`RwLock`
   facade). Race conditions between writers are excluded by the architecture, not tested.
-- **Network-layer correctness** — the HTTP and WebSocket layers have golden-shape tests
+- **Network-layer correctness**: the HTTP and WebSocket layers have golden-shape tests
   in `crates/server/tests/`; they do not yet have fault-injection or load tests.
-- **Cypher coverage** — the supported subset and its known gaps are documented in
+- **Cypher coverage**: the supported subset and its known gaps are documented in
   [`docs/site/query.md`](query.md).
