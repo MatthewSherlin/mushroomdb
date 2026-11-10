@@ -158,6 +158,13 @@ the endpoint come from the standard `AWS_ACCESS_KEY_ID`,
 `AWS_ENDPOINT_URL` variables; `r2://` and `minio://` need the endpoint. Put the
 credentials in the platform's secret store, never in a template.
 
+On AWS you can leave the keys unset and let the platform's role supply them: an
+ECS or Fargate task role (AWS sets `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` in
+the container) or an EKS service account role (`AWS_WEB_IDENTITY_TOKEN_FILE` and
+`AWS_ROLE_ARN`). On EC2 the instance profile is used. The role needs read and
+write on the bucket prefix. Explicit keys, when set, take precedence. EKS Pod
+Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) is not supported yet.
+
 ```text
 MUSHROOMDB_BACKUP_S3_URL=s3://my-bucket/prefix
 ```
