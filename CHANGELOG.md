@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **S3 backup authenticates with an ECS or Fargate task role.** With no access keys
+  set, the backup client never read `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` and
+  asked EC2 instance metadata, which a task does not have, so uploads and
+  restore-on-boot failed to authenticate on Fargate unless long-lived keys were
+  stored as a secret. It now uses the task role. Explicit keys still take
+  precedence; EKS web identity already worked. Present in released 0.10.x (ledger
+  row 175).
 - **Over Bolt, a `UNION` keeps the graph structures inside its maps and mixed
   lists.** A `UNION` of parts that each return a node inside a map (`RETURN {who:
   n} AS v UNION …`) sent the node as its key again, as before 0.10.5; a `UNION ALL`

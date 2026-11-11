@@ -229,7 +229,10 @@ pub fn parse_location(url: &str) -> Result<S3Location, BackupError> {
 ///
 /// Credentials and endpoint come from the standard `AWS_*` variables
 /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`,
-/// `AWS_REGION`, default `us-east-1`). `r2://` and `minio://` need
+/// `AWS_REGION`, default `us-east-1`). With no keys set, the client uses an
+/// EKS web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`), then
+/// an ECS or Fargate task role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`),
+/// then EC2 instance metadata. `r2://` and `minio://` need
 /// `AWS_ENDPOINT_URL`; a plain-`http` endpoint is allowed, for a local MinIO.
 /// Every upload carries an S3 SHA-256 checksum, so the service rejects a body
 /// that was corrupted in transit. Conditional PUT (`If-None-Match` /
@@ -272,6 +275,12 @@ pub fn build_store_with(
     }
     if let Some(token) = get("AWS_SESSION_TOKEN") {
         b = b.with_token(token);
+    }
+    // An ECS or Fargate task role: the client reads its credentials from the
+    // container endpoint. Without this it falls back to EC2 instance
+    // metadata, which a task does not have.
+    if let Some(uri) = get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+        b = b.with_config(AmazonS3ConfigKey::ContainerCredentialsRelativeUri, uri);
     }
     if let Some(ep) = endpoint {
         b = b
@@ -430,5 +439,32 @@ mod tests {
             build_store_with(&c, env(&[("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")])).is_ok()
         );
         assert!(build_store_with(&BackupConfig::new("s3://b/p"), env(&[])).is_ok());
+    }
+
+    // On ECS and Fargate the credentials come from the task role, at the
+    // address `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` names; with no keys set,
+    // the client has to ask there rather than at EC2 instance metadata.
+    #[test]
+    fn a_container_task_role_supplies_the_credentials_when_no_keys_are_set() {
+        let c = BackupConfig::new("s3://b/p");
+        let uri = (
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/abc",
+        );
+        let store = build_store_with(&c, env(&[uri])).unwrap();
+        let debug = format!("{store:?}");
+        assert!(
+            debug.contains("http://169.254.170.2/v2/credentials/abc"),
+            "{debug}"
+        );
+
+        // Explicit keys still win over the task role.
+        let keys = [
+            uri,
+            ("AWS_ACCESS_KEY_ID", "AKID"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ];
+        let debug = format!("{:?}", build_store_with(&c, env(&keys)).unwrap());
+        assert!(!debug.contains("169.254.170.2"), "{debug}");
     }
 }

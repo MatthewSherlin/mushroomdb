@@ -183,6 +183,7 @@ non-zero while any row is neither **CLOSED** nor explicitly **DEFERRED**.
 | 172 | Low: performance gap, present in released 0.10.0 and 0.10.1 | On Linux arm64 (3-CPU container), a plain commit paused is 1.20× v0.9.2 after the row 167 allocation fix, vs the 1.15× target. The remaining gap tracks WAL syscall overhead: `strace` shows ~0.3 extra `mprotect` and 0.17 `futex` per commit on glibc vs macOS even with all per-commit heap allocs removed; macOS (M4) reaches 1.04×. `scripts/check-defect-ledger.sh` exit 0 because the gate bound is 1.35×, not the target. Evidence: Linux arm64 container (3 CPUs, `--cpus 3`), paused probe vs v0.9.2 after row 167 fix: 1.20–1.21× (target 1.15×, bound 1.35×) | **DEFERRED** to 0.11 |
 | 173 | Low: wrong value shape over Bolt, present in released 0.10.5 | A `UNION` dropped the row 152 structures: `MATCH (n:A) RETURN {node: n} AS v UNION MATCH (m:B) RETURN {node: m} AS v` sent `node` as the key, because the deduplicating combine built a fresh result without the value kind trees and only the flat column kinds were restored. `UNION ALL` kept the first part's trees for every row, so a later part's string equal to a node key was sent as that Node. Found by the review of PR #154. | **CLOSED** in 0.10.6: trees merged across parts like the flat kinds |
 | 174 | Low: wrong value shape over Bolt, present in released 0.10.5 | A `MATCH … SET/REMOVE … RETURN` built its result without row 152's value kind trees: `MATCH (n {id: 'ada'}) SET n.seen = true RETURN {who: n}`, `[n, 1]` and `coalesce(n, n)` sent the node as its key; only a bare variable column was a structure. Found by the review of the row 173 fix. | **CLOSED** in 0.10.6: the write `RETURN` sets its trees from the `MATCH`'s variable kinds |
+| 175 | Medium: backup unusable on ECS/Fargate without long-lived keys, present in released 0.10.x | `build_store_with` in `crates/backup/src/store.rs` started from `AmazonS3Builder::new()` and passed on only the key, secret, token, region and endpoint variables. With no keys set, the client skipped the container credential endpoint named by `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` and asked EC2 instance metadata, which a Fargate task does not have: backup uploads and restore-on-boot failed to authenticate. Reported by a downstream deployment on Fargate. | **CLOSED** in 0.10.6: the variable is passed to the builder |
 <!-- DEFECT-INDEX:END -->
 
 ## 20. Spec §5.9 asks for a shape the code cannot be put into: CLOSED
@@ -5176,3 +5177,22 @@ kind tree, so `attach_entities` skipped them and the node went out as its key.
 variable takes the kind of its value column. Test:
 `a_set_return_sends_nodes_inside_maps_and_expressions_as_structures` in
 `crates/bolt/tests/structures.rs`.
+
+## 175. S3 backup cannot authenticate with an ECS or Fargate task role: CLOSED in 0.10.6
+
+Present in released 0.10.x; **Medium** (backup and restore-on-boot unusable on ECS and Fargate
+unless long-lived access keys are stored as a secret, which a compliance review flags). Reported by
+a downstream deployment that runs `serve` as a single Fargate task with `MUSHROOMDB_BACKUP_S3_URL`
+set.
+
+`build_store_with` built the client with `AmazonS3Builder::new()` and set the access key, secret,
+session token, region and endpoint from the environment. object_store 0.11 picks credentials in this
+order: explicit keys, then an EKS web identity (which it reads from the environment itself), then a
+container task role (only if the builder was given the relative URI), then EC2 instance metadata.
+The URI was never passed, so a task with no keys fell through to instance metadata and failed.
+
+**Closed, 0.10.6.** `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` is passed to the builder as
+`ContainerCredentialsRelativeUri`. Explicit keys still take precedence. Not covered: EKS Pod
+Identity's `AWS_CONTAINER_CREDENTIALS_FULL_URI`, which object_store 0.11 does not support. Test:
+`a_container_task_role_supplies_the_credentials_when_no_keys_are_set` in
+`crates/backup/src/store.rs`; `docs/site/self-host.md` documents the credential order.
