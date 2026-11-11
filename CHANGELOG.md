@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.10.6: S3 backup on Fargate, and graph values in a UNION and a write RETURN
 
 ### Fixed
 
